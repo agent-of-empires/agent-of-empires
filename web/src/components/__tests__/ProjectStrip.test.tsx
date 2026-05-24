@@ -83,6 +83,7 @@ describe("ProjectStrip", () => {
         activeWorkspaceId="Alpha-workspace"
         onSelectWorkspace={onSelectWorkspace}
         onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
       />,
     );
 
@@ -101,6 +102,7 @@ describe("ProjectStrip", () => {
         activeWorkspaceId="Alpha-workspace"
         onSelectWorkspace={vi.fn()}
         onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
       />,
     );
 
@@ -121,10 +123,56 @@ describe("ProjectStrip", () => {
         activeWorkspaceId="Alpha-workspace"
         onSelectWorkspace={vi.fn()}
         onSelectSession={onSelectSession}
+        onCreateSession={vi.fn()}
       />,
     );
 
     fireEvent.click(getByRole("button", { name: /Alpha-second/i }));
     expect(onSelectSession).toHaveBeenCalledWith("Alpha-second");
+  });
+
+  it("filters projects by project and session details", () => {
+    const beta = group("Beta", "/tmp/beta", "Idle");
+    beta.workspaces[0]!.sessions[0]!.branch = "feature/searchable";
+    beta.workspaces[0]!.sessions[0]!.tool = "codex";
+
+    const { getByLabelText, getByRole, queryByRole } = render(
+      <ProjectStrip
+        groups={[group("Alpha", "/tmp/alpha", "Running"), beta]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(getByLabelText("Filter project strip"), {
+      target: { value: "searchable" },
+    });
+
+    expect(queryByRole("tab", { name: /Alpha/i })).toBeNull();
+    expect(getByRole("tab", { name: /Beta/i })).toBeTruthy();
+  });
+
+  it("starts a new session from the project row without selecting it", () => {
+    const onCreateSession = vi.fn();
+    const onSelectWorkspace = vi.fn();
+
+    const { getByLabelText } = render(
+      <ProjectStrip
+        groups={[group("Alpha", "/tmp/alpha", "Running")]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        onSelectWorkspace={onSelectWorkspace}
+        onSelectSession={vi.fn()}
+        onCreateSession={onCreateSession}
+      />,
+    );
+
+    fireEvent.click(getByLabelText("New session in Alpha"));
+
+    expect(onCreateSession).toHaveBeenCalledWith("/tmp/alpha");
+    expect(onSelectWorkspace).not.toHaveBeenCalled();
   });
 });

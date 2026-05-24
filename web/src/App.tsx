@@ -903,6 +903,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           activeWorkspaceId={activeWorkspace?.id ?? null}
           onSelectWorkspace={handleSelectWorkspace}
           onSelectSession={handleSelectSession}
+          onCreateSession={handleCreateSession}
+          readOnly={serverAbout?.read_only}
         />
       )}
 
