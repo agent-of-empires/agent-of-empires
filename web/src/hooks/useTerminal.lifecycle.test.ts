@@ -1368,6 +1368,7 @@ describe("useTerminal lifecycle", () => {
   });
 
   it("Ctrl+C copies selected terminal text instead of sending an interrupt", async () => {
+    const originalExecCommand = document.execCommand;
     const execCommand = vi.fn(() => true);
     Object.defineProperty(document, "execCommand", {
       configurable: true,
@@ -1411,6 +1412,10 @@ describe("useTerminal lifecycle", () => {
       });
       expect(ctrlC).toBeUndefined();
     } finally {
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: originalExecCommand,
+      });
       div.remove();
     }
   });

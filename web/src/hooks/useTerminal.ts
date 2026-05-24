@@ -47,13 +47,16 @@ const twarn = (...args: unknown[]) => {
   console.warn("[terminal.ws]", ...args);
 };
 
-function copyText(text: string): boolean {
+async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
   if (window.isSecureContext && navigator.clipboard?.writeText) {
-    void navigator.clipboard.writeText(text).catch((err) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (err) {
       twarn("clipboard.writeText failed", err);
-    });
-    return true;
+      return false;
+    }
   }
 
   const textarea = document.createElement("textarea");
@@ -304,7 +307,7 @@ export function useTerminal(
       } catch (err) {
         twarn("execCommand copy failed", err);
       }
-      copyText(selection);
+      void copyText(selection);
       return true;
     };
     const onCopy = (event: ClipboardEvent) => {
