@@ -32,16 +32,22 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       shortcut: ProjectStripShortcut,
     ) => {
       if (shortcut === "disabled") return false;
-      if (e.shiftKey || e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) {
+      if (e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) {
         return false;
       }
+      if (shortcut === "shift-alt-hl") {
+        return e.shiftKey && e.altKey && !e.ctrlKey;
+      }
       if (shortcut === "alt-hl") {
-        return e.altKey && !e.ctrlKey;
+        return e.altKey && !e.ctrlKey && !e.shiftKey;
       }
       if (shortcut === "ctrl-alt-hl") {
-        return e.ctrlKey && e.altKey;
+        return (
+          (e.ctrlKey && e.altKey && !e.shiftKey) ||
+          (e.shiftKey && e.altKey && !e.ctrlKey)
+        );
       }
-      return e.ctrlKey && !e.altKey;
+      return e.ctrlKey && !e.altKey && !e.shiftKey;
     };
 
     const handler = (e: KeyboardEvent) => {
@@ -80,7 +86,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       if (
         matchesProjectNavigationShortcut(
           e,
-          actions.projectStripShortcut ?? "ctrl-alt-hl",
+          actions.projectStripShortcut ?? "shift-alt-hl",
         ) &&
         (!isInput || isTerminalInput)
       ) {

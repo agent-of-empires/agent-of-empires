@@ -11,6 +11,7 @@ const PROJECT_STRIP_SHORTCUTS: Array<{
   value: ProjectStripShortcut;
   label: string;
 }> = [
+  { value: "shift-alt-hl", label: "Shift+Alt+H / Shift+Alt+L" },
   { value: "ctrl-alt-hl", label: "Ctrl+Alt+H / Ctrl+Alt+L" },
   { value: "alt-hl", label: "Alt+H / Alt+L" },
   { value: "ctrl-hl", label: "Ctrl+H / Ctrl+L" },
@@ -168,8 +169,8 @@ export function TerminalSettings() {
                 ))}
               </select>
               <p className="text-[11px] text-text-muted mt-1">
-                Ctrl+Alt+H/L is the default because browsers often reserve
-                Ctrl+L for the address bar and may not deliver it to the app.
+                Shift+Alt+H/L is the default because browsers often reserve
+                Ctrl+H and Ctrl+L for history or the address bar.
               </p>
             </div>
           )}

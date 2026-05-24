@@ -101,7 +101,7 @@ describe("TerminalSettings localStorage contract", () => {
     const selects = container.querySelectorAll("select");
     const shortcutSelect = selects[2] as HTMLSelectElement;
 
-    expect(shortcutSelect.value).toBe("ctrl-alt-hl");
+    expect(shortcutSelect.value).toBe("shift-alt-hl");
 
     fireEvent.change(shortcutSelect, { target: { value: "ctrl-hl" } });
     expect(readStored().projectStripShortcut).toBe("ctrl-hl");
@@ -131,7 +131,7 @@ describe("TerminalSettings localStorage contract", () => {
         desktopFontSize: 14,
         autoOpenKeyboard: true,
         projectStrip: false,
-        projectStripShortcut: "ctrl-alt-hl",
+        projectStripShortcut: "shift-alt-hl",
         persistentTerminals: false,
         maxPersistentTerminals: 5,
         diffViewMode: "tree",
@@ -164,7 +164,7 @@ describe("TerminalSettings localStorage contract", () => {
         desktopFontSize: 16,
         autoOpenKeyboard: false,
         projectStrip: true,
-        projectStripShortcut: "ctrl-alt-hl",
+        projectStripShortcut: "shift-alt-hl",
         persistentTerminals: true,
         maxPersistentTerminals: 42,
       }),
@@ -190,7 +190,7 @@ describe("TerminalSettings localStorage contract", () => {
     expect(desktopSelect.value).toBe("16");
     expect(checkbox.checked).toBe(false);
     expect(projectStripCheckbox.checked).toBe(true);
-    expect(projectShortcut.value).toBe("ctrl-alt-hl");
+    expect(projectShortcut.value).toBe("shift-alt-hl");
     expect(persistentCheckbox.checked).toBe(true);
     expect(persistentLimit.value).toBe("42");
   });

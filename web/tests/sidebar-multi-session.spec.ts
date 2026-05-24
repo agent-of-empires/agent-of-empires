@@ -375,14 +375,14 @@ test.describe("Sidebar multi-session (#956)", () => {
       "true",
     );
 
-    await page.keyboard.press("Control+Alt+L");
+    await page.keyboard.press("Shift+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
     await expect(strip.getByRole("tab", { name: /beta/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
 
-    await page.keyboard.press("Control+Alt+H");
+    await page.keyboard.press("Shift+Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
 
     await page.evaluate(() => {
@@ -396,7 +396,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     });
     await page.reload();
 
-    await page.keyboard.press("Control+Alt+L");
+    await page.keyboard.press("Shift+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 });
