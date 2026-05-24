@@ -138,7 +138,6 @@ export function HelpOverlay({ onClose }: Props) {
 
 function formatProjectShortcut(shortcut: ProjectStripShortcut) {
   if (shortcut === "disabled") return null;
-  if (shortcut === "shift-alt-hl") return "Shift+Alt+H/L";
   if (shortcut === "ctrl-alt-hl") return "Ctrl+Alt+H/L";
   if (shortcut === "ctrl-hl") return "Ctrl+H/L";
   return "Alt+H/L";

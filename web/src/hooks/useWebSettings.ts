@@ -10,7 +10,6 @@ const STORAGE_KEY = "aoe-web-settings";
 
 export type ProjectStripShortcut =
   | "alt-hl"
-  | "shift-alt-hl"
   | "ctrl-alt-hl"
   | "ctrl-hl"
   | "disabled";
@@ -33,7 +32,7 @@ function getDefaults(): WebSettings {
     desktopFontSize: 14,
     autoOpenKeyboard: true,
     projectStrip: false,
-    projectStripShortcut: "shift-alt-hl",
+    projectStripShortcut: "alt-hl",
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
@@ -44,7 +43,6 @@ function getDefaults(): WebSettings {
 function isProjectStripShortcut(value: unknown): value is ProjectStripShortcut {
   return (
     value === "alt-hl" ||
-    value === "shift-alt-hl" ||
     value === "ctrl-alt-hl" ||
     value === "ctrl-hl" ||
     value === "disabled"

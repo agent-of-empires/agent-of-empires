@@ -85,20 +85,18 @@ describe("useKeyboardShortcuts", () => {
     expect(actions.onToggleSidebar).not.toHaveBeenCalled();
   });
 
-  it("routes Shift+Alt+H and Shift+Alt+L to project navigation actions by default", () => {
+  it("routes Alt+H and Alt+L to project navigation actions by default", () => {
     const actions = makeActions();
     renderHook(() => useKeyboardShortcuts(() => actions));
 
     dispatch(document.body, {
       key: "h",
       code: "KeyH",
-      shiftKey: true,
       altKey: true,
     });
     dispatch(document.body, {
       key: "l",
       code: "KeyL",
-      shiftKey: true,
       altKey: true,
     });
 
@@ -140,7 +138,7 @@ describe("useKeyboardShortcuts", () => {
     const input = document.createElement("input");
     document.body.appendChild(input);
 
-    dispatch(input, { key: "h", code: "KeyH", shiftKey: true, altKey: true });
+    dispatch(input, { key: "h", code: "KeyH", altKey: true });
 
     expect(actions.onPreviousProject).not.toHaveBeenCalled();
     input.remove();
@@ -153,7 +151,7 @@ describe("useKeyboardShortcuts", () => {
     textarea.className = "xterm-helper-textarea";
     document.body.appendChild(textarea);
 
-    dispatch(textarea, { key: "l", code: "KeyL", shiftKey: true, altKey: true });
+    dispatch(textarea, { key: "l", code: "KeyL", altKey: true });
 
     expect(actions.onNextProject).toHaveBeenCalledTimes(1);
     textarea.remove();

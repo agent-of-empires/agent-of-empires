@@ -35,9 +35,6 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       if (e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) {
         return false;
       }
-      if (shortcut === "shift-alt-hl") {
-        return e.shiftKey && e.altKey && !e.ctrlKey;
-      }
       if (shortcut === "alt-hl") {
         return e.altKey && !e.ctrlKey && !e.shiftKey;
       }
@@ -86,7 +83,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       if (
         matchesProjectNavigationShortcut(
           e,
-          actions.projectStripShortcut ?? "shift-alt-hl",
+          actions.projectStripShortcut ?? "alt-hl",
         ) &&
         (!isInput || isTerminalInput)
       ) {
