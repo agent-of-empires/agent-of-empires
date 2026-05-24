@@ -1,26 +1,26 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { Plus, Search } from "lucide-react";
+import { createPortal } from "react-dom";
+import { Plus } from "lucide-react";
 import type {
   RepoGroup,
   SessionResponse,
   SessionStatus,
   Workspace,
 } from "../lib/types";
-import type { RepoColor } from "../lib/repoAppearance";
+import type { RepoAppearanceUpdate, RepoColor } from "../lib/repoAppearance";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
-import { matchesProjectStripFilter } from "../lib/projectStrip";
 import { StatusGlyph } from "./StatusGlyph";
 
 interface Props {
   groups: RepoGroup[];
   activeSessionId: string | null;
   activeWorkspaceId: string | null;
-  filter: string;
-  onFilterChange: (filter: string) => void;
   onSelectWorkspace: (workspaceId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onCreateSession: (repoPath: string) => void;
+  onDeleteSession?: (workspaceId: string) => void;
+  onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   readOnly?: boolean;
 }
 
@@ -35,6 +35,8 @@ const STATUS_PRIORITY: SessionStatus[] = [
   "Unknown",
   "Deleting",
 ];
+
+const RECENT_FINISH_WINDOW_MS = 5 * 60 * 1000;
 
 function statusRank(status: SessionStatus): number {
   const idx = STATUS_PRIORITY.indexOf(status);
@@ -81,24 +83,43 @@ function workspaceLabel(workspace: Workspace) {
   return workspace.branch ?? workspace.displayName ?? "default";
 }
 
+function hasRecentlyFinishedSession(
+  sessions: SessionResponse[],
+  idleDecayWindowMs: number,
+): boolean {
+  const now = Date.now();
+  const windowMs = Math.max(idleDecayWindowMs, RECENT_FINISH_WINDOW_MS);
+  return sessions.some((session) => {
+    if (session.status !== "Idle" || !session.idle_entered_at) return false;
+    const idleAt = Date.parse(session.idle_entered_at);
+    if (!Number.isFinite(idleAt)) return false;
+    const age = now - idleAt;
+    return age >= 0 && age <= windowMs;
+  });
+}
+
 export function ProjectStrip({
   groups,
   activeSessionId,
   activeWorkspaceId,
-  filter,
-  onFilterChange,
   onSelectWorkspace,
   onSelectSession,
   onCreateSession,
+  onDeleteSession,
+  onUpdateAppearance,
   readOnly = false,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const activeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const [menu, setMenu] = useState<{
     groupId: string;
     x: number;
     y: number;
   } | null>(null);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const renameRef = useRef<HTMLInputElement | null>(null);
 
   const openMenuForGroup = (groupId: string, element: HTMLElement) => {
     const rect = element.getBoundingClientRect();
@@ -109,7 +130,6 @@ export function ProjectStrip({
     () =>
       groups
         .filter((group) => group.workspaces.length > 0)
-        .filter((group) => matchesProjectStripFilter(group, filter.trim()))
         .map((group) => {
           const sessions = groupSessions(group);
           const session = bestSession(sessions, idleDecayWindowMs);
@@ -119,10 +139,13 @@ export function ProjectStrip({
             session,
             active,
             workspaceId: group.workspaces[0]!.id,
-            count: sessions.length,
+            recentlyFinished: hasRecentlyFinishedSession(
+              sessions,
+              idleDecayWindowMs,
+            ),
           };
         }),
-    [groups, filter, activeWorkspaceId, idleDecayWindowMs],
+    [groups, activeWorkspaceId, idleDecayWindowMs],
   );
 
   const activeItem =
@@ -140,36 +163,57 @@ export function ProjectStrip({
     });
   }, [activeWorkspaceId]);
 
+  useEffect(() => {
+    if (renamingGroupId) renameRef.current?.select();
+  }, [renamingGroupId]);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: MouseEvent) => {
+      if (menuRef.current?.contains(event.target as Node)) return;
+      setMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenu(null);
+    };
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", close);
+      document.addEventListener("contextmenu", close);
+      document.addEventListener("keydown", onKeyDown);
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menu]);
+
+  const startRename = (group: RepoGroup) => {
+    setMenu(null);
+    setRenameValue(group.alias ?? group.defaultDisplayName);
+    setRenamingGroupId(group.id);
+  };
+
+  const commitRename = (group: RepoGroup) => {
+    setRenamingGroupId(null);
+    const trimmed = renameValue.trim();
+    onUpdateAppearance(group.id, { alias: trimmed || null });
+  };
+
   if (groups.length === 0) return null;
 
   return (
     <nav
       aria-label="Project switcher"
       data-testid="project-strip"
-      className="h-[72px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
+      className="h-16 shrink-0 border-b border-surface-700/20 bg-surface-900/95"
     >
-      <div className="flex h-8 items-center justify-end border-b border-surface-800/80 px-2">
-        <label className="relative w-full max-w-[18rem]">
-          <Search
-            aria-hidden="true"
-            className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-dim"
-          />
-          <input
-            aria-label="Filter project strip"
-            data-testid="project-strip-filter"
-            type="search"
-            value={filter}
-            onChange={(e) => onFilterChange(e.target.value)}
-            placeholder="Filter projects, branches, agents..."
-            className="h-8 w-full rounded-md border border-surface-700 bg-surface-950 pl-7 pr-2 font-sans text-[11px] text-text-primary outline-none transition-colors placeholder:text-text-dim focus:border-brand-600"
-          />
-        </label>
-      </div>
       <div
         aria-label="Projects"
-        className="flex h-8 items-center gap-1 overflow-x-auto px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="flex h-8 items-center gap-1 overflow-x-auto border-b border-surface-800/80 px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
-        {items.map(({ group, session, active, workspaceId }) => {
+        {items.map(({ group, session, active, workspaceId, recentlyFinished }) => {
           const status = session?.status ?? "Unknown";
           return (
             <div
@@ -212,50 +256,88 @@ export function ProjectStrip({
                 className="flex h-full min-w-0 flex-1 items-center px-2 text-left"
                 title={`${group.displayName} · ${status} · ${group.repoPath}`}
               >
-                <span className="min-w-0 flex-1 text-center">
-                  <span className="block truncate text-[11px] font-medium leading-4">
-                    {group.displayName}
-                  </span>
-                </span>
-              </button>
-              {menu?.groupId === group.id && (
-                <div
-                  role="menu"
-                  data-testid="project-strip-menu"
-                  style={{ left: menu.x, top: menu.y }}
-                  className="fixed z-30 w-44 rounded-md border border-surface-700 bg-surface-950 p-1 shadow-lg"
-                >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    disabled={readOnly}
-                    onClick={() => {
-                      setMenu(null);
-                      onCreateSession(group.repoPath);
+                {renamingGroupId === group.id ? (
+                  <input
+                    ref={renameRef}
+                    type="text"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                    onBlur={() => commitRename(group)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === "Enter") commitRename(group);
+                      if (e.key === "Escape") setRenamingGroupId(null);
                     }}
-                    className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    data-testid="project-strip-rename-input"
+                    className="h-6 min-w-0 flex-1 rounded-md border border-brand-600 bg-surface-950 px-1.5 text-center text-[11px] text-text-primary outline-none"
+                  />
+                ) : (
+                  <>
+                    {recentlyFinished && (
+                      <span
+                        aria-label="Recently finished"
+                        className="mr-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-status-running"
+                      />
+                    )}
+                    <span className="min-w-0 flex-1 text-center">
+                      <span className="block truncate text-[11px] font-medium leading-4">
+                        {group.displayName}
+                      </span>
+                    </span>
+                  </>
+                )}
+              </button>
+              {menu?.groupId === group.id &&
+                createPortal(
+                  <div
+                    ref={menuRef}
+                    role="menu"
+                    data-testid="project-strip-menu"
+                    style={{ left: menu.x, top: menu.y }}
+                    className="fixed z-50 w-44 rounded-md border border-surface-700 bg-surface-950 p-1 shadow-lg"
                   >
-                    <Plus className="h-3.5 w-3.5" />
-                    New session
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => setMenu(null)}
-                    className="h-8 w-full rounded-md px-2 text-left text-[12px] text-text-muted transition-colors hover:bg-surface-800"
-                  >
-                    Close
-                  </button>
-                </div>
-              )}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => startRename(group)}
+                      className="h-8 w-full rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800"
+                    >
+                      Rename project
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      disabled={readOnly}
+                      onClick={() => {
+                        setMenu(null);
+                        onCreateSession(group.repoPath);
+                      }}
+                      className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      New session
+                    </button>
+                    {!readOnly && onDeleteSession && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setMenu(null);
+                          onDeleteSession(workspaceId);
+                        }}
+                        className="h-8 w-full rounded-md px-2 text-left text-[12px] text-status-error transition-colors hover:bg-status-error/10"
+                      >
+                        Delete current session
+                      </button>
+                    )}
+                  </div>,
+                  document.body,
+                )}
             </div>
           );
         })}
-        {items.length === 0 && (
-          <div className="flex h-9 items-center px-2 text-[12px] text-text-dim">
-            No projects match the filter.
-          </div>
-        )}
       </div>
       <div
         aria-label="Sessions in selected project"

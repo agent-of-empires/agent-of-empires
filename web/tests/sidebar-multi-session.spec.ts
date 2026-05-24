@@ -12,6 +12,7 @@ interface MockSession {
   project_path: string;
   branch: string | null;
   status?: string;
+  idle_entered_at?: string | null;
 }
 
 async function mockApis(page: Page, sessions: MockSession[]) {
@@ -32,6 +33,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
           yolo_mode: false,
           created_at: new Date().toISOString(),
           last_accessed_at: null,
+          idle_entered_at: s.idle_entered_at ?? null,
           last_error: null,
           branch: s.branch,
           main_repo_path: null,
@@ -392,12 +394,26 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.keyboard.press("Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
 
-    await strip.getByLabel("Filter project strip").fill("gamma");
-    await expect(projectTab("gamma")).toBeVisible();
-    await expect(projectTab("alpha")).toHaveCount(0);
+    await projectTab("alpha").dblclick();
+    await expect(page.locator("[data-testid='project-strip-menu']")).toBeVisible();
+    await page.mouse.click(8, 8);
+    await expect(page.locator("[data-testid='project-strip-menu']")).toHaveCount(0);
+
+    await projectTab("alpha").dblclick();
+    await page.getByRole("menuitem", { name: /Rename project/i }).click();
+    const renameInput = page.locator("[data-testid='project-strip-rename-input']");
+    await renameInput.fill("Alpha Client");
+    await renameInput.press("Enter");
+    await expect(projectTab("Alpha Client")).toBeVisible();
+
+    await projectTab("Alpha Client").dblclick();
+    await expect(
+      page.getByRole("menuitem", { name: /Delete current session/i }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
 
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-c$/);
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
 
     await page.evaluate(() => {
       window.localStorage.setItem(
@@ -411,6 +427,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.reload();
 
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-c$/);
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 });

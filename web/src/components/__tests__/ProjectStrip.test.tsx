@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { ProjectStrip } from "../ProjectStrip";
 import type { RepoGroup, SessionResponse } from "../../lib/types";
+import type { RepoAppearanceUpdate } from "../../lib/repoAppearance";
 
 function session(
   id: string,
@@ -70,48 +71,64 @@ function group(name: string, path: string, status: SessionResponse["status"]): R
   };
 }
 
+function renderProjectStrip({
+  groups,
+  activeSessionId = "Alpha-session",
+  activeWorkspaceId = "Alpha-workspace",
+  onSelectWorkspace = vi.fn(),
+  onSelectSession = vi.fn(),
+  onCreateSession = vi.fn(),
+  onDeleteSession = vi.fn(),
+  onUpdateAppearance = vi.fn(),
+}: {
+  groups: RepoGroup[];
+  activeSessionId?: string | null;
+  activeWorkspaceId?: string | null;
+  onSelectWorkspace?: (workspaceId: string) => void;
+  onSelectSession?: (sessionId: string) => void;
+  onCreateSession?: (repoPath: string) => void;
+  onDeleteSession?: (workspaceId: string) => void;
+  onUpdateAppearance?: (repoId: string, update: RepoAppearanceUpdate) => void;
+}) {
+  return render(
+    <ProjectStrip
+      groups={groups}
+      activeSessionId={activeSessionId}
+      activeWorkspaceId={activeWorkspaceId}
+      onSelectWorkspace={onSelectWorkspace}
+      onSelectSession={onSelectSession}
+      onCreateSession={onCreateSession}
+      onDeleteSession={onDeleteSession}
+      onUpdateAppearance={onUpdateAppearance}
+    />,
+  );
+}
+
 describe("ProjectStrip", () => {
   it("renders project tabs and selects the first workspace in the group", () => {
     const onSelectWorkspace = vi.fn();
-    const { getAllByTestId } = render(
-      <ProjectStrip
-        groups={[
-          group("Alpha", "/tmp/alpha", "Running"),
-          group("Beta", "/tmp/beta", "Idle"),
-        ]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={onSelectWorkspace}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { getAllByTestId } = renderProjectStrip({
+      groups: [
+        group("Alpha", "/tmp/alpha", "Running"),
+        group("Beta", "/tmp/beta", "Idle"),
+      ],
+      onSelectWorkspace,
+    });
 
     const beta = getAllByTestId("project-strip-tab").find((tab) =>
       tab.textContent?.includes("Beta"),
     );
     expect(beta).toBeTruthy();
-    expect(beta.getAttribute("aria-selected")).toBe("false");
+    expect(beta?.getAttribute("aria-selected")).toBe("false");
 
-    fireEvent.click(beta);
+    fireEvent.click(beta!);
     expect(onSelectWorkspace).toHaveBeenCalledWith("Beta-workspace");
   });
 
   it("marks the active project tab", () => {
-    const { getAllByTestId } = render(
-      <ProjectStrip
-        groups={[group("Alpha", "/tmp/alpha", "Running")]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { getAllByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
 
     const alpha = getAllByTestId("project-strip-tab").find((tab) =>
       tab.textContent?.includes("Alpha"),
@@ -124,67 +141,13 @@ describe("ProjectStrip", () => {
     const alpha = group("Alpha", "/tmp/alpha", "Running");
     alpha.workspaces[0]!.sessions.push(session("Alpha-second", "/tmp/alpha", "Waiting"));
 
-    const { getByRole } = render(
-      <ProjectStrip
-        groups={[alpha]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={onSelectSession}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { getByRole } = renderProjectStrip({
+      groups: [alpha],
+      onSelectSession,
+    });
 
     fireEvent.click(getByRole("button", { name: /Alpha-second/i }));
     expect(onSelectSession).toHaveBeenCalledWith("Alpha-second");
-  });
-
-  it("filters projects by project and session details", () => {
-    const beta = group("Beta", "/tmp/beta", "Idle");
-    beta.workspaces[0]!.sessions[0]!.branch = "feature/searchable";
-    beta.workspaces[0]!.sessions[0]!.tool = "codex";
-
-    const { getAllByTestId } = render(
-      <ProjectStrip
-        groups={[group("Alpha", "/tmp/alpha", "Running"), beta]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter="searchable"
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
-
-    const tabs = getAllByTestId("project-strip-tab");
-    expect(tabs.some((tab) => tab.textContent?.includes("Alpha"))).toBe(false);
-    expect(tabs.some((tab) => tab.textContent?.includes("Beta"))).toBe(true);
-  });
-
-  it("reports filter text changes to the parent state", () => {
-    const onFilterChange = vi.fn();
-
-    const { getByLabelText } = render(
-      <ProjectStrip
-        groups={[group("Alpha", "/tmp/alpha", "Running")]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={onFilterChange}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
-
-    fireEvent.change(getByLabelText("Filter project strip"), {
-      target: { value: "alp" },
-    });
-
-    expect(onFilterChange).toHaveBeenCalledWith("alp");
   });
 
   it("keeps unknown statuses behind known statuses when choosing the project status", () => {
@@ -197,40 +160,34 @@ describe("ProjectStrip", () => {
       session("Alpha-waiting", "/tmp/alpha", "Waiting"),
     ];
 
-    const { getByTestId } = render(
-      <ProjectStrip
-        groups={[alpha]}
-        activeSessionId="Alpha-waiting"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { getByTestId } = renderProjectStrip({
+      groups: [alpha],
+      activeSessionId: "Alpha-waiting",
+    });
 
     expect(getByTestId("project-strip-tab").getAttribute("title")).toContain(
       "Waiting",
     );
   });
 
+  it("marks projects with recently finished sessions", () => {
+    const alpha = group("Alpha", "/tmp/alpha", "Idle");
+    alpha.workspaces[0]!.sessions[0]!.idle_entered_at = new Date().toISOString();
+
+    const { getByLabelText } = renderProjectStrip({ groups: [alpha] });
+
+    expect(getByLabelText("Recently finished")).toBeTruthy();
+  });
+
   it("starts a new session from the project options menu without selecting it", () => {
     const onCreateSession = vi.fn();
     const onSelectWorkspace = vi.fn();
 
-    const { getByRole, getByTestId } = render(
-      <ProjectStrip
-        groups={[group("Alpha", "/tmp/alpha", "Running")]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={onSelectWorkspace}
-        onSelectSession={vi.fn()}
-        onCreateSession={onCreateSession}
-      />,
-    );
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+      onCreateSession,
+      onSelectWorkspace,
+    });
 
     fireEvent.doubleClick(getByTestId("project-strip-tab"));
     fireEvent.click(getByRole("menuitem", { name: /New session/i }));
@@ -239,22 +196,57 @@ describe("ProjectStrip", () => {
     expect(onSelectWorkspace).not.toHaveBeenCalled();
   });
 
+  it("renames a project from the project options menu", () => {
+    const onUpdateAppearance = vi.fn();
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+      onUpdateAppearance,
+    });
+
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    fireEvent.click(getByRole("menuitem", { name: /Rename project/i }));
+    const input = getByTestId("project-strip-rename-input");
+    fireEvent.change(input, { target: { value: "Client Alpha" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onUpdateAppearance).toHaveBeenCalledWith("/tmp/alpha", {
+      alias: "Client Alpha",
+    });
+  });
+
+  it("opens the delete flow from the project options menu", () => {
+    const onDeleteSession = vi.fn();
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+      onDeleteSession,
+    });
+
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    fireEvent.click(getByRole("menuitem", { name: /Delete current session/i }));
+
+    expect(onDeleteSession).toHaveBeenCalledWith("Alpha-workspace");
+  });
+
+  it("closes the project options menu when Escape is pressed", async () => {
+    const { getByTestId, queryByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
+
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    expect(queryByTestId("project-strip-menu")).toBeTruthy();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(queryByTestId("project-strip-menu")).toBeNull();
+  });
+
   it("keeps project tabs focused on names instead of summary metadata", () => {
-    const { queryByText, getByTestId } = render(
-      <ProjectStrip
-        groups={[group("Alpha", "/tmp/alpha", "Running")]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { queryByText, getByTestId, queryByLabelText } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
 
     expect(queryByText(/projects/i)).toBeNull();
     expect(queryByText(/sessions/i)).toBeNull();
+    expect(queryByLabelText("Filter project strip")).toBeNull();
     expect(getByTestId("project-strip-tab").textContent).toBe("Alpha");
   });
 
@@ -263,18 +255,7 @@ describe("ProjectStrip", () => {
     alpha.workspaces[0]!.primaryAgent = "cursor";
     alpha.workspaces[0]!.sessions[0]!.tool = "codex";
 
-    const { queryByText } = render(
-      <ProjectStrip
-        groups={[alpha]}
-        activeSessionId="Alpha-session"
-        activeWorkspaceId="Alpha-workspace"
-        filter=""
-        onFilterChange={vi.fn()}
-        onSelectWorkspace={vi.fn()}
-        onSelectSession={vi.fn()}
-        onCreateSession={vi.fn()}
-      />,
-    );
+    const { queryByText } = renderProjectStrip({ groups: [alpha] });
 
     expect(queryByText(/cursor/i)).toBeNull();
     expect(queryByText(/codex/i)).toBeNull();
