@@ -148,7 +148,7 @@ describe("useKeyboardShortcuts", () => {
     const actions = makeActions();
     renderHook(() => useKeyboardShortcuts(() => actions));
     const strip = document.createElement("nav");
-    strip.dataset.testid = "project-strip";
+    strip.dataset.projectStrip = "true";
     const input = document.createElement("input");
     strip.appendChild(input);
     document.body.appendChild(strip);

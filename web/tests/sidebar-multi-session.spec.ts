@@ -16,6 +16,9 @@ interface MockSession {
 }
 
 async function mockApis(page: Page, sessions: MockSession[]) {
+  const observed: { workspaceOrdering: string[] | null } = {
+    workspaceOrdering: null,
+  };
   await page.route("**/api/login/status", (r) =>
     r.fulfill({ json: { required: false, authenticated: true } }),
   );
@@ -46,6 +49,12 @@ async function mockApis(page: Page, sessions: MockSession[]) {
       },
     });
   });
+  await page.route("**/api/workspace-ordering", async (r) => {
+    if (r.request().method() !== "PUT") return r.fulfill({ status: 400 });
+    const body = r.request().postDataJSON() as { order?: string[] };
+    observed.workspaceOrdering = body.order ?? null;
+    return r.fulfill({ json: { ok: true } });
+  });
   for (const path of [
     "settings",
     "themes",
@@ -60,6 +69,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
       r.fulfill({ json: path === "docker/status" ? {} : [] }),
     );
   }
+  return observed;
 }
 
 test.describe("Sidebar multi-session (#956)", () => {
@@ -343,12 +353,13 @@ test.describe("Sidebar multi-session (#956)", () => {
   test("project strip is opt-in and supports configurable project navigation", async ({
     page,
   }) => {
-    await mockApis(page, [
+    const observed = await mockApis(page, [
       {
         id: "sess-a",
         title: "Ethiopians",
         project_path: "/tmp/alpha",
         branch: null,
+        status: "Running",
       },
       {
         id: "sess-b",
@@ -412,8 +423,38 @@ test.describe("Sidebar multi-session (#956)", () => {
     ).toBeVisible();
     await page.keyboard.press("Escape");
 
+    await projectTab("Alpha Client").dblclick();
+    await page.locator("[data-testid='project-strip-color-amber']").click();
+    const appearance = await page.evaluate(() =>
+      window.localStorage.getItem("aoe-repo-appearance-v1"),
+    );
+    expect(JSON.parse(appearance ?? "{}")).toMatchObject({
+      "/tmp/alpha": { alias: "Alpha Client", color: "amber" },
+    });
+
+    await expect(projectTab("Alpha Client").getByLabel("Running session in project")).toBeVisible();
+
+    const alphaBox = await projectTab("Alpha Client").boundingBox();
+    const betaBox = await projectTab("beta").boundingBox();
+    expect(alphaBox).not.toBeNull();
+    expect(betaBox).not.toBeNull();
+    await page.mouse.move(
+      alphaBox!.x + alphaBox!.width / 2,
+      alphaBox!.y + alphaBox!.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      betaBox!.x + betaBox!.width / 2,
+      betaBox!.y + betaBox!.height / 2,
+      { steps: 8 },
+    );
+    await page.mouse.up();
+    await expect
+      .poll(() => observed.workspaceOrdering?.[0] ?? null)
+      .toContain("sess-b");
+
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-b$/);
+    await expect(page).toHaveURL(/\/session\/sess-c$/);
 
     await page.evaluate(() => {
       window.localStorage.setItem(
@@ -427,6 +468,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.reload();
 
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-b$/);
+    await expect(page).toHaveURL(/\/session\/sess-c$/);
   });
 });

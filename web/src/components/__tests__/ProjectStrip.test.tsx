@@ -79,6 +79,7 @@ function renderProjectStrip({
   onSelectSession = vi.fn(),
   onCreateSession = vi.fn(),
   onDeleteSession = vi.fn(),
+  onReorderWorkspaces = vi.fn(),
   onUpdateAppearance = vi.fn(),
 }: {
   groups: RepoGroup[];
@@ -88,6 +89,7 @@ function renderProjectStrip({
   onSelectSession?: (sessionId: string) => void;
   onCreateSession?: (repoPath: string) => void;
   onDeleteSession?: (workspaceId: string) => void;
+  onReorderWorkspaces?: (newOrder: string[]) => void;
   onUpdateAppearance?: (repoId: string, update: RepoAppearanceUpdate) => void;
 }) {
   return render(
@@ -99,6 +101,7 @@ function renderProjectStrip({
       onSelectSession={onSelectSession}
       onCreateSession={onCreateSession}
       onDeleteSession={onDeleteSession}
+      onReorderWorkspaces={onReorderWorkspaces}
       onUpdateAppearance={onUpdateAppearance}
     />,
   );
@@ -176,7 +179,34 @@ describe("ProjectStrip", () => {
 
     const { getByLabelText } = renderProjectStrip({ groups: [alpha] });
 
-    expect(getByLabelText("Recently finished")).toBeTruthy();
+    expect(getByLabelText("Recently finished session in project")).toBeTruthy();
+  });
+
+  it("marks projects with running sessions distinctly", () => {
+    const { getByLabelText } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
+
+    expect(getByLabelText("Running session in project")).toBeTruthy();
+  });
+
+  it("deduplicates repeated sessions in the selected project session row", () => {
+    const alpha = group("Alpha", "/tmp/alpha", "Running");
+    const duplicate = alpha.workspaces[0]!.sessions[0]!;
+    alpha.workspaces.push({
+      id: "Alpha-workspace-duplicate",
+      branch: "feature/dup",
+      projectPath: "/tmp/alpha",
+      displayName: "feature/dup",
+      agents: ["claude"],
+      primaryAgent: "claude",
+      status: "active",
+      sessions: [duplicate],
+    });
+
+    const { getAllByTestId } = renderProjectStrip({ groups: [alpha] });
+
+    expect(getAllByTestId("project-strip-session")).toHaveLength(1);
   });
 
   it("starts a new session from the project options menu without selecting it", () => {
@@ -211,6 +241,21 @@ describe("ProjectStrip", () => {
 
     expect(onUpdateAppearance).toHaveBeenCalledWith("/tmp/alpha", {
       alias: "Client Alpha",
+    });
+  });
+
+  it("changes project color from the project options menu", () => {
+    const onUpdateAppearance = vi.fn();
+    const { getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+      onUpdateAppearance,
+    });
+
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    fireEvent.click(getByTestId("project-strip-color-amber"));
+
+    expect(onUpdateAppearance).toHaveBeenCalledWith("/tmp/alpha", {
+      color: "amber",
     });
   });
 

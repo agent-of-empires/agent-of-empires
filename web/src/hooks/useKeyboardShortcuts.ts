@@ -57,7 +57,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       const isTerminalInput =
         !!target?.closest(".xterm") ||
         !!target?.classList.contains("xterm-helper-textarea");
-      const isProjectStripInput = !!target?.closest("[data-testid='project-strip']");
+      const isProjectStripInput = !!target?.closest("[data-project-strip='true']");
 
       const actions = getActions();
       const mod = IS_MAC ? e.metaKey : e.metaKey || e.ctrlKey;

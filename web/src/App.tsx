@@ -906,6 +906,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onSelectSession={handleSelectSession}
           onCreateSession={handleCreateSession}
           onDeleteSession={handleDeleteSession}
+          onReorderWorkspaces={handleReorderWorkspaces}
           onUpdateAppearance={updateRepoAppearance}
           readOnly={serverAbout?.read_only}
         />
