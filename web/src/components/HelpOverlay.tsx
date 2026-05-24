@@ -7,7 +7,7 @@ interface Props {
 
 const TERMINAL_SHORTCUTS = [
   { key: "All keys", desc: "Relayed directly to the agent via PTY" },
-  { key: "Ctrl+C", desc: "Send interrupt to agent" },
+  { key: "Ctrl+C", desc: "Copy selection, otherwise interrupt agent" },
   { key: "Ctrl+D", desc: "Send EOF to agent" },
   { key: "Up/Down", desc: "Scroll terminal history" },
 ];
