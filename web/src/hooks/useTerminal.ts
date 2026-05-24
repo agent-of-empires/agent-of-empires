@@ -75,6 +75,13 @@ function copyText(text: string): boolean {
   return copied;
 }
 
+function setClipboardEventText(event: ClipboardEvent, text: string): boolean {
+  if (!text || !event.clipboardData) return false;
+  event.clipboardData.setData("text/plain", text);
+  event.preventDefault();
+  return true;
+}
+
 // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven attempts
 // cover typical tunnel restarts and transient WiFi drops without flooding
 // the server or burning the user's battery on a truly dead backend.
@@ -287,6 +294,25 @@ export function useTerminal(
 
     term.open(termEl);
 
+    const getCopySelection = () =>
+      term.getSelection() || window.getSelection()?.toString() || "";
+    const copyTerminalSelection = () => {
+      const selection = getCopySelection();
+      if (!selection) return false;
+      try {
+        if (document.execCommand("copy")) return true;
+      } catch (err) {
+        twarn("execCommand copy failed", err);
+      }
+      copyText(selection);
+      return true;
+    };
+    const onCopy = (event: ClipboardEvent) => {
+      const selection = getCopySelection();
+      setClipboardEventText(event, selection);
+    };
+    termEl.addEventListener("copy", onCopy);
+
     term.attachCustomKeyEventHandler((event: KeyboardEvent) => {
       if (event.type !== "keydown") return true;
       const isCopy =
@@ -294,11 +320,9 @@ export function useTerminal(
         !event.shiftKey &&
         (event.ctrlKey || event.metaKey) &&
         event.code === "KeyC";
-      if (!isCopy || !term.hasSelection()) return true;
+      if (!isCopy || !getCopySelection()) return true;
 
-      const selection = term.getSelection();
-      if (!selection) return true;
-      copyText(selection);
+      copyTerminalSelection();
 
       event.preventDefault();
       event.stopPropagation();
@@ -1273,6 +1297,7 @@ export function useTerminal(
       window.removeEventListener("focus", onWindowFocus);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("pageshow", onPageShow);
+      termEl.removeEventListener("copy", onCopy);
       viewport.removeEventListener("touchstart", onTouchStart, touchOpts);
       viewport.removeEventListener("touchmove", onTouchMove, touchOpts);
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);

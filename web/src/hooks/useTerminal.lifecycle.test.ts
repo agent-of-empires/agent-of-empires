@@ -1282,15 +1282,96 @@ describe("useTerminal lifecycle", () => {
     }
   });
 
-  it("Ctrl+C copies selected terminal text instead of sending an interrupt", async () => {
-    Object.defineProperty(window, "isSecureContext", {
+  it("terminal copy events write the selected terminal text to clipboardData", async () => {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      renderHook(() => {
+        const term = useTerminal("s-copy-event", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+
+      captured.selection = "selected terminal text";
+      const clipboardData = {
+        setData: vi.fn(),
+      };
+      const event = new Event("copy", {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "clipboardData", {
+        value: clipboardData,
+      });
+      const xtermEl = div.querySelector(".xterm") as HTMLDivElement;
+      expect(xtermEl.dispatchEvent(event)).toBe(false);
+
+      expect(clipboardData.setData).toHaveBeenCalledWith(
+        "text/plain",
+        "selected terminal text",
+      );
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("terminal copy events fall back to browser selection text", async () => {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    const originalGetSelection = window.getSelection;
+    Object.defineProperty(window, "getSelection", {
       configurable: true,
-      value: true,
+      value: vi.fn(() => ({ toString: () => "browser selected text" })),
     });
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
+    try {
+      renderHook(() => {
+        const term = useTerminal("s-copy-browser-selection", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+
+      captured.selection = "";
+      const clipboardData = {
+        setData: vi.fn(),
+      };
+      const event = new Event("copy", {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "clipboardData", {
+        value: clipboardData,
+      });
+      const xtermEl = div.querySelector(".xterm") as HTMLDivElement;
+      expect(xtermEl.dispatchEvent(event)).toBe(false);
+
+      expect(clipboardData.setData).toHaveBeenCalledWith(
+        "text/plain",
+        "browser selected text",
+      );
+    } finally {
+      Object.defineProperty(window, "getSelection", {
+        configurable: true,
+        value: originalGetSelection,
+      });
+      div.remove();
+    }
+  });
+
+  it("Ctrl+C copies selected terminal text instead of sending an interrupt", async () => {
+    const execCommand = vi.fn(() => true);
+    Object.defineProperty(document, "execCommand", {
       configurable: true,
-      value: { writeText },
+      value: execCommand,
     });
     const div = document.createElement("div");
     document.body.appendChild(div);
@@ -1323,7 +1404,7 @@ describe("useTerminal lifecycle", () => {
       const handled = captured.customKey?.(event);
 
       expect(handled).toBe(false);
-      expect(writeText).toHaveBeenCalledWith("selected terminal text");
+      expect(execCommand).toHaveBeenCalledWith("copy");
       const ctrlC = ws.sent.slice(before).find((m) => {
         if (typeof m === "string") return false;
         return m.length === 1 && m[0] === 0x03;
