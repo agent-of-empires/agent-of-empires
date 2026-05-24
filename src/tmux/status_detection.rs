@@ -4,12 +4,48 @@ use crate::session::Status;
 
 use super::utils::strip_ansi;
 
-const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_CHARS: &[&str] = &[
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⣻",
+];
+const LIVE_ACTIVITY_WORDS: &[&str] = &[
+    "analyzing",
+    "applying",
+    "building",
+    "editing",
+    "executing",
+    "fetching",
+    "generating",
+    "grepping",
+    "processing",
+    "reading",
+    "running",
+    "searching",
+    "testing",
+    "thinking",
+    "working",
+    "writing",
+];
 
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
         .iter()
         .any(|line| SPINNER_CHARS.iter().any(|s| line.contains(s)))
+}
+
+fn has_live_activity_word(text_lower: &str) -> bool {
+    LIVE_ACTIVITY_WORDS
+        .iter()
+        .any(|word| status_line_starts_with_phrase(text_lower.trim(), word))
+}
+
+fn has_spinner_activity_line(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let line_lower = line.to_lowercase();
+        has_any_spinner(&[*line])
+            && LIVE_ACTIVITY_WORDS
+                .iter()
+                .any(|word| line_lower.contains(word))
+    })
 }
 
 fn contains_approval_prompt(text_lower: &str, extra: &[&str]) -> bool {
@@ -667,8 +703,58 @@ fn status_line_starts_with_phrase(line: &str, phrase: &str) -> bool {
         .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':')
 }
 
-/// Cursor agent status is detected via hooks (file-based), same as Claude Code.
-pub fn detect_cursor_status(_content: &str) -> Status {
+/// Cursor agent status is detected via hooks first, but pane parsing is still
+/// needed when hooks are missing or the Cursor CLI is executing a long-running
+/// turn between hook writes.
+pub fn detect_cursor_status(raw_content: &str) -> Status {
+    let content = raw_content.to_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    let non_empty_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+
+    let recent: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .copied()
+        .collect();
+    let recent_lower = recent.join("\n");
+
+    if contains_approval_prompt(
+        &recent_lower,
+        &[
+            "permission required",
+            "approval required",
+            "allow command",
+            "allow this command",
+            "run this command",
+            "enter to approve",
+            "enter to select",
+            "esc to cancel",
+        ],
+    ) {
+        return Status::Waiting;
+    }
+
+    if recent_lower.contains("ctrl+c to stop")
+        || recent_lower.contains("ctrl+c to interrupt")
+        || recent_lower.contains("esc to interrupt")
+    {
+        return Status::Running;
+    }
+
+    if has_spinner_activity_line(&recent) {
+        return Status::Running;
+    }
+
+    if recent.iter().any(|line| has_live_activity_word(line)) {
+        return Status::Running;
+    }
+
     Status::Idle
 }
 
@@ -1022,11 +1108,21 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
 
     if last_lines_lower.contains("esc to interrupt")
         || last_lines_lower.contains("ctrl+c to interrupt")
+        || last_lines_lower.contains("ctrl+c to stop")
     {
         return Status::Running;
     }
 
-    if has_any_spinner(&lines) {
+    if has_any_spinner(&lines) || has_spinner_activity_line(&non_empty_lines) {
+        return Status::Running;
+    }
+
+    if non_empty_lines
+        .iter()
+        .rev()
+        .take(10)
+        .any(|line| has_live_activity_word(line))
+    {
         return Status::Running;
     }
 
@@ -1038,9 +1134,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_detect_cursor_status_is_stub() {
-        // Cursor uses hook-based detection; the stub always returns Idle
-        assert_eq!(detect_cursor_status("anything"), Status::Idle);
+    fn test_detect_cursor_status_running_on_live_activity() {
+        let content = "\
+  Grepped \"legacy_engine\" in .
+
+ ⠘⠣ Reading  6.66k tokens
+
+  → Add a follow-up                                      ctrl+c to stop
+
+  Composer 2.5 · 48.2%                                  Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_editing_spinner() {
+        let content = "\
+  ┌──────────────────────────────┐
+  │ Editing src/app/submit/page.tsx
+  └──────────────────────────────┘
+
+ ⠘⠆ Editing  39.76k tokens";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_waiting_for_permission_prompt() {
+        let content = "\
+Run this command?
+
+> Allow this command
+  Deny
+
+enter to select · esc to cancel";
+        assert_eq!(detect_cursor_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_completed_output() {
+        let content = "\
+  Finished the requested changes.
+
+  → Add a follow-up
+
+  Composer 2.5 · 60.9% · 4 files edited                 Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
     }
 
     #[test]
@@ -2170,6 +2307,24 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             detect_antigravity_status("⠋ Thinking about your request"),
             Status::Running
         );
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_running_on_stop_hint() {
+        let content = "\
+  Applying patch to src/session/instance.rs
+
+  → Add a follow-up                                      ctrl+c to stop";
+        assert_eq!(detect_antigravity_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_running_on_live_activity_line() {
+        let content = "\
+  Generated summary for the previous step.
+
+  Editing src/session/instance.rs";
+        assert_eq!(detect_antigravity_status(content), Status::Running);
     }
 
     #[test]
