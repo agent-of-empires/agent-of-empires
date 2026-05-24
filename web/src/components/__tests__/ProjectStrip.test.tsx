@@ -175,4 +175,24 @@ describe("ProjectStrip", () => {
     expect(onCreateSession).toHaveBeenCalledWith("/tmp/alpha");
     expect(onSelectWorkspace).not.toHaveBeenCalled();
   });
+
+  it("does not render agent tool names in the compact strip", () => {
+    const alpha = group("Alpha", "/tmp/alpha", "Running");
+    alpha.workspaces[0]!.primaryAgent = "cursor";
+    alpha.workspaces[0]!.sessions[0]!.tool = "codex";
+
+    const { queryByText } = render(
+      <ProjectStrip
+        groups={[alpha]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+      />,
+    );
+
+    expect(queryByText(/cursor/i)).toBeNull();
+    expect(queryByText(/codex/i)).toBeNull();
+  });
 });

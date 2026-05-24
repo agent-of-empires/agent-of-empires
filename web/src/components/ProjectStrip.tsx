@@ -161,18 +161,15 @@ export function ProjectStrip({
     <nav
       aria-label="Project switcher"
       data-testid="project-strip"
-      className="h-[128px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
+      className="h-[88px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
     >
-      <div className="flex h-10 items-center gap-2 border-b border-surface-800/80 px-2">
+      <div className="flex h-8 items-center gap-2 border-b border-surface-800/80 px-2">
         <div className="min-w-0 shrink-0">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-text-muted">
-            Projects
-          </div>
           <div className="font-mono text-[10px] text-text-dim">
-            {items.length}/{groups.length} · {totalSessions} sessions
+            {items.length}/{groups.length} projects · {totalSessions} sessions
           </div>
         </div>
-        <label className="relative min-w-[14rem] flex-1">
+        <label className="relative min-w-[10rem] flex-1">
           <Search
             aria-hidden="true"
             className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-dim"
@@ -184,14 +181,14 @@ export function ProjectStrip({
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter projects, branches, agents..."
-            className="h-8 w-full rounded-md border border-surface-700 bg-surface-950 pl-7 pr-2 font-mono text-[12px] text-text-primary outline-none transition-colors placeholder:text-text-dim focus:border-brand-600"
+            className="h-6 w-full rounded border border-surface-700 bg-surface-950 pl-7 pr-2 font-mono text-[11px] text-text-primary outline-none transition-colors placeholder:text-text-dim focus:border-brand-600"
           />
         </label>
       </div>
       <div
         role="tablist"
         aria-label="Projects"
-        className="flex h-11 items-center gap-1 overflow-x-auto px-2 [scrollbar-width:thin]"
+        className="flex h-8 items-center gap-1 overflow-x-auto px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {items.map(({ group, session, active, workspaceId, count }) => {
           const status = session?.status ?? "Unknown";
@@ -205,7 +202,7 @@ export function ProjectStrip({
           return (
             <div
               key={group.id}
-              className={`group flex h-9 min-w-[15rem] max-w-[22rem] items-center rounded-md border transition-colors ${
+              className={`group flex h-6 min-w-[7.5rem] max-w-[12rem] items-center rounded border transition-colors ${
                 active
                   ? "border-brand-600 bg-surface-800 text-text-primary"
                   : "border-transparent text-text-muted hover:border-surface-700 hover:bg-surface-800/70 hover:text-text-secondary"
@@ -219,11 +216,11 @@ export function ProjectStrip({
                 aria-selected={active}
                 data-testid="project-strip-tab"
                 onClick={() => onSelectWorkspace(workspaceId)}
-                className="flex h-full min-w-0 flex-1 items-center gap-2 px-2 text-left"
+                className="flex h-full min-w-0 flex-1 items-center gap-1.5 px-1.5 text-left"
                 title={group.repoPath}
               >
                 <span
-                  className={`w-4 shrink-0 text-center font-mono text-[12px] ${textClass}`}
+                  className={`w-3 shrink-0 text-center font-mono text-[10px] ${textClass}`}
                   aria-hidden="true"
                 >
                   <StatusGlyph
@@ -232,18 +229,14 @@ export function ProjectStrip({
                     idleEnteredAt={session?.idle_entered_at ?? null}
                   />
                 </span>
-                <OwnerAvatar owner={group.remoteOwner} size={16} />
+                <OwnerAvatar owner={group.remoteOwner} size={14} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[12px] font-medium leading-4">
+                  <span className="block truncate text-[11px] font-medium leading-4">
                     {group.displayName}
                   </span>
-                  <span className="block truncate font-mono text-[10px] leading-3 text-text-dim">
-                    {session?.tool ?? "agent"} · {count} session
-                    {count === 1 ? "" : "s"}
-                  </span>
                 </span>
-                <span className="shrink-0 rounded border border-surface-700/70 px-1 font-mono text-[10px] text-text-dim">
-                  {group.workspaces.length}
+                <span className="shrink-0 rounded border border-surface-700/70 px-1 font-mono text-[9px] text-text-dim">
+                  {count}
                 </span>
               </button>
               <button
@@ -253,9 +246,9 @@ export function ProjectStrip({
                 onClick={() => {
                   onCreateSession(group.repoPath);
                 }}
-                className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-text-muted opacity-70 transition-colors hover:bg-surface-700/60 hover:text-text-secondary group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
+                className="mr-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-text-muted opacity-70 transition-colors hover:bg-surface-700/60 hover:text-text-secondary group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
               >
-                <Plus className="h-3.5 w-3.5" />
+                <Plus className="h-3 w-3" />
               </button>
             </div>
           );
@@ -268,31 +261,27 @@ export function ProjectStrip({
       </div>
       <div
         aria-label="Sessions in selected project"
-        className="flex h-[76px] items-start gap-1 overflow-x-auto border-t border-surface-800/80 px-2 py-1.5 [scrollbar-width:thin]"
+        className="flex h-[48px] items-center gap-1 overflow-x-auto border-t border-surface-800/80 px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {activeWorkspaceItems.map((workspace) => {
           const label = workspaceLabel(workspace);
           return (
             <div
               key={workspace.id}
-              className="flex h-16 shrink-0 items-center gap-1 rounded-md border border-surface-800 bg-surface-950/40 px-1.5"
+              className="flex h-8 shrink-0 items-center gap-1 rounded border border-surface-800 bg-surface-950/40 px-1"
             >
               <button
                 type="button"
                 onClick={() => onSelectWorkspace(workspace.id)}
-                className={`h-12 w-[9.5rem] rounded px-1.5 text-left transition-colors ${
+                className={`h-6 w-[6.5rem] rounded px-1.5 text-left transition-colors ${
                   workspace.id === activeWorkspaceId
                     ? "bg-surface-800 text-text-primary"
                     : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"
                 }`}
                 title={workspace.projectPath}
               >
-                <span className="block truncate text-[11px] font-medium leading-4">
+                <span className="block truncate text-[10px] font-medium leading-3">
                   {label}
-                </span>
-                <span className="block truncate font-mono text-[9px] leading-3 text-text-dim">
-                  {workspace.primaryAgent} · {workspace.sessions.length} session
-                  {workspace.sessions.length === 1 ? "" : "s"}
                 </span>
               </button>
               {workspace.sessions.map((session) => {
@@ -311,7 +300,7 @@ export function ProjectStrip({
                     aria-current={session.id === activeSessionId ? "page" : undefined}
                     data-testid="project-strip-session"
                     onClick={() => onSelectSession(session.id)}
-                    className={`flex h-12 w-[13.5rem] items-center gap-1.5 rounded px-1.5 text-left transition-colors ${
+                    className={`flex h-6 w-[7.5rem] items-center gap-1 rounded px-1.5 text-left transition-colors ${
                       session.id === activeSessionId
                         ? "bg-surface-800 text-text-primary"
                         : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"
@@ -319,7 +308,7 @@ export function ProjectStrip({
                     title={`${title} · ${session.project_path}`}
                   >
                     <span
-                      className={`w-3 shrink-0 text-center font-mono text-[10px] ${textClass}`}
+                      className={`w-3 shrink-0 text-center font-mono text-[9px] ${textClass}`}
                       aria-hidden="true"
                     >
                       <StatusGlyph
@@ -329,12 +318,8 @@ export function ProjectStrip({
                       />
                     </span>
                     <span className="min-w-0">
-                      <span className="block truncate text-[11px] leading-4">
+                      <span className="block truncate text-[10px] leading-3">
                         {title}
-                      </span>
-                      <span className="block truncate font-mono text-[9px] leading-3 text-text-dim">
-                        {session.tool} · {session.status}
-                        {session.branch ? ` · ${session.branch}` : ""}
                       </span>
                     </span>
                   </button>
