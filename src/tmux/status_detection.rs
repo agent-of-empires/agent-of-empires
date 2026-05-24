@@ -25,6 +25,15 @@ const LIVE_ACTIVITY_WORDS: &[&str] = &[
     "working",
     "writing",
 ];
+const COMPLETED_ACTIVITY_MARKERS: &[&str] = &[
+    "complete",
+    "completed",
+    "done",
+    "finished",
+    "success",
+    "successful",
+    "successfully",
+];
 
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
@@ -698,9 +707,28 @@ fn status_line_starts_with_phrase(line: &str, phrase: &str) -> bool {
     let Some(rest) = line.strip_prefix(phrase) else {
         return false;
     };
-    rest.chars()
+    let has_valid_boundary = rest
+        .chars()
         .next()
-        .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':')
+        .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':');
+    has_valid_boundary && !activity_tail_has_completion_marker(rest)
+}
+
+fn activity_tail_has_completion_marker(rest: &str) -> bool {
+    let tail =
+        rest.trim_start_matches(|c: char| c.is_whitespace() || c == '.' || c == '…' || c == ':');
+    if tail.is_empty() {
+        return false;
+    }
+
+    tail.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(5)
+        .map(str::to_lowercase)
+        .any(|word| {
+            COMPLETED_ACTIVITY_MARKERS.contains(&word.as_str())
+                || (word.len() > 3 && word.ends_with("ed"))
+        })
 }
 
 /// Cursor agent status is detected via hooks first, but pane parsing is still
@@ -1113,7 +1141,7 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    if has_any_spinner(&lines) || has_spinner_activity_line(&non_empty_lines) {
+    if has_any_spinner(&lines) {
         return Status::Running;
     }
 
@@ -1178,6 +1206,18 @@ enter to select · esc to cancel";
 
   Composer 2.5 · 60.9% · 4 files edited                 Auto-run";
         assert_eq!(detect_cursor_status(content), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_completed_activity_phrases() {
+        for content in [
+            "Running tests completed successfully.\n\n→ Add a follow-up",
+            "Reading config.toml finished.\n\n→ Add a follow-up",
+            "Editing src/app.rs done.\n\n→ Add a follow-up",
+            "Testing finished with success.\n\n→ Add a follow-up",
+        ] {
+            assert_eq!(detect_cursor_status(content), Status::Idle);
+        }
     }
 
     #[test]
@@ -2325,6 +2365,18 @@ Antigravity CLI requires permission to read, edit, and execute files here.
 
   Editing src/session/instance.rs";
         assert_eq!(detect_antigravity_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_idle_on_completed_activity_phrases() {
+        for content in [
+            "Running tests completed successfully.",
+            "Reading config.toml finished.",
+            "Editing src/session/instance.rs done.",
+            "Testing finished with success.",
+        ] {
+            assert_eq!(detect_antigravity_status(content), Status::Idle);
+        }
     }
 
     #[test]
