@@ -1,3 +1,6 @@
+import { useWebSettings } from "../hooks/useWebSettings";
+import type { ProjectStripShortcut } from "../hooks/useWebSettings";
+
 interface Props {
   onClose: () => void;
 }
@@ -21,16 +24,27 @@ const IS_MAC =
   /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
 export function HelpOverlay({ onClose }: Props) {
+  const { settings } = useWebSettings();
   const modKey = IS_MAC ? "⌘" : "Ctrl";
 
   const optKey = IS_MAC ? "⌥" : "Alt";
+  const projectShortcutLabel = formatProjectShortcut(
+    settings.projectStripShortcut,
+  );
 
   const shortcuts = [
     { key: `${modKey}K`, desc: "Open command palette" },
     { key: `${modKey}B`, desc: "Toggle left sidebar" },
     { key: `${modKey}${optKey}B`, desc: "Toggle right panel" },
     { key: `${modKey}\``, desc: "Toggle agent / shell terminal focus" },
-    { key: "Ctrl+H/L", desc: "Previous / next project when Project strip is enabled" },
+    ...(projectShortcutLabel
+      ? [
+          {
+            key: projectShortcutLabel,
+            desc: "Previous / next project when Project strip is enabled",
+          },
+        ]
+      : []),
     { key: "n", desc: "New session" },
     { key: "D", desc: "Toggle diff panel" },
     { key: "s", desc: "Toggle settings" },
@@ -120,4 +134,11 @@ export function HelpOverlay({ onClose }: Props) {
       </div>
     </div>
   );
+}
+
+function formatProjectShortcut(shortcut: ProjectStripShortcut) {
+  if (shortcut === "disabled") return null;
+  if (shortcut === "ctrl-alt-hl") return "Ctrl+Alt+H/L";
+  if (shortcut === "ctrl-hl") return "Ctrl+H/L";
+  return "Alt+H/L";
 }

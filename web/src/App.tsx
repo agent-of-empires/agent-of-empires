@@ -646,6 +646,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onToggleSidebar: () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => setDiffCollapsed((c) => !c),
         onToggleTerminalFocus: handleToggleTerminalFocus,
+        projectStripShortcut: webSettings.projectStripShortcut,
         onPreviousProject: webSettings.projectStrip
           ? () => handleProjectStripStep(-1)
           : undefined,
@@ -663,6 +664,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         handleToggleTerminalFocus,
         serverAbout,
         webSettings.projectStrip,
+        webSettings.projectStripShortcut,
         handleProjectStripStep,
       ],
     ),
@@ -897,8 +899,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       {webSettings.projectStrip && !showSettings && !showProjects && (
         <ProjectStrip
           groups={groups}
+          activeSessionId={activeSessionId}
           activeWorkspaceId={activeWorkspace?.id ?? null}
           onSelectWorkspace={handleSelectWorkspace}
+          onSelectSession={handleSelectSession}
         />
       )}
 

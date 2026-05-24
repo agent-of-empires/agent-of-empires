@@ -95,6 +95,18 @@ describe("TerminalSettings localStorage contract", () => {
     expect(readStored().projectStrip).toBe(true);
   });
 
+  it("project strip shortcut select writes the shortcut setting", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ projectStrip: true }));
+    const { container } = render(<TerminalSettings />);
+    const selects = container.querySelectorAll("select");
+    const shortcutSelect = selects[2] as HTMLSelectElement;
+
+    expect(shortcutSelect.value).toBe("ctrl-alt-hl");
+
+    fireEvent.change(shortcutSelect, { target: { value: "ctrl-hl" } });
+    expect(readStored().projectStripShortcut).toBe("ctrl-hl");
+  });
+
   it("persistent terminal limit input writes a clamped number", () => {
     window.localStorage.setItem(
       KEY,
@@ -119,6 +131,7 @@ describe("TerminalSettings localStorage contract", () => {
         desktopFontSize: 14,
         autoOpenKeyboard: true,
         projectStrip: false,
+        projectStripShortcut: "ctrl-alt-hl",
         persistentTerminals: false,
         maxPersistentTerminals: 5,
         diffViewMode: "tree",
@@ -151,6 +164,7 @@ describe("TerminalSettings localStorage contract", () => {
         desktopFontSize: 16,
         autoOpenKeyboard: false,
         projectStrip: true,
+        projectStripShortcut: "ctrl-alt-hl",
         persistentTerminals: true,
         maxPersistentTerminals: 42,
       }),
@@ -166,6 +180,9 @@ describe("TerminalSettings localStorage contract", () => {
     const checkbox = checkboxes[0] as HTMLInputElement;
     const projectStripCheckbox = checkboxes[1] as HTMLInputElement;
     const persistentCheckbox = checkboxes[2] as HTMLInputElement;
+    const projectShortcut = container.querySelectorAll(
+      "select",
+    )[2] as HTMLSelectElement;
     const persistentLimit = container.querySelector(
       "input[type=number]",
     ) as HTMLInputElement;
@@ -173,6 +190,7 @@ describe("TerminalSettings localStorage contract", () => {
     expect(desktopSelect.value).toBe("16");
     expect(checkbox.checked).toBe(false);
     expect(projectStripCheckbox.checked).toBe(true);
+    expect(projectShortcut.value).toBe("ctrl-alt-hl");
     expect(persistentCheckbox.checked).toBe(true);
     expect(persistentLimit.value).toBe("42");
   });

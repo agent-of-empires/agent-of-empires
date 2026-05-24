@@ -338,7 +338,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
   });
 
-  test("project strip is opt-in and supports Ctrl+H/Ctrl+L navigation", async ({
+  test("project strip is opt-in and supports configurable project navigation", async ({
     page,
   }) => {
     await mockApis(page, [
@@ -375,14 +375,28 @@ test.describe("Sidebar multi-session (#956)", () => {
       "true",
     );
 
-    await page.keyboard.press("Control+L");
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
     await expect(strip.getByRole("tab", { name: /beta/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
 
-    await page.keyboard.press("Control+H");
+    await page.keyboard.press("Control+Alt+H");
+    await expect(page).toHaveURL(/\/session\/sess-a$/);
+
+    await page.evaluate(() => {
+      window.localStorage.setItem(
+        "aoe-web-settings",
+        JSON.stringify({
+          projectStrip: true,
+          projectStripShortcut: "disabled",
+        }),
+      );
+    });
+    await page.reload();
+
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 });

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import type { ProjectStripShortcut } from "./useWebSettings";
 
 const IS_MAC =
   typeof navigator !== "undefined" &&
@@ -16,6 +17,7 @@ interface ShortcutActions {
   onToggleTerminalFocus: () => void;
   onPreviousProject?: () => void;
   onNextProject?: () => void;
+  projectStripShortcut?: ProjectStripShortcut;
 }
 
 /**
@@ -25,6 +27,23 @@ interface ShortcutActions {
  */
 export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
   useEffect(() => {
+    const matchesProjectNavigationShortcut = (
+      e: KeyboardEvent,
+      shortcut: ProjectStripShortcut,
+    ) => {
+      if (shortcut === "disabled") return false;
+      if (e.shiftKey || e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) {
+        return false;
+      }
+      if (shortcut === "alt-hl") {
+        return e.altKey && !e.ctrlKey;
+      }
+      if (shortcut === "ctrl-alt-hl") {
+        return e.ctrlKey && e.altKey;
+      }
+      return e.ctrlKey && !e.altKey;
+    };
+
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const isInput =
@@ -32,7 +51,9 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
         (target.tagName === "INPUT" ||
           target.tagName === "TEXTAREA" ||
           target.isContentEditable);
-      const isTerminalInput = !!target?.closest(".xterm");
+      const isTerminalInput =
+        !!target?.closest(".xterm") ||
+        !!target?.classList.contains("xterm-helper-textarea");
 
       const actions = getActions();
       const mod = IS_MAC ? e.metaKey : e.metaKey || e.ctrlKey;
@@ -57,11 +78,10 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       }
 
       if (
-        e.ctrlKey &&
-        !e.metaKey &&
-        !e.shiftKey &&
-        !e.altKey &&
-        (e.code === "KeyH" || e.code === "KeyL") &&
+        matchesProjectNavigationShortcut(
+          e,
+          actions.projectStripShortcut ?? "ctrl-alt-hl",
+        ) &&
         (!isInput || isTerminalInput)
       ) {
         const action =

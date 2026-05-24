@@ -79,8 +79,10 @@ describe("ProjectStrip", () => {
           group("Alpha", "/tmp/alpha", "Running"),
           group("Beta", "/tmp/beta", "Idle"),
         ]}
+        activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
         onSelectWorkspace={onSelectWorkspace}
+        onSelectSession={vi.fn()}
       />,
     );
 
@@ -95,13 +97,34 @@ describe("ProjectStrip", () => {
     const { getByRole } = render(
       <ProjectStrip
         groups={[group("Alpha", "/tmp/alpha", "Running")]}
+        activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
         onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
       />,
     );
 
     expect(
       getByRole("tab", { name: /Alpha/i }).getAttribute("aria-selected"),
     ).toBe("true");
+  });
+
+  it("renders selected project sessions and selects a specific session", () => {
+    const onSelectSession = vi.fn();
+    const alpha = group("Alpha", "/tmp/alpha", "Running");
+    alpha.workspaces[0]!.sessions.push(session("Alpha-second", "/tmp/alpha", "Waiting"));
+
+    const { getByRole } = render(
+      <ProjectStrip
+        groups={[alpha]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={onSelectSession}
+      />,
+    );
+
+    fireEvent.click(getByRole("button", { name: /Alpha-second/i }));
+    expect(onSelectSession).toHaveBeenCalledWith("Alpha-second");
   });
 });

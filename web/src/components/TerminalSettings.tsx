@@ -1,4 +1,5 @@
 import { useWebSettings } from "../hooks/useWebSettings";
+import type { ProjectStripShortcut } from "../hooks/useWebSettings";
 import {
   MAX_PERSISTENT_TERMINALS,
   MIN_PERSISTENT_TERMINALS,
@@ -6,6 +7,15 @@ import {
 } from "../lib/persistentTerminals";
 
 const FONT_SIZES = Array.from({ length: 23 }, (_, i) => i + 6); // 6..28
+const PROJECT_STRIP_SHORTCUTS: Array<{
+  value: ProjectStripShortcut;
+  label: string;
+}> = [
+  { value: "ctrl-alt-hl", label: "Ctrl+Alt+H / Ctrl+Alt+L" },
+  { value: "alt-hl", label: "Alt+H / Alt+L" },
+  { value: "ctrl-hl", label: "Ctrl+H / Ctrl+L" },
+  { value: "disabled", label: "Off" },
+];
 
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
@@ -126,8 +136,7 @@ export function TerminalSettings() {
                 </span>
               </div>
               <p className="text-[11px] text-text-muted mt-1">
-                Show a zellij-style project switcher above the workspace. When
-                enabled, Ctrl+H and Ctrl+L move across projects.
+                Show a zellij-style project switcher above the workspace.
               </p>
             </div>
             <input
@@ -137,6 +146,33 @@ export function TerminalSettings() {
               className="accent-brand-600 w-4 h-4 shrink-0"
             />
           </label>
+          {settings.projectStrip && (
+            <div className="mt-3">
+              <label className="block text-[13px] text-text-secondary mb-2">
+                Project strip shortcut
+              </label>
+              <select
+                value={settings.projectStripShortcut}
+                onChange={(e) =>
+                  update({
+                    projectStripShortcut: e.target
+                      .value as ProjectStripShortcut,
+                  })
+                }
+                className="w-full bg-surface-800 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary font-mono"
+              >
+                {PROJECT_STRIP_SHORTCUTS.map((shortcut) => (
+                  <option key={shortcut.value} value={shortcut.value}>
+                    {shortcut.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] text-text-muted mt-1">
+                Ctrl+Alt+H/L is the default because browsers often reserve
+                Ctrl+L for the address bar and may not deliver it to the app.
+              </p>
+            </div>
+          )}
         </div>
 
         <div>

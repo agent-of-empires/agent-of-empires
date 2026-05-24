@@ -8,11 +8,18 @@ import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 const STORAGE_KEY = "aoe-web-settings";
 
+export type ProjectStripShortcut =
+  | "alt-hl"
+  | "ctrl-alt-hl"
+  | "ctrl-hl"
+  | "disabled";
+
 export interface WebSettings {
   mobileFontSize: number;
   desktopFontSize: number;
   autoOpenKeyboard: boolean;
   projectStrip: boolean;
+  projectStripShortcut: ProjectStripShortcut;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
   diffViewMode: "flat" | "tree";
@@ -25,11 +32,21 @@ function getDefaults(): WebSettings {
     desktopFontSize: 14,
     autoOpenKeyboard: true,
     projectStrip: false,
+    projectStripShortcut: "ctrl-alt-hl",
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     collapsedDiffDirs: [],
   };
+}
+
+function isProjectStripShortcut(value: unknown): value is ProjectStripShortcut {
+  return (
+    value === "alt-hl" ||
+    value === "ctrl-alt-hl" ||
+    value === "ctrl-hl" ||
+    value === "disabled"
+  );
 }
 
 function normalizeSnapshot(settings: WebSettings): WebSettings {
@@ -44,6 +61,9 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
       typeof settings.projectStrip === "boolean"
         ? settings.projectStrip
         : defaults.projectStrip,
+    projectStripShortcut: isProjectStripShortcut(settings.projectStripShortcut)
+      ? settings.projectStripShortcut
+      : defaults.projectStripShortcut,
     maxPersistentTerminals: normalizePersistentTerminalLimit(
       settings.maxPersistentTerminals,
     ),
