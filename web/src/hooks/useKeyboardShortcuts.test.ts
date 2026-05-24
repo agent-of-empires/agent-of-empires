@@ -144,6 +144,21 @@ describe("useKeyboardShortcuts", () => {
     input.remove();
   });
 
+  it("allows project navigation from the project strip filter input", () => {
+    const actions = makeActions();
+    renderHook(() => useKeyboardShortcuts(() => actions));
+    const strip = document.createElement("nav");
+    strip.dataset.testid = "project-strip";
+    const input = document.createElement("input");
+    strip.appendChild(input);
+    document.body.appendChild(strip);
+
+    dispatch(input, { key: "l", code: "KeyL", altKey: true });
+
+    expect(actions.onNextProject).toHaveBeenCalledTimes(1);
+    strip.remove();
+  });
+
   it("allows project navigation from xterm helper textarea focus", () => {
     const actions = makeActions();
     renderHook(() => useKeyboardShortcuts(() => actions));

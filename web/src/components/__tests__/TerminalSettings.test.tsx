@@ -149,6 +149,7 @@ describe("TerminalSettings localStorage contract", () => {
       desktopFontSize: 14,
       autoOpenKeyboard: true,
       projectStrip: false,
+      projectStripShortcut: "alt-hl",
       persistentTerminals: false,
       maxPersistentTerminals: 5,
       diffViewMode: "tree",

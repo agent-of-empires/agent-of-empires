@@ -73,7 +73,7 @@ function group(name: string, path: string, status: SessionResponse["status"]): R
 describe("ProjectStrip", () => {
   it("renders project tabs and selects the first workspace in the group", () => {
     const onSelectWorkspace = vi.fn();
-    const { getByRole } = render(
+    const { getAllByTestId } = render(
       <ProjectStrip
         groups={[
           group("Alpha", "/tmp/alpha", "Running"),
@@ -81,13 +81,18 @@ describe("ProjectStrip", () => {
         ]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
         onSelectWorkspace={onSelectWorkspace}
         onSelectSession={vi.fn()}
         onCreateSession={vi.fn()}
       />,
     );
 
-    const beta = getByRole("tab", { name: /Beta/i });
+    const beta = getAllByTestId("project-strip-tab").find((tab) =>
+      tab.textContent?.includes("Beta"),
+    );
+    expect(beta).toBeTruthy();
     expect(beta.getAttribute("aria-selected")).toBe("false");
 
     fireEvent.click(beta);
@@ -95,20 +100,23 @@ describe("ProjectStrip", () => {
   });
 
   it("marks the active project tab", () => {
-    const { getByRole } = render(
+    const { getAllByTestId } = render(
       <ProjectStrip
         groups={[group("Alpha", "/tmp/alpha", "Running")]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
         onSelectWorkspace={vi.fn()}
         onSelectSession={vi.fn()}
         onCreateSession={vi.fn()}
       />,
     );
 
-    expect(
-      getByRole("tab", { name: /Alpha/i }).getAttribute("aria-selected"),
-    ).toBe("true");
+    const alpha = getAllByTestId("project-strip-tab").find((tab) =>
+      tab.textContent?.includes("Alpha"),
+    );
+    expect(alpha?.getAttribute("aria-selected")).toBe("true");
   });
 
   it("renders selected project sessions and selects a specific session", () => {
@@ -121,6 +129,8 @@ describe("ProjectStrip", () => {
         groups={[alpha]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
         onSelectWorkspace={vi.fn()}
         onSelectSession={onSelectSession}
         onCreateSession={vi.fn()}
@@ -136,11 +146,34 @@ describe("ProjectStrip", () => {
     beta.workspaces[0]!.sessions[0]!.branch = "feature/searchable";
     beta.workspaces[0]!.sessions[0]!.tool = "codex";
 
-    const { getByLabelText, getByRole, queryByRole } = render(
+    const { getAllByTestId } = render(
       <ProjectStrip
         groups={[group("Alpha", "/tmp/alpha", "Running"), beta]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter="searchable"
+        onFilterChange={vi.fn()}
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+      />,
+    );
+
+    const tabs = getAllByTestId("project-strip-tab");
+    expect(tabs.some((tab) => tab.textContent?.includes("Alpha"))).toBe(false);
+    expect(tabs.some((tab) => tab.textContent?.includes("Beta"))).toBe(true);
+  });
+
+  it("reports filter text changes to the parent state", () => {
+    const onFilterChange = vi.fn();
+
+    const { getByLabelText } = render(
+      <ProjectStrip
+        groups={[group("Alpha", "/tmp/alpha", "Running")]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={onFilterChange}
         onSelectWorkspace={vi.fn()}
         onSelectSession={vi.fn()}
         onCreateSession={vi.fn()}
@@ -148,11 +181,36 @@ describe("ProjectStrip", () => {
     );
 
     fireEvent.change(getByLabelText("Filter project strip"), {
-      target: { value: "searchable" },
+      target: { value: "alp" },
     });
 
-    expect(queryByRole("tab", { name: /Alpha/i })).toBeNull();
-    expect(getByRole("tab", { name: /Beta/i })).toBeTruthy();
+    expect(onFilterChange).toHaveBeenCalledWith("alp");
+  });
+
+  it("keeps unknown statuses behind known statuses when choosing the project status", () => {
+    const alpha = group("Alpha", "/tmp/alpha", "Idle");
+    alpha.workspaces[0]!.sessions = [
+      {
+        ...session("Alpha-unknown", "/tmp/alpha", "Unknown"),
+        status: "FutureStatus" as SessionResponse["status"],
+      },
+      session("Alpha-waiting", "/tmp/alpha", "Waiting"),
+    ];
+
+    const { getByTestId } = render(
+      <ProjectStrip
+        groups={[alpha]}
+        activeSessionId="Alpha-waiting"
+        activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+      />,
+    );
+
+    expect(getByTestId("project-strip-tab").querySelector(".text-status-waiting")).not.toBeNull();
   });
 
   it("starts a new session from the project row without selecting it", () => {
@@ -164,6 +222,8 @@ describe("ProjectStrip", () => {
         groups={[group("Alpha", "/tmp/alpha", "Running")]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
         onSelectWorkspace={onSelectWorkspace}
         onSelectSession={vi.fn()}
         onCreateSession={onCreateSession}
@@ -186,6 +246,8 @@ describe("ProjectStrip", () => {
         groups={[alpha]}
         activeSessionId="Alpha-session"
         activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
         onSelectWorkspace={vi.fn()}
         onSelectSession={vi.fn()}
         onCreateSession={vi.fn()}

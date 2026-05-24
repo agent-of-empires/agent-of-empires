@@ -42,6 +42,7 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ProjectStrip } from "./components/ProjectStrip";
+import { matchesProjectStripFilter } from "./lib/projectStrip";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the cockpit surface so non-cockpit users never download
@@ -185,6 +186,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const navigate = useNavigate();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
+  const [projectStripFilter, setProjectStripFilter] = useState("");
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
@@ -381,19 +383,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleProjectStripStep = useCallback(
     (direction: -1 | 1) => {
-      const selectableGroups = groups.filter((g) => g.workspaces.length > 0);
+      const filterQuery = projectStripFilter.trim();
+      const selectableGroups = groups
+        .filter((g) => g.workspaces.length > 0)
+        .filter((g) => matchesProjectStripFilter(g, filterQuery));
       if (selectableGroups.length === 0) return;
       const activeIndex = selectableGroups.findIndex((group) =>
         group.workspaces.some((w) => w.id === activeWorkspace?.id),
       );
-      const currentIndex = activeIndex >= 0 ? activeIndex : 0;
+      const currentIndex =
+        activeIndex >= 0 ? activeIndex : direction === 1 ? -1 : 0;
       const nextIndex =
         (currentIndex + direction + selectableGroups.length) %
         selectableGroups.length;
       const nextWorkspace = selectableGroups[nextIndex]?.workspaces[0];
       if (nextWorkspace) handleSelectWorkspace(nextWorkspace.id);
     },
-    [activeWorkspace?.id, groups, handleSelectWorkspace],
+    [activeWorkspace?.id, groups, handleSelectWorkspace, projectStripFilter],
   );
 
   // In-app toast forwarded from the service worker sets this event when
@@ -901,6 +907,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           groups={groups}
           activeSessionId={activeSessionId}
           activeWorkspaceId={activeWorkspace?.id ?? null}
+          filter={projectStripFilter}
+          onFilterChange={setProjectStripFilter}
           onSelectWorkspace={handleSelectWorkspace}
           onSelectSession={handleSelectSession}
           onCreateSession={handleCreateSession}

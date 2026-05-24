@@ -57,6 +57,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       const isTerminalInput =
         !!target?.closest(".xterm") ||
         !!target?.classList.contains("xterm-helper-textarea");
+      const isProjectStripInput = !!target?.closest("[data-testid='project-strip']");
 
       const actions = getActions();
       const mod = IS_MAC ? e.metaKey : e.metaKey || e.ctrlKey;
@@ -85,7 +86,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
           e,
           actions.projectStripShortcut ?? "alt-hl",
         ) &&
-        (!isInput || isTerminalInput)
+        (!isInput || isTerminalInput || isProjectStripInput)
       ) {
         const action =
           e.code === "KeyH" ? actions.onPreviousProject : actions.onNextProject;

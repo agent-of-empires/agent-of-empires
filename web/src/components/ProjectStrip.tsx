@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, type CSSProperties } from "react";
 import { Plus, Search } from "lucide-react";
 import type {
   RepoGroup,
@@ -9,6 +9,7 @@ import type {
 import type { RepoColor } from "../lib/repoAppearance";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { matchesProjectStripFilter } from "../lib/projectStrip";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 
@@ -16,6 +17,8 @@ interface Props {
   groups: RepoGroup[];
   activeSessionId: string | null;
   activeWorkspaceId: string | null;
+  filter: string;
+  onFilterChange: (filter: string) => void;
   onSelectWorkspace: (workspaceId: string) => void;
   onSelectSession: (sessionId: string) => void;
   onCreateSession: (repoPath: string) => void;
@@ -34,6 +37,11 @@ const STATUS_PRIORITY: SessionStatus[] = [
   "Deleting",
 ];
 
+function statusRank(status: SessionStatus): number {
+  const idx = STATUS_PRIORITY.indexOf(status);
+  return idx === -1 ? STATUS_PRIORITY.length : idx;
+}
+
 function bestSession(
   sessions: SessionResponse[],
   idleDecayWindowMs: number,
@@ -43,8 +51,7 @@ function bestSession(
 
   return (
     [...sessions].sort(
-      (a, b) =>
-        STATUS_PRIORITY.indexOf(a.status) - STATUS_PRIORITY.indexOf(b.status),
+      (a, b) => statusRank(a.status) - statusRank(b.status),
     )[0] ?? null
   );
 }
@@ -71,33 +78,6 @@ function repoColorStyle(color: RepoColor | null): CSSProperties | undefined {
   };
 }
 
-function matchesFilter(group: RepoGroup, query: string) {
-  if (!query) return true;
-  const q = query.toLowerCase();
-  return (
-    group.displayName.toLowerCase().includes(q) ||
-    group.defaultDisplayName.toLowerCase().includes(q) ||
-    group.repoPath.toLowerCase().includes(q) ||
-    group.remoteOwner?.toLowerCase().includes(q) ||
-    group.workspaces.some((workspace) =>
-      [
-        workspace.displayName,
-        workspace.branch ?? "",
-        workspace.projectPath,
-        workspace.primaryAgent,
-        ...workspace.agents,
-        ...workspace.sessions.flatMap((session) => [
-          session.title,
-          session.tool,
-          session.status,
-          session.branch ?? "",
-          session.project_path,
-        ]),
-      ].some((value) => value.toLowerCase().includes(q)),
-    )
-  );
-}
-
 function workspaceLabel(workspace: Workspace) {
   return workspace.branch ?? workspace.displayName ?? "default";
 }
@@ -106,20 +86,21 @@ export function ProjectStrip({
   groups,
   activeSessionId,
   activeWorkspaceId,
+  filter,
+  onFilterChange,
   onSelectWorkspace,
   onSelectSession,
   onCreateSession,
   readOnly = false,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
-  const [filter, setFilter] = useState("");
   const activeButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const items = useMemo(
     () =>
       groups
         .filter((group) => group.workspaces.length > 0)
-        .filter((group) => matchesFilter(group, filter.trim()))
+        .filter((group) => matchesProjectStripFilter(group, filter.trim()))
         .map((group) => {
           const sessions = groupSessions(group);
           const session = bestSession(sessions, idleDecayWindowMs);
@@ -161,7 +142,7 @@ export function ProjectStrip({
     <nav
       aria-label="Project switcher"
       data-testid="project-strip"
-      className="h-[88px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
+      className="h-[72px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
     >
       <div className="flex h-8 items-center gap-2 border-b border-surface-800/80 px-2">
         <div className="min-w-0 shrink-0">
@@ -179,14 +160,13 @@ export function ProjectStrip({
             data-testid="project-strip-filter"
             type="search"
             value={filter}
-            onChange={(e) => setFilter(e.target.value)}
+            onChange={(e) => onFilterChange(e.target.value)}
             placeholder="Filter projects, branches, agents..."
-            className="h-6 w-full rounded border border-surface-700 bg-surface-950 pl-7 pr-2 font-mono text-[11px] text-text-primary outline-none transition-colors placeholder:text-text-dim focus:border-brand-600"
+            className="h-8 w-full rounded-md border border-surface-700 bg-surface-950 pl-7 pr-2 font-sans text-[11px] text-text-primary outline-none transition-colors placeholder:text-text-dim focus:border-brand-600"
           />
         </label>
       </div>
       <div
-        role="tablist"
         aria-label="Projects"
         className="flex h-8 items-center gap-1 overflow-x-auto px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
@@ -202,7 +182,7 @@ export function ProjectStrip({
           return (
             <div
               key={group.id}
-              className={`group flex h-6 min-w-[7.5rem] max-w-[12rem] items-center rounded border transition-colors ${
+              className={`group flex h-7 min-w-[7.5rem] max-w-[12rem] items-center rounded-md border transition-colors ${
                 active
                   ? "border-brand-600 bg-surface-800 text-text-primary"
                   : "border-transparent text-text-muted hover:border-surface-700 hover:bg-surface-800/70 hover:text-text-secondary"
@@ -212,7 +192,6 @@ export function ProjectStrip({
               <button
                 ref={active ? activeButtonRef : undefined}
                 type="button"
-                role="tab"
                 aria-selected={active}
                 data-testid="project-strip-tab"
                 onClick={() => onSelectWorkspace(workspaceId)}
@@ -235,7 +214,7 @@ export function ProjectStrip({
                     {group.displayName}
                   </span>
                 </span>
-                <span className="shrink-0 rounded border border-surface-700/70 px-1 font-mono text-[9px] text-text-dim">
+                <span className="shrink-0 rounded-full border border-surface-700/70 px-1.5 font-mono text-[9px] text-text-dim">
                   {count}
                 </span>
               </button>
@@ -246,7 +225,7 @@ export function ProjectStrip({
                 onClick={() => {
                   onCreateSession(group.repoPath);
                 }}
-                className="mr-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-text-muted opacity-70 transition-colors hover:bg-surface-700/60 hover:text-text-secondary group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
+                className="mr-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-text-muted opacity-70 transition-colors hover:bg-surface-700/60 hover:text-text-secondary group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
               >
                 <Plus className="h-3 w-3" />
               </button>
@@ -261,19 +240,19 @@ export function ProjectStrip({
       </div>
       <div
         aria-label="Sessions in selected project"
-        className="flex h-[48px] items-center gap-1 overflow-x-auto border-t border-surface-800/80 px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="flex h-8 items-center gap-1 overflow-x-auto border-t border-surface-800/80 px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {activeWorkspaceItems.map((workspace) => {
           const label = workspaceLabel(workspace);
           return (
             <div
               key={workspace.id}
-              className="flex h-8 shrink-0 items-center gap-1 rounded border border-surface-800 bg-surface-950/40 px-1"
+              className="flex h-7 shrink-0 items-center gap-1 rounded-md border border-surface-800 bg-surface-950/40 px-1"
             >
               <button
                 type="button"
                 onClick={() => onSelectWorkspace(workspace.id)}
-                className={`h-6 w-[6.5rem] rounded px-1.5 text-left transition-colors ${
+                className={`h-7 w-[6.5rem] rounded-md px-1.5 text-left transition-colors ${
                   workspace.id === activeWorkspaceId
                     ? "bg-surface-800 text-text-primary"
                     : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"
@@ -300,7 +279,7 @@ export function ProjectStrip({
                     aria-current={session.id === activeSessionId ? "page" : undefined}
                     data-testid="project-strip-session"
                     onClick={() => onSelectSession(session.id)}
-                    className={`flex h-6 w-[7.5rem] items-center gap-1 rounded px-1.5 text-left transition-colors ${
+                    className={`flex h-7 w-[7.5rem] items-center gap-1 rounded-md px-1.5 text-left transition-colors ${
                       session.id === activeSessionId
                         ? "bg-surface-800 text-text-primary"
                         : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"

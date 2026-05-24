@@ -354,6 +354,12 @@ test.describe("Sidebar multi-session (#956)", () => {
         project_path: "/tmp/beta",
         branch: null,
       },
+      {
+        id: "sess-c",
+        title: "Goths",
+        project_path: "/tmp/gamma",
+        branch: null,
+      },
     ]);
     await page.setViewportSize({ width: 1280, height: 720 });
 
@@ -369,21 +375,29 @@ test.describe("Sidebar multi-session (#956)", () => {
     });
     await page.reload();
     const strip = page.locator("[data-testid='project-strip']");
+    const projectTab = (name: string) =>
+      strip.locator("[data-testid='project-strip-tab']").filter({ hasText: name });
     await expect(strip).toBeVisible();
-    await expect(strip.getByRole("tab", { name: /alpha/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    await page.goto("/");
+    await expect(strip).toBeVisible();
+
+    await page.keyboard.press("Alt+L");
+    await expect(page).toHaveURL(/\/session\/sess-a$/);
+    await expect(projectTab("alpha")).toHaveAttribute("aria-selected", "true");
 
     await page.keyboard.press("Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
-    await expect(strip.getByRole("tab", { name: /beta/i })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    await expect(projectTab("beta")).toHaveAttribute("aria-selected", "true");
 
     await page.keyboard.press("Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
+
+    await strip.getByLabel("Filter project strip").fill("gamma");
+    await expect(projectTab("gamma")).toBeVisible();
+    await expect(projectTab("alpha")).toHaveCount(0);
+
+    await page.keyboard.press("Alt+L");
+    await expect(page).toHaveURL(/\/session\/sess-c$/);
 
     await page.evaluate(() => {
       window.localStorage.setItem(
@@ -397,6 +411,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.reload();
 
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-a$/);
+    await expect(page).toHaveURL(/\/session\/sess-c$/);
   });
 });
