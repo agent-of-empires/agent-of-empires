@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Plus, Search } from "lucide-react";
 import type {
   RepoGroup,
@@ -11,7 +11,6 @@ import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { matchesProjectStripFilter } from "../lib/projectStrip";
 import { StatusGlyph } from "./StatusGlyph";
-import { OwnerAvatar } from "./OwnerAvatar";
 
 interface Props {
   groups: RepoGroup[];
@@ -95,6 +94,16 @@ export function ProjectStrip({
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const activeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [menu, setMenu] = useState<{
+    groupId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const openMenuForGroup = (groupId: string, element: HTMLElement) => {
+    const rect = element.getBoundingClientRect();
+    setMenu({ groupId, x: rect.left, y: rect.bottom + 4 });
+  };
 
   const items = useMemo(
     () =>
@@ -114,11 +123,6 @@ export function ProjectStrip({
           };
         }),
     [groups, filter, activeWorkspaceId, idleDecayWindowMs],
-  );
-
-  const totalSessions = groups.reduce(
-    (sum, group) => sum + groupSessions(group).length,
-    0,
   );
 
   const activeItem =
@@ -144,13 +148,8 @@ export function ProjectStrip({
       data-testid="project-strip"
       className="h-[72px] shrink-0 border-b border-surface-700/20 bg-surface-900/95"
     >
-      <div className="flex h-8 items-center gap-2 border-b border-surface-800/80 px-2">
-        <div className="min-w-0 shrink-0">
-          <div className="font-mono text-[10px] text-text-dim">
-            {items.length}/{groups.length} projects · {totalSessions} sessions
-          </div>
-        </div>
-        <label className="relative min-w-[10rem] flex-1">
+      <div className="flex h-8 items-center justify-end border-b border-surface-800/80 px-2">
+        <label className="relative w-full max-w-[18rem]">
           <Search
             aria-hidden="true"
             className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-dim"
@@ -170,19 +169,12 @@ export function ProjectStrip({
         aria-label="Projects"
         className="flex h-8 items-center gap-1 overflow-x-auto px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
-        {items.map(({ group, session, active, workspaceId, count }) => {
+        {items.map(({ group, session, active, workspaceId }) => {
           const status = session?.status ?? "Unknown";
-          const textClass = getStatusTextClass(
-            {
-              status,
-              idle_entered_at: session?.idle_entered_at ?? null,
-            },
-            idleDecayWindowMs,
-          );
           return (
             <div
               key={group.id}
-              className={`group flex h-7 min-w-[7.5rem] max-w-[12rem] items-center rounded-md border transition-colors ${
+              className={`group relative flex h-7 min-w-[4.5rem] max-w-[9rem] items-center rounded-md border transition-colors ${
                 active
                   ? "border-brand-600 bg-surface-800 text-text-primary"
                   : "border-transparent text-text-muted hover:border-surface-700 hover:bg-surface-800/70 hover:text-text-secondary"
@@ -193,42 +185,69 @@ export function ProjectStrip({
                 ref={active ? activeButtonRef : undefined}
                 type="button"
                 aria-selected={active}
+                aria-haspopup="menu"
                 data-testid="project-strip-tab"
                 onClick={() => onSelectWorkspace(workspaceId)}
-                className="flex h-full min-w-0 flex-1 items-center gap-1.5 px-1.5 text-left"
-                title={group.repoPath}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  openMenuForGroup(group.id, e.currentTarget);
+                }}
+                onDoubleClick={(e) => {
+                  e.preventDefault();
+                  openMenuForGroup(group.id, e.currentTarget);
+                }}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (
+                    e.key !== "Enter" &&
+                    e.key !== " " &&
+                    e.key !== "ContextMenu" &&
+                    !(e.shiftKey && e.key === "F10")
+                  ) {
+                    return;
+                  }
+                  e.preventDefault();
+                  openMenuForGroup(group.id, e.currentTarget);
+                }}
+                className="flex h-full min-w-0 flex-1 items-center px-2 text-left"
+                title={`${group.displayName} · ${status} · ${group.repoPath}`}
               >
-                <span
-                  className={`w-3 shrink-0 text-center font-mono text-[10px] ${textClass}`}
-                  aria-hidden="true"
-                >
-                  <StatusGlyph
-                    status={status}
-                    createdAt={session?.created_at ?? null}
-                    idleEnteredAt={session?.idle_entered_at ?? null}
-                  />
-                </span>
-                <OwnerAvatar owner={group.remoteOwner} size={14} />
-                <span className="min-w-0 flex-1">
+                <span className="min-w-0 flex-1 text-center">
                   <span className="block truncate text-[11px] font-medium leading-4">
                     {group.displayName}
                   </span>
                 </span>
-                <span className="shrink-0 rounded-full border border-surface-700/70 px-1.5 font-mono text-[9px] text-text-dim">
-                  {count}
-                </span>
               </button>
-              <button
-                type="button"
-                aria-label={`New session in ${group.displayName}`}
-                disabled={readOnly}
-                onClick={() => {
-                  onCreateSession(group.repoPath);
-                }}
-                className="mr-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-text-muted opacity-70 transition-colors hover:bg-surface-700/60 hover:text-text-secondary group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
-              >
-                <Plus className="h-3 w-3" />
-              </button>
+              {menu?.groupId === group.id && (
+                <div
+                  role="menu"
+                  data-testid="project-strip-menu"
+                  style={{ left: menu.x, top: menu.y }}
+                  className="fixed z-30 w-44 rounded-md border border-surface-700 bg-surface-950 p-1 shadow-lg"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={readOnly}
+                    onClick={() => {
+                      setMenu(null);
+                      onCreateSession(group.repoPath);
+                    }}
+                    className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    New session
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => setMenu(null)}
+                    className="h-8 w-full rounded-md px-2 text-left text-[12px] text-text-muted transition-colors hover:bg-surface-800"
+                  >
+                    Close
+                  </button>
+                </div>
+              )}
             </div>
           );
         })}

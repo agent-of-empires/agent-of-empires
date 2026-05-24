@@ -210,14 +210,16 @@ describe("ProjectStrip", () => {
       />,
     );
 
-    expect(getByTestId("project-strip-tab").querySelector(".text-status-waiting")).not.toBeNull();
+    expect(getByTestId("project-strip-tab").getAttribute("title")).toContain(
+      "Waiting",
+    );
   });
 
-  it("starts a new session from the project row without selecting it", () => {
+  it("starts a new session from the project options menu without selecting it", () => {
     const onCreateSession = vi.fn();
     const onSelectWorkspace = vi.fn();
 
-    const { getByLabelText } = render(
+    const { getByRole, getByTestId } = render(
       <ProjectStrip
         groups={[group("Alpha", "/tmp/alpha", "Running")]}
         activeSessionId="Alpha-session"
@@ -230,10 +232,30 @@ describe("ProjectStrip", () => {
       />,
     );
 
-    fireEvent.click(getByLabelText("New session in Alpha"));
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    fireEvent.click(getByRole("menuitem", { name: /New session/i }));
 
     expect(onCreateSession).toHaveBeenCalledWith("/tmp/alpha");
     expect(onSelectWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("keeps project tabs focused on names instead of summary metadata", () => {
+    const { queryByText, getByTestId } = render(
+      <ProjectStrip
+        groups={[group("Alpha", "/tmp/alpha", "Running")]}
+        activeSessionId="Alpha-session"
+        activeWorkspaceId="Alpha-workspace"
+        filter=""
+        onFilterChange={vi.fn()}
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+      />,
+    );
+
+    expect(queryByText(/projects/i)).toBeNull();
+    expect(queryByText(/sessions/i)).toBeNull();
+    expect(getByTestId("project-strip-tab").textContent).toBe("Alpha");
   });
 
   it("does not render agent tool names in the compact strip", () => {
