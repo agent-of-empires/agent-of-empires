@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, waitFor } from "@testing-library/react";
 import { ProjectStrip } from "../ProjectStrip";
 import type { RepoGroup, SessionResponse } from "../../lib/types";
 import type { RepoAppearanceUpdate } from "../../lib/repoAppearance";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function session(
   id: string,
@@ -122,7 +126,7 @@ describe("ProjectStrip", () => {
       tab.textContent?.includes("Beta"),
     );
     expect(beta).toBeTruthy();
-    expect(beta?.getAttribute("aria-selected")).toBe("false");
+    expect(beta?.getAttribute("aria-current")).toBeNull();
 
     fireEvent.click(beta!);
     expect(onSelectWorkspace).toHaveBeenCalledWith("Beta-workspace");
@@ -136,7 +140,7 @@ describe("ProjectStrip", () => {
     const alpha = getAllByTestId("project-strip-tab").find((tab) =>
       tab.textContent?.includes("Alpha"),
     );
-    expect(alpha?.getAttribute("aria-selected")).toBe("true");
+    expect(alpha?.getAttribute("aria-current")).toBe("page");
   });
 
   it("renders selected project sessions and selects a specific session", () => {
@@ -305,7 +309,66 @@ describe("ProjectStrip", () => {
         body: JSON.stringify({ title: "Review patch" }),
       }),
     );
-    fetchMock.mockRestore();
+    await waitFor(() =>
+      expect(getByTestId("project-strip-session").textContent).toContain(
+        "Review patch",
+      ),
+    );
+  });
+
+  it("updates session notification state from the selected project session menu", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue({ ok: true } as Response);
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
+
+    fireEvent.contextMenu(getByTestId("project-strip-session"));
+    fireEvent.click(getByRole("menuitem", { name: "All events" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/Alpha-session/notifications",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          notify_on_waiting: true,
+          notify_on_idle: true,
+          notify_on_error: true,
+        }),
+      }),
+    );
+
+    fireEvent.contextMenu(getByTestId("project-strip-session"));
+    expect(getByRole("menuitem", { name: /All events/ })).toBeTruthy();
+  });
+
+  it("does not mutate project or session actions in read-only mode", () => {
+    const onUpdateAppearance = vi.fn();
+    const { getByRole, getByTestId, queryByTestId } = render(
+      <ProjectStrip
+        groups={[group("ReadOnly", "/tmp/read-only", "Running")]}
+        activeSessionId="ReadOnly-session"
+        activeWorkspaceId="ReadOnly-workspace"
+        onSelectWorkspace={vi.fn()}
+        onSelectSession={vi.fn()}
+        onCreateSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onReorderWorkspaces={vi.fn()}
+        onUpdateAppearance={onUpdateAppearance}
+        readOnly
+      />,
+    );
+
+    fireEvent.doubleClick(getByTestId("project-strip-tab"));
+    fireEvent.click(getByRole("menuitem", { name: /Rename project/i }));
+    expect(queryByTestId("project-strip-rename-input")).toBeNull();
+    fireEvent.click(getByTestId("project-strip-color-amber"));
+    expect(onUpdateAppearance).not.toHaveBeenCalled();
+
+    fireEvent.contextMenu(getByTestId("project-strip-session"));
+    fireEvent.click(getByRole("menuitem", { name: "Rename" }));
+    expect(queryByTestId("project-strip-session-rename-input")).toBeNull();
   });
 
   it("shows sidebar-equivalent session menu actions", () => {

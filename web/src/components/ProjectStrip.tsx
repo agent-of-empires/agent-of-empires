@@ -213,6 +213,12 @@ export function ProjectStrip({
   } | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [sessionTitleOverrides, setSessionTitleOverrides] = useState<
+    Record<string, string>
+  >({});
+  const [sessionNotifyOverrides, setSessionNotifyOverrides] = useState<
+    Record<string, NotifyPreset>
+  >({});
   const [renameValue, setRenameValue] = useState("");
   const renameRef = useRef<HTMLInputElement | null>(null);
   const sessionRenameRef = useRef<HTMLInputElement | null>(null);
@@ -336,6 +342,7 @@ export function ProjectStrip({
   }, [sessionMenu]);
 
   const startRename = (group: RepoGroup) => {
+    if (readOnly) return;
     setMenu(null);
     setRenameValue(group.alias ?? group.defaultDisplayName);
     setRenamingGroupId(group.id);
@@ -343,21 +350,32 @@ export function ProjectStrip({
 
   const commitRename = (group: RepoGroup) => {
     setRenamingGroupId(null);
+    if (readOnly) return;
     const trimmed = renameValue.trim();
     onUpdateAppearance(group.id, { alias: trimmed || null });
   };
 
   const startRenameSession = (session: SessionResponse) => {
+    if (readOnly) return;
     setSessionMenu(null);
-    setRenameValue(session.title.trim() || session.tool);
+    setRenameValue(
+      sessionTitleOverrides[session.id] ?? (session.title.trim() || session.tool),
+    );
     setRenamingSessionId(session.id);
   };
 
   const commitSessionRename = async (session: SessionResponse) => {
     setRenamingSessionId(null);
+    if (readOnly) return;
     const trimmed = renameValue.trim();
-    if (!trimmed || trimmed === session.title.trim()) return;
-    await renameSession(session.id, trimmed);
+    const currentTitle = sessionTitleOverrides[session.id] ?? session.title.trim();
+    if (!trimmed || trimmed === currentTitle) return;
+    if (await renameSession(session.id, trimmed)) {
+      setSessionTitleOverrides((titles) => ({
+        ...titles,
+        [session.id]: trimmed,
+      }));
+    }
   };
 
   const setNotifyPreset = async (
@@ -365,17 +383,23 @@ export function ProjectStrip({
     preset: NotifyPreset,
   ) => {
     setSessionMenu(null);
-    if (
-      preset ===
+    if (readOnly) return;
+    const currentPreset =
+      sessionNotifyOverrides[session.id] ??
       detectNotifyPreset(
         session.notify_on_waiting,
         session.notify_on_idle,
         session.notify_on_error,
-      )
-    ) {
+      );
+    if (preset === currentPreset) {
       return;
     }
-    await setSessionNotifications(session.id, preset);
+    if (await setSessionNotifications(session.id, preset)) {
+      setSessionNotifyOverrides((presets) => ({
+        ...presets,
+        [session.id]: preset,
+      }));
+    }
   };
 
   if (groups.length === 0) return null;
@@ -419,7 +443,7 @@ export function ProjectStrip({
                     <button
                       ref={active ? activeButtonRef : undefined}
                       type="button"
-                      aria-selected={active}
+                      aria-current={active ? "page" : undefined}
                       aria-haspopup="menu"
                       data-testid="project-strip-tab"
                       onClick={() => onSelectWorkspace(workspaceId)}
@@ -495,13 +519,16 @@ export function ProjectStrip({
                           role="menu"
                           data-testid="project-strip-menu"
                           style={{ left: menu.x, top: menu.y }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
                           className="fixed z-50 w-48 rounded-md border border-surface-700 bg-surface-950 p-1 shadow-lg"
                         >
                           <button
                             type="button"
                             role="menuitem"
+                            disabled={readOnly}
                             onClick={() => startRename(group)}
-                            className="h-8 w-full rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800"
+                            className="h-8 w-full rounded-md px-2 text-left text-[12px] text-text-secondary transition-colors hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             Rename project
                           </button>
@@ -540,7 +567,9 @@ export function ProjectStrip({
                               <button
                                 key={option.id}
                                 type="button"
+                                disabled={readOnly}
                                 onClick={() => {
+                                  if (readOnly) return;
                                   setMenu(null);
                                   onUpdateAppearance(group.id, { color: option.id });
                                 }}
@@ -550,19 +579,21 @@ export function ProjectStrip({
                                   group.color === option.id
                                     ? "border-text-primary"
                                     : "border-surface-700"
-                                }`}
+                                } disabled:cursor-not-allowed disabled:opacity-40`}
                                 style={repoSwatchStyle(option.id)}
                               />
                             ))}
                             <button
                               type="button"
+                              disabled={readOnly}
                               onClick={() => {
+                                if (readOnly) return;
                                 setMenu(null);
                                 onUpdateAppearance(group.id, { color: null });
                               }}
                               data-testid="project-strip-color-clear"
                               aria-label="Clear background"
-                              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+                              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40 disabled:cursor-not-allowed disabled:opacity-40"
                             >
                               None
                             </button>
@@ -589,15 +620,19 @@ export function ProjectStrip({
             },
             idleDecayWindowMs,
           );
-          const title = session.title.trim() || session.tool;
+          const title =
+            sessionTitleOverrides[session.id] ??
+            (session.title.trim() || session.tool);
           const workspace = activeWorkspaceItems.find((w) =>
             w.sessions.some((s) => s.id === session.id),
           );
-          const notifyPreset = detectNotifyPreset(
-            session.notify_on_waiting,
-            session.notify_on_idle,
-            session.notify_on_error,
-          );
+          const notifyPreset =
+            sessionNotifyOverrides[session.id] ??
+            detectNotifyPreset(
+              session.notify_on_waiting,
+              session.notify_on_idle,
+              session.notify_on_error,
+            );
           const isRenaming = renamingSessionId === session.id;
           return (
             <div
@@ -669,14 +704,17 @@ export function ProjectStrip({
                     role="menu"
                     data-testid="project-strip-session-menu"
                     style={{ left: sessionMenu.x, top: sessionMenu.y }}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
                     className="fixed z-50 min-w-[180px] rounded-lg border border-surface-700 bg-surface-800 py-1 shadow-lg"
                   >
                     <button
                       type="button"
                       role="menuitem"
+                      disabled={readOnly}
                       onClick={() => startRenameSession(session)}
                       data-testid="project-strip-session-menu-rename"
-                      className="w-full px-3 py-2 text-left text-sm text-text-secondary transition-colors hover:bg-surface-700/50"
+                      className="w-full px-3 py-2 text-left text-sm text-text-secondary transition-colors hover:bg-surface-700/50 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       Rename
                     </button>
@@ -697,10 +735,11 @@ export function ProjectStrip({
                           key={preset}
                           type="button"
                           role="menuitem"
+                          disabled={readOnly}
                           onClick={() => void setNotifyPreset(session, preset)}
                           className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-surface-700/50 ${
                             selected ? "text-text-primary" : "text-text-secondary"
-                          }`}
+                          } disabled:cursor-not-allowed disabled:opacity-40`}
                         >
                           <span className="w-3 text-brand-500">
                             {selected ? "✓" : ""}

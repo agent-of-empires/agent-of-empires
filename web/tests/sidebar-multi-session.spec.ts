@@ -59,8 +59,8 @@ async function mockApis(page: Page, sessions: MockSession[]) {
     observed.workspaceOrdering = body.order ?? null;
     return r.fulfill({ json: { ok: true } });
   });
-  await page.route("**/api/sessions/*", async (r) => {
-    const id = r.request().url().split("/api/sessions/")[1] ?? "";
+  await page.route("**/api/sessions/**", async (r) => {
+    const id = (r.request().url().split("/api/sessions/")[1] ?? "").split("/")[0];
     if (r.request().method() === "PATCH") {
       observed.sessionPatch = {
         id,
@@ -414,11 +414,11 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     await page.keyboard.press("Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
-    await expect(projectTab("alpha")).toHaveAttribute("aria-selected", "true");
+    await expect(projectTab("alpha")).toHaveAttribute("aria-current", "page");
 
     await page.keyboard.press("Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
-    await expect(projectTab("beta")).toHaveAttribute("aria-selected", "true");
+    await expect(projectTab("beta")).toHaveAttribute("aria-current", "page");
 
     await page.keyboard.press("Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
@@ -486,6 +486,18 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page.getByRole("menuitem", { name: /Default/ })).toBeVisible();
     await expect(page.getByRole("menuitem", { name: "All events" })).toBeVisible();
     await expect(page.locator("[data-testid='project-strip-session-menu-delete']")).toBeVisible();
+    await page.getByRole("menuitem", { name: "All events" }).click();
+    await expect
+      .poll(() => observed.sessionPatch)
+      .toMatchObject({
+        id: "sess-c",
+        body: {
+          notify_on_waiting: true,
+          notify_on_idle: true,
+          notify_on_error: true,
+        },
+      });
+    await sessionChip.click({ button: "right" });
     await page.getByRole("menuitem", { name: "Rename" }).click();
     await page.locator("[data-testid='project-strip-session-rename-input']").fill("Goths Renamed");
     await page.locator("[data-testid='project-strip-session-rename-input']").press("Enter");
