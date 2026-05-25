@@ -16,6 +16,17 @@
       ]
     },
     {
+      "id": "terminal.live-output-resize",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useTerminal.lifecycle.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useTerminal.ts"
+      ]
+    },
+    {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",

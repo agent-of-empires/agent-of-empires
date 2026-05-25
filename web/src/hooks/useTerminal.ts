@@ -445,11 +445,21 @@ export function useTerminal(
     // proposed dimensions and pushing them through term.resize each
     // observation breaks that latch and reliably propagates the final
     // container size up to the server.
+    let lastObservedWidth = -1;
+    let lastObservedHeight = -1;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
         if (w <= 0 || h <= 0) continue;
+        if (
+          Math.abs(w - lastObservedWidth) < 1 &&
+          Math.abs(h - lastObservedHeight) < 1
+        ) {
+          continue;
+        }
+        lastObservedWidth = w;
+        lastObservedHeight = h;
         try {
           const proposed = fitAddon.proposeDimensions();
           if (

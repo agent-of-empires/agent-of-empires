@@ -33,6 +33,10 @@ const { captured } = vi.hoisted(() => ({
     customKey: undefined as ((e: KeyboardEvent) => boolean) | undefined,
     customWheel: undefined as ((e: WheelEvent) => boolean) | undefined,
     selection: "",
+    resizeObserverCallback: undefined as ResizeObserverCallback | undefined,
+    proposedDimensions: { cols: 100, rows: 30 } as
+      | { cols: number; rows: number }
+      | undefined,
   },
 }));
 
@@ -99,6 +103,9 @@ vi.mock("@xterm/addon-fit", () => {
     fit(): void {
       captured.onResize?.({ cols: 100, rows: 30 });
     }
+    proposeDimensions(): { cols: number; rows: number } | undefined {
+      return captured.proposedDimensions;
+    }
   }
   return { FitAddon: FakeFitAddon };
 });
@@ -123,8 +130,8 @@ vi.mock("@xterm/addon-web-links", () => {
 // hook constructor throws and the whole test file fails to load.
 
 class FakeResizeObserver {
-  constructor(_cb: ResizeObserverCallback) {
-    void _cb;
+  constructor(cb: ResizeObserverCallback) {
+    captured.resizeObserverCallback = cb;
   }
   observe(): void {}
   disconnect(): void {}
@@ -194,6 +201,8 @@ beforeEach(() => {
   captured.customKey = undefined;
   captured.customWheel = undefined;
   captured.selection = "";
+  captured.resizeObserverCallback = undefined;
+  captured.proposedDimensions = { cols: 100, rows: 30 };
   originalWebSocket = global.WebSocket;
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   originalResizeObserver = global.ResizeObserver;
@@ -217,6 +226,13 @@ async function flushAsync(times = 8): Promise<void> {
   await act(async () => {
     for (let i = 0; i < times; i++) await Promise.resolve();
   });
+}
+
+function fireResizeObserver(width: number, height: number): void {
+  const entry = {
+    contentRect: { width, height },
+  } as ResizeObserverEntry;
+  captured.resizeObserverCallback?.([entry], {} as ResizeObserver);
 }
 
 // renderHook attaches its container to document.body for us; the
@@ -392,6 +408,78 @@ describe("useTerminal lifecycle", () => {
       expect(result.current.state.connected).toBe(true);
     } finally {
       FakeFitAddonClass.prototype.fit = origFit;
+      div.remove();
+    }
+  });
+
+  it("does not refit when live output triggers ResizeObserver with unchanged bounds", async () => {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      renderHook(() => {
+        const term = useTerminal("s-live-output", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.OPEN;
+        ws.onopen?.(new Event("open"));
+      });
+      await flushAsync();
+
+      // Prime the observer with the real container bounds. Browsers fire
+      // an initial ResizeObserver notification after observe(), and the
+      // hook should remember that content-box size.
+      act(() => {
+        fireResizeObserver(800, 500);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      await flushAsync();
+
+      const before = ws.sent.length;
+      captured.proposedDimensions = { cols: 101, rows: 31 };
+      act(() => {
+        ws.onmessage?.({
+          data: new TextEncoder().encode("cursor output").buffer,
+        } as MessageEvent);
+        fireResizeObserver(800, 500);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      await flushAsync();
+
+      const resizeAfterOutput = ws.sent
+        .slice(before)
+        .find((m) => typeof m === "string" && m.includes('"resize"'));
+      expect(resizeAfterOutput).toBeUndefined();
+
+      act(() => {
+        fireResizeObserver(900, 500);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      await flushAsync();
+      const resizeAfterRealChange = ws.sent
+        .slice(before)
+        .find(
+          (m) =>
+            typeof m === "string" &&
+            m.includes('"resize"') &&
+            m.includes('"cols":101') &&
+            m.includes('"rows":31'),
+        );
+      expect(resizeAfterRealChange).toBeDefined();
+    } finally {
       div.remove();
     }
   });
