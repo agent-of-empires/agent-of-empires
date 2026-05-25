@@ -18,6 +18,7 @@ export interface WebSettings {
   mobileFontSize: number;
   desktopFontSize: number;
   autoOpenKeyboard: boolean;
+  showTopBar: boolean;
   projectStrip: boolean;
   projectStripShortcut: ProjectStripShortcut;
   persistentTerminals: boolean;
@@ -31,6 +32,7 @@ function getDefaults(): WebSettings {
     mobileFontSize: 8,
     desktopFontSize: 14,
     autoOpenKeyboard: true,
+    showTopBar: true,
     projectStrip: false,
     projectStripShortcut: "alt-hl",
     persistentTerminals: false,
@@ -61,6 +63,10 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
       typeof settings.projectStrip === "boolean"
         ? settings.projectStrip
         : defaults.projectStrip,
+    showTopBar:
+      typeof settings.showTopBar === "boolean"
+        ? settings.showTopBar
+        : defaults.showTopBar,
     projectStripShortcut: isProjectStripShortcut(settings.projectStripShortcut)
       ? settings.projectStripShortcut
       : defaults.projectStripShortcut,

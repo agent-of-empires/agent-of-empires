@@ -209,6 +209,18 @@ describe("ProjectStrip", () => {
     expect(getAllByTestId("project-strip-session")).toHaveLength(1);
   });
 
+  it("keeps selected project session chips to one visible label", () => {
+    const alpha = group("Alpha", "/tmp/alpha", "Running");
+    alpha.workspaces[0]!.branch = "feature/alpha";
+    alpha.workspaces[0]!.displayName = "feature/alpha";
+    alpha.workspaces[0]!.sessions[0]!.title = "Build UI";
+
+    const { getByTestId, queryByText } = renderProjectStrip({ groups: [alpha] });
+
+    expect(getByTestId("project-strip-session").textContent).toContain("Build UI");
+    expect(queryByText("feature/alpha")).toBeNull();
+  });
+
   it("starts a new session from the project options menu without selecting it", () => {
     const onCreateSession = vi.fn();
     const onSelectWorkspace = vi.fn();
@@ -269,6 +281,47 @@ describe("ProjectStrip", () => {
     fireEvent.doubleClick(getByTestId("project-strip-tab"));
     fireEvent.click(getByRole("menuitem", { name: /Delete current session/i }));
 
+    expect(onDeleteSession).toHaveBeenCalledWith("Alpha-workspace");
+  });
+
+  it("renames a session from the selected project session menu", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue({ ok: true } as Response);
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+    });
+
+    fireEvent.contextMenu(getByTestId("project-strip-session"));
+    fireEvent.click(getByRole("menuitem", { name: "Rename" }));
+    const input = getByTestId("project-strip-session-rename-input");
+    fireEvent.change(input, { target: { value: "Review patch" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/Alpha-session",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ title: "Review patch" }),
+      }),
+    );
+    fetchMock.mockRestore();
+  });
+
+  it("shows sidebar-equivalent session menu actions", () => {
+    const onDeleteSession = vi.fn();
+    const { getByRole, getByTestId } = renderProjectStrip({
+      groups: [group("Alpha", "/tmp/alpha", "Running")],
+      onDeleteSession,
+    });
+
+    fireEvent.contextMenu(getByTestId("project-strip-session"));
+
+    expect(getByRole("menuitem", { name: "Rename" })).toBeTruthy();
+    expect(getByRole("menuitem", { name: "Off" })).toBeTruthy();
+    expect(getByRole("menuitem", { name: /Default/ })).toBeTruthy();
+    expect(getByRole("menuitem", { name: "All events" })).toBeTruthy();
+    fireEvent.click(getByTestId("project-strip-session-menu-delete"));
     expect(onDeleteSession).toHaveBeenCalledWith("Alpha-workspace");
   });
 

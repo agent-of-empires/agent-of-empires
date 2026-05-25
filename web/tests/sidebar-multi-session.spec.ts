@@ -16,8 +16,12 @@ interface MockSession {
 }
 
 async function mockApis(page: Page, sessions: MockSession[]) {
-  const observed: { workspaceOrdering: string[] | null } = {
+  const observed: {
+    workspaceOrdering: string[] | null;
+    sessionPatch: { id: string; body: Record<string, unknown> } | null;
+  } = {
     workspaceOrdering: null,
+    sessionPatch: null,
   };
   await page.route("**/api/login/status", (r) =>
     r.fulfill({ json: { required: false, authenticated: true } }),
@@ -54,6 +58,20 @@ async function mockApis(page: Page, sessions: MockSession[]) {
     const body = r.request().postDataJSON() as { order?: string[] };
     observed.workspaceOrdering = body.order ?? null;
     return r.fulfill({ json: { ok: true } });
+  });
+  await page.route("**/api/sessions/*", async (r) => {
+    const id = r.request().url().split("/api/sessions/")[1] ?? "";
+    if (r.request().method() === "PATCH") {
+      observed.sessionPatch = {
+        id,
+        body: r.request().postDataJSON() as Record<string, unknown>,
+      };
+      return r.fulfill({ json: { ok: true } });
+    }
+    if (r.request().method() === "DELETE") {
+      return r.fulfill({ json: { ok: true } });
+    }
+    return r.fulfill({ status: 400 });
   });
   for (const path of [
     "settings",
@@ -456,11 +474,47 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.keyboard.press("Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-c$/);
 
+    const sessionChip = page.locator("[data-testid='project-strip-session']").filter({
+      hasText: "Goths",
+    });
+    await expect(sessionChip).toHaveCount(1);
+    await expect(sessionChip).not.toContainText("gamma");
+    await sessionChip.click({ button: "right" });
+    await expect(page.locator("[data-testid='project-strip-session-menu']")).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Off" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: /Default/ })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "All events" })).toBeVisible();
+    await expect(page.locator("[data-testid='project-strip-session-menu-delete']")).toBeVisible();
+    await page.getByRole("menuitem", { name: "Rename" }).click();
+    await page.locator("[data-testid='project-strip-session-rename-input']").fill("Goths Renamed");
+    await page.locator("[data-testid='project-strip-session-rename-input']").press("Enter");
+    await expect
+      .poll(() => observed.sessionPatch)
+      .toMatchObject({ id: "sess-c", body: { title: "Goths Renamed" } });
+
     await page.evaluate(() => {
       window.localStorage.setItem(
         "aoe-web-settings",
         JSON.stringify({
           projectStrip: true,
+          showTopBar: false,
+        }),
+      );
+    });
+    await page.reload();
+    await expect(page.locator("header")).toHaveCount(0);
+    await expect(page.getByText("Search anything…")).toHaveCount(0);
+    await expect(strip).toBeVisible();
+    await page.keyboard.press("Alt+H");
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
+
+    await page.evaluate(() => {
+      window.localStorage.setItem(
+        "aoe-web-settings",
+        JSON.stringify({
+          projectStrip: true,
+          showTopBar: false,
           projectStripShortcut: "disabled",
         }),
       );
@@ -468,6 +522,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.reload();
 
     await page.keyboard.press("Alt+L");
-    await expect(page).toHaveURL(/\/session\/sess-c$/);
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 });

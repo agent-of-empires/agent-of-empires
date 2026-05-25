@@ -881,21 +881,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
       style={rootStyle}
     >
-      <TopBar
-        activeWorkspace={activeWorkspace}
-        activeSession={activeSession ?? null}
-        onToggleSidebar={handleToggleSidebar}
-        onOpenPalette={() => setShowPalette(true)}
-        onToggleDiff={toggleDiff}
-        diffCollapsed={diffCollapsed}
-        onOpenHelp={handleOpenHelp}
-        onOpenAbout={handleOpenAbout}
-        onLogout={onLogout}
-        loginRequired={loginRequired}
-        isOffline={!!error}
-        isDevBuild={isDebugBuild(serverAbout)}
-        onGoDashboard={handleGoDashboard}
-      />
+      {webSettings.showTopBar && (
+        <TopBar
+          activeWorkspace={activeWorkspace}
+          activeSession={activeSession ?? null}
+          onToggleSidebar={handleToggleSidebar}
+          onOpenPalette={() => setShowPalette(true)}
+          onToggleDiff={toggleDiff}
+          diffCollapsed={diffCollapsed}
+          onOpenHelp={handleOpenHelp}
+          onOpenAbout={handleOpenAbout}
+          onLogout={onLogout}
+          loginRequired={loginRequired}
+          isOffline={!!error}
+          isDevBuild={isDebugBuild(serverAbout)}
+          onGoDashboard={handleGoDashboard}
+        />
+      )}
 
       {webSettings.projectStrip && !showSettings && !showProjects && (
         <ProjectStrip

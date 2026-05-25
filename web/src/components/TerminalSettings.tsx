@@ -130,6 +130,27 @@ export function TerminalSettings() {
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <div>
               <div className="text-[13px] text-text-secondary">
+                Top header
+              </div>
+              <p className="text-[11px] text-text-muted mt-1">
+                Show the header with Search anything, sidebar, and utility
+                controls. Hide it when the project strip is your primary
+                navigation.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={settings.showTopBar}
+              onChange={(e) => update({ showTopBar: e.target.checked })}
+              className="accent-brand-600 w-4 h-4 shrink-0"
+            />
+          </label>
+        </div>
+
+        <div>
+          <label className="flex items-center justify-between gap-3 cursor-pointer">
+            <div>
+              <div className="text-[13px] text-text-secondary">
                 Project strip{" "}
                 <span className="font-mono text-[11px] text-text-muted">
                   (Beta)

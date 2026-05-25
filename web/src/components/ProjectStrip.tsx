@@ -28,7 +28,6 @@ import type {
   RepoGroup,
   SessionResponse,
   SessionStatus,
-  Workspace,
 } from "../lib/types";
 import {
   REPO_COLOR_OPTIONS,
@@ -37,6 +36,7 @@ import {
 } from "../lib/repoAppearance";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { renameSession, setSessionNotifications } from "../lib/api";
 import { StatusGlyph } from "./StatusGlyph";
 
 interface Props {
@@ -65,6 +65,18 @@ const STATUS_PRIORITY: SessionStatus[] = [
 ];
 
 const RECENT_FINISH_WINDOW_MS = 5 * 60 * 1000;
+
+type NotifyPreset = "off" | "default" | "all";
+
+function detectNotifyPreset(
+  waiting: boolean | null | undefined,
+  idle: boolean | null | undefined,
+  error: boolean | null | undefined,
+): NotifyPreset {
+  if (waiting === false && idle === false && error === false) return "off";
+  if (waiting === true && idle === true && error === true) return "all";
+  return "default";
+}
 
 function statusRank(status: SessionStatus): number {
   const idx = STATUS_PRIORITY.indexOf(status);
@@ -122,10 +134,6 @@ function repoColorStyle(color: RepoColor | null): CSSProperties | undefined {
 
 function repoSwatchStyle(color: RepoColor): CSSProperties {
   return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
-}
-
-function workspaceLabel(workspace: Workspace) {
-  return workspace.branch ?? workspace.displayName ?? "default";
 }
 
 function hasRecentlyFinishedSession(
@@ -192,14 +200,22 @@ export function ProjectStrip({
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const activeButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const sessionMenuRef = useRef<HTMLDivElement | null>(null);
   const [menu, setMenu] = useState<{
     groupId: string;
     x: number;
     y: number;
   } | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const renameRef = useRef<HTMLInputElement | null>(null);
+  const sessionRenameRef = useRef<HTMLInputElement | null>(null);
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
@@ -207,7 +223,13 @@ export function ProjectStrip({
 
   const openMenuForGroup = (groupId: string, element: HTMLElement) => {
     const rect = element.getBoundingClientRect();
+    setSessionMenu(null);
     setMenu({ groupId, x: rect.left, y: rect.bottom + 4 });
+  };
+
+  const openMenuForSession = (sessionId: string, x: number, y: number) => {
+    setMenu(null);
+    setSessionMenu({ sessionId, x, y });
   };
 
   const items = useMemo(
@@ -266,6 +288,10 @@ export function ProjectStrip({
   }, [renamingGroupId]);
 
   useEffect(() => {
+    if (renamingSessionId) sessionRenameRef.current?.select();
+  }, [renamingSessionId]);
+
+  useEffect(() => {
     if (!menu) return;
     const close = (event: MouseEvent) => {
       if (menuRef.current?.contains(event.target as Node)) return;
@@ -287,6 +313,28 @@ export function ProjectStrip({
     };
   }, [menu]);
 
+  useEffect(() => {
+    if (!sessionMenu) return;
+    const close = (event: MouseEvent) => {
+      if (sessionMenuRef.current?.contains(event.target as Node)) return;
+      setSessionMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSessionMenu(null);
+    };
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", close);
+      document.addEventListener("contextmenu", close);
+      document.addEventListener("keydown", onKeyDown);
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sessionMenu]);
+
   const startRename = (group: RepoGroup) => {
     setMenu(null);
     setRenameValue(group.alias ?? group.defaultDisplayName);
@@ -297,6 +345,37 @@ export function ProjectStrip({
     setRenamingGroupId(null);
     const trimmed = renameValue.trim();
     onUpdateAppearance(group.id, { alias: trimmed || null });
+  };
+
+  const startRenameSession = (session: SessionResponse) => {
+    setSessionMenu(null);
+    setRenameValue(session.title.trim() || session.tool);
+    setRenamingSessionId(session.id);
+  };
+
+  const commitSessionRename = async (session: SessionResponse) => {
+    setRenamingSessionId(null);
+    const trimmed = renameValue.trim();
+    if (!trimmed || trimmed === session.title.trim()) return;
+    await renameSession(session.id, trimmed);
+  };
+
+  const setNotifyPreset = async (
+    session: SessionResponse,
+    preset: NotifyPreset,
+  ) => {
+    setSessionMenu(null);
+    if (
+      preset ===
+      detectNotifyPreset(
+        session.notify_on_waiting,
+        session.notify_on_idle,
+        session.notify_on_error,
+      )
+    ) {
+      return;
+    }
+    await setSessionNotifications(session.id, preset);
   };
 
   if (groups.length === 0) return null;
@@ -514,42 +593,143 @@ export function ProjectStrip({
           const workspace = activeWorkspaceItems.find((w) =>
             w.sessions.some((s) => s.id === session.id),
           );
-          const label = workspace ? workspaceLabel(workspace) : null;
+          const notifyPreset = detectNotifyPreset(
+            session.notify_on_waiting,
+            session.notify_on_idle,
+            session.notify_on_error,
+          );
+          const isRenaming = renamingSessionId === session.id;
           return (
-            <button
+            <div
               key={session.id}
-              type="button"
-              aria-current={session.id === activeSessionId ? "page" : undefined}
-              data-testid="project-strip-session"
-              onClick={() => onSelectSession(session.id)}
-              className={`flex h-7 w-[8.5rem] shrink-0 items-center gap-1 rounded-md px-1.5 text-left transition-colors ${
-                session.id === activeSessionId
-                  ? "bg-surface-800 text-text-primary"
-                  : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"
-              }`}
-              title={`${title} · ${session.project_path}`}
+              className="relative shrink-0"
             >
-              <span
-                className={`w-3 shrink-0 text-center font-mono text-[9px] ${textClass}`}
-                aria-hidden="true"
-              >
-                <StatusGlyph
-                  status={session.status}
-                  createdAt={session.created_at}
-                  idleEnteredAt={session.idle_entered_at}
+              {isRenaming ? (
+                <input
+                  ref={sessionRenameRef}
+                  type="text"
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onBlur={() => void commitSessionRename(session)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void commitSessionRename(session);
+                    if (e.key === "Escape") setRenamingSessionId(null);
+                  }}
+                  data-testid="project-strip-session-rename-input"
+                  className="h-7 w-[8.5rem] rounded-md border border-brand-600 bg-surface-950 px-1.5 text-[10px] text-text-primary outline-none"
                 />
-              </span>
-              <span className="min-w-0">
-                <span className="block truncate text-[10px] leading-3">
-                  {title}
-                </span>
-                {label && (
-                  <span className="block truncate text-[9px] leading-3 text-text-dim">
-                    {label}
+              ) : (
+                <button
+                  type="button"
+                  aria-current={session.id === activeSessionId ? "page" : undefined}
+                  aria-haspopup="menu"
+                  data-testid="project-strip-session"
+                  onClick={() => onSelectSession(session.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    openMenuForSession(session.id, e.clientX, e.clientY);
+                  }}
+                  onKeyDown={(e) => {
+                    if (
+                      e.key !== "ContextMenu" &&
+                      !(e.shiftKey && e.key === "F10")
+                    ) {
+                      return;
+                    }
+                    e.preventDefault();
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    openMenuForSession(session.id, rect.left + 12, rect.bottom + 4);
+                  }}
+                  className={`flex h-7 w-[8.5rem] items-center gap-1 rounded-md px-1.5 text-left transition-colors ${
+                    session.id === activeSessionId
+                      ? "bg-surface-800 text-text-primary"
+                      : "text-text-muted hover:bg-surface-800/70 hover:text-text-secondary"
+                  }`}
+                  title={`${title} · ${session.project_path}`}
+                >
+                  <span
+                    className={`w-3 shrink-0 text-center font-mono text-[9px] ${textClass}`}
+                    aria-hidden="true"
+                  >
+                    <StatusGlyph
+                      status={session.status}
+                      createdAt={session.created_at}
+                      idleEnteredAt={session.idle_entered_at}
+                    />
                   </span>
+                  <span className="block min-w-0 truncate text-[10px] leading-3">
+                    {title}
+                  </span>
+                </button>
+              )}
+              {sessionMenu?.sessionId === session.id &&
+                createPortal(
+                  <div
+                    ref={sessionMenuRef}
+                    role="menu"
+                    data-testid="project-strip-session-menu"
+                    style={{ left: sessionMenu.x, top: sessionMenu.y }}
+                    className="fixed z-50 min-w-[180px] rounded-lg border border-surface-700 bg-surface-800 py-1 shadow-lg"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => startRenameSession(session)}
+                      data-testid="project-strip-session-menu-rename"
+                      className="w-full px-3 py-2 text-left text-sm text-text-secondary transition-colors hover:bg-surface-700/50"
+                    >
+                      Rename
+                    </button>
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Notifications
+                    </div>
+                    {(["off", "default", "all"] as const).map((preset) => {
+                      const label =
+                        preset === "off"
+                          ? "Off"
+                          : preset === "default"
+                            ? "Default"
+                            : "All events";
+                      const selected = notifyPreset === preset;
+                      return (
+                        <button
+                          key={preset}
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void setNotifyPreset(session, preset)}
+                          className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-surface-700/50 ${
+                            selected ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          <span className="w-3 text-brand-500">
+                            {selected ? "✓" : ""}
+                          </span>
+                          {label}
+                        </button>
+                      );
+                    })}
+                    {!readOnly && workspace && onDeleteSession && (
+                      <>
+                        <div className="border-t border-surface-700/20 my-1" />
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setSessionMenu(null);
+                            onDeleteSession(workspace.id);
+                          }}
+                          data-testid="project-strip-session-menu-delete"
+                          className="w-full px-3 py-2 text-left text-sm text-status-error transition-colors hover:bg-status-error/10"
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </div>,
+                  document.body,
                 )}
-              </span>
-            </button>
+            </div>
           );
         })}
       </div>
