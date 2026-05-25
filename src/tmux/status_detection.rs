@@ -5,7 +5,7 @@ use crate::session::Status;
 use super::utils::strip_ansi;
 
 const SPINNER_CHARS: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⣻",
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⠞", "⣻",
 ];
 const LIVE_ACTIVITY_WORDS: &[&str] = &[
     "analyzing",
@@ -775,6 +775,10 @@ pub fn detect_cursor_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
+    if cursor_has_background_task(&recent_lower) {
+        return Status::Running;
+    }
+
     if has_spinner_activity_line(&recent) {
         return Status::Running;
     }
@@ -784,6 +788,10 @@ pub fn detect_cursor_status(raw_content: &str) -> Status {
     }
 
     Status::Idle
+}
+
+fn cursor_has_background_task(text_lower: &str) -> bool {
+    text_lower.contains("background task") || text_lower.contains("background tasks")
 }
 
 /// Copilot CLI status detection via tmux pane parsing.
@@ -1171,6 +1179,32 @@ mod tests {
   → Add a follow-up                                      ctrl+c to stop
 
   Composer 2.5 · 48.2%                                  Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_calling_spinner() {
+        let content = "\
+ ⠀⠞ Calling  23.62k tokens
+
+
+  → Add a follow-up  ctrl+c to stop
+
+
+  Composer 2.5 · 55.7% · 49 files edited  Auto-run
+";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_background_task() {
+        let content = "\
+  → Add a follow-up
+
+
+  1 background task
+  Composer 2.5 · 39.2% · 20 files edited  Auto-run
+";
         assert_eq!(detect_cursor_status(content), Status::Running);
     }
 
