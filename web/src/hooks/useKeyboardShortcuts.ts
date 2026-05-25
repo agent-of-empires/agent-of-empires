@@ -81,12 +81,18 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
         return;
       }
 
+      const projectStripShortcut =
+        actions.projectStripShortcut ?? "ctrl-alt-hl";
+      const isProjectNavigationShortcut = matchesProjectNavigationShortcut(
+        e,
+        projectStripShortcut,
+      );
       if (
-        matchesProjectNavigationShortcut(
-          e,
-          actions.projectStripShortcut ?? "alt-hl",
-        ) &&
-        (!isInput || isTerminalInput || isProjectStripInput)
+        isProjectNavigationShortcut &&
+        (!isInput ||
+          isTerminalInput ||
+          isProjectStripInput ||
+          projectStripShortcut === "ctrl-alt-hl")
       ) {
         const action =
           e.code === "KeyH" ? actions.onPreviousProject : actions.onNextProject;

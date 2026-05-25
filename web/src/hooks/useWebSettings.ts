@@ -34,7 +34,7 @@ function getDefaults(): WebSettings {
     autoOpenKeyboard: true,
     showTopBar: true,
     projectStrip: false,
-    projectStripShortcut: "alt-hl",
+    projectStripShortcut: "ctrl-alt-hl",
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",

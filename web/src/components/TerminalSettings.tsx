@@ -11,8 +11,8 @@ const PROJECT_STRIP_SHORTCUTS: Array<{
   value: ProjectStripShortcut;
   label: string;
 }> = [
-  { value: "alt-hl", label: "Alt+H / Alt+L" },
   { value: "ctrl-alt-hl", label: "Ctrl+Alt+H / Ctrl+Alt+L" },
+  { value: "alt-hl", label: "Alt+H / Alt+L" },
   { value: "ctrl-hl", label: "Ctrl+H / Ctrl+L" },
   { value: "disabled", label: "Off" },
 ];
@@ -130,11 +130,11 @@ export function TerminalSettings() {
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <div>
               <div className="text-[13px] text-text-secondary">
-                Top header
+                Show top header
               </div>
               <p className="text-[11px] text-text-muted mt-1">
-                Show the header with Search anything, sidebar, and utility
-                controls. Hide it when the project strip is your primary
+                Toggle the Search anything header, sidebar button, and utility
+                controls. Turn this off when the project strip is your primary
                 navigation.
               </p>
             </div>
@@ -189,8 +189,8 @@ export function TerminalSettings() {
                 ))}
               </select>
               <p className="text-[11px] text-text-muted mt-1">
-                Alt+H/L matches zellij-style pane navigation. Ctrl+H and Ctrl+L
-                are also available but browsers may reserve them.
+                Ctrl+Alt+H/L avoids more browser menu conflicts. Alt+H/L is
+                closer to zellij, but browsers may reserve it.
               </p>
             </div>
           )}

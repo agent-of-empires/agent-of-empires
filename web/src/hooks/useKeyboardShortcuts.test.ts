@@ -85,18 +85,20 @@ describe("useKeyboardShortcuts", () => {
     expect(actions.onToggleSidebar).not.toHaveBeenCalled();
   });
 
-  it("routes Alt+H and Alt+L to project navigation actions by default", () => {
+  it("routes Ctrl+Alt+H and Ctrl+Alt+L to project navigation actions by default", () => {
     const actions = makeActions();
     renderHook(() => useKeyboardShortcuts(() => actions));
 
     dispatch(document.body, {
       key: "h",
       code: "KeyH",
+      ctrlKey: true,
       altKey: true,
     });
     dispatch(document.body, {
       key: "l",
       code: "KeyL",
+      ctrlKey: true,
       altKey: true,
     });
 
@@ -132,8 +134,8 @@ describe("useKeyboardShortcuts", () => {
     expect(actions.onNextProject).toHaveBeenCalledTimes(1);
   });
 
-  it("does not steal project navigation shortcuts from regular text inputs", () => {
-    const actions = makeActions();
+  it("does not steal Alt-only project navigation shortcuts from regular text inputs", () => {
+    const actions = { ...makeActions(), projectStripShortcut: "alt-hl" as const };
     renderHook(() => useKeyboardShortcuts(() => actions));
     const input = document.createElement("input");
     document.body.appendChild(input);
@@ -141,6 +143,18 @@ describe("useKeyboardShortcuts", () => {
     dispatch(input, { key: "h", code: "KeyH", altKey: true });
 
     expect(actions.onPreviousProject).not.toHaveBeenCalled();
+    input.remove();
+  });
+
+  it("treats Ctrl+Alt project navigation as global even from text inputs", () => {
+    const actions = makeActions();
+    renderHook(() => useKeyboardShortcuts(() => actions));
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+
+    dispatch(input, { key: "l", code: "KeyL", ctrlKey: true, altKey: true });
+
+    expect(actions.onNextProject).toHaveBeenCalledTimes(1);
     input.remove();
   });
 
@@ -153,7 +167,7 @@ describe("useKeyboardShortcuts", () => {
     strip.appendChild(input);
     document.body.appendChild(strip);
 
-    dispatch(input, { key: "l", code: "KeyL", altKey: true });
+    dispatch(input, { key: "l", code: "KeyL", ctrlKey: true, altKey: true });
 
     expect(actions.onNextProject).toHaveBeenCalledTimes(1);
     strip.remove();
@@ -166,7 +180,7 @@ describe("useKeyboardShortcuts", () => {
     textarea.className = "xterm-helper-textarea";
     document.body.appendChild(textarea);
 
-    dispatch(textarea, { key: "l", code: "KeyL", altKey: true });
+    dispatch(textarea, { key: "l", code: "KeyL", ctrlKey: true, altKey: true });
 
     expect(actions.onNextProject).toHaveBeenCalledTimes(1);
     textarea.remove();

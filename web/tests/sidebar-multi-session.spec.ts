@@ -412,15 +412,15 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.goto("/");
     await expect(strip).toBeVisible();
 
-    await page.keyboard.press("Alt+L");
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
     await expect(projectTab("alpha")).toHaveAttribute("aria-current", "page");
 
-    await page.keyboard.press("Alt+L");
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
     await expect(projectTab("beta")).toHaveAttribute("aria-current", "page");
 
-    await page.keyboard.press("Alt+H");
+    await page.keyboard.press("Control+Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
 
     await projectTab("alpha").dblclick();
@@ -471,7 +471,7 @@ test.describe("Sidebar multi-session (#956)", () => {
       .poll(() => observed.workspaceOrdering?.[0] ?? null)
       .toContain("sess-b");
 
-    await page.keyboard.press("Alt+L");
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-c$/);
 
     const sessionChip = page.locator("[data-testid='project-strip-session']").filter({
@@ -518,7 +518,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page.locator("header")).toHaveCount(0);
     await expect(page.getByText("Search anything…")).toHaveCount(0);
     await expect(strip).toBeVisible();
-    await page.keyboard.press("Alt+H");
+    await page.keyboard.press("Control+Alt+H");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
 
     await page.evaluate(() => {
@@ -533,7 +533,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     });
     await page.reload();
 
-    await page.keyboard.press("Alt+L");
+    await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 });

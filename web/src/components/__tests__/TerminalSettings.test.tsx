@@ -110,7 +110,7 @@ describe("TerminalSettings localStorage contract", () => {
     const selects = container.querySelectorAll("select");
     const shortcutSelect = selects[2] as HTMLSelectElement;
 
-    expect(shortcutSelect.value).toBe("alt-hl");
+    expect(shortcutSelect.value).toBe("ctrl-alt-hl");
 
     fireEvent.change(shortcutSelect, { target: { value: "ctrl-hl" } });
     expect(readStored().projectStripShortcut).toBe("ctrl-hl");
