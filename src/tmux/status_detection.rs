@@ -775,15 +775,20 @@ pub fn detect_cursor_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
+    let active_lines = cursor_lines_after_last_prompt(&recent);
+    if has_spinner_activity_line(active_lines) {
+        return Status::Running;
+    }
+
+    if active_lines.iter().any(|line| has_live_activity_word(line)) {
+        return Status::Running;
+    }
+
+    if cursor_has_follow_up_prompt(&recent) {
+        return Status::Idle;
+    }
+
     if cursor_has_background_task(&recent_lower) {
-        return Status::Running;
-    }
-
-    if has_spinner_activity_line(&recent) {
-        return Status::Running;
-    }
-
-    if recent.iter().any(|line| has_live_activity_word(line)) {
         return Status::Running;
     }
 
@@ -792,6 +797,28 @@ pub fn detect_cursor_status(raw_content: &str) -> Status {
 
 fn cursor_has_background_task(text_lower: &str) -> bool {
     text_lower.contains("background task") || text_lower.contains("background tasks")
+}
+
+fn cursor_has_follow_up_prompt(lines: &[&str]) -> bool {
+    cursor_last_follow_up_prompt_index(lines).is_some()
+}
+
+fn cursor_lines_after_last_prompt<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    match cursor_last_follow_up_prompt_index(lines) {
+        Some(index) => &lines[index + 1..],
+        None => lines,
+    }
+}
+
+fn cursor_last_follow_up_prompt_index(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|line| cursor_is_follow_up_prompt(line))
+}
+
+fn cursor_is_follow_up_prompt(line: &str) -> bool {
+    let clean_line = strip_ansi(line).trim().to_lowercase();
+    clean_line == "→" || clean_line.starts_with("→ add a follow-up")
 }
 
 /// Copilot CLI status detection via tmux pane parsing.
@@ -1197,10 +1224,21 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_cursor_status_running_on_background_task() {
+    fn test_detect_cursor_status_idle_on_background_task_after_follow_up_prompt() {
         let content = "\
   → Add a follow-up
 
+
+  1 background task
+  Composer 2.5 · 39.2% · 20 files edited  Auto-run
+";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_background_task_without_prompt() {
+        let content = "\
+  Started processing the request.
 
   1 background task
   Composer 2.5 · 39.2% · 20 files edited  Auto-run
@@ -1252,6 +1290,19 @@ enter to select · esc to cancel";
         ] {
             assert_eq!(detect_cursor_status(content), Status::Idle);
         }
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_stale_spinner_before_follow_up_prompt() {
+        let content = "\
+ ⠘⠆ Editing  39.76k tokens
+
+  Updated src/app/submit/page.tsx
+
+  → Add a follow-up
+
+  Composer 2.5 · 56.1% · 26 files edited  Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
     }
 
     #[test]
