@@ -737,18 +737,40 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             }
         };
 
-        // Collect labeled URLs in preference order (Tailscale > LAN > localhost).
+        // Collect labeled URLs in preference order: Tailscale, LAN, localhost.
         // When bound to 0.0.0.0 we're reachable on all three; on a specific
         // host we just surface that one.
-        let labeled_urls: Vec<(IpKind, String)> = if host == "0.0.0.0" {
-            let mut urls: Vec<(IpKind, String)> = discover_tagged_ips()
-                .into_iter()
-                .map(|(kind, ip)| (kind, make_url(&ip.to_string())))
-                .collect();
-            urls.push((IpKind::Loopback, make_url("localhost")));
+        let labeled_urls: Vec<(String, String)> = if host == "0.0.0.0" {
+            let tagged_ips = discover_tagged_ips();
+            let has_tailscale_ip = tagged_ips
+                .iter()
+                .any(|(kind, _)| *kind == IpKind::Tailscale);
+            let mut urls: Vec<(String, String)> = Vec::new();
+            let mut added_tailscale_dns = false;
+            if has_tailscale_ip {
+                match tunnel::tailscale_dns_name().await {
+                    Ok(dns) => {
+                        urls.push(("tailscale".to_string(), make_url(&dns)));
+                        added_tailscale_dns = true;
+                    }
+                    Err(e) => tracing::debug!(
+                        target: "http.middleware",
+                        "Could not resolve Tailscale DNS name for serve URL list: {e}"
+                    ),
+                }
+            }
+            urls.extend(tagged_ips.into_iter().map(|(kind, ip)| {
+                let label = if kind == IpKind::Tailscale && added_tailscale_dns {
+                    "tailscale-ip"
+                } else {
+                    kind.label()
+                };
+                (label.to_string(), make_url(&ip.to_string()))
+            }));
+            urls.push(("localhost".to_string(), make_url("localhost")));
             urls
         } else {
-            vec![(IpKind::Loopback, make_url(host))]
+            vec![("localhost".to_string(), make_url(host))]
         };
 
         println!("aoe web dashboard running at:");
@@ -778,8 +800,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 contents.push_str(primary);
                 contents.push('\n');
             }
-            for (kind, url) in labeled_urls.iter().skip(1) {
-                contents.push_str(kind.label());
+            for (label, url) in labeled_urls.iter().skip(1) {
+                contents.push_str(label);
                 contents.push('\t');
                 contents.push_str(url);
                 contents.push('\n');

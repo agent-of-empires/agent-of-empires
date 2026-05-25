@@ -742,6 +742,12 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
 }
 
 async fn tailscale_funnel_url() -> anyhow::Result<String> {
+    let host = tailscale_dns_name().await?;
+    debug!(host = %host, "tailscale_funnel_url: resolved stable hostname");
+    Ok(format!("https://{}", host))
+}
+
+pub async fn tailscale_dns_name() -> anyhow::Result<String> {
     let out = Command::new("tailscale")
         .args(["status", "--json"])
         .output()
@@ -767,6 +773,10 @@ async fn tailscale_funnel_url() -> anyhow::Result<String> {
         );
         anyhow::anyhow!("parse tailscale status JSON: {}", e)
     })?;
+    parse_tailscale_dns_name(&parsed)
+}
+
+fn parse_tailscale_dns_name(parsed: &serde_json::Value) -> anyhow::Result<String> {
     let dns = parsed
         .get("Self")
         .and_then(|s| s.get("DNSName"))
@@ -782,8 +792,7 @@ async fn tailscale_funnel_url() -> anyhow::Result<String> {
     if host.is_empty() {
         anyhow::bail!("empty DNSName from tailscale status");
     }
-    debug!(host = %host, "tailscale_funnel_url: resolved stable hostname");
-    Ok(format!("https://{}", host))
+    Ok(host.to_string())
 }
 
 /// Does this ServeConfig proxy URL point at the local machine
@@ -1045,6 +1054,25 @@ mod tests {
         assert!(!proxy_is_loopback("http://100.64.0.1:8080"));
         assert!(!proxy_is_loopback("http://example.com"));
         assert!(!proxy_is_loopback("http://192.168.1.5:8080"));
+    }
+
+    #[test]
+    fn parse_tailscale_dns_name_strips_trailing_dot() {
+        let parsed = serde_json::json!({
+            "Self": {
+                "DNSName": "macbook.tailnet.ts.net."
+            }
+        });
+        assert_eq!(
+            parse_tailscale_dns_name(&parsed).unwrap(),
+            "macbook.tailnet.ts.net"
+        );
+    }
+
+    #[test]
+    fn parse_tailscale_dns_name_rejects_missing_value() {
+        let parsed = serde_json::json!({ "Self": {} });
+        assert!(parse_tailscale_dns_name(&parsed).is_err());
     }
 
     #[test]
