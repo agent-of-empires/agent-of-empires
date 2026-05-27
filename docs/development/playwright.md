@@ -2,6 +2,8 @@
 
 This document is the long-form reference for the web suite. The short version lives in `AGENTS.md` under "Web Dashboard Playwright Tests". Read the short version first.
 
+For the demo/highlight clip workflow that records every spec and stitches the videos into one mp4, see [showcase-video.md](showcase-video.md).
+
 ## The two suites
 
 | Suite | Config | Where | Speed | When to use |
