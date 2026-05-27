@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
+    "test:showcase": "playwright test --config=playwright.showcase.config.ts",
     "test:unit": "vitest run",
     "coverage:merge": "node scripts/merge-coverage.mjs",
     "coverage:all": "rm -rf coverage && AOE_COVERAGE=1 npm run test:unit -- --coverage && AOE_COVERAGE=1 npx playwright test && npm run coverage:merge"
