@@ -146,6 +146,7 @@ async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> 
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -184,6 +185,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn attach_idle_session_does_not_synthesize_stopped() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -225,6 +227,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
 /// the grace; the watchdog must disarm on that first notification rather
 /// than synthesize a spurious `reattach_idle` Stopped.
 #[tokio::test]
+#[serial_test::serial]
 async fn attach_in_flight_disarms_after_first_inbound_notification() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -258,10 +261,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(2500)).await;
     let _ = client.shutdown().await;
 
-    assert_ne!(
-        stopped.as_deref(),
-        Some("reattach_idle"),
-        "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan"
+    assert!(
+        stopped.is_none(),
+        "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
     );
 }
 
