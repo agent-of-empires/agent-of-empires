@@ -317,6 +317,11 @@ export function useTerminal(
     // gesture; `armClipboardCopy()` below pre-arms a gesture-bound
     // `ClipboardItem` promise that this handler resolves. See #1499.
     let osc52Resolve: ((text: string) => void) | null = null;
+    // Monotonic arm counter: each drag-arm captures its own seq so a
+    // stale timeout from a prior arm cannot null out a newer arm's
+    // resolver (which would make the next OSC 52 miss the gesture-bound
+    // path). See #1499.
+    let osc52ArmSeq = 0;
     const writeClipboardText = (text: string) => {
       navigator.clipboard?.writeText(text).catch((err) => {
         // Expected on browsers that won't honor an async write without a
@@ -1308,21 +1313,24 @@ export function useTerminal(
     // (Firefox) fall back to a best-effort writeText, which may be blocked.
     // See #1499.
     const armClipboardCopy = () => {
+      const armSeq = ++osc52ArmSeq;
       let settled = false;
       const finish = () => {
         settled = true;
-        osc52Resolve = null;
+        // Only retract the shared resolver if it still belongs to this
+        // arm; a later drag may have already installed its own.
+        if (osc52ArmSeq === armSeq) osc52Resolve = null;
       };
       try {
         if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
           const pending = new Promise<Blob>((resolve, reject) => {
             osc52Resolve = (text) => {
-              if (settled) return;
+              if (settled || osc52ArmSeq !== armSeq) return;
               finish();
               resolve(new Blob([text], { type: "text/plain" }));
             };
             setTimeout(() => {
-              if (settled) return;
+              if (settled || osc52ArmSeq !== armSeq) return;
               finish();
               reject(new Error("osc52 clipboard timeout"));
             }, OSC52_CLIPBOARD_TIMEOUT_MS);
@@ -1343,12 +1351,12 @@ export function useTerminal(
         // the best-effort writeText path below.
       }
       osc52Resolve = (text) => {
-        if (settled) return;
+        if (settled || osc52ArmSeq !== armSeq) return;
         finish();
         writeClipboardText(text);
       };
       setTimeout(() => {
-        if (!settled) finish();
+        if (!settled && osc52ArmSeq === armSeq) finish();
       }, OSC52_CLIPBOARD_TIMEOUT_MS);
     };
     let mouseDownPoint: { x: number; y: number } | null = null;
