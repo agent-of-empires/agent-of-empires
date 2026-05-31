@@ -111,14 +111,11 @@ pub async fn reconcile_cockpit_workers(
     // batched activity query does not run on every 2s tick. Runs BEFORE
     // the resume snapshot below: a worker marked dormant here is excluded
     // from this same tick's respawn pass by the `!i.is_idle_dormant()`
-    // filter. `auto_stop_idle_secs == 0` (default) disables the feature.
-    let auto_stop_idle_secs =
-        crate::session::profile_config::resolve_config_or_warn(&state.profile)
-            .cockpit
-            .auto_stop_idle_secs;
-    if auto_stop_idle_secs > 0 && last_idle_reap.map_or(true, |t| t.elapsed() >= IDLE_REAP_INTERVAL)
-    {
-        reap_idle_workers(state, auto_stop_idle_secs).await;
+    // filter. The idle threshold is resolved per session profile inside
+    // `reap_idle_workers`; `auto_stop_idle_secs == 0` (the default)
+    // disables the feature for sessions on that profile.
+    if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
+        reap_idle_workers(state).await;
         *last_idle_reap = Some(std::time::Instant::now());
     }
 
@@ -348,7 +345,7 @@ fn should_auto_stop(
 /// a still-running worker the next tick would respawn. `has_in_flight_turn`
 /// is re-checked immediately before shutdown to avoid killing a worker a
 /// prompt started in the gap since the candidate snapshot.
-async fn reap_idle_workers(state: &Arc<AppState>, idle_secs: u32) {
+async fn reap_idle_workers(state: &Arc<AppState>) {
     // Candidates: cockpit sessions not already sunk/dormant. Snapshot
     // (id, profile) under the read lock so we don't hold it across awaits.
     let candidates: Vec<(String, String)> = {
@@ -364,18 +361,48 @@ async fn reap_idle_workers(state: &Arc<AppState>, idle_secs: u32) {
     if candidates.is_empty() {
         return;
     }
-    // Keep only sessions with a live worker; nothing to reap otherwise.
-    let mut live: Vec<(String, String)> = Vec::new();
+    // Resolve auto_stop_idle_secs per distinct profile (config touches
+    // disk, so resolve off-thread, once per profile). Each session is
+    // reaped against its OWN profile's threshold, not the daemon's.
+    let distinct_profiles: Vec<String> = {
+        let mut seen = HashSet::new();
+        candidates
+            .iter()
+            .map(|(_, p)| p.clone())
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    };
+    let idle_by_profile: std::collections::HashMap<String, u32> =
+        tokio::task::spawn_blocking(move || {
+            distinct_profiles
+                .into_iter()
+                .map(|p| {
+                    let secs = crate::session::profile_config::resolve_config_or_warn(&p)
+                        .cockpit
+                        .auto_stop_idle_secs;
+                    (p, secs)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+    // Keep only sessions whose profile enables idle auto-stop and that
+    // have a live worker; nothing to reap otherwise.
+    let mut live: Vec<(String, String, u32)> = Vec::new();
     for (id, profile) in candidates {
+        let idle_secs = idle_by_profile.get(&profile).copied().unwrap_or(0);
+        if idle_secs == 0 {
+            continue;
+        }
         if state.cockpit_supervisor.is_running(&id).await {
-            live.push((id, profile));
+            live.push((id, profile, idle_secs));
         }
     }
     if live.is_empty() {
         return;
     }
     // One batched query for the latest event timestamp per candidate.
-    let ids: Vec<String> = live.iter().map(|(id, _)| id.clone()).collect();
+    let ids: Vec<String> = live.iter().map(|(id, _, _)| id.clone()).collect();
     let store = Arc::clone(&state.cockpit_event_store);
     let latest = match tokio::task::spawn_blocking(move || store.last_event_at_for_sessions(&ids))
         .await
@@ -387,7 +414,7 @@ async fn reap_idle_workers(state: &Arc<AppState>, idle_secs: u32) {
         }
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for (id, profile) in live {
+    for (id, profile, idle_secs) in live {
         // Cheap pre-check (no in-flight probe yet): skips sessions with no
         // history or still within the idle window. Sessions with no events
         // are never reaped, so a freshly-spawned worker is safe.
@@ -456,11 +483,36 @@ async fn reap_idle_workers(state: &Arc<AppState>, idle_secs: u32) {
                     "auto-stopped idle cockpit worker"
                 );
             }
-            Err(e) => tracing::warn!(
-                target: "cockpit.supervisor",
-                session = %id,
-                "idle-reap shutdown failed: {e}"
-            ),
+            Err(e) => {
+                // Shutdown failed and the worker may still be running. Clear
+                // the dormant marker (in-memory + on disk) so future reap and
+                // respawn passes are not permanently blocked for this session
+                // by the resume snapshot's `!is_idle_dormant()` filter. Only
+                // UnknownSession (handled above) means the worker is truly gone.
+                {
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                        inst.idle_dormant_since = None;
+                    }
+                }
+                if let Ok(storage) = crate::session::Storage::new(&profile) {
+                    let id_clear = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        storage.update(|instances, _groups| {
+                            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clear) {
+                                inst.idle_dormant_since = None;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await;
+                }
+                tracing::warn!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    "idle-reap shutdown failed; cleared dormant marker: {e}"
+                );
+            }
         }
     }
 }
@@ -603,7 +655,11 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         }
     };
 
-    let source_profile_for_spawn = sandbox_info.as_ref().map(|_| source_profile.clone());
+    // Thread the session profile through regardless of sandboxing: the
+    // spawn path resolves agent_cockpit_cmd and worker env from it, so a
+    // non-sandbox session on a non-default profile must not fall back to
+    // the default profile.
+    let source_profile_for_spawn = Some(source_profile.clone());
     let spawn_result = supervisor
         .spawn(crate::cockpit::supervisor::SpawnRequest {
             session_id: id.clone(),
