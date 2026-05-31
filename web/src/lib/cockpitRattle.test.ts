@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   chooseVerb,
+  deriveSpinnerState,
   pickIndex,
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -87,6 +88,24 @@ describe("chooseVerb", () => {
     expect(chooseVerb("tool", 42, "Read")).toBe(
       chooseVerb("tool", 42, "Read"),
     );
+  });
+});
+
+describe("deriveSpinnerState (#1213)", () => {
+  it("prefers tool over thinking when both are set", () => {
+    expect(deriveSpinnerState(true, "Terminal")).toBe("tool");
+  });
+
+  it("returns tool when only a tool is in flight", () => {
+    expect(deriveSpinnerState(false, "Terminal")).toBe("tool");
+  });
+
+  it("returns thinking when thinking and no tool", () => {
+    expect(deriveSpinnerState(true, null)).toBe("thinking");
+  });
+
+  it("returns working when neither thinking nor tool", () => {
+    expect(deriveSpinnerState(false, null)).toBe("working");
   });
 });
 

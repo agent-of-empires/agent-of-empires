@@ -954,6 +954,19 @@
       "components": []
     },
     {
+      "id": "cockpit.spinner-tool-precedence",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/__tests__/WorkingSpinner.test.tsx",
+        "src/lib/cockpitTypes.test.ts",
+        "src/lib/cockpitRattle.test.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
       "id": "cockpit.escape-no-cancel",
       "kind": "live-playwright",
       "risk": "medium",

@@ -699,6 +699,10 @@ export function applyEvent(
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
     next.inFlightTool = tc;
+    // The reasoning block produced output (a tool call), so the agent is
+    // no longer thinking. The adapter often skips ThinkingEnded when it
+    // transitions into tool calls, so clear it here. See #1213.
+    next.thinking = false;
     // Skip duplicate tool_start rows. SQLite stores accumulated from
     // pre-fix runs (where post-load history-replay leaked through) can
     // contain the same tool_call_id twice; rendering both makes
@@ -915,6 +919,10 @@ export function applyEvent(
   }
   if ("AgentMessageChunk" in event) {
     next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
+    // Visible assistant text means the agent is answering, not thinking.
+    // A later reasoning block re-sets `thinking` via ThinkingStarted. See
+    // #1213.
+    next.thinking = false;
     next.activity = pushActivity(next.activity, {
       id: `msg-${frame.seq}`,
       kind: "message",
@@ -938,6 +946,10 @@ export function applyEvent(
     // optimistic message above any still-arriving prior-turn agent
     // chunks. See #1170.
     next.inFlightTool = null;
+    // Belt-and-suspenders against a missed ThinkingEnded leaking the
+    // thinking state into the next turn (same defensive shape as the
+    // inFlightTool reset above). See #1213.
+    next.thinking = false;
     sweepOpenToolCalls(next, frame.seq);
     next.lastStoppedSeq = Math.min(
       next.lastStoppedSeq + 1,

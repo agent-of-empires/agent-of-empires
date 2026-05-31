@@ -94,6 +94,21 @@ export const THINKING_VERBS: readonly string[] = [
 ] as const;
 
 /**
+ * Pick the spinner sub-state from the two flags the cockpit tracks.
+ * `tool` is the more specific, I/O-bound signal: a tool in flight means
+ * the agent is blocked waiting on its result, which the user needs to
+ * see over the compute-bound "thinking" state. Prefer it when both are
+ * set (the claude-agent-acp adapter can leave `thinking` latched true
+ * through a tool run by skipping ThinkingEnded). See #1213.
+ */
+export function deriveSpinnerState(
+  thinking: boolean,
+  tool: string | null,
+): "thinking" | "tool" | "working" {
+  return tool ? "tool" : thinking ? "thinking" : "working";
+}
+
+/**
  * Pick a stable random index for a list. The same seed within one
  * turn keeps the verb stable; we generate a fresh seed each turn.
  */
