@@ -161,10 +161,12 @@ export function CockpitRuntime({
         .map((c) => (c.type === "text" ? c.text : ""))
         .join("")
         .trim();
-      const attachments = pendingAttachmentsRef.current;
+      const attachments = [...pendingAttachmentsRef.current];
       if (!text && attachments.length === 0) return;
-      setPendingAttachments([]);
+      // Clear staged attachments only after the send resolves, so a
+      // failed send keeps them staged for retry instead of dropping them.
       await cockpit.sendPrompt(text, attachments);
+      setPendingAttachments([]);
     },
     onCancel: async () => {
       await cockpit.cancelPrompt();
