@@ -20,6 +20,13 @@ const PAGES_DIR = join(__dirname, "..", "src", "pages");
 const PAGES = [
   // --- Guides (docs/guides/ → pages/guides/) ---
   {
+    source: "docs/guides/shell-completions.md",
+    dest: "guides/shell-completions.md",
+    title: "Shell Completions",
+    description:
+      "Install and refresh tab-completion for the aoe CLI in bash, zsh, fish, PowerShell, and elvish.",
+  },
+  {
     source: "docs/guides/diff-view.md",
     dest: "guides/diff-view.md",
     title: "Diff View",
@@ -267,6 +274,7 @@ const URL_MAP = {
   "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
   "docs/api.md": "/docs/api/",
   // Guides
+  "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
   "docs/guides/sandbox.md": "/guides/sandbox/",

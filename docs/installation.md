@@ -58,6 +58,8 @@ The `aoe update` command detects how aoe was installed (Homebrew, the curl insta
 
 Inside the TUI, press `u` when the update bar is visible to run the same flow without leaving the app. Press `Ctrl+x` to dismiss the bar for the current session.
 
+If you installed shell completions as a static file, regenerate it after an update so it picks up new commands and flags. See [Shell Completions](guides/shell-completions.md) for both the static and the always-fresh eval-on-startup setup.
+
 ## Uninstall
 
 To remove Agent of Empires:
