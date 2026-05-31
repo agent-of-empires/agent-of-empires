@@ -130,6 +130,23 @@ fn validate_attachments(
                 format!("unsupported attachment type: {}", up.mime_type),
             ));
         }
+        // Reject oversized payloads before allocating the decoded buffer.
+        // base64 expands 4/3, so an encoded string longer than the
+        // encoded-equivalent of MAX_ATTACHMENT_BYTES can never fit the
+        // decoded cap; bailing here stops a client forcing a huge
+        // allocation (memory-pressure DoS). The decoded-size checks below
+        // remain as the second line of defense. The +4 covers base64
+        // rounding/padding so a legitimately max-sized blob is not rejected.
+        let encoded_limit = MAX_ATTACHMENT_BYTES / 3 * 4 + 4;
+        if up.data.len() > encoded_limit {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "attachment exceeds {} MiB limit",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(up.data.as_bytes())
             .map_err(|_| {
@@ -316,9 +333,10 @@ pub async fn spawn_cockpit(
                 .into_response();
         }
     };
-    let source_profile = sandbox_info
-        .as_ref()
-        .map(|_| instance.source_profile.clone());
+    // Pass the session profile through regardless of sandboxing so the
+    // spawn path resolves agent_cockpit_cmd and worker env from the right
+    // profile for non-sandbox sessions too.
+    let source_profile = Some(instance.source_profile.clone());
     let agent_for_response = agent.clone();
     match state
         .cockpit_supervisor
@@ -515,9 +533,10 @@ pub async fn switch_cockpit_agent(
                 .into_response();
         }
     };
-    let source_profile = sandbox_info
-        .as_ref()
-        .map(|_| instance.source_profile.clone());
+    // Pass the session profile through regardless of sandboxing so the
+    // spawn path resolves agent_cockpit_cmd and worker env from the right
+    // profile for non-sandbox sessions too.
+    let source_profile = Some(instance.source_profile.clone());
 
     let model = req.model.clone().or(instance.cockpit_model.clone());
     let spawn_result = state
@@ -1158,7 +1177,7 @@ pub async fn cockpit_enable(
         || state
             .cockpit_supervisor
             .custom_agent_has_cockpit_cmd(
-                &instance.tool,
+                &agent_name,
                 &profile,
                 std::path::Path::new(&instance.project_path),
             )
@@ -1247,7 +1266,10 @@ pub async fn cockpit_enable(
                 return;
             }
         };
-        let source_profile = sandbox_info.as_ref().map(|_| profile_for_spawn);
+        // Pass the session profile through regardless of sandboxing so the
+        // spawn path resolves agent_cockpit_cmd and worker env from the right
+        // profile for non-sandbox sessions too.
+        let source_profile = Some(profile_for_spawn);
         if let Err(e) = supervisor
             .spawn(crate::cockpit::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
