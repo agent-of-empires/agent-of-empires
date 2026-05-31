@@ -198,7 +198,8 @@ pub trait BroadcastSink: Send + Sync + 'static {
         _session_id: &str,
         _seq: u64,
         _blob: &crate::cockpit::event_store::AttachmentBlob,
-    ) {
+    ) -> bool {
+        true
     }
     /// Roll back blobs for one prompt seq. Used when publishing the
     /// matching `UserPromptSent` fails durability, so refs and blobs
@@ -790,7 +791,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         let seq = next_seq(&self.next_seqs, session_id);
         let mut refs = Vec::with_capacity(attachments.len());
         for blob in attachments {
-            self.sink.record_attachment(session_id, seq, blob);
+            if !self.sink.record_attachment(session_id, seq, blob) {
+                // A blob failed to persist; roll back any siblings already
+                // written for this seq and abort before publishing, so the
+                // UserPromptSent never carries refs load_attachment() can't serve.
+                self.sink.delete_attachments_for_seq(session_id, seq);
+                return;
+            }
             refs.push(crate::cockpit::state::PromptAttachmentRef {
                 id: blob.id.clone(),
                 kind: blob.kind,
@@ -2457,13 +2464,11 @@ impl BroadcastSink for ChannelSink {
         session_id: &str,
         seq: u64,
         blob: &crate::cockpit::event_store::AttachmentBlob,
-    ) {
+    ) -> bool {
         match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                tokio::task::block_in_place(|| {
-                    self.event_store.record_attachment(session_id, seq, blob)
-                });
-            }
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.record_attachment(session_id, seq, blob)
+            }),
             _ => self.event_store.record_attachment(session_id, seq, blob),
         }
     }

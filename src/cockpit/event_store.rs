@@ -69,6 +69,7 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "ModesAvailable",
     "CurrentModeChanged",
     "AcpSessionAssigned",
+    "PromptCapabilities",
 ];
 
 /// Build the `AND event_json NOT LIKE '{"Name":%'` SQL fragment for every
@@ -921,7 +922,11 @@ impl EventStore {
     /// client that receives the `UserPromptSent` can immediately fetch
     /// the blob over the GET endpoint. Idempotent on
     /// `(session_id, attachment_id)`.
-    pub fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) {
+    /// Returns `true` on success. On failure the caller must abort
+    /// publishing the matching `UserPromptSent` and roll back any blobs
+    /// already recorded for this seq, so attachment refs never point at
+    /// rows `load_attachment()` cannot serve.
+    pub fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let conn = match self.conn.lock() {
             Ok(g) => g,
@@ -948,7 +953,9 @@ impl EventStore {
                 attachment = %blob.id,
                 "insert attachment failed: {e}"
             );
+            return false;
         }
+        true
     }
 
     /// Drop all attachment blobs owned by one prompt seq. Used as a
