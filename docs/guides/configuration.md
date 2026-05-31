@@ -40,6 +40,18 @@ All settings below can also be edited from the TUI settings screen (press `s` or
 | `AOE_ACP_TRACE` | Add the ACP framework's raw JSON-RPC firehose to `debug.log` (`1` to enable). Very chatty; useful for chasing schema mismatches. |
 | `AOE_TERMINAL_TRACE` | Add per-message byte tracing for the web terminal WebSocket relay to `debug.log` (`1` to enable). Bumps the `terminal` target to `trace`, surfacing every PTY read/write and every WS send/recv. Spammy under load (a busy claude session emits thousands of frames/min); use only when chasing terminal disconnect bugs. |
 
+### Terminal latency instrumentation
+
+The web dashboard can attribute keystroke-to-echo lag (the gap between pressing a key and seeing the character) to network versus server and PTY hops. Append `?debug=terminal-timing` to the dashboard URL. This is a measurement aid only; it changes no behavior and is entirely inert without the flag, so normal sessions pay nothing.
+
+When the flag is set, the terminal:
+
+- Measures **Idle-TTFB**: when you type after a quiet moment, it stamps the keystroke and resolves on the next inbound frame, recording both socket arrival and xterm render completion. It does not match echoed bytes (shells, TUIs, autosuggestions and password prompts make the echo unrelated to what you typed), so the number reflects the real key-to-screen path without parsing the echo.
+- Sends a small control-channel ping every 500ms that the server bounces back without touching the PTY. This is the **WS control RTT**: network plus WebSocket transit with no PTY in the loop. The server includes its own recv-to-send duration so no clock sync is needed.
+- Logs a rolling p50/p95 summary to the browser console every 10s, including the active renderer (`webgl` or `dom`).
+
+Call `window.__aoeTiming.dump()` in the browser console to pull the raw samples as JSON for offline analysis. Interpretation: if WS control RTT is close to Idle-TTFB, the network dominates; if Idle-TTFB is well above WS control RTT, the server, PTY, tmux, or agent echo path dominates; if socket arrival is fast but render is slow, the renderer or main thread dominates.
+
 ## Theme
 
 ```toml

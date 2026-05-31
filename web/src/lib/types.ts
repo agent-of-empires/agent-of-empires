@@ -163,6 +163,25 @@ export interface PrimaryStatusMessage {
   is_primary: boolean;
 }
 
+/** Client → server latency probe, sent only under
+ *  `?debug=terminal-timing`. `client_t` is a `performance.now()` stamp
+ *  echoed back unchanged in the pong. Never touches the PTY. See #1453. */
+export interface TimingPingMessage {
+  type: "timing_ping";
+  seq: number;
+  client_t: number;
+}
+
+/** Server → client reply to {@link TimingPingMessage}. `server_busy_us`
+ *  is the server's own recv-to-send duration, so the client can subtract
+ *  it from the round trip without clock synchronisation. See #1453. */
+export interface TimingPongMessage {
+  type: "timing_pong";
+  seq: number;
+  client_t: number;
+  server_busy_us: number;
+}
+
 /** Rich diff file info with addition/deletion stats */
 export interface RichDiffFile {
   path: string;
