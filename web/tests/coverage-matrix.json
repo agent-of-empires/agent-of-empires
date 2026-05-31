@@ -38,6 +38,17 @@
       ]
     },
     {
+      "id": "terminal.copy-on-select",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/terminal-copy-select.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useTerminal.ts"
+      ]
+    },
+    {
       "id": "terminal.ws-reconnect",
       "kind": "mocked-playwright",
       "risk": "high",
