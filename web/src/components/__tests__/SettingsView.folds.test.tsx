@@ -10,7 +10,7 @@
 // at web/tests/live/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -292,6 +292,40 @@ describe("Settings Advanced fold", () => {
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       sandbox: { environment: ["FOO=bar"] },
     });
+  });
+
+  // Regression: the mount-time fetchProfiles resolution flips selectedProfile
+  // from its "" seed to the default. That transition must NOT remount the
+  // content fieldset, or a fold expanded during the load window collapses out
+  // from under the user. This is the deterministic mirror of the live flake in
+  // tests/live/settings-advanced-fold.spec.ts (the cockpit "Advanced" fold
+  // vanishing right after a click).
+  it("keeps an expanded fold open when the initial profile resolves", async () => {
+    let resolveProfiles!: (p: typeof PROFILES) => void;
+    vi.mocked(api.fetchProfiles).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveProfiles = resolve;
+        }),
+    );
+
+    const { container } = renderView("cockpit");
+
+    // Cockpit renders without waiting on profiles/settings, so the fold is
+    // interactive during the load window. Open it before profiles resolve.
+    expandAdvanced(container);
+    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
+
+    // Profiles resolve: selectedProfile flips "" -> "main". Pre-fix this
+    // remounted the fieldset and collapsed the fold.
+    await act(async () => {
+      resolveProfiles(PROFILES);
+    });
+
+    await waitFor(() =>
+      expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"),
+    );
+    expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
   });
 
   it("collapses the fold when switching profiles (#4)", async () => {
