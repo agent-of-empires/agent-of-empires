@@ -2121,8 +2121,11 @@ pub async fn create_session(
                             return;
                         }
                     };
-                    let source_profile_for_spawn =
-                        sandbox_info.as_ref().map(|_| source_profile.clone());
+                    // Pass the session profile through regardless of
+                    // sandboxing so the spawn path resolves agent_cockpit_cmd
+                    // and worker env from the right profile for non-sandbox
+                    // sessions too.
+                    let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
                         .spawn(crate::cockpit::supervisor::SpawnRequest {
                             session_id: id.clone(),
