@@ -692,6 +692,36 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    /// Publish a "Send diff comments" submission as a typed
+    /// `Event::UserDiffCommentsPrompt`. Unlike `publish_user_prompt`
+    /// this skips the `/clear` detection: assembled diff-comment
+    /// markdown is never a clear command, and treating it as one would
+    /// wrongly fold the transcript. The caller forwards
+    /// `assembled_markdown` to the agent separately, exactly as it does
+    /// the plain text of a normal prompt.
+    pub async fn publish_user_diff_comments_prompt(
+        &self,
+        session_id: &str,
+        intro: String,
+        outro: String,
+        is_multi_repo: bool,
+        comments: Vec<super::state::DiffComment>,
+        assembled_markdown: String,
+    ) {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink.publish(
+            session_id,
+            seq,
+            &Event::UserDiffCommentsPrompt {
+                intro,
+                outro,
+                is_multi_repo,
+                comments,
+                assembled_markdown,
+            },
+        );
+    }
+
     /// Resolve the agent registry key for a session. Reads the live
     /// `Runner` handle's `SpawnConfig` directly when available;
     /// otherwise loads the on-disk record so an `Attached` worker (or

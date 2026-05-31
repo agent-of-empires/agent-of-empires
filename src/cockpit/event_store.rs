@@ -934,6 +934,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::AgentStartupError { .. } => "agent_startup_error",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
+        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
@@ -1114,6 +1115,91 @@ mod tests {
         } else {
             panic!("expected UserPromptSent");
         }
+    }
+
+    #[test]
+    fn diff_comments_prompt_round_trips_structured_fields() {
+        use super::super::state::DiffComment;
+        let (_tmp, store) = open_store(1000);
+        let comment = DiffComment {
+            id: "c-1".into(),
+            repo_name: Some("repoA".into()),
+            file_path: "src/main.rs".into(),
+            side: "new".into(),
+            start_line: 42,
+            end_line: 45,
+            body: "rename this".into(),
+            captured_snippet: "fn main() {}".into(),
+            language: Some("rust".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+        };
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserDiffCommentsPrompt {
+                    intro: "Hey:".into(),
+                    outro: "Please address these comments.".into(),
+                    is_multi_repo: true,
+                    comments: vec![comment],
+                    assembled_markdown: "## Diff comments\n\n...".into(),
+                },
+            )
+            .unwrap();
+        let replay = store.replay_from("s-1", 0);
+        assert_eq!(replay.len(), 1);
+        match &replay[0].1 {
+            Event::UserDiffCommentsPrompt {
+                intro,
+                is_multi_repo,
+                comments,
+                assembled_markdown,
+                ..
+            } => {
+                assert_eq!(intro, "Hey:");
+                assert!(*is_multi_repo);
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].repo_name.as_deref(), Some("repoA"));
+                assert_eq!(comments[0].start_line, 42);
+                assert!(assembled_markdown.starts_with("## Diff comments"));
+            }
+            other => panic!("expected UserDiffCommentsPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_comments_prompt_serialises_camel_case() {
+        use super::super::state::DiffComment;
+        let event = Event::UserDiffCommentsPrompt {
+            intro: String::new(),
+            outro: "Please address these comments.".into(),
+            is_multi_repo: false,
+            comments: vec![DiffComment {
+                id: "c-1".into(),
+                repo_name: None,
+                file_path: "a.rs".into(),
+                side: "old".into(),
+                start_line: 1,
+                end_line: 1,
+                body: "b".into(),
+                captured_snippet: "s".into(),
+                language: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: None,
+            }],
+            assembled_markdown: "m".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Event payload fields and comment fields are both camelCase on
+        // the wire so the frontend union mirrors them one-for-one.
+        assert!(json.contains("\"isMultiRepo\""));
+        assert!(json.contains("\"assembledMarkdown\""));
+        assert!(json.contains("\"filePath\""));
+        assert!(json.contains("\"startLine\""));
+        // repo_name / updated_at are skipped when None.
+        assert!(!json.contains("\"repoName\""));
+        assert!(!json.contains("\"updatedAt\""));
     }
 
     #[test]

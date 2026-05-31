@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::approvals::ApprovalDecision;
-use super::state::Event;
+use super::state::{DiffComment, Event};
 
 /// One frame on the per-AppState cockpit broadcast channel: the cockpit
 /// session id plus the typed cockpit Event. Subscribed WebSocket
@@ -68,6 +68,26 @@ impl<'de> Deserialize<'de> for CockpitBroadcastFrame {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub text: String,
+}
+
+/// `POST /api/sessions/{id}/cockpit/prompt/diff-comments` body.
+///
+/// The "Send diff comments" dialog sends the structured review (so the
+/// transcript can re-render the rich card) alongside `assembled_markdown`,
+/// the exact WYSIWYG prompt the user approved in the preview. The server
+/// forwards `assembled_markdown` to the agent verbatim and records both
+/// in an `Event::UserDiffCommentsPrompt`. The frontend owns markdown
+/// assembly (sort, headings, code-fence sizing, repo prefixes); the
+/// server does not re-derive it, so the card payload and the agent-visible
+/// text can never disagree.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffCommentsPromptRequest {
+    pub intro: String,
+    pub outro: String,
+    pub is_multi_repo: bool,
+    pub comments: Vec<DiffComment>,
+    pub assembled_markdown: String,
 }
 
 /// `POST /api/sessions/{id}/cockpit/approvals/{nonce}` body.

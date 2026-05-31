@@ -162,6 +162,22 @@ pub fn build_context_primer(events: &[(u64, Event)], opts: PrimerOptions) -> Con
                 // unsent prompt is no longer the trailing state.
                 ended_non_success = false;
             }
+            Event::UserDiffCommentsPrompt {
+                assembled_markdown, ..
+            } => {
+                // Same turn-boundary semantics as UserPromptSent: the
+                // assembled markdown is the text the agent actually saw.
+                if let Some(t) = current.take() {
+                    turns.push(t);
+                }
+                current = Some(Turn {
+                    user_text: assembled_markdown.clone(),
+                    event_count: 1,
+                    ..Turn::default()
+                });
+                included_event_count += 1;
+                ended_non_success = false;
+            }
             Event::AgentMessageChunk { text } => {
                 let turn = current.get_or_insert_with(Turn::default);
                 turn.assistant_text.push_str(text);

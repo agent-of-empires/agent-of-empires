@@ -57,6 +57,7 @@ import {
 } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
+import type { DiffCommentsCardPayload } from "../diff/comments/buildPrompt";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -493,11 +494,23 @@ function UserMessage() {
   );
 }
 
-/** Text-part renderer for user messages. Detects the diff-comments
- *  sentinel header (prepended by `buildFullPrompt`) and swaps in the
- *  structured `DiffCommentsUserCard`; falls back to the classic chat
- *  bubble otherwise. */
+/** Text-part renderer for user messages. Renders the structured
+ *  `DiffCommentsUserCard` for diff-comments prompts: from the typed
+ *  event payload carried on the message metadata (see #1123) for new
+ *  prompts, or from the decoded base64 sentinel for legacy persisted
+ *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
+  const typedPayload = useMessage(
+    (m) =>
+      (m.metadata?.custom as { diffComments?: DiffCommentsCardPayload } | undefined)
+        ?.diffComments,
+  );
+  if (typedPayload) {
+    return <DiffCommentsUserCard payload={typedPayload} />;
+  }
+  // Legacy fallback: older prompts carry the structured data in a
+  // base64 sentinel at the top of the text body. Decode + render the
+  // same card. Kept until those persisted events age out of the log.
   const payload = parseDiffCommentsSentinel(text);
   if (payload) {
     return <DiffCommentsUserCard payload={payload} />;

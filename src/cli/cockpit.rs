@@ -824,6 +824,7 @@ fn event_kind(event: &crate::cockpit::Event) -> &'static str {
         Event::AgentStartupError { .. } => "agent_startup_error",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
+        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",

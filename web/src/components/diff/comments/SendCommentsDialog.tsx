@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
-import { buildCommentsMarkdown, buildFullPrompt } from "./buildPrompt";
+import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
 
 interface Props {
@@ -63,16 +63,16 @@ export function SendCommentsDialog({
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
     setError(null);
-    const body = buildFullPrompt(comments, introDraft, outroDraft, {
+    const built = buildDiffCommentsPrompt(comments, introDraft, outroDraft, {
       isMultiRepo,
     });
     try {
       const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt`,
+        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt/diff-comments`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: body }),
+          body: JSON.stringify(built),
         },
       );
       if (!res.ok) {

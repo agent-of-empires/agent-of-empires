@@ -338,6 +338,125 @@ describe("applyEvent / UserPromptSent", () => {
   });
 });
 
+describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
+  function diffCommentsFrame(seq: number): CockpitFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: {
+        UserDiffCommentsPrompt: {
+          intro: "Take a look:",
+          outro: "Please address these comments.",
+          isMultiRepo: true,
+          comments: [
+            {
+              id: "c-1",
+              repoName: "repoA",
+              filePath: "src/main.rs",
+              side: "new",
+              startLine: 42,
+              endLine: 45,
+              body: "rename this",
+              capturedSnippet: "fn main() {}",
+              language: "rust",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+          assembledMarkdown: "Take a look:\n\n## Diff comments\n\n...\n",
+        },
+      },
+    };
+  }
+
+  it("appends a typed user_diff_comments row carrying the structured payload", () => {
+    const next = applyEvent(emptyCockpitState(), diffCommentsFrame(1));
+    expect(next.activity).toHaveLength(1);
+    const row = next.activity[0]!;
+    expect(row.id).toBe("user-seq-1");
+    expect(row.kind).toBe("user_diff_comments");
+    // text is the assembled markdown (agent-visible body / fallback),
+    // never a base64 sentinel.
+    expect(row.text).toContain("## Diff comments");
+    expect(row.text).not.toContain("aoe:diff-comments");
+    expect(row.diffComments).toEqual({
+      intro: "Take a look:",
+      outro: "Please address these comments.",
+      isMultiRepo: true,
+      comments: [
+        {
+          id: "c-1",
+          repoName: "repoA",
+          filePath: "src/main.rs",
+          side: "new",
+          startLine: 42,
+          endLine: 45,
+          body: "rename this",
+          capturedSnippet: "fn main() {}",
+          language: "rust",
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+    expect(next.lastSeq).toBe(1);
+    expect(next.turnActive).toBe(true);
+  });
+
+  it("applies the same per-turn resets as a plain prompt", () => {
+    const stale: CockpitState = {
+      ...emptyCockpitState(),
+      assistantMessage: "stale partial reply",
+      startupError: "old error",
+      lastError: "old action error",
+      workerStopped: true,
+      workerRestarting: true,
+      agentUnresponsive: true,
+      turnActive: false,
+    };
+    const next = applyEvent(stale, diffCommentsFrame(1));
+    expect(next.assistantMessage).toBe("");
+    expect(next.startupError).toBeNull();
+    expect(next.lastError).toBeNull();
+    expect(next.workerStopped).toBe(false);
+    expect(next.workerRestarting).toBe(false);
+    expect(next.agentUnresponsive).toBe(false);
+    expect(next.turnActive).toBe(true);
+  });
+
+  it("counts as a prior user turn for SessionContextReset (#1123)", () => {
+    // A session whose only turn is a diff-comments prompt must still
+    // surface the context-reset row + arm the primer; otherwise it is
+    // wrongly treated as a 0-message session.
+    let state = applyEvent(emptyCockpitState(), diffCommentsFrame(1));
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { SessionContextReset: { reason: "session/load failed: bad id" } },
+    });
+    expect(state.activity.some((r) => r.kind === "context_reset")).toBe(true);
+    expect(state.contextPrimerAvailable).toEqual({
+      resetSeq: 2,
+      reason: "session/load failed: bad id",
+    });
+  });
+
+  it("reconstructs the diff-comments turn on replay (no optimistic row)", () => {
+    // The send dialog posts directly, so there is never a placeholder to
+    // promote; the server echo simply appends the typed row.
+    const final = [
+      diffCommentsFrame(1),
+      {
+        session_id: "s-1",
+        seq: 2,
+        event: { AgentMessageChunk: { text: "On it." } },
+      } as CockpitFrame,
+    ].reduce((state, f) => applyEvent(state, f), emptyCockpitState());
+    const rows = final.activity.filter((a) => a.kind === "user_diff_comments");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.diffComments?.comments).toHaveLength(1);
+    expect(final.lastSeq).toBe(2);
+  });
+});
+
 describe("applyEvent / AvailableCommandsUpdated", () => {
   it("populates availableCommands and replaces the prior list", () => {
     const f1: CockpitFrame = {
