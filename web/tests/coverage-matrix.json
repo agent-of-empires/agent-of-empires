@@ -1121,10 +1121,24 @@
       "risk": "high",
       "specs": [
         "src/lib/cockpitTypes.test.ts",
-        "src/components/cockpit/RateLimitRecoveryModal.test.tsx"
+        "src/components/cockpit/SwitchAgentModal.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/RateLimitRecoveryModal.tsx"
+        "web/src/components/cockpit/SwitchAgentModal.tsx"
+      ]
+    },
+    {
+      "id": "cockpit.switch-agent-manual",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/SwitchAgentModal.test.tsx",
+        "src/lib/api.cockpit.test.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/SwitchAgentModal.tsx",
+        "web/src/components/cockpit/Composer.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {

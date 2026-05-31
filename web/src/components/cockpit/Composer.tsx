@@ -20,6 +20,7 @@ import {
 } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowLeftRight,
   AtSign,
   ChevronUp,
   Paperclip,
@@ -30,6 +31,7 @@ import {
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
+import { SwitchAgentModal } from "./SwitchAgentModal";
 import type {
   CockpitState,
   PromptAttachmentInput,
@@ -195,6 +197,9 @@ function fileToBase64(file: File): Promise<string> {
 
 interface Props {
   sessionId: string;
+  /** Registry key of the agent the session currently runs. Drives the
+   *  "Switch agent" control's filtered target list and handoff copy. */
+  currentAgent: CockpitState["agent"];
   availableModes: CockpitState["availableModes"];
   currentModeId: CockpitState["currentModeId"];
   /** Legacy enum-based mode used as fallback when the agent does not
@@ -264,6 +269,7 @@ interface Props {
 
 export function Composer({
   sessionId,
+  currentAgent,
   availableModes,
   currentModeId,
   legacyMode,
@@ -430,6 +436,12 @@ export function Composer({
       () => setPendingAttachments([]),
     );
   }, [composerRuntime, enqueuePrompt, pendingAttachments, setPendingAttachments]);
+
+  // Manual agent switch dialog, opened from the toolbar control. Unlike
+  // the rate-limit recovery path (which lives up in CockpitView), this
+  // is available at any time so a user can hand back to, say, claude
+  // after a rate-limit handoff to codex.
+  const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -855,6 +867,12 @@ export function Composer({
                   pendingConfigOption={pendingConfigOption}
                   onSetConfigOption={setConfigOption}
                 />
+                <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
+                <ToolbarButton
+                  icon={<ArrowLeftRight className="h-3.5 w-3.5" />}
+                  label="Switch agent"
+                  onClick={() => setSwitchAgentOpen(true)}
+                />
               </div>
 
               <div className="flex items-center gap-2">
@@ -876,6 +894,29 @@ export function Composer({
           </ComposerPrimitive.Root>
         </ComposerPrimitive.Unstable_TriggerPopoverRoot>
       </div>
+      <SwitchAgentModal
+        open={switchAgentOpen}
+        sessionId={sessionId}
+        currentAgent={currentAgent}
+        onClose={() => setSwitchAgentOpen(false)}
+        onPrefill={(text) => {
+          composerRuntime.setText(text);
+          requestAnimationFrame(() => {
+            const el = taRef.current;
+            if (!el) return;
+            el.focus();
+            const len = el.value.length;
+            try {
+              el.setSelectionRange(len, len);
+            } catch {
+              // ignore: non-text inputs can throw here
+            }
+            el.style.height = "auto";
+            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+          });
+        }}
+        trigger="manual"
+      />
     </div>
   );
 }

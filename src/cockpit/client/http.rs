@@ -14,7 +14,7 @@ use thiserror::Error;
 use super::discovery::DaemonEndpoint;
 use crate::cockpit::protocol::{
     ApprovalDecisionWire, ContextPrimerResponse, PromptRequest, ReplayResponse,
-    ResolveApprovalRequest,
+    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -109,6 +109,31 @@ impl HttpClient {
         let res = self.auth(self.http.post(&url)).send().await?;
         check_status(res, session_id).await?;
         Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/cockpit/switch-agent`. Hands the session
+    /// off to another ACP backend, keeping the transcript. Returns the
+    /// daemon's response (before/switch seqs) so callers can fetch a
+    /// context primer if they want a handoff recap.
+    pub async fn switch_agent(
+        &self,
+        session_id: &str,
+        target: &str,
+        model: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<SwitchAgentResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/cockpit/switch-agent",
+            self.endpoint.base_url, session_id
+        );
+        let body = SwitchAgentRequest {
+            target: target.to_string(),
+            model: model.map(str::to_string),
+            reason: reason.map(str::to_string),
+        };
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<SwitchAgentResponse>().await?)
     }
 
     /// `POST /api/sessions/{id}/cockpit/approvals/{nonce}`.

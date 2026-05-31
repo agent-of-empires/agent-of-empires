@@ -130,6 +130,19 @@ pub enum CockpitCommands {
         /// Cockpit session id.
         session: String,
     },
+    /// Switch a cockpit session to a different ACP agent, keeping the
+    /// transcript. The new agent starts fresh; use `aoe cockpit agents`
+    /// to list valid targets. Handy for returning to claude after a
+    /// rate-limit handoff to codex.
+    SwitchAgent {
+        /// Cockpit session id.
+        session: String,
+        /// Registry key of the target agent (e.g. `claude`, `codex`).
+        target: String,
+        /// Optional model override forwarded to the new agent.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tracing::instrument(target = "cli.cockpit", skip_all)]
@@ -162,6 +175,11 @@ pub async fn run(command: CockpitCommands) -> Result<()> {
         CockpitCommands::Cancel { session } => cancel(&session).await,
         CockpitCommands::Tail { session, since } => tail(&session, since).await,
         CockpitCommands::Attach { session } => attach(&session).await,
+        CockpitCommands::SwitchAgent {
+            session,
+            target,
+            model,
+        } => switch_agent(&session, &target, model.as_deref()).await,
     }
 }
 
@@ -752,6 +770,17 @@ async fn cancel(session: &str) -> Result<()> {
     let client = HttpClient::new(endpoint)?;
     client.cancel(session).await.map_err(map_http)?;
     println!("cancel sent");
+    Ok(())
+}
+
+async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let resp = client
+        .switch_agent(session, target, model, Some("manual"))
+        .await
+        .map_err(map_http)?;
+    println!("switched cockpit agent for {session} -> {}", resp.agent);
     Ok(())
 }
 

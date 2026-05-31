@@ -7,39 +7,51 @@ import {
 } from "../../lib/api";
 
 /**
- * Rate-limit recovery dialog. Surfaces from the cockpit rate-limit
- * banner when the user clicks "Continue in another agent". Lists the
- * cockpit ACP registry, preselects `codex` when present (otherwise
- * the first non-current entry), and hands off the session via
+ * Agent-switch dialog. Lists the cockpit ACP registry, preselects a
+ * sensible target, and hands the session off via
  * `POST /api/sessions/:id/cockpit/switch-agent`.
+ *
+ * Two triggers drive it, distinguished by `trigger`:
+ *   - "rate_limit": surfaced from the rate-limit banner's "Continue in
+ *     another agent" CTA. Preselects `codex` and frames the recap as a
+ *     rate-limit handoff.
+ *   - "manual": surfaced from the composer toolbar at any time (e.g. to
+ *     return to claude after a rate-limit handoff). Preselects the first
+ *     available agent and frames the recap as a plain switch.
  *
  * After a successful switch:
  *   1. Fetch the context primer using `before_seq` so the recap
  *      excludes the AgentSwitched event itself.
  *   2. Compose a framed handoff message that prepends the recap and
- *      appends `unprocessed_prompt` (the user's last prompt that the
- *      rate-limited agent never processed) as the body the user is
- *      about to send.
- *   3. Call `onPrefill` so the parent drops the text into the
- *      composer. The composer is NOT auto-sent; the user reviews and
- *      sends manually. See #1282.
+ *      appends `unprocessed_prompt` (a prompt the prior agent never
+ *      processed, only present on the rate-limit path) as the body the
+ *      user is about to send.
+ *   3. Call `onPrefill` so the parent drops the text into the composer.
+ *      The composer is NOT auto-sent; the user reviews and sends
+ *      manually. See #1282.
  */
+type SwitchTrigger = "rate_limit" | "manual";
+
 interface Props {
   open: boolean;
   sessionId: string;
   currentAgent: string | null;
   onClose: () => void;
   onPrefill: (text: string) => void;
+  /** What opened the dialog. Drives copy and the recorded switch
+   *  reason. Defaults to "manual". */
+  trigger?: SwitchTrigger;
 }
 
 const PREFERRED_FALLBACK = "codex";
 
-export function RateLimitRecoveryModal({
+export function SwitchAgentModal({
   open,
   sessionId,
   currentAgent,
   onClose,
   onPrefill,
+  trigger = "manual",
 }: Props) {
   const [agents, setAgents] = useState<CockpitAgentInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -49,6 +61,8 @@ export function RateLimitRecoveryModal({
   const abortRef = useRef<AbortController | null>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  const rateLimited = trigger === "rate_limit";
 
   useEffect(() => {
     if (!open) return;
@@ -60,10 +74,12 @@ export function RateLimitRecoveryModal({
         if (cancelled) return;
         const filtered = list.filter((a) => a.name !== currentAgent);
         setAgents(filtered);
-        // Preferred fallback: codex when installed; otherwise first
-        // remaining entry. The user can change the pick before
-        // confirming.
-        const preferred = filtered.find((a) => a.name === PREFERRED_FALLBACK);
+        // On the rate-limit path, prefer codex when installed. On a
+        // manual switch we have no preferred direction, so just pick the
+        // first remaining entry. The user can change the pick either way.
+        const preferred = rateLimited
+          ? filtered.find((a) => a.name === PREFERRED_FALLBACK)
+          : undefined;
         setSelected(preferred?.name ?? filtered[0]?.name ?? null);
       })
       .catch((e) => {
@@ -75,12 +91,15 @@ export function RateLimitRecoveryModal({
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    // Only flag this load as stale. abortRef belongs to the primer
+    // fetch in handleConfirm; aborting it here would cancel an in-flight
+    // handoff when an unrelated dep (currentAgent, rateLimited) changes.
+    // The agents fetch itself takes no signal, so there is nothing else
+    // to cancel.
     return () => {
       cancelled = true;
-      abortRef.current?.abort();
-      abortRef.current = null;
     };
-  }, [open, currentAgent]);
+  }, [open, currentAgent, rateLimited]);
 
   // Escape closes; while submitting we don't dismiss so a half-completed
   // switch can finish without leaving the UI in an unknown state.
@@ -94,7 +113,7 @@ export function RateLimitRecoveryModal({
   }, [open, submitting, onClose]);
 
   // Focus the confirm button on open, return focus to whatever was
-  // focused before (typically the banner button that triggered us).
+  // focused before (typically the control that triggered us).
   useEffect(() => {
     if (!open) return;
     previousFocusRef.current = document.activeElement as HTMLElement | null;
@@ -112,7 +131,12 @@ export function RateLimitRecoveryModal({
     setSubmitting(true);
     setError(null);
     try {
-      const result = await switchCockpitAgent(sessionId, selected);
+      const result = await switchCockpitAgent(
+        sessionId,
+        selected,
+        null,
+        rateLimited ? "rate_limited" : "manual",
+      );
       if (!result) {
         setError("Switch failed: server returned no response.");
         return;
@@ -132,6 +156,7 @@ export function RateLimitRecoveryModal({
         to: selected,
         recap,
         unprocessed,
+        rateLimited,
       });
       onPrefill(prefill);
       onClose();
@@ -142,25 +167,38 @@ export function RateLimitRecoveryModal({
     }
   };
 
+  const title = rateLimited ? "Continue in another agent?" : "Switch agent?";
+
   return (
     <div
       role="dialog"
       aria-modal="true"
-      aria-labelledby="rate-limit-recovery-title"
+      aria-labelledby="switch-agent-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
       onClick={(e) => {
         if (e.target === e.currentTarget && !submitting) onClose();
       }}
     >
       <div className="w-full max-w-lg rounded-lg border border-surface-700 bg-surface-900 p-5 shadow-xl text-text-primary">
-        <h2 id="rate-limit-recovery-title" className="text-base font-semibold">
-          Continue in another agent?
+        <h2 id="switch-agent-title" className="text-base font-semibold">
+          {title}
         </h2>
         <p className="mt-1 text-xs text-text-muted">
-          The current agent ({currentAgent ?? "unknown"}) is rate-limited.
-          Hand the session off to a different installed ACP backend; we
-          will pre-fill the composer with a recap of the recent turns
-          for you to review before sending.
+          {rateLimited ? (
+            <>
+              The current agent ({currentAgent ?? "unknown"}) is rate-limited.
+              Hand the session off to a different installed ACP backend; we
+              will pre-fill the composer with a recap of the recent turns
+              for you to review before sending.
+            </>
+          ) : (
+            <>
+              Hand this session off from {currentAgent ?? "the current agent"}{" "}
+              to a different installed ACP backend, keeping the transcript. We
+              will pre-fill the composer with a recap of the recent turns for
+              you to review before sending.
+            </>
+          )}
         </p>
 
         {loading ? (
@@ -211,8 +249,11 @@ export function RateLimitRecoveryModal({
         <div className="mt-5 flex justify-end gap-2">
           <button
             type="button"
-            onClick={onClose}
-            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800"
+            onClick={() => {
+              if (!submitting) onClose();
+            }}
+            disabled={submitting}
+            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-60"
           >
             Cancel
           </button>
@@ -223,7 +264,9 @@ export function RateLimitRecoveryModal({
             disabled={!selected || submitting || agents.length === 0}
             className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {submitting ? "Switching..." : `Continue in ${selected ?? ""}`}
+            {submitting
+              ? "Switching..."
+              : `${rateLimited ? "Continue in" : "Switch to"} ${selected ?? ""}`}
           </button>
         </div>
       </div>
@@ -236,6 +279,7 @@ interface PrefillInputs {
   to: string;
   recap: string;
   unprocessed: string;
+  rateLimited: boolean;
 }
 
 function buildHandoffPrefill({
@@ -243,10 +287,13 @@ function buildHandoffPrefill({
   to,
   recap,
   unprocessed,
+  rateLimited,
 }: PrefillInputs): string {
   const parts: string[] = [];
   parts.push(
-    `[CONTEXT HANDOFF: ${from} was rate-limited; continuing with ${to}.]`,
+    rateLimited
+      ? `[CONTEXT HANDOFF: ${from} was rate-limited; continuing with ${to}.]`
+      : `[CONTEXT HANDOFF: switched from ${from} to ${to}.]`,
   );
   parts.push("");
   parts.push(

@@ -442,14 +442,18 @@ export interface SwitchAgentResponse {
  *  `target` (registry key, e.g. "codex"). Backend stops the old
  *  worker, spawns the new one, persists the agent change, and emits
  *  an AgentSwitched event. On failure (unknown target, spawn error)
- *  the instance is left untouched. See #1282. */
+ *  the instance is left untouched. `reason` is recorded on the event
+ *  and shown in the transcript divider: "rate_limited" for the
+ *  recovery flow, "manual" for an explicit user switch. See #1282. */
 export async function switchCockpitAgent(
   sessionId: string,
   target: string,
   model?: string | null,
+  reason?: string | null,
 ): Promise<SwitchAgentResponse | null> {
-  const body: { target: string; model?: string } = { target };
+  const body: { target: string; model?: string; reason?: string } = { target };
   if (model) body.model = model;
+  if (reason) body.reason = reason;
   return fetchJson<SwitchAgentResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/switch-agent`,
     {

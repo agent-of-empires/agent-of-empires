@@ -41,7 +41,7 @@ import {
 import { Composer } from "./Composer";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
-import { RateLimitRecoveryModal } from "./RateLimitRecoveryModal";
+import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import {
   isQueuedPromptLong,
@@ -462,6 +462,7 @@ function CockpitChrome({
 
           <Composer
             sessionId={sessionId}
+            currentAgent={state.agent}
             availableModes={state.availableModes}
             currentModeId={state.currentModeId}
             legacyMode={state.mode}
@@ -1200,12 +1201,13 @@ export function RateLimitRecoverySection({
   return (
     <>
       {children({ onSwitchAgent: () => setOpen(true) })}
-      <RateLimitRecoveryModal
+      <SwitchAgentModal
         open={open}
         sessionId={sessionId}
         currentAgent={currentAgent}
         onClose={() => setOpen(false)}
         onPrefill={onPrefill}
+        trigger="rate_limit"
       />
     </>
   );
