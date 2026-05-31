@@ -56,8 +56,10 @@ import {
   TodoGroupCard,
 } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
-import { parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
-import type { DiffCommentsCardPayload } from "../diff/comments/buildPrompt";
+import {
+  isDiffCommentsCardPayload,
+  parseDiffCommentsSentinel,
+} from "../diff/comments/buildPrompt";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -508,10 +510,9 @@ function UserMessage() {
 function UserText({ text }: { text: string }) {
   const typedPayload = useMessage(
     (m) =>
-      (m.metadata?.custom as { diffComments?: DiffCommentsCardPayload } | undefined)
-        ?.diffComments,
+      (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments,
   );
-  if (typedPayload) {
+  if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
   }
   // Legacy fallback: older prompts carry the structured data in a
