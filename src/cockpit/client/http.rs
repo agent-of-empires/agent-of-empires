@@ -93,6 +93,7 @@ impl HttpClient {
         );
         let body = PromptRequest {
             text: text.to_string(),
+            attachments: Vec::new(),
         };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
         check_status(res, session_id).await?;

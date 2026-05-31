@@ -171,6 +171,13 @@ pub enum SupervisorError {
 /// See #1038.
 pub trait BroadcastSink: Send + Sync + 'static {
     fn publish(&self, session_id: &str, seq: u64, event: &Event);
+    /// Like `publish`, but reports whether the event write reached the
+    /// durable event store. Default assumes success for sinks that don't
+    /// persist (tests / in-memory fixtures).
+    fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.publish(session_id, seq, event);
+        true
+    }
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -179,6 +186,22 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
         Vec::new()
     }
+    /// Persist one prompt attachment blob keyed to the seq of the
+    /// `UserPromptSent` it rides with, so the retention prune and
+    /// session delete drop it in lockstep. Default no-op so test sinks
+    /// without an event store opt out cleanly, mirroring
+    /// `unresolved_approval_nonces`. See #1000 / #965.
+    fn record_attachment(
+        &self,
+        _session_id: &str,
+        _seq: u64,
+        _blob: &crate::cockpit::event_store::AttachmentBlob,
+    ) {
+    }
+    /// Roll back blobs for one prompt seq. Used when publishing the
+    /// matching `UserPromptSent` fails durability, so refs and blobs
+    /// never diverge on disk.
+    fn delete_attachments_for_seq(&self, _session_id: &str, _seq: u64) {}
 }
 
 /// How this supervisor acquired the worker. Drives both reap (which
@@ -680,12 +703,48 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) {
+        self.publish_user_prompt_with_attachments(session_id, text, &[])
+            .await;
+    }
+
+    /// Like `publish_user_prompt` but also persists the prompt's
+    /// attachment blobs (keyed to the same seq as the `UserPromptSent`)
+    /// and records metadata-only refs on the event so replay can render
+    /// them. The bytes never enter the event JSON; only the refs do.
+    /// See #1000 / #965.
+    pub async fn publish_user_prompt_with_attachments(
+        &self,
+        session_id: &str,
+        text: String,
+        attachments: &[crate::cockpit::event_store::AttachmentBlob],
+    ) {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
         let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish(session_id, seq, &Event::UserPromptSent { text });
+        let mut refs = Vec::with_capacity(attachments.len());
+        for blob in attachments {
+            self.sink.record_attachment(session_id, seq, blob);
+            refs.push(crate::cockpit::state::PromptAttachmentRef {
+                id: blob.id.clone(),
+                kind: blob.kind,
+                mime_type: blob.mime_type.clone(),
+                name: blob.name.clone(),
+                size: blob.data.len() as u64,
+            });
+        }
+        let persisted = self.sink.publish_persisted(
+            session_id,
+            seq,
+            &Event::UserPromptSent {
+                text,
+                attachments: refs,
+            },
+        );
+        if !persisted {
+            self.sink.delete_attachments_for_seq(session_id, seq);
+            return;
+        }
         if is_clear {
             let seq = next_seq(&self.next_seqs, session_id);
             self.sink.publish(session_id, seq, &Event::SessionCleared);
@@ -1483,12 +1542,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))
     }
 
-    /// Send a user prompt to a running cockpit worker.
-    pub async fn send_prompt(&self, session_id: &str, text: &str) -> Result<(), SupervisorError> {
+    /// Send a user prompt (with optional attachments) to a running
+    /// cockpit worker.
+    pub async fn send_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[crate::cockpit::event_store::AttachmentBlob],
+    ) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
         let client = self.client_for_session(session_id).await?;
-        client.send_prompt(text).await?;
+        client.send_prompt(text, attachments).await?;
         Ok(())
     }
 
@@ -2212,6 +2277,10 @@ pub struct ChannelSink {
 
 impl BroadcastSink for ChannelSink {
     fn publish(&self, session_id: &str, seq: u64, event: &Event) {
+        let _ = self.publish_persisted(session_id, seq, event);
+    }
+
+    fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
         // Persist FIRST so a disk failure can be surfaced before
         // broadcast subscribers see an event the on-disk log doesn't
         // have. If the write fails the seq is already burned (the
@@ -2238,6 +2307,7 @@ impl BroadcastSink for ChannelSink {
             }
             _ => self.event_store.record(session_id, seq, event),
         };
+        let persisted = record_result.is_ok();
         let event_ref: &Event = match record_result {
             Ok(()) => event,
             Err(e) => {
@@ -2260,10 +2330,38 @@ impl BroadcastSink for ChannelSink {
             event: Arc::new(event_ref.clone()),
         };
         let _ = self.tx.send(frame);
+        persisted
     }
 
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
         self.event_store.unresolved_approval_nonces(session_id)
+    }
+
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::cockpit::event_store::AttachmentBlob,
+    ) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.record_attachment(session_id, seq, blob)
+                });
+            }
+            _ => self.event_store.record_attachment(session_id, seq, blob),
+        }
+    }
+
+    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.delete_attachments_for_seq(session_id, seq)
+                });
+            }
+            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
+        }
     }
 }
 
@@ -2932,7 +3030,7 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(matches!(
             &frames[0].2,
-            Event::UserPromptSent { text } if text == "/clear"
+            Event::UserPromptSent { text, .. } if text == "/clear"
         ));
         assert!(matches!(&frames[1].2, Event::SessionCleared));
         assert_eq!(frames[1].1, 2, "SessionCleared must use the next seq");
@@ -3095,13 +3193,13 @@ mod tests {
         assert_eq!(*seq, 1);
         assert!(matches!(
             event,
-            Event::UserPromptSent { text } if text == "first prompt"
+            Event::UserPromptSent { text, .. } if text == "first prompt"
         ));
         let (_, seq2, event2) = &frames[1];
         assert_eq!(*seq2, 2);
         assert!(matches!(
             event2,
-            Event::UserPromptSent { text } if text == "second prompt"
+            Event::UserPromptSent { text, .. } if text == "second prompt"
         ));
     }
 
@@ -3495,6 +3593,7 @@ mod tests {
             1,
             &Event::UserPromptSent {
                 text: "hello world".into(),
+                attachments: Vec::new(),
             },
         );
         sink.publish(
@@ -3518,7 +3617,7 @@ mod tests {
         assert_eq!(stored[0].0, 1);
         assert!(matches!(
             stored[0].1,
-            Event::UserPromptSent { ref text } if text == "hello world"
+            Event::UserPromptSent { ref text, .. } if text == "hello world"
         ));
         assert_eq!(stored[1].0, 2);
         assert!(matches!(
@@ -3583,7 +3682,7 @@ mod tests {
         let texts: Vec<String> = stored
             .iter()
             .filter_map(|(_, ev)| match ev {
-                Event::UserPromptSent { text } => Some(text.clone()),
+                Event::UserPromptSent { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();

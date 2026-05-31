@@ -989,6 +989,19 @@
       ]
     },
     {
+      "id": "cockpit.attachments",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-attachment.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/Composer.tsx",
+        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
       "id": "cockpit.approval",
       "kind": "live-playwright",
       "risk": "high",

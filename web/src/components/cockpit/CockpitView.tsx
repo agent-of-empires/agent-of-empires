@@ -168,6 +168,8 @@ function CockpitChrome({
   manualReconnect,
   resolveApproval,
   sendPrompt,
+  pendingAttachments,
+  setPendingAttachments,
   forceEndTurn,
   lastActivityRef,
   dismissError,
@@ -472,6 +474,9 @@ function CockpitChrome({
             turnActive={state.turnActive}
             queuedCount={state.queuedPrompts.length}
             enqueuePrompt={sendPrompt}
+            promptCapabilities={state.promptCapabilities}
+            pendingAttachments={pendingAttachments}
+            setPendingAttachments={setPendingAttachments}
             primerPrefill={primerPrefill}
           />
         </div>

@@ -179,9 +179,17 @@ impl CockpitTranscript {
                 self.rows.push(ActivityRow::AgentMessage(text.clone()));
                 self.pending_message_idx = Some(self.rows.len() - 1);
             }
-            Event::UserPromptSent { text } => {
+            Event::UserPromptSent { text, attachments } => {
                 self.flush_pending_chunk();
-                self.rows.push(ActivityRow::UserPrompt(text.clone()));
+                // The TUI cockpit view renders text only; note the
+                // attachment count inline so a prompt sent from the web
+                // composer with images doesn't look empty here.
+                let row = if attachments.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text} [{} attachment(s)]", attachments.len())
+                };
+                self.rows.push(ActivityRow::UserPrompt(row));
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
             }
@@ -397,6 +405,7 @@ impl CockpitTranscript {
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }
             | Event::PromptRejected { .. }
+            | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }
             | Event::ModeSwitchFailed { .. }
             | Event::ConfigOptionsUpdated { .. }
@@ -443,7 +452,13 @@ mod tests {
     #[test]
     fn user_prompt_creates_row() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         assert_eq!(t.rows.len(), 1);
         match &t.rows[0] {
             ActivityRow::UserPrompt(text) => assert_eq!(text, "hi"),
@@ -563,13 +578,20 @@ mod tests {
     #[test]
     fn duplicate_seq_is_ignored() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         // Replay-vs-live overlap can deliver the same seq twice; the
         // reducer must dedupe.
         t.apply(&frame(
             1,
             Event::UserPromptSent {
                 text: "ignored".into(),
+                attachments: Vec::new(),
             },
         ));
         assert_eq!(t.rows.len(), 1);
@@ -586,7 +608,13 @@ mod tests {
         ));
         assert!(t.context_primer_pending);
         // Sending a prompt clears the hint.
-        t.apply(&frame(2, Event::UserPromptSent { text: "go".into() }));
+        t.apply(&frame(
+            2,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: Vec::new(),
+            },
+        ));
         assert!(!t.context_primer_pending);
     }
 
@@ -642,7 +670,13 @@ mod tests {
     #[test]
     fn reset_clears_state_but_preserves_session_id() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         t.reset();
         assert_eq!(t.session_id, "s-1");
         assert_eq!(t.last_seq, 0);

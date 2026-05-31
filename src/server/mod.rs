@@ -1199,7 +1199,17 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/cockpit/prompt",
-            post(api::cockpit_prompt),
+            // Prompt bodies carry inline base64 attachments, which blow
+            // past the global 1 MiB cap. Raise the limit on this route
+            // only; the server-side decoded-size caps in
+            // `validate_attachments` are the real guard. 28 MiB leaves
+            // headroom for the 20 MiB total decoded cap plus base64's
+            // ~33% overhead and JSON framing. See #1000 / #965.
+            post(api::cockpit_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/attachments/{attachment_id}",
+            get(api::cockpit_attachment),
         )
         .route(
             "/api/sessions/{id}/cockpit/prompt/diff-comments",
@@ -2458,7 +2468,10 @@ mod tests {
             memory_recall: None,
         };
         assert_eq!(
-            derive_cockpit_status(&Event::UserPromptSent { text: "hi".into() }),
+            derive_cockpit_status(&Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            }),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(

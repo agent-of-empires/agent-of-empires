@@ -347,9 +347,25 @@ async function handleRequest(msg) {
   }
 
   switch (method) {
-    case "initialize":
-      sendResult(id, INITIALIZE_RESULT);
+    case "initialize": {
+      // A script may advertise prompt capabilities (image / audio /
+      // embeddedContext) so attachment specs can exercise the gate
+      // without a real agent. Defaults stay all-false. See #1000 / #965.
+      const result = script.promptCapabilities
+        ? {
+            ...INITIALIZE_RESULT,
+            agentCapabilities: {
+              ...INITIALIZE_RESULT.agentCapabilities,
+              promptCapabilities: {
+                ...INITIALIZE_RESULT.agentCapabilities.promptCapabilities,
+                ...script.promptCapabilities,
+              },
+            },
+          }
+        : INITIALIZE_RESULT;
+      sendResult(id, result);
       return;
+    }
 
     case "session/new":
     case "session/load": {
