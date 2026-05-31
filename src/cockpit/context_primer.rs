@@ -146,7 +146,7 @@ pub fn build_context_primer(events: &[(u64, Event)], opts: PrimerOptions) -> Con
         }
 
         match event {
-            Event::UserPromptSent { text } => {
+            Event::UserPromptSent { text, .. } => {
                 if let Some(t) = current.take() {
                     turns.push(t);
                 }
@@ -715,6 +715,7 @@ mod tests {
             seq,
             Event::UserPromptSent {
                 text: text.to_string(),
+                attachments: Vec::new(),
             },
         )
     }

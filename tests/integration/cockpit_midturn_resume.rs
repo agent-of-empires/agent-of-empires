@@ -300,7 +300,7 @@ async fn socket_transport_round_trips_prompt_via_attach() {
     .expect("attach to bridge");
 
     client
-        .send_prompt("hello over socket")
+        .send_prompt("hello over socket", &[])
         .await
         .expect("send_prompt");
 

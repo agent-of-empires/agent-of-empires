@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ErrorCode;
 use agent_client_protocol::schema::{
-    CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, KillTerminalRequest,
+    AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
+    CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
+    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
@@ -42,13 +43,14 @@ use super::agent_compat::{self, ExpectedAgent};
 use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
+use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
 use super::permissions::build_approval;
 use super::state::{
     AvailableCommand, CockpitSessionId, ConfigOptionCategory, ConfigOptionChoice,
     ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
-    PlanStepStatus, RateLimitInfo, SessionMode, SessionUsage, StartupErrorDetail, ToolCall,
-    UsageCost,
+    PlanStepStatus, PromptAttachmentKind, RateLimitInfo, SessionMode, SessionUsage,
+    StartupErrorDetail, ToolCall, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
 use crate::session::SandboxInfo;
@@ -285,7 +287,10 @@ pub struct SpawnConfig {
 
 /// Commands sent from `AcpClient` methods to the background connection task.
 enum ClientCmd {
-    Prompt(String),
+    /// The fully-built prompt content blocks (text first, then any
+    /// attachments). Built in `send_prompt` so the connection task just
+    /// forwards them to `session/prompt`. See #1000.
+    Prompt(Vec<ContentBlock>),
     Cancel,
     SetMode(String),
     /// Send `session/set_config_option` for the given (`config_id`,
@@ -1466,11 +1471,47 @@ impl AcpClient {
         .await
     }
 
-    /// Send a user message to the agent (ACP `session/prompt`).
-    pub async fn send_prompt(&self, text: &str) -> Result<(), AcpError> {
+    /// Send a user message to the agent (ACP `session/prompt`). The
+    /// `attachments` are mapped to the matching ACP `ContentBlock`
+    /// (`Image` / `Audio` / `Resource`) and appended after the text
+    /// block. Callers are responsible for gating attachment kinds on
+    /// the agent's advertised `prompt_capabilities`; this method does
+    /// not re-check them. See #1000 / #965.
+    pub async fn send_prompt(
+        &self,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), AcpError> {
+        use base64::Engine as _;
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + attachments.len());
+        blocks.push(ContentBlock::Text(TextContent::new(text)));
+        for att in attachments {
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
+            let block = match att.kind {
+                PromptAttachmentKind::Image => {
+                    ContentBlock::Image(ImageContent::new(data_b64, att.mime_type.clone()))
+                }
+                PromptAttachmentKind::Audio => {
+                    ContentBlock::Audio(AudioContent::new(data_b64, att.mime_type.clone()))
+                }
+                PromptAttachmentKind::Resource => {
+                    // Embedded binary resource. ACP requires a uri; the
+                    // bytes never leave the daemon so a synthetic
+                    // `attachment://` uri is enough for the agent to
+                    // refer to it.
+                    let uri = format!("attachment:///{}", att.id);
+                    let blob =
+                        BlobResourceContents::new(data_b64, uri).mime_type(att.mime_type.clone());
+                    ContentBlock::Resource(EmbeddedResource::new(
+                        EmbeddedResourceResource::BlobResourceContents(blob),
+                    ))
+                }
+            };
+            blocks.push(block);
+        }
         cmd_tx
-            .send(ClientCmd::Prompt(text.to_string()))
+            .send(ClientCmd::Prompt(blocks))
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -3607,6 +3648,21 @@ async fn run_connection_task<W, R>(
             }
 
             let load_session_capable = init.agent_capabilities.load_session;
+            // Surface the agent's prompt capabilities to the cockpit so
+            // the web composer can gate the attachment button on the
+            // current agent, and the server prompt handler can reject
+            // attachments the agent cannot accept. `initialize` runs on
+            // both Fresh and Resume connects, so this re-emits on every
+            // reconnect and replay always carries a current copy. See
+            // #1000 / #965.
+            let prompt_caps = &init.agent_capabilities.prompt_capabilities;
+            let _ = event_tx_for_block
+                .send(Event::PromptCapabilities {
+                    image: prompt_caps.image,
+                    audio: prompt_caps.audio,
+                    embedded_context: prompt_caps.embedded_context,
+                })
+                .await;
             // Snapshot the watchdog-arming flag before `mode` is moved
             // into the match below.
             let arm_resume_watchdog = matches!(
@@ -3883,7 +3939,7 @@ async fn run_connection_task<W, R>(
             loop {
                 let cmd = cmd_rx.recv().await;
                 match cmd {
-                    Some(ClientCmd::Prompt(text)) => {
+                    Some(ClientCmd::Prompt(blocks)) => {
                         // First user prompt after session/load: stop
                         // dropping notifications. The agent's history-
                         // replay window is over; everything from now on
@@ -3900,7 +3956,7 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
-                        info!(target: "cockpit.acp", "sending prompt ({} chars)", text.len());
+                        info!(target: "cockpit.acp", "sending prompt ({} content blocks)", blocks.len());
                         // Drive the prompt request concurrently with the
                         // command channel so out-of-band notifications
                         // (Cancel, SetMode) can be delivered to the agent
@@ -3960,10 +4016,7 @@ async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_fut = connection
-                            .send_request(PromptRequest::new(
-                                acp_session_id.clone(),
-                                vec![ContentBlock::Text(TextContent::new(text))],
-                            ))
+                            .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
                             .block_task();
                         tokio::pin!(prompt_fut);
 
@@ -4306,7 +4359,7 @@ async fn run_connection_task<W, R>(
                                                 respond_to,
                                             );
                                         }
-                                        Some(ClientCmd::Prompt(rejected_text)) => {
+                                        Some(ClientCmd::Prompt(rejected_blocks)) => {
                                             // Surface the dropped prompt
                                             // to the UI so the user can
                                             // retry from a Rejected pill
@@ -4318,6 +4371,18 @@ async fn run_connection_task<W, R>(
                                             // server-side gap when a prompt
                                             // does make it to the daemon
                                             // while another is in flight.
+                                            // Recover the text from the
+                                            // first text block; attachments
+                                            // aren't carried back into the
+                                            // retry pill (rare agent-busy
+                                            // edge, text is the retry hook).
+                                            let rejected_text = rejected_blocks
+                                                .iter()
+                                                .find_map(|b| match b {
+                                                    ContentBlock::Text(t) => Some(t.text.clone()),
+                                                    _ => None,
+                                                })
+                                                .unwrap_or_default();
                                             warn!(
                                                 target: "cockpit.acp",
                                                 "received Prompt while one is in flight; rejecting"

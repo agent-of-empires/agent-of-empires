@@ -282,7 +282,7 @@ export type CockpitEvent =
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
-  | { UserPromptSent: { text: string } }
+  | { UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] } }
   | {
       UserDiffCommentsPrompt: {
         intro: string;
@@ -292,11 +292,62 @@ export type CockpitEvent =
         assembledMarkdown: string;
       };
     }
+  | {
+      PromptCapabilities: {
+        image: boolean;
+        audio: boolean;
+        embedded_context: boolean;
+      };
+    }
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } };
+
+/** Metadata-only attachment ref as it rides on a `UserPromptSent`
+ *  event from the server (mirrors Rust `PromptAttachmentRef`). The
+ *  bytes are fetched lazily from the replay GET endpoint. See #1000. */
+export interface PromptAttachmentRefWire {
+  id: string;
+  kind: PromptAttachmentKind;
+  mime_type: string;
+  name?: string;
+  size: number;
+}
+
+export type PromptAttachmentKind = "image" | "audio" | "resource";
+
+/** What the agent will accept on a prompt, from the ACP `initialize`
+ *  handshake. Drives the composer's attachment button gating. */
+export interface PromptCapabilities {
+  image: boolean;
+  audio: boolean;
+  embeddedContext: boolean;
+}
+
+/** One attachment as the composer hands it to `sendPrompt`: the raw
+ *  base64 bytes plus metadata. The hook turns this into both the POST
+ *  upload body and the optimistic preview row. See #1000 / #965. */
+export interface PromptAttachmentInput {
+  kind: PromptAttachmentKind;
+  mimeType: string;
+  name?: string;
+  /** Standard base64, no `data:` URL prefix. */
+  dataB64: string;
+}
+
+/** One attachment as the composer and transcript render it. `url` is
+ *  the replay GET endpoint for server-confirmed rows, or a local
+ *  object URL for the optimistic echo before the server confirms. */
+export interface CockpitAttachment {
+  id: string;
+  kind: PromptAttachmentKind;
+  mimeType: string;
+  name?: string;
+  size: number;
+  url: string;
+}
 
 export interface CockpitFrame {
   session_id: string;
@@ -308,6 +359,10 @@ export interface CockpitState {
   agent: string | null;
   model: string | null;
   mode: SessionMode;
+  /** Attachment kinds the current agent accepts, from the latest
+   *  `PromptCapabilities` event. Null until the handshake reports it;
+   *  the composer keeps the attachment button disabled while null. */
+  promptCapabilities: PromptCapabilities | null;
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
@@ -560,6 +615,10 @@ export interface ActivityRow {
     isMultiRepo: boolean;
     comments: DiffComment[];
   };
+  /** Attachments on a `user_prompt` row (images / audio / resources).
+   *  Set from the optimistic local preview on send, or from the
+   *  server `UserPromptSent` refs on replay. See #1000 / #965. */
+  attachments?: CockpitAttachment[];
   at: string; // ISO-8601
 }
 
@@ -585,6 +644,7 @@ export function emptyCockpitState(): CockpitState {
     agent: null,
     model: null,
     mode: "Default",
+    promptCapabilities: null,
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
@@ -1135,8 +1195,32 @@ export function applyEvent(
     next.turnActive = isTurnActive(next);
     return next;
   }
+  if ("PromptCapabilities" in event) {
+    const c = event.PromptCapabilities;
+    next.promptCapabilities = {
+      image: c.image,
+      audio: c.audio,
+      embeddedContext: c.embedded_context,
+    };
+    return next;
+  }
   if ("UserPromptSent" in event) {
     const text = event.UserPromptSent.text;
+    // Map server attachment refs to render-ready attachments backed by
+    // the replay GET endpoint. Used on the replay/no-optimistic path;
+    // the optimistic row already carries local preview URLs. See #1000.
+    const serverAttachments: CockpitAttachment[] = (
+      event.UserPromptSent.attachments ?? []
+    ).map((a) => ({
+      id: a.id,
+      kind: a.kind,
+      mimeType: a.mime_type,
+      name: a.name,
+      size: a.size,
+      url: `/api/sessions/${encodeURIComponent(
+        frame.session_id,
+      )}/cockpit/attachments/${encodeURIComponent(a.id)}`,
+    }));
     // Dedupe against the optimistic row that useCockpit's sendPrompt
     // dispatched a moment ago: find the OLDEST matching un-promoted
     // user_prompt with the same text and promote it to the
@@ -1161,7 +1245,18 @@ export function applyEvent(
       const match = next.activity[matchIdx];
       if (match) {
         const updated = next.activity.slice();
-        updated[matchIdx] = { ...match, id: `user-seq-${frame.seq}` };
+        // Keep the optimistic local previews if present (no refetch);
+        // otherwise adopt the server refs so the bubble still renders.
+        updated[matchIdx] = {
+          ...match,
+          id: `user-seq-${frame.seq}`,
+          attachments:
+            match.attachments && match.attachments.length > 0
+              ? match.attachments
+              : serverAttachments.length > 0
+                ? serverAttachments
+                : undefined,
+        };
         next.activity = updated;
       }
     } else {
@@ -1176,6 +1271,7 @@ export function applyEvent(
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
+        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
         at: new Date().toISOString(),
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;

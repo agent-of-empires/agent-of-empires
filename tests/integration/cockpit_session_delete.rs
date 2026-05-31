@@ -48,7 +48,7 @@ async fn drive_handshake_and_capture_session_id(
     deadline: std::time::Instant,
 ) -> Option<String> {
     client
-        .send_prompt("hello")
+        .send_prompt("hello", &[])
         .await
         .expect("send_prompt should reach the shim");
     let mut acp_session_id: Option<String> = None;

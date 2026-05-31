@@ -269,14 +269,14 @@ async function flushAsync(): Promise<void> {
 
 describe("useCockpit drain race (#1144)", () => {
   let promptPostCount: number;
-  let promptPostShouldFail: boolean;
+  let promptPostStatus: number;
   let promptPostBodies: string[];
   let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
 
   beforeEach(() => {
     sockets.length = 0;
     promptPostCount = 0;
-    promptPostShouldFail = false;
+    promptPostStatus = 200;
     promptPostBodies = [];
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
@@ -291,10 +291,10 @@ describe("useCockpit drain race (#1144)", () => {
           if (typeof init?.body === "string") {
             promptPostBodies.push(init.body);
           }
-          if (promptPostShouldFail) {
-            return new Response("simulated failure", { status: 500 });
+          if (promptPostStatus >= 400) {
+            return new Response("simulated failure", { status: promptPostStatus });
           }
-          return new Response("{}", { status: 200 });
+          return new Response("{}", { status: promptPostStatus });
         }
         return new Response("{}", { status: 200 });
       }),
@@ -390,6 +390,38 @@ describe("useCockpit drain race (#1144)", () => {
     );
   });
 
+  it("retires the optimistic turn when prompt POST is rejected with 4xx", async () => {
+    const { result } = renderHook(() => useCockpit("sess-reject-4xx"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    promptPostStatus = 400;
+    await act(async () => {
+      await result.current.sendPrompt("send bad attachment", [
+        {
+          kind: "image",
+          mimeType: "image/x-xcf",
+          dataB64: "aA==",
+          name: "bad.xcf",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.pendingUserPromptSeq).toBe(1);
+    expect(result.current.state.lastStoppedSeq).toBe(1);
+    expect(result.current.state.turnActive).toBe(false);
+    expect(result.current.state.lastError).toContain(
+      "Could not send prompt (400)",
+    );
+  });
+
   it("combined-mode drain leaves the queue intact when the prompt POST fails", async () => {
     const { result } = renderHook(() => useCockpit("sess-drain-2"));
     await flushAsync();
@@ -426,7 +458,7 @@ describe("useCockpit drain race (#1144)", () => {
 
     // Configure the prompt POST to fail, then end the turn so the drain
     // fires.
-    promptPostShouldFail = true;
+    promptPostStatus = 500;
     act(() => {
       ws.onmessage?.({
         data: JSON.stringify({

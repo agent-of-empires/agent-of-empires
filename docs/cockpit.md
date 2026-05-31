@@ -323,6 +323,53 @@ pointer is not invalidated mid-utterance, then drains the final text
 into the composer state on blur (typically when you tap Send) or
 after a brief idle period. See #1431.
 
+### Composer attachments (images, audio, files)
+
+The web composer can send attachments alongside the prompt text when
+the active agent advertises support for them. Three ways to add one:
+
+- the paperclip button in the composer toolbar opens a file picker;
+- paste an image (for example a screenshot) with Cmd/Ctrl+V while the
+  composer is focused;
+- drag and drop files onto the composer.
+
+Staged attachments show as removable chips above the text area; images
+render a thumbnail. A prompt can be attachment-only (no text), which is
+handy for "what is wrong here?" screenshots.
+
+Support is gated on the agent's ACP `prompt_capabilities`, reported
+during the `initialize` handshake. The paperclip is disabled (with a
+tooltip explaining why) when the current agent does not accept
+attachments, and the file picker only offers the kinds it does accept:
+
+- `image` for images,
+- `audio` for audio,
+- `embedded_context` for embedded resources (text / markdown / JSON /
+  PDF).
+
+`claude-agent-acp` advertises `image` and `embedded_context`; other
+agents vary, so the button reflects whichever agent is running.
+
+The server is the authority: it re-checks the agent capability, enforces
+a per-attachment size limit (10 MiB), a total-per-prompt limit (20 MiB),
+a count cap (8), a MIME allowlist (`image/svg+xml` and HTML are
+excluded), and sniffs image magic bytes so a mislabeled file is
+rejected. Oversize or unsupported attachments come back as an error
+instead of reaching the agent.
+
+Attachments are persisted with the transcript so they re-render on
+reload. The bytes live in a dedicated store keyed to the prompt and are
+pruned in lockstep with it (and dropped when the session is deleted), so
+the event log stays lean. Replayed images are fetched lazily from
+`GET /api/sessions/{id}/cockpit/attachments/{attachment_id}`.
+
+Attachments require an idle, connected agent. Unlike text, they are not
+held in the offline prompt queue (which is stored locally in the
+browser); sending an attachment while the agent is mid-turn or
+disconnected surfaces an error rather than silently dropping it. Audio
+and embedded resources are sent and stored, but render as a labelled
+chip rather than an inline player or preview for now.
+
 ### Queued prompts (mid-turn + inactive session)
 
 The web composer keeps your messages around even when the session

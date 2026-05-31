@@ -402,6 +402,49 @@ pub struct DiffComment {
     pub updated_at: Option<String>,
 }
 
+/// Which ACP `ContentBlock` an attachment maps to. The string form
+/// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
+/// with the web composer and the prompt-request DTO in `protocol.rs`,
+/// so renaming a variant breaks the build on both sides rather than
+/// silently dropping attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptAttachmentKind {
+    Image,
+    Audio,
+    Resource,
+}
+
+impl PromptAttachmentKind {
+    /// Stable lowercase tag, matching the serde wire form. Used by the
+    /// attachment store to persist the kind as a TEXT column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptAttachmentKind::Image => "image",
+            PromptAttachmentKind::Audio => "audio",
+            PromptAttachmentKind::Resource => "resource",
+        }
+    }
+}
+
+/// Replay-side view of one prompt attachment. Carries metadata only,
+/// never the bytes: the decoded blob lives in the `cockpit_attachments`
+/// table keyed by `(session_id, id)` and is fetched lazily over
+/// `GET /cockpit/attachments/{id}`. Keeping bytes out of the event log
+/// is what stops `event_json` (and every WS replay frame) from bloating
+/// to megabytes per screenshot. See #1000 / #965.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptAttachmentRef {
+    pub id: String,
+    pub kind: PromptAttachmentKind,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Decoded byte length, for the UI to show a size hint without
+    /// fetching the blob.
+    pub size: u64,
+}
+
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
 /// become variants and flow through the same path.
@@ -595,6 +638,26 @@ pub enum Event {
     /// every turn collapses into one assistant blob.
     UserPromptSent {
         text: String,
+        /// Attachments the user sent alongside the text (images, audio,
+        /// embedded resources). Metadata only; bytes live in the
+        /// `cockpit_attachments` store. `#[serde(default)]` keeps
+        /// pre-attachment events on disk deserialising as text-only, so
+        /// no migration is needed. See #1000 / #965.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PromptAttachmentRef>,
+    },
+    /// The agent's prompt capabilities, captured from the ACP
+    /// `initialize` response right after the handshake (and re-emitted
+    /// on every connect, since `initialize` runs in both Fresh and
+    /// Resume modes). Persisted + replayed so the web composer can gate
+    /// the attachment button on the current agent without a round-trip,
+    /// and so a reconnecting client reconstructs the gate from history.
+    /// The server prompt handler reads the latest one to reject
+    /// attachments an agent cannot accept. See #1000.
+    PromptCapabilities {
+        image: bool,
+        audio: bool,
+        embedded_context: bool,
     },
     /// Echo of a "Send diff comments" submission, published by the
     /// `POST /cockpit/prompt/diff-comments` handler before
@@ -815,6 +878,11 @@ impl CockpitState {
             // persistent CockpitState; it bumps seq so the replay buffer
             // and on-disk store capture the user's side of the turn.
             Event::UserDiffCommentsPrompt { .. } => {}
+            // Surfaced to the web composer via replay and read by the
+            // server prompt handler from the event store; no persistent
+            // CockpitState field consumes it, so this arm only bumps
+            // seq/updated_at like the streaming events above.
+            Event::PromptCapabilities { .. } => {}
             Event::AcpSessionAssigned { .. } => {
                 // A fresh agent that passed the compatibility check
                 // has come online; heal any sticky startup error so a
