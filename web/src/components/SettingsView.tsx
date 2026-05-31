@@ -810,6 +810,17 @@ function CockpitSettings({
           min={0}
           onChange={(v) => onSaveField("cockpit", "silent_orphan_fast_grace_secs", v)}
         />
+        <NumberField
+          label="Auto-stop idle workers (s)"
+          description="Seconds of inactivity (no cockpit events, no in-flight turn) after which the daemon stops an idle cockpit worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Cockpit workers only. Persists to config.toml as cockpit.auto_stop_idle_secs; cross-device. See #1689."
+          value={
+            typeof cockpit.auto_stop_idle_secs === "number"
+              ? (cockpit.auto_stop_idle_secs as number)
+              : 0
+          }
+          min={0}
+          onChange={(v) => onSaveField("cockpit", "auto_stop_idle_secs", v)}
+        />
       </CollapsibleSection>
 
       {error && <div className="text-xs text-rose-400">{error}</div>}

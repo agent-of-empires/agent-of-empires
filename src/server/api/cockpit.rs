@@ -447,10 +447,12 @@ pub async fn cockpit_prompt(
     // Touch the instance before forwarding so an archived or
     // currently-snoozed session auto-wakes the same way the tmux send
     // path does (`/api/sessions/{id}/send`). `touch_last_accessed`
-    // clears `archived_at` and `snoozed_until` so the cockpit
-    // reconciler stops skipping the session on its next ~2s tick and
-    // respawns the worker; the frontend's queue drains as soon as the
-    // fresh `AcpSessionAssigned` lands. See #1581.
+    // clears `archived_at`, `snoozed_until`, and `idle_dormant_since` so
+    // the cockpit reconciler stops skipping the session on its next ~2s
+    // tick and respawns the worker; the frontend's queue drains as soon
+    // as the fresh `AcpSessionAssigned` lands. The idle_dormant_since
+    // clear is the wake path for auto-stopped idle workers (#1689); a
+    // worker reaped for inactivity respawns on the next prompt. See #1581.
     //
     // The in-memory mutation and the disk persistence are both held
     // under `state.instance_lock(&id)` so they serialize against
@@ -465,9 +467,20 @@ pub async fn cockpit_prompt(
     let triage_changed = {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            let was_sunk = inst.is_archived() || inst.is_snoozed();
+            let was_sunk = inst.is_archived() || inst.is_snoozed() || inst.is_idle_dormant();
             if was_sunk {
+                let was_idle_dormant = inst.is_idle_dormant();
                 inst.touch_last_accessed();
+                if was_idle_dormant {
+                    // Pairs with the "auto-stopped idle cockpit worker"
+                    // info log in the reconciler's reap pass (#1689) so the
+                    // stop/resume cycle is traceable in the daemon log.
+                    tracing::info!(
+                        target: "cockpit.supervisor",
+                        session = %id,
+                        "waking idle-dormant cockpit session on prompt; reconciler will respawn the worker"
+                    );
+                }
             }
             was_sunk
         } else {

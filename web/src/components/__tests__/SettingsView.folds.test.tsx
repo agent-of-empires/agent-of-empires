@@ -196,6 +196,10 @@ describe("Settings Advanced fold", () => {
       fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"),
       "30",
     );
+    commit(
+      fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"),
+      "28800",
+    );
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
@@ -205,6 +209,9 @@ describe("Settings Advanced fold", () => {
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       cockpit: { silent_orphan_fast_grace_secs: 30 },
+    });
+    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+      cockpit: { auto_stop_idle_secs: 28800 },
     });
   });
 
