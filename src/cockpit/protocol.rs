@@ -228,6 +228,13 @@ pub struct SwitchAgentRequest {
     /// back to the instance's existing `cockpit_model`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Why the switch happened, recorded verbatim in the `AgentSwitched`
+    /// event and surfaced in the transcript divider. The rate-limit
+    /// recovery flow sends `"rate_limited"`; an explicit user-initiated
+    /// switch (composer control, `aoe cockpit switch-agent`) sends
+    /// `"manual"`. Defaults to `"manual"` when omitted.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/cockpit/switch-agent` response.
@@ -246,7 +253,9 @@ pub struct SwitchAgentResponse {
     /// recovery composer prefill so the divider, state-clear, and
     /// primer prefill all land in order.
     pub switch_seq: u64,
-    pub status: &'static str,
+    /// Owned so the client side can deserialize the response (a
+    /// `&'static str` field is not `DeserializeOwned`).
+    pub status: String,
 }
 
 #[cfg(test)]
@@ -303,5 +312,23 @@ mod tests {
         let body = serde_json::json!({ "decision": "Allow" });
         let parsed: ResolveApprovalRequest = serde_json::from_value(body).unwrap();
         assert!(matches!(parsed.decision, ApprovalDecisionWire::Allow));
+    }
+
+    #[test]
+    fn switch_agent_request_optional_fields_default_to_none() {
+        // A bare body (the rate-limit recovery modal's original shape)
+        // still deserializes; model and reason are optional.
+        let body = serde_json::json!({ "target": "codex" });
+        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.target, "codex");
+        assert!(parsed.model.is_none());
+        assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn switch_agent_request_carries_reason() {
+        let body = serde_json::json!({ "target": "claude", "reason": "manual" });
+        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("manual"));
     }
 }

@@ -410,9 +410,11 @@ pub async fn list_cockpit_agents(State(state): State<Arc<AppState>>) -> impl Int
 }
 
 /// Atomically move a cockpit session from one ACP backend to another.
-/// Used by the rate-limit recovery flow (#1282) so the user can
-/// continue a Claude-rate-limited session in `codex` (or another
-/// installed ACP backend) without losing the transcript.
+/// Two callers drive this: the rate-limit recovery flow (#1282), which
+/// hands a Claude-rate-limited session off to `codex` (or another
+/// installed backend), and explicit user-initiated switches from the
+/// composer control or `aoe cockpit switch-agent`. Both keep the
+/// transcript; only the recorded `reason` differs.
 ///
 /// Sequence:
 ///   1. Validate `target` exists in the cockpit registry.
@@ -590,11 +592,18 @@ pub async fn switch_cockpit_agent(
         }
     }
 
+    let reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("manual")
+        .to_string();
     let switch_seq = state.cockpit_supervisor.publish_agent_switched(
         &id,
         from_agent.clone(),
         target.clone(),
-        "rate_limited".into(),
+        reason,
     );
 
     Json(SwitchAgentResponse {
@@ -602,7 +611,7 @@ pub async fn switch_cockpit_agent(
         agent: target,
         before_seq,
         switch_seq,
-        status: "running",
+        status: "running".to_string(),
     })
     .into_response()
 }

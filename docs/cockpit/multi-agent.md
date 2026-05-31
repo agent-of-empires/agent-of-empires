@@ -91,6 +91,15 @@ The cockpit then renders the generic tool card, which is the right
 fallback. The user can file a PR adding the alias once they've used the
 agent and confirmed the wire shape.
 
+## Switching Agents on a Live Session
+
+A cockpit session is not pinned to the agent it started with. You can hand it off to any other installed ACP backend at any time, keeping the transcript. The new agent starts fresh (a new ACP session) and is primed with a recap of the recent turns so it can pick up where the last one left off.
+
+- **Web dashboard:** use the "Switch agent" control in the composer toolbar. The rate-limit recovery banner exposes the same picker via "Continue in another agent" when an agent is over its limit.
+- **CLI:** `aoe cockpit switch-agent <session> <target>`, where `<target>` is a registry key from `aoe cockpit agents`. Add `--model <name>` to override the model.
+
+This is what you reach for after a rate-limit hand-off: switch claude to codex when claude is limited, then `aoe cockpit switch-agent <session> claude` (or the toolbar control) to return once the window resets. The transcript records each switch with its reason (`manual` or `rate_limited`) on a divider.
+
 ## Known Limitations
 
 - Codex / opencode / gemini cockpit support has been built from adapter

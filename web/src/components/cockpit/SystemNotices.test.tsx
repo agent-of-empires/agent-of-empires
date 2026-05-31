@@ -2,7 +2,7 @@
 //
 // Wiring contract for the rate-limit recovery handoff button. CockpitView
 // passes `onSwitchAgent={() => setRecoveryOpen(true)}` and the only way
-// the user reaches the RateLimitRecoveryModal is by clicking the button
+// the user reaches the SwitchAgentModal from here is by clicking the button
 // SystemNotices conditionally renders below the rate-limit banner. This
 // test pins:
 //   1. The button shows up exactly when both `rateLimit` and
