@@ -29,7 +29,11 @@ Gemini CLI, etc.) is the *server*. Any ACP-conformant agent works.
 
 aoe ships a registry entry for each tool whose ACP server we've verified
 against [agentclientprotocol.com](https://agentclientprotocol.com/get-started/agents.md).
-The wizard greys out the cockpit option for tools not in this set.
+When the cockpit master switch is on, the web wizard shows a per-session
+**Cockpit** toggle (on by default) for tools in this set, so you can opt
+a single session down to a plain tmux session without flipping the global
+switch. Tools not in this set, and custom agents, have no toggle and
+always fall back to tmux.
 
 | aoe tool   | Substrate B (cockpit)                                      | Auth                                   |
 |------------|------------------------------------------------------------|----------------------------------------|

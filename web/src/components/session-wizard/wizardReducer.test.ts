@@ -212,3 +212,57 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
     expect(late.data.yoloMode).toBe(true);
   });
 });
+
+describe("SessionWizard reducer / useCockpit (#1580)", () => {
+  it("defaults useCockpit to true so the master switch keeps its current behavior", () => {
+    expect(initialData.useCockpit).toBe(true);
+  });
+
+  it("SET_FIELD useCockpit updates the flag", () => {
+    const next = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useCockpit",
+      value: false,
+    });
+    expect(next.data.useCockpit).toBe(false);
+  });
+
+  it("toggling useCockpit does NOT mark profileDirty", () => {
+    // useCockpit is deliberately excluded from the dirty-tracking list:
+    // the mount-time APPLY_PROFILE_DEFAULTS seeder uses skipIfDirty, so
+    // marking dirty on a cockpit toggle would suppress the profile's
+    // tool/yolo/sandbox/env defaults even though cockpit is unrelated.
+    const next = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useCockpit",
+      value: false,
+    });
+    expect(next.data.profileDirty).toBe(false);
+
+    // A late profile-defaults fetch must still apply (not be skipped).
+    const late = reducer(next, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: true,
+      sandboxEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(late.data.yoloMode).toBe(true);
+  });
+
+  it("switching tool preserves the user's useCockpit choice", () => {
+    const optedOut = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useCockpit",
+      value: false,
+    });
+    const next = reducer(optedOut, {
+      type: "SET_FIELD",
+      field: "tool",
+      value: "opencode",
+    });
+    expect(next.data.tool).toBe("opencode");
+    expect(next.data.useCockpit).toBe(false);
+  });
+});
