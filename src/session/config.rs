@@ -582,6 +582,18 @@ pub struct SessionConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub agent_detect_as: HashMap<String, String>,
 
+    /// ACP launch command for a custom agent, enabling it to run in the
+    /// structured cockpit UI (e.g., "oc-superpowers" = "ocp run sp acp").
+    /// A custom agent with an entry here is cockpit-capable; without one it
+    /// is tmux-only.
+    ///
+    /// Note: unlike `custom_agents` (a shell command run in a tmux pane),
+    /// this value is split into argv with shell-word rules and executed
+    /// directly, with no shell. For shell features, wrap explicitly, e.g.
+    /// `sh -lc 'source ~/.profile && ocp run sp acp'`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_cockpit_cmd: HashMap<String, String>,
+
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
     /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
@@ -759,6 +771,7 @@ impl Default for SessionConfig {
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
+            agent_cockpit_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             restart_wake_message: default_restart_wake_message(),
@@ -863,6 +876,40 @@ impl SessionConfig {
                     target,
                     crate::agents::agent_names().join(", ")
                 );
+            }
+        }
+        for (name, command) in &self.agent_cockpit_cmd {
+            if name.is_empty() {
+                tracing::warn!(target: "session.store", "agent_cockpit_cmd: entry with empty agent name will be ignored");
+                continue;
+            }
+            if crate::agents::get_agent(name).is_some() {
+                tracing::warn!(target: "session.store",
+                    "agent_cockpit_cmd: '{}' shadows a built-in agent; built-in agents already have a cockpit adapter and the entry will be ignored",
+                    name
+                );
+                continue;
+            }
+            if !self.custom_agents.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_cockpit_cmd: '{}' has no matching custom_agents entry; it will not appear in the agent picker",
+                    name
+                );
+            }
+            match shell_words::split(command) {
+                Ok(argv) if argv.is_empty() => {
+                    tracing::warn!(target: "session.store",
+                        "agent_cockpit_cmd: '{}' has an empty command, cockpit will be unavailable for it",
+                        name
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "session.store",
+                        "agent_cockpit_cmd: '{}' has a malformed command ({}), cockpit will be unavailable for it",
+                        name, e
+                    );
+                }
             }
         }
     }
@@ -2297,6 +2344,34 @@ mod tests {
             deserialized.session.agent_detect_as.get("lenovo-claude"),
             Some(&"claude".to_string()),
         );
+    }
+
+    #[test]
+    fn test_agent_cockpit_cmd_roundtrip() {
+        let mut config = Config::default();
+        config
+            .session
+            .custom_agents
+            .insert("oc-sp".to_string(), "ocp run sp".to_string());
+        config
+            .session
+            .agent_cockpit_cmd
+            .insert("oc-sp".to_string(), "ocp run sp acp".to_string());
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.session.agent_cockpit_cmd.get("oc-sp"),
+            Some(&"ocp run sp acp".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_agent_cockpit_cmd_defaults_empty() {
+        // A config with no agent_cockpit_cmd must deserialize to an empty
+        // map (serde default), not error, so existing configs keep loading.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.session.agent_cockpit_cmd.is_empty());
     }
 
     #[test]

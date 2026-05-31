@@ -46,6 +46,8 @@ always fall back to tmux.
 | `aoe-agent`| Bundled multi-provider agent (Vercel AI SDK 6)             | Whatever provider env vars Vercel AI SDK expects |
 | *aider, cursor, copilot, droid, settl, hermes* | not yet wired into the cockpit registry; fall back to terminal mode |
 
+A **custom agent** can run in cockpit too: give it an ACP launch command via `agent_cockpit_cmd` in config (or the TUI settings screen). See [Running a custom agent in cockpit](guides/configuration.md#running-a-custom-agent-in-cockpit). The wizard reads each agent's `acp_capable` flag from the server, so a custom agent with an `agent_cockpit_cmd` offers cockpit just like a built-in; without one it stays terminal-only.
+
 The four env vars cockpit always forwards to the agent process are
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CONFIG_DIR`. For the others, set them in the env that runs

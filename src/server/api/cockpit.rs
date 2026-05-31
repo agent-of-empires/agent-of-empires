@@ -280,7 +280,12 @@ pub async fn spawn_cockpit(
     let explicit = req.agent.clone().or_else(|| instance.cockpit_agent.clone());
     let agent = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, explicit.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            explicit.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
 
     let cwd = PathBuf::from(&instance.project_path);
@@ -461,7 +466,12 @@ pub async fn switch_cockpit_agent(
     };
     let from_agent = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.cockpit_agent.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
     if from_agent == target {
         return (
@@ -1121,15 +1131,30 @@ pub async fn cockpit_enable(
         .into_response();
     }
 
-    // Verify the tool has an ACP-capable registry entry. Otherwise
-    // there's no agent to spawn and the swap would just produce a
-    // dead cockpit. Falls back to "tool not in registry" → 400.
+    // Verify the tool has an ACP-capable agent. Otherwise there's no
+    // agent to spawn and the swap would just produce a dead cockpit.
+    // Built-in tools resolve from the registry; a custom agent is valid
+    // when it declares an `agent_cockpit_cmd` in its profile config.
     let agent_name = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.cockpit_agent.as_deref(),
+            &profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
     let registry = state.cockpit_supervisor.registry_snapshot().await;
-    if registry.get(&agent_name).is_none() {
+    let resolvable = registry.get(&agent_name).is_some()
+        || state
+            .cockpit_supervisor
+            .custom_agent_has_cockpit_cmd(
+                &instance.tool,
+                &profile,
+                std::path::Path::new(&instance.project_path),
+            )
+            .await;
+    if !resolvable {
         return (
             StatusCode::BAD_REQUEST,
             format!("no cockpit agent registered for tool {:?}", instance.tool),

@@ -123,8 +123,10 @@ pub(super) const SESSION_BLOCKED_FIELDS: &[&str] = &[
     // custom_agents maps names to arbitrary shell commands (e.g., "ssh -t host claude").
     // agent_detect_as maps names to detection targets but is part of the agent config
     // surface that should only be editable locally.
+    // agent_cockpit_cmd maps names to ACP launch commands, another command-injection vector.
     "custom_agents",
     "agent_detect_as",
+    "agent_cockpit_cmd",
 ];
 
 /// Top-level settings sections whose presence in a `PATCH
@@ -790,6 +792,8 @@ mod tests {
             "custom_agents",
             // agent_detect_as: part of the agent config surface
             "agent_detect_as",
+            // agent_cockpit_cmd: maps agent names to ACP launch commands
+            "agent_cockpit_cmd",
         ];
         assert_eq!(
             SESSION_BLOCKED_FIELDS.len(),

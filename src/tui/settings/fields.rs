@@ -107,6 +107,7 @@ pub enum FieldKey {
     AgentStatusHooks,
     CustomAgents,
     AgentDetectAs,
+    AgentCockpitCmd,
     HostEnvironment,
     SessionIdPollerMaxThreads,
     LiveSendExitChord,
@@ -1906,6 +1907,30 @@ fn build_agents_fields(
         items
     };
 
+    let (cockpit_cmd_map, cockpit_cmd_override) = resolve_value(
+        scope,
+        global.session.agent_cockpit_cmd.clone(),
+        session.and_then(|s| s.agent_cockpit_cmd.clone()),
+    );
+    let cockpit_cmd_list: Vec<String> = {
+        let mut items: Vec<_> = cockpit_cmd_map
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        items.sort();
+        items
+    };
+    let global_cockpit_cmd_list: Vec<String> = {
+        let mut items: Vec<_> = global
+            .session
+            .agent_cockpit_cmd
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        items.sort();
+        items
+    };
+
     vec![
         SettingField {
             key: FieldKey::DefaultTool,
@@ -1973,6 +1998,19 @@ fn build_agents_fields(
             inherited_display: inherited_if(
                 detect_as_override,
                 FieldValue::List(global_detect_as_list),
+            ),
+        },
+        SettingField {
+            key: FieldKey::AgentCockpitCmd,
+            label: "Agent Cockpit Command",
+            description:
+                "ACP launch command enabling a custom agent in cockpit: agent=command (e.g. oc-sp=ocp run sp acp)",
+            value: FieldValue::List(cockpit_cmd_list),
+            category: SettingsCategory::Agents,
+            has_override: cockpit_cmd_override,
+            inherited_display: inherited_if(
+                cockpit_cmd_override,
+                FieldValue::List(global_cockpit_cmd_list),
             ),
         },
         SettingField {
@@ -2748,6 +2786,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::AgentDetectAs, FieldValue::List(v)) => {
             config.session.agent_detect_as = parse_key_value_list(v);
         }
+        (FieldKey::AgentCockpitCmd, FieldValue::List(v)) => {
+            config.session.agent_cockpit_cmd = parse_key_value_list(v);
+        }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => config.sound.enabled = *v,
         (FieldKey::SoundMode, FieldValue::Select { selected, .. }) => {
@@ -3238,6 +3279,14 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 .session
                 .get_or_insert_with(SessionConfigOverride::default);
             s.agent_detect_as = Some(map);
+        }
+        (FieldKey::AgentCockpitCmd, FieldValue::List(v)) => {
+            let map = parse_key_value_list(v);
+            use crate::session::SessionConfigOverride;
+            let s = config
+                .session
+                .get_or_insert_with(SessionConfigOverride::default);
+            s.agent_cockpit_cmd = Some(map);
         }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => {
@@ -3893,6 +3942,7 @@ mod tests {
             FieldKey::AgentCommandOverride,
             FieldKey::CustomAgents,
             FieldKey::AgentDetectAs,
+            FieldKey::AgentCockpitCmd,
             FieldKey::AgentStatusHooks,
         ] {
             assert!(
