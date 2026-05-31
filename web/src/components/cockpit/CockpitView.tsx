@@ -62,6 +62,7 @@ import {
   SPINNER_INTERVAL_MS,
   VERB_INTERVAL_MS,
   chooseVerb,
+  deriveSpinnerState,
 } from "../../lib/cockpitRattle";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
 import {
@@ -999,11 +1000,7 @@ export function WorkingSpinner({
     return () => window.clearInterval(t);
   }, [lastActivityRef]);
 
-  const state: "thinking" | "tool" | "working" = thinking
-    ? "thinking"
-    : tool
-      ? "tool"
-      : "working";
+  const state = deriveSpinnerState(thinking, tool);
   // Swap the rattle verb for an explicit "waiting on model" badge
   // with a live elapsed counter once the inactivity gap is clearly
   // longer than normal TTFT. The user can then distinguish "model

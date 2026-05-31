@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 
 import { WorkingSpinner } from "../CockpitView";
+import { THINKING_VERBS } from "../../../lib/cockpitRattle";
 
 function makeRef(initial: number): React.RefObject<number> {
   return { current: initial } as React.RefObject<number>;
@@ -82,5 +83,17 @@ describe("WorkingSpinner force-end-turn gate (#1176)", () => {
       screen.queryByRole("button", { name: /force end turn/i }),
     ).toBeNull();
     expect(screen.getByText(/waiting on tool… 3m \d{2}s/i)).toBeTruthy();
+  });
+});
+
+describe("WorkingSpinner state precedence (#1213)", () => {
+  it("shows the tool verb, not a thinking verb, when both thinking and tool are set", () => {
+    // The adapter can leave `thinking` latched true through a tool run
+    // (it skips ThinkingEnded). Tool is the more specific signal and
+    // must win, so the user sees "Dispatching Terminal…" rather than a
+    // mystical thinking verb while a shell command is in flight.
+    renderSpinner({ stalledSecs: 1, tool: "Terminal", thinking: true });
+    expect(screen.getByText(/Terminal…/)).toBeTruthy();
+    expect(THINKING_VERBS.some((v) => screen.queryByText(`${v}…`))).toBe(false);
   });
 });

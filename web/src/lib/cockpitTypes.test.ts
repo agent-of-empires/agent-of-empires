@@ -18,6 +18,7 @@ import {
   normaliseTurnCounters,
   type CockpitFrame,
   type CockpitState,
+  type ToolCall,
 } from "./cockpitTypes";
 
 function frame(seq: number, text: string): CockpitFrame {
@@ -2094,5 +2095,91 @@ describe("applyEvent / ConfigOptions (#1403)", () => {
       event: "SessionCleared",
     });
     expect(state.configOptions).toHaveLength(2);
+  });
+});
+
+describe("applyEvent / thinking-state honesty (#1213)", () => {
+  // claude-agent-acp emits ThinkingStarted once per reasoning block but
+  // often skips ThinkingEnded when it transitions into tool calls or
+  // final text. Without these clears, `thinking` latches true through a
+  // whole turn and the WorkingSpinner shows "thinking" verbs while a
+  // Terminal command is actually running. See #1213.
+
+  function toolCall(id: string, name: string): ToolCall {
+    return {
+      id,
+      name,
+      kind: "execute",
+      args_preview: "{}",
+      started_at: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  it("clears thinking when a tool call starts (no ThinkingEnded from adapter)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
+    });
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool?.name).toBe("Terminal");
+  });
+
+  it("clears thinking when assistant text starts streaming", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "Here is the answer" } },
+    });
+    expect(state.thinking).toBe(false);
+  });
+
+  it("clears thinking on Stopped so it does not leak across turns", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool).toBeNull();
+  });
+
+  it("derives tool over thinking through an interleaved turn (full trace)", () => {
+    // Mirrors the affected session: ThinkingStarted, then a Terminal
+    // tool call with no intervening ThinkingEnded.
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
+    });
+    // The WorkingSpinner derives state as tool > thinking > working.
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool).not.toBeNull();
   });
 });
