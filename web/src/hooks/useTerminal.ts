@@ -13,6 +13,8 @@ import type {
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { useWebSettings } from "./useWebSettings";
+import { TerminalTiming } from "../lib/terminalTiming";
+import type { TimingPingMessage, TimingPongMessage } from "../lib/types";
 
 // Client-side terminal WS debug logging is gated behind a runtime flag
 // so production users don't get a console full of lifecycle chatter.
@@ -46,6 +48,26 @@ const twarn = (...args: unknown[]) => {
   // can surface terminal-specific issues quickly.
   console.warn("[terminal.ws]", ...args);
 };
+
+// Keystroke-to-echo latency instrumentation, gated on its own
+// `?debug=terminal-timing` flag (separate from the `?debug=1` logging
+// gate above). When off, none of the timing code runs and no probe
+// traffic is sent, so normal sessions pay nothing. See #1453.
+const TERMINAL_TIMING_ENABLED = (() => {
+  if (typeof window === "undefined") return false;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("debug") === "terminal-timing";
+  } catch {
+    return false;
+  }
+})();
+// Cadence of the WS control-path ping while timing is enabled. 500ms
+// gives ~120 samples/min, enough for p90 over a debug session without
+// looking abusive on metered links.
+const TIMING_PING_INTERVAL_MS = 500;
+// How often the rolling p50/p95 summary is logged to the console.
+const TIMING_SUMMARY_INTERVAL_MS = 10000;
 
 // Fast-start retry schedule: 200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s. Total
 // to exhaustion ~22s vs the old exponential ladder's ~91s. The old 1s/30s
@@ -223,6 +245,18 @@ export function useTerminal(
     const container = containerRef.current;
     container.innerHTML = "";
 
+    // Latency instrumentation lives for the lifetime of this terminal and
+    // is exposed on `window.__aoeTiming` so an operator can call
+    // `window.__aoeTiming.dump()` to pull raw samples for offline
+    // analysis. Null (and entirely inert) unless the flag is set.
+    const timing = TERMINAL_TIMING_ENABLED ? new TerminalTiming() : null;
+    let timingPingTimer: ReturnType<typeof setInterval> | null = null;
+    let timingSummaryTimer: ReturnType<typeof setInterval> | null = null;
+    if (timing) {
+      (window as Window & { __aoeTiming?: TerminalTiming }).__aoeTiming =
+        timing;
+    }
+
     const isMobileViewport = () => window.innerWidth < MOBILE_BREAKPOINT_PX;
     const readFontSize = () =>
       isMobileViewport() ? settings.mobileFontSize : settings.desktopFontSize;
@@ -320,9 +354,14 @@ export function useTerminal(
     // so the terminal still works there.
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        timing?.setRenderer("dom");
+        webgl.dispose();
+      });
       term.loadAddon(webgl);
+      timing?.setRenderer("webgl");
     } catch (err) {
+      timing?.setRenderer("dom");
       tdbg("webgl addon unavailable, using DOM renderer", err);
     }
 
@@ -603,11 +642,29 @@ export function useTerminal(
           setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
         }
         if (event.data instanceof ArrayBuffer) {
-          term.write(new Uint8Array(event.data));
+          const bytes = new Uint8Array(event.data);
+          const token = timing?.onBinaryFrame(performance.now());
+          if (token) {
+            // This frame resolved an armed keystroke; capture the time
+            // through xterm's render completion as well as socket arrival.
+            term.write(bytes, () => timing!.onRender(token, performance.now()));
+          } else {
+            term.write(bytes);
+          }
         } else if (typeof event.data === "string") {
           // Check for server control messages before writing to terminal
           try {
             const msg = JSON.parse(event.data) as { type?: string };
+            if (msg.type === "timing_pong") {
+              const pong = msg as TimingPongMessage;
+              timing?.onPong(
+                pong.seq,
+                pong.client_t,
+                pong.server_busy_us,
+                performance.now(),
+              );
+              return;
+            }
             if (msg.type === "primary_status") {
               const status = msg as PrimaryStatusMessage;
               setState((prev) => ({ ...prev, isPrimary: status.is_primary }));
@@ -705,6 +762,10 @@ export function useTerminal(
       // Ctrl equivalents (Ctrl+A = 0x01, Ctrl+U = 0x15, etc.).
       term.onData((data: string) => {
         if (ws.readyState !== WebSocket.OPEN) return;
+        // Arm an Idle-TTFB sample for this keystroke. Arming (not the
+        // exact byte) is all the tracker needs; it only records when the
+        // terminal was idle and resolves on the next inbound frame.
+        timing?.onKeystroke(performance.now());
         if (ctrlActiveRef.current && data.length === 1) {
           const code = data.toUpperCase().charCodeAt(0);
           if (code >= 65 && code <= 90) {
@@ -721,6 +782,34 @@ export function useTerminal(
     // Kick off the connection. xterm.js's open() is synchronous so we
     // can dial the WS immediately after construction.
     connect();
+
+    // Drive the control-path ping and the periodic console summary. Both
+    // exist only when timing is enabled. The ping measures pure WS round
+    // trip (never reaches the PTY); the summary logs rolling percentiles
+    // so an operator watching the console sees attribution without
+    // dumping. makePing skips while a keystroke sample is armed so the
+    // probe never contends with the experiential measurement.
+    if (timing) {
+      timingPingTimer = setInterval(() => {
+        const ws = wsRef.current;
+        timing.pruneTimeouts(performance.now());
+        if (ws?.readyState !== WebSocket.OPEN) return;
+        const ping = timing.makePing(performance.now());
+        if (ping) {
+          ws.send(
+            JSON.stringify({
+              type: "timing_ping",
+              seq: ping.seq,
+              client_t: ping.client_t,
+            } as TimingPingMessage),
+          );
+        }
+      }, TIMING_PING_INTERVAL_MS);
+      timingSummaryTimer = setInterval(() => {
+        timing.pruneTimeouts(performance.now());
+        console.info(timing.summaryLine());
+      }, TIMING_SUMMARY_INTERVAL_MS);
+    }
 
     // Touch swipe emits SGR mouse-wheel escape sequences to the PTY
     // so tmux mouse-mode enters copy-mode and scrolls.
@@ -1304,6 +1393,12 @@ export function useTerminal(
       if (wheelPersistTimer) clearTimeout(wheelPersistTimer);
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (fontSizeRaf !== null) cancelAnimationFrame(fontSizeRaf);
+      if (timingPingTimer) clearInterval(timingPingTimer);
+      if (timingSummaryTimer) clearInterval(timingSummaryTimer);
+      if (timing) {
+        const w = window as Window & { __aoeTiming?: TerminalTiming };
+        if (w.__aoeTiming === timing) delete w.__aoeTiming;
+      }
       // Detach handlers BEFORE closing so the soon-to-fire onclose closure
       // can't schedule a retry that races the next session's connect path.
       // Without this, the old onclose runs after cleanup, calls setTimeout
