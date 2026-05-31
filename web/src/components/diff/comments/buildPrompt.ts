@@ -24,6 +24,24 @@ export interface DiffCommentsCardPayload {
   comments: DiffComment[];
 }
 
+/** Runtime shape guard for `DiffCommentsCardPayload`. Message metadata
+ *  arrives untyped over the wire, so callers that read it from a cast
+ *  must validate before rendering the card, which assumes `comments` is
+ *  iterable. A malformed payload returns `false` so the caller can fall
+ *  back to plain-text rendering. */
+export function isDiffCommentsCardPayload(
+  value: unknown,
+): value is DiffCommentsCardPayload {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.intro === "string" &&
+    typeof v.outro === "string" &&
+    typeof v.isMultiRepo === "boolean" &&
+    Array.isArray(v.comments)
+  );
+}
+
 /** The single build artifact for the typed diff-comments send path:
  *  the card payload plus `assembledMarkdown`, the exact text forwarded
  *  to the agent. Built once and used for the dialog preview, the POST
