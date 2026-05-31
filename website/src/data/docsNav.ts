@@ -37,6 +37,7 @@ export const docsNav: NavSection[] = [
       { title: "Agent Command Overrides", href: "/guides/agent-override/" },
       { title: "Tool Sessions", href: "/guides/tool-sessions/" },
       { title: "Session Resume (Claude)", href: "/guides/session-resume/" },
+      { title: "Shell Completions", href: "/guides/shell-completions/" },
       { title: "Sound Effects", href: "/docs/sounds/" },
       { title: "Push Notifications", href: "/docs/push-notifications/" },
     ],

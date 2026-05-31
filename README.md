@@ -114,6 +114,7 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 - **[tmux Status Bar](https://www.agent-of-empires.com/guides/tmux-status-bar/)**: integrated session monitoring
 - **[Sound Effects](https://www.agent-of-empires.com/docs/sounds/)**: audible agent status notifications
 - **[Configuration Reference](https://www.agent-of-empires.com/docs/guides/configuration/)**: all config options
+- **[Shell Completions](https://www.agent-of-empires.com/guides/shell-completions/)**: tab-completion for bash, zsh, fish, PowerShell, and elvish
 - **[CLI Reference](https://www.agent-of-empires.com/docs/cli/reference/)**: complete command documentation
 - **[HTTP API Reference](https://www.agent-of-empires.com/docs/api/)**: REST endpoints for external orchestrators
 - **[Development](https://www.agent-of-empires.com/docs/development/)**: contributing and local setup

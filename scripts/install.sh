@@ -156,7 +156,7 @@ main() {
     echo ""
     success "Run 'aoe' to get started!"
     echo ""
-    info "For shell completions, run: aoe completion --help"
+    info "For shell completions, see: https://www.agent-of-empires.com/guides/shell-completions/"
 }
 
 main "$@"
