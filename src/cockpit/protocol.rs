@@ -162,6 +162,12 @@ pub struct ReplayQuery {
     /// strictly newer than this. Defaults to 0 (full replay).
     #[serde(default)]
     pub since: u64,
+    /// Max frames to return in this page. Omitted falls back to the
+    /// server's default page size; the server also clamps to a hard
+    /// max. Clients paginate by passing the previous response's
+    /// `next_cursor` back as `since` while `has_more` is true.
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 /// `GET /api/sessions/{id}/cockpit/replay` response.
@@ -183,6 +189,17 @@ pub struct ReplayResponse {
     /// retention window in status output and detect mid-flight prunes.
     #[serde(default)]
     pub lowest_seq: Option<u64>,
+    /// Cursor to pass back as `since` for the next page: the highest
+    /// seq this page consumed (including rows that failed to
+    /// deserialise, so a corrupt row can't stall a paging loop).
+    /// `None` for an empty page. Only meaningful with `has_more`.
+    #[serde(default)]
+    pub next_cursor: Option<u64>,
+    /// True when more events exist beyond this page within the store.
+    /// Clients keep paging (advancing `since` to `next_cursor`) while
+    /// this is set. Always false for an unbounded (`limit`-less) reply.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// `GET /api/sessions/{id}/cockpit/context-primer?before_seq=N` query.

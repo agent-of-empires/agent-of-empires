@@ -82,6 +82,24 @@ fn non_substantive_not_like_clauses() -> String {
         .join("\n               ")
 }
 
+/// One page of replayed events plus the cursor metadata a paginating
+/// client needs to fetch the next page.
+pub struct ReplayPage {
+    /// Deserialised events for this page, oldest first. Rows that fail
+    /// to deserialise are skipped here but still advance `last_scanned_seq`
+    /// so a corrupt row can never stall a paging loop.
+    pub events: Vec<(u64, Event)>,
+    /// Highest `seq` this page consumed, whether or not it deserialised.
+    /// The client passes this back as `since` for the next page, so the
+    /// cursor advances past skipped/corrupt rows. `None` for an empty page.
+    pub last_scanned_seq: Option<u64>,
+    /// True when at least one row exists beyond this page's window.
+    /// Derived from a `LIMIT n + 1` probe row, so it is consistent with
+    /// the page rows under the same lock and never depends on a
+    /// separately queried `highest_seq`.
+    pub has_more: bool,
+}
+
 /// SQLite-backed cockpit event log. One row per (session_id, seq).
 pub struct EventStore {
     conn: Mutex<Connection>,
@@ -323,43 +341,99 @@ impl EventStore {
 
     /// Return all events for `session_id` with `seq > since`, oldest
     /// first. An empty vec means the session has no newer events.
+    ///
+    /// Unbounded; used by the WS on-connect drain and tests. The REST
+    /// replay endpoint pages via [`replay_page`](Self::replay_page).
     pub fn replay_from(&self, session_id: &str, since: u64) -> Vec<(u64, Event)> {
+        self.replay_page(session_id, since, None).events
+    }
+
+    /// Return events for `session_id` with `seq > since`, oldest first,
+    /// at most `limit` of them. `None` means unbounded (no `LIMIT`).
+    ///
+    /// Pagination is keyset over `seq`: callers pass the previous page's
+    /// `last_scanned_seq` back as `since`. When `limit` is `Some(n)` the
+    /// query probes `n + 1` rows so `has_more` reflects whether another
+    /// page exists, computed under the same lock as the page rows (so it
+    /// never races a concurrently growing `highest_seq`). `last_scanned_seq`
+    /// advances over every consumed row including ones that fail to
+    /// deserialise, so a corrupt row can't trap a paging loop.
+    pub fn replay_page(&self, session_id: &str, since: u64, limit: Option<usize>) -> ReplayPage {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let mut stmt = match conn.prepare(
-            "SELECT seq, event_json FROM cockpit_events
-             WHERE session_id = ?1 AND seq > ?2
-             ORDER BY seq ASC",
-        ) {
+        // Probe one extra row beyond `limit` to detect `has_more` without
+        // a second query against `highest_seq`.
+        let probe = limit.map(|n| n.saturating_add(1));
+        let sql = match probe {
+            Some(_) => {
+                "SELECT seq, event_json FROM cockpit_events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC LIMIT ?3"
+            }
+            None => {
+                "SELECT seq, event_json FROM cockpit_events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC"
+            }
+        };
+        let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => {
                 warn!(target: "cockpit.event_store", "prepare replay for {session_id}: {e}");
-                return Vec::new();
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                };
             }
         };
-        let rows = match stmt.query_map(params![session_id, since as i64], |row| {
+        let map_row = |row: &rusqlite::Row| {
             let seq: i64 = row.get(0)?;
             let json: String = row.get(1)?;
             Ok((seq as u64, json))
-        }) {
+        };
+        let rows = match probe {
+            Some(p) => stmt.query_map(params![session_id, since as i64, p as i64], map_row),
+            None => stmt.query_map(params![session_id, since as i64], map_row),
+        };
+        let rows = match rows {
             Ok(r) => r,
             Err(e) => {
                 warn!(target: "cockpit.event_store", "query replay for {session_id}: {e}");
-                return Vec::new();
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                };
             }
         };
         let mut out = Vec::new();
+        let mut last_scanned_seq = None;
+        let mut scanned = 0usize;
+        let mut has_more = false;
         for row in rows {
             match row {
-                Ok((seq, json)) => match serde_json::from_str::<Event>(&json) {
-                    Ok(event) => out.push((seq, event)),
-                    Err(e) => warn!(
-                        target: "cockpit.event_store",
-                        "deserialise event {session_id}@{seq}: {e}"
-                    ),
-                },
+                Ok((seq, json)) => {
+                    // The probe row proves another page exists; don't
+                    // consume it or advance the cursor onto it.
+                    if let Some(n) = limit {
+                        if scanned == n {
+                            has_more = true;
+                            break;
+                        }
+                    }
+                    scanned += 1;
+                    last_scanned_seq = Some(seq);
+                    match serde_json::from_str::<Event>(&json) {
+                        Ok(event) => out.push((seq, event)),
+                        Err(e) => warn!(
+                            target: "cockpit.event_store",
+                            "deserialise event {session_id}@{seq}: {e}"
+                        ),
+                    }
+                }
                 Err(e) => warn!(target: "cockpit.event_store", "row error: {e}"),
             }
         }
@@ -367,10 +441,16 @@ impl EventStore {
             target: "cockpit.event_store",
             session = %session_id,
             since,
+            limit = ?limit,
             returned = out.len(),
+            has_more,
             "replayed events"
         );
-        out
+        ReplayPage {
+            events: out,
+            last_scanned_seq,
+            has_more,
+        }
     }
 
     /// Return the latest `Event::PlanUpdated` stored for `session_id`,
@@ -1377,6 +1457,90 @@ mod tests {
         let map = store.last_event_at_for_sessions(&["s-a".to_string(), "s-b".to_string()]);
         assert_eq!(map.get("s-a"), Some(&900));
         assert_eq!(map.get("s-b"), Some(&7000));
+    }
+
+    #[test]
+    fn replay_page_reassembles_into_unbounded_result() {
+        // Paging with a small limit and following `last_scanned_seq`
+        // must rebuild exactly what a single unbounded replay returns.
+        let (_tmp, store) = open_store(1000);
+        for i in 1..=10 {
+            store.record("s-1", i, &Event::ThinkingStarted).unwrap();
+        }
+        let unbounded: Vec<u64> = store
+            .replay_from("s-1", 0)
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+
+        let mut paged = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let page = store.replay_page("s-1", cursor, Some(3));
+            assert!(page.events.len() <= 3, "page exceeded limit");
+            paged.extend(page.events.iter().map(|(s, _)| *s));
+            match page.last_scanned_seq {
+                Some(next) if page.has_more => cursor = next,
+                _ => break,
+            }
+        }
+        assert_eq!(paged, unbounded);
+    }
+
+    #[test]
+    fn replay_page_has_more_at_exact_boundary() {
+        let (_tmp, store) = open_store(1000);
+        for i in 1..=4 {
+            store.record("s-1", i, &Event::ThinkingStarted).unwrap();
+        }
+        // Limit equal to the row count: full page, nothing left over.
+        let full = store.replay_page("s-1", 0, Some(4));
+        assert_eq!(full.events.len(), 4);
+        assert!(!full.has_more);
+        assert_eq!(full.last_scanned_seq, Some(4));
+
+        // One short: a probe row remains, so `has_more` is set and the
+        // cursor stops at the last consumed seq, not the probe row.
+        let partial = store.replay_page("s-1", 0, Some(3));
+        assert_eq!(partial.events.len(), 3);
+        assert!(partial.has_more);
+        assert_eq!(partial.last_scanned_seq, Some(3));
+    }
+
+    #[test]
+    fn replay_page_cursor_advances_past_corrupt_row() {
+        // A row that fails to deserialise is skipped from `events` but
+        // still advances `last_scanned_seq`, so a paging loop can never
+        // get stuck re-requesting the same corrupt seq.
+        let (_tmp, store) = open_store(1000);
+        store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO cockpit_events (session_id, seq, event_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["s-1", 2_i64, "{not valid event json", 0_i64],
+            )
+            .unwrap();
+        }
+        store.record("s-1", 3, &Event::ThinkingEnded).unwrap();
+
+        // Page size 2 lands the corrupt row mid-page: it is dropped from
+        // events but the cursor moves to seq 2, so the next page yields 3.
+        let page1 = store.replay_page("s-1", 0, Some(2));
+        assert_eq!(
+            page1.events.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(page1.last_scanned_seq, Some(2));
+        assert!(page1.has_more);
+
+        let page2 = store.replay_page("s-1", page1.last_scanned_seq.unwrap(), Some(2));
+        assert_eq!(
+            page2.events.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(!page2.has_more);
     }
 
     #[test]
