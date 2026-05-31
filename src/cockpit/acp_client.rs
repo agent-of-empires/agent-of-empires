@@ -2398,6 +2398,7 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ThinkingStarted
             | Event::ThinkingEnded
             | Event::UserPromptSent { .. }
+            | Event::UserDiffCommentsPrompt { .. }
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
@@ -2420,6 +2421,7 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
         Event::UserPromptSent { .. } => "user_prompt_sent",
+        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",

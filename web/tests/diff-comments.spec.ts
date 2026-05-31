@@ -7,7 +7,8 @@ import { clickSidebarSession } from "./helpers/sidebar";
 //   `+` gutter button or the banner.
 // - Click `+` to comment on a single line; save; card renders.
 // - Open the send dialog, edit intro, send; comments clear; POST
-//   reaches /cockpit/prompt with the assembled body.
+//   reaches /cockpit/prompt/diff-comments with the structured body
+//   (intro/outro/comments/isMultiRepo/assembledMarkdown). See #1123.
 // - Comments persist to localStorage and reload back into the UI.
 
 const FILE_PATH = "src/example.ts";
@@ -229,15 +230,25 @@ test.describe("Diff comments (#928)", () => {
     await expect(page.getByText("nit").first()).toBeVisible();
   });
 
-  test("send dialog POSTs to /cockpit/prompt and clears comments on success", async ({
+  test("send dialog POSTs structured body to /cockpit/prompt/diff-comments and clears comments on success", async ({
     page,
   }) => {
     await setup(page);
-    let captured: { text?: string } | null = null;
-    await page.route("**/api/sessions/*/cockpit/prompt", (r) => {
-      captured = JSON.parse(r.request().postData() || "{}");
-      return r.fulfill({ json: {} });
-    });
+    interface CapturedBody {
+      intro?: string;
+      outro?: string;
+      isMultiRepo?: boolean;
+      comments?: Array<{ body?: string }>;
+      assembledMarkdown?: string;
+    }
+    let captured: CapturedBody | null = null;
+    await page.route(
+      "**/api/sessions/*/cockpit/prompt/diff-comments",
+      (r) => {
+        captured = JSON.parse(r.request().postData() || "{}");
+        return r.fulfill({ json: {} });
+      },
+    );
     await openSessionAndFile(page);
     await startSingleLineComment(page, "new", 3);
     await page
@@ -251,11 +262,21 @@ test.describe("Diff comments (#928)", () => {
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
     // Confirm send (dialog's own Send button is the last one in the DOM).
     await page.getByRole("button", { name: /^Send$/ }).last().click();
-    await expect.poll(() => captured?.text).toBeTruthy();
-    expect(captured?.text).toContain("Hey:");
-    expect(captured?.text).toContain("## Diff comments");
-    expect(captured?.text).toContain("rename");
-    expect(captured?.text).toContain("Please address these comments.");
+    await expect.poll(() => captured?.assembledMarkdown).toBeTruthy();
+    // Structured fields the transcript card renders from.
+    expect(captured?.intro).toBe("Hey:");
+    expect(captured?.outro).toBe("Please address these comments.");
+    expect(captured?.isMultiRepo).toBe(false);
+    expect(captured?.comments).toHaveLength(1);
+    expect(captured?.comments?.[0]?.body).toContain("rename");
+    // assembledMarkdown is the agent-visible body, no base64 sentinel.
+    expect(captured?.assembledMarkdown).toContain("Hey:");
+    expect(captured?.assembledMarkdown).toContain("## Diff comments");
+    expect(captured?.assembledMarkdown).toContain("rename");
+    expect(captured?.assembledMarkdown).toContain(
+      "Please address these comments.",
+    );
+    expect(captured?.assembledMarkdown).not.toContain("aoe:diff-comments");
     // Banner cleared.
     await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
   });

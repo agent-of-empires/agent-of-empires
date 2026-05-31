@@ -444,6 +444,62 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
   });
 });
 
+describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
+  it("emits a user message with the structured payload on metadata.custom", () => {
+    const row: ActivityRow = {
+      id: "user-seq-1",
+      kind: "user_diff_comments",
+      text: "Take a look:\n\n## Diff comments\n\n...\n",
+      diffComments: {
+        intro: "Take a look:",
+        outro: "Please address these comments.",
+        isMultiRepo: true,
+        comments: [
+          {
+            id: "c-1",
+            repoName: "repoA",
+            filePath: "src/main.rs",
+            side: "new",
+            startLine: 42,
+            endLine: 45,
+            body: "rename this",
+            capturedSnippet: "fn main() {}",
+            language: "rust",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      },
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    // The text part stays the assembled markdown so copy / fallback work.
+    const parts = user.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.type).toBe("text");
+    expect(parts[0]!.text).toContain("## Diff comments");
+    // The structured payload rides on metadata.custom.diffComments for
+    // UserText to render the rich card without parsing any sentinel.
+    const custom = (
+      user.metadata as
+        | { custom?: { diffComments?: { comments?: unknown[] } } }
+        | undefined
+    )?.custom;
+    expect(custom?.diffComments?.comments).toHaveLength(1);
+  });
+
+  it("omits metadata when the structured payload is absent", () => {
+    const row: ActivityRow = {
+      id: "user-seq-2",
+      kind: "user_diff_comments",
+      text: "plain body\n",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    expect(user.metadata).toBeUndefined();
+  });
+});
+
 function toolStopped(id: string, text = ""): ActivityRow {
   return {
     id: `stopped-${id}-9`,

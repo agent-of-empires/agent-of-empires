@@ -185,6 +185,17 @@ impl CockpitTranscript {
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
             }
+            Event::UserDiffCommentsPrompt {
+                assembled_markdown, ..
+            } => {
+                // The TUI has no rich diff-comments card; render the
+                // assembled markdown (exactly what the agent received) as
+                // a plain user prompt row, same as UserPromptSent.
+                self.flush_pending_chunk();
+                self.rows
+                    .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
+                self.context_primer_pending = false;
+            }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
                 self.status_text = Some("thinking…".to_string());

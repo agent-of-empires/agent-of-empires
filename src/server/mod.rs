@@ -1202,6 +1202,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::cockpit_prompt),
         )
         .route(
+            "/api/sessions/{id}/cockpit/prompt/diff-comments",
+            post(api::cockpit_prompt_diff_comments),
+        )
+        .route(
             "/api/sessions/{id}/cockpit/cancel",
             post(api::cockpit_cancel),
         )

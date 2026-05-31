@@ -849,6 +849,35 @@
       ]
     },
     {
+      "id": "diff-comments.send-flow",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/diff-comments.spec.ts"
+      ],
+      "components": [
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/components/diff/comments/CommentsBanner.tsx",
+        "web/src/components/diff/comments/CommentForm.tsx",
+        "web/src/components/diff/comments/CommentCard.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.typed-event",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/diff/comments/buildPrompt.test.ts",
+        "src/lib/cockpitTypes.test.ts",
+        "src/components/cockpit/CockpitRuntime.test.ts"
+      ],
+      "components": [
+        "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
+        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
       "id": "right-panel.mobile-picker",
       "kind": "mocked-playwright",
       "risk": "high",

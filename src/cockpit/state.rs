@@ -374,6 +374,34 @@ pub enum StateError {
     ApprovalAlreadyResolved(Nonce),
 }
 
+/// A single user-authored diff-line review comment, carried verbatim
+/// in `Event::UserDiffCommentsPrompt` so the cockpit transcript can
+/// re-render the rich review card on replay without parsing the
+/// assembled markdown. Field names mirror the frontend `DiffComment`
+/// type (`web/src/components/diff/comments/types.ts`) one-for-one; the
+/// server never interprets these, it only stores and replays them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffComment {
+    pub id: String,
+    /// Workspace member name. Absent for single-repo sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    pub file_path: String,
+    /// `"old"` or `"new"`. Stored as a string so an unrecognised side
+    /// from a future frontend never fails replay of the whole log.
+    pub side: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub body: String,
+    pub captured_snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
 /// become variants and flow through the same path.
@@ -567,6 +595,26 @@ pub enum Event {
     /// every turn collapses into one assistant blob.
     UserPromptSent {
         text: String,
+    },
+    /// Echo of a "Send diff comments" submission, published by the
+    /// `POST /cockpit/prompt/diff-comments` handler before
+    /// `assembled_markdown` is forwarded to the agent. The agent only
+    /// ever sees `assembled_markdown` (no sentinel); the structured
+    /// fields exist so the cockpit transcript re-renders the rich
+    /// `DiffCommentsUserCard` on replay without parsing the markdown.
+    /// `intro`/`outro` are the effective values the user approved in the
+    /// dialog (trimmed intro, defaulted outro), so replay matches what
+    /// the agent received. Replaces the legacy
+    /// `<!-- aoe:diff-comments:v1 ... -->` sentinel carried inside an
+    /// ordinary `UserPromptSent`; older persisted sentinel events keep
+    /// rendering via the frontend decode fallback.
+    #[serde(rename_all = "camelCase")]
+    UserDiffCommentsPrompt {
+        intro: String,
+        outro: String,
+        is_multi_repo: bool,
+        comments: Vec<DiffComment>,
+        assembled_markdown: String,
     },
     /// A user prompt arrived at the daemon while another `session/prompt`
     /// was still in flight. The daemon refused to forward it (claude-agent-acp
@@ -763,6 +811,10 @@ impl CockpitState {
                 self.startup_error = Some(detail);
             }
             Event::UserPromptSent { .. } => {}
+            // Like UserPromptSent, the diff-comments prompt doesn't mutate
+            // persistent CockpitState; it bumps seq so the replay buffer
+            // and on-disk store capture the user's side of the turn.
+            Event::UserDiffCommentsPrompt { .. } => {}
             Event::AcpSessionAssigned { .. } => {
                 // A fresh agent that passed the compatibility check
                 // has come online; heal any sticky startup error so a

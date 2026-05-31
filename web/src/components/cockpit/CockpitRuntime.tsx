@@ -247,6 +247,25 @@ export function activityToThreadMessages(
       continue;
     }
 
+    if (row.kind === "user_diff_comments") {
+      // A typed diff-comments prompt. The assembled markdown is the
+      // user-visible / agent body (and the fallback if the card can't
+      // render); the structured payload rides on the message metadata
+      // so UserText can render the rich DiffCommentsUserCard without
+      // parsing any sentinel. See #1123.
+      flushAssistant();
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+        metadata: row.diffComments
+          ? { custom: { diffComments: row.diffComments } }
+          : undefined,
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
     if (row.kind === "context_reset") {
       // `session/load` fallback after an `aoe serve` restart: model's
       // window is empty even though we replay the prior transcript.

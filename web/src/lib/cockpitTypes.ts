@@ -4,6 +4,8 @@
 // side can add new variants without breaking the UI as long as the
 // component renders unknown frames gracefully.
 
+import type { DiffComment } from "../components/diff/comments/types";
+
 export type ApprovalDecision =
   | "Allow"
   | "AllowAlways"
@@ -281,6 +283,15 @@ export type CockpitEvent =
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | { UserPromptSent: { text: string } }
+  | {
+      UserDiffCommentsPrompt: {
+        intro: string;
+        outro: string;
+        isMultiRepo: boolean;
+        comments: DiffComment[];
+        assembledMarkdown: string;
+      };
+    }
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
@@ -528,6 +539,7 @@ export interface ActivityRow {
     | "message"
     | "thinking"
     | "user_prompt"
+    | "user_diff_comments"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -538,6 +550,16 @@ export interface ActivityRow {
    *  pick a per-kind renderer without needing to look the call up by
    *  toolCallId. */
   tool?: ToolCall;
+  /** Structured payload on `user_diff_comments` rows. The runtime
+   *  attaches it to the assistant-ui message metadata so the
+   *  transcript renders the rich `DiffCommentsUserCard`; `text` holds
+   *  the assembled markdown as the fallback / agent-visible body. */
+  diffComments?: {
+    intro: string;
+    outro: string;
+    isMultiRepo: boolean;
+    comments: DiffComment[];
+  };
   at: string; // ISO-8601
 }
 
@@ -601,6 +623,47 @@ export function emptyCockpitState(): CockpitState {
     configOptionSwitchFailed: null,
     pendingConfigOption: null,
   };
+}
+
+/** Per-turn state resets shared by every "a new user turn started"
+ *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
+ *  Mutates `next` in place; the caller has already appended the
+ *  activity row and bumped `pendingUserPromptSeq`. */
+function applyNewTurnResets(next: CockpitState): void {
+  next.assistantMessage = "";
+  next.startupError = null;
+  next.lastError = null;
+  next.turnActive = isTurnActive(next);
+  // New turn; reset the no-output detector so Stopped fires the
+  // empty-output notice if the agent produces nothing.
+  next.turnHasOutput = false;
+  // A fresh prompt means the worker is alive again; clear the
+  // user_stopped banner without waiting for AcpSessionAssigned.
+  next.workerStopped = false;
+  next.workerRestarting = false;
+  // The user is moving on. Clear any pending Retry pills and the
+  // agent-unresponsive banner; if the rejection was legitimate the
+  // new prompt will end up rejected too and a fresh pill will land.
+  // See #1196.
+  next.rejectedPrompts = [];
+  next.agentUnresponsive = false;
+  next.agentOrphaned = false;
+  // /loop dynamic mode self-fires a prompt on wake, but a user-typed
+  // follow-up during the wait is NOT the wake firing; only clear when
+  // the scheduled time has already elapsed. The countdown UI continues
+  // counting down through a mid-wait user prompt; the next
+  // ScheduleWakeup turn (or the wake itself) overrides it cleanly.
+  // See #1091.
+  if (next.nextWakeupAt) {
+    const wakeAt = new Date(next.nextWakeupAt).getTime();
+    if (!Number.isNaN(wakeAt) && Date.now() >= wakeAt) {
+      next.nextWakeupAt = null;
+      next.nextWakeupReason = null;
+    }
+  }
+  // Any pending context-primer offer is consumed once the user submits
+  // a new prompt; the recovery affordance is one-shot.
+  next.contextPrimerAvailable = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -1117,40 +1180,30 @@ export function applyEvent(
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
     }
-    next.assistantMessage = "";
-    next.startupError = null;
-    next.lastError = null;
-    next.turnActive = isTurnActive(next);
-    // New turn; reset the no-output detector so Stopped fires the
-    // empty-output notice if the agent produces nothing.
-    next.turnHasOutput = false;
-    // A fresh prompt means the worker is alive again; clear the
-    // user_stopped banner without waiting for AcpSessionAssigned.
-    next.workerStopped = false;
-    next.workerRestarting = false;
-    // The user is moving on. Clear any pending Retry pills and the
-    // agent-unresponsive banner; if the rejection was legitimate the
-    // new prompt will end up rejected too and a fresh pill will land.
-    // See #1196.
-    next.rejectedPrompts = [];
-    next.agentUnresponsive = false;
-    next.agentOrphaned = false;
-    // /loop dynamic mode self-fires a UserPromptSent on wake, but a
-    // user-typed follow-up during the wait is NOT the wake firing;
-    // only clear when the scheduled time has already elapsed. The
-    // countdown UI continues counting down through a mid-wait user
-    // prompt; the next ScheduleWakeup turn (or the wake itself)
-    // overrides it cleanly. See #1091.
-    if (next.nextWakeupAt) {
-      const wakeAt = new Date(next.nextWakeupAt).getTime();
-      if (!Number.isNaN(wakeAt) && Date.now() >= wakeAt) {
-        next.nextWakeupAt = null;
-        next.nextWakeupReason = null;
-      }
-    }
-    // Any pending context-primer offer is consumed once the user
-    // submits a new prompt; the recovery affordance is one-shot.
-    next.contextPrimerAvailable = null;
+    applyNewTurnResets(next);
+    return next;
+  }
+  if ("UserDiffCommentsPrompt" in event) {
+    // The "Send diff comments" dialog posts directly (no optimistic
+    // row), so there is never a placeholder to promote: always append a
+    // typed `user_diff_comments` row. `text` carries the assembled
+    // markdown (agent-visible body / fallback); `diffComments` carries
+    // the structured payload the runtime hands to the transcript card.
+    const p = event.UserDiffCommentsPrompt;
+    next.activity = pushActivity(next.activity, {
+      id: `user-seq-${frame.seq}`,
+      kind: "user_diff_comments",
+      text: p.assembledMarkdown,
+      diffComments: {
+        intro: p.intro,
+        outro: p.outro,
+        isMultiRepo: p.isMultiRepo,
+        comments: p.comments,
+      },
+      at: new Date().toISOString(),
+    });
+    next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+    applyNewTurnResets(next);
     return next;
   }
   if ("AcpSessionAssigned" in event) {
@@ -1202,7 +1255,9 @@ export function applyEvent(
     // order, so checking `activity` here captures "any prompt with a
     // lower seq than this reset"; later prompts won't retroactively
     // surface the suppressed row.
-    const hasPriorPrompt = next.activity.some((r) => r.kind === "user_prompt");
+    const hasPriorPrompt = next.activity.some(
+      (r) => r.kind === "user_prompt" || r.kind === "user_diff_comments",
+    );
     if (!hasPriorPrompt) {
       return next;
     }

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cockpit::approvals::Nonce;
 use crate::cockpit::protocol::{
-    ContextPrimerQuery, ContextPrimerResponse, PromptRequest, ReplayQuery, ReplayResponse,
-    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
+    ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest, PromptRequest,
+    ReplayQuery, ReplayResponse, ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
 use crate::cockpit::supervisor::SupervisorError;
 use crate::server::AppState;
@@ -432,37 +432,28 @@ pub async fn switch_cockpit_agent(
     .into_response()
 }
 
-pub async fn cockpit_prompt(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Some(resp) = read_only_block(&state) {
-        return resp;
-    }
-    let Json(req) = match req {
-        Ok(j) => j,
-        Err(rej) => return rej.into_response(),
-    };
-    // Touch the instance before forwarding so an archived or
-    // currently-snoozed session auto-wakes the same way the tmux send
-    // path does (`/api/sessions/{id}/send`). `touch_last_accessed`
-    // clears `archived_at`, `snoozed_until`, and `idle_dormant_since` so
-    // the cockpit reconciler stops skipping the session on its next ~2s
-    // tick and respawns the worker; the frontend's queue drains as soon
-    // as the fresh `AcpSessionAssigned` lands. The idle_dormant_since
-    // clear is the wake path for auto-stopped idle workers (#1689); a
-    // worker reaped for inactivity respawns on the next prompt. See #1581.
-    //
-    // The in-memory mutation and the disk persistence are both held
-    // under `state.instance_lock(&id)` so they serialize against
-    // other session-mutating endpoints (archive / snooze / pin /
-    // rename) on the same id. Without this guard, a concurrent
-    // archive PATCH could interleave with the touch and produce a
-    // lost write (archive sets archived_at = Some, touch clears it,
-    // archive's persist lands first, touch's persist lands second
-    // and overwrites the archive).
-    let inst_lock = state.instance_lock(&id).await;
+/// Auto-wake an archived, snoozed, or idle-dormant session before a
+/// prompt is forwarded, matching the tmux send path
+/// (`/api/sessions/{id}/send`). `touch_last_accessed` clears
+/// `archived_at`, `snoozed_until`, and `idle_dormant_since` so the
+/// cockpit reconciler stops skipping the session on its next ~2s tick and
+/// respawns the worker; the frontend's queue drains as soon as the fresh
+/// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
+/// auto-stopped idle workers (#1689); a worker reaped for inactivity
+/// respawns on the next prompt. See #1581.
+///
+/// The in-memory mutation and the disk persistence are both held under
+/// `state.instance_lock(&id)` so they serialize against other
+/// session-mutating endpoints (archive / snooze / pin / rename) on the
+/// same id. Without this guard, a concurrent archive PATCH could
+/// interleave with the touch and produce a lost write (archive sets
+/// archived_at = Some, touch clears it, archive's persist lands first,
+/// touch's persist lands second and overwrites the archive). The lock is
+/// dropped before the caller reaches the supervisor: publish/send take
+/// their own locks downstream and holding ours across the agent forward
+/// would serialize prompts unnecessarily and stall siblings.
+async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) {
+    let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
     let triage_changed = {
         let mut instances = state.instances.write().await;
@@ -497,8 +488,8 @@ pub async fn cockpit_prompt(
                 .unwrap_or_default()
         };
         if let Ok(storage) = crate::session::Storage::new(&profile) {
-            let id_clone = id.clone();
-            let session_id_for_log = id.clone();
+            let id_clone = id.to_string();
+            let session_id_for_log = id.to_string();
             match tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
@@ -523,11 +514,21 @@ pub async fn cockpit_prompt(
             }
         }
     }
-    // Drop the per-session lock before reaching out to the
-    // supervisor. publish_user_prompt and send_prompt take their own
-    // locks downstream; holding ours across the agent forward would
-    // serialize prompts unnecessarily and stall siblings.
-    drop(_guard);
+}
+
+pub async fn cockpit_prompt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    touch_and_wake_if_sunk(&state, &id).await;
     // Publish the user's prompt into the event stream BEFORE forwarding
     // to the agent so the replay buffer / on-disk store captures it
     // even if the agent forward fails. The frontend treats UserPromptSent
@@ -537,6 +538,58 @@ pub async fn cockpit_prompt(
         .publish_user_prompt(&id, req.text.clone())
         .await;
     match state.cockpit_supervisor.send_prompt(&id, &req.text).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(SupervisorError::UnknownSession(_)) => {
+            (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("prompt failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/sessions/{id}/cockpit/prompt/diff-comments`: the typed
+/// successor to the diff-comments sentinel hack. The frontend sends the
+/// structured review plus the `assembled_markdown` it previewed; the
+/// server records a typed `Event::UserDiffCommentsPrompt` (so the
+/// transcript re-renders the rich card on replay) and forwards only
+/// `assembled_markdown` to the agent, so the agent never sees the old
+/// base64 sentinel noise. Mirrors `cockpit_prompt`'s auto-wake +
+/// publish-before-forward ordering.
+pub async fn cockpit_prompt_diff_comments(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<DiffCommentsPromptRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    touch_and_wake_if_sunk(&state, &id).await;
+    // Publish the typed event BEFORE forwarding so the replay buffer /
+    // on-disk store captures the user's side even if the forward fails,
+    // matching cockpit_prompt.
+    state
+        .cockpit_supervisor
+        .publish_user_diff_comments_prompt(
+            &id,
+            req.intro,
+            req.outro,
+            req.is_multi_repo,
+            req.comments,
+            req.assembled_markdown.clone(),
+        )
+        .await;
+    match state
+        .cockpit_supervisor
+        .send_prompt(&id, &req.assembled_markdown)
+        .await
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
             (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()

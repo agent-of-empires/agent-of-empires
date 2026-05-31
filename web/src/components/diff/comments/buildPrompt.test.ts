@@ -1,11 +1,28 @@
 import { describe, it, expect } from "vitest";
 import {
   buildCommentsMarkdown,
-  buildFullPrompt,
+  buildDiffCommentsPrompt,
   parseDiffCommentsSentinel,
   stripDiffCommentsSentinel,
 } from "./buildPrompt";
 import type { DiffComment } from "./types";
+
+/** Reproduce the legacy `<!-- aoe:diff-comments:v1 <base64> -->`
+ *  encoder (removed from the send path in #1123) so the decode-fallback
+ *  tests can still exercise `parseDiffCommentsSentinel` against the
+ *  shape older persisted prompts carry. */
+function legacySentinel(payload: {
+  intro: string;
+  outro: string;
+  isMultiRepo: boolean;
+  comments: DiffComment[];
+}): string {
+  const json = JSON.stringify(payload);
+  const bytes = new TextEncoder().encode(json);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+  return `<!-- aoe:diff-comments:v1 ${btoa(bin)} -->\nbody\n`;
+}
 
 function mk(partial: Partial<DiffComment>): DiffComment {
   return {
@@ -104,65 +121,88 @@ describe("buildCommentsMarkdown", () => {
   });
 });
 
-describe("buildFullPrompt", () => {
+describe("buildDiffCommentsPrompt", () => {
   it("uses default outro when blank", () => {
-    const prompt = buildFullPrompt([mk({})], "", "", { isMultiRepo: false });
-    expect(prompt).toMatch(/Please address these comments\.\n$/);
+    const built = buildDiffCommentsPrompt([mk({})], "", "", {
+      isMultiRepo: false,
+    });
+    expect(built.outro).toBe("Please address these comments.");
+    expect(built.assembledMarkdown).toMatch(/Please address these comments\.\n$/);
   });
 
   it("uses provided outro when set", () => {
-    const prompt = buildFullPrompt([mk({})], "", "Custom outro", {
+    const built = buildDiffCommentsPrompt([mk({})], "", "Custom outro", {
       isMultiRepo: false,
     });
-    expect(prompt).toMatch(/Custom outro\n$/);
-    expect(prompt).not.toContain("Please address these comments.");
+    expect(built.outro).toBe("Custom outro");
+    expect(built.assembledMarkdown).toMatch(/Custom outro\n$/);
+    expect(built.assembledMarkdown).not.toContain("Please address these comments.");
   });
 
   it("prepends intro when set", () => {
-    const prompt = buildFullPrompt([mk({})], "Hey:", "", { isMultiRepo: false });
-    const body = stripDiffCommentsSentinel(prompt);
-    expect(body.startsWith("Hey:\n\n## Diff comments")).toBe(true);
+    const built = buildDiffCommentsPrompt([mk({})], "Hey:", "", {
+      isMultiRepo: false,
+    });
+    expect(built.intro).toBe("Hey:");
+    expect(built.assembledMarkdown.startsWith("Hey:\n\n## Diff comments")).toBe(
+      true,
+    );
   });
 
   it("trims surrounding whitespace from intro/outro", () => {
-    const prompt = buildFullPrompt(
-      [mk({})],
-      "  intro  \n",
-      "   outro   ",
-      { isMultiRepo: false },
-    );
-    const body = stripDiffCommentsSentinel(prompt);
-    expect(body.startsWith("intro\n")).toBe(true);
-    expect(body).toMatch(/outro\n$/);
+    const built = buildDiffCommentsPrompt([mk({})], "  intro  \n", "   outro   ", {
+      isMultiRepo: false,
+    });
+    expect(built.intro).toBe("intro");
+    expect(built.outro).toBe("outro");
+    expect(built.assembledMarkdown.startsWith("intro\n")).toBe(true);
+    expect(built.assembledMarkdown).toMatch(/outro\n$/);
   });
 
   it("omits the comments section when no comments", () => {
-    const prompt = buildFullPrompt([], "intro", "outro", { isMultiRepo: false });
-    expect(prompt).not.toContain("## Diff comments");
-    expect(prompt).not.toContain("aoe:diff-comments");
-    expect(prompt).toContain("intro");
-    expect(prompt).toContain("outro");
+    const built = buildDiffCommentsPrompt([], "intro", "outro", {
+      isMultiRepo: false,
+    });
+    expect(built.assembledMarkdown).not.toContain("## Diff comments");
+    expect(built.assembledMarkdown).toContain("intro");
+    expect(built.assembledMarkdown).toContain("outro");
+    expect(built.comments).toHaveLength(0);
   });
 
-  it("prepends a sentinel header when comments are present", () => {
-    const prompt = buildFullPrompt([mk({})], "", "", { isMultiRepo: false });
-    expect(prompt.startsWith("<!-- aoe:diff-comments:v1 ")).toBe(true);
-    expect(prompt).toContain("\n## Diff comments\n");
+  it("never emits a sentinel header (typed-event send path)", () => {
+    const built = buildDiffCommentsPrompt([mk({})], "", "", {
+      isMultiRepo: false,
+    });
+    expect(built.assembledMarkdown).not.toContain("aoe:diff-comments");
+    expect(built.assembledMarkdown).not.toContain("<!--");
+    expect(built.assembledMarkdown).toContain("## Diff comments");
+  });
+
+  it("carries the structured comments and multi-repo flag verbatim", () => {
+    const comment = mk({ repoName: "repoA" });
+    const built = buildDiffCommentsPrompt([comment], "", "", {
+      isMultiRepo: true,
+    });
+    expect(built.isMultiRepo).toBe(true);
+    expect(built.comments).toEqual([comment]);
   });
 });
 
-describe("parseDiffCommentsSentinel", () => {
+describe("parseDiffCommentsSentinel (legacy decode fallback)", () => {
   it("returns null when no sentinel", () => {
     expect(parseDiffCommentsSentinel("hello world")).toBeNull();
   });
 
-  it("round-trips a payload built by buildFullPrompt", () => {
+  it("round-trips a legacy sentinel payload", () => {
     const comment = mk({
       body: "needs error handling",
       capturedSnippet: "let x = 1;",
     });
-    const prompt = buildFullPrompt([comment], "Take a look:", "Thanks.", {
+    const prompt = legacySentinel({
+      intro: "Take a look:",
+      outro: "Thanks.",
       isMultiRepo: false,
+      comments: [comment],
     });
     const payload = parseDiffCommentsSentinel(prompt);
     expect(payload).not.toBeNull();
@@ -176,7 +216,12 @@ describe("parseDiffCommentsSentinel", () => {
 
   it("survives snippets that contain `-->`", () => {
     const c = mk({ capturedSnippet: "<!-- not allowed -->\nlet x = 1;" });
-    const prompt = buildFullPrompt([c], "", "", { isMultiRepo: false });
+    const prompt = legacySentinel({
+      intro: "",
+      outro: "Please address these comments.",
+      isMultiRepo: false,
+      comments: [c],
+    });
     const payload = parseDiffCommentsSentinel(prompt);
     expect(payload).not.toBeNull();
     expect(payload!.comments[0]!.capturedSnippet).toContain("-->");
@@ -187,12 +232,14 @@ describe("parseDiffCommentsSentinel", () => {
     expect(parseDiffCommentsSentinel(broken)).toBeNull();
   });
 
-  it("preserves the visible body for the agent", () => {
-    const prompt = buildFullPrompt([mk({})], "Intro:", "Outro.", {
+  it("strips the sentinel to recover the visible body", () => {
+    const prompt = legacySentinel({
+      intro: "Intro:",
+      outro: "Outro.",
       isMultiRepo: false,
+      comments: [mk({})],
     });
     const body = stripDiffCommentsSentinel(prompt);
-    expect(body.startsWith("Intro:\n\n## Diff comments")).toBe(true);
-    expect(body).toMatch(/Outro\.\n$/);
+    expect(body).toBe("body\n");
   });
 });
