@@ -1135,6 +1135,44 @@ impl AcpClient {
         (client, event_tx)
     }
 
+    /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
+    /// records whether a `session/delete` RPC was issued. The returned
+    /// `AtomicBool` flips to `true` the moment a
+    /// `ClientCmd::DeleteSession` is received, and the consumer answers
+    /// it immediately so the caller's `delete_session` returns without
+    /// waiting on the timeout. Used to assert that reversible teardown
+    /// does NOT delete the agent transcript while permanent removal
+    /// does (#1710).
+    #[cfg(test)]
+    pub fn fake_for_test_recording(
+        session_id: CockpitSessionId,
+    ) -> (
+        Self,
+        mpsc::Sender<Event>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let saw_delete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_delete_task = saw_delete.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let ClientCmd::DeleteSession { respond_to, .. } = cmd {
+                    saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                }
+            }
+        });
+        let client = Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        };
+        (client, event_tx, saw_delete)
+    }
+
     /// Spawn an ACP agent subprocess, run the handshake + create a
     /// session, and start pumping notifications into the inbound channel.
     pub async fn spawn(

@@ -1297,9 +1297,12 @@ pub async fn cockpit_disable(
         .into_response();
     }
 
-    // Tear down the cockpit worker. UnknownSession is fine — the
-    // supervisor may not have a worker if startup never completed.
-    match state.cockpit_supervisor.shutdown(&id).await {
+    // Tear down the cockpit worker. Disabling cockpit mode discards the
+    // conversation (we delete on-disk history and clear the stored ACP
+    // id below), so release the agent's persisted transcript too via
+    // session/delete. UnknownSession is fine, the supervisor may not
+    // have a worker if startup never completed. See #1710.
+    match state.cockpit_supervisor.shutdown_and_delete(&id).await {
         Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
         Err(e) => {
             tracing::warn!(target: "cockpit.switch", session = %id, "shutdown cockpit failed: {e}");
