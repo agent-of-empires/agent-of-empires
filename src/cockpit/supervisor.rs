@@ -1710,18 +1710,39 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Shutdown a single cockpit worker.
+    /// Shutdown a single cockpit worker, preserving its agent-side
+    /// transcript so the next respawn can resume it via `session/load`.
+    ///
+    /// This is the temporary-teardown path: cockpit stop, snooze,
+    /// archive, idle auto-stop, and supersede all funnel here. They are
+    /// reversible, so we must NOT fire `session/delete` (which deletes
+    /// the agent's on-disk transcript); doing so left every snooze /
+    /// archive / idle-stop unable to resume, resetting context on the
+    /// next prompt (#1710). For permanent removal use
+    /// [`Self::shutdown_and_delete`].
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped").await
+        self.shutdown_with_reason(session_id, "user_stopped", false)
+            .await
     }
 
     /// Like `shutdown`, but tags the synthetic `Stopped` event with
     /// `reason: "idle_auto_stop"` so the cockpit timeline shows the
     /// worker was reclaimed for inactivity rather than user-stopped.
     /// Used by the reconciler's idle-reap pass (#1689). Seamless: no UI
-    /// banner, the next prompt respawns the worker.
+    /// banner, the next prompt respawns the worker. Preserves the
+    /// agent transcript so that respawn resumes instead of resetting.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop")
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false)
+            .await
+    }
+
+    /// Shutdown a worker AND release its agent-side persisted state via
+    /// the experimental `session/delete` RPC. Use only when the session
+    /// is being permanently discarded (session delete, or disabling
+    /// cockpit mode), never for reversible teardown, which must keep the
+    /// transcript resumable. See #1710 and `shutdown`.
+    pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "user_stopped", true)
             .await
     }
 
@@ -1729,6 +1750,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         stop_reason: &str,
+        delete_adapter_state: bool,
     ) -> Result<(), SupervisorError> {
         // Hold workers + pending_resumes simultaneously so the spawn
         // can't observe an empty workers map, finish the handshake,
@@ -1742,13 +1764,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             // Best-effort experimental `session/delete` RPC before
             // SIGTERM. Adapters that advertise
             // `sessionCapabilities.delete: {}` (claude-agent-acp >= 0.36)
-            // release adapter-side persisted state here. Other
-            // adapters return -32601 and we proceed to the existing
-            // kill path either way. Bounded by
-            // `ACP_SESSION_DELETE_TIMEOUT` inside `delete_session`
-            // (~2s) so a wedged adapter cannot stall the user's
-            // delete. See #1404.
-            try_session_delete(&handle.client, session_id).await;
+            // release adapter-side persisted state here, deleting the
+            // agent's on-disk transcript. Other adapters return -32601
+            // and we proceed to the existing kill path either way.
+            // Bounded by `ACP_SESSION_DELETE_TIMEOUT` inside
+            // `delete_session` (~2s) so a wedged adapter cannot stall
+            // the caller. See #1404.
+            //
+            // Gated on `delete_adapter_state`: only permanent removal
+            // (session delete / disabling cockpit) deletes the
+            // transcript. Reversible teardown (snooze, archive, idle
+            // auto-stop, stop, supersede) must keep it so the next
+            // respawn resumes via `session/load` instead of resetting
+            // the conversation. See #1710.
+            if delete_adapter_state {
+                try_session_delete(&handle.client, session_id).await;
+            }
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
             // SIGTERM the runner (if there is one) so the agent
@@ -3078,6 +3109,93 @@ mod tests {
         assert!(
             sink.frames.lock().unwrap().is_empty(),
             "shutdown must not publish for stdio fixtures"
+        );
+    }
+
+    /// Reversible teardown must keep the agent transcript resumable, so
+    /// `shutdown` (snooze, archive, idle auto-stop, stop, supersede)
+    /// must NOT fire `session/delete`; only permanent removal via
+    /// `shutdown_and_delete` may. Regression test for the snooze /
+    /// archive / idle-stop context loss in #1710. Isolates HOME so the
+    /// registry record (which carries the stored ACP id that
+    /// `try_session_delete` needs) stays out of real state, and uses a
+    /// reaped, never-leader pid so the teardown's process-group SIGTERM
+    /// resolves to a harmless ESRCH.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_skips_session_delete_permanent_delete_fires_it() {
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; matches the existing pattern.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        // Dead pid that was never a process-group leader, so the
+        // teardown's killpg/kill signal nothing (ESRCH).
+        let dead_pid = {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn helper");
+            let id = child.id();
+            let _ = child.wait();
+            id
+        };
+
+        async fn register(
+            sup: &Supervisor<VecSink>,
+            session: &str,
+            pid: u32,
+            socket: std::path::PathBuf,
+        ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+            let record = crate::cockpit::worker_registry::WorkerRecord::new(
+                session.into(),
+                pid,
+                socket,
+                "claude-agent-acp".into(),
+                "claude-code".into(),
+                std::env::temp_dir(),
+                None,
+                vec![],
+                vec![],
+                Some("acp-test-id".into()),
+                None,
+            );
+            crate::cockpit::worker_registry::save(&record).unwrap();
+            let (client, _tx, saw_delete) =
+                AcpClient::fake_for_test_recording(CockpitSessionId(session.into()));
+            let mut workers = sup.workers.lock().await;
+            workers.insert(
+                session.into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+            saw_delete
+        }
+
+        let sup = Supervisor::new(VecSink::new());
+
+        let keep = register(&sup, "s-keep", dead_pid, tmp.path().join("keep.sock")).await;
+        sup.shutdown("s-keep").await.expect("shutdown ok");
+        assert!(
+            !keep.load(Ordering::SeqCst),
+            "shutdown must NOT send session/delete; the transcript must \
+             stay resumable so the next respawn restores context (#1710)"
+        );
+
+        let purge = register(&sup, "s-del", dead_pid, tmp.path().join("del.sock")).await;
+        sup.shutdown_and_delete("s-del")
+            .await
+            .expect("shutdown_and_delete ok");
+        assert!(
+            purge.load(Ordering::SeqCst),
+            "shutdown_and_delete (permanent removal) must send session/delete"
         );
     }
 

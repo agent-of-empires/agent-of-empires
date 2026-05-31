@@ -82,9 +82,19 @@ Practical implications:
 
 ## Session deletion
 
-When you delete a cockpit session, aoe opportunistically fires the
-experimental `session/delete` ACP request against the live worker
-(bounded by a 2-second timeout) whenever a stored ACP session id
+`session/delete` fires only on **permanent** removal: deleting a
+cockpit session, or disabling cockpit mode on a session (which discards
+the conversation). Reversible teardown, `aoe cockpit stop`, snooze,
+archive, and idle auto-stop, deliberately does NOT fire it, so the
+agent's transcript stays on disk and the next respawn resumes via
+`session/load` instead of resetting the conversation. Firing it on
+those paths previously reset context on every snooze / archive /
+idle-stop. See
+[#1710](https://github.com/agent-of-empires/agent-of-empires/issues/1710).
+
+When you permanently delete a cockpit session, aoe opportunistically
+fires the experimental `session/delete` ACP request against the live
+worker (bounded by a 2-second timeout) whenever a stored ACP session id
 exists, and then proceeds with the existing kill path
 (`session/cancel` for in-flight prompts, then SIGTERM on the runner,
 then on-disk cleanup). aoe does not inspect the initialize-time

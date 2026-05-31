@@ -1218,7 +1218,9 @@ pub async fn update_session_archive(
         // reconciler does not race to respawn it. The reconciler also
         // skips archived sessions (see cockpit_reconciler.rs), but
         // shutting down here gives an immediate teardown rather than
-        // waiting for the next poll tick.
+        // waiting for the next poll tick. `shutdown` preserves the
+        // agent transcript (no session/delete), so unarchiving resumes
+        // the conversation instead of resetting it (#1710).
         #[cfg(feature = "serve")]
         match state.cockpit_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1361,6 +1363,9 @@ pub async fn update_session_snooze(
     // worker stays down until the snooze expires; the next reconciler
     // tick after expiry brings it back. Unsnooze just lets the
     // reconciler re-pick the session naturally, no explicit respawn.
+    // `shutdown` preserves the agent transcript (no session/delete), so
+    // that respawn resumes the conversation instead of resetting it
+    // (#1710).
     #[cfg(feature = "serve")]
     if was_cockpit_mode && minutes.is_some() {
         match state.cockpit_supervisor.shutdown(&id).await {
@@ -1460,7 +1465,9 @@ pub async fn delete_session(
     // return UnknownSession, which we ignore.
     #[cfg(feature = "serve")]
     if instance.cockpit_mode {
-        match state.cockpit_supervisor.shutdown(&id).await {
+        // Permanent removal: release the agent's persisted transcript
+        // too, since the session is going away for good. See #1710.
+        match state.cockpit_supervisor.shutdown_and_delete(&id).await {
             Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => {
                 tracing::warn!(
