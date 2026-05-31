@@ -190,6 +190,11 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
+    // Custom agents have no ACP adapter, so they can never run in
+    // cockpit even if their name collides with a built-in entry in
+    // ACP_CAPABLE_TOOLS. Mirror AgentStep's guard here.
+    const selectedCustomAgent =
+      state.agents.find((a) => a.name === d.tool)?.kind === "custom";
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the
@@ -217,12 +222,18 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Cockpit is auto-on for ACP-capable tools when the master
-      // switch is on; non-ACP tools and a disabled master switch
-      // both fall back to tmux. The server re-applies the master
-      // switch (see src/server/api/sessions.rs), so a tampered
-      // client request can't escalate cockpit on.
-      cockpit_mode: cockpitMasterEnabled && ACP_CAPABLE_TOOLS.has(d.tool),
+      // Cockpit runs only when the master switch is on, the tool is
+      // ACP-capable, and the user kept the per-session toggle on
+      // (default). Turning it off launches a tmux session even with
+      // the master switch enabled. Non-ACP tools, custom agents, and a
+      // disabled master switch all fall back to tmux. The server
+      // re-applies the master switch (see src/server/api/sessions.rs),
+      // so a tampered client request can't escalate cockpit on.
+      cockpit_mode:
+        cockpitMasterEnabled &&
+        !selectedCustomAgent &&
+        ACP_CAPABLE_TOOLS.has(d.tool) &&
+        d.useCockpit,
       scratch: d.scratch || undefined,
     };
     const result = await createSession(body);
@@ -260,7 +271,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} />;
+        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} />;
       default:
         return null;
     }

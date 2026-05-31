@@ -400,6 +400,21 @@
       ]
     },
     {
+      "id": "wizard.cockpit-opt-out",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/cockpitToggle.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
       "id": "wizard.multi-repo-stale-base",
       "kind": "live-playwright",
       "risk": "high",

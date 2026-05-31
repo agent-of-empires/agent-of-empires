@@ -114,12 +114,15 @@ describe("AgentStep custom-agent selection (#1252)", () => {
     ).toBeTruthy();
   });
 
-  it("renders the ACP substrate notice when the selected agent is a built-in with ACP support", () => {
-    const { getByText } = renderAgentStep({
+  it("renders the interactive cockpit toggle when the selected agent is a built-in with ACP support", () => {
+    const { getByRole, getByText } = renderAgentStep({
       tool: "claude",
       agents: [builtin, custom],
     });
-    expect(getByText(/Cockpit is enabled/)).toBeTruthy();
+    // The ACP-capable case now renders CockpitSubstrateCard (an
+    // interactive switch defaulting on) rather than a read-only notice.
+    expect(getByRole("switch", { name: "Use cockpit" })).toBeTruthy();
+    expect(getByText(/Renders the agent's plan/)).toBeTruthy();
   });
 
   it("clicking an agent button calls onChange with the agent name", () => {
@@ -282,6 +285,7 @@ describe("ReviewStep agent row (#1252)", () => {
         onSubmit={() => {}}
         onJumpTo={() => {}}
         steps={[{ id: "agent", label: "Agent" }] as Parameters<typeof ReviewStep>[0]["steps"]}
+        cockpitMasterEnabled={false}
       />,
     );
   }

@@ -47,6 +47,17 @@ export interface WizardData {
    *  `scratch` clears `path`/`useWorktree`/`extraRepoPaths`; setting any
    *  of those back to a non-empty value clears `scratch`. */
   scratch: boolean;
+  /** Per-session opt-in to cockpit rendering for ACP-capable tools.
+   *  Defaults true so the cockpit master switch (`cockpit.enabled`)
+   *  keeps its current "ACP tools run in cockpit" behavior; the user
+   *  can turn it off in AgentStep to launch a tmux/terminal session
+   *  even while the master switch is on. The submit path only sends
+   *  `cockpit_mode: true` when the master switch is on, the tool is
+   *  ACP-capable, and this flag is set; the server re-checks the
+   *  master switch (src/server/api/sessions.rs). Intentionally not
+   *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
+   *  remembered opt-out would silently defeat the master switch. */
+  useCockpit: boolean;
   [key: string]: unknown;
 }
 
@@ -94,6 +105,7 @@ export const initialData: WizardData = {
   advancedEnabled: false, profileDirty: false,
   customInstruction: "", extraArgs: "", commandOverride: "",
   scratch: false,
+  useCockpit: true,
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {
