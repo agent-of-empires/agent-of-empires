@@ -57,8 +57,9 @@ base("plain drag-select copies terminal text to the clipboard", async ({
     });
 
     const sessions = await listSessions(serve.baseUrl);
-    expect(sessions.length).toBeGreaterThan(0);
-    const sessionId: string = sessions[0]!.id;
+    const seeded = sessions.find((s) => s.title === "copytest");
+    expect(seeded).toBeTruthy();
+    const sessionId: string = seeded!.id;
 
     await page.goto(`${serve.baseUrl}/`);
     const sessionRow = page
