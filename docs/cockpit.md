@@ -397,6 +397,16 @@ can't accept them yet. Two cases:
    `AcpSessionAssigned` event), the same drain effect fires the
    queue. See #1359.
 
+3. **Idle-dormant session.** If the worker was auto-stopped for
+   inactivity (`auto_stop_idle_secs`, `Stopped` reason
+   `idle_auto_stop`), the composer stays fully usable and your prompt
+   does not park indefinitely: the POST itself is the wake path. The
+   server clears the dormancy marker, the reconciler respawns the
+   worker, and the request is held until the fresh worker is ready,
+   then delivered. A prompt you had already queued before the worker
+   went dormant drains the same way the moment the dormancy event
+   lands. See #1689.
+
 Queued entries persist in the per-origin localStorage snapshot at
 `aoe:cockpit-state:v1:<sid>`, so a page reload (and closing then
 reopening the tab on the same origin) keeps them across the reconnect

@@ -482,6 +482,17 @@ export interface CockpitState {
    *  transient "Restarting…" banner appears without a reconnect button;
    *  cleared on AcpSessionAssigned or UserPromptSent. */
   workerRestarting: boolean;
+  /** Set true when the daemon publishes `Stopped { reason: "idle_auto_stop" }`,
+   *  meaning the reconciler reaped the worker for inactivity
+   *  (`cockpit.auto_stop_idle_secs`) and marked the session dormant. Unlike
+   *  `workerStopped`, this is recoverable without any explicit reconnect:
+   *  the next prompt POST wakes it (the server's `touch_and_wake_if_sunk`
+   *  clears dormancy, the reconciler respawns, and `send_prompt`'s
+   *  `wait_for_worker` holds the request until the fresh worker is ready).
+   *  `sendPrompt` and the drain effect read this so a dormant worker does
+   *  NOT park prompts in the local queue forever; instead the POST itself
+   *  is the wake path. Cleared on AcpSessionAssigned or UserPromptSent. */
+  workerIdleStopped: boolean;
   /** Follow-up prompts the user typed and submitted while a turn was
    *  already running. The composer enqueues them client-side instead
    *  of racing the agent (claude-agent-acp serialises session/prompt
@@ -670,6 +681,7 @@ export function emptyCockpitState(): CockpitState {
     turnHasOutput: false,
     workerStopped: false,
     workerRestarting: false,
+    workerIdleStopped: false,
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
@@ -701,6 +713,10 @@ function applyNewTurnResets(next: CockpitState): void {
   // user_stopped banner without waiting for AcpSessionAssigned.
   next.workerStopped = false;
   next.workerRestarting = false;
+  // A prompt also wakes an idle-dormant worker (the POST cleared
+  // dormancy server-side); drop the marker so the drain effect stops
+  // treating the worker as wakeable-but-down.
+  next.workerIdleStopped = false;
   // The user is moving on. Clear any pending Retry pills and the
   // agent-unresponsive banner; if the rejection was legitimate the
   // new prompt will end up rejected too and a fresh pill will land.
@@ -1131,6 +1147,19 @@ export function applyEvent(
       next.workerStopped = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = true;
+    } else if (event.Stopped.reason === "idle_auto_stop") {
+      // The reconciler reaped the worker for inactivity and marked the
+      // session dormant (#1689). This is NOT a user stop: no reconnect
+      // banner, no composer lockdown. The next prompt POST wakes the
+      // worker server-side (`touch_and_wake_if_sunk` clears dormancy,
+      // the reconciler respawns, `send_prompt` waits for it), so the
+      // composer stays usable and `sendPrompt` / the drain effect read
+      // `workerIdleStopped` to route a queued prompt through the POST
+      // wake path instead of parking it forever. Cleared on the next
+      // UserPromptSent or AcpSessionAssigned.
+      next.workerIdleStopped = true;
+      next.workerStopped = false;
+      next.workerRestarting = false;
     }
     // Some upstream slash commands (e.g. /usage, /status, /memory in
     // claude-agent-acp) advertise via available_commands_update but
@@ -1325,6 +1354,9 @@ export function applyEvent(
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
+    // The respawn may have been triggered by waking an idle-dormant
+    // worker; the fresh handshake means it is no longer dormant.
+    next.workerIdleStopped = false;
     // The respawn after an `agent_unresponsive` escalation completed;
     // clear the banner so the user can interact again. See #1196.
     next.agentUnresponsive = false;

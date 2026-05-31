@@ -1144,7 +1144,19 @@ export function useCockpit(
       }
       const wsClosed = statusRef.current !== "open";
       const workerNotRunning = workerStateRef.current !== "running";
-      const shouldEnqueue = wsClosed || workerNotRunning || state.turnActive || state.workerStopped || state.workerRestarting;
+      // An idle-auto-stopped worker is dormant, not dead: the prompt POST
+      // itself wakes it (the server clears dormancy, the reconciler
+      // respawns, and `send_prompt`'s `wait_for_worker` holds the request
+      // until the fresh worker is ready). So a dormant worker must NOT
+      // park the prompt on `workerNotRunning` (the REST poll reads
+      // "absent" until the respawn lands); parking would leave it in the
+      // local queue forever and the worker would never come back. Only a
+      // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
+      const blockedAsideFromWorker =
+        wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      const shouldEnqueue = state.workerIdleStopped
+        ? blockedAsideFromWorker
+        : blockedAsideFromWorker || workerNotRunning;
       if (shouldEnqueue) {
         // The local prompt queue is text-only (persisted to
         // localStorage, where megabytes of base64 would blow the
@@ -1170,6 +1182,7 @@ export function useCockpit(
       state.turnActive,
       state.workerStopped,
       state.workerRestarting,
+      state.workerIdleStopped,
       dispatchPromptNow,
     ],
   );
@@ -1195,7 +1208,14 @@ export function useCockpit(
     // came online). Park queued prompts so they don't POST into a
     // worker that's not online yet; the next REST poll flips
     // workerState to "running" and re-runs this effect. See #1088.
-    if (workerStateRef.current !== "running") return;
+    //
+    // Exception: an idle-auto-stopped (dormant) worker reads "absent"
+    // too, but here the POST is the wake path, so we must let the drain
+    // fire to issue it. The server's `touch_and_wake_if_sunk` clears
+    // dormancy and `send_prompt`'s `wait_for_worker` holds the POST
+    // until the respawned worker is ready. Without this, a prompt the
+    // user queued while the worker was dormant would never drain. #1689.
+    if (workerStateRef.current !== "running" && !state.workerIdleStopped) return;
     // Reconnect race: connect() awaits fetchReplay BEFORE opening the
     // WS, and replay can dispatch a Stopped frame that flips turnActive
     // off. If we drain here while the WS is still in "connecting",
@@ -1267,6 +1287,7 @@ export function useCockpit(
     state.turnActive,
     state.workerStopped,
     state.workerRestarting,
+    state.workerIdleStopped,
     state.queuedPrompts,
     dispatchPromptNow,
   ]);

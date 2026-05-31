@@ -1174,6 +1174,19 @@
       ]
     },
     {
+      "id": "cockpit.idle-dormant-wake",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/cockpitTypes.test.ts",
+        "src/hooks/useCockpit.queue.test.ts"
+      ],
+      "components": [
+        "web/src/lib/cockpitTypes.ts",
+        "web/src/hooks/useCockpit.ts"
+      ]
+    },
+    {
       "id": "cockpit.files-index",
       "kind": "vitest",
       "risk": "medium",
