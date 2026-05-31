@@ -94,7 +94,11 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
 }
 
 function normalizeGroupPath(path: string | null | undefined): string {
-  return (path ?? "").trim();
+  const trimmed = (path ?? "").trim();
+  if (trimmed === "") return "";
+  // Strip leading/trailing slashes so "feature" and "feature/" bucket as
+  // the same group instead of two perceived-identical entries.
+  return trimmed.replace(/^\/+|\/+$/g, "");
 }
 
 function groupDisplayName(path: string): string {

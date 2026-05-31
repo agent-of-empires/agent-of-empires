@@ -140,6 +140,20 @@ describe("buildSessionGroups", () => {
     expect(groups.map((g) => g.id)).toEqual([UNGROUPED_GROUP_ID]);
   });
 
+  it("buckets paths that differ only by leading/trailing slashes together", () => {
+    const groups = build([
+      workspace("w1", [session({ id: "a", group_path: "feature" })]),
+      workspace("w2", [session({ id: "b", group_path: "feature/" })]),
+      workspace("w3", [session({ id: "c", group_path: "/feature" })]),
+    ]);
+    expect(groups.map((g) => g.id)).toEqual(["feature"]);
+    expect(groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual([
+      "w1",
+      "w2",
+      "w3",
+    ]);
+  });
+
   it("uses the leaf segment of a nested path as the display name", () => {
     const groups = build([
       workspace("w1", [session({ id: "s1", group_path: "feature/auth" })]),
