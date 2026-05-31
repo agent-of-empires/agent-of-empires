@@ -492,9 +492,16 @@ Practical implications:
   to the orphaned in-flight `session/prompt` is dropped silently by
   the transport because its request id was issued by the previous
   daemon; to keep the UI from staying stuck on "thinking" forever,
-  the daemon arms a resume-idle watchdog that emits a synthetic
-  `Stopped { reason: "reattach_idle" }` event after 10s of inbound
-  silence. Sessions that the runner cannot reattach to (dead PID,
+  the daemon arms a resume-idle watchdog. It disarms on the first
+  inbound notification the runner forwards after reattach: once any
+  event arrives the turn is observable, and later gaps are normal
+  mid-turn silence (Task subagents, slow Bash, reasoning between tool
+  calls), not an orphan. It synthesizes a
+  `Stopped { reason: "reattach_idle" }` event only when the runner
+  forwards no notification at all within 30s of reattach. The narrow
+  residual, a turn that completes after reattach whose lost response
+  leaves a stale spinner, is rare and clears via Force end turn or the
+  next prompt. Sessions that the runner cannot reattach to (dead PID,
   missing socket, etc.) fall through to a fresh spawn; if the on-disk
   event log shows that fresh spawn's session was mid-prompt at the
   moment the daemon died, the reconciler publishes a

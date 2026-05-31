@@ -338,13 +338,18 @@ enum ConnectMode {
     },
 }
 
-/// Time without any inbound notification, after a `Resume`-mode attach
-/// with `in_flight_turn = true`, before the watchdog synthesizes a
-/// `Stopped { reason: "reattach_idle" }` event. LLM streams rarely have
-/// intra-turn silence near this duration so the false-positive risk
-/// (UI flips to Idle then back to Streaming on the next chunk) is
-/// bounded.
-const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Time after a `Resume`-mode attach with `in_flight_turn = true`,
+/// during which the runner forwards NO inbound notification, before the
+/// watchdog synthesizes a `Stopped { reason: "reattach_idle" }` event.
+/// The watchdog disarms permanently on the first inbound notification
+/// (see `first_event_after_attach`): once the runner forwards anything,
+/// the turn is observable and later silence is normal mid-turn
+/// reasoning, not an orphan. So this grace only bounds the fully-silent
+/// reattach case (the orphaned `session/prompt` response was lost and
+/// no notification ever arrives). 30s leaves headroom for a slow first
+/// post-attach event (model reasoning before its first chunk) while
+/// still clearing a truly-dead reattach quickly. See #1216.
+const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Grace window between the first `session/cancel` notification (sent
 /// during an in-flight `session/prompt`) and the daemon declaring the
@@ -2516,6 +2521,26 @@ fn wakeup_lifecycle_signal_from_update(
     }
 }
 
+/// Classify a notification for both watchdog lanes. Returns
+/// `(lifecycle_signal, wakeup_signal)`.
+///
+/// During post-load history replay suppression we intentionally surface no
+/// signal, so stale replay frames cannot suppress or disarm watchdogs for a
+/// new prompt epoch.
+fn classify_watchdog_notification_signals(
+    update: &agent_client_protocol::schema::SessionUpdate,
+    profile: &agent_profiles::AgentProfile,
+    suppressing_history_replay: bool,
+) -> (Option<LifecycleSignal>, Option<LifecycleSignal>) {
+    if suppressing_history_replay {
+        return (None, None);
+    }
+    (
+        classify_lifecycle_signal(update),
+        wakeup_lifecycle_signal_from_update(update, profile),
+    )
+}
+
 /// Parse Claude's ExitPlanMode tool input into a structured `Plan`.
 /// Claude ships the plan markdown in `raw_input.plan`; we extract its
 /// bullet- or number-prefixed lines as `PlanStep`s with status=Pending,
@@ -3325,15 +3350,22 @@ async fn run_connection_task<W, R>(
     //     Updated by the notification handler below. Initialized to "now"
     //     so a session that never receives a single notification still
     //     fires Stopped after RESUME_IDLE_GRACE rather than immediately.
+    //   - `first_event_after_attach`: set true on the first inbound
+    //     lifecycle-bearing notification after attach (progress, tool
+    //     lifecycle, terminal usage, wakeup). Ambient updates like mode
+    //     or available-command refreshes do not prove turn progress, so
+    //     they must not disarm the watchdog.
     //   - `prompt_sent_since_attach`: set when the user issues a prompt
     //     after attach; the user's real PromptRequest will own the next
     //     Stopped, so the watchdog must stand down.
     //   - `watchdog_fired`: ensures we synthesize Stopped at most once.
     let now_ms = chrono::Utc::now().timestamp_millis();
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
+    let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
+    let first_event_after_attach_for_notif = first_event_after_attach.clone();
 
     let result = Client
         .builder()
@@ -3344,6 +3376,8 @@ async fn run_connection_task<W, R>(
                 let suppress = suppress_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
+                let first_event_after_attach =
+                    first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 async move {
@@ -3360,31 +3394,24 @@ async fn run_connection_task<W, R>(
                     // started racing it.
                     let envelope_epoch =
                         current_prompt_epoch.load(Ordering::Relaxed);
-                    // Classify before consuming `notification.update` in
-                    // the event mapping below; emit only when we're not
-                    // in the post-load history-replay window so stale
-                    // chunks from a prior turn can't influence the
-                    // current prompt's silent-orphan state machine.
-                    let lifecycle_signal = if suppressing {
-                        None
-                    } else {
-                        classify_lifecycle_signal(&notification.update)
-                    };
-                    // Derive `WakeupPending` directly from the source
-                    // update so it only fires on a successful
-                    // `ToolCallUpdate { status: Completed, title:
-                    // ScheduleWakeup }`. Scanning `mapped_events` for
-                    // `Event::WakeupScheduled` instead would let the
-                    // initial `ToolCall` frame (tool not yet completed)
-                    // and any in-progress / failed completion trip
-                    // suppression for `delay + base_grace`, masking a
-                    // real adapter wedge. See CodeRabbit review on
-                    // PR #1406.
-                    let wakeup_signal = if suppressing {
-                        None
-                    } else {
-                        wakeup_lifecycle_signal_from_update(&notification.update, profile)
-                    };
+                    // Classify watchdog signals before consuming
+                    // `notification.update` in the event mapping below.
+                    // During post-load replay suppression this returns no
+                    // signal so stale chunks from a prior turn cannot
+                    // influence the current prompt's watchdog state.
+                    let (lifecycle_signal, wakeup_signal) =
+                        classify_watchdog_notification_signals(
+                            &notification.update,
+                            profile,
+                            suppressing,
+                        );
+                    // Disarm resume-idle only on lifecycle-bearing
+                    // notifications (progress/tool/terminal/wakeup). Pure
+                    // ambient updates (mode, command list, metadata) are
+                    // not proof of in-flight turn progress.
+                    if lifecycle_signal.is_some() || wakeup_signal.is_some() {
+                        first_event_after_attach.store(true, Ordering::Relaxed);
+                    }
                     let mapped_events = map_update_to_events(notification.update, profile);
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
@@ -3795,6 +3822,7 @@ async fn run_connection_task<W, R>(
             if arm_resume_watchdog {
                 let event_tx_for_watchdog = event_tx_for_block.clone();
                 let last_event_at = last_event_at.clone();
+                let first_event_after_attach = first_event_after_attach.clone();
                 let prompt_sent_since_attach = prompt_sent_since_attach.clone();
                 let watchdog_fired = watchdog_fired.clone();
                 let session_label_for_watchdog = session_label.clone();
@@ -3809,6 +3837,24 @@ async fn run_connection_task<W, R>(
                         if prompt_sent_since_attach.load(Ordering::Relaxed) {
                             // User sent a new prompt; its real
                             // PromptRequest will own the next Stopped.
+                            return;
+                        }
+                        if first_event_after_attach.load(Ordering::Relaxed) {
+                            // The runner forwarded at least one notification
+                            // for the in-flight turn, so the turn is
+                            // observable; any further silence is normal
+                            // mid-turn reasoning (Task subagents, slow Bash,
+                            // long reads) rather than an orphaned turn. Disarm
+                            // permanently. The narrow residual (the turn
+                            // completes after attach and its PromptResponse is
+                            // lost, leaving a stale spinner) is rare and
+                            // recoverable via force-end-turn / a new prompt.
+                            // See #1216.
+                            info!(
+                                target: "cockpit.acp",
+                                session = %session_label_for_watchdog,
+                                "resume-idle watchdog: disarming, in-flight turn is observable"
+                            );
                             return;
                         }
                         let last = last_event_at.load(Ordering::Relaxed);
@@ -6152,6 +6198,52 @@ mod tests {
             &agent_profiles::CLAUDE,
         );
         assert!(matches!(sig, Some(LifecycleSignal::WakeupPending { .. })));
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_ignores_ambient_updates() {
+        use agent_client_protocol::schema::{
+            AvailableCommand as AcpAvailableCommand, AvailableCommandsUpdate,
+        };
+        let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AcpAvailableCommand::new("review", "Review changes"),
+        ]));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, false);
+        assert!(
+            lifecycle.is_none() && wakeup.is_none(),
+            "ambient updates must not count as watchdog activity"
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_marks_lifecycle_updates() {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "tc-lifecycle-1",
+            ToolCallUpdateFields::new(),
+        ));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, false);
+        assert!(
+            lifecycle.is_some() && wakeup.is_none(),
+            "tool lifecycle updates must disarm the resume-idle watchdog"
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_suppresses_during_history_replay() {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "tc-suppressed-1",
+            ToolCallUpdateFields::new(),
+        ));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, true);
+        assert!(
+            lifecycle.is_none() && wakeup.is_none(),
+            "post-load replay suppression must block watchdog signals"
+        );
     }
 
     #[test]
