@@ -24,9 +24,17 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
+    /// True when this agent can run in the structured cockpit UI: a
+    /// built-in with an ACP adapter, or a custom agent that declares a
+    /// valid `agent_cockpit_cmd`. The web wizard reads this to decide
+    /// whether a session created for the agent runs in cockpit or tmux.
+    pub acp_capable: bool,
 }
 
-fn build_custom_agent_infos(custom_agents: &HashMap<String, String>) -> Vec<AgentInfo> {
+fn build_custom_agent_infos(
+    custom_agents: &HashMap<String, String>,
+    agent_cockpit_cmd: &HashMap<String, String>,
+) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
         .iter()
         .filter(|(name, command)| {
@@ -41,6 +49,9 @@ fn build_custom_agent_infos(custom_agents: &HashMap<String, String>) -> Vec<Agen
             host_only: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
+            acp_capable: agent_cockpit_cmd
+                .get(name)
+                .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(name, cmd).is_ok()),
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -52,8 +63,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
+        let agent_cockpit_cmd = config.session.agent_cockpit_cmd;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
+        let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
         let mut agents = crate::agents::AGENTS
             .iter()
             .map(|a| AgentInfo {
@@ -63,9 +76,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 host_only: a.host_only,
                 installed: available.iter().any(|s| s == a.name),
                 install_hint: a.install_hint.to_string(),
+                acp_capable: acp_registry.get(a.name).is_some(),
             })
             .collect::<Vec<_>>();
-        agents.extend(build_custom_agent_infos(&custom_agents));
+        agents.extend(build_custom_agent_infos(&custom_agents, &agent_cockpit_cmd));
         agents
     })
     .await
@@ -1183,10 +1197,10 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_use_safe_placeholders() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-claude",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
 
         assert_eq!(entries.len(), 1);
         let agent = &entries[0];
@@ -1196,14 +1210,16 @@ mod tests {
         assert!(!agent.host_only);
         assert!(agent.installed);
         assert_eq!(agent.install_hint, "Configured custom agent");
+        // No agent_cockpit_cmd configured, so it is tmux-only.
+        assert!(!agent.acp_capable);
     }
 
     #[test]
     fn custom_agent_entries_never_serialize_command_values() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-agent",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
 
         let json = serde_json::to_string(&entries).unwrap();
         assert!(json.contains("remote-agent"));
@@ -1214,10 +1230,10 @@ mod tests {
 
     #[test]
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-agent",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
         let value = serde_json::to_value(&entries).unwrap();
 
         assert_eq!(value[0]["kind"], "custom");
@@ -1235,14 +1251,17 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_filter_empty_values_and_builtin_collisions() {
-        let entries = build_custom_agent_infos(&custom_agents(&[
-            ("", "codex"),
-            ("empty-command", ""),
-            ("   ", "codex"),
-            ("whitespace-command", "   "),
-            ("claude", "ssh -t prod.example claude"),
-            ("remote-codex", "ssh -t prod.example codex"),
-        ]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[
+                ("", "codex"),
+                ("empty-command", ""),
+                ("   ", "codex"),
+                ("whitespace-command", "   "),
+                ("claude", "ssh -t prod.example claude"),
+                ("remote-codex", "ssh -t prod.example codex"),
+            ]),
+            &HashMap::new(),
+        );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["remote-codex"]);
@@ -1251,14 +1270,36 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_are_sorted_by_name() {
-        let entries = build_custom_agent_infos(&custom_agents(&[
-            ("zeta", "zeta-cmd"),
-            ("alpha", "alpha-cmd"),
-            ("middle", "middle-cmd"),
-        ]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[
+                ("zeta", "zeta-cmd"),
+                ("alpha", "alpha-cmd"),
+                ("middle", "middle-cmd"),
+            ]),
+            &HashMap::new(),
+        );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    #[test]
+    fn custom_agent_acp_capable_tracks_agent_cockpit_cmd() {
+        let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("plain", "ssh host claude")]);
+        let cockpit = custom_agents(&[
+            ("oc-sp", "ocp run sp acp"),
+            // An entry whose command is malformed must not flip capability on.
+            ("broken", "ocp run \"unterminated"),
+        ]);
+        let entries = build_custom_agent_infos(&custom, &cockpit);
+
+        let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
+        assert!(
+            oc_sp.acp_capable,
+            "agent with a valid cockpit cmd is capable"
+        );
+        let plain = entries.iter().find(|e| e.name == "plain").unwrap();
+        assert!(!plain.acp_capable, "agent with no cockpit cmd is tmux-only");
     }
 
     #[tokio::test]

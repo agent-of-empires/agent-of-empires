@@ -20,6 +20,28 @@ pub struct AgentSpec {
     pub env_allowlist: Option<Vec<String>>,
 }
 
+impl AgentSpec {
+    /// Build an ACP `AgentSpec` from a custom agent's `agent_cockpit_cmd`
+    /// string. The string is split with shell-word rules into argv and run
+    /// directly (no shell). Returns a user-facing error message when the
+    /// command is empty or has malformed quoting.
+    pub fn from_cockpit_cmd(name: &str, cmd: &str) -> Result<AgentSpec, String> {
+        let argv = shell_words::split(cmd)
+            .map_err(|e| format!("custom agent `{name}` has a malformed cockpit command ({e})"))?;
+        let mut argv = argv.into_iter();
+        let command = argv
+            .next()
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| format!("custom agent `{name}` has an empty cockpit command"))?;
+        Ok(AgentSpec {
+            command,
+            args: argv.collect(),
+            description: format!("Custom ACP agent `{name}`"),
+            env_allowlist: None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentRegistry {
     pub agents: HashMap<String, AgentSpec>,
@@ -167,6 +189,33 @@ mod tests {
         let reg = AgentRegistry::with_defaults();
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("aoe-agent").is_some());
+    }
+
+    #[test]
+    fn from_cockpit_cmd_splits_argv() {
+        let spec = AgentSpec::from_cockpit_cmd("oc-sp", "ocp run sp acp").unwrap();
+        assert_eq!(spec.command, "ocp");
+        assert_eq!(spec.args, vec!["run", "sp", "acp"]);
+        assert_eq!(spec.description, "Custom ACP agent `oc-sp`");
+        assert!(spec.env_allowlist.is_none());
+    }
+
+    #[test]
+    fn from_cockpit_cmd_honors_quoting() {
+        let spec = AgentSpec::from_cockpit_cmd("wrap", "sh -lc 'ocp run sp acp'").unwrap();
+        assert_eq!(spec.command, "sh");
+        assert_eq!(spec.args, vec!["-lc", "ocp run sp acp"]);
+    }
+
+    #[test]
+    fn from_cockpit_cmd_rejects_empty() {
+        assert!(AgentSpec::from_cockpit_cmd("x", "").is_err());
+        assert!(AgentSpec::from_cockpit_cmd("x", "   ").is_err());
+    }
+
+    #[test]
+    fn from_cockpit_cmd_rejects_unbalanced_quotes() {
+        assert!(AgentSpec::from_cockpit_cmd("x", "ocp run \"unterminated").is_err());
     }
 
     #[test]

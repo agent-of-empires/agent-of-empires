@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../../lib/acpCapableTools";
+import { isAcpCapable } from "../../../lib/acpCapableTools";
 
 interface WizardData {
   tool: string;
@@ -36,10 +36,9 @@ interface Props {
   cockpitMasterEnabled: boolean;
 }
 
-/** Read-only callout for the cases where cockpit is impossible even
- *  though the master switch is on: a custom agent or a built-in tool
- *  with no ACP adapter. Both fall back to the tmux terminal, so there
- *  is nothing to toggle. The ACP-capable case renders
+/** Read-only callout when the selected tool cannot run in cockpit. This
+ *  includes built-in tools without ACP support and custom agents that do
+ *  not provide `agent_cockpit_cmd`. ACP-capable tools render
  *  `CockpitSubstrateCard` instead. */
 function SubstrateNotice({
   tool,
@@ -58,7 +57,7 @@ function SubstrateNotice({
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
         {customAgent
-          ? "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support."
+          ? "Custom agents run in the terminal unless they define agent_cockpit_cmd in config or TUI settings."
           : `${tool} has no ACP adapter yet, so this session falls back to the tmux terminal. Pick a tool with cockpit support (e.g. claude, opencode, gemini) to use the structured UI.`}
       </p>
     </div>
@@ -131,7 +130,7 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   );
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
-  const acpCapable = !selectedCustomAgent && ACP_CAPABLE_TOOLS.has(data.tool);
+  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
@@ -222,9 +221,8 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
       {/* Substrate picker. When the master switch is on and the tool is
           ACP-capable, the user gets a per-session cockpit toggle
           (default on, see #1580) so they can opt down to a tmux session
-          without flipping the global switch. Non-ACP tools and custom
-          agents can't run in cockpit, so they show a read-only fallback
-          notice instead. When the master switch is off, every new
+          without flipping the global switch. Tools that are not ACP-capable
+          show a read-only fallback notice instead. When the master switch is off, every new
           session is tmux and nothing is shown. */}
       {cockpitMasterEnabled &&
         (acpCapable ? (

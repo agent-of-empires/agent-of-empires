@@ -104,6 +104,13 @@ pub struct SessionResponse {
     /// cockpit view. See #1088.
     #[cfg(feature = "serve")]
     pub cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
+    /// True when this session's agent can run in cockpit: a built-in
+    /// with an ACP adapter, or a custom agent whose profile config
+    /// declares a valid `agent_cockpit_cmd`. The web terminal view reads
+    /// this to decide whether the "switch to cockpit" affordance is
+    /// available, replacing the hardcoded client-side tool list.
+    #[cfg(feature = "serve")]
+    pub acp_capable: bool,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -255,6 +262,19 @@ impl SessionResponse {
             cockpit_mode: inst.cockpit_mode,
             #[cfg(feature = "serve")]
             cockpit_worker_state,
+            // Built-in ACP capability is resolved here from a process-wide
+            // registry (cheap, no IO). Custom agents depend on profile
+            // config; the list and create handlers overlay that without a
+            // per-row config read.
+            #[cfg(feature = "serve")]
+            acp_capable: {
+                let resolved = inst
+                    .cockpit_agent
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str());
+                builtin_acp_registry().get(resolved).is_some()
+            },
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -321,6 +341,28 @@ pub struct SessionsEnvelope {
     pub workspace_ordering: Vec<String>,
 }
 
+/// Process-wide built-in ACP registry, built once. Used to compute
+/// `SessionResponse.acp_capable` for built-in agents without allocating
+/// a registry per response row.
+#[cfg(feature = "serve")]
+fn builtin_acp_registry() -> &'static crate::cockpit::AgentRegistry {
+    static REG: std::sync::OnceLock<crate::cockpit::AgentRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::cockpit::AgentRegistry::with_defaults)
+}
+
+/// True iff this custom agent declares a valid `agent_cockpit_cmd` in the
+/// given profile-resolved map. Built-in capability is handled separately
+/// in the constructor, so this only covers the custom case.
+#[cfg(feature = "serve")]
+fn custom_agent_acp_capable(
+    agent_cockpit_cmd: &std::collections::HashMap<String, String>,
+    tool: &str,
+) -> bool {
+    agent_cockpit_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(tool, cmd).is_ok())
+}
+
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -363,6 +405,32 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             )
         })
         .collect();
+
+    // Overlay custom-agent ACP capability (built-ins were resolved in the
+    // constructor). Cache by (profile, project_path) since repo-local
+    // config can override agent_cockpit_cmd, so each distinct pair is
+    // resolved at most once.
+    #[cfg(feature = "serve")]
+    {
+        use std::collections::HashMap;
+        let mut cockpit_cmd_cache: HashMap<(String, String), HashMap<String, String>> =
+            HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            if resp.acp_capable {
+                continue;
+            }
+            let key = (inst.source_profile.clone(), inst.project_path.clone());
+            let map = cockpit_cmd_cache.entry(key).or_insert_with(|| {
+                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &inst.source_profile,
+                    std::path::Path::new(&inst.project_path),
+                )
+                .session
+                .agent_cockpit_cmd
+            });
+            resp.acp_capable = custom_agent_acp_capable(map, &inst.tool);
+        }
+    }
 
     // Resolve per-profile cleanup defaults with a TTL cache on AppState
     let cache = {
@@ -1877,6 +1945,30 @@ pub async fn create_session(
             instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
             instance.cockpit_agent = body.cockpit_agent;
             instance.cockpit_model = body.cockpit_model;
+            // Don't trust the client's capability decision. Re-resolve
+            // whether this agent can actually run in cockpit; a custom
+            // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
+            // falls back to tmux here rather than erroring at spawn time.
+            if instance.cockpit_mode {
+                let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+                let resolved = instance
+                    .cockpit_agent
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(instance.tool.as_str());
+                let capable = acp_registry.get(resolved).is_some()
+                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
+                        &instance.source_profile,
+                        std::path::Path::new(&instance.project_path),
+                    )
+                    .session
+                    .agent_cockpit_cmd
+                    .get(&instance.tool)
+                    .is_some_and(|cmd| {
+                        crate::cockpit::AgentSpec::from_cockpit_cmd(&instance.tool, cmd).is_ok()
+                    });
+                instance.cockpit_mode = capable;
+            }
         }
 
         // Anything that fails between here and the final `Ok(..)`
@@ -1940,6 +2032,18 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Overlay custom-agent ACP capability so the wizard's redirect
+            // into the new session renders the right substrate immediately.
+            #[cfg(feature = "serve")]
+            if !resp.acp_capable {
+                let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &instance.source_profile,
+                    std::path::Path::new(&instance.project_path),
+                )
+                .session
+                .agent_cockpit_cmd;
+                resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
+            }
             #[cfg(feature = "serve")]
             let cockpit_spawn_target = if instance.cockpit_mode {
                 Some((
@@ -1973,7 +2077,12 @@ pub async fn create_session(
             {
                 let agent = state
                     .cockpit_supervisor
-                    .pick_agent_for_tool(&tool, agent_override.as_deref())
+                    .pick_agent_for_tool(
+                        &tool,
+                        agent_override.as_deref(),
+                        &source_profile,
+                        std::path::Path::new(&project_path),
+                    )
                     .await;
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = state.cockpit_supervisor.clone();
@@ -4286,6 +4395,8 @@ mod workspace_ordering_tests {
             cockpit_mode: false,
             #[cfg(feature = "serve")]
             cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            #[cfg(feature = "serve")]
+            acp_capable: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

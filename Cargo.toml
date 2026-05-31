@@ -44,6 +44,9 @@ portable-pty = "0.9"
 # Fuzzy matching
 nucleo-matcher = "0.3"
 
+# Shell-style splitting of custom-agent ACP command strings into argv
+shell-words = "1.1"
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"

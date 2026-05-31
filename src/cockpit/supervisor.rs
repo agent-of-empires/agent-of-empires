@@ -143,6 +143,8 @@ pub enum SupervisorError {
     Acp(#[from] AcpError),
     #[error("agent {0:?} not in registry")]
     UnknownAgent(String),
+    #[error("{0}")]
+    InvalidAgentCommand(String),
     #[error("session {0:?} already has a running cockpit worker")]
     AlreadyRunning(String),
     /// Configured `[cockpit] max_concurrent_workers` cap is full. The
@@ -488,34 +490,98 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or_else(|| SupervisorError::UnknownAgent(name.into()))
     }
 
+    /// Resolve the agent spec for a cockpit session, overlaying the
+    /// session's (already profile-resolved) config onto the built-in
+    /// registry. Built-in agents resolve from the registry; a custom
+    /// agent resolves from its `agent_cockpit_cmd` entry, parsed into
+    /// argv. Never mutates the registry, so two profiles defining the
+    /// same custom name with different commands don't clobber each other
+    /// and `/cockpit/switch-agent` validation stays per-session.
+    pub async fn resolve_agent_spec(
+        &self,
+        name: &str,
+        config: &crate::session::config::SessionConfig,
+    ) -> Result<AgentSpec, SupervisorError> {
+        if let Some(spec) = self.registry.lock().await.get(name).cloned() {
+            return Ok(spec);
+        }
+        if let Some(cmd) = config.agent_cockpit_cmd.get(name) {
+            return AgentSpec::from_cockpit_cmd(name, cmd)
+                .map_err(SupervisorError::InvalidAgentCommand);
+        }
+        Err(SupervisorError::UnknownAgent(name.into()))
+    }
+
     /// Pick the agent name to spawn for an instance. Precedence:
     ///   1. explicit `cockpit_agent` override on the instance
     ///   2. registry entry keyed on the instance's tool name
     ///      (so `tool="opencode"` → registry `"opencode"` →
     ///      `opencode acp`, etc.)
-    ///   3. legacy fallback: `claude` for the claude tool, otherwise
+    ///   3. custom agent declaring an ACP command via
+    ///      `agent_cockpit_cmd` in the session's profile config
+    ///   4. legacy fallback: `claude` for the claude tool, otherwise
     ///      `aoe-agent` (our bundled multi-provider agent)
-    pub async fn pick_agent_for_tool(&self, tool: &str, explicit_override: Option<&str>) -> String {
+    ///
+    /// `profile` is the session's source profile (`""` resolves the
+    /// user's default) and `project_path` is its working directory;
+    /// both are consulted for step 3 so repo-local `agent_cockpit_cmd`
+    /// overrides are honored.
+    pub async fn pick_agent_for_tool(
+        &self,
+        tool: &str,
+        explicit_override: Option<&str>,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> String {
         if let Some(name) = explicit_override {
             if !name.is_empty() {
                 return name.to_string();
             }
         }
-        // Step 2: tool-keyed registry lookup. Done under the same
-        // lock as resolve_agent so a custom override registered via
-        // upsert_agent is honored.
+        // Step 2: tool-keyed registry lookup.
         {
             let reg = self.registry.lock().await;
             if reg.get(tool).is_some() {
                 return tool.to_string();
             }
         }
-        // Step 3: legacy fallbacks.
+        // Step 3: custom agent with a configured ACP command resolves to
+        // its own name; spawn builds the spec from config (no registry
+        // mutation).
+        if self
+            .custom_agent_has_cockpit_cmd(tool, profile, project_path)
+            .await
+        {
+            return tool.to_string();
+        }
+        // Step 4: legacy fallbacks.
         if tool == "claude" {
             "claude".into()
         } else {
             "aoe-agent".into()
         }
+    }
+
+    /// True iff `tool` is a custom agent that declares an
+    /// `agent_cockpit_cmd` in its profile + repo-resolved config.
+    pub async fn custom_agent_has_cockpit_cmd(
+        &self,
+        tool: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> bool {
+        let tool = tool.to_string();
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
+                .session
+                .agent_cockpit_cmd
+                .get(&tool)
+                .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(&tool, cmd).is_ok())
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn registry_snapshot(&self) -> AgentRegistry {
@@ -931,7 +997,25 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
-        let mut spec = self.resolve_agent(&agent).await?;
+        // Resolve the spec config-aware: built-ins come from the
+        // registry, custom agents from this session's profile + repo
+        // resolved `agent_cockpit_cmd`. Read off-thread; config
+        // resolution touches disk.
+        let profile_for_cfg = source_profile.clone().unwrap_or_default();
+        let cwd_for_cfg = cwd.clone();
+        let resolved_cfg = tokio::task::spawn_blocking(move || {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &profile_for_cfg,
+                &cwd_for_cfg,
+            )
+        })
+        .await
+        .map_err(|e| {
+            SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
+        })?;
+        let mut spec = self
+            .resolve_agent_spec(&agent, &resolved_cfg.session)
+            .await?;
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.

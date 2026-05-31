@@ -539,30 +539,62 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // for, where missing tooling is a hard error rather than a
         // silent fallback to tmux.
         if instance.cockpit_mode && user_picked_cockpit {
+            // A custom agent explicitly opted into cockpit must declare an
+            // ACP command; otherwise we'd silently fall back to aoe-agent
+            // and launch the wrong thing. Fail loudly instead.
+            let has_override = instance
+                .cockpit_agent
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            let is_custom = config.session.custom_agents.contains_key(&instance.tool);
+            if is_custom
+                && !has_override
+                && !config
+                    .session
+                    .agent_cockpit_cmd
+                    .contains_key(&instance.tool)
+            {
+                bail!(
+                    "custom agent `{tool}` has no `agent_cockpit_cmd`, so it can't run in cockpit.\n\
+                     Add an ACP launch command under `[session.agent_cockpit_cmd]`, e.g.\n\
+                     {tool} = \"ocp run sp acp\"\n\
+                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
+                    tool = instance.tool
+                );
+            }
             let registry = crate::cockpit::agent_registry::AgentRegistry::with_defaults();
             let agent_name = pick_cockpit_agent_name(
                 &registry,
+                &config.session,
                 &instance.tool,
                 instance.cockpit_agent.as_deref(),
             );
-            if let Some(spec) = registry.get(&agent_name) {
-                if !crate::cli::cockpit::command_present(&spec.command) {
-                    let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
-                        .unwrap_or("install via your package manager and re-run");
-                    bail!(
-                        "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
-                         Install: {}\n\
-                         Or run: aoe cockpit doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
-                         Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                        spec.command,
-                        hint
-                    );
-                }
-            } else {
+            // Resolve the spec from the registry (built-in) or the custom
+            // agent's configured ACP command, then verify the binary is on
+            // PATH. A missing adapter is a hard error at add-time rather
+            // than a silent 404 on the first prompt.
+            let spec = match registry.get(&agent_name) {
+                Some(spec) => spec.clone(),
+                None => match config.session.agent_cockpit_cmd.get(&agent_name) {
+                    Some(cmd) => crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    None => bail!(
+                        "cockpit agent `{agent_name}` is not in the registry.\n\
+                         Run `aoe cockpit doctor` to see configured agents."
+                    ),
+                },
+            };
+            if !crate::cli::cockpit::command_present(&spec.command) {
+                let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
+                    .unwrap_or("install via your package manager and re-run");
                 bail!(
-                    "cockpit agent `{agent_name}` is not in the registry.\n\
-                     Run `aoe cockpit doctor` to see configured agents."
+                    "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
+                     Install: {}\n\
+                     Or run: aoe cockpit doctor --fix\n\
+                     Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
+                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
+                    spec.command,
+                    hint
                 );
             }
         }
@@ -911,10 +943,12 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → legacy (`claude` → `claude`, else `aoe-agent`).
+/// registry entry → custom agent with `agent_cockpit_cmd` → legacy
+/// (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
 fn pick_cockpit_agent_name(
     registry: &crate::cockpit::agent_registry::AgentRegistry,
+    session: &crate::session::config::SessionConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -924,6 +958,9 @@ fn pick_cockpit_agent_name(
         }
     }
     if registry.get(tool).is_some() {
+        return tool.to_string();
+    }
+    if session.agent_cockpit_cmd.contains_key(tool) {
         return tool.to_string();
     }
     if tool == "claude" {

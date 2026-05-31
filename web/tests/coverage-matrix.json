@@ -426,6 +426,19 @@
       ]
     },
     {
+      "id": "cockpit.custom-agent-acp-capable",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-custom-agent.spec.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/TerminalView.tsx"
+      ]
+    },
+    {
       "id": "wizard.profile-description",
       "kind": "mocked-playwright",
       "risk": "medium",

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../lib/acpCapableTools";
+import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { StepIndicator } from "./StepIndicator";
@@ -190,11 +190,10 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
-    // Custom agents have no ACP adapter, so they can never run in
-    // cockpit even if their name collides with a built-in entry in
-    // ACP_CAPABLE_TOOLS. Mirror AgentStep's guard here.
-    const selectedCustomAgent =
-      state.agents.find((a) => a.name === d.tool)?.kind === "custom";
+    const selectedAgentAcpCapable = isAcpCapable(
+      d.tool,
+      state.agents.find((a) => a.name === d.tool)?.acp_capable,
+    );
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the
@@ -222,17 +221,17 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Cockpit runs only when the master switch is on, the tool is
+      // Cockpit runs only when the master switch is on, the agent is
       // ACP-capable, and the user kept the per-session toggle on
-      // (default). Turning it off launches a tmux session even with
-      // the master switch enabled. Non-ACP tools, custom agents, and a
-      // disabled master switch all fall back to tmux. The server
-      // re-applies the master switch (see src/server/api/sessions.rs),
-      // so a tampered client request can't escalate cockpit on.
+      // (default). Capability comes from the server's per-agent
+      // `acp_capable` flag (including custom agents with an
+      // `agent_cockpit_cmd`) with hardcoded fallback while loading. The
+      // server re-resolves capability and re-applies the master switch
+      // (see src/server/api/sessions.rs), so a tampered request can't
+      // escalate cockpit on for a non-capable agent.
       cockpit_mode:
         cockpitMasterEnabled &&
-        !selectedCustomAgent &&
-        ACP_CAPABLE_TOOLS.has(d.tool) &&
+        selectedAgentAcpCapable &&
         d.useCockpit,
       scratch: d.scratch || undefined,
     };

@@ -6,7 +6,7 @@ import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
 import { SwitchSubstrateAction } from "./cockpit/SwitchSubstrateAction";
 import { ensureSession } from "../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../lib/acpCapableTools";
+import { isAcpCapable } from "../lib/acpCapableTools";
 import { safeSetItem } from "../lib/safeStorage";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -245,7 +245,7 @@ export function TerminalView({
           <SwitchSubstrateAction
             sessionId={session.id}
             cockpitMode={false}
-            acpCapable={ACP_CAPABLE_TOOLS.has(session.tool)}
+            acpCapable={isAcpCapable(session.tool, session.acp_capable)}
             variant="icon"
           />
         </div>

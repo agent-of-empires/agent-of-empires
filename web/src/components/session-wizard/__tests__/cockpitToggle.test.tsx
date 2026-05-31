@@ -6,8 +6,8 @@
 // force-routed into cockpit. Two surfaces:
 //
 //   - AgentStep renders an interactive CockpitSubstrateCard (a switch,
-//     default on) for ACP-capable built-ins; non-ACP tools and custom
-//     agents keep the read-only fallback notice and show no switch.
+//     default on) for ACP-capable tools (built-in or custom); non-ACP
+//     tools keep the read-only fallback notice and show no switch.
 //   - SessionWizard's submit payload sets `cockpit_mode` from
 //     `cockpitMasterEnabled && acpCapable && useCockpit`, so toggling
 //     the switch off sends `cockpit_mode: false` (the server then
@@ -124,7 +124,7 @@ describe("AgentStep cockpit substrate card (#1580)", () => {
     expect(queryByRole("switch", { name: "Use cockpit" })).toBeNull();
     expect(
       getByText(
-        "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support.",
+        "Custom agents run in the terminal unless they define agent_cockpit_cmd in config or TUI settings.",
       ),
     ).toBeTruthy();
   });
