@@ -730,6 +730,41 @@
       ]
     },
     {
+      "id": "sidebar.group-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sidebarGroups.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.axis-hook",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useSidebarAxis.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useSidebarAxis.ts"
+      ]
+    },
+    {
+      "id": "sidebar.group-axis-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/sidebar-groups-axis.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useSessionGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",

@@ -254,6 +254,15 @@ A sort toggle next to the filter button in the sidebar header switches to **Rece
 
 The toggle's state is per-browser (localStorage), not synced across devices and not tied to your profile. Toggling back to manual restores the stored manual order and re-enables drag. The multi-repo group stays pinned at the bottom in both modes.
 
+### Sidebar grouping: by repo or by group
+
+A grouping toggle (the layers icon) next to the sort toggle switches the axis the sidebar organises sessions by:
+
+- **By repo** (default) groups workspaces by their git repository, the original behavior.
+- **By group** groups sessions by the user-defined group you assigned in the TUI rename dialog or with `aoe group move`, mirroring the TUI's group headers. Sessions with no group fall into an **Ungrouped** bucket pinned to the bottom. A session whose worktree hosts agents in different groups shows up under each of those groups.
+
+The choice is per-browser (localStorage). Collapse state is tracked separately for each axis, so collapsing a group in **By group** does not collapse a repo in **By repo**. The group axis is read-only in v1: group rename, color, and drag-reorder live on the repo axis only, and groups themselves are not yet reorderable.
+
 ### Triage: pin, archive, snooze
 
 The sidebar exposes three triage primitives via the right-click (long-press on touch) context menu on any session row:
