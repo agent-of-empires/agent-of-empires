@@ -302,7 +302,11 @@ export function Composer({
   // rejection beyond this is enforced authoritatively server-side.
   const addFiles = useCallback(
     async (files: FileList | File[]) => {
-      const list = Array.from(files);
+      // Only encode up to the remaining slots: base64 work on files the
+      // cap would discard anyway stalls the composer on large drops.
+      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
+      if (remaining === 0) return;
+      const list = Array.from(files).slice(0, remaining);
       const accepted: PromptAttachmentInput[] = [];
       for (const file of list) {
         const kind = mimeToKind(file.type || "application/octet-stream");
@@ -321,8 +325,20 @@ export function Composer({
         prev.concat(accepted).slice(0, MAX_ATTACHMENTS),
       );
     },
-    [promptCapabilities, setPendingAttachments],
+    [pendingAttachments.length, promptCapabilities, setPendingAttachments],
   );
+
+  // Reconcile already-staged attachments when capabilities change (e.g.
+  // after a manual agent switch): drop files whose kind the new agent no
+  // longer supports so they cannot be submitted. `attachmentsEnabled`
+  // only gates new intake, not files staged under the previous agent.
+  useEffect(() => {
+    if (!promptCapabilities) return;
+    setPendingAttachments((prev) => {
+      const next = prev.filter((att) => kindSupported(att.kind, promptCapabilities));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [promptCapabilities, setPendingAttachments]);
 
   const removeAttachment = useCallback(
     (index: number) => {
