@@ -244,6 +244,25 @@ On phones (below the `md` breakpoint) the dashboard shows a single full-viewport
 
 This replaces the earlier slide-in overlay, which left the paired terminal almost no room once the soft keyboard opened. Because each view now owns the whole viewport, the paired terminal handles the keyboard the same way the agent terminal does. The agent terminal and the paired shell stay alive in the background when you switch away, so their scrollback and focus are preserved. The desktop side-by-side split is unchanged.
 
+### Terminal copy and scroll
+
+The live terminal uses tmux for scrollback and selection, so copy and scroll
+work together with no modifier keys:
+
+- **Scroll** with the mouse wheel (or a two-finger swipe on touch) to move back
+  through tmux scrollback. A "Back to live" control returns you to the bottom.
+- **Select** by click-dragging across the text. Dragging upward past the top
+  edge scrolls into the scrollback and extends the selection, so you can grab
+  output taller than the window. Releasing the drag copies the selection to
+  your system clipboard automatically; no Ctrl/Cmd+C needed.
+
+Copy-to-clipboard relies on the browser Clipboard API, which is only available
+in a secure context: pages served over HTTPS (the remote-access tunnel modes)
+or over `http://localhost`. On a plain-HTTP LAN/VPN origin the browser blocks
+clipboard writes, and the selection stays visible but is not copied. Firefox
+is best-effort here because it does not support the asynchronous clipboard
+write the terminal uses; Chromium and Safari copy reliably.
+
 ### Sidebar sort
 
 By default the sidebar shows your manually-ordered list. Drag a row with a press-and-hold gesture to move it; the new order persists across browsers and devices via `workspace-ordering.json`.

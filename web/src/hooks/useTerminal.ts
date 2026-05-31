@@ -91,6 +91,14 @@ const DEFAULT_FONT_SIZE = 14;
 const MOBILE_BREAKPOINT_PX = 768;
 const WHEEL_ZOOM_SENSITIVITY = 0.05;
 const WHEEL_PERSIST_DEBOUNCE_MS = 400;
+// How long, after a drag-select releases, to wait for tmux's OSC 52
+// clipboard escape to arrive over the WS before giving up. The escape is
+// emitted by tmux's copy-selection on mouse release and round-trips through
+// the PTY relay, so it lands a frame or two after `mouseup`. See #1499.
+const OSC52_CLIPBOARD_TIMEOUT_MS = 500;
+// Pointer travel (px) below which a press/release is treated as a click, not
+// a drag, so a plain focus click doesn't arm a clipboard write.
+const DRAG_COPY_THRESHOLD_PX = 4;
 const RESIZE_DEBOUNCE_MS = 50;
 // First-resize debounce: longer than the steady-state value so the
 // initial layout transition (sidebar mount, splitter snap, font swap)
@@ -295,6 +303,54 @@ export function useTerminal(
     term.loadAddon(new WebLinksAddon());
 
     term.open(termEl);
+
+    // Select-to-copy bridge. tmux owns text selection here: mouse-mode is on
+    // (src/tmux/utils.rs) so a drag drives tmux copy-mode, which is the only
+    // way to select across the scrollback boundary given xterm's
+    // `scrollback: 0`. On copy, tmux (`set-clipboard on`) emits an OSC 52
+    // clipboard escape, but xterm.js has no built-in OSC 52 handler, so the
+    // payload was dropped on the floor and select-to-copy silently failed
+    // after the wterm -> xterm.js swap. We decode it and write it to the
+    // system clipboard. The escape arrives asynchronously over the WS, after
+    // the `mouseup` that triggered the copy, so a bare
+    // `navigator.clipboard.writeText()` is rejected for lacking a user
+    // gesture; `armClipboardCopy()` below pre-arms a gesture-bound
+    // `ClipboardItem` promise that this handler resolves. See #1499.
+    let osc52Resolve: ((text: string) => void) | null = null;
+    const writeClipboardText = (text: string) => {
+      navigator.clipboard?.writeText(text).catch((err) => {
+        // Expected on browsers that won't honor an async write without a
+        // live user gesture (notably Firefox, which lacks promise-valued
+        // ClipboardItem). Best-effort; logged, not surfaced.
+        tdbg("clipboard writeText failed", err);
+      });
+    };
+    term.parser.registerOscHandler(52, (data) => {
+      // Payload shape: "<targets>;<base64>" where targets is e.g. "c"
+      // (clipboard), "p" (primary), or "cp". A lone "?" in the data half is
+      // a paste query we don't answer.
+      const sep = data.indexOf(";");
+      if (sep === -1) return true;
+      const encoded = data.slice(sep + 1);
+      if (encoded === "" || encoded === "?") return true;
+      let text: string;
+      try {
+        const bin = atob(encoded);
+        const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+        text = new TextDecoder().decode(bytes);
+      } catch (err) {
+        tdbg("osc52 decode failed", err);
+        return true;
+      }
+      if (osc52Resolve) {
+        osc52Resolve(text);
+        osc52Resolve = null;
+      } else {
+        // Not a user drag (e.g. the agent itself ran a copy); write directly.
+        writeClipboardText(text);
+      }
+      return true;
+    });
 
     // Mobile soft-keyboard Backspace autorepeat arrives as a stream of
     // `beforeinput` events (inputType "deleteContentBackward", with keydown
@@ -1244,6 +1300,81 @@ export function useTerminal(
     };
     viewport.addEventListener("click", onClickCapture, true);
 
+    // Arm a clipboard write tied to the synchronous `mouseup` that ends a
+    // drag-select, so the OSC 52 escape tmux emits asynchronously over the WS
+    // keeps the browser's user-gesture authorization (see the OSC 52 handler
+    // registered after term.open). A promise-valued ClipboardItem is the
+    // gesture-preserving path (Safari/Chromium); browsers without it
+    // (Firefox) fall back to a best-effort writeText, which may be blocked.
+    // See #1499.
+    const armClipboardCopy = () => {
+      let settled = false;
+      const finish = () => {
+        settled = true;
+        osc52Resolve = null;
+      };
+      try {
+        if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+          const pending = new Promise<Blob>((resolve, reject) => {
+            osc52Resolve = (text) => {
+              if (settled) return;
+              finish();
+              resolve(new Blob([text], { type: "text/plain" }));
+            };
+            setTimeout(() => {
+              if (settled) return;
+              finish();
+              reject(new Error("osc52 clipboard timeout"));
+            }, OSC52_CLIPBOARD_TIMEOUT_MS);
+          });
+          // Attach our own rejection handler so a timeout never surfaces as an
+          // unhandled rejection if the clipboard implementation drops the
+          // promise (the write() consumer below also sees it; both fire).
+          pending.catch(() => {});
+          navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {
+            // Rejected when no OSC 52 arrived within the timeout (drag
+            // selected nothing) or the engine declined the async write.
+            // Harmless.
+          });
+          return;
+        }
+      } catch {
+        // Promise-valued ClipboardItem unsupported (Firefox); fall through to
+        // the best-effort writeText path below.
+      }
+      osc52Resolve = (text) => {
+        if (settled) return;
+        finish();
+        writeClipboardText(text);
+      };
+      setTimeout(() => {
+        if (!settled) finish();
+      }, OSC52_CLIPBOARD_TIMEOUT_MS);
+    };
+    let mouseDownPoint: { x: number; y: number } | null = null;
+    const onMouseDownCapture = (e: MouseEvent) => {
+      if (e.button === 0) mouseDownPoint = { x: e.clientX, y: e.clientY };
+    };
+    const onWindowMouseUp = (e: MouseEvent) => {
+      const start = mouseDownPoint;
+      mouseDownPoint = null;
+      if (e.button !== 0 || !start) return;
+      // Threshold filters plain focus clicks; only a real drag (which tmux
+      // turns into a copy-mode selection) should arm a clipboard write.
+      if (
+        Math.hypot(e.clientX - start.x, e.clientY - start.y) <
+        DRAG_COPY_THRESHOLD_PX
+      ) {
+        return;
+      }
+      armClipboardCopy();
+    };
+    // mousedown on the viewport so only drags that begin inside the terminal
+    // count; mouseup on the window so a release outside the terminal bounds
+    // (the user dragged past the top edge into scrollback) still arms.
+    viewport.addEventListener("mousedown", onMouseDownCapture, { capture: true });
+    window.addEventListener("mouseup", onWindowMouseUp, { capture: true });
+
     // Mouse wheel: Ctrl+wheel = zoom (trackpad pinch), plain wheel =
     // scroll. tmux manages its own scrollback via mouse-mode escape
     // sequences, so we always synthesize SGR wheel sequences and emit
@@ -1386,6 +1517,10 @@ export function useTerminal(
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);
       viewport.removeEventListener("touchcancel", onTouchEnd, touchOpts);
       viewport.removeEventListener("click", onClickCapture, true);
+      viewport.removeEventListener("mousedown", onMouseDownCapture, {
+        capture: true,
+      });
+      window.removeEventListener("mouseup", onWindowMouseUp, { capture: true });
       viewport.removeEventListener("wheel", onWheelCapture, true);
       xtermTextarea?.removeEventListener("beforeinput", onBeforeInput, {
         capture: true,
