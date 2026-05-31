@@ -4,7 +4,7 @@ import type { StepDef, StepId } from "../StepIndicator";
 import { getReviewSummary } from "../sessionNames";
 import { useServerDown, OFFLINE_TITLE } from "../../../lib/connectionState";
 import type { AgentInfo } from "../../../lib/types";
-import { ACP_CAPABLE_TOOLS } from "../../../lib/acpCapableTools";
+import { isAcpCapable } from "../../../lib/acpCapableTools";
 
 interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useCockpit: boolean; [key: string]: unknown; }
 interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; }
@@ -125,8 +125,7 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
   // with, including the per-session opt-out (#1580).
   const willUseCockpit =
     cockpitMasterEnabled &&
-    !selectedCustomAgent &&
-    ACP_CAPABLE_TOOLS.has(data.tool) &&
+    isAcpCapable(data.tool, selectedAgent?.acp_capable) &&
     data.useCockpit;
 
   useEffect(() => {
