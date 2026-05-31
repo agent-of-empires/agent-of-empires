@@ -36,6 +36,11 @@ import {
 import { getToken } from "../lib/token";
 import { setSessionArchive, setSessionSnooze } from "../lib/api";
 
+/** Outcome of an immediate prompt POST, used by the drain effect to
+ *  decide whether to retire queued items (delivered or permanently
+ *  rejected) or keep them for a later retry (transient failure). */
+type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
+
 export type Action =
   | { kind: "frame"; frame: CockpitFrame }
   | { kind: "frames"; frames: CockpitFrame[] }
@@ -1010,22 +1015,26 @@ export function useCockpit(
 
   // Dispatch a prompt immediately, no queueing. Internal helper used by
   // both sendPrompt (when the turn is idle) and the drain effect below
-  // (when popping the head of queuedPrompts on Stopped). Returns true
-  // when the POST succeeded so the drain effect knows whether to retire
-  // the items it just sent; false on any disconnect / non-OK response /
-  // network error so the queue stays intact for the next turn-end retry.
+  // (when popping the head of queuedPrompts on Stopped). The result tells
+  // the drain effect what to do with the items it just sent:
+  //   - "ok": delivered, retire them.
+  //   - "non_retryable_failure": the server rejected them with a 4xx, so
+  //     retrying would just re-POST the same failing batch every turn-end;
+  //     retire them too (the error banner already surfaced the reason).
+  //   - "retryable_failure": a transient disconnect / 5xx / network error,
+  //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
     async (
       text: string,
       attachments?: PromptAttachmentInput[],
-    ): Promise<boolean> => {
-      if (!sessionId) return false;
+    ): Promise<PromptSendResult> => {
+      if (!sessionId) return "retryable_failure";
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
           message: "Cockpit disconnected; message not sent. Reconnect to retry.",
         });
-        return false;
+        return "retryable_failure";
       }
       // Optimistic preview rows: render the attachment inline from a
       // local data URL so the bubble shows immediately, before the
@@ -1078,22 +1087,23 @@ export function useCockpit(
           // capability gate, unknown session), so there is no in-flight
           // turn to cancel and no Stopped frame to retire our optimistic
           // turn marker.
-          if (res.status >= 400 && res.status < 500) {
+          const rejected = res.status >= 400 && res.status < 500;
+          if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           }
           dispatch({
             kind: "error",
             message: `Could not send prompt (${res.status}). ${detail}`.trim(),
           });
-          return false;
+          return rejected ? "non_retryable_failure" : "retryable_failure";
         }
-        return true;
+        return "ok";
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
         });
-        return false;
+        return "retryable_failure";
       }
     },
     [sessionId],
@@ -1263,8 +1273,12 @@ export function useCockpit(
       const combined = combineQueuedPrompts(snapshot);
       const sentIds = snapshot.map((q) => q.id);
       void dispatchPromptNow(combined)
-        .then((ok) => {
-          if (ok) dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+        .then((result) => {
+          // Retire on success and on non-retryable rejection; only a
+          // transient failure keeps the batch queued for the next retry.
+          if (result !== "retryable_failure") {
+            dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+          }
         })
         .finally(() => {
           drainingRef.current = false;
@@ -1273,8 +1287,10 @@ export function useCockpit(
       const head = state.queuedPrompts[0]!;
       const headId = head.id;
       void dispatchPromptNow(head.text)
-        .then((ok) => {
-          if (ok) dispatch({ kind: "dequeue_prompt", id: headId });
+        .then((result) => {
+          if (result !== "retryable_failure") {
+            dispatch({ kind: "dequeue_prompt", id: headId });
+          }
         })
         .finally(() => {
           drainingRef.current = false;
