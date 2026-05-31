@@ -195,6 +195,17 @@
       "components": []
     },
     {
+      "id": "settings.cockpit-persistence",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/settings-persistence-cockpit.spec.ts"
+      ],
+      "components": [
+        "web/src/components/SettingsView.tsx"
+      ]
+    },
+    {
       "id": "settings.theme-payload",
       "kind": "vitest",
       "risk": "low",

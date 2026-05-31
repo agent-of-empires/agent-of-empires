@@ -353,6 +353,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<DateTime<Utc>>,
 
+    /// Internal cockpit idle-dormancy marker. Set by the reconciler's
+    /// idle-reap pass when a cockpit worker is shut down for inactivity
+    /// (`cockpit.auto_stop_idle_secs`); while set, the reconciler skips
+    /// respawning the worker, so the session stays stopped until the
+    /// user comes back. Cleared by `touch_last_accessed()` (the same
+    /// wake path that clears archive/snooze), so the next prompt revives
+    /// the worker on the following reconciler tick. Distinct from
+    /// `snoozed_until` (user-facing, deadline-based, sorts to tier 99)
+    /// and `archived_at` (user-facing hide): dormancy is invisible to
+    /// the UI sort and exists only to suppress auto-respawn. See #1689.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_dormant_since: Option<DateTime<Utc>>,
+
     /// Web-only pin marker. Distinct from `favorited_at`: favorite is the
     /// TUI attention-sort within-tier pin, while pin is a hard top-of-sort
     /// surfacing primitive surfaced through the web sidebar (where the TUI's
@@ -797,6 +810,7 @@ impl Instance {
             archived_at: None,
             favorited_at: None,
             snoozed_until: None,
+            idle_dormant_since: None,
             pinned_at: None,
             scratch: false,
             worktree_info: None,
@@ -845,6 +859,20 @@ impl Instance {
         self.last_accessed_at = Some(Utc::now());
         self.archived_at = None;
         self.snoozed_until = None;
+        self.idle_dormant_since = None;
+    }
+
+    /// Whether this session's cockpit worker was auto-stopped for
+    /// inactivity and should not be respawned by the reconciler until the
+    /// user wakes it. See `idle_dormant_since` and #1689.
+    pub fn is_idle_dormant(&self) -> bool {
+        self.idle_dormant_since.is_some()
+    }
+
+    /// Mark the session dormant after its cockpit worker was auto-stopped
+    /// for inactivity. Idempotent: re-marking refreshes the timestamp.
+    pub fn mark_idle_dormant(&mut self) {
+        self.idle_dormant_since = Some(Utc::now());
     }
 
     /// Mutates: `status`, `sandbox_info`. Field set must match what
@@ -1035,12 +1063,15 @@ impl Instance {
             self.archived_at = None;
             self.snoozed_until = None;
         }
-        // touch_last_accessed(): clears archived + snoozed. Does NOT clear
-        // favorite or pin (both are explicit user-surfacing signals, not
-        // sink states).
+        // touch_last_accessed(): clears archived + snoozed + idle-dormant.
+        // Does NOT clear favorite or pin (both are explicit user-surfacing
+        // signals, not sink states). Mirrors touch_last_accessed() so the
+        // wake-from-dormancy invariant holds on the concurrent-writer merge
+        // path too, not just direct touches (#1689).
         if touched {
             self.archived_at = None;
             self.snoozed_until = None;
+            self.idle_dormant_since = None;
         }
         // Final-state invariant: archive is the strongest dismiss and
         // wins over snooze. The per-mutation rules above clear other
@@ -3546,6 +3577,24 @@ mod tests {
         assert!(inst.is_snoozed());
         inst.touch_last_accessed();
         assert!(!inst.is_snoozed());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_clears_idle_dormant() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.mark_idle_dormant();
+        assert!(inst.is_idle_dormant());
+        inst.touch_last_accessed();
+        assert!(!inst.is_idle_dormant());
+    }
+
+    #[test]
+    fn test_mark_idle_dormant_sets_marker() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        assert!(!inst.is_idle_dormant());
+        inst.mark_idle_dormant();
+        assert!(inst.is_idle_dormant());
+        assert!(inst.idle_dormant_since.is_some());
     }
 
     #[test]

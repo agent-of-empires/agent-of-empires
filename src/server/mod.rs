@@ -1605,6 +1605,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
     #[cfg(feature = "serve")]
     let mut attempted_cockpit_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    #[cfg(feature = "serve")]
+    let mut last_idle_reap: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
 
@@ -1733,8 +1735,12 @@ async fn status_poll_loop(state: Arc<AppState>) {
             }
 
             #[cfg(feature = "serve")]
-            cockpit_reconciler::reconcile_cockpit_workers(&state, &mut attempted_cockpit_spawns)
-                .await;
+            cockpit_reconciler::reconcile_cockpit_workers(
+                &state,
+                &mut attempted_cockpit_spawns,
+                &mut last_idle_reap,
+            )
+            .await;
         }
     }
 }

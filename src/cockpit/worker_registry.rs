@@ -409,6 +409,59 @@ fn socket_exists(path: &Path) -> bool {
     }
 }
 
+/// Signal the runner's entire process group, then the runner pid itself.
+///
+/// The runner is spawned `setsid` (a fresh session, so it is the leader of
+/// a process group whose id equals its pid), and the agent subprocess plus
+/// the agent's own children (e.g. the node ACP wrapper and the SDK child it
+/// execs) inherit that group. Signalling the group reaps the whole tree in
+/// one shot. Signalling only the runner pid leaves the agent and its
+/// grandchildren orphaned under PID 1, which is the cockpit-runner /
+/// `node` / `claude` process leak that accumulated across daemon restarts
+/// and superseded spawns (#1689). The trailing single-pid signal is a
+/// belt-and-suspenders for the unlikely case `setsid` failed and the
+/// runner is not a group leader. Best-effort; errors are ignored.
+#[cfg(unix)]
+fn signal_runner_group(pid: u32, sig: nix::sys::signal::Signal) {
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::Pid;
+    let p = Pid::from_raw(pid as i32);
+    let _ = killpg(p, sig);
+    let _ = kill(p, sig);
+}
+
+/// SIGTERM the runner's process group (runner + agent + grandchildren).
+pub fn terminate_runner_group(pid: u32) {
+    #[cfg(unix)]
+    signal_runner_group(pid, nix::sys::signal::Signal::SIGTERM);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// SIGKILL the runner's process group; the escalation path when SIGTERM
+/// does not take.
+pub fn kill_runner_group(pid: u32) {
+    #[cfg(unix)]
+    signal_runner_group(pid, nix::sys::signal::Signal::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Reap the runner for `session_id`: SIGTERM its whole process group (if
+/// the registry entry exists), then remove the registry entry and socket.
+/// The canonical teardown used by the supervisor's shutdown paths and by a
+/// fresh spawn that supersedes a stale runner, so no prior agent tree is
+/// left orphaned. The SIGTERM is sent unconditionally: the process group
+/// can outlive its leader pid, so gating on leader liveness would skip the
+/// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
+/// already-empty group is a harmless no-op. See #1689.
+pub fn terminate(session_id: &str) {
+    if let Ok(Some(record)) = load(session_id) {
+        terminate_runner_group(record.pid);
+    }
+    delete(session_id).ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +696,42 @@ mod tests {
             let after = load("x").unwrap().unwrap();
             assert!(after.last_attached_at.is_some());
             assert!(after.detached_at.is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn terminate_deletes_entry_for_dead_pid() {
+        with_temp_home(|| {
+            // 2e9 is not a live pid (see is_pid_alive_unlikely_pid), so
+            // terminate sends no signal and just clears the stale entry.
+            let rec = WorkerRecord::new(
+                "term-dead".into(),
+                2_000_000_000,
+                PathBuf::from("/tmp/term-dead.sock"),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            save(&rec).unwrap();
+            assert!(record_path("term-dead").unwrap().exists());
+            terminate("term-dead");
+            assert!(!record_path("term-dead").unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn terminate_missing_entry_is_noop() {
+        with_temp_home(|| {
+            // No entry, no panic, nothing to delete.
+            terminate("does-not-exist");
+            assert!(!record_path("does-not-exist").unwrap().exists());
         });
     }
 

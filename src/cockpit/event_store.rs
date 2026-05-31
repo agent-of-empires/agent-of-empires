@@ -57,6 +57,30 @@ use tracing::{debug, trace, warn};
 use super::approvals::Nonce;
 use super::state::{Event, Plan};
 
+/// Externally-tagged JSON discriminants for non-substantive cockpit
+/// events: lifecycle and metadata snapshots the agent emits once per
+/// session (or on every cold-start resume) that must not count as session
+/// activity. Two SQL predicates depend on this set staying in sync: the
+/// retention prune exempts them from eviction (#1049) and the idle-reap
+/// idle clock ignores them (#1689). Centralized so the two cannot silently
+/// desync.
+const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
+    "AvailableCommandsUpdated",
+    "ModesAvailable",
+    "CurrentModeChanged",
+    "AcpSessionAssigned",
+];
+
+/// Build the `AND event_json NOT LIKE '{"Name":%'` SQL fragment for every
+/// non-substantive discriminant, newline-joined for readable queries.
+fn non_substantive_not_like_clauses() -> String {
+    NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+        .iter()
+        .map(|name| format!("AND event_json NOT LIKE '{{\"{name}\":%'"))
+        .collect::<Vec<_>>()
+        .join("\n               ")
+}
+
 /// SQLite-backed cockpit event log. One row per (session_id, seq).
 pub struct EventStore {
     conn: Mutex<Connection>,
@@ -95,7 +119,9 @@ impl EventStore {
                 PRIMARY KEY (session_id, seq)
             );
             CREATE INDEX IF NOT EXISTS idx_cockpit_events_session_seq
-                ON cockpit_events(session_id, seq);",
+                ON cockpit_events(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_cockpit_events_session_created_at
+                ON cockpit_events(session_id, created_at);",
         )
         .context("create cockpit_events schema")?;
         debug!(
@@ -170,7 +196,7 @@ impl EventStore {
         // See #1049. The `event_json NOT LIKE` clauses match the
         // externally-tagged JSON discriminant for each pinned variant.
         if self.max_events_per_session > 0 {
-            match conn.execute(
+            let prune_sql = format!(
                 "DELETE FROM cockpit_events
                  WHERE session_id = ?1
                    AND seq <= (
@@ -179,10 +205,11 @@ impl EventStore {
                      ORDER BY seq DESC
                      LIMIT 1 OFFSET ?2
                    )
-                   AND event_json NOT LIKE '{\"AvailableCommandsUpdated\":%'
-                   AND event_json NOT LIKE '{\"ModesAvailable\":%'
-                   AND event_json NOT LIKE '{\"CurrentModeChanged\":%'
-                   AND event_json NOT LIKE '{\"AcpSessionAssigned\":%'",
+                   {clauses}",
+                clauses = non_substantive_not_like_clauses()
+            );
+            match conn.execute(
+                &prune_sql,
                 params![session_id, self.max_events_per_session as i64],
             ) {
                 Ok(0) => {}
@@ -781,6 +808,73 @@ impl EventStore {
         terminator.is_none()
     }
 
+    /// Latest `created_at` (ms since epoch) per session for the given
+    /// ids, in a single grouped query. Sessions with no events are
+    /// absent from the returned map. Backed by the
+    /// `(session_id, created_at)` index. Used by the reconciler's
+    /// idle-reap pass (#1689) to find cockpit workers that have seen no
+    /// activity for longer than `cockpit.auto_stop_idle_secs`, without a
+    /// per-session round trip.
+    pub fn last_event_at_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> std::collections::HashMap<String, i64> {
+        let mut out = std::collections::HashMap::new();
+        if session_ids.is_empty() {
+            return out;
+        }
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let placeholders = std::iter::repeat("?")
+            .take(session_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Exclude non-substantive lifecycle/metadata events so they do not
+        // reset the idle clock. AcpSessionAssigned in particular is emitted
+        // on every cold-start resume (acp_client.rs), so counting it would
+        // make a daemon restart look like fresh activity for every worker
+        // and the idle-reap (#1689) would never fire across restarts. Shares
+        // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS with the retention prune so the
+        // two predicates cannot desync.
+        let sql = format!(
+            "SELECT session_id, MAX(created_at) FROM cockpit_events
+             WHERE session_id IN ({placeholders})
+               {clauses}
+             GROUP BY session_id",
+            clauses = non_substantive_not_like_clauses()
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "cockpit.event_store", "last_event_at_for_sessions prepare: {e}");
+                return out;
+            }
+        };
+        let rows = stmt.query_map(rusqlite::params_from_iter(session_ids.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        });
+        match rows {
+            Ok(iter) => {
+                for r in iter {
+                    match r {
+                        Ok((session_id, created_at)) => {
+                            out.insert(session_id, created_at);
+                        }
+                        Err(e) => {
+                            warn!(target: "cockpit.event_store", "last_event_at_for_sessions row: {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(target: "cockpit.event_store", "last_event_at_for_sessions query: {e}");
+            }
+        }
+        out
+    }
+
     /// Drop every event for a session. Called when the session is
     /// deleted or its substrate is switched away from cockpit, so the
     /// next cockpit_enable starts fresh from seq=1.
@@ -871,6 +965,99 @@ mod tests {
         let replay = store.replay_from("s-1", 2);
         let seqs: Vec<u64> = replay.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn last_event_at_ignores_non_substantive_events() {
+        // #1689: the idle clock must reflect real activity, not lifecycle /
+        // metadata events. A session whose only events are AcpSessionAssigned
+        // (emitted on every cold-start resume), ModesAvailable, etc. must NOT
+        // register a recent activity timestamp, otherwise a daemon restart
+        // would reset every worker's idle timer and the reap would never fire.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-lifecycle",
+                1,
+                &Event::AcpSessionAssigned {
+                    acp_session_id: "acp-1".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-lifecycle",
+                2,
+                &Event::ModesAvailable {
+                    current_mode_id: "default".into(),
+                    modes: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-real",
+                1,
+                &Event::UserPromptSent {
+                    text: "hello".into(),
+                },
+            )
+            .unwrap();
+
+        let map =
+            store.last_event_at_for_sessions(&["s-lifecycle".to_string(), "s-real".to_string()]);
+        assert!(
+            !map.contains_key("s-lifecycle"),
+            "non-substantive-only session must not register activity: {map:?}"
+        );
+        assert!(
+            map.contains_key("s-real"),
+            "session with a real event must register activity: {map:?}"
+        );
+    }
+
+    /// Insert a substantive event with an explicit `created_at` (ms) so
+    /// tests can pin MAX(created_at) deterministically. `"ThinkingStarted"`
+    /// serializes to a bare JSON string, so it never matches the
+    /// non-substantive `{"Name":%` predicates.
+    fn insert_at(store: &EventStore, session_id: &str, seq: u64, created_at: i64) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO cockpit_events (session_id, seq, event_json, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, seq as i64, "\"ThinkingStarted\"", created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn last_event_at_empty_input_is_empty() {
+        let (_tmp, store) = open_store(1000);
+        insert_at(&store, "s-1", 1, 1000);
+        assert!(store.last_event_at_for_sessions(&[]).is_empty());
+    }
+
+    #[test]
+    fn last_event_at_skips_missing_sessions() {
+        let (_tmp, store) = open_store(1000);
+        insert_at(&store, "s-present", 1, 5000);
+        let map =
+            store.last_event_at_for_sessions(&["s-present".to_string(), "s-missing".to_string()]);
+        assert_eq!(map.get("s-present"), Some(&5000));
+        assert!(!map.contains_key("s-missing"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn last_event_at_returns_max_per_session() {
+        let (_tmp, store) = open_store(1000);
+        insert_at(&store, "s-a", 1, 100);
+        insert_at(&store, "s-a", 2, 900);
+        insert_at(&store, "s-a", 3, 400);
+        insert_at(&store, "s-b", 1, 7000);
+        let map = store.last_event_at_for_sessions(&["s-a".to_string(), "s-b".to_string()]);
+        assert_eq!(map.get("s-a"), Some(&900));
+        assert_eq!(map.get("s-b"), Some(&7000));
     }
 
     #[test]

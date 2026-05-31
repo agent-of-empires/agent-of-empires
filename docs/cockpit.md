@@ -162,6 +162,7 @@ queue_drain_mode = "combined"  # how the composer drains client-side queued prom
 force_end_turn_threshold_secs = 30  # seconds of streaming silence before the spinner offers a "Force end turn" button (#1100)
 silent_orphan_grace_secs = 120  # daemon-side watchdog grace when the adapter stops talking with no in-flight tool; 0 disables (#1240); bumped from 60 in #1360 for async-agent flows; nonzero values below 120 clamp up at runtime
 silent_orphan_fast_grace_secs = 20  # accelerated grace used once a cost-populated UsageUpdate has arrived for the current prompt (#1240); ignored while an async-agent wait is active (#1360)
+auto_stop_idle_secs = 0  # auto-stop cockpit workers idle this many seconds; 0 disables (default); the next prompt respawns the worker (#1689)
 ```
 
 `max_concurrent_resumes` bounds how many cockpit workers the reconciler
@@ -175,6 +176,19 @@ race is safe even at high parallelism (#1088).
 `enabled = false` is a master kill switch; cockpit refuses to spawn
 even if a session has `--cockpit`. `default_for_claude = true` makes
 new Claude sessions cockpit-mode by default on mobile clients.
+
+`auto_stop_idle_secs` reclaims resources from abandoned sessions. When
+set to a positive value, the daemon stops any cockpit worker that has
+seen no events and has no in-flight turn for that many seconds, freeing
+its claude-agent-acp subprocess. The stop is seamless: the session keeps
+its place in the sidebar, the timeline shows a `Stopped` event with
+reason `idle_auto_stop`, and the next prompt you send respawns a fresh
+worker (resuming the agent-side transcript) within a couple of seconds.
+A mid-turn worker is never stopped. The check runs about once a minute,
+so the effective stop can lag the threshold by up to a minute. Default
+`0` disables the feature; no worker is ever stopped for inactivity. This
+covers cockpit workers only; plain TUI/tmux sessions are not affected
+(#1689).
 
 Migration v005 seeds these defaults on upgrade so the section already
 exists if you came from 1.4.x. Migration v006 then flips the v005-seeded
@@ -454,6 +468,17 @@ Practical implications:
   next `aoe serve` reattaches.
 - To actually terminate a worker, run `aoe cockpit stop <session>` or
   `aoe cockpit stop --all`. To force-kill, `aoe cockpit kill <session>`.
+- **No orphaned agents on teardown.** Every termination path (idle
+  auto-stop, `aoe cockpit stop|kill|restart`, snooze/archive, daemon
+  `shutdown_all`, and a fresh spawn that supersedes a stale runner)
+  signals the runner's whole process group, so the agent subprocess and
+  its own children (the node ACP wrapper and the SDK child it execs) die
+  with the runner instead of reparenting to PID 1. Earlier releases
+  signalled only the runner pid, so superseded or torn-down runners
+  leaked `node` / `claude` processes that accumulated across daemon
+  restarts and e2e runs (#1689). A runner that is hard-killed with
+  `SIGKILL` (which cannot run its own cleanup) can still leak; prefer
+  the verbs above over `kill -9`.
 - During the detach window (between `aoe serve --stop` and the next
   `aoe serve`), the runner buffers up to 256 agent → daemon
   notification lines so per-stream chunks emitted while the daemon was

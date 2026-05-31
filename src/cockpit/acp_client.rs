@@ -1173,6 +1173,14 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         if let Some(socket_path) = config.socket_path.clone() {
+            // Supersede guard: a fresh spawn overwrites this session's
+            // registry entry, so any runner already registered for it would
+            // be orphaned (its agent's node/SDK children reparent to PID 1
+            // and leak, accumulating across restarts). Reap the prior
+            // runner's whole process group and clear its stale entry/socket
+            // before binding the replacement. No-op when there is no live
+            // prior runner. See #1689.
+            super::worker_registry::terminate(&session_id.0);
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,

@@ -77,7 +77,11 @@ type RawTargetTuple = (
     bool,
 );
 
-pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
+pub async fn reconcile_cockpit_workers(
+    state: &Arc<AppState>,
+    attempted: &mut HashSet<String>,
+    last_idle_reap: &mut Option<std::time::Instant>,
+) {
     // Honor `cockpit.enabled = false` from config.toml — the persistent
     // master switch. Mirrored as an atomic; `PATCH /api/cockpit/master`
     // flips it live without restarting `aoe serve`.
@@ -103,6 +107,21 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
         attempted.remove(id);
     }
 
+    // Idle auto-stop (#1689). Cadence-gated to IDLE_REAP_INTERVAL so the
+    // batched activity query does not run on every 2s tick. Runs BEFORE
+    // the resume snapshot below: a worker marked dormant here is excluded
+    // from this same tick's respawn pass by the `!i.is_idle_dormant()`
+    // filter. `auto_stop_idle_secs == 0` (default) disables the feature.
+    let auto_stop_idle_secs =
+        crate::session::profile_config::resolve_config_or_warn(&state.profile)
+            .cockpit
+            .auto_stop_idle_secs;
+    if auto_stop_idle_secs > 0 && last_idle_reap.map_or(true, |t| t.elapsed() >= IDLE_REAP_INTERVAL)
+    {
+        reap_idle_workers(state, auto_stop_idle_secs).await;
+        *last_idle_reap = Some(std::time::Instant::now());
+    }
+
     // Snapshot per-target resume inputs under the instances read lock.
     // We then drop the lock so the parallel resume tasks (each ~3s for
     // a fresh spawn) don't pin it.
@@ -118,7 +137,9 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.cockpit_mode && !i.is_archived() && !i.is_snoozed())
+            .filter(|i| {
+                i.cockpit_mode && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+            })
             .map(|i| {
                 (
                     i.id.clone(),
@@ -285,6 +306,161 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
                     "resume task panicked: {e}"
                 );
             }
+        }
+    }
+}
+
+/// How often the idle-reap pass actually runs. The reconciler ticks
+/// every 2s, but the idle threshold is measured in hours, so reaping on
+/// every tick would hammer SQLite for no benefit; this gates the batched
+/// activity query to a coarse cadence. See #1689.
+const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Pure idle-reap decision. A cockpit worker is auto-stopped only when the
+/// feature is enabled (`threshold_secs > 0`), it is not mid-turn, and its
+/// last recorded event is at least `threshold_secs` old. A session with no
+/// events (`last_event_ms == None`) is never reaped, so a freshly-spawned
+/// worker without history survives. Extracted from `reap_idle_workers` so
+/// the policy is unit-testable without a live supervisor or DB. See #1689.
+fn should_auto_stop(
+    now_ms: i64,
+    last_event_ms: Option<i64>,
+    threshold_secs: u32,
+    in_flight: bool,
+) -> bool {
+    if threshold_secs == 0 || in_flight {
+        return false;
+    }
+    match last_event_ms {
+        Some(ms) => now_ms.saturating_sub(ms) >= i64::from(threshold_secs) * 1000,
+        None => false,
+    }
+}
+
+/// Idle auto-stop pass (#1689). Shuts down cockpit workers that have seen
+/// no activity for `idle_secs` and are not mid-turn, marking their
+/// session dormant so the resume pass does not respawn them. The next
+/// user prompt clears dormancy (via `Instance::touch_last_accessed`) and
+/// the following reconciler tick spawns a fresh worker.
+///
+/// Ordering and races: dormancy is persisted BEFORE the worker is shut
+/// down, so a persist failure leaves the worker alive instead of orphaning
+/// a still-running worker the next tick would respawn. `has_in_flight_turn`
+/// is re-checked immediately before shutdown to avoid killing a worker a
+/// prompt started in the gap since the candidate snapshot.
+async fn reap_idle_workers(state: &Arc<AppState>, idle_secs: u32) {
+    // Candidates: cockpit sessions not already sunk/dormant. Snapshot
+    // (id, profile) under the read lock so we don't hold it across awaits.
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.cockpit_mode && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+            })
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Keep only sessions with a live worker; nothing to reap otherwise.
+    let mut live: Vec<(String, String)> = Vec::new();
+    for (id, profile) in candidates {
+        if state.cockpit_supervisor.is_running(&id).await {
+            live.push((id, profile));
+        }
+    }
+    if live.is_empty() {
+        return;
+    }
+    // One batched query for the latest event timestamp per candidate.
+    let ids: Vec<String> = live.iter().map(|(id, _)| id.clone()).collect();
+    let store = Arc::clone(&state.cockpit_event_store);
+    let latest = match tokio::task::spawn_blocking(move || store.last_event_at_for_sessions(&ids))
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(target: "cockpit.supervisor", error = %e, "idle-reap activity query failed");
+            return;
+        }
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for (id, profile) in live {
+        // Cheap pre-check (no in-flight probe yet): skips sessions with no
+        // history or still within the idle window. Sessions with no events
+        // are never reaped, so a freshly-spawned worker is safe.
+        let last_ms = latest.get(&id).copied();
+        if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
+            continue;
+        }
+        // Re-check mid-turn right before stopping: a turn may have started
+        // since the snapshot. spawn_blocking matches the SQLite-on-tokio
+        // pattern used by the resume pass above.
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_probe = id.clone();
+        let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe))
+            .await
+            .unwrap_or(false);
+        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight) {
+            continue;
+        }
+        // Mark dormant in-memory so this tick's resume snapshot skips it.
+        {
+            let mut instances = state.instances.write().await;
+            match instances.iter_mut().find(|i| i.id == id) {
+                Some(inst) => inst.mark_idle_dormant(),
+                None => continue,
+            }
+        }
+        // Persist BEFORE shutdown: a daemon restart must keep the worker
+        // stopped, and if persistence fails we must not orphan a killed
+        // worker that the next tick would respawn.
+        let persisted = if let Ok(storage) = crate::session::Storage::new(&profile) {
+            let id_persist = id.clone();
+            tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                        inst.mark_idle_dormant();
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        if !persisted {
+            // Roll back the in-memory mark and leave the worker alive; retry
+            // on the next interval.
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.idle_dormant_since = None;
+            }
+            tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "idle-reap persist failed; leaving worker alive"
+            );
+            continue;
+        }
+        match state.cockpit_supervisor.shutdown_idle(&id).await {
+            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {
+                tracing::info!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    idle_secs,
+                    "auto-stopped idle cockpit worker"
+                );
+            }
+            Err(e) => tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "idle-reap shutdown failed: {e}"
+            ),
         }
     }
 }
@@ -497,5 +673,50 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM);
         }
         crate::cockpit::worker_registry::delete(&record.session_id).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_stop;
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn disabled_threshold_never_stops() {
+        // threshold 0 = feature off; even a worker idle for a day survives.
+        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), 0, false));
+    }
+
+    #[test]
+    fn in_flight_worker_is_never_stopped() {
+        // Idle far past the threshold, but mid-turn: do not kill.
+        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), 3600, true));
+    }
+
+    #[test]
+    fn idle_past_threshold_stops() {
+        // Last event 2h ago, threshold 1h, not mid-turn: reap.
+        assert!(should_auto_stop(HOUR_MS * 2, Some(0), 3600, false));
+    }
+
+    #[test]
+    fn idle_within_threshold_survives() {
+        // Last event 30min ago, threshold 1h: too soon.
+        let now = HOUR_MS;
+        let last = HOUR_MS / 2;
+        assert!(!should_auto_stop(now, Some(last), 3600, false));
+    }
+
+    #[test]
+    fn no_events_never_stops() {
+        // A worker with no recorded events (fresh spawn) is never reaped.
+        assert!(!should_auto_stop(HOUR_MS * 24, None, 3600, false));
+    }
+
+    #[test]
+    fn exactly_at_threshold_stops() {
+        // Boundary: elapsed == threshold reaps (>= comparison).
+        assert!(should_auto_stop(3600 * 1000, Some(0), 3600, false));
     }
 }

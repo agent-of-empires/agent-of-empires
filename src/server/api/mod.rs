@@ -79,6 +79,13 @@ pub(super) const ALLOWED_GLOBAL_SETTINGS_SECTIONS: &[&str] = &[
     // No shell commands, no binary paths. Values are validated against the
     // EnvFilter parser before being written back to disk.
     "logging",
+    // cockpit: bools, numeric tuning knobs, and a queue-drain enum. The one
+    // binary-path field (`node_path`) is stripped via COCKPIT_BLOCKED_FIELDS
+    // below, mirroring the session allowlist+blocklist pattern, so the web
+    // surface carries no shell command or binary override. Without this the
+    // dashboard cockpit settings (durations, queue mode, resume/grace/idle
+    // knobs) silently failed to save. See #1689.
+    "cockpit",
 ];
 
 /// Sections that PATCH /api/settings/profile/:name may write.
@@ -97,8 +104,16 @@ pub(super) const ALLOWED_PROFILE_SETTINGS_SECTIONS: &[&str] = &[
     "worktree",
     "web",
     "logging",
+    "cockpit",
     "description",
 ];
+
+/// Cockpit fields stripped from any web settings PATCH before it is
+/// written, mirroring `SESSION_BLOCKED_FIELDS`. `node_path` overrides the
+/// Node.js binary the cockpit runner launches, an arbitrary-binary / RCE
+/// surface that must stay local-only; the rest of the cockpit section
+/// (bools, numbers, queue-drain enum) is safe to set from the dashboard.
+pub(super) const COCKPIT_BLOCKED_FIELDS: &[&str] = &["node_path"];
 
 pub(super) const SESSION_BLOCKED_FIELDS: &[&str] = &[
     "agent_command_override",
@@ -553,6 +568,10 @@ mod tests {
             // logging: persistent tracing filter. EnvFilter parser
             // validates every value before save_config writes it back.
             "logging",
+            // cockpit: audited for #1689. Safe knobs (bools, numbers, enum);
+            // the binary-path field node_path is stripped via
+            // COCKPIT_BLOCKED_FIELDS before write.
+            "cockpit",
         ];
         assert_eq!(
             ALLOWED_GLOBAL_SETTINGS_SECTIONS.len(),
@@ -599,6 +618,9 @@ mod tests {
             "worktree",
             "web",
             "logging",
+            // cockpit: see global allowlist note; node_path stripped via
+            // COCKPIT_BLOCKED_FIELDS. #1689.
+            "cockpit",
             // description: optional string surfaced in the wizard profile
             // picker (#949). Plain text, no shell metacharacters.
             "description",
@@ -778,6 +800,29 @@ mod tests {
             assert!(
                 SESSION_BLOCKED_FIELDS.contains(field),
                 "SESSION_BLOCKED_FIELDS lost field {:?}",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn cockpit_blocked_fields_are_pinned() {
+        // node_path overrides the Node.js binary the cockpit runner launches,
+        // an arbitrary-binary / RCE surface that must stay local-only even
+        // though the rest of the cockpit section is API-writable. Renaming
+        // the Rust field must update this list in the same commit.
+        let expected: &[&str] = &["node_path"];
+        assert_eq!(
+            COCKPIT_BLOCKED_FIELDS.len(),
+            expected.len(),
+            "COCKPIT_BLOCKED_FIELDS size changed — this strips the binary-path \
+             override from incoming web cockpit settings and must be reviewed \
+             as a security change."
+        );
+        for field in expected {
+            assert!(
+                COCKPIT_BLOCKED_FIELDS.contains(field),
+                "COCKPIT_BLOCKED_FIELDS lost field {:?}",
                 field
             );
         }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use super::{
     body_requires_elevation, validate_profile_name, ALLOWED_GLOBAL_SETTINGS_SECTIONS,
-    ALLOWED_PROFILE_SETTINGS_SECTIONS, SESSION_BLOCKED_FIELDS,
+    ALLOWED_PROFILE_SETTINGS_SECTIONS, COCKPIT_BLOCKED_FIELDS, SESSION_BLOCKED_FIELDS,
 };
 use crate::server::auth::AuthenticatedSession;
 
@@ -160,6 +160,14 @@ pub async fn update_settings(
                     if let Some(session_obj) = value.as_object_mut() {
                         for blocked in SESSION_BLOCKED_FIELDS {
                             session_obj.remove(*blocked);
+                        }
+                    }
+                }
+                // Strip blocked fields from cockpit section (node_path).
+                if key == "cockpit" {
+                    if let Some(cockpit_obj) = value.as_object_mut() {
+                        for blocked in COCKPIT_BLOCKED_FIELDS {
+                            cockpit_obj.remove(*blocked);
                         }
                     }
                 }
@@ -1043,6 +1051,13 @@ pub async fn update_profile_settings(
                     if let Some(session_obj) = value.as_object_mut() {
                         for blocked in SESSION_BLOCKED_FIELDS {
                             session_obj.remove(*blocked);
+                        }
+                    }
+                }
+                if key == "cockpit" {
+                    if let Some(cockpit_obj) = value.as_object_mut() {
+                        for blocked in COCKPIT_BLOCKED_FIELDS {
+                            cockpit_obj.remove(*blocked);
                         }
                     }
                 }

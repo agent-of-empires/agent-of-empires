@@ -512,12 +512,13 @@ fn kill_now(session: &str) -> Result<()> {
     // on `stop`: the running daemon's drain task uses the registry-gone
     // signal to skip respawn on user-initiated termination.
     worker_registry::delete(session).ok();
-    #[cfg(unix)]
-    if worker_registry::is_pid_alive(record.pid) {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGKILL);
-    }
+    // Group-SIGKILL so the agent's node/SDK grandchildren die with the
+    // runner instead of orphaning under PID 1 (#1689). Unconditional: the
+    // process group can outlive its leader pid, so gating on leader
+    // liveness would skip the killpg and leak surviving descendants.
+    // killpg ignores ESRCH, so signaling an already-empty group is a
+    // harmless no-op.
+    worker_registry::kill_runner_group(record.pid);
     println!(
         "Killed cockpit worker for {} (PID {}).",
         session, record.pid
@@ -530,26 +531,19 @@ async fn signal_and_wait(
     timeout_secs: u64,
 ) {
     use crate::cockpit::worker_registry;
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let pid = Pid::from_raw(record.pid as i32);
+    // Group signals so the whole agent tree (runner + node + SDK child)
+    // goes down together, not just the runner pid. Sent unconditionally:
+    // the group can outlive its leader pid, so gating on leader liveness
+    // would skip the SIGTERM and leak surviving descendants. See #1689.
+    worker_registry::terminate_runner_group(record.pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
         if !worker_registry::is_pid_alive(record.pid) {
             return;
         }
-        let _ = kill(pid, Signal::SIGTERM);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        while std::time::Instant::now() < deadline {
-            if !worker_registry::is_pid_alive(record.pid) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = kill(pid, Signal::SIGKILL);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    #[cfg(not(unix))]
-    let _ = (record, timeout_secs);
+    worker_registry::kill_runner_group(record.pid);
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -624,12 +618,11 @@ fn restart(session: &str) -> Result<()> {
     // Reconnect" affordance.
     worker_registry::mark_restart_pending(session);
     worker_registry::delete(session).ok();
-    #[cfg(unix)]
-    if worker_registry::is_pid_alive(record.pid) {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM);
-    }
+    // Group-SIGTERM so the agent's node/SDK grandchildren die with the
+    // runner rather than orphaning under PID 1 before respawn (#1689).
+    // Unconditional: the group can outlive its leader pid, so gating on
+    // leader liveness would skip the killpg and leak descendants.
+    worker_registry::terminate_runner_group(record.pid);
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid

@@ -1062,6 +1062,11 @@ impl SettingsView {
                     c.silent_orphan_fast_grace_secs = None;
                 }
             }
+            FieldKey::CockpitAutoStopIdleSecs => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.auto_stop_idle_secs = None;
+                }
+            }
             // Logging is global-only for v1 (no profile overrides); the
             // "clear override" gesture is a no-op for these keys.
             // SessionIdPollerMaxThreads and ConfirmBeforeQuit are also
