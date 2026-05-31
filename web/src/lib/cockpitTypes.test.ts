@@ -819,6 +819,51 @@ describe("applyEvent / Stopped restart_pending", () => {
   });
 });
 
+describe("applyEvent / Stopped idle_auto_stop (#1689)", () => {
+  it("sets workerIdleStopped (not workerStopped) on reason=idle_auto_stop", () => {
+    const state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    // Crucially NOT a user stop: no reconnect banner, composer stays open.
+    expect(state.workerStopped).toBe(false);
+    expect(state.workerRestarting).toBe(false);
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("clears workerIdleStopped on the next UserPromptSent (the prompt woke it)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "wake up" } },
+    });
+    expect(state.workerIdleStopped).toBe(false);
+  });
+
+  it("clears workerIdleStopped on AcpSessionAssigned (respawn handshake landed)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AcpSessionAssigned: { acp_session_id: "fresh-id" } },
+    });
+    expect(state.workerIdleStopped).toBe(false);
+  });
+});
+
 describe("applyEvent / WakeupScheduled lifecycle", () => {
   it("user-typed prompt mid-wait keeps the pending wakeup", () => {
     // Regression for #1091: a user-typed follow-up during the wait
