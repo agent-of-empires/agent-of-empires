@@ -1342,4 +1342,26 @@ mod tests {
         assert_eq!(u.used, 5_000);
         assert_eq!(u.cost.as_ref().unwrap().currency, "USD");
     }
+
+    #[test]
+    fn rate_limit_auto_resumed_clears_rate_limit_snapshot() {
+        let mut s = fresh_state();
+        s.apply_event(Event::RateLimit {
+            info: RateLimitInfo {
+                status: "usage limit reached".into(),
+                resets_at: Utc::now(),
+                kind: "rate_limit".into(),
+            },
+        })
+        .unwrap();
+        assert!(s.rate_limit.is_some(), "RateLimit seeds the park snapshot");
+        s.apply_event(Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            s.rate_limit.is_none(),
+            "RateLimitAutoResumed must clear the rate-limit snapshot"
+        );
+    }
 }

@@ -3820,6 +3820,32 @@ mod tests {
         assert_eq!(drained_seq, 2, "drain seq must follow startup-error seq");
     }
 
+    /// `publish_rate_limit_auto_resumed` must emit a `RateLimitAutoResumed`
+    /// carrying the exact `resets_at` and allocate monotonic per-session
+    /// seqs, so the reconciler breadcrumb supersedes `Stopped{rate_limited}`
+    /// in the replay/store ordering. See #1722.
+    #[tokio::test]
+    async fn publish_rate_limit_auto_resumed_emits_event_with_monotonic_seq() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let resets_at = chrono::Utc::now();
+
+        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2, "seq must be monotonic per session");
+
+        let frames = sink.frames.lock().unwrap();
+        let first = frames
+            .iter()
+            .find(|(sid, seq, _)| sid == "s-rl" && *seq == 1)
+            .expect("first breadcrumb frame published");
+        assert!(matches!(
+            &first.2,
+            Event::RateLimitAutoResumed { resets_at: ts } if *ts == resets_at
+        ));
+    }
+
     /// `with_capacity` enforces the configured cap. Past the cap,
     /// new spawns return `CapacityFull` instead of starting another
     /// worker. The error must include `current` and `limit` so the
