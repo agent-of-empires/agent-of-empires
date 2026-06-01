@@ -471,6 +471,17 @@ pub struct HomeView {
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
     pub(super) live_send_last_resize: Option<(u16, u16)>,
+    /// True between a live-send leader press and the next key. While armed,
+    /// the next key is interpreted as a live-send command (palette, sidebar
+    /// toggle, exit) rather than forwarded to the agent, and the status bar
+    /// shows the which-key menu. Always false outside live mode; cleared on
+    /// live-send exit. See `handle_live_send_key`.
+    pub(super) live_send_pending_leader: bool,
+    /// When true, the session list (sidebar) is hidden so the preview pane
+    /// gets the full terminal width. Toggled from live mode via the leader
+    /// (`leader b`) for a distraction-free agent view; reset on live-send
+    /// exit so the list always reappears in the normal home view.
+    pub(super) sidebar_collapsed: bool,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
     /// to the selected agent's pane, so the 250ms preview poll doesn't
     /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
@@ -860,6 +871,8 @@ impl HomeView {
             live_send_worker: None,
             live_capture_worker: None,
             live_send_last_resize: None,
+            live_send_pending_leader: false,
+            sidebar_collapsed: false,
             preview_pane_synced: None,
             pending_paste: None,
             pending_attach_after_warning: None,
@@ -2353,6 +2366,16 @@ impl HomeView {
         self.save_list_width();
     }
 
+    /// Hide or reveal the session list so the preview pane can use the
+    /// full terminal width. Only meaningful while live mode is active
+    /// (the render path ignores the flag otherwise and `exit_live_send_*`
+    /// resets it), so this is deliberately ephemeral rather than persisted
+    /// to config. The next render reflows the preview, and the live-send
+    /// resize loop pushes the new geometry to the agent's pane.
+    pub fn toggle_sidebar_collapsed(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+    }
+
     fn save_list_width(&self) {
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
             config.app_state.home_list_width = Some(self.list_width);
@@ -2943,16 +2966,35 @@ impl HomeView {
         // during live mode aren't possible (settings_view participates
         // in has_dialog and lives in its own takeover), so a snapshot
         // at entry time is sufficient.
-        let exit_chord_spec = resolve_config_or_warn(&self.config_profile())
-            .session
-            .live_send_exit_chord;
+        let resolved_config = resolve_config_or_warn(&self.config_profile());
+        let exit_chord_spec = resolved_config.session.live_send_exit_chord;
         let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
+        // The leader is a single chord, not a list. An empty configured
+        // value disables it (so every key, including the default `C-b`,
+        // passes straight through). A non-empty but unparseable value is
+        // treated as a typo and falls back to the default leader rather
+        // than silently dropping the feature, mirroring how the exit
+        // chord recovers from a bad spec.
+        let leader_spec = resolved_config.session.live_send_leader;
+        let leader = if leader_spec.trim().is_empty() {
+            None
+        } else {
+            live_send::parse_chord(&leader_spec).or_else(|| {
+                tracing::warn!(
+                    "live-send: unparseable leader chord '{}'; falling back to default '{}'",
+                    leader_spec,
+                    live_send::DEFAULT_LEADER
+                );
+                live_send::parse_chord(live_send::DEFAULT_LEADER)
+            })
+        };
         self.live_send = Some(live_send::LiveSendState {
             session_id: inst.id.clone(),
             title: inst.title.clone(),
             tmux_name: tmux_name.clone(),
             target,
             exit_chords,
+            leader,
         });
         // Spawn the background worker that dispatches translated
         // keystrokes as one-shot `tmux send-keys` subprocesses (the
@@ -2972,6 +3014,10 @@ impl HomeView {
                 None
             }
         };
+        // Start every live-mode entry (including a switch from another
+        // session) with a disarmed leader menu, so a half-entered chord
+        // can't carry over from a prior target.
+        self.live_send_pending_leader = false;
         // Clear the resize dedup so `finalize_live_send_resize` always
         // issues its sync resize, even if the cached geometry from a
         // prior session happens to match the current preview_pane_area.

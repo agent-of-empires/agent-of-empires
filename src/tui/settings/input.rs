@@ -777,6 +777,11 @@ impl SettingsView {
                     s.live_send_exit_chord = None;
                 }
             }
+            FieldKey::LiveSendLeader => {
+                if let Some(ref mut s) = config.session {
+                    s.live_send_leader = None;
+                }
+            }
             FieldKey::NewSessionAttachMode => {
                 if let Some(ref mut s) = config.session {
                     s.new_session_attach_mode = None;

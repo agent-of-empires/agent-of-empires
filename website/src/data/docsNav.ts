@@ -24,6 +24,7 @@ export const docsNav: NavSection[] = [
       { title: "Docker Sandbox", href: "/guides/sandbox/" },
       { title: "Podman", href: "/guides/podman/" },
       { title: "Apple Containers", href: "/guides/apple-containers/" },
+      { title: "Live Mode", href: "/guides/live-mode/" },
       { title: "Web Dashboard", href: "/guides/web-dashboard/" },
       { title: "Cockpit (Native Agent Rendering)", href: "/docs/cockpit/" },
       { title: "Cockpit Multi-Agent Support", href: "/docs/cockpit/multi-agent/" },

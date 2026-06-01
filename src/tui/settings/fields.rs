@@ -110,6 +110,7 @@ pub enum FieldKey {
     HostEnvironment,
     SessionIdPollerMaxThreads,
     LiveSendExitChord,
+    LiveSendLeader,
     NewSessionAttachMode,
     DefaultAttachMode,
     ClickAction,
@@ -1991,6 +1992,12 @@ fn build_interaction_fields(
         session.and_then(|s| s.live_send_exit_chord.clone()),
     );
 
+    let (live_send_leader, live_send_leader_override) = resolve_value(
+        scope,
+        global.session.live_send_leader.clone(),
+        session.and_then(|s| s.live_send_leader.clone()),
+    );
+
     let (new_session_attach_mode, new_session_attach_mode_override) = resolve_value(
         scope,
         global.session.new_session_attach_mode,
@@ -2110,6 +2117,23 @@ fn build_interaction_fields(
             inherited_display: inherited_if(
                 live_send_exit_chord_override,
                 FieldValue::Text(global.session.live_send_exit_chord.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::LiveSendLeader,
+            label: "Live-Send Leader",
+            description: "Tmux-style leader (prefix) chord for live-send commands. \
+                 Default `C-b` matches tmux. In live mode the leader arms a \
+                 menu: leader then `k` opens the command palette, `b` toggles \
+                 the sidebar, `q` exits. Press the leader twice to send it \
+                 through to the agent. Leave empty to disable the leader. The \
+                 exit chord above stays a separate single-press exit.",
+            value: FieldValue::Text(live_send_leader),
+            category: SettingsCategory::Interaction,
+            has_override: live_send_leader_override,
+            inherited_display: inherited_if(
+                live_send_leader_override,
+                FieldValue::Text(global.session.live_send_leader.clone()),
             ),
         },
         SettingField {
@@ -2612,6 +2636,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
             config.session.live_send_exit_chord = v.clone();
+        }
+        (FieldKey::LiveSendLeader, FieldValue::Text(v)) => {
+            config.session.live_send_leader = v.clone();
         }
         (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
             config.session.new_session_attach_mode = index_to_new_session_attach_mode(*selected);
@@ -3117,6 +3144,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.session, |s, val| {
                 s.live_send_exit_chord = val
+            });
+        }
+        (FieldKey::LiveSendLeader, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.session, |s, val| {
+                s.live_send_leader = val
             });
         }
         (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
@@ -3831,6 +3863,7 @@ mod tests {
             FieldKey::NewSessionAttachMode,
             FieldKey::ClickAction,
             FieldKey::LiveSendExitChord,
+            FieldKey::LiveSendLeader,
             FieldKey::MouseCapture,
         ] {
             assert!(

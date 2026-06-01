@@ -624,6 +624,20 @@ pub struct SessionConfig {
     #[serde(default = "default_live_send_exit_chord")]
     pub live_send_exit_chord: String,
 
+    /// Leader (prefix) chord for live-send mode commands, tmux-style
+    /// (`C-b`, `C-a`, `M-Space`, `F1`, …). In live mode the leader arms
+    /// a one-shot menu: leader then `k` opens the command palette, `b`
+    /// toggles the sidebar, `q` exits. Pressing the leader twice sends a
+    /// literal leader keystroke to the agent (matches tmux `send-prefix`).
+    /// Default `C-b` lines up with tmux and herdr; the only chord it
+    /// steals from the agent is the leader itself, and double-tap still
+    /// delivers it. Set empty to disable the leader entirely (every key,
+    /// including `C-b`, then passes straight through). The dedicated exit
+    /// chord (`live_send_exit_chord`, default `C-q`) is independent of the
+    /// leader and stays a single-press fast exit.
+    #[serde(default = "default_live_send_leader")]
+    pub live_send_leader: String,
+
     /// What the TUI does immediately after a new session finishes
     /// creating. `Tmux` (default) drops into the tmux attach view, the
     /// historical behavior. `LiveSend` enters live-send mode against
@@ -737,6 +751,7 @@ impl Default for SessionConfig {
             row_tag: RowTagMode::default(),
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
+            live_send_leader: default_live_send_leader(),
             new_session_attach_mode: NewSessionAttachMode::default(),
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
@@ -757,6 +772,13 @@ fn default_live_send_exit_chord() -> String {
     // Ctrl+q: mobile-friendly, passes Termius, well-known quit chord.
     // Kept in sync with live_send::DEFAULT_EXIT_CHORD.
     "C-q".to_string()
+}
+
+fn default_live_send_leader() -> String {
+    // Ctrl+b: the tmux (and herdr) leader. Familiar to multiplexer users
+    // and steals only one chord from the agent. Kept in sync with
+    // live_send::DEFAULT_LEADER.
+    "C-b".to_string()
 }
 
 /// Upper bound on snooze duration: 30 days (43,200 minutes). Originally

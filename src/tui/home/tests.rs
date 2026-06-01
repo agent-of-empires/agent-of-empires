@@ -191,6 +191,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         tmux_name: "aoe_test_live".to_string(),
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
+        leader: None,
     };
 
     // Hidden via the toggle: gone outside live...
@@ -6062,6 +6063,7 @@ mod scroll_pane_isolation {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
 
         let up_handled = env.view.handle_scroll_up(50, 10);
@@ -6093,11 +6095,226 @@ mod scroll_pane_isolation {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
 
         let handled = env.view.handle_scroll_down(5, 10);
         assert!(!handled, "list scroll must be a no-op in live mode");
         assert_eq!(env.view.cursor, 1, "selection must not change in live mode");
+    }
+
+    /// Build a live-send env with the default Ctrl+B leader armed and the
+    /// cursor on a real session, so leader-menu keys route through
+    /// `handle_live_send_key`.
+    fn live_env_with_leader() -> TestEnv {
+        use crate::tui::home::live_send::LiveSendState;
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let id = match env.view.flat_items.get(1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            _ => panic!("fixture should have a session at flat_items[1]"),
+        };
+        env.view.live_send = Some(LiveSendState {
+            session_id: id,
+            title: "session".to_string(),
+            tmux_name: "fake".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: crate::tui::home::live_send::parse_chord(
+                crate::tui::home::live_send::DEFAULT_LEADER,
+            ),
+        });
+        env
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Pressing the leader arms the menu (swallowed, not forwarded);
+    /// the follow-up `b` toggles the sidebar and disarms.
+    #[test]
+    #[serial]
+    fn live_leader_b_toggles_sidebar() {
+        let mut env = live_env_with_leader();
+        assert!(!env.view.sidebar_collapsed);
+
+        env.view.handle_key(ctrl('b'), None);
+        assert!(
+            env.view.live_send_pending_leader,
+            "leader press should arm the menu"
+        );
+        assert!(
+            !env.view.sidebar_collapsed,
+            "leader alone must not toggle anything yet"
+        );
+
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        assert!(!env.view.live_send_pending_leader, "menu should disarm");
+        assert!(env.view.sidebar_collapsed, "leader+b hides the sidebar");
+
+        // And again to reveal it.
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        assert!(!env.view.sidebar_collapsed, "leader+b again shows it");
+    }
+
+    /// Leader + k opens the command palette over live mode.
+    #[test]
+    #[serial]
+    fn live_leader_k_opens_palette() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert!(!env.view.live_send_pending_leader);
+        assert!(
+            env.view.command_palette.is_some(),
+            "leader+k should open the command palette"
+        );
+        // Live mode is still active underneath the palette overlay.
+        assert!(env.view.live_send.is_some());
+    }
+
+    /// Leader + q exits live mode and resets the live-only UI state.
+    #[test]
+    #[serial]
+    fn live_leader_q_exits() {
+        let mut env = live_env_with_leader();
+        env.view.sidebar_collapsed = true;
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('q')), None);
+        assert!(env.view.live_send.is_none(), "leader+q exits live mode");
+        assert!(
+            !env.view.sidebar_collapsed,
+            "exiting must re-reveal the sidebar"
+        );
+        assert!(!env.view.live_send_pending_leader);
+    }
+
+    /// An unbound key after the leader cancels the menu without exiting,
+    /// toggling, or opening anything (it does not fall through to the
+    /// agent either: the leader already swallowed it).
+    #[test]
+    #[serial]
+    fn live_leader_unknown_key_cancels_menu() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('z')), None);
+        assert!(!env.view.live_send_pending_leader, "menu disarms");
+        assert!(env.view.live_send.is_some(), "still live");
+        assert!(!env.view.sidebar_collapsed);
+        assert!(env.view.command_palette.is_none());
+    }
+
+    /// The fast exit chord (Ctrl+Q) stays a single press, independent of
+    /// the leader: it must not require arming the menu first.
+    #[test]
+    #[serial]
+    fn live_ctrl_q_still_one_press_exit() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('q'), None);
+        assert!(
+            env.view.live_send.is_none(),
+            "Ctrl+Q exits in a single press"
+        );
+        assert!(!env.view.live_send_pending_leader);
+    }
+
+    /// A modified key after the leader (e.g. Ctrl+K) cancels the menu
+    /// rather than firing a command: only the leader-again passthrough
+    /// claims a modified form, so the user can't accidentally trigger the
+    /// palette by holding Ctrl out of muscle memory.
+    #[test]
+    #[serial]
+    fn live_leader_then_modified_key_cancels() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(ctrl('k'), None);
+        assert!(!env.view.live_send_pending_leader, "menu disarms");
+        assert!(
+            env.view.command_palette.is_none(),
+            "leader + Ctrl+K must NOT open the palette"
+        );
+        assert!(env.view.live_send.is_some(), "still live");
+    }
+
+    /// Committing a palette command while live (here a jump) exits live
+    /// mode first, so the preview can never show one session while
+    /// keystrokes target another. Cancelling the palette is covered
+    /// separately and must stay live.
+    #[test]
+    #[serial]
+    fn palette_command_while_live_exits_live() {
+        let mut env = live_env_with_leader();
+        // Open the palette from within live mode via the leader.
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert!(env.view.command_palette.is_some());
+        assert!(env.view.live_send.is_some(), "palette opens over live mode");
+
+        // Filter to a jump entry and commit it.
+        for ch in "jump".chars() {
+            env.view.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert!(
+            env.view.live_send.is_none(),
+            "committing a palette command must drop out of live mode"
+        );
+        assert!(env.view.command_palette.is_none());
+        assert!(!env.view.sidebar_collapsed, "live-only state is reset");
+    }
+
+    /// Collapsing the sidebar in live mode hands the preview the full
+    /// width: the preview sub-rect grows past the normal side-by-side
+    /// width, and rendering the which-key banner doesn't panic.
+    #[test]
+    #[serial]
+    fn collapsed_sidebar_gives_preview_full_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut env = live_env_with_leader();
+        let theme = crate::tui::styles::load_theme("empire");
+
+        let render = |env: &mut TestEnv| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    env.view.render(f, area, &theme, None, None);
+                })
+                .unwrap();
+            env.view.preview_pane_area.width
+        };
+
+        let split_width = render(&mut env);
+        env.view.sidebar_collapsed = true;
+        let full_width = render(&mut env);
+        assert!(
+            full_width > split_width,
+            "collapsed sidebar should widen the preview ({full_width} vs {split_width})"
+        );
+        // The list isn't drawn while collapsed, so its hit-test rects must
+        // be cleared or a click in the preview area could resolve to a
+        // hidden list row.
+        assert!(
+            env.view.list_inner_area.width == 0 && env.view.list_inner_area.height == 0,
+            "collapsed sidebar must clear the list hit-test rect"
+        );
+        assert!(
+            env.view.handle_click(2, 2).is_none(),
+            "a click in collapsed live mode must not resolve to a list row"
+        );
+
+        // The which-key banner renders without panicking while armed.
+        env.view.live_send_pending_leader = true;
+        let _ = render(&mut env);
     }
 }
 
@@ -6525,6 +6742,7 @@ mod click_to_select {
             tmux_name: format!("aoe_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         // Click session B's row.
@@ -6560,6 +6778,7 @@ mod click_to_select {
             tmux_name: format!("aoe_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         let action = env.view.handle_click(5, 3);
@@ -6939,6 +7158,7 @@ mod preview_drag_select {
             tmux_name: "aoe_test_drag_select".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
     }
 
@@ -7302,6 +7522,7 @@ mod preview_drag_select {
             tmux_name: "aoe_test_full_pipeline".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         // Find a row in the preview area that actually has text in
@@ -7427,6 +7648,7 @@ mod live_send_mode {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
         id
     }
@@ -7443,6 +7665,7 @@ mod live_send_mode {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
     }
 
@@ -9143,6 +9366,7 @@ mod right_click_context_menu {
             tmux_name: "aoe_test_empty_click_exit_live".to_string(),
             target: live_send::LiveSendTarget::Agent,
             exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
+            leader: None,
         });
         assert!(env.view.live_send.is_some());
         assert!(env.view.handle_empty_list_click(5, 5));
