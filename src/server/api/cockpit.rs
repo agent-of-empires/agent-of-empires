@@ -759,7 +759,15 @@ pub async fn cockpit_prompt(
     // to a 404. The detached task survives this request being cancelled on
     // client disconnect. See #1748.
     if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
         match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                // The session was deleted (or triaged) between the wake and
+                // the resume snapshot. Do not publish into a session that no
+                // longer exists; a 404 is the honest answer, not a retryable
+                // worker_not_ready. See #1748.
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
             Ok(_) => {}
             Err(SupervisorError::CapacityFull { current, limit }) => {
                 return (
@@ -833,11 +841,21 @@ pub async fn cockpit_prompt_diff_comments(
         Err(rej) => return rej.into_response(),
     };
     let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
     // Idle-dormant wake: respawn synchronously-reserved + detached so the
     // send_prompt below waits for the worker instead of 404ing. Mirrors
     // cockpit_prompt. See #1748.
     if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
         match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
             Ok(_) => {}
             Err(SupervisorError::CapacityFull { current, limit }) => {
                 return (
