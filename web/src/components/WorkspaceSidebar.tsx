@@ -71,6 +71,7 @@ import {
   setSessionPin,
   setSessionSnooze,
   setWorktreeName,
+  updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
@@ -798,6 +799,10 @@ export const SessionRow = memo(function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
+  const sessionGroup = firstSession?.group_path ?? "";
+  const [editingGroup, setEditingGroup] = useState(false);
+  const [groupValue, setGroupValue] = useState(sessionGroup);
+  const groupRef = useRef<HTMLInputElement>(null);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
   const touchOpenedAt = useRef(0);
@@ -812,6 +817,10 @@ export const SessionRow = memo(function SessionRow({
   useEffect(() => {
     if (renaming) renameRef.current?.select();
   }, [renaming]);
+
+  useEffect(() => {
+    if (editingGroup) groupRef.current?.select();
+  }, [editingGroup]);
 
   useClampedMenuPosition(contextMenu, menuRef, setContextMenu);
 
@@ -909,6 +918,25 @@ export const SessionRow = memo(function SessionRow({
     setWorkdirModalOpen(true);
   };
 
+  const startGroupEdit = () => {
+    if (editingGroup) return;
+    setContextMenu(null);
+    setGroupValue(sessionGroup);
+    setEditingGroup(true);
+  };
+
+  const commitGroupEdit = async () => {
+    setEditingGroup(false);
+    if (!sessionId) return;
+    // Trim so a field cleared to blank (or whitespace) ungroups. A
+    // non-empty path is sent as-is, matching the wizard group field and
+    // the server, which apply no slash normalization. No-op when the
+    // value is unchanged.
+    const next = groupValue.trim();
+    if (next === sessionGroup) return;
+    await updateSessionGroup(sessionId, next);
+  };
+
   const handleDelete = () => {
     setContextMenu(null);
     onDelete?.(workspace.id);
@@ -928,6 +956,27 @@ export const SessionRow = memo(function SessionRow({
             if (e.key === "Escape") setRenaming(false);
           }}
           data-testid="sidebar-rename-input"
+          className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+        />
+      </div>
+    );
+  }
+
+  if (editingGroup) {
+    return (
+      <div className={`py-1 ${indented ? "pl-6 pr-3" : "px-3"}`}>
+        <input
+          ref={groupRef}
+          type="text"
+          value={groupValue}
+          onChange={(e) => setGroupValue(e.target.value)}
+          onBlur={commitGroupEdit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitGroupEdit();
+            if (e.key === "Escape") setEditingGroup(false);
+          }}
+          placeholder="Group (blank to ungroup)"
+          data-testid="sidebar-group-input"
           className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
         />
       </div>
@@ -1144,6 +1193,15 @@ export const SessionRow = memo(function SessionRow({
               className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
             >
               Edit workdir name
+            </button>
+          )}
+          {!readOnly && (
+            <button
+              onClick={startGroupEdit}
+              data-testid="sidebar-context-menu-edit-group"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Edit group
             </button>
           )}
           {!readOnly && cockpitSession && (
