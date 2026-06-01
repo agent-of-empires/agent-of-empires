@@ -28,6 +28,7 @@ use self::input::{Focus, Intent};
 use self::state::{CockpitViewState, ToastBanner, ToastKind};
 use crate::cockpit::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, ManagerError, WsError, WsMessage,
+    REPLAY_PAGE_SIZE,
 };
 use crate::cockpit::protocol::ApprovalDecisionWire;
 use crate::tui::styles::Theme;
@@ -155,7 +156,7 @@ pub async fn run_for_endpoint(
     // Hydrate the transcript via /replay before opening the WebSocket
     // so the user sees the historical conversation immediately instead
     // of a blank pane until live frames start arriving.
-    let initial = http.replay(session_id, 0).await;
+    let initial = http.replay_paged(session_id, 0, REPLAY_PAGE_SIZE).await;
     let ws_result = ws_connect(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
@@ -265,7 +266,11 @@ pub async fn run_for_endpoint(
                         // Daemon evicted events we hadn't seen yet. Drop
                         // local reducer state and rehydrate from /replay.
                         state.transcript.reset();
-                        match state.http.replay(&state.session_id, 0).await {
+                        match state
+                            .http
+                            .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
+                            .await
+                        {
                             Ok(replay) => {
                                 if replay.lost {
                                     state.transcript.set_lagged();
