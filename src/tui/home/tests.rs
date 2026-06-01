@@ -6176,22 +6176,15 @@ mod click_to_select {
         // SelectOnly via SessionConfigOverride. The resolver must
         // pick the profile override, not the global default, so a
         // single click returns None and the cursor still moves.
-        use crate::session::config::ClickAction;
-        use crate::session::profile_config::{
-            save_profile_config, ProfileConfig, SessionConfigOverride,
-        };
+        use crate::session::profile_config::{save_profile_config, ProfileConfig};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
 
-        let profile_config = ProfileConfig {
-            session: Some(SessionConfigOverride {
-                click_action: Some(ClickAction::SelectOnly),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile_config: ProfileConfig =
+            serde_json::from_value(serde_json::json!({"session": {"click_action": "select_only"}}))
+                .unwrap();
         save_profile_config("test", &profile_config).unwrap();
 
         let action = env.view.handle_click(5, 3);

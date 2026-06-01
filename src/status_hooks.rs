@@ -101,33 +101,6 @@ impl Default for StatusHookConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StatusHookConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub debounce_ms: Option<u64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_starting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_running: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_waiting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_idle: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_change: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusHookContext {
     pub session_id: String,

@@ -5,16 +5,19 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 
-use super::config::{
-    ColorMode, Config, ContainerRuntimeName, DefaultTerminalMode, TmuxClipboardMode, TmuxMouseMode,
-    TmuxStatusBarMode, VolumeIgnoresStrategy,
-};
+use super::config::Config;
 use super::get_profile_dir;
 
-/// Profile-specific settings. All fields are Option<T> - None means "inherit from global"
+/// Profile-specific settings, stored as a sparse override tree (#1692).
+///
+/// Every override is a section table keyed by config-section name (e.g.
+/// `sandbox`, `cockpit`) mirroring the `Config` JSON shape; an absent key
+/// inherits the global value. There are no typed per-section structs: a field
+/// is overridable purely by virtue of existing in the `Config` schema, so
+/// adding one never touches this file. Merging is the generic recursive
+/// [`merge_configs_generic`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
     /// Short, human-readable description of what this profile does.
@@ -23,282 +26,18 @@ pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<ThemeConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updates: Option<UpdatesConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<WorktreeConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux: Option<TmuxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sound: Option<crate::sound::SoundConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_hooks: Option<crate::status_hooks::StatusHookConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cockpit: Option<CockpitConfigOverride>,
-
-    /// Per-profile override for the host-side `environment` list. When
-    /// `Some`, replaces the global list entirely (matching the existing
-    /// `sandbox.environment` override semantics). `None` inherits the
-    /// global value. Same entry grammar as `Config.environment`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub environment: Option<Vec<String>>,
+    /// Sparse overrides, keyed by config section. Flattened so the on-disk TOML
+    /// keeps the historical `[section]` table layout (no migration needed).
+    #[serde(flatten)]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Per-profile overrides for the [cockpit] config section. Every field
-/// is `Option<T>`; when `None`, the global value wins. The TUI's
-/// "Clear override" action sets the field to None.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CockpitConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_for_claude: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrent_workers: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_events: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub show_tool_durations: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_drain_mode: Option<crate::session::config::QueueDrainMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrent_resumes: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub force_end_turn_threshold_secs: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub silent_orphan_grace_secs: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub silent_orphan_fast_grace_secs: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ThemeConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color_mode: Option<ColorMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_decay_minutes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UpdatesConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub update_check_mode: Option<crate::session::config::UpdateCheckMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check_interval_hours: Option<u64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notify_in_cli: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_poll_interval_minutes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WorktreeConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_template: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bare_repo_path_template: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_cleanup: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub show_branch_in_tui: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delete_branch_on_cleanup: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_path_template: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub init_submodules: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SandboxConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled_by_default: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_image: Option<String>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub extra_volumes: Option<Vec<String>>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub port_mappings: Option<Vec<String>>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub environment: Option<Vec<String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_cleanup: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_limit: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_limit: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_terminal_mode: Option<DefaultTerminalMode>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub volume_ignores: Option<Vec<String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mount_ssh: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selinux_relabel: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_instruction: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_runtime: Option<ContainerRuntimeName>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_ignores_strategy: Option<VolumeIgnoresStrategy>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TmuxConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_bar: Option<TmuxStatusBarMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mouse: Option<TmuxMouseMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clipboard: Option<TmuxClipboardMode>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SessionConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tool: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub yolo_mode_default: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_extra_args: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_command_override: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_status_hooks: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mouse_capture: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_agents: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_detect_as: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strict_hotkeys: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snooze_duration_minutes: Option<u32>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restart_wake_message: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub row_tag: Option<super::config::RowTagMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_send_exit_chord: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_session_attach_mode: Option<super::config::NewSessionAttachMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_attach_mode: Option<super::config::NewSessionAttachMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub click_action: Option<super::config::ClickAction>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct HooksConfigOverride {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub on_create: Option<Vec<String>>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub on_launch: Option<Vec<String>>,
-
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_helpers::option_string_or_vec"
-    )]
-    pub on_destroy: Option<Vec<String>>,
+impl ProfileConfig {
+    /// The overrides as a JSON object, ready to merge onto a serialized
+    /// `Config`. Excludes the profile-only `description`.
+    fn overrides_value(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.overrides.clone())
+    }
 }
 
 /// Load profile-specific config. Returns empty config if file doesn't exist.
@@ -317,7 +56,23 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
         return Ok(ProfileConfig::default());
     }
     let config: ProfileConfig = toml::from_str(&content)?;
+    // Type-check the overrides by merging onto a default Config. The sparse map
+    // accepts any JSON, so a wrong-typed value (e.g. `worktree.enabled = "yes"`)
+    // would otherwise only surface as a panic at merge time; reject it here so
+    // the caller warns and falls back to defaults.
+    validate_overrides_typecheck(&config.overrides_value())?;
     Ok(config)
+}
+
+/// Confirm a sparse override object deserializes back into a [`Config`] when
+/// merged onto the defaults. Used at load time so a malformed override file is
+/// a graceful error rather than a merge-time panic.
+pub(super) fn validate_overrides_typecheck(overrides: &serde_json::Value) -> Result<()> {
+    let mut base = serde_json::to_value(Config::default())?;
+    crate::session::settings_schema::merge_json(&mut base, overrides);
+    serde_json::from_value::<Config>(base)
+        .map_err(|e| anyhow::anyhow!("invalid override value: {e}"))?;
+    Ok(())
 }
 
 /// Save profile-specific config
@@ -338,18 +93,7 @@ pub fn get_profile_config_path(profile: &str) -> Result<std::path::PathBuf> {
 
 /// Check if a profile has any overrides set
 pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
-    config.description.is_some()
-        || config.theme.is_some()
-        || config.updates.is_some()
-        || config.worktree.is_some()
-        || config.sandbox.is_some()
-        || config.tmux.is_some()
-        || config.session.is_some()
-        || config.hooks.is_some()
-        || config.sound.is_some()
-        || config.status_hooks.is_some()
-        || config.cockpit.is_some()
-        || config.environment.is_some()
+    config.description.is_some() || !config.overrides.is_empty()
 }
 
 /// Load effective config for a profile (global + profile overrides merged)
@@ -374,192 +118,23 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
     }
 }
 
-/// Apply sandbox config overrides to a target config.
-pub fn apply_sandbox_overrides(
-    target: &mut super::config::SandboxConfig,
-    source: &SandboxConfigOverride,
-) {
-    if let Some(enabled_by_default) = source.enabled_by_default {
-        target.enabled_by_default = enabled_by_default;
-    }
-    if let Some(ref default_image) = source.default_image {
-        target.default_image = default_image.clone();
-    }
-    if let Some(ref extra_volumes) = source.extra_volumes {
-        target.extra_volumes = extra_volumes.clone();
-    }
-    if let Some(ref port_mappings) = source.port_mappings {
-        target.port_mappings = port_mappings.clone();
-    }
-    if let Some(ref environment) = source.environment {
-        target.environment = environment.clone();
-    }
-    if let Some(auto_cleanup) = source.auto_cleanup {
-        target.auto_cleanup = auto_cleanup;
-    }
-    if let Some(ref cpu_limit) = source.cpu_limit {
-        target.cpu_limit = Some(cpu_limit.clone());
-    }
-    if let Some(ref memory_limit) = source.memory_limit {
-        target.memory_limit = Some(memory_limit.clone());
-    }
-    if let Some(default_terminal_mode) = source.default_terminal_mode {
-        target.default_terminal_mode = default_terminal_mode;
-    }
-    if let Some(ref volume_ignores) = source.volume_ignores {
-        target.volume_ignores = volume_ignores.clone();
-    }
-    if let Some(mount_ssh) = source.mount_ssh {
-        target.mount_ssh = mount_ssh;
-    }
-    if let Some(selinux_relabel) = source.selinux_relabel {
-        target.selinux_relabel = selinux_relabel;
-    }
-    if let Some(ref custom_instruction) = source.custom_instruction {
-        target.custom_instruction = Some(custom_instruction.clone());
-    }
-    if let Some(container_runtime) = source.container_runtime {
-        target.container_runtime = container_runtime;
-    }
-    if let Some(volume_ignores_strategy) = source.volume_ignores_strategy {
-        target.volume_ignores_strategy = volume_ignores_strategy;
-    }
-}
-
-/// Apply worktree config overrides to a target config.
-pub fn apply_worktree_overrides(
-    target: &mut super::config::WorktreeConfig,
-    source: &WorktreeConfigOverride,
-) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(ref path_template) = source.path_template {
-        target.path_template = path_template.clone();
-    }
-    if let Some(ref bare_repo_path_template) = source.bare_repo_path_template {
-        target.bare_repo_path_template = bare_repo_path_template.clone();
-    }
-    if let Some(auto_cleanup) = source.auto_cleanup {
-        target.auto_cleanup = auto_cleanup;
-    }
-    if let Some(show_branch_in_tui) = source.show_branch_in_tui {
-        target.show_branch_in_tui = show_branch_in_tui;
-    }
-    if let Some(delete_branch_on_cleanup) = source.delete_branch_on_cleanup {
-        target.delete_branch_on_cleanup = delete_branch_on_cleanup;
-    }
-    if let Some(ref workspace_path_template) = source.workspace_path_template {
-        target.workspace_path_template = workspace_path_template.clone();
-    }
-    if let Some(init_submodules) = source.init_submodules {
-        target.init_submodules = init_submodules;
-    }
-}
-
-/// Apply hooks config overrides to a target config.
-pub fn apply_hooks_overrides(
-    target: &mut crate::session::repo_config::HooksConfig,
-    source: &HooksConfigOverride,
-) {
-    if let Some(ref on_create) = source.on_create {
-        target.on_create = on_create.clone();
-    }
-    if let Some(ref on_launch) = source.on_launch {
-        target.on_launch = on_launch.clone();
-    }
-    if let Some(ref on_destroy) = source.on_destroy {
-        target.on_destroy = on_destroy.clone();
-    }
-}
-
-/// Apply session config overrides to a target config.
-pub fn apply_session_overrides(
-    target: &mut super::config::SessionConfig,
-    source: &SessionConfigOverride,
-) {
-    if source.default_tool.is_some() {
-        target.default_tool = source.default_tool.clone();
-    }
-    if let Some(yolo_mode_default) = source.yolo_mode_default {
-        target.yolo_mode_default = yolo_mode_default;
-    }
-    if let Some(ref args) = source.agent_extra_args {
-        target.agent_extra_args = args.clone();
-    }
-    if let Some(ref overrides) = source.agent_command_override {
-        target.agent_command_override = overrides.clone();
-    }
-    if let Some(agent_status_hooks) = source.agent_status_hooks {
-        target.agent_status_hooks = agent_status_hooks;
-    }
-    if let Some(mouse_capture) = source.mouse_capture {
-        target.mouse_capture = mouse_capture;
-    }
-    if let Some(ref custom_agents) = source.custom_agents {
-        target.custom_agents = custom_agents.clone();
-    }
-    if let Some(ref detect_as) = source.agent_detect_as {
-        target.agent_detect_as = detect_as.clone();
-    }
-    if let Some(strict_hotkeys) = source.strict_hotkeys {
-        target.strict_hotkeys = strict_hotkeys;
-    }
-    if let Some(snooze_duration_minutes) = source.snooze_duration_minutes {
-        target.snooze_duration_minutes = snooze_duration_minutes;
-    }
-    if let Some(ref restart_wake_message) = source.restart_wake_message {
-        target.restart_wake_message = restart_wake_message.clone();
-    }
-    if let Some(row_tag) = source.row_tag {
-        target.row_tag = row_tag;
-    }
-    if let Some(ref live_send_exit_chord) = source.live_send_exit_chord {
-        target.live_send_exit_chord = live_send_exit_chord.clone();
-    }
-    if let Some(new_session_attach_mode) = source.new_session_attach_mode {
-        target.new_session_attach_mode = new_session_attach_mode;
-    }
-    if let Some(default_attach_mode) = source.default_attach_mode {
-        target.default_attach_mode = default_attach_mode;
-    }
-    if let Some(click_action) = source.click_action {
-        target.click_action = click_action;
-    }
-}
-
-/// Apply tmux config overrides to a target config.
-pub fn apply_tmux_overrides(target: &mut super::config::TmuxConfig, source: &TmuxConfigOverride) {
-    if let Some(status_bar) = source.status_bar {
-        target.status_bar = status_bar;
-    }
-    if let Some(mouse) = source.mouse {
-        target.mouse = mouse;
-    }
-    if let Some(clipboard) = source.clipboard {
-        target.clipboard = clipboard;
-    }
-}
-
 /// Merge profile overrides into global config.
 ///
-/// Delegates to [`merge_configs_generic`]: the profile serializes to a sparse
-/// override tree that is JSON-merged onto the global config. Proven equivalent
-/// to the former per-field merge by `generic_merge_matches_typed_merge` (#1692),
-/// so adding a config field never touches this function.
+/// Delegates to [`merge_configs_generic`]: the profile's sparse override tree is
+/// JSON-merged onto the global config, so adding a config field never touches
+/// this function.
 pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
-    let overrides = serde_json::to_value(profile).expect("ProfileConfig serializes to JSON");
-    merge_configs_generic(&global, &overrides)
+    merge_configs_generic(&global, &profile.overrides_value())
 }
 
 /// Generic single-source merge (#1692): serialize the global config to JSON,
-/// apply the profile's overrides as a sparse JSON merge (object keys recurse,
-/// scalars and arrays replace), and deserialize back into a typed [`Config`].
+/// apply the overrides as a sparse JSON merge (object keys recurse, scalars and
+/// arrays replace), and deserialize back into a typed [`Config`].
 ///
 /// This works for every section without per-field arms, so adding a config
-/// field never touches a merge function. It is proven equivalent to the legacy
-/// hand-written [`merge_configs`] by `generic_merge_matches_typed_merge` before
-/// it becomes the only merge path.
+/// field never touches a merge function. The deserialize is infallible in
+/// practice because every override-writing path (file load, server PATCH, TUI)
+/// type-checks against the schema first; see [`validate_overrides_typecheck`].
 pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> Config {
     let mut base = serde_json::to_value(global).expect("Config serializes to JSON");
     crate::session::settings_schema::merge_json(&mut base, overrides);
@@ -610,36 +185,31 @@ pub fn validate_check_interval(hours: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Build a `ProfileConfig` from a sparse override object (the on-disk shape).
+    fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
+        serde_json::from_value(overrides).expect("profile override deserializes")
+    }
 
     #[test]
     fn test_profile_config_default() {
         let config = ProfileConfig::default();
-        assert!(config.theme.is_none());
-        assert!(config.updates.is_none());
-        assert!(config.worktree.is_none());
-        assert!(config.sandbox.is_none());
-        assert!(config.tmux.is_none());
+        assert!(config.description.is_none());
+        assert!(config.overrides.is_empty());
     }
 
     #[test]
     fn test_profile_config_serialization_empty() {
         let config = ProfileConfig::default();
         let serialized = toml::to_string(&config).unwrap();
-        // Empty config should serialize to empty (skip_serializing_if)
+        // Empty config should serialize to empty (skip_serializing_if + empty map).
         assert!(serialized.trim().is_empty());
     }
 
     #[test]
     fn test_profile_config_serialization_partial() {
-        use crate::session::config::UpdateCheckMode;
-        let config = ProfileConfig {
-            updates: Some(UpdatesConfigOverride {
-                update_check_mode: Some(UpdateCheckMode::Off),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let config = profile_from(json!({"updates": {"update_check_mode": "off"}}));
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("[updates]"));
         assert!(serialized.contains("update_check_mode = \"off\""));
@@ -647,7 +217,6 @@ mod tests {
 
     #[test]
     fn test_profile_config_deserialization() {
-        use crate::session::config::UpdateCheckMode;
         let toml = r#"
             [updates]
             update_check_mode = "off"
@@ -658,14 +227,10 @@ mod tests {
         "#;
 
         let config: ProfileConfig = toml::from_str(toml).unwrap();
-        assert!(config.updates.is_some());
-        let updates = config.updates.unwrap();
-        assert_eq!(updates.update_check_mode, Some(UpdateCheckMode::Off));
-        assert_eq!(updates.check_interval_hours, Some(48));
-
-        assert!(config.sandbox.is_some());
-        let sandbox = config.sandbox.unwrap();
-        assert_eq!(sandbox.enabled_by_default, Some(true));
+        let ov = serde_json::to_value(&config).unwrap();
+        assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
+        assert_eq!(ov["updates"]["check_interval_hours"], json!(48));
+        assert_eq!(ov["sandbox"]["enabled_by_default"], json!(true));
     }
 
     #[test]
@@ -685,18 +250,10 @@ mod tests {
     fn test_merge_configs_with_overrides() {
         use crate::session::config::UpdateCheckMode;
         let global = Config::default();
-        let profile = ProfileConfig {
-            updates: Some(UpdatesConfigOverride {
-                update_check_mode: Some(UpdateCheckMode::Off),
-                check_interval_hours: Some(48),
-                ..Default::default()
-            }),
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = profile_from(json!({
+            "updates": {"update_check_mode": "off", "check_interval_hours": 48},
+            "worktree": {"enabled": true},
+        }));
 
         let merged = merge_configs(global, &profile);
 
@@ -714,15 +271,9 @@ mod tests {
         global.status_hooks.on_waiting = Some("global-waiting".to_string());
         global.status_hooks.debounce_ms = 100;
 
-        let profile = ProfileConfig {
-            status_hooks: Some(crate::status_hooks::StatusHookConfigOverride {
-                enabled: Some(true),
-                debounce_ms: Some(500),
-                on_waiting: Some("profile-waiting".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = profile_from(json!({
+            "status_hooks": {"enabled": true, "debounce_ms": 500, "on_waiting": "profile-waiting"}
+        }));
 
         let merged = merge_configs(global, &profile);
         assert!(merged.status_hooks.enabled);
@@ -738,13 +289,7 @@ mod tests {
         let empty = ProfileConfig::default();
         assert!(!profile_has_overrides(&empty));
 
-        let with_override = ProfileConfig {
-            theme: Some(ThemeConfigOverride {
-                name: Some("dark".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let with_override = profile_from(json!({"theme": {"name": "dark"}}));
         assert!(profile_has_overrides(&with_override));
     }
 
@@ -777,87 +322,56 @@ mod tests {
 
     #[test]
     fn test_merge_configs_with_tmux_mouse_override() {
+        use crate::session::config::TmuxMouseMode;
         let global = Config::default();
         assert_eq!(global.tmux.mouse, TmuxMouseMode::Auto);
 
-        let profile = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                mouse: Some(TmuxMouseMode::Enabled),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"tmux": {"mouse": "enabled"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.tmux.mouse, TmuxMouseMode::Enabled);
     }
 
     #[test]
     fn test_merge_configs_tmux_mouse_inherits_when_not_overridden() {
+        use crate::session::config::{TmuxMouseMode, TmuxStatusBarMode};
         let mut global = Config::default();
         global.tmux.mouse = TmuxMouseMode::Enabled;
 
-        let profile = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                status_bar: Some(TmuxStatusBarMode::Enabled),
-                mouse: None,
-                clipboard: None,
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"tmux": {"status_bar": "enabled"}}));
         let merged = merge_configs(global, &profile);
-        assert_eq!(merged.tmux.mouse, TmuxMouseMode::Enabled); // Should inherit from global
+        assert_eq!(merged.tmux.mouse, TmuxMouseMode::Enabled); // inherits from global
         assert_eq!(merged.tmux.status_bar, TmuxStatusBarMode::Enabled);
     }
 
     #[test]
     fn test_merge_configs_tmux_mouse_disabled_override() {
+        use crate::session::config::TmuxMouseMode;
         let mut global = Config::default();
         global.tmux.mouse = TmuxMouseMode::Enabled;
 
-        let profile = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                mouse: Some(TmuxMouseMode::Disabled),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"tmux": {"mouse": "disabled"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.tmux.mouse, TmuxMouseMode::Disabled);
     }
 
     #[test]
     fn test_merge_configs_with_tmux_clipboard_override() {
+        use crate::session::config::TmuxClipboardMode;
         let global = Config::default();
         assert_eq!(global.tmux.clipboard, TmuxClipboardMode::Auto);
 
-        let profile = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                clipboard: Some(TmuxClipboardMode::Disabled),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"tmux": {"clipboard": "disabled"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Disabled);
     }
 
     #[test]
     fn test_merge_configs_tmux_clipboard_inherits_when_not_overridden() {
+        use crate::session::config::TmuxClipboardMode;
         let mut global = Config::default();
         global.tmux.clipboard = TmuxClipboardMode::Enabled;
 
-        let profile = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                mouse: Some(TmuxMouseMode::Enabled),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"tmux": {"mouse": "enabled"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Enabled);
     }
@@ -867,14 +381,8 @@ mod tests {
         let global = Config::default();
         assert!(global.sandbox.volume_ignores.is_empty());
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                volume_ignores: Some(vec!["target".to_string(), "node_modules".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile =
+            profile_from(json!({"sandbox": {"volume_ignores": ["target", "node_modules"]}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(
             merged.sandbox.volume_ignores,
@@ -887,15 +395,7 @@ mod tests {
         let mut global = Config::default();
         global.sandbox.volume_ignores = vec!["target".to_string()];
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(true),
-                volume_ignores: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"sandbox": {"enabled_by_default": true}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.sandbox.volume_ignores, vec!["target"]);
         assert!(merged.sandbox.enabled_by_default);
@@ -903,56 +403,33 @@ mod tests {
 
     #[test]
     fn test_volume_ignores_override_serialization() {
-        let config = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                volume_ignores: Some(vec!["target".to_string(), ".venv".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let config = profile_from(json!({"sandbox": {"volume_ignores": ["target", ".venv"]}}));
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("volume_ignores"));
 
         let deserialized: ProfileConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            deserialized.sandbox.unwrap().volume_ignores,
-            Some(vec!["target".to_string(), ".venv".to_string()])
-        );
+        let ov = serde_json::to_value(&deserialized).unwrap();
+        assert_eq!(ov["sandbox"]["volume_ignores"], json!(["target", ".venv"]));
     }
 
     #[test]
     fn test_tmux_config_override_serialization() {
-        let config = ProfileConfig {
-            tmux: Some(TmuxConfigOverride {
-                status_bar: Some(TmuxStatusBarMode::Enabled),
-                mouse: Some(TmuxMouseMode::Enabled),
-                clipboard: Some(TmuxClipboardMode::Enabled),
-            }),
-            ..Default::default()
-        };
-
+        let config = profile_from(json!({
+            "tmux": {"status_bar": "enabled", "mouse": "enabled", "clipboard": "enabled"}
+        }));
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("[tmux]"));
         assert!(serialized.contains(r#"mouse = "enabled""#));
 
         let deserialized: ProfileConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            deserialized.tmux.as_ref().unwrap().mouse,
-            Some(TmuxMouseMode::Enabled)
-        );
+        let ov = serde_json::to_value(&deserialized).unwrap();
+        assert_eq!(ov["tmux"]["mouse"], json!("enabled"));
     }
 
     #[test]
     fn test_merge_configs_with_theme_override() {
         let global = Config::default();
-        let profile = ProfileConfig {
-            theme: Some(ThemeConfigOverride {
-                name: Some("tokyo-night".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = profile_from(json!({"theme": {"name": "tokyo-night"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.theme.name, "tokyo-night");
     }
@@ -969,7 +446,8 @@ mod tests {
 
     #[test]
     fn test_sandbox_override_string_shorthand() {
-        // Regression test: all Option<Vec<String>> sandbox fields accept a plain string
+        // Regression: a single string stands in for a one-element list, coerced
+        // by the target `SandboxConfig`'s `string_or_vec` deserializer on merge.
         let toml = r#"
             [sandbox]
             environment = "ANTHROPIC_API_KEY"
@@ -978,25 +456,25 @@ mod tests {
             port_mappings = "3000:3000"
         "#;
         let config: ProfileConfig = toml::from_str(toml).unwrap();
-        let sb = config.sandbox.unwrap();
-        assert_eq!(sb.environment, Some(vec!["ANTHROPIC_API_KEY".to_string()]));
-        assert_eq!(sb.extra_volumes, Some(vec!["/data:/data:ro".to_string()]));
-        assert_eq!(sb.volume_ignores, Some(vec!["node_modules".to_string()]));
-        assert_eq!(sb.port_mappings, Some(vec!["3000:3000".to_string()]));
+        let merged = merge_configs(Config::default(), &config);
+        assert_eq!(merged.sandbox.environment, vec!["ANTHROPIC_API_KEY"]);
+        assert_eq!(merged.sandbox.extra_volumes, vec!["/data:/data:ro"]);
+        assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
+        assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
     }
 
     #[test]
     fn test_hooks_override_string_shorthand() {
-        // Regression test: HooksConfigOverride accepts a plain string
+        // Regression: HooksConfig accepts a plain string, coerced on merge.
         let toml = r#"
             [hooks]
             on_create = "npm install"
             on_launch = "npm start"
         "#;
         let config: ProfileConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
-        assert_eq!(hooks.on_create, Some(vec!["npm install".to_string()]));
-        assert_eq!(hooks.on_launch, Some(vec!["npm start".to_string()]));
+        let merged = merge_configs(Config::default(), &config);
+        assert_eq!(merged.hooks.on_create, vec!["npm install"]);
+        assert_eq!(merged.hooks.on_launch, vec!["npm start"]);
     }
 
     #[test]
@@ -1005,9 +483,9 @@ mod tests {
             environment = ["CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work", "GH_TOKEN"]
         "#;
         let config: ProfileConfig = toml::from_str(toml_in).unwrap();
-        let env = config.environment.clone().unwrap();
+        let merged = merge_configs(Config::default(), &config);
         assert_eq!(
-            env,
+            merged.environment,
             vec![
                 "CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work".to_string(),
                 "GH_TOKEN".to_string(),
@@ -1021,17 +499,18 @@ mod tests {
 
     #[test]
     fn test_environment_string_shorthand_deserializes() {
-        // `string_or_vec` lets a single string stand in for a one-element list.
+        // A single string stands in for a one-element list, coerced on merge.
         let toml_in = r#"environment = "FOO=bar""#;
         let config: ProfileConfig = toml::from_str(toml_in).unwrap();
-        assert_eq!(config.environment, Some(vec!["FOO=bar".to_string()]));
+        let merged = merge_configs(Config::default(), &config);
+        assert_eq!(merged.environment, vec!["FOO=bar".to_string()]);
     }
 
     #[test]
     fn test_environment_override_promotes_profile_has_overrides() {
-        let mut profile = ProfileConfig::default();
+        let profile = ProfileConfig::default();
         assert!(!profile_has_overrides(&profile));
-        profile.environment = Some(vec!["FOO=bar".to_string()]);
+        let profile = profile_from(json!({"environment": ["FOO=bar"]}));
         assert!(profile_has_overrides(&profile));
     }
 
@@ -1041,12 +520,7 @@ mod tests {
             environment: vec!["FROM_GLOBAL=1".to_string()],
             ..Default::default()
         };
-
-        let profile = ProfileConfig {
-            environment: Some(vec!["FROM_PROFILE=2".to_string()]),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"environment": ["FROM_PROFILE=2"]}));
         let merged = merge_configs(global, &profile);
         // Profile env replaces (matches sandbox.environment semantics).
         assert_eq!(merged.environment, vec!["FROM_PROFILE=2".to_string()]);
@@ -1069,8 +543,6 @@ mod tests {
     fn test_description_default_is_none() {
         let config = ProfileConfig::default();
         assert!(config.description.is_none());
-        // Default empty config must still serialize empty so untouched profiles
-        // don't grow a description line on first save.
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.trim().is_empty());
     }
@@ -1089,28 +561,18 @@ mod tests {
             environment: vec!["FROM_GLOBAL=1".to_string()],
             ..Default::default()
         };
-
         let profile = ProfileConfig::default();
-
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]);
     }
 
-    // Baseline pins for the Vec sandbox overrides that the single-source
-    // refactor (#1692) will regenerate. Replace semantics, not extend.
+    // Replace (not extend) semantics for the Vec sandbox overrides.
     #[test]
     fn test_merge_configs_replaces_extra_volumes() {
         let mut global = Config::default();
         global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                extra_volumes: Some(vec!["/from-profile:/p".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"sandbox": {"extra_volumes": ["/from-profile:/p"]}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.sandbox.extra_volumes, vec!["/from-profile:/p"]);
     }
@@ -1120,15 +582,7 @@ mod tests {
         let mut global = Config::default();
         global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(true),
-                extra_volumes: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"sandbox": {"enabled_by_default": true}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.sandbox.extra_volumes, vec!["/from-global:/g"]);
     }
@@ -1138,14 +592,8 @@ mod tests {
         let mut global = Config::default();
         global.sandbox.port_mappings = vec!["3000:3000".to_string()];
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                port_mappings: Some(vec!["8080:8080".to_string(), "9090:9090".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile =
+            profile_from(json!({"sandbox": {"port_mappings": ["8080:8080", "9090:9090"]}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.sandbox.port_mappings, vec!["8080:8080", "9090:9090"]);
     }
@@ -1155,15 +603,7 @@ mod tests {
         let mut global = Config::default();
         global.sandbox.port_mappings = vec!["3000:3000".to_string()];
 
-        let profile = ProfileConfig {
-            sandbox: Some(SandboxConfigOverride {
-                cpu_limit: Some("2".to_string()),
-                port_mappings: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"sandbox": {"cpu_limit": "2"}}));
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
     }
@@ -1173,17 +613,13 @@ mod tests {
         let global = Config::default();
         assert!(!global.cockpit.enabled);
 
-        let profile = ProfileConfig {
-            cockpit: Some(CockpitConfigOverride {
-                enabled: Some(true),
-                default_agent: Some("claude-code".to_string()),
-                max_concurrent_workers: Some(9),
-                replay_bytes: Some(1024),
-                node_path: Some("/opt/node".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = profile_from(json!({"cockpit": {
+            "enabled": true,
+            "default_agent": "claude-code",
+            "max_concurrent_workers": 9,
+            "replay_bytes": 1024,
+            "node_path": "/opt/node",
+        }}));
 
         let merged = merge_configs(global, &profile);
         assert!(merged.cockpit.enabled);
@@ -1201,171 +637,18 @@ mod tests {
         global.cockpit.default_agent = "from-global".to_string();
         global.cockpit.max_concurrent_workers = 7;
 
-        let profile = ProfileConfig {
-            cockpit: Some(CockpitConfigOverride {
-                enabled: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
+        let profile = profile_from(json!({"cockpit": {"enabled": true}}));
         let merged = merge_configs(global, &profile);
         assert!(merged.cockpit.enabled);
         assert_eq!(merged.cockpit.default_agent, "from-global");
         assert_eq!(merged.cockpit.max_concurrent_workers, 7);
     }
 
-    /// Build a profile that overrides at least one field in every section, so
-    /// the equivalence check below exercises every merge path.
-    fn fully_populated_profile() -> ProfileConfig {
-        use crate::session::config::{
-            ClickAction, ColorMode, ContainerRuntimeName, DefaultTerminalMode,
-            NewSessionAttachMode, QueueDrainMode, RowTagMode, UpdateCheckMode,
-        };
-        let one = |k: &str, v: &str| {
-            let mut m = HashMap::new();
-            m.insert(k.to_string(), v.to_string());
-            m
-        };
-        ProfileConfig {
-            description: Some("equivalence fixture".to_string()),
-            theme: Some(ThemeConfigOverride {
-                name: Some("tokyo-night".to_string()),
-                color_mode: Some(ColorMode::Palette),
-                idle_decay_minutes: Some(7),
-            }),
-            updates: Some(UpdatesConfigOverride {
-                update_check_mode: Some(UpdateCheckMode::Off),
-                check_interval_hours: Some(48),
-                notify_in_cli: Some(false),
-                web_poll_interval_minutes: Some(15),
-            }),
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(true),
-                path_template: Some("wt/{name}".to_string()),
-                bare_repo_path_template: Some("bare/{name}".to_string()),
-                auto_cleanup: Some(false),
-                show_branch_in_tui: Some(true),
-                delete_branch_on_cleanup: Some(true),
-                workspace_path_template: Some("ws/{name}".to_string()),
-                init_submodules: Some(true),
-            }),
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(true),
-                default_image: Some("img:latest".to_string()),
-                extra_volumes: Some(vec!["/a:/a".to_string()]),
-                port_mappings: Some(vec!["1:1".to_string()]),
-                environment: Some(vec!["X=1".to_string()]),
-                auto_cleanup: Some(false),
-                cpu_limit: Some("2".to_string()),
-                memory_limit: Some("512m".to_string()),
-                default_terminal_mode: Some(DefaultTerminalMode::Container),
-                volume_ignores: Some(vec!["target".to_string()]),
-                mount_ssh: Some(true),
-                selinux_relabel: Some(true),
-                custom_instruction: Some("ci".to_string()),
-                container_runtime: Some(ContainerRuntimeName::Podman),
-                volume_ignores_strategy: Some(VolumeIgnoresStrategy::Named),
-            }),
-            tmux: Some(TmuxConfigOverride {
-                status_bar: Some(TmuxStatusBarMode::Enabled),
-                mouse: Some(TmuxMouseMode::Enabled),
-                clipboard: Some(TmuxClipboardMode::Disabled),
-            }),
-            session: Some(SessionConfigOverride {
-                default_tool: Some("claude".to_string()),
-                yolo_mode_default: Some(true),
-                agent_extra_args: Some(one("claude", "--verbose")),
-                agent_command_override: Some(one("claude", "/opt/claude")),
-                agent_status_hooks: Some(true),
-                mouse_capture: Some(true),
-                custom_agents: Some(one("mine", "my-cmd")),
-                agent_detect_as: Some(one("mine", "claude")),
-                strict_hotkeys: Some(true),
-                snooze_duration_minutes: Some(30),
-                restart_wake_message: Some("wake".to_string()),
-                row_tag: Some(RowTagMode::Profile),
-                live_send_exit_chord: Some("C-x".to_string()),
-                new_session_attach_mode: Some(NewSessionAttachMode::LiveSend),
-                default_attach_mode: Some(NewSessionAttachMode::LiveSend),
-                click_action: Some(ClickAction::SelectOnly),
-            }),
-            hooks: Some(HooksConfigOverride {
-                on_create: Some(vec!["a".to_string()]),
-                on_launch: Some(vec!["b".to_string()]),
-                on_destroy: Some(vec!["c".to_string()]),
-            }),
-            sound: Some(crate::sound::SoundConfigOverride {
-                enabled: Some(true),
-                mode: Some(crate::sound::SoundMode::Random),
-                on_start: Some("start.wav".to_string()),
-                on_running: Some("run.wav".to_string()),
-                on_waiting: Some("wait.wav".to_string()),
-                on_idle: Some("idle.wav".to_string()),
-                on_error: Some("err.wav".to_string()),
-                on_approval: Some("ok.wav".to_string()),
-                volume: Some(0.5),
-            }),
-            status_hooks: Some(crate::status_hooks::StatusHookConfigOverride {
-                enabled: Some(true),
-                debounce_ms: Some(250),
-                on_starting: Some("s".to_string()),
-                on_running: Some("r".to_string()),
-                on_waiting: Some("w".to_string()),
-                on_idle: Some("i".to_string()),
-                on_error: Some("e".to_string()),
-                on_change: Some("c".to_string()),
-            }),
-            cockpit: Some(CockpitConfigOverride {
-                enabled: Some(true),
-                default_for_claude: Some(false),
-                default_agent: Some("claude-code".to_string()),
-                max_concurrent_workers: Some(9),
-                replay_events: Some(100),
-                replay_bytes: Some(2048),
-                node_path: Some("/opt/node".to_string()),
-                show_tool_durations: Some(false),
-                queue_drain_mode: Some(QueueDrainMode::Serial),
-                max_concurrent_resumes: Some(2),
-                force_end_turn_threshold_secs: Some(45),
-                silent_orphan_grace_secs: Some(90),
-                silent_orphan_fast_grace_secs: Some(15),
-            }),
-            environment: Some(vec!["G=1".to_string()]),
-        }
-    }
-
-    /// The generic single-source merge must reproduce the legacy typed merge
-    /// for every section. This is the gate that lets `merge_configs_generic`
-    /// replace `merge_configs` without changing behavior (#1692).
-    #[test]
-    fn generic_merge_matches_typed_merge() {
-        // Start from a non-default global so overrides must actually replace
-        // values rather than coincidentally matching defaults.
-        let mut global = Config::default();
-        global.theme.name = "catppuccin-latte".to_string();
-        global.cockpit.default_agent = "global-agent".to_string();
-        global.environment = vec!["FROM_GLOBAL=1".to_string()];
-        global.sandbox.extra_volumes = vec!["/global:/g".to_string()];
-
-        let profile = fully_populated_profile();
-
-        let typed = merge_configs(global.clone(), &profile);
-        let overrides = serde_json::to_value(&profile).unwrap();
-        let generic = merge_configs_generic(&global, &overrides);
-
-        assert_eq!(
-            serde_json::to_value(&typed).unwrap(),
-            serde_json::to_value(&generic).unwrap(),
-            "generic merge diverged from typed merge"
-        );
-    }
-
     #[test]
     fn generic_merge_inherits_with_empty_overrides() {
         let mut global = Config::default();
         global.cockpit.max_concurrent_workers = 7;
-        let generic = merge_configs_generic(&global, &serde_json::json!({}));
+        let generic = merge_configs_generic(&global, &json!({}));
         assert_eq!(
             serde_json::to_value(&global).unwrap(),
             serde_json::to_value(&generic).unwrap(),

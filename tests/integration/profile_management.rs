@@ -263,36 +263,31 @@ fn test_rename_profile_with_path_separator_fails() -> Result<()> {
 #[test]
 #[serial]
 fn test_profile_config_isolation() -> Result<()> {
-    use agent_of_empires::session::{
-        load_profile_config, save_profile_config, ProfileConfig, UpdatesConfigOverride,
-    };
+    use agent_of_empires::session::{load_profile_config, save_profile_config, ProfileConfig};
+    use serde_json::json;
 
     let _temp = setup_temp_home();
 
     create_profile("custom")?;
 
     // Save a profile-specific config override for "custom"
-    let custom_config = ProfileConfig {
-        updates: Some(UpdatesConfigOverride {
-            update_check_mode: Some(agent_of_empires::session::config::UpdateCheckMode::Off),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let custom_config: ProfileConfig =
+        serde_json::from_value(json!({"updates": {"update_check_mode": "off"}}))?;
     save_profile_config("custom", &custom_config)?;
 
     // Load config for "default" profile - should have no overrides
     let default_config = load_profile_config("default")?;
     assert!(
-        default_config.updates.is_none(),
+        !default_config.overrides.contains_key("updates"),
         "Default profile should have no update overrides"
     );
 
     // Verify custom profile has its override
     let loaded_custom = load_profile_config("custom")?;
+    let ov = serde_json::to_value(&loaded_custom)?;
     assert_eq!(
-        loaded_custom.updates.unwrap().update_check_mode,
-        Some(agent_of_empires::session::config::UpdateCheckMode::Off),
+        ov["updates"]["update_check_mode"],
+        json!("off"),
         "Custom profile should have update_check_mode = Off"
     );
 

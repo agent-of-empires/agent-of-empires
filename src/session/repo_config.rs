@@ -21,34 +21,47 @@ pub enum HookProgress {
 }
 
 use super::config::Config;
-use super::profile_config::{
-    HooksConfigOverride, ProfileConfig, SandboxConfigOverride, SessionConfigOverride,
-    TmuxConfigOverride, UpdatesConfigOverride, WorktreeConfigOverride,
-};
+use super::profile_config::ProfileConfig;
+
+/// Config sections a repo `.agent-of-empires/config.toml` may override.
+/// Personal/global sections (theme, status_hooks, cockpit, web, logging, host
+/// environment) are intentionally excluded, matching the historical typed
+/// `RepoConfig` that simply had no field for them.
+const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
+    "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
+];
 
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
+///
+/// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
+/// tables keyed by config-section name. Only [`REPO_OVERRIDABLE_SECTIONS`] are
+/// honored; any other section is dropped on merge and on save, so a repo can
+/// never override personal/global settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
+    #[serde(flatten)]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionConfigOverride>,
+impl RepoConfig {
+    /// The lifecycle hooks section parsed into a [`HooksConfig`], if present.
+    /// Used by the trust system to hash and display the repo's hook commands.
+    pub fn hooks(&self) -> Option<HooksConfig> {
+        self.overrides
+            .get("hooks")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<WorktreeConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updates: Option<UpdatesConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux: Option<TmuxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sound: Option<crate::sound::SoundConfigOverride>,
+    /// The overrides restricted to repo-allowed sections, as a JSON object.
+    fn allowed_overrides(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.overrides
+                .iter()
+                .filter(|(k, _)| REPO_OVERRIDABLE_SECTIONS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
 }
 
 /// Hook commands to run at various lifecycle points.
@@ -136,6 +149,12 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     let config: RepoConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
+    // Type-check the repo overrides by merging onto a default Config (the sparse
+    // map accepts any JSON). A wrong-typed value surfaces as a load error here
+    // rather than a merge-time panic; the caller degrades to profile config.
+    super::profile_config::validate_overrides_typecheck(&config.allowed_overrides())
+        .with_context(|| format!("Invalid override in {}", config_path.display()))?;
+
     Ok(Some(config))
 }
 
@@ -174,105 +193,43 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
 }
 
 /// Merge repo config overrides into an already-resolved config (global + profile).
-pub fn merge_repo_config(mut config: Config, repo: &RepoConfig) -> Config {
-    use super::profile_config::{
-        apply_sandbox_overrides, apply_session_overrides, apply_tmux_overrides,
-        apply_worktree_overrides,
-    };
+///
+/// Routes through the generic sparse-JSON merge (#1692): the repo's
+/// allowed-section overrides are applied onto the serialized config. Object
+/// keys recurse and scalars/arrays replace, matching the legacy per-field merge
+/// (empty hook lists never serialize, so they inherit rather than wipe).
+pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
+    super::profile_config::merge_configs_generic(&config, &repo.allowed_overrides())
+}
 
-    if let Some(ref session_override) = repo.session {
-        apply_session_overrides(&mut config.session, session_override);
-    }
-
-    if let Some(ref sandbox_override) = repo.sandbox {
-        apply_sandbox_overrides(&mut config.sandbox, sandbox_override);
-    }
-
-    if let Some(ref worktree_override) = repo.worktree {
-        apply_worktree_overrides(&mut config.worktree, worktree_override);
-    }
-
-    if let Some(ref hooks) = repo.hooks {
-        if !hooks.on_create.is_empty() {
-            config.hooks.on_create = hooks.on_create.clone();
-        }
-        if !hooks.on_launch.is_empty() {
-            config.hooks.on_launch = hooks.on_launch.clone();
-        }
-        if !hooks.on_destroy.is_empty() {
-            config.hooks.on_destroy = hooks.on_destroy.clone();
-        }
-    }
-
-    if let Some(ref updates_override) = repo.updates {
-        if let Some(update_check_mode) = updates_override.update_check_mode {
-            config.updates.update_check_mode = update_check_mode;
-        }
-        if let Some(check_interval_hours) = updates_override.check_interval_hours {
-            config.updates.check_interval_hours = check_interval_hours;
-        }
-        if let Some(notify_in_cli) = updates_override.notify_in_cli {
-            config.updates.notify_in_cli = notify_in_cli;
-        }
-    }
-
-    if let Some(ref tmux_override) = repo.tmux {
-        apply_tmux_overrides(&mut config.tmux, tmux_override);
-    }
-
-    if let Some(ref sound_override) = repo.sound {
-        crate::sound::apply_sound_overrides(&mut config.sound, sound_override);
-    }
-
-    config
+/// Filter a sparse override map to the repo-allowed sections.
+fn repo_overridable_overrides(
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    overrides
+        .iter()
+        .filter(|(k, _)| REPO_OVERRIDABLE_SECTIONS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Convert a RepoConfig into a ProfileConfig for TUI editing.
 /// This allows the settings TUI to reuse the same field infrastructure
-/// for all three scopes (Global, Profile, Repo).
+/// for all three scopes (Global, Profile, Repo). Only repo-allowed sections
+/// carry over so the TUI never shows a personal/global field as repo-overridden.
 pub fn repo_config_to_profile(repo: &RepoConfig) -> ProfileConfig {
     ProfileConfig {
-        updates: repo.updates.clone(),
-        worktree: repo.worktree.clone(),
-        sandbox: repo.sandbox.clone(),
-        tmux: repo.tmux.clone(),
-        session: repo.session.clone(),
-        sound: repo.sound.clone(),
-        hooks: repo.hooks.as_ref().map(|h| HooksConfigOverride {
-            on_create: if h.on_create.is_empty() {
-                None
-            } else {
-                Some(h.on_create.clone())
-            },
-            on_launch: if h.on_launch.is_empty() {
-                None
-            } else {
-                Some(h.on_launch.clone())
-            },
-            on_destroy: if h.on_destroy.is_empty() {
-                None
-            } else {
-                Some(h.on_destroy.clone())
-            },
-        }),
-        ..Default::default()
+        description: None,
+        overrides: repo_overridable_overrides(&repo.overrides),
     }
 }
 
-/// Convert a ProfileConfig back into a RepoConfig after TUI editing.
+/// Convert a ProfileConfig back into a RepoConfig after TUI editing. Sections
+/// the repo may not override (theme, cockpit, ...) are dropped here, matching
+/// the historical behavior where editing them in Repo scope was discarded.
 pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
     RepoConfig {
-        hooks: profile.hooks.as_ref().map(|h| HooksConfig {
-            on_create: h.on_create.clone().unwrap_or_default(),
-            on_launch: h.on_launch.clone().unwrap_or_default(),
-            on_destroy: h.on_destroy.clone().unwrap_or_default(),
-        }),
-        session: profile.session.clone(),
-        sandbox: profile.sandbox.clone(),
-        worktree: profile.worktree.clone(),
-        updates: profile.updates.clone(),
-        tmux: profile.tmux.clone(),
-        sound: profile.sound.clone(),
+        overrides: repo_overridable_overrides(&profile.overrides),
     }
 }
 
@@ -483,7 +440,7 @@ pub fn check_hook_trust(project_path: &Path) -> Result<HookTrustStatus> {
         None => return Ok(HookTrustStatus::NoHooks),
     };
 
-    let hooks = match repo_config.hooks {
+    let hooks = match repo_config.hooks() {
         Some(h) if !h.is_empty() => h,
         _ => return Ok(HookTrustStatus::NoHooks),
     };
@@ -1174,15 +1131,13 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install"]);
         assert_eq!(hooks.on_launch, vec!["echo start"]);
-        assert_eq!(
-            config.session.unwrap().default_tool,
-            Some("opencode".to_string())
-        );
-        assert_eq!(config.sandbox.unwrap().enabled_by_default, Some(true));
-        assert_eq!(config.worktree.unwrap().enabled, Some(true));
+        let ov = serde_json::to_value(&config).unwrap();
+        assert_eq!(ov["session"]["default_tool"], serde_json::json!("opencode"));
+        assert_eq!(ov["sandbox"]["enabled_by_default"], serde_json::json!(true));
+        assert_eq!(ov["worktree"]["enabled"], serde_json::json!(true));
     }
 
     #[test]
@@ -1200,7 +1155,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(
             hooks.on_launch,
             vec!["uv python install 3.11 && uv venv /opt/venv --python 3.11"]
@@ -1208,14 +1163,10 @@ mod tests {
         assert!(hooks.on_create.is_empty());
 
         // Verify the sandbox config is also preserved
-        let sandbox = config.sandbox.unwrap();
+        let ov = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            sandbox.environment,
-            Some(vec![
-                "ANTHROPIC_API_KEY".to_string(),
-                "UV_LINK_MODE=copy".to_string(),
-                "CI=true".to_string(),
-            ])
+            ov["sandbox"]["environment"],
+            serde_json::json!(["ANTHROPIC_API_KEY", "UV_LINK_MODE=copy", "CI=true"])
         );
     }
 
@@ -1227,7 +1178,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install"]);
         assert!(hooks.on_launch.is_empty());
     }
@@ -1240,7 +1191,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_destroy, vec!["docker-compose down"]);
         assert!(hooks.on_create.is_empty());
         assert!(hooks.on_launch.is_empty());
@@ -1254,7 +1205,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(
             hooks.on_destroy,
             vec!["docker-compose down", "rm -rf /tmp/cache"]
@@ -1270,7 +1221,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install", "cp .env.example .env"]);
         assert_eq!(hooks.on_launch, vec!["npm start"]);
     }
@@ -1278,23 +1229,16 @@ mod tests {
     #[test]
     fn test_repo_config_empty_deserialization() {
         let config: RepoConfig = toml::from_str("").unwrap();
-        assert!(config.hooks.is_none());
-        assert!(config.session.is_none());
-        assert!(config.sandbox.is_none());
-        assert!(config.worktree.is_none());
+        assert!(config.hooks().is_none());
+        assert!(config.overrides.is_empty());
     }
 
     #[test]
     fn test_merge_repo_config_session() {
         let config = Config::default();
-        let repo = RepoConfig {
-            session: Some(SessionConfigOverride {
-                default_tool: Some("opencode".to_string()),
-                yolo_mode_default: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig =
+            serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
+                .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert_eq!(merged.session.default_tool, Some("opencode".to_string()));
     }
@@ -1302,15 +1246,12 @@ mod tests {
     #[test]
     fn test_merge_repo_config_sandbox() {
         let config = Config::default();
-        let repo = RepoConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(true),
-                default_image: Some("ghcr.io/example/custom:latest".to_string()),
-                volume_ignores: Some(vec!["node_modules".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(serde_json::json!({"sandbox": {
+            "enabled_by_default": true,
+            "default_image": "ghcr.io/example/custom:latest",
+            "volume_ignores": ["node_modules"]
+        }}))
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert!(merged.sandbox.enabled_by_default);
         // `aoe add --sandbox` reads `config.sandbox.default_image` as its
@@ -1325,14 +1266,10 @@ mod tests {
     #[test]
     fn test_merge_repo_config_worktree() {
         let config = Config::default();
-        let repo = RepoConfig {
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(true),
-                path_template: Some("../wt/{branch}".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(
+            serde_json::json!({"worktree": {"enabled": true, "path_template": "../wt/{branch}"}}),
+        )
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert!(merged.worktree.enabled);
         assert_eq!(merged.worktree.path_template, "../wt/{branch}");
@@ -1554,17 +1491,11 @@ mod tests {
         config.worktree.auto_cleanup = true;
 
         // Only override one field per section
-        let repo = RepoConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(false),
-                ..Default::default()
-            }),
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(serde_json::json!({
+            "sandbox": {"enabled_by_default": false},
+            "worktree": {"enabled": false}
+        }))
+        .unwrap();
 
         let merged = merge_repo_config(config, &repo);
         // Overridden fields should change

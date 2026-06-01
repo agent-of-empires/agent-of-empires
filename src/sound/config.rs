@@ -92,68 +92,6 @@ pub(super) fn is_default_volume(v: &f64) -> bool {
     (*v - 1.0).abs() < 1e-9
 }
 
-/// Profile override for sound config (all fields optional, None = inherit)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SoundConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<SoundMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_start: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_running: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_waiting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_idle: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_approval: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume: Option<f64>,
-}
-
-/// Apply sound config overrides from a profile
-pub fn apply_sound_overrides(target: &mut SoundConfig, source: &SoundConfigOverride) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(ref mode) = source.mode {
-        target.mode = mode.clone();
-    }
-    if source.on_start.is_some() {
-        target.on_start = source.on_start.clone();
-    }
-    if source.on_running.is_some() {
-        target.on_running = source.on_running.clone();
-    }
-    if source.on_waiting.is_some() {
-        target.on_waiting = source.on_waiting.clone();
-    }
-    if source.on_idle.is_some() {
-        target.on_idle = source.on_idle.clone();
-    }
-    if source.on_error.is_some() {
-        target.on_error = source.on_error.clone();
-    }
-    if source.on_approval.is_some() {
-        target.on_approval = source.on_approval.clone();
-    }
-    if let Some(volume) = source.volume {
-        target.volume = volume;
-    }
-}
-
 /// Returns the 15 volume level strings "0.1", "0.2", ..., "1.5"
 pub fn volume_options() -> Vec<String> {
     (1..=15).map(|i| format!("{:.1}", i as f64 * 0.1)).collect()
@@ -216,42 +154,6 @@ mod tests {
         "#;
         let config: SoundConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.mode, SoundMode::Specific("wololo".to_string()));
-    }
-
-    #[test]
-    fn test_sound_config_override_default() {
-        let ovr = SoundConfigOverride::default();
-        assert!(ovr.enabled.is_none());
-        assert!(ovr.mode.is_none());
-    }
-
-    #[test]
-    fn test_apply_sound_overrides() {
-        let mut config = SoundConfig::default();
-        let ovr = SoundConfigOverride {
-            enabled: Some(true),
-            on_error: Some("alarm".to_string()),
-            ..Default::default()
-        };
-        apply_sound_overrides(&mut config, &ovr);
-        assert!(config.enabled);
-        assert_eq!(config.on_error, Some("alarm".to_string()));
-        // Non-overridden fields stay default
-        assert_eq!(config.mode, SoundMode::Random);
-    }
-
-    #[test]
-    fn test_apply_sound_overrides_on_approval() {
-        let mut config = SoundConfig {
-            on_approval: Some("waiting".to_string()),
-            ..Default::default()
-        };
-        let ovr = SoundConfigOverride {
-            on_approval: Some("alarm".to_string()),
-            ..Default::default()
-        };
-        apply_sound_overrides(&mut config, &ovr);
-        assert_eq!(config.on_approval, Some("alarm".to_string()));
     }
 
     #[test]

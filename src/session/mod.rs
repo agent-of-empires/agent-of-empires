@@ -20,8 +20,8 @@ pub mod settings_schema;
 pub mod stop;
 mod storage;
 
-pub use crate::sound::{SoundConfig, SoundConfigOverride};
-pub use crate::status_hooks::{StatusHookConfig, StatusHookConfigOverride};
+pub use crate::sound::SoundConfig;
+pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_update_settings, load_config, save_config, validate_snooze_duration, ClickAction, Config,
@@ -45,9 +45,7 @@ pub use instance::{
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_memory_limit, validate_volume_format,
-    CockpitConfigOverride, HooksConfigOverride, ProfileConfig, SandboxConfigOverride,
-    SessionConfigOverride, ThemeConfigOverride, TmuxConfigOverride, UpdatesConfigOverride,
-    WorktreeConfigOverride,
+    ProfileConfig,
 };
 pub use projects::{Project, ProjectScope};
 pub use repo_config::{

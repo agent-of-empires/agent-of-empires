@@ -2,12 +2,23 @@
 
 use agent_of_empires::session::{
     merge_configs, merge_repo_config, resolve_config, save_config, save_profile_config, Config,
-    HooksConfig, HooksConfigOverride, ProfileConfig, RepoConfig,
+    ProfileConfig, RepoConfig,
 };
 use anyhow::Result;
+use serde_json::json;
 use serial_test::serial;
 
 use crate::common::setup_temp_home;
+
+/// Build a `ProfileConfig` from a sparse override object.
+fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
+    serde_json::from_value(overrides).expect("profile override deserializes")
+}
+
+/// Build a `RepoConfig` from a sparse override object.
+fn repo_from(overrides: serde_json::Value) -> RepoConfig {
+    serde_json::from_value(overrides).expect("repo override deserializes")
+}
 
 // T014: Global hooks resolve when no repo config exists
 #[test]
@@ -41,13 +52,7 @@ fn test_repo_hooks_override_global_per_field() -> Result<()> {
     let resolved = resolve_config("default")?;
 
     // Repo only defines on_create
-    let repo = RepoConfig {
-        hooks: Some(HooksConfig {
-            on_create: vec!["repo_create".to_string()],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let repo = repo_from(json!({"hooks": {"on_create": ["repo_create"]}}));
 
     let merged = merge_repo_config(resolved, &repo);
 
@@ -72,14 +77,9 @@ fn test_repo_hooks_override_both_fields() -> Result<()> {
 
     let resolved = resolve_config("default")?;
 
-    let repo = RepoConfig {
-        hooks: Some(HooksConfig {
-            on_create: vec!["repo_create".to_string()],
-            on_launch: vec!["repo_launch".to_string()],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let repo = repo_from(json!({
+        "hooks": {"on_create": ["repo_create"], "on_launch": ["repo_launch"]}
+    }));
 
     let merged = merge_repo_config(resolved, &repo);
     assert_eq!(merged.hooks.on_create, vec!["repo_create"]);
@@ -106,13 +106,7 @@ fn test_global_profile_hooks_bypass_trust() -> Result<()> {
     assert_eq!(resolved.hooks.on_create, vec!["global_cmd"]);
 
     // With profile override - also no trust check
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_launch: Some(vec!["profile_launch".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_launch": ["profile_launch"]}}));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;
@@ -133,13 +127,7 @@ fn test_profile_overrides_on_create_only() -> Result<()> {
     global.hooks.on_launch = vec!["global_launch".to_string()];
     save_config(&global)?;
 
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_create: Some(vec!["profile_create".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_create": ["profile_create"]}}));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;
@@ -161,26 +149,17 @@ fn test_clearing_profile_hooks_restores_global() -> Result<()> {
     save_config(&global)?;
 
     // First set profile override
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_create: Some(vec!["profile_create".to_string()]),
-            on_launch: Some(vec!["profile_launch".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({
+        "hooks": {"on_create": ["profile_create"], "on_launch": ["profile_launch"]}
+    }));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;
     assert_eq!(resolved.hooks.on_create, vec!["profile_create"]);
     assert_eq!(resolved.hooks.on_launch, vec!["profile_launch"]);
 
-    // Clear profile override (set to None)
-    let cleared_profile = ProfileConfig {
-        hooks: None,
-        ..Default::default()
-    };
-    save_profile_config("default", &cleared_profile)?;
+    // Clear profile override (empty profile)
+    save_profile_config("default", &ProfileConfig::default())?;
 
     let resolved = resolve_config("default")?;
     assert_eq!(resolved.hooks.on_create, vec!["global_create"]);
@@ -202,13 +181,7 @@ fn test_three_level_resolution() -> Result<()> {
     save_config(&global)?;
 
     // Profile: only overrides on_create
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_create: Some(vec!["profile_create".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_create": ["profile_create"]}}));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;
@@ -216,13 +189,7 @@ fn test_three_level_resolution() -> Result<()> {
     assert_eq!(resolved.hooks.on_launch, vec!["global_launch"]);
 
     // Repo: only overrides on_launch
-    let repo = RepoConfig {
-        hooks: Some(HooksConfig {
-            on_launch: vec!["repo_launch".to_string()],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let repo = repo_from(json!({"hooks": {"on_launch": ["repo_launch"]}}));
 
     let final_config = merge_repo_config(resolved, &repo);
     // on_create: profile > global (repo is empty, so profile value stays)
@@ -243,13 +210,7 @@ fn test_merge_configs_hooks_override() -> Result<()> {
     global.hooks.on_create = vec!["g1".to_string(), "g2".to_string()];
     global.hooks.on_launch = vec!["gl".to_string()];
 
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_create: Some(vec!["p1".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_create": ["p1"]}}));
 
     let merged = merge_configs(global, &profile);
     assert_eq!(merged.hooks.on_create, vec!["p1"]);
@@ -284,13 +245,7 @@ fn test_profile_on_destroy_override() -> Result<()> {
     global.hooks.on_destroy = vec!["global_cleanup".to_string()];
     save_config(&global)?;
 
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_destroy: Some(vec!["profile_cleanup".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_destroy": ["profile_cleanup"]}}));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;
@@ -311,13 +266,7 @@ fn test_repo_on_destroy_override() -> Result<()> {
 
     let resolved = resolve_config("default")?;
 
-    let repo = RepoConfig {
-        hooks: Some(HooksConfig {
-            on_destroy: vec!["repo_cleanup".to_string()],
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let repo = repo_from(json!({"hooks": {"on_destroy": ["repo_cleanup"]}}));
 
     let merged = merge_repo_config(resolved, &repo);
     assert_eq!(merged.hooks.on_destroy, vec!["repo_cleanup"]);
@@ -335,13 +284,7 @@ fn test_clearing_profile_on_destroy_restores_global() -> Result<()> {
     global.hooks.on_destroy = vec!["global_cleanup".to_string()];
     save_config(&global)?;
 
-    let profile = ProfileConfig {
-        hooks: Some(HooksConfigOverride {
-            on_destroy: Some(vec!["profile_cleanup".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"hooks": {"on_destroy": ["profile_cleanup"]}}));
     save_profile_config("default", &profile)?;
 
     let resolved = resolve_config("default")?;

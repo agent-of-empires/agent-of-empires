@@ -2,12 +2,17 @@
 
 use agent_of_empires::session::{
     load_profile_config, merge_configs, save_config, save_profile_config, Config, ProfileConfig,
-    SandboxConfigOverride, ThemeConfigOverride, UpdatesConfigOverride, WorktreeConfigOverride,
 };
 use anyhow::Result;
+use serde_json::json;
 use serial_test::serial;
 
 use crate::common::setup_temp_home;
+
+/// Build a `ProfileConfig` from a sparse override object (the on-disk shape).
+fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
+    serde_json::from_value(overrides).expect("profile override deserializes")
+}
 
 #[test]
 #[serial]
@@ -20,13 +25,7 @@ fn test_merge_overrides_global() -> Result<()> {
     save_config(&global)?;
 
     // Save profile override with sandbox.auto_cleanup = false
-    let profile = ProfileConfig {
-        sandbox: Some(SandboxConfigOverride {
-            auto_cleanup: Some(false),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"sandbox": {"auto_cleanup": false}}));
     save_profile_config("default", &profile)?;
 
     // Load and merge
@@ -54,13 +53,7 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
     save_config(&global)?;
 
     // Profile only overrides theme
-    let profile = ProfileConfig {
-        theme: Some(ThemeConfigOverride {
-            name: Some("dark".to_string()),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({"theme": {"name": "dark"}}));
     save_profile_config("default", &profile)?;
 
     let loaded_global = Config::load()?;
@@ -116,40 +109,22 @@ fn test_config_toml_round_trip() -> Result<()> {
 fn test_profile_config_toml_round_trip() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let profile = ProfileConfig {
-        updates: Some(UpdatesConfigOverride {
-            update_check_mode: Some(agent_of_empires::session::config::UpdateCheckMode::Off),
-            check_interval_hours: Some(48),
-            ..Default::default()
-        }),
-        worktree: Some(WorktreeConfigOverride {
-            enabled: Some(true),
-            auto_cleanup: Some(false),
-            ..Default::default()
-        }),
-        sandbox: Some(SandboxConfigOverride {
-            auto_cleanup: Some(false),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile = profile_from(json!({
+        "updates": {"update_check_mode": "off", "check_interval_hours": 48},
+        "worktree": {"enabled": true, "auto_cleanup": false},
+        "sandbox": {"auto_cleanup": false},
+    }));
 
     save_profile_config("default", &profile)?;
     let loaded = load_profile_config("default")?;
 
-    let updates = loaded.updates.unwrap();
-    assert_eq!(
-        updates.update_check_mode,
-        Some(agent_of_empires::session::config::UpdateCheckMode::Off)
-    );
-    assert_eq!(updates.check_interval_hours, Some(48));
-
-    let worktree = loaded.worktree.unwrap();
-    assert_eq!(worktree.enabled, Some(true));
-    assert_eq!(worktree.auto_cleanup, Some(false));
-
-    let sandbox = loaded.sandbox.unwrap();
-    assert_eq!(sandbox.auto_cleanup, Some(false));
+    // Overrides survive the TOML round trip as a sparse tree.
+    let ov = serde_json::to_value(&loaded)?;
+    assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
+    assert_eq!(ov["updates"]["check_interval_hours"], json!(48));
+    assert_eq!(ov["worktree"]["enabled"], json!(true));
+    assert_eq!(ov["worktree"]["auto_cleanup"], json!(false));
+    assert_eq!(ov["sandbox"]["auto_cleanup"], json!(false));
 
     Ok(())
 }

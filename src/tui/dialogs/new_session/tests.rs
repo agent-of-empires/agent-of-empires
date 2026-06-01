@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{merge_configs, Config, ProfileConfig, SessionConfigOverride};
+use crate::session::{merge_configs, Config, ProfileConfig};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fs;
 
@@ -916,14 +916,9 @@ fn help_content_fits_in_dialog() {
 #[test]
 fn test_profile_override_sets_default_tool() {
     let global = Config::default();
-    let profile_config = ProfileConfig {
-        session: Some(SessionConfigOverride {
-            default_tool: Some("opencode".to_string()),
-            yolo_mode_default: None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile_config: ProfileConfig =
+        serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
+            .unwrap();
 
     let resolved = merge_configs(global, &profile_config);
     let dialog = NewSessionDialog::new_with_config(
@@ -944,14 +939,9 @@ fn test_profile_override_beats_global_default_tool() {
     let mut global = Config::default();
     global.session.default_tool = Some("claude".to_string());
 
-    let profile_config = ProfileConfig {
-        session: Some(SessionConfigOverride {
-            default_tool: Some("opencode".to_string()),
-            yolo_mode_default: None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let profile_config: ProfileConfig =
+        serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
+            .unwrap();
 
     let resolved = merge_configs(global, &profile_config);
     assert_eq!(
