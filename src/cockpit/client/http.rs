@@ -24,6 +24,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// the rest.
 #[derive(serde::Deserialize)]
 struct AboutResponse {
+    #[serde(default)]
     cockpit_queue_drain_mode: String,
 }
 
