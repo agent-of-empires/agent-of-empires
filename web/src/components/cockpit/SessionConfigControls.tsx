@@ -65,7 +65,7 @@ export function SessionConfigControls({
   return (
     <div
       data-testid="session-config-controls"
-      className="inline-flex items-center gap-1.5"
+      className="flex flex-wrap items-center gap-1.5"
     >
       {model && (
         <ModelDropdown

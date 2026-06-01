@@ -2355,6 +2355,18 @@
       ]
     },
     {
+      "id": "cockpit.story.composer-mobile-footer-actions",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-stories/composer-mobile-footer-actions.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/Composer.tsx",
+        "web/src/components/cockpit/SessionConfigControls.tsx"
+      ]
+    },
+    {
       "id": "cockpit.story.composer-stop-mid-turn",
       "kind": "live-playwright",
       "risk": "high",
