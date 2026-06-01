@@ -102,6 +102,16 @@ uses text attributes only (bold, italic, dim) so it tracks your theme
 colors. Code-block syntax highlighting is deferred; press `o` to open
 the web dashboard for full-fidelity rendering.
 
+**Tool cards.** Tool calls in the transcript render per kind rather than
+as a single generic line. An edit or write shows the file path and a
+compact added/removed line diff (colored with your theme's diff colors);
+an execute shows the command and a bounded preview of its output; a read
+shows the path and a content preview; a delete shows the target path.
+The diff is capped at 20 changed lines and previews at 12 lines, with a
+"+N more" footer when there is more; press `o` to open the web dashboard
+for the full diff and output. Any other tool kind falls back to the
+generic one-liner (name, arguments, output snapshot).
+
 ### Web composer Enter behavior
 
 On desktop, Enter sends the prompt and Shift+Enter inserts a

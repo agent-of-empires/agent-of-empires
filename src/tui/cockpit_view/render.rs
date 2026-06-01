@@ -1,15 +1,18 @@
 //! Four-pane render of a cockpit session: transcript / status banner /
-//! queued-prompts strip / composer. Tool-card breakdowns are intentionally minimal in the MVP
-//! (one-liner per tool call); rich diff / image / file previews are
-//! deferred to the followup issues called out in the implementation
-//! plan. Press `o` from the transcript pane to open the web cockpit
-//! for full-fidelity inspection.
+//! queued-prompts strip / composer. Tool calls render through a
+//! per-kind dispatcher (`render_tool_lines`): edit/write show a compact
+//! line diff, execute shows the command and an output preview, read
+//! shows the path and a content preview, delete shows the path, and any
+//! other kind falls back to the generic one-liner. Image previews and
+//! syntax highlighting stay deferred to the web cockpit; press `o` from
+//! the transcript pane to open it for full-fidelity inspection.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use similar::{ChangeTag, TextDiff};
 
 use super::input::Focus;
 use super::reducer::{ActivityRow, CockpitTranscript, NoteKind, ToolCallRow};
@@ -221,7 +224,12 @@ fn render_transcript(frame: &mut Frame, area: Rect, theme: &Theme, state: &Cockp
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = transcript_lines(&state.transcript, state.selected_approval, state.focus);
+    let lines = transcript_lines(
+        &state.transcript,
+        state.selected_approval,
+        state.focus,
+        theme,
+    );
     // Clamp scroll against the *wrapped* visual row count, not
     // `lines.len()`. Streaming `AgentMessage` rows grew text inside
     // a single logical line: Paragraph's wrap inflated the
@@ -520,6 +528,7 @@ fn transcript_lines<'a>(
     transcript: &'a CockpitTranscript,
     selected_approval: Option<usize>,
     focus: Focus,
+    theme: &Theme,
 ) -> Vec<Line<'a>> {
     let mut out: Vec<Line<'a>> = Vec::new();
     let mut approval_render_idx: usize = 0;
@@ -537,7 +546,7 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::ToolCall(tool) => {
-                out.extend(render_tool_lines(tool));
+                out.extend(render_tool_lines(tool, theme));
                 out.push(Line::default());
             }
             ActivityRow::Approval(row) => {
@@ -625,7 +634,26 @@ fn truncate_chars(s: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-fn render_tool_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
+/// Arg-name variants the agents use for a tool's primary path, command,
+/// and edit before/after text. Mirrors the web cockpit's `pickStr` key
+/// lists in `web/src/components/cockpit/ToolCards.tsx` so the TUI and the
+/// dashboard surface the same field across agent versions.
+const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
+const OLD_KEYS: &[&str] = &["old_string", "oldString", "old_str"];
+const NEW_KEYS: &[&str] = &["new_string", "newString", "new_str", "content"];
+const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
+
+/// +/- lines beyond this budget collapse into a "+N more" footer so a
+/// large Edit can't flood the transcript on a narrow terminal.
+const TOOL_DIFF_MAX_LINES: usize = 20;
+/// Read/execute output previews are capped to this many lines.
+const TOOL_PREVIEW_MAX_LINES: usize = 12;
+
+/// Render one tool call. Dispatches on `tool.kind` (the lowercased ACP
+/// `ToolKind`) to a per-kind body; any kind we don't special-case, or
+/// one whose args don't parse into the expected shape, falls back to the
+/// generic one-liner so unknown tools still render.
+fn render_tool_lines(tool: &ToolCallRow, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = format!(
         "tool {} · {}",
@@ -640,6 +668,176 @@ fn render_tool_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         header,
         Style::default().add_modifier(Modifier::BOLD),
     )));
+
+    let args = parse_args_object(&tool.args);
+    let body = match tool.kind.as_str() {
+        "edit" | "write" => render_edit_body(args.as_ref(), theme),
+        "execute" => render_execute_body(args.as_ref(), tool),
+        "read" => render_read_body(args.as_ref(), tool),
+        "delete" => render_delete_body(args.as_ref()),
+        _ => None,
+    };
+    lines.extend(body.unwrap_or_else(|| render_generic_body(tool)));
+    lines
+}
+
+/// Parse `args_preview` as a JSON object. Mirrors the web cockpit's
+/// `parseJsonObject`: returns `None` for non-object, unparsable, or
+/// truncated payloads so callers fall back to the generic renderer.
+fn parse_args_object(args: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// First string-valued key from `keys`, mirroring the web `pickStr`.
+fn pick_str<'a>(
+    args: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    let args = args?;
+    keys.iter().find_map(|k| match args.get(*k) {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// Edit/Write: the file path plus a compact line diff built from the
+/// `old_string`/`new_string` (or `content`) args, the same source the
+/// web Edit card uses. `None` when no after-text arg is present (the
+/// generic renderer then handles it).
+fn render_edit_body(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    theme: &Theme,
+) -> Option<Vec<Line<'static>>> {
+    let new = pick_str(args, NEW_KEYS)?;
+    let old = pick_str(args, OLD_KEYS).unwrap_or("");
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
+    let path = pick_str(args, PATH_KEYS).unwrap_or("(unknown file)");
+    let mut lines = vec![Line::from(format!("  {path}"))];
+    lines.extend(diff_lines(old, new, theme));
+    Some(lines)
+}
+
+/// Compact line diff in the style of `src/tui/diff/render.rs`: only the
+/// changed (`+`/`-`) lines, bounded to `TOOL_DIFF_MAX_LINES`.
+fn diff_lines(old: &str, new: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let diff = TextDiff::from_lines(old, new);
+    let mut out = Vec::new();
+    let mut hidden = 0usize;
+    for change in diff.iter_all_changes() {
+        let (sign, style) = match change.tag() {
+            ChangeTag::Delete => ("-", Style::default().fg(theme.diff_delete)),
+            ChangeTag::Insert => ("+", Style::default().fg(theme.diff_add)),
+            // Context lines carry no signal in the compact card; drop them.
+            ChangeTag::Equal => continue,
+        };
+        if out.len() >= TOOL_DIFF_MAX_LINES {
+            hidden += 1;
+            continue;
+        }
+        let text = change.value();
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        out.push(Line::from(Span::styled(format!("  {sign} {text}"), style)));
+    }
+    if hidden > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  … +{hidden} more diff lines; press `o` for full"),
+            Style::default().fg(theme.dimmed),
+        )));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  (no textual changes)",
+            Style::default().fg(theme.dimmed),
+        )));
+    }
+    out
+}
+
+/// Execute: the command plus a bounded preview of its output.
+fn render_execute_body(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    tool: &ToolCallRow,
+) -> Option<Vec<Line<'static>>> {
+    let command = pick_str(args, CMD_KEYS)?;
+    let cmd_lines: Vec<&str> = command.lines().collect();
+    let mut lines = vec![Line::from(format!(
+        "  $ {}",
+        cmd_lines.first().copied().unwrap_or("")
+    ))];
+    if cmd_lines.len() > 1 {
+        lines.push(Line::from(Span::styled(
+            format!("    (+{} more command lines)", cmd_lines.len() - 1),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    lines.extend(output_preview_lines(tool));
+    Some(lines)
+}
+
+/// Read: the file path plus a bounded preview of the read content.
+fn render_read_body(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    tool: &ToolCallRow,
+) -> Option<Vec<Line<'static>>> {
+    let path = pick_str(args, PATH_KEYS)?;
+    let mut lines = vec![Line::from(format!("  {path}"))];
+    lines.extend(output_preview_lines(tool));
+    Some(lines)
+}
+
+/// Delete: just the target path.
+fn render_delete_body(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Vec<Line<'static>>> {
+    let path = pick_str(args, PATH_KEYS)?;
+    Some(vec![Line::from(format!("  {path}"))])
+}
+
+/// Bounded preview of a tool's completion content, shared by the read
+/// and execute cards. Falls back to a status word before completion or
+/// when the agent shipped no body.
+fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
+    let Some(completion) = &tool.completed else {
+        return vec![Line::from(Span::styled(
+            "  (running…)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))];
+    };
+    if completion.content.is_empty() {
+        let msg = if completion.ok {
+            "  (no output)"
+        } else {
+            "  (tool failed; press `o` for details)"
+        };
+        return vec![Line::from(msg.to_string())];
+    }
+    let mut out = Vec::new();
+    let total = completion.content.lines().count();
+    for line in completion.content.lines().take(TOOL_PREVIEW_MAX_LINES) {
+        out.push(Line::from(format!("  {line}")));
+    }
+    if total > TOOL_PREVIEW_MAX_LINES {
+        out.push(Line::from(Span::styled(
+            format!(
+                "  … +{} more lines; press `o` for full",
+                total - TOOL_PREVIEW_MAX_LINES
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    out
+}
+
+/// Generic one-liner fallback for unknown tool kinds: the truncated args
+/// preview plus a truncated output snapshot. This is the pre-#1702
+/// rendering, preserved verbatim so unrecognized tools are unchanged.
+fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if !tool.args.is_empty() {
         let truncated = match truncate_chars(&tool.args, 200) {
             Some(head) => format!("  $ {head}…"),
@@ -992,5 +1190,126 @@ mod tests {
             dump.contains(&format!("/{last_name}")),
             "selected row /{last_name} scrolled off-screen: {dump:?}"
         );
+    }
+    fn tool_row(kind: &str, args: &str, completion: Option<(bool, &str)>) -> ToolCallRow {
+        use super::super::reducer::ToolCompletion;
+        ToolCallRow {
+            name: "Tool".into(),
+            kind: kind.into(),
+            args: args.into(),
+            completed: completion.map(|(ok, content)| ToolCompletion {
+                ok,
+                content: content.into(),
+            }),
+        }
+    }
+
+    fn joined(lines: &[Line]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn edit_kind_renders_added_and_removed_diff_lines() {
+        let row = tool_row(
+            "edit",
+            r#"{"file_path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
+            None,
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("src/a.rs"), "path missing: {out:?}");
+        assert!(
+            out.contains("- let x = 1;"),
+            "removed line missing: {out:?}"
+        );
+        assert!(out.contains("+ let x = 2;"), "added line missing: {out:?}");
+    }
+
+    #[test]
+    fn write_kind_renders_all_inserts_from_content() {
+        let row = tool_row(
+            "write",
+            r#"{"file_path":"new.txt","content":"line one\nline two"}"#,
+            None,
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("new.txt"));
+        assert!(out.contains("+ line one"), "{out:?}");
+        assert!(out.contains("+ line two"), "{out:?}");
+    }
+
+    #[test]
+    fn edit_diff_caps_at_budget_with_more_footer() {
+        // 30 changed lines exceed TOOL_DIFF_MAX_LINES (20).
+        let new_body: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let args =
+            serde_json::json!({ "file_path": "big.txt", "old_string": "", "new_string": new_body });
+        let row = tool_row("edit", &args.to_string(), None);
+        let lines = render_tool_lines(&row, &Theme::default());
+        let plus = lines
+            .iter()
+            .filter(|l| line_text(l).trim_start().starts_with("+ "))
+            .count();
+        assert_eq!(plus, TOOL_DIFF_MAX_LINES, "diff not capped: {plus}");
+        assert!(
+            joined(&lines).contains("+10 more diff lines"),
+            "missing more-footer: {:?}",
+            joined(&lines)
+        );
+    }
+
+    #[test]
+    fn execute_kind_renders_command_and_output_preview() {
+        let row = tool_row(
+            "execute",
+            r#"{"command":"ls -la"}"#,
+            Some((true, "file_a\nfile_b")),
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("$ ls -la"), "command missing: {out:?}");
+        assert!(out.contains("file_a"), "output preview missing: {out:?}");
+        assert!(out.contains("file_b"), "{out:?}");
+    }
+
+    #[test]
+    fn read_kind_renders_path_and_content_preview() {
+        let row = tool_row(
+            "read",
+            r#"{"path":"src/lib.rs"}"#,
+            Some((true, "pub fn main() {}")),
+        );
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("src/lib.rs"), "path missing: {out:?}");
+        assert!(
+            out.contains("pub fn main()"),
+            "content preview missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn delete_kind_renders_only_path() {
+        let row = tool_row("delete", r#"{"path":"old.txt"}"#, Some((true, "")));
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("old.txt"), "path missing: {out:?}");
+        // No diff gutters for a delete.
+        assert!(!out.contains("+ "), "{out:?}");
+        assert!(!out.contains("- "), "{out:?}");
+    }
+
+    #[test]
+    fn unknown_kind_falls_back_to_generic_one_liner() {
+        let row = tool_row("fetch", "https://example.com", Some((true, "200 OK")));
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        // Generic body shows the raw args prefixed with `$ ` and the output.
+        assert!(out.contains("$ https://example.com"), "{out:?}");
+        assert!(out.contains("200 OK"), "{out:?}");
+    }
+
+    #[test]
+    fn edit_with_unparsable_args_falls_back_to_generic() {
+        // Truncated JSON (16KB ingest cap can clip mid-object) must not
+        // panic or vanish; it falls through to the generic renderer.
+        let row = tool_row("edit", r#"{"file_path":"a.rs","old_str"#, None);
+        let out = joined(&render_tool_lines(&row, &Theme::default()));
+        assert!(out.contains("$ {\"file_path\""), "{out:?}");
     }
 }

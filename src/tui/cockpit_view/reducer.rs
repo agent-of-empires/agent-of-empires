@@ -80,6 +80,12 @@ pub enum ActivityRow {
 #[derive(Debug, Clone)]
 pub struct ToolCallRow {
     pub name: String,
+    /// ACP `ToolKind` lowercased (`read` / `edit` / `delete` / `execute`
+    /// / …), forwarded from `ToolCall::kind`. Drives the per-kind
+    /// renderer in `render_tool_lines`; empty string falls back to the
+    /// generic one-liner. `ToolCallUpdated` does not carry kind, so the
+    /// value set at `ToolCallStarted` is authoritative for the row.
+    pub kind: String,
     pub args: String,
     pub completed: Option<ToolCompletion>,
 }
@@ -229,6 +235,7 @@ impl CockpitTranscript {
                 self.flush_pending_chunk();
                 let row = ToolCallRow {
                     name: tool_call.name.clone(),
+                    kind: tool_call.kind.clone(),
                     args: tool_call.args_preview.clone(),
                     completed: None,
                 };
@@ -561,6 +568,22 @@ mod tests {
                 let c = row.completed.as_ref().expect("completed");
                 assert!(c.ok);
                 assert_eq!(c.content, "ok");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn tool_call_started_carries_kind_to_row() {
+        let mut t = CockpitTranscript::new("s-1");
+        let mut tc = tool("t-1", "Edit");
+        tc.kind = "edit".into();
+        tc.args_preview = r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into();
+        t.apply(&frame(1, Event::ToolCallStarted { tool_call: tc }));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.kind, "edit");
+                assert!(row.args.contains("old_string"));
             }
             _ => panic!("expected ToolCall"),
         }

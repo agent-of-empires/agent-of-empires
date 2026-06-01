@@ -19,6 +19,7 @@ mod harness;
 
 mod cli;
 mod cockpit_focus_isolation_e2e;
+mod cockpit_tool_cards_e2e;
 mod command_palette;
 mod errors;
 mod intro;
