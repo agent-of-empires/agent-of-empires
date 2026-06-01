@@ -26,6 +26,7 @@ mod snooze_duration;
 mod sort_picker;
 mod tool_picker;
 mod update_confirm;
+mod worktree_name;
 
 pub use changelog::ChangelogDialog;
 pub use command_palette::{
@@ -56,6 +57,7 @@ pub use snooze_duration::SnoozeDurationDialog;
 pub use sort_picker::SortPickerDialog;
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
+pub use worktree_name::{WorktreeNameData, WorktreeNameDialog};
 
 pub enum DialogResult<T> {
     Continue,

@@ -17,7 +17,7 @@ use crate::tui::dialogs::{
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HookTrustAction,
     HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
     PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
-    RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog,
+    RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -863,6 +863,11 @@ impl HomeView {
             let _ = dialog.handle_click(col, row);
             return true;
         }
+        if self.worktree_name_dialog.is_some() {
+            // Keyboard-driven dialog; swallow clicks so the list underneath
+            // doesn't react while it's open.
+            return true;
+        }
         if let Some(dialog) = &mut self.restart_dialog {
             let _ = dialog.handle_click(col, row);
             return true;
@@ -1528,6 +1533,27 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.worktree_name_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.worktree_name_dialog = None;
+                }
+                DialogResult::Submit(data) => {
+                    self.worktree_name_dialog = None;
+                    if let Err(e) =
+                        self.set_worktree_name_for_selected(&data.name, data.rename_branch)
+                    {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Edit Workdir Name Failed",
+                            &format!("Could not edit the workdir name: {e}"),
+                        ));
+                    }
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.restart_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -1954,6 +1980,7 @@ impl HomeView {
             ActionId::Stop => self.stop_selected(),
             ActionId::Delete => self.open_delete_for_selected(),
             ActionId::Rename => self.open_rename_for_selected(),
+            ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_serve(),
             ActionId::Settings => self.open_settings(),
@@ -3068,6 +3095,52 @@ impl HomeView {
         }
     }
 
+    /// Open the edit-workdir-name dialog for the selected session. Only
+    /// valid for an aoe-managed worktree session that is not running; other
+    /// cases surface an info dialog explaining why.
+    pub(super) fn open_worktree_name_for_selected(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let snapshot = self.get_instance(&id).map(|inst| {
+            (
+                inst.worktree_info.clone(),
+                inst.status,
+                inst.project_path.clone(),
+            )
+        });
+        let Some((worktree_info, status, project_path)) = snapshot else {
+            return;
+        };
+        let Some(wt) = worktree_info else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Not a Worktree Session",
+                "This session does not use a worktree, so it has no workdir name to edit.",
+            ));
+            return;
+        };
+        if !wt.managed_by_aoe {
+            self.info_dialog = Some(InfoDialog::new(
+                "Worktree Not Managed by AoE",
+                "This worktree was attached rather than created by AoE, so its workdir name cannot be edited.",
+            ));
+            return;
+        }
+        if status.blocks_worktree_edit() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Session Active",
+                "Stop the session before editing its workdir name.",
+            ));
+            return;
+        }
+        let current_dir = std::path::Path::new(&project_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&project_path)
+            .to_string();
+        self.worktree_name_dialog = Some(WorktreeNameDialog::new(&current_dir, &wt.branch));
+    }
+
     /// Open the delete dialog (or a force-remove confirm, or a group
     /// delete-options dialog) for the sidebar's current selection. Mirrors
     /// the gating of the historical `'d'` / `'D'` key handlers:
@@ -3413,6 +3486,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.rename_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
+        if let Some(ref mut dialog) = self.worktree_name_dialog {
             dialog.handle_paste(text);
             return;
         }
@@ -3833,6 +3910,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.rename_dialog {
+            dialog.handle_paste(&s);
+            return;
+        }
+        if let Some(ref mut dialog) = self.worktree_name_dialog {
             dialog.handle_paste(&s);
             return;
         }

@@ -595,6 +595,7 @@ impl HomeView {
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
+            worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
             hook_trust_dialog,
