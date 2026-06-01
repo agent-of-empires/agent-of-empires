@@ -69,6 +69,10 @@ test("description edit persists across reload", async ({ serve, page }) => {
 
   const desc = page.getByPlaceholder("What this profile is for");
   await desc.fill("client repos");
+  // The field is a controlled input (value={description}); wait until the
+  // DOM value reflects committed React state before saving, otherwise the
+  // Save handler can read a stale empty description and PATCH null.
+  await expect(desc).toHaveValue("client repos");
   await page.getByRole("button", { name: "Save" }).click();
 
   await expect(async () => {
