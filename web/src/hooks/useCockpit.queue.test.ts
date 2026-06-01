@@ -270,6 +270,7 @@ async function flushAsync(): Promise<void> {
 describe("useCockpit drain race (#1144)", () => {
   let promptPostCount: number;
   let promptPostStatus: number;
+  let promptPostBody: string;
   let promptPostBodies: string[];
   let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
 
@@ -277,6 +278,7 @@ describe("useCockpit drain race (#1144)", () => {
     sockets.length = 0;
     promptPostCount = 0;
     promptPostStatus = 200;
+    promptPostBody = "simulated failure";
     promptPostBodies = [];
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
@@ -292,7 +294,7 @@ describe("useCockpit drain race (#1144)", () => {
             promptPostBodies.push(init.body);
           }
           if (promptPostStatus >= 400) {
-            return new Response("simulated failure", { status: promptPostStatus });
+            return new Response(promptPostBody, { status: promptPostStatus });
           }
           return new Response("{}", { status: promptPostStatus });
         }
@@ -476,6 +478,128 @@ describe("useCockpit drain race (#1144)", () => {
     expect(result.current.state.workerIdleStopped).toBe(true);
     expect(promptPostCount).toBe(1);
     expect(promptPostBodies[0]).toContain("parked before dormancy");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("keeps an idle-dormant prompt queued without an error banner on a worker_not_ready 503 (#1748)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-idle-503", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // Worker reaped for inactivity: dormant.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-503",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    // The wake POST goes out, but the respawn did not finish within the
+    // server's wait window, so it returns the typed retryable 503. The
+    // prompt must NOT be dropped (it re-queues) and NO error banner shows;
+    // the drain re-fires it once the worker comes online. See #1748.
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
+    );
+  });
+
+  it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {
+    // Control: the capacity 503 needs operator action, so unlike
+    // worker_not_ready it must keep its banner rather than being silently
+    // swallowed as a transient.
+    const { result } = renderHook(() => useCockpit("sess-idle-cap", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-cap",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_capacity_full (4/4)";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+
+    expect(result.current.state.lastError ?? "").toContain(
+      "Could not send prompt (503)",
+    );
+  });
+
+  it("keeps the error banner on a worker_not_ready 503 for an attachment send (#1748)", async () => {
+    // Attachments cannot be re-queued (the local queue is text-only), so a
+    // worker_not_ready 503 for an attachment send has no retry path. The
+    // banner must show rather than being suppressed as transient.
+    const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-attach",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "shot.png",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    expect(result.current.state.lastError ?? "").toContain(
+      "Could not send prompt (503)",
+    );
     expect(result.current.state.queuedPrompts).toEqual([]);
   });
 
