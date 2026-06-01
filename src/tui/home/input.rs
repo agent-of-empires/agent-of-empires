@@ -3323,6 +3323,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.intro_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.info_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.changelog_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
 
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
             Some((col, row))

@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::hover::HoverState;
 use crate::tui::styles::Theme;
 use crate::update::install::InstallMethod;
 
@@ -17,6 +18,9 @@ pub struct UpdateConfirmDialog {
     selected: bool, // true = Yes, false = No
     yes_button_area: Rect,
     no_button_area: Rect,
+    /// Which Yes/No button the mouse is over, for the hover highlight.
+    /// Visual only; never changes `selected`.
+    hover: HoverState,
 }
 
 impl UpdateConfirmDialog {
@@ -40,6 +44,7 @@ impl UpdateConfirmDialog {
             selected: false,
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
@@ -54,10 +59,12 @@ impl UpdateConfirmDialog {
         None
     }
 
-    /// Hover does not change the Yes/No selection. See `ConfirmDialog`
-    /// for the rationale.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the Yes/No button under the cursor without changing
+    /// `selected`. See `ConfirmDialog::handle_hover` for the rationale.
+    /// Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.yes_button_area, self.no_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -113,7 +120,7 @@ impl UpdateConfirmDialog {
             Paragraph::new(self.prompt_block.as_str()).style(Style::default().fg(theme.text));
         frame.render_widget(body, chunks[0]);
 
-        let (yes, no) = render_yes_no(frame, chunks[1], theme, self.selected);
+        let (yes, no) = render_yes_no(frame, chunks[1], theme, self.selected, self.hover.current());
         self.yes_button_area = yes;
         self.no_button_area = no;
     }

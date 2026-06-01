@@ -7,6 +7,7 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::components::buttons::render_yes_no;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
+use crate::tui::components::hover::HoverState;
 use crate::tui::styles::Theme;
 
 /// Options for what to clean up when deleting a session
@@ -66,6 +67,9 @@ pub struct UnifiedDeleteDialog {
     /// have dedicated fields above because the renderer returns them
     /// from `render_yes_no` already; everything else lives here.
     focusable_rects: Vec<(FocusElement, Rect)>,
+    /// Which Yes/No button the mouse is over, for the hover highlight.
+    /// Visual only; never moves keyboard `focus`.
+    hover: HoverState,
 }
 
 impl UnifiedDeleteDialog {
@@ -110,6 +114,7 @@ impl UnifiedDeleteDialog {
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
             focusable_rects: Vec::new(),
+            hover: HoverState::default(),
         }
     }
 
@@ -136,11 +141,15 @@ impl UnifiedDeleteDialog {
         None
     }
 
-    /// Hover does not change focus on the checkboxes or Yes/No buttons.
-    /// See `ConfirmDialog::handle_hover` for the rationale. Click still
-    /// moves focus and (for checkboxes) toggles state.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the Yes/No button under the cursor. Hover never moves
+    /// keyboard `focus` (mouse drift between reading the dialog and
+    /// pressing Enter would otherwise silently flip which action fires);
+    /// it only drives the visual highlight. Click still moves focus and
+    /// (for checkboxes) toggles state. Returns `true` when the
+    /// highlighted button changed so the caller can redraw.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.yes_button_area, self.no_button_area])
     }
 
     fn hit_focusable(&self, col: u16, row: u16) -> Option<FocusElement> {
@@ -503,7 +512,13 @@ impl UnifiedDeleteDialog {
     }
 
     fn render_buttons(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let (yes, no) = render_yes_no(frame, area, theme, self.focus == FocusElement::YesButton);
+        let (yes, no) = render_yes_no(
+            frame,
+            area,
+            theme,
+            self.focus == FocusElement::YesButton,
+            self.hover.current(),
+        );
         self.yes_button_area = yes;
         self.no_button_area = no;
     }
@@ -819,18 +834,34 @@ mod tests {
     }
 
     #[test]
-    fn hover_never_changes_focus() {
-        // Hover must leave focus alone; otherwise mouse drift between
-        // reading the dialog and pressing Enter / Space silently shifts
-        // which element the next keystroke targets.
+    fn hover_highlights_button_without_changing_focus() {
+        // Hover drives the visual highlight only; it must leave focus
+        // alone, otherwise mouse drift between reading the dialog and
+        // pressing Enter / Space silently shifts which element the next
+        // keystroke targets.
         let mut dialog = simple_dialog();
         stage_rects_for_simple(&mut dialog);
         dialog.focus = FocusElement::NoButton;
-        // Over Yes, over No, over checkbox row, off-rects; all no-ops.
-        for (col, row) in [(12, 8), (20, 8), (10, 5), (50, 50)] {
-            assert!(!dialog.handle_hover(col, row), "hover at ({col},{row})");
-            assert_eq!(dialog.focus, FocusElement::NoButton);
-        }
+        let yes = dialog.yes_button_area;
+        let no = dialog.no_button_area;
+
+        // Over Yes: highlight Yes, focus stays put.
+        assert!(dialog.handle_hover(12, 8));
+        assert_eq!(dialog.hover.current(), Some(yes));
+        assert_eq!(dialog.focus, FocusElement::NoButton);
+
+        // Over No: highlight follows, focus still unchanged.
+        assert!(dialog.handle_hover(20, 8));
+        assert_eq!(dialog.hover.current(), Some(no));
+        assert_eq!(dialog.focus, FocusElement::NoButton);
+
+        // Same cell again: nothing changed, so no redraw is requested.
+        assert!(!dialog.handle_hover(20, 8));
+
+        // Off the buttons: highlight clears, focus unchanged.
+        assert!(dialog.handle_hover(50, 50));
+        assert_eq!(dialog.hover.current(), None);
+        assert_eq!(dialog.focus, FocusElement::NoButton);
     }
 
     #[test]
