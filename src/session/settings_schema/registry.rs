@@ -3,12 +3,27 @@
 //! This is the single list the TUI, web, and server all consume.
 
 use super::FieldDescriptor;
-use crate::session::config::CockpitConfig;
+use crate::session::config::{
+    CockpitConfig, LoggingConfig, SandboxConfig, SessionConfig, ThemeConfig, TmuxConfig,
+    UpdatesConfig, WebConfig, WorktreeConfig,
+};
+use crate::sound::SoundConfig;
+use crate::status_hooks::StatusHookConfig;
 
 /// All settings descriptors, in section then field order.
 pub fn schema() -> Vec<FieldDescriptor> {
     let mut out = Vec::new();
+    out.extend(ThemeConfig::settings_descriptors());
+    out.extend(UpdatesConfig::settings_descriptors());
+    out.extend(WorktreeConfig::settings_descriptors());
+    out.extend(SandboxConfig::settings_descriptors());
+    out.extend(TmuxConfig::settings_descriptors());
+    out.extend(SessionConfig::settings_descriptors());
+    out.extend(SoundConfig::settings_descriptors());
+    out.extend(StatusHookConfig::settings_descriptors());
+    out.extend(WebConfig::settings_descriptors());
     out.extend(CockpitConfig::settings_descriptors());
+    out.extend(LoggingConfig::settings_descriptors());
     out
 }
 
