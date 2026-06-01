@@ -615,7 +615,11 @@ pub struct SessionConfig {
     /// Default coding tool for new sessions. If not set or the tool is
     /// unavailable, falls back to the first available tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "Default Tool", widget = "custom:default-tool")]
+    #[setting(
+        label = "Default Tool",
+        widget = "custom:default-tool",
+        category = "Agents"
+    )]
     pub default_tool: Option<String>,
 
     /// Enable YOLO mode by default for new sessions (skip permission prompts).
@@ -629,7 +633,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Agent Extra Args",
         widget = "list",
-        web = "local_only:per-agent argv injection, a host execution surface"
+        web = "local_only:per-agent argv injection, a host execution surface",
+        category = "Agents"
     )]
     pub agent_extra_args: HashMap<String, String>,
 
@@ -639,7 +644,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Agent Command Override",
         widget = "list",
-        web = "local_only:replaces the agent binary, a host execution surface"
+        web = "local_only:replaces the agent binary, a host execution surface",
+        category = "Agents"
     )]
     pub agent_command_override: HashMap<String, String>,
 
@@ -648,7 +654,7 @@ pub struct SessionConfig {
     /// agent's settings file; status detection falls back to tmux pane
     /// content parsing, which is less reliable.
     #[serde(default = "default_true")]
-    #[setting(label = "Agent Status Hooks", widget = "toggle")]
+    #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
@@ -658,7 +664,7 @@ pub struct SessionConfig {
     /// The AOE_MOUSE_CAPTURE env var remains an opt-out backstop and can still
     /// force capture off when set.
     #[serde(default = "default_true")]
-    #[setting(label = "Mouse Capture", widget = "toggle")]
+    #[setting(label = "Mouse Capture", widget = "toggle", category = "Interaction")]
     pub mouse_capture: bool,
 
     /// User-defined agents: name=command (e.g. lenovo-claude=ssh -t lenovo
@@ -668,7 +674,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Custom Agents",
         widget = "list",
-        web = "local_only:maps names to arbitrary shell commands, a host execution surface"
+        web = "local_only:maps names to arbitrary shell commands, a host execution surface",
+        category = "Agents"
     )]
     pub custom_agents: HashMap<String, String>,
 
@@ -679,7 +686,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Agent Detect As",
         widget = "list",
-        web = "local_only:part of the agent-command surface, edited locally only"
+        web = "local_only:part of the agent-command surface, edited locally only",
+        category = "Agents"
     )]
     pub agent_detect_as: HashMap<String, String>,
 
@@ -741,7 +749,11 @@ pub struct SessionConfig {
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
     /// additional exits if you need to send C-q through to the agent.
     #[serde(default = "default_live_send_exit_chord")]
-    #[setting(label = "Live-Send Exit Chord", widget = "text")]
+    #[setting(
+        label = "Live-Send Exit Chord",
+        widget = "text",
+        category = "Interaction"
+    )]
     pub live_send_exit_chord: String,
 
     /// What to do after creating a new session: drop into tmux (default,
@@ -751,7 +763,8 @@ pub struct SessionConfig {
     #[setting(
         label = "New Session Attach Mode",
         widget = "select",
-        options = "tmux:Tmux,live_send:Live mode"
+        options = "tmux:Tmux,live_send:Live mode",
+        category = "Interaction"
     )]
     pub new_session_attach_mode: NewSessionAttachMode,
 
@@ -763,7 +776,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Default Attach Mode",
         widget = "select",
-        options = "tmux:Tmux,live_send:Live mode"
+        options = "tmux:Tmux,live_send:Live mode",
+        category = "Interaction"
     )]
     pub default_attach_mode: NewSessionAttachMode,
 
@@ -776,7 +790,8 @@ pub struct SessionConfig {
     #[setting(
         label = "Mouse Click Action",
         widget = "select",
-        options = "live_send:Live mode,select_only:Select only"
+        options = "live_send:Live mode,select_only:Select only",
+        category = "Interaction"
     )]
     pub click_action: ClickAction,
 
