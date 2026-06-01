@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
 use crate::cockpit::protocol::{
-    ApprovalDecisionWire, ContextPrimerResponse, PromptRequest, ReplayResponse,
+    ApprovalDecisionWire, ContextPrimerResponse, FilesResponse, PromptRequest, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
 
@@ -169,6 +169,18 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, session_id).await?;
         Ok(res.json::<ContextPrimerResponse>().await?)
+    }
+
+    /// `GET /api/sessions/{id}/cockpit/files`. Workspace file list for
+    /// the composer's `@`-mention picker.
+    pub async fn files(&self, session_id: &str) -> Result<FilesResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/cockpit/files",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<FilesResponse>().await?)
     }
 
     /// `POST /api/sessions/{id}/cockpit/prompt`.
