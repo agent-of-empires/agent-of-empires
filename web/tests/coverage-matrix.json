@@ -2740,6 +2740,44 @@
       ]
     },
     {
+      "id": "sidebar.multi-select-logic",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sidebarSelection.test.ts",
+        "src/lib/__tests__/sidebarOptimistic.test.ts",
+        "src/lib/__tests__/sidebarBulk.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.multi-select-gestures",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/sidebar-multi-select.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.bulk-triage-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/sidebar-bulk-triage.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
+      ]
+    },
+    {
       "id": "triage.cockpit-banners",
       "kind": "vitest",
       "risk": "medium",
