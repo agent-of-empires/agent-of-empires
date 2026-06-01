@@ -348,6 +348,41 @@
       ]
     },
     {
+      "id": "profiles.page",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/profiles-page.spec.ts"
+      ],
+      "components": [
+        "web/src/components/profiles/ProfilesPage.tsx"
+      ]
+    },
+    {
+      "id": "profiles.hooks-readonly",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/profiles/__tests__/HooksReadOnlyPanel.test.tsx",
+        "src/lib/profileHooks.test.ts"
+      ],
+      "components": [
+        "web/src/components/profiles/HooksReadOnlyPanel.tsx"
+      ]
+    },
+    {
+      "id": "profiles.write-guard",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/components/profiles/__tests__/ProfilesPage.test.tsx"
+      ],
+      "components": [
+        "web/src/components/profiles/ProfilesPage.tsx"
+      ]
+    },
+    {
       "id": "profiles.override",
       "kind": "live-playwright",
       "risk": "high",

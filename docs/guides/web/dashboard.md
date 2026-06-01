@@ -98,6 +98,14 @@ The "Snoozed & archived" section sits at the very bottom of the sidebar and aggr
 
 In read-only mode (`aoe serve --read-only`) the three menu entries are hidden, matching the existing read-only gate on Delete.
 
+## Profiles
+
+The Profiles entry in the sidebar footer opens a dedicated page (`/profiles`) for managing configuration profiles. It lists every profile in a left rail with a **default** badge, and the detail panel lets you create, rename, delete, set the default, and edit a profile's description. The **Edit configuration** buttons deep-link into the matching Settings tab scoped to that profile (`/settings/<tab>?profile=<name>`), where the per-section editing (including the passphrase-gated sandbox and worktree fields) lives.
+
+Lifecycle hooks are shown **read-only** on this page. Each event (On Create, On Launch, On Destroy) is labeled with its source: a profile override, an override that disables the inherited commands (an explicit empty list), the inherited global commands, or none. Hooks run arbitrary shell commands when sessions are created, launched, and destroyed, so a hooks section set through the dashboard API would be remote code execution. For that reason hook editing is blocked server-side and the dashboard never writes hooks; edit them in your config file or the TUI settings. This mirrors the agent-command and environment fields (`agent_command_override`, `agent_extra_args`, `extra_env`, `custom_agents`, `agent_detect_as`), which are also not editable from the web.
+
+In read-only mode (`aoe serve --read-only`) the create / rename / delete / set-default / description controls are hidden; the profile list and the read-only hooks view stay visible.
+
 ## On mobile
 
 Below the `md` breakpoint the dashboard shows a single full-viewport pane rather than the desktop side-by-side split. The right-panel button in the top bar opens a picker that swaps the main pane between three views: the **Agent terminal**, the **Diff** (changed files and review), and the **Paired terminal** (host or container shell). A back chip in the top-left of the diff and paired views returns you to the agent terminal.
