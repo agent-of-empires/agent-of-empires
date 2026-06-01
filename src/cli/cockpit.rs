@@ -668,13 +668,16 @@ fn truncate(s: &str, n: usize) -> String {
 // daemon is the only path to the disk-backed event store; there's no
 // useful read against "no daemon".
 
-use crate::cockpit::client::{require_daemon, HttpClient, HttpError, WsMessage};
+use crate::cockpit::client::{require_daemon, HttpClient, HttpError, WsMessage, REPLAY_PAGE_SIZE};
 use crate::cockpit::protocol::ApprovalDecisionWire;
 
 async fn history(session: &str, since: u64, json: bool) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    let resp = client.replay(session, since).await.map_err(map_http)?;
+    let resp = client
+        .replay_paged(session, since, REPLAY_PAGE_SIZE)
+        .await
+        .map_err(map_http)?;
     if resp.lost {
         eprintln!(
             "warning: retention window evicted events before seq {}; transcript is partial.",

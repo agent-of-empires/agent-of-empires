@@ -28,6 +28,10 @@ struct AboutResponse {
     cockpit_queue_drain_mode: String,
 }
 
+/// Page size requested by [`HttpClient::replay_paged`]. Stays at or
+/// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
+pub const REPLAY_PAGE_SIZE: u64 = 1000;
+
 /// Cockpit daemon HTTP client. Cheap to clone; the underlying
 /// `reqwest::Client` is reference-counted.
 #[derive(Debug, Clone)]
@@ -68,7 +72,12 @@ impl HttpClient {
         &self.endpoint
     }
 
-    /// `GET /api/sessions/{id}/cockpit/replay?since=N`.
+    /// `GET /api/sessions/{id}/cockpit/replay?since=N`. Unbounded fetch
+    /// (no `limit`): the server still applies its default page bound, so
+    /// this returns at most one page. Used by the status probe, which
+    /// only reads the metadata (`highest_seq`/`lowest_seq`) and passes
+    /// `since=u64::MAX` so no frames come back. History consumers should
+    /// use [`replay_paged`](Self::replay_paged) instead.
     pub async fn replay(&self, session_id: &str, since: u64) -> Result<ReplayResponse, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/cockpit/replay?since={}",
@@ -77,6 +86,74 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, session_id).await?;
         Ok(res.json::<ReplayResponse>().await?)
+    }
+
+    /// `GET /api/sessions/{id}/cockpit/replay?since=N&limit=L`. One page.
+    pub async fn replay_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        limit: u64,
+    ) -> Result<ReplayResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/cockpit/replay?since={}&limit={}",
+            self.endpoint.base_url, session_id, since, limit
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<ReplayResponse>().await?)
+    }
+
+    /// Page through replay history from `since`, accumulating every
+    /// frame into one `ReplayResponse`. Each request is bounded to
+    /// `page_size` so the daemon never buffers the whole history at once.
+    ///
+    /// The loop is capped at the first page's `highest_seq`: events
+    /// appended after replay began arrive over the live WS channel and
+    /// are deduped by the reducer, so chasing them here would never
+    /// converge on a busy session. Stops early and propagates `lost` if
+    /// any page reports a retention gap, leaving the caller to reset.
+    pub async fn replay_paged(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+    ) -> Result<ReplayResponse, HttpError> {
+        let mut frames = Vec::new();
+        let mut cursor = since;
+        let mut target: Option<u64> = None;
+        let mut lost = false;
+        // Assigned every iteration before the post-loop read; the loop
+        // always runs at least once.
+        let mut highest_seq;
+        let mut lowest_seq;
+        loop {
+            let page = self.replay_page(session_id, cursor, page_size).await?;
+            highest_seq = page.highest_seq;
+            lowest_seq = page.lowest_seq;
+            let cap = *target.get_or_insert(page.highest_seq);
+            frames.extend(page.frames);
+            if page.lost {
+                lost = true;
+                break;
+            }
+            match page.next_cursor {
+                // Keep paging only while the cursor advances and stays
+                // within the snapshot window captured on the first page.
+                Some(next) if page.has_more && next > cursor && next < cap => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        Ok(ReplayResponse {
+            frames,
+            lost,
+            highest_seq,
+            lowest_seq,
+            next_cursor: None,
+            has_more: false,
+        })
     }
 
     /// `GET /api/sessions/{id}/cockpit/context-primer?before_seq=N`.
