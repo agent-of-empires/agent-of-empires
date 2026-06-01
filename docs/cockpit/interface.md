@@ -55,7 +55,11 @@ status banner at the bottom of the screen shows the current focus.
 | Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
 | Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
 | Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
-| Composer    | `Esc`           | Return focus to the transcript                        |
+| Composer    | `/`             | Type a slash at the start of an empty line to open the command picker |
+| Composer    | `↑` / `↓`       | Move the picker highlight (picker open)               |
+| Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight down / up (picker open) |
+| Composer    | `Enter` / `Tab` | Insert the highlighted command (picker open)          |
+| Composer    | `Esc`           | Dismiss the picker, or return focus to the transcript |
 | Transcript  | `j` / `↓`       | Scroll down one line                                  |
 | Transcript  | `k` / `↑`       | Scroll up one line                                    |
 | Transcript  | `PgDn` / `PgUp` | Scroll ten lines                                      |
@@ -71,6 +75,18 @@ status banner at the bottom of the screen shows the current focus.
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
 | Any         | `Ctrl+X`        | Clear every queued (not-yet-sent) prompt              |
+
+**Slash-command picker.** When the composer holds a single-word
+slash query (`/comp`, no spaces yet), a picker floats above the
+composer listing the agent's advertised commands ranked against what
+you typed, the same ranking the web composer uses. Navigate with the
+arrows or `Ctrl+n` / `Ctrl+p`, then press `Enter` or `Tab` to insert
+`/{command} ` into the composer (it does not auto-send, so you can
+add arguments first). `Esc` dismisses the picker without inserting;
+it stays closed until the query text changes, so cursor movement
+won't reopen it. A slash query with no matching command is left
+alone: `Enter` sends it verbatim. The picker only appears once the
+agent has advertised commands over the ACP stream.
 
 **Focus isolation.** Approval keys (`a`/`Shift+A`/`d`) only resolve
 when the approval card itself has focus. Typing "always allow" into

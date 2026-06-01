@@ -12,6 +12,7 @@ pub mod input;
 pub mod queue;
 pub mod reducer;
 pub mod render;
+pub mod slash;
 pub mod state;
 
 use std::io::Stdout;
@@ -24,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::time::Instant;
 
-use self::input::{Focus, Intent};
+use self::input::{Focus, InputContext, Intent};
 use self::state::{CockpitViewState, ToastBanner, ToastKind};
 use crate::cockpit::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, ManagerError, WsError, WsMessage,
@@ -197,6 +198,7 @@ pub async fn run_for_endpoint(
                 state.transcript.apply(frame);
             }
             state.reconcile_selection();
+            state.reconcile_slash_selection();
             None
         }
         Err(e) => {
@@ -248,6 +250,7 @@ pub async fn run_for_endpoint(
                         let was_active = state.transcript.turn_active;
                         state.transcript.apply(&frame);
                         state.reconcile_selection();
+                        state.reconcile_slash_selection();
                         let now_active = state.transcript.turn_active;
                         if !was_active && now_active {
                             // Turn started (our own prompt echoed back, or
@@ -279,6 +282,7 @@ pub async fn run_for_endpoint(
                                     state.transcript.apply(frame);
                                 }
                                 state.reconcile_selection();
+                                state.reconcile_slash_selection();
                                 // Re-derived turn state from the rebuilt
                                 // transcript; the lock no longer reflects
                                 // anything observable. Drain if idle.
@@ -360,7 +364,11 @@ async fn handle_terminal_event(
     }
 
     let has_pending = !state.transcript.pending_approvals.is_empty();
-    let intent = input::dispatch(state.focus, &key, has_pending);
+    let ctx = InputContext {
+        has_pending_approval: has_pending,
+        slash_picker_open: state.slash_picker_open(),
+    };
+    let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
@@ -377,8 +385,27 @@ async fn handle_terminal_event(
         }
         Intent::Compose(k) => {
             // ratatui_textarea consumes raw crossterm KeyEvent through
-            // its `Input` conversion.
+            // its `Input` conversion. Snapshot the slash query first so
+            // we can detect a query-text change (vs. mere cursor motion)
+            // and reset the picker highlight only when the text shifts.
+            let before = state.slash_query();
             state.composer.input(k);
+            if state.slash_query() != before {
+                state.slash_selected = 0;
+            }
+            state.reconcile_slash_selection();
+            Ok(false)
+        }
+        Intent::SlashMove(delta) => {
+            state.move_slash_selection(delta);
+            Ok(false)
+        }
+        Intent::SlashAccept => {
+            state.accept_selected_slash();
+            Ok(false)
+        }
+        Intent::SlashDismiss => {
+            state.dismiss_slash();
             Ok(false)
         }
         Intent::SubmitPrompt => {
