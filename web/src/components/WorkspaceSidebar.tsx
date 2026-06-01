@@ -66,10 +66,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   renameSession,
-  setSessionArchive,
   setSessionNotifications,
-  setSessionPin,
-  setSessionSnooze,
   setWorktreeName,
   updateSessionGroup,
 } from "../lib/api";
@@ -82,14 +79,22 @@ import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
 import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
 import { reportError } from "../lib/toastBus";
 import {
-  resolveEffectiveSnoozedUntil,
-  snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
   workspaceIsPinned,
   workspaceIsSunk,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
+import {
+  effectiveArchivedOf,
+  effectivePinnedOf,
+  effectiveSnoozedUntilOf,
+  type OptimisticTriage,
+} from "../lib/sidebarOptimistic";
+import { useSidebarTriage } from "../hooks/useSidebarTriage";
+// Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
+// from this module; the definition now lives in `sidebarOptimistic.ts`.
+export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
@@ -327,17 +332,6 @@ function formatDurationSecondsShort(seconds: number): string {
   return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
-/** Wall-clock target for an optimistic snooze: `Date.now() + minutes
- *  * 60_000` as an RFC3339 ISO string. Sits outside the component so
- *  the `Date.now()` call doesn't trip
- *  `react-hooks/purity`; the event handler that calls it is itself a
- *  closure, not a render. The exact value is throwaway (the server's
- *  response on the next poll is the source of truth), so a few ms
- *  of jitter is harmless. See #1581. */
-export function makeOptimisticSnoozedUntil(minutes: number): string {
-  return new Date(Date.now() + minutes * 60_000).toISOString();
-}
-
 /** Compact "time remaining" label for the snooze chip computed once at
  *  render time (no per-second timer, by design: snooze rows poll the
  *  sessions API at the existing cadence and the static label is more
@@ -432,6 +426,10 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -557,6 +555,10 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   readOnly,
   indented,
+  optimistic,
+  onPinToggle,
+  onArchiveToggle,
+  onSnooze,
 }: {
   workspace: Workspace;
   isActive: boolean;
@@ -564,6 +566,14 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
+  // Optimistic triage overlay for this row plus the parent-owned mutation
+  // callbacks. Triage state used to live in the row as three `useState`s;
+  // it now lives in the sidebar so bulk actions can drive many rows from
+  // one place. See #1724.
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(
@@ -660,25 +670,12 @@ export const SessionRow = memo(function SessionRow({
     await setSessionNotifications(sessionId, preset);
   };
 
-  // Triage actions (pin / archive / snooze). Optimistic state lets the
-  // glyph, chip, and tier flip immediately on click; on PATCH failure we
-  // revert and surface a toast. The optimistic snap clears itself once
-  // the next sessions-poll reflects the same value, so a successful
-  // round-trip is invisible to the user (just feels fast).
-  const [optimisticPinned, setOptimisticPinned] = useState<boolean | null>(
-    null,
-  );
-  const [optimisticArchived, setOptimisticArchived] = useState<boolean | null>(
-    null,
-  );
-  // Optimistic `snoozed_until` override. `undefined` = no override
-  // (use the prop), a string = pretend the server already returned
-  // this RFC3339 timestamp, `null` = pretend the server already
-  // unsnoozed. Clears once the prop matches the override on the next
-  // poll, matching the pin / archive pattern above.
-  const [optimisticSnoozedUntil, setOptimisticSnoozedUntil] = useState<
-    string | null | undefined
-  >(undefined);
+  // Triage actions (pin / archive / snooze). The optimistic overlay and the
+  // network calls live in the sidebar parent now (keyed by workspace id) so
+  // a bulk action can drive many rows at once; the row just closes its own
+  // menu/modal and delegates the mutation. See #1724. The optimistic snap
+  // still clears itself once the next sessions-poll reflects the same value,
+  // so a successful round-trip is invisible to the user (just feels fast).
   // Snooze duration picker. Lives in its own portal-rendered modal,
   // independent of the context menu's lifecycle so the parent-menu
   // dismissal listener cannot close the picker out from under us.
@@ -686,83 +683,21 @@ export const SessionRow = memo(function SessionRow({
   // Edit-workdir-name picker, also in its own portal-rendered modal so the
   // context-menu dismissal listener does not close it. See #1723.
   const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
-  useEffect(() => {
-    if (optimisticPinned !== null && optimisticPinned === isPinned) {
-      setOptimisticPinned(null);
-    }
-  }, [isPinned, optimisticPinned]);
-  useEffect(() => {
-    if (optimisticArchived !== null && optimisticArchived === isArchived) {
-      setOptimisticArchived(null);
-    }
-  }, [isArchived, optimisticArchived]);
-  useEffect(() => {
-    if (optimisticSnoozedUntil === undefined) return;
-    // Clear the override only when the server value actually matches
-    // it. A naive "both non-null" check used to fire prematurely
-    // when the user re-snoozed an already-snoozed row: the prop
-    // was still the OLD timestamp but non-null, the override was
-    // the NEW timestamp, the effect treated them as a match, and
-    // the chip snapped back to the stale time until the next
-    // poll. See #1581 CodeRabbit review.
-    if (optimisticSnoozedUntil === null && snoozedUntil == null) {
-      setOptimisticSnoozedUntil(undefined);
-      return;
-    }
-    if (
-      optimisticSnoozedUntil != null &&
-      snoozedUntil != null &&
-      snoozeTimestampCloseEnough(optimisticSnoozedUntil, snoozedUntil)
-    ) {
-      setOptimisticSnoozedUntil(undefined);
-    }
-  }, [snoozedUntil, optimisticSnoozedUntil]);
 
-  const togglePin = async () => {
+  const togglePin = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isPinned;
-    setOptimisticPinned(next);
-    const result = await setSessionPin(sessionId, next);
-    if (!result) {
-      setOptimisticPinned(null);
-      reportError(next ? "Failed to pin session" : "Failed to unpin session");
-    }
+    onPinToggle(workspace, !effectivePinnedOf(optimistic, isPinned));
   };
 
-  const toggleArchive = async () => {
+  const toggleArchive = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isArchived;
-    setOptimisticArchived(next);
-    const result = await setSessionArchive(sessionId, next);
-    if (!result) {
-      setOptimisticArchived(null);
-      reportError(
-        next ? "Failed to archive session" : "Failed to unarchive session",
-      );
-    }
+    onArchiveToggle(workspace, !effectiveArchivedOf(optimistic, isArchived));
   };
 
-  const applySnooze = async (minutes: number | null) => {
+  const applySnooze = (minutes: number | null) => {
     setContextMenu(null);
     setSnoozeModalOpen(false);
-    if (!sessionId) return;
-    // Optimistic flip: render the snooze chip + sink the row before
-    // the PATCH round-trip lands, matching the pin / archive
-    // affordance. For positive minutes we synthesise a target
-    // timestamp; the server is the source of truth and the value is
-    // discarded on the next poll, so a few ms of drift is harmless.
-    const optimisticUntil =
-      minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
-    setOptimisticSnoozedUntil(optimisticUntil);
-    const result = await setSessionSnooze(sessionId, minutes);
-    if (!result) {
-      setOptimisticSnoozedUntil(undefined);
-      reportError(
-        minutes == null ? "Failed to unsnooze session" : "Failed to snooze session",
-      );
-    }
+    onSnooze(workspace, minutes);
   };
 
   // Close the context menu first, then open the modal in the next
@@ -787,13 +722,10 @@ export const SessionRow = memo(function SessionRow({
   };
 
   // Effective state for rendering: optimistic overrides win until the
-  // prop catches up (cleared in the effects above).
-  const effectivePinned = optimisticPinned ?? isPinned;
-  const effectiveArchived = optimisticArchived ?? isArchived;
-  const effectiveSnoozedUntil = resolveEffectiveSnoozedUntil(
-    optimisticSnoozedUntil,
-    snoozedUntil,
-  );
+  // sidebar's overlay reconciler drops them once the prop catches up.
+  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
+  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
   const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -2145,6 +2077,20 @@ export function WorkspaceSidebar({
     [groups, onReorderWorkspaces, onReorderGroups],
   );
 
+  // All workspaces flattened across groups, used to reconcile the optimistic
+  // triage overlay against server truth on each refresh. A workspace can
+  // appear under multiple groups (group axis); reconcileOptimistic keys by
+  // workspace id so duplicates are harmless.
+  const allWorkspaces = useMemo(
+    () => groups.flatMap((g) => g.workspaces.map((v) => v.workspace)),
+    [groups],
+  );
+
+  // Optimistic triage overlay + single-id PATCH wiring, lifted out of
+  // SessionRow so single-row and (in #1724) bulk actions share one source of
+  // truth. Triage always targets the workspace's primary session.
+  const triage = useSidebarTriage(allWorkspaces);
+
   const q = filterQuery.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
@@ -2454,6 +2400,12 @@ export function WorkspaceSidebar({
                                 }}
                                 onDelete={onDeleteSession}
                                 readOnly={readOnly}
+                                optimistic={triage.optimisticFor(
+                                  v.workspace.id,
+                                )}
+                                onPinToggle={triage.pinToggle}
+                                onArchiveToggle={triage.archiveToggle}
+                                onSnooze={triage.snooze}
                                 // Drag is disabled when the tier
                                 // comparator already controls placement:
                                 // lastActivity mode has no manual
@@ -2658,6 +2610,10 @@ export function WorkspaceSidebar({
                       }}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
+                      optimistic={triage.optimisticFor(v.workspace.id)}
+                      onPinToggle={triage.pinToggle}
+                      onArchiveToggle={triage.archiveToggle}
+                      onSnooze={triage.snooze}
                       indented
                     />
                   ))}
