@@ -120,11 +120,14 @@ base(
         .filter({ has: page.locator(":scope > span", { hasText: /^(Build|Plan)$/ }) })
         .first();
       await expect(trigger).toBeVisible({ timeout: 10_000 });
+      // The chip shows OpenCode's real default mode, never the phantom
+      // claude "Default". (A page-wide "Default" check would false-match
+      // the reasoning-effort selector, which has its own "Default" label.)
       await expect(trigger).toContainText(/Build/i);
-      await expect(page.getByText("Default", { exact: true })).toHaveCount(0);
 
       // Switch to Plan via the config-option channel; the fake returns the
-      // updated configOptions and the chip flips.
+      // updated configOptions and the chip flips. The open mode menu must
+      // not offer the phantom "Default".
       await trigger.click();
       const menu = page.locator('[role="menu"]');
       await expect(menu.getByText(/^Default$/)).toHaveCount(0);
