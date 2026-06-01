@@ -1169,11 +1169,16 @@ fn list_files(root: &std::path::Path, cap: usize) -> std::io::Result<(Vec<String
             truncated = true;
             break;
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
+        // Sort each directory's entries by name before walking them so
+        // the traversal (and therefore which files survive the `cap`) is
+        // deterministic; `read_dir` order is platform/filesystem
+        // dependent and otherwise unspecified.
+        let mut entries: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(e) => e.flatten().collect(),
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with('.') {
@@ -1957,8 +1962,10 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}.rs")), "").unwrap();
         }
+        // Per-directory sorting makes the truncated subset deterministic,
+        // so we can pin the exact files, not just the count.
         let (files, truncated) = list_files(dir.path(), 3).unwrap();
         assert!(truncated);
-        assert_eq!(files.len(), 3);
+        assert_eq!(files, vec!["f0.rs", "f1.rs", "f2.rs"]);
     }
 }
