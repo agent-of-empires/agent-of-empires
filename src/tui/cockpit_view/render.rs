@@ -1,5 +1,7 @@
-//! Four-pane render of a cockpit session: transcript / status banner /
-//! queued-prompts strip / composer. Tool calls render through a
+//! Render of a cockpit session, stacked top to bottom: transcript /
+//! status banner / queued-prompts strip (zero height when empty) /
+//! composer. The slash and `@` mention pickers float above the composer
+//! when open rather than taking a pane. Tool calls render through a
 //! per-kind dispatcher (`render_tool_lines`): edit/write show a compact
 //! line diff, execute shows the command and an output preview, read
 //! shows the path and a content preview, delete shows the path, and any
