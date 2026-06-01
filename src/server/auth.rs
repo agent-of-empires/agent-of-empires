@@ -395,10 +395,11 @@ fn log_loopback_bypass_token(client_ip: IpAddr, path: &str) {
 /// this layer: the same endpoint accepts both tamper-surface keys
 /// (sandbox, worktree, dangerous session fields) and benign user-
 /// preference keys (theme, sound, updates, web notifications,
-/// logging, description, safe session fields). The handler does a
-/// body-shape elevation check via `body_requires_elevation` and
-/// returns the same `403 elevation_required` payload when a tamper-
-/// surface key is present without elevation. Elevating the whole
+/// logging, description, safe session fields). The handler validates
+/// each patch leaf against the settings schema
+/// (`settings_schema::validate_patch`) and returns the same `403
+/// elevation_required` payload when a `requires_elevation` field is
+/// present without elevation (#1692). Elevating the whole
 /// endpoint here trained every preference save to re-prompt for the
 /// passphrase, which both broke the theme picker UX and conditioned
 /// users to dismiss the real prompts. See #1510.
@@ -1512,11 +1513,12 @@ mod tests {
         assert!(requires_elevation(&Method::PATCH, "/api/settings/"));
 
         // `PATCH /api/profiles/{name}/settings` is body-gated inside the
-        // handler (`update_profile_settings` calls `body_requires_elevation`
-        // and re-issues the 403 elevation_required payload for tamper-
-        // surface keys). The path-level gate exempts it so safe
-        // preference fields (theme, sound, etc.) do not re-prompt the
-        // passphrase on every save. See #1510.
+        // handler (`update_profile_settings` validates each leaf via
+        // `settings_schema::validate_patch` and re-issues the 403
+        // elevation_required payload for `requires_elevation` fields). The
+        // path-level gate exempts it so safe preference fields (theme,
+        // sound, etc.) do not re-prompt the passphrase on every save.
+        // See #1510, #1692.
         assert!(!requires_elevation(
             &Method::PATCH,
             "/api/profiles/work/settings"

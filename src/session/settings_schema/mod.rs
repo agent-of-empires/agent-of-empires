@@ -19,10 +19,12 @@
 use serde::{Deserialize, Serialize};
 
 mod merge;
+mod policy;
 mod registry;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
+pub use policy::{validate_patch, PatchRejection, Scope};
 pub use registry::{descriptor, schema};
 pub use validate::{validate_value, ValidationError};
 

@@ -32,33 +32,57 @@ pub struct StatusHookConfig {
 
     /// Shell command run when a session enters Starting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Starting", widget = "optional_text")]
+    #[setting(
+        label = "On Starting",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_starting: Option<String>,
 
     /// Shell command run when a session enters Running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Running", widget = "optional_text")]
+    #[setting(
+        label = "On Running",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_running: Option<String>,
 
     /// Shell command run when a session enters Waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Waiting", widget = "optional_text")]
+    #[setting(
+        label = "On Waiting",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_waiting: Option<String>,
 
     /// Shell command run when a session enters Idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Idle", widget = "optional_text")]
+    #[setting(
+        label = "On Idle",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_idle: Option<String>,
 
     /// Shell command run when a session enters Error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Error", widget = "optional_text")]
+    #[setting(
+        label = "On Error",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_error: Option<String>,
 
     /// Shell command run after the status-specific command on every status
     /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Any Change", widget = "optional_text")]
+    #[setting(
+        label = "On Any Change",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_change: Option<String>,
 }
 
