@@ -1333,19 +1333,17 @@ impl HomeView {
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        // Outside live-send, captures fork a fresh `tmux capture-pane`
-        // so we throttle to 250ms (4 Hz). Inside live-send, captures
-        // ride the long-lived `tmux -C` control-mode socket and cost
-        // a single round-trip (~1-2ms), so there's no upside to
-        // throttling: every render refreshes the preview, the agent's
-        // output appears as soon as the main loop wakes (key event,
-        // tokio ticker, or the %output wake-up the reader thread
-        // pushes when tmux notifies us of new pane bytes). The result
-        // is roughly attach-quality latency in the common case; the
-        // residual gap is the cost of capture-pane + ratatui re-render
-        // vs. tmux writing bytes straight into your terminal. The core's
-        // `force` flag carries this: we pass `in_live` so live-send bypasses
-        // the 250ms idle throttle.
+        // Outside live-send, captures fork a fresh `tmux capture-pane` so we
+        // throttle to 250ms (4 Hz). Inside agent live-send the fork moves off
+        // the render thread entirely: `LiveCaptureWorker` keeps the cache
+        // fresh on its own thread and the block below just applies the newest
+        // content (the core's `force` flag and the synchronous fork remain
+        // for non-agent live-send targets and the throttled non-live path).
+        // This replaced the old per-frame on-thread fork, which the
+        // `tui.render` trace measured at ~8.5ms on macOS (~90% of a frame).
+        // Control-mode capture was removed with the rest of the `tmux -C`
+        // path (#1485 revert); there is no socket round-trip and no
+        // `%output` wake. Profile the result via `capture_us` on the trace.
         let in_live = self.live_send.is_some();
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
@@ -1385,15 +1383,55 @@ impl HomeView {
             }
         }
 
-        // Captures always go through the fork-based path
-        // (`Session::capture_pane_with_size` via the instance helper). The
-        // long-lived `tmux -C` connection is reserved for `send-keys` from the
-        // worker thread; on some tmux builds (macOS 3.x observed) the control-
-        // mode connection EOFs mid-session, and routing captures through it as
-        // well meant a dropped connection froze the preview until the user
-        // exited live mode. Forking per capture costs ~5-10 ms on a local mac
-        // and is invisible against the 250 ms idle throttle / `%output`-wake
-        // cadence; we trade that overhead for "preview never gets stuck".
+        // Agent live-send reads from the off-thread capture worker instead
+        // of forking `capture-pane` on the render thread. The worker keeps
+        // fresh pane content flowing on its own thread (see
+        // `LiveCaptureWorker`); here we just publish the current geometry and
+        // apply the newest content it has produced. This is what moves the
+        // ~8.5ms (macOS) per-frame capture cost off the hot path: the
+        // measured `capture_us` drops from thousands to tens. The worker
+        // already skips empty captures, so the #1501 kill switch (don't flash
+        // blank when a capture comes back empty) is preserved by simply not
+        // overwriting the cache when there's no new content.
+        if in_live {
+            if let Some(id) = self.selected_session.clone() {
+                let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
+                let latest = self.live_capture_worker.as_ref().map(|worker| {
+                    worker.set_capture_lines(capture_lines);
+                    let mut latest = None;
+                    while let Some(content) = worker.try_recv() {
+                        latest = Some(content);
+                    }
+                    latest
+                });
+                // `Some(None)` = worker present, nothing new this frame (keep
+                // the cache). `None` = no worker (non-agent target); fall
+                // through to the synchronous path below.
+                if let Some(latest) = latest {
+                    if let Some(content) = latest {
+                        let cache = &mut self.preview_cache;
+                        cache.captured_lines = content.lines().count();
+                        cache.content = content;
+                        cache.parsed_text = None;
+                        cache.session_id = Some(id);
+                        cache.dimensions = (width, height);
+                        cache.last_refresh = Instant::now();
+                        let captured_lines = cache.captured_lines;
+                        self.preview_scroll_offset = clamp_scroll_to_capture(
+                            self.preview_scroll_offset,
+                            captured_lines,
+                            self.preview_visible_rows,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Captures otherwise go through the fork-based path
+        // (`Session::capture_pane_with_size` via the instance helper); the
+        // synchronous path runs outside live-send (250ms-throttled) and for
+        // non-agent live-send targets, which don't force-refresh per frame.
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
         // capture (which is what `Session::capture_pane_with_size` returns when
@@ -1716,8 +1754,12 @@ impl HomeView {
                     // means subsequent shared borrows on
                     // `parsed_text` and on `self.get_instance` can
                     // coexist in the actual render call.
+                    let cap_start = Instant::now();
                     self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
+                    self.preview_timings.capture = cap_start.elapsed();
+                    let parse_start = Instant::now();
                     self.preview_cache.ensure_parsed();
+                    self.preview_timings.parse = parse_start.elapsed();
 
                     if let Some(id) = &self.selected_session {
                         if let Some(inst) = self.get_instance(id) {

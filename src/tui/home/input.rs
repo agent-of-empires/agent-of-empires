@@ -3615,6 +3615,7 @@ impl HomeView {
         session.reset_size_to_latest_client();
         self.live_send = None;
         self.live_send_worker = None;
+        self.live_capture_worker = None;
         self.live_send_last_resize = None;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
