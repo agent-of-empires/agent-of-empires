@@ -655,15 +655,18 @@ pub async fn switch_cockpit_agent(
 /// dropped before the caller reaches the supervisor: publish/send take
 /// their own locks downstream and holding ours across the agent forward
 /// would serialize prompts unnecessarily and stall siblings.
-async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) {
+/// Returns whether the wake cleared an idle-dormant marker, so the caller
+/// can synchronously kick a background respawn (the reconciler's ~2s tick
+/// is too slow for the prompt that triggered the wake; see #1748).
+async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
-    let triage_changed = {
+    let (triage_changed, woke_idle_dormant) = {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            let was_sunk = inst.is_archived() || inst.is_snoozed() || inst.is_idle_dormant();
+            let was_idle_dormant = inst.is_idle_dormant();
+            let was_sunk = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
             if was_sunk {
-                let was_idle_dormant = inst.is_idle_dormant();
                 inst.touch_last_accessed();
                 if was_idle_dormant {
                     // Pairs with the "auto-stopped idle cockpit worker"
@@ -672,13 +675,13 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) {
                     tracing::info!(
                         target: "cockpit.supervisor",
                         session = %id,
-                        "waking idle-dormant cockpit session on prompt; reconciler will respawn the worker"
+                        "waking idle-dormant cockpit session on prompt; spawning a fresh worker"
                     );
                 }
             }
-            was_sunk
+            (was_sunk, was_idle_dormant)
         } else {
-            false
+            (false, false)
         }
     };
     if triage_changed {
@@ -717,6 +720,7 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) {
             }
         }
     }
+    woke_idle_dormant
 }
 
 pub async fn cockpit_prompt(
@@ -731,7 +735,7 @@ pub async fn cockpit_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -741,11 +745,46 @@ pub async fn cockpit_prompt(
     // Decode + validate + capability-gate attachments BEFORE publishing
     // so a rejected prompt never leaves a half-rendered attachment in
     // the transcript (the publish path is otherwise authoritative). See
-    // #1000 / #965.
+    // #1000 / #965. Validating before the resume trigger below also
+    // avoids respawning a worker for a request we are about to reject.
     let attachments = match validate_attachments(&state, &id, &req.attachments) {
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    // Idle-dormant wake: the worker was auto-stopped for inactivity
+    // (#1689) and the reconciler will not respawn it until its next ~2s
+    // tick. Reserve the resume slot synchronously and drive a fresh spawn
+    // in a detached task NOW, so the `send_prompt` below blocks on
+    // `wait_for_worker` until the worker is live instead of racing ahead
+    // to a 404. The detached task survives this request being cancelled on
+    // client disconnect. See #1748.
+    if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
+        match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                // The session was deleted (or triaged) between the wake and
+                // the resume snapshot. Do not publish into a session that no
+                // longer exists; a 404 is the honest answer, not a retryable
+                // worker_not_ready. See #1748.
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Ok(_) => {}
+            Err(SupervisorError::CapacityFull { current, limit }) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_capacity_full ({current}/{limit})"),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_not_ready: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Publish the user's prompt into the event stream BEFORE forwarding
     // to the agent so the replay buffer / on-disk store captures it
     // even if the agent forward fails. The frontend treats UserPromptSent
@@ -761,7 +800,17 @@ pub async fn cockpit_prompt(
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            if woke_idle_dormant {
+                // The respawn we kicked above did not finish within
+                // `send_prompt`'s wait window (slow sandbox / spawn). The
+                // worker is still coming; signal a retryable typed status
+                // so the frontend keeps the prompt queued and re-fires on
+                // the next `AcpSessionAssigned`, rather than dropping it
+                // on a 404. See #1748.
+                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            }
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -791,7 +840,39 @@ pub async fn cockpit_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    // Idle-dormant wake: respawn synchronously-reserved + detached so the
+    // send_prompt below waits for the worker instead of 404ing. Mirrors
+    // cockpit_prompt. See #1748.
+    if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
+        match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Ok(_) => {}
+            Err(SupervisorError::CapacityFull { current, limit }) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_capacity_full ({current}/{limit})"),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_not_ready: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Publish the typed event BEFORE forwarding so the replay buffer /
     // on-disk store captures the user's side even if the forward fails,
     // matching cockpit_prompt.
@@ -813,7 +894,11 @@ pub async fn cockpit_prompt_diff_comments(
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            if woke_idle_dormant {
+                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            }
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

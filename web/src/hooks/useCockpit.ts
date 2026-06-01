@@ -1088,13 +1088,32 @@ export function useCockpit(
           // turn to cancel and no Stopped frame to retire our optimistic
           // turn marker.
           const rejected = res.status >= 400 && res.status < 500;
+          // Typed transient: the session was idle-auto-stopped (#1689) and
+          // its worker did not finish respawning within send_prompt's wait
+          // window. The worker is still coming online, so this is
+          // retryable; suppress the error banner (the queued indicator and
+          // respawn are the right signal) and let the drain re-fire it on
+          // the next AcpSessionAssigned. A capacity 503 ("worker_capacity_full")
+          // is NOT this case: it needs operator action, so it keeps its
+          // banner. See #1748.
+          //
+          // Only suppress for text-only sends: the local queue does not
+          // carry attachments, so an attachment send that hits this 503 has
+          // no retry path. Keep its banner so the user knows to resend
+          // rather than seeing a silent optimistic bubble. See #1748.
+          const workerNotReady =
+            res.status === 503 &&
+            detail.startsWith("worker_not_ready") &&
+            (!attachments || attachments.length === 0);
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           }
-          dispatch({
-            kind: "error",
-            message: `Could not send prompt (${res.status}). ${detail}`.trim(),
-          });
+          if (!workerNotReady) {
+            dispatch({
+              kind: "error",
+              message: `Could not send prompt (${res.status}). ${detail}`.trim(),
+            });
+          }
           return rejected ? "non_retryable_failure" : "retryable_failure";
         }
         return "ok";
@@ -1185,7 +1204,20 @@ export function useCockpit(
         dispatch({ kind: "enqueue_prompt", text });
         return;
       }
-      await dispatchPromptNow(text, attachments);
+      const result = await dispatchPromptNow(text, attachments);
+      // Idle-dormant direct send: the worker was respawning and did not
+      // come online within send_prompt's wait window, so the POST returned
+      // a retryable typed 503. Park the prompt instead of dropping it; the
+      // drain effect re-fires it once AcpSessionAssigned brings the worker
+      // online (text-only, since the queue does not carry attachments).
+      // See #1748.
+      if (
+        result === "retryable_failure" &&
+        state.workerIdleStopped &&
+        (!attachments || attachments.length === 0)
+      ) {
+        dispatch({ kind: "enqueue_prompt", text });
+      }
     },
     [
       sessionId,

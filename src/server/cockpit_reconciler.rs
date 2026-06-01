@@ -622,58 +622,23 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             .synthesize_stopped_for_orphan(&id, "orphaned_at_restart");
     }
 
-    let supervisor = Arc::clone(&state.cockpit_supervisor);
-    let agent = supervisor
-        .pick_agent_for_tool(
-            &tool,
-            agent_override.as_deref(),
-            &source_profile,
-            std::path::Path::new(&project_path),
-        )
-        .await;
-    let cwd = PathBuf::from(project_path);
-
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
-        &state.instances,
-        &inst_lock,
-        &id,
-        false,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            let message = format!("sandbox container ensure failed: {e}");
-            tracing::warn!(
-                target: "cockpit.supervisor",
-                session = %id,
-                "reconciler container ensure failed: {message}"
-            );
-            supervisor.publish_startup_error(&id, message);
-            return ResumeOutcome::SpawnFinished;
-        }
+    let resume_target = ResumeTarget {
+        id: id.clone(),
+        tool,
+        agent_override,
+        model,
+        project_path,
+        stored_acp_session_id,
+        source_profile,
+        in_flight_turn,
+        yolo_mode,
     };
-
-    // Thread the session profile through regardless of sandboxing: the
-    // spawn path resolves agent_cockpit_cmd and worker env from it, so a
-    // non-sandbox session on a non-default profile must not fall back to
-    // the default profile.
-    let source_profile_for_spawn = Some(source_profile.clone());
-    let spawn_result = supervisor
-        .spawn(crate::cockpit::supervisor::SpawnRequest {
-            session_id: id.clone(),
-            agent: agent.clone(),
-            cwd,
-            additional_dirs: vec![],
-            provider_env: vec![],
-            model,
-            stored_acp_session_id,
-            sandbox_info,
-            source_profile: source_profile_for_spawn,
-            yolo_mode,
-        })
-        .await;
+    let req = match build_spawn_request(&state, &resume_target).await {
+        Ok(req) => req,
+        Err(()) => return ResumeOutcome::SpawnFinished,
+    };
+    let agent = req.agent.clone();
+    let spawn_result = state.cockpit_supervisor.spawn(req).await;
     if let Err(e) = spawn_result {
         // Re-check whether the session still exists in instances.
         // The user can delete a session during the spawn handshake
@@ -689,7 +654,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 agent = %agent,
                 "auto-spawn reconciler failed: {message}"
             );
-            supervisor.publish_startup_error(&id, message);
+            state.cockpit_supervisor.publish_startup_error(&id, message);
         } else {
             tracing::debug!(
                 target: "cockpit.supervisor",
@@ -700,6 +665,181 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         }
     }
     ResumeOutcome::SpawnFinished
+}
+
+/// Build a fresh-spawn `SpawnRequest` for a resume target: pick the
+/// agent, resolve the cwd, and ensure the sandbox container. On a sandbox
+/// failure it publishes a startup error (so the UI banner matches the
+/// reconciler path) and returns `Err(())`; callers bail. Shared by the
+/// reconciler's fresh-spawn fallback and the prompt-wake resume (#1748)
+/// so both paths build identical requests.
+async fn build_spawn_request(
+    state: &Arc<AppState>,
+    target: &ResumeTarget,
+) -> Result<crate::cockpit::supervisor::SpawnRequest, ()> {
+    let supervisor = Arc::clone(&state.cockpit_supervisor);
+    let agent = supervisor
+        .pick_agent_for_tool(
+            &target.tool,
+            target.agent_override.as_deref(),
+            &target.source_profile,
+            std::path::Path::new(&target.project_path),
+        )
+        .await;
+    let cwd = PathBuf::from(&target.project_path);
+
+    let inst_lock = state.instance_lock(&target.id).await;
+    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &target.id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            let message = format!("sandbox container ensure failed: {e}");
+            tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %target.id,
+                "reconciler container ensure failed: {message}"
+            );
+            supervisor.publish_startup_error(&target.id, message);
+            return Err(());
+        }
+    };
+
+    // Thread the session profile through regardless of sandboxing: the
+    // spawn path resolves agent_cockpit_cmd and worker env from it, so a
+    // non-sandbox session on a non-default profile must not fall back to
+    // the default profile.
+    Ok(crate::cockpit::supervisor::SpawnRequest {
+        session_id: target.id.clone(),
+        agent,
+        cwd,
+        additional_dirs: vec![],
+        provider_env: vec![],
+        model: target.model.clone(),
+        stored_acp_session_id: target.stored_acp_session_id.clone(),
+        sandbox_info,
+        source_profile: Some(target.source_profile.clone()),
+        yolo_mode: target.yolo_mode,
+    })
+}
+
+/// Snapshot a single cockpit session's resume inputs from the live
+/// instance list. Returns `None` when the session is gone or is not a
+/// cockpit session. `in_flight_turn` is always false: this is only used
+/// by the prompt-wake path (#1748), where the worker was idle-auto-stopped
+/// and is by definition not mid-turn.
+async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<ResumeTarget> {
+    let instances = state.instances.read().await;
+    // Filter the same triage states the reconciler skips everywhere else.
+    // The wake path drops `instance_lock` before calling this, so an archive
+    // or snooze can win the race after dormancy was cleared; resolving to
+    // None (then NotFound) keeps us from respawning a session the reconciler
+    // intentionally leaves sunk. See #1748.
+    let inst = instances.iter().find(|i| {
+        i.id == id && i.cockpit_mode && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+    })?;
+    Some(ResumeTarget {
+        id: inst.id.clone(),
+        tool: inst.tool.clone(),
+        agent_override: inst.cockpit_agent.clone(),
+        model: inst.cockpit_model.clone(),
+        project_path: inst.project_path.clone(),
+        stored_acp_session_id: inst.cockpit_acp_session_id.clone(),
+        source_profile: inst.source_profile.clone(),
+        in_flight_turn: false,
+        yolo_mode: inst.yolo_mode,
+    })
+}
+
+/// Result of a prompt-wake resume trigger. See `trigger_resume_background`.
+pub(crate) enum ResumeTrigger {
+    /// A detached resume task was started; a `pending_resumes` slot is
+    /// reserved so `wait_for_worker` will block until the worker is live.
+    Started,
+    /// A worker is already running or another resume is already in flight.
+    AlreadyResuming,
+    /// The session is gone or is not a cockpit session; nothing to do.
+    NotFound,
+}
+
+/// Synchronously reserve a resume slot for `id`, then drive a fresh worker
+/// spawn in a DETACHED task so it survives the originating HTTP request
+/// being cancelled on client disconnect. Because `begin_resume` reserves
+/// the `pending_resumes` slot before this returns, a subsequent
+/// `send_prompt` -> `wait_for_worker` observes the reservation and blocks
+/// until the worker is live instead of failing fast with a 404. The next
+/// reconciler tick sees the reservation via `is_running` and skips the
+/// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
+/// the worker cap is reached so the handler can surface 503. See #1748.
+pub(crate) async fn trigger_resume_background(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<ResumeTrigger, crate::cockpit::supervisor::SupervisorError> {
+    use crate::cockpit::supervisor::{ResumeKind, ResumeReservationOutcome};
+    let reservation = match state
+        .cockpit_supervisor
+        .begin_resume(id, ResumeKind::Spawn)
+        .await?
+    {
+        ResumeReservationOutcome::Reserved(r) => r,
+        ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+    };
+    let Some(target) = resume_target_for_session(state, id).await else {
+        // Session vanished between the wake and this snapshot; drop the
+        // reservation (RAII clears pending + notifies waiters) and report
+        // nothing to do.
+        drop(reservation);
+        return Ok(ResumeTrigger::NotFound);
+    };
+    let state = Arc::clone(state);
+    crate::task_util::spawn_supervised(
+        "cockpit.prompt_wake_resume",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let req = match build_spawn_request(&state, &target).await {
+                // Sandbox failure already published a startup error; the
+                // reservation drops here and wakes any parked send_prompt.
+                Ok(req) => req,
+                Err(()) => return,
+            };
+            let agent = req.agent.clone();
+            if let Err(e) = state.cockpit_supervisor.spawn_inner(req, reservation).await {
+                // AlreadyRunning / SpawnCancelled are benign: a worker
+                // already exists or the session was intentionally torn
+                // down mid-handshake. Only surface real startup failures.
+                if !matches!(
+                    e,
+                    crate::cockpit::supervisor::SupervisorError::AlreadyRunning(_)
+                        | crate::cockpit::supervisor::SupervisorError::SpawnCancelled(_)
+                ) {
+                    let still_present = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .any(|i| i.id == target.id);
+                    if still_present {
+                        let message = format!("Failed to start cockpit agent {agent:?}: {e}");
+                        tracing::warn!(
+                            target: "cockpit.supervisor",
+                            session = %target.id,
+                            agent = %agent,
+                            "prompt-wake spawn failed: {message}"
+                        );
+                        state
+                            .cockpit_supervisor
+                            .publish_startup_error(&target.id, message);
+                    }
+                }
+            }
+        },
+    );
+    Ok(ResumeTrigger::Started)
 }
 
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
