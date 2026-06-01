@@ -40,6 +40,13 @@ pub struct CockpitTranscript {
     /// "context lost, re-prime?" banner until the user dismisses it
     /// or sends the next prompt.
     pub context_primer_pending: bool,
+    /// Whether the agent is mid-turn, derived purely from daemon events:
+    /// true on `UserPromptSent` / `ThinkingStarted`, false on `Stopped`
+    /// / `AgentStartupError` / `PromptRejected`. Server truth (mirrors
+    /// the web reducer's `turnActive`), so it lives here and is rebuilt
+    /// by `/replay` after a `reset()`. The composer reads it to decide
+    /// whether Enter sends now or parks the prompt in the local queue.
+    pub turn_active: bool,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view
     /// layer should clear and rehydrate via HTTP /replay.
     pub lagged: bool,
@@ -121,6 +128,7 @@ impl CockpitTranscript {
             current_mode: None,
             available_commands: Vec::new(),
             context_primer_pending: false,
+            turn_active: false,
             lagged: false,
             last_seq: 0,
             pending_message_idx: None,
@@ -192,6 +200,7 @@ impl CockpitTranscript {
                 self.rows.push(ActivityRow::UserPrompt(row));
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
+                self.turn_active = true;
             }
             Event::UserDiffCommentsPrompt {
                 assembled_markdown, ..
@@ -203,10 +212,12 @@ impl CockpitTranscript {
                 self.rows
                     .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
                 self.context_primer_pending = false;
+                self.turn_active = true;
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
                 self.status_text = Some("thinking…".to_string());
+                self.turn_active = true;
             }
             Event::ThinkingEnded => {
                 self.flush_pending_chunk();
@@ -329,6 +340,7 @@ impl CockpitTranscript {
                     kind: NoteKind::Info,
                     text: format!("agent stopped: {reason}"),
                 });
+                self.turn_active = false;
             }
             Event::AgentStartupError { message } => {
                 self.flush_pending_chunk();
@@ -337,6 +349,7 @@ impl CockpitTranscript {
                     kind: NoteKind::Error,
                     text: format!("agent startup failed: {message}"),
                 });
+                self.turn_active = false;
             }
             Event::IncompatibleAgent { .. } => {
                 // Structured detail for the web cockpit's StartupErrorScreen.
@@ -399,13 +412,19 @@ impl CockpitTranscript {
                 // Legacy hard-coded mode enum. Fold to the same field.
                 self.current_mode = Some(format!("{mode:?}"));
             }
+            Event::PromptRejected { .. } => {
+                // The daemon refused the prompt (e.g. read-only mode); no
+                // turn started, so clear the busy flag the optimistic
+                // submit path may have set. The richer rejected-prompt
+                // renderer is followup work (see the no-op group below).
+                self.turn_active = false;
+            }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }
             | Event::CancelRequested { .. }
-            | Event::PromptRejected { .. }
             | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }
             | Event::ModeSwitchFailed { .. }
@@ -666,6 +685,80 @@ mod tests {
             } => {}
             _ => panic!("expected warning note"),
         }
+    }
+
+    #[test]
+    fn turn_active_tracks_prompt_and_stop_edges() {
+        let mut t = CockpitTranscript::new("s-1");
+        assert!(!t.turn_active, "fresh transcript is idle");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active, "UserPromptSent opens the turn");
+        t.apply(&frame(2, Event::ThinkingStarted));
+        assert!(t.turn_active, "thinking keeps the turn open");
+        t.apply(&frame(
+            3,
+            Event::Stopped {
+                reason: "completed".into(),
+            },
+        ));
+        assert!(!t.turn_active, "Stopped closes the turn");
+    }
+
+    #[test]
+    fn turn_active_clears_on_startup_error_and_rejection() {
+        let mut t = CockpitTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+        ));
+        assert!(!t.turn_active, "startup error ends any in-flight turn");
+
+        t.apply(&frame(
+            3,
+            Event::UserPromptSent {
+                text: "again".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active);
+        t.apply(&frame(
+            4,
+            Event::PromptRejected {
+                text: "again".into(),
+                reason: "read-only".into(),
+            },
+        ));
+        assert!(!t.turn_active, "a rejected prompt never started a turn");
+    }
+
+    #[test]
+    fn reset_returns_to_idle() {
+        let mut t = CockpitTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active);
+        t.reset();
+        assert!(!t.turn_active, "reset drops derived turn state for replay");
     }
 
     #[test]

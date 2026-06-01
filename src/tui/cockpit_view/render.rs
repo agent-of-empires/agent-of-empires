@@ -1,5 +1,5 @@
-//! Three-pane render of a cockpit session: transcript / status banner /
-//! composer. Tool-card breakdowns are intentionally minimal in the MVP
+//! Four-pane render of a cockpit session: transcript / status banner /
+//! queued-prompts strip / composer. Tool-card breakdowns are intentionally minimal in the MVP
 //! (one-liner per tool call); rich diff / image / file previews are
 //! deferred to the followup issues called out in the implementation
 //! plan. Press `o` from the transcript pane to open the web cockpit
@@ -8,7 +8,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::input::Focus;
@@ -18,18 +18,78 @@ use crate::cockpit::approvals::ApprovalDecision;
 use crate::tui::styles::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitViewState) {
+    let queue_height = queued_strip_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // transcript
-            Constraint::Length(1), // status line
+            Constraint::Min(5),               // transcript
+            Constraint::Length(1),            // status line
+            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
         ])
         .split(area);
 
     render_transcript(frame, chunks[0], theme, state);
     render_status(frame, chunks[1], theme, state);
-    render_composer(frame, chunks[2], theme, state);
+    if queue_height > 0 {
+        render_queue(frame, chunks[2], theme, state);
+    }
+    render_composer(frame, chunks[3], theme, state);
+}
+
+/// Up to this many queued prompts are previewed in the strip; the rest
+/// collapse into a "(+N more)" line so a large backlog can't squeeze the
+/// transcript off-screen.
+const QUEUE_PREVIEW_ROWS: usize = 3;
+
+/// Height of the queued-prompts strip: zero when the queue is empty,
+/// otherwise the previewed rows plus the block's top and bottom borders.
+fn queued_strip_height(state: &CockpitViewState) -> u16 {
+    if state.queue.is_empty() {
+        return 0;
+    }
+    let shown = state.queue.len().min(QUEUE_PREVIEW_ROWS);
+    let overflow = usize::from(state.queue.len() > QUEUE_PREVIEW_ROWS);
+    (shown + overflow) as u16 + 2
+}
+
+fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitViewState) {
+    let title = format!(
+        " Queued ({}) · drains on idle · Ctrl-x clears ",
+        state.queue.len()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(title)
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, prompt) in state.queue.iter().take(QUEUE_PREVIEW_ROWS).enumerate() {
+        // Queued prompts can hold newlines (Shift+Enter in the composer);
+        // ratatui's Line strips them, so collapse whitespace first to keep
+        // the preview on one tidy line and truncate predictably.
+        let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = match truncate_chars(&one_line, 80) {
+            Some(head) => format!("{}. {head}…", i + 1),
+            None => format!("{}. {one_line}", i + 1),
+        };
+        lines.push(Line::from(Span::styled(
+            preview,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    if state.queue.len() > QUEUE_PREVIEW_ROWS {
+        let extra = state.queue.len() - QUEUE_PREVIEW_ROWS;
+        lines.push(Line::from(Span::styled(
+            format!("(+{extra} more)"),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Top + bottom border rows wrapping the composer textarea.
@@ -533,6 +593,42 @@ fn help_hint(focus: Focus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cockpit::client::discovery::Source;
+    use crate::cockpit::client::{DaemonEndpoint, HttpClient};
+
+    fn test_state() -> CockpitViewState {
+        let endpoint = DaemonEndpoint {
+            base_url: "http://127.0.0.1:8080".into(),
+            token: None,
+            source: Source::Env,
+        };
+        let http = HttpClient::new(endpoint.clone()).unwrap();
+        CockpitViewState::new("s-1".into(), endpoint, http, None)
+    }
+
+    #[test]
+    fn queued_strip_height_is_zero_when_empty() {
+        let state = test_state();
+        assert_eq!(queued_strip_height(&state), 0);
+    }
+
+    #[test]
+    fn queued_strip_height_grows_with_entries_then_caps() {
+        let mut state = test_state();
+        state.queue.push("one".into());
+        assert_eq!(queued_strip_height(&state), 1 + 2);
+        state.queue.push("two".into());
+        state.queue.push("three".into());
+        assert_eq!(queued_strip_height(&state), 3 + 2);
+        // Beyond the preview cap, an extra "+N more" row is added but the
+        // height stays bounded.
+        state.queue.push("four".into());
+        state.queue.push("five".into());
+        assert_eq!(
+            queued_strip_height(&state),
+            QUEUE_PREVIEW_ROWS as u16 + 1 + 2
+        );
+    }
 
     #[test]
     fn visual_line_count_counts_wrapped_rows() {
