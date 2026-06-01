@@ -15,6 +15,7 @@ import {
   ArrowLeftRight,
   Clock,
   GripVertical,
+  Hourglass,
   Layers,
   ListOrdered,
   Moon,
@@ -74,6 +75,7 @@ import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
 import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
+import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
 import { reportError } from "../lib/toastBus";
 import {
   resolveEffectiveSnoozedUntil,
@@ -628,6 +630,21 @@ export const SessionRow = memo(function SessionRow({
   // `hasDraft` ORs the same set. Lets a user juggling sessions see at a
   // glance which rows have prompts pending without opening the cockpit.
   const queuedCount = useQueuedCountForSessions(sessionIds);
+  // Rate-limit park visibility parity with the cockpit notice (#1715).
+  // The server maps rate-limited stops to Idle, so the status glyph can't
+  // distinguish a parked session from a normal idle one; surface it here
+  // from the same cockpit-state mirror the queued badge reads.
+  const rateLimited = useRateLimitedForSessions(sessionIds);
+  const rateLimitResetLabel = useMemo(() => {
+    if (!rateLimited?.resetsAt) return null;
+    const reset = new Date(rateLimited.resetsAt);
+    return Number.isNaN(reset.getTime())
+      ? null
+      : reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }, [rateLimited]);
+  const rateLimitTitle = rateLimited
+    ? `Rate-limited${rateLimited.count > 1 ? ` (${rateLimited.count} sessions)` : ""}${rateLimitResetLabel ? `; resets at ${rateLimitResetLabel}` : ""}`
+    : "";
 
   const setNotifyPreset = async (preset: NotifyPreset) => {
     setContextMenu(null);
@@ -986,6 +1003,19 @@ export const SessionRow = memo(function SessionRow({
                   className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
                 >
                   {queuedCount}
+                </span>
+              )}
+              {rateLimited && (
+                <span
+                  title={rateLimitTitle}
+                  aria-label={rateLimitTitle}
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-700/40 bg-orange-950/30 px-1 text-[10px] font-mono font-medium text-orange-300"
+                >
+                  <Hourglass className="h-3 w-3" />
+                  {rateLimited.count > 1 && (
+                    <span className="tabular-nums">{rateLimited.count}</span>
+                  )}
+                  {rateLimitResetLabel && <span>{rateLimitResetLabel}</span>}
                 </span>
               )}
               {effectiveArchived && (
