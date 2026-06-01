@@ -108,11 +108,26 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             "✓ Updated to v{}. Restart `aoe` to use the new version.",
             info.latest_version
         );
+        println!("{}", daemon_restart_hint());
         println!("{}", completion_refresh_hint());
     } else if matches!(&method, InstallMethod::Homebrew) {
         println!("✓ brew upgrade complete.");
     }
     Ok(())
+}
+
+/// Reminder printed after a successful in-place update: a running
+/// `aoe serve` daemon keeps executing the old code it already loaded
+/// until it is restarted, and its cockpit workers survive that restart by
+/// design (see #1037). The new binary therefore does not take effect
+/// anywhere until the daemon restarts; once it does, a worker left on the
+/// old build finishes any in-flight turn and then respawns on the new
+/// build automatically (see #1754). Surfacing this avoids the silent
+/// mixed-version trap where a freshly-shipped fix appears not to work.
+fn daemon_restart_hint() -> &'static str {
+    "  If `aoe serve` is running, restart it (`aoe serve --stop`, then start it\n  \
+     again) so the daemon picks up the new binary. Cockpit workers from the old\n  \
+     build finish their current turn, then respawn on the new build."
 }
 
 /// Reminder printed after a successful in-place update. A static completion
@@ -129,7 +144,7 @@ fn completion_refresh_hint() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::completion_refresh_hint;
+    use super::{completion_refresh_hint, daemon_restart_hint};
 
     #[test]
     fn hint_points_at_regen_and_eval_alternative() {
@@ -138,5 +153,14 @@ mod tests {
         assert!(hint.contains("guides/shell-completions"));
         // Mentions the always-fresh alternative so users can avoid manual refresh.
         assert!(hint.to_lowercase().contains("eval"));
+    }
+
+    #[test]
+    fn daemon_hint_mentions_restart_and_respawn() {
+        let hint = daemon_restart_hint();
+        // Points the user at the restart that actually applies the binary.
+        assert!(hint.contains("aoe serve --stop"));
+        // Sets the expectation that workers converge to the new build.
+        assert!(hint.to_lowercase().contains("respawn"));
     }
 }
