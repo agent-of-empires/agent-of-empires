@@ -644,6 +644,26 @@ const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 /// event store, never from memory. A re-rate-limit writes a fresh
 /// `RateLimit` event with a new `resets_at`, so the next auto-resume waits
 /// for the new window rather than looping.
+/// Wall-clock instant at which a rate-limit-parked session becomes
+/// eligible for auto-resume: the later of the adapter-reported reset
+/// (plus the configured grace) and a hardcoded minimum park measured from
+/// when the `RateLimit` event was recorded. The floor keeps a buggy
+/// adapter that reports a past `resets_at` (or a zero grace) from driving
+/// a tight respawn loop. See #1722.
+fn rate_limit_resume_at(
+    resets_at: chrono::DateTime<chrono::Utc>,
+    recorded_at_ms: i64,
+    grace_secs: u32,
+) -> chrono::DateTime<chrono::Utc> {
+    let resets_plus_grace = resets_at + chrono::Duration::seconds(i64::from(grace_secs));
+    match chrono::DateTime::from_timestamp_millis(recorded_at_ms)
+        .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
+    {
+        Some(floor) if floor > resets_plus_grace => floor,
+        _ => resets_plus_grace,
+    }
+}
+
 async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
     // Candidates: cockpit sessions currently parked (recorded in
     // `attempted`, no live worker). Snapshot (id, profile) under the read
@@ -746,15 +766,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
-        // resume_at = max(resets_at + grace, recorded_at + MIN_PARK).
-        let resets_plus_grace = info.resets_at + chrono::Duration::seconds(i64::from(grace_secs));
-        let resume_at = match chrono::DateTime::from_timestamp_millis(recorded_at_ms)
-            .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
-        {
-            Some(floor) if floor > resets_plus_grace => floor,
-            _ => resets_plus_grace,
-        };
-        if now < resume_at {
+        if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
             continue;
         }
         // Eligible: publish the breadcrumb (supersedes Stopped{rate_limited})
@@ -1170,7 +1182,11 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adopt_decision, should_auto_stop, AdoptDecision};
+    use super::{
+        adopt_decision, rate_limit_resume_at, should_auto_stop, AdoptDecision,
+        RATE_LIMIT_MIN_PARK_SECS,
+    };
+    use chrono::{Duration, TimeZone, Utc};
 
     const HOUR_MS: i64 = 3_600_000;
 
@@ -1215,6 +1231,38 @@ mod tests {
             AdoptDecision::FreshSpawn
         );
         assert_eq!(adopt_decision(false, true, true), AdoptDecision::FreshSpawn);
+    }
+
+    #[test]
+    fn resume_at_is_reset_plus_grace_when_far_in_future() {
+        // A reset an hour out dominates the 30s recorded-at floor, so the
+        // resume instant is exactly resets_at + grace.
+        let recorded_at = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let resets_at = recorded_at + Duration::hours(1);
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 15);
+        assert_eq!(got, resets_at + Duration::seconds(15));
+    }
+
+    #[test]
+    fn resume_at_floors_on_recorded_at_for_past_reset() {
+        // Adapter reported a reset in the past with zero grace; without the
+        // floor this would resume immediately. The floor pins it to
+        // recorded_at + MIN_PARK so there is no tight respawn loop.
+        let recorded_at = Utc.timestamp_opt(2_000_000, 0).unwrap();
+        let resets_at = recorded_at - Duration::seconds(5); // already elapsed
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 0);
+        assert_eq!(
+            got,
+            recorded_at + Duration::seconds(RATE_LIMIT_MIN_PARK_SECS)
+        );
+    }
+
+    #[test]
+    fn resume_at_grace_wins_when_above_floor() {
+        // resets_at == recorded_at, grace 120s > 30s floor: grace wins.
+        let recorded_at = Utc.timestamp_opt(3_000_000, 0).unwrap();
+        let got = rate_limit_resume_at(recorded_at, recorded_at.timestamp_millis(), 120);
+        assert_eq!(got, recorded_at + Duration::seconds(120));
     }
 
     #[test]
