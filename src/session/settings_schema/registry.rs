@@ -101,6 +101,42 @@ mod tests {
     }
 
     #[test]
+    fn schema_serializes_with_tagged_widget_policy_validation() {
+        // Locks the JSON contract the web `SettingsFieldDescriptor` TS type
+        // depends on (GET /api/settings/schema). Widgets are tagged `kind`,
+        // write policies `policy`, validation `rule`; every descriptor carries
+        // a dotted-path id via section+field.
+        let json = serde_json::to_value(schema()).expect("schema serializes");
+        let arr = json.as_array().expect("schema is a JSON array");
+        assert!(!arr.is_empty());
+        for d in arr {
+            let obj = d.as_object().expect("descriptor is an object");
+            for key in [
+                "section",
+                "field",
+                "category",
+                "label",
+                "description",
+                "widget",
+                "web_write",
+                "profile_overridable",
+                "validation",
+            ] {
+                assert!(obj.contains_key(key), "descriptor missing `{key}`: {d}");
+            }
+            assert!(d["widget"].get("kind").is_some(), "widget not tagged: {d}");
+            assert!(
+                d["web_write"].get("policy").is_some(),
+                "web_write not tagged: {d}"
+            );
+            assert!(
+                d["validation"].get("rule").is_some(),
+                "validation not tagged: {d}"
+            );
+        }
+    }
+
+    #[test]
     fn cockpit_advanced_grouping() {
         let d = descriptor("cockpit", "max_concurrent_workers").unwrap();
         assert!(d.advanced);

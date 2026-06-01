@@ -43,9 +43,9 @@ pub use sessions::{
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
-    get_settings, get_update_status, list_agents, list_devices, list_groups, list_profiles,
-    list_sounds, list_themes, rename_profile, serve_sound_file, update_profile_settings,
-    update_settings,
+    get_settings, get_settings_schema, get_update_status, list_agents, list_devices, list_groups,
+    list_profiles, list_sounds, list_themes, rename_profile, serve_sound_file,
+    update_profile_settings, update_settings,
 };
 
 const SHELL_METACHARACTERS: &[char] = &[

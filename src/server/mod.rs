@@ -1150,6 +1150,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/settings",
             get(api::get_settings).patch(api::update_settings),
         )
+        .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))

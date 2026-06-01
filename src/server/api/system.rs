@@ -215,6 +215,16 @@ pub async fn update_settings(
     }
 }
 
+/// `GET /api/settings/schema` returns the flat list of settings field
+/// descriptors (the single source of truth, see #1692). The web dashboard
+/// renders a generic field component from this list instead of hand-written
+/// per-field JSX, so a new config field appears on the web automatically. No
+/// secrets: descriptors are pure metadata (labels, widgets, validation, write
+/// policy), so this needs no elevation, only normal authentication.
+pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+    Json(crate::session::settings_schema::schema())
+}
+
 // --- Devices ---
 
 pub async fn list_devices(

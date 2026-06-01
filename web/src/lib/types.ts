@@ -344,3 +344,63 @@ export interface CreateSessionRequest {
 /** Live cockpit worker lifecycle, mirrored from
  *  `crate::cockpit::supervisor::CockpitWorkerState`. See #1088. */
 export type CockpitWorkerState = "absent" | "resuming" | "running";
+
+// --- Settings schema (single source of truth, see #1692) ---
+//
+// Mirrors `crate::session::settings_schema`. `GET /api/settings/schema`
+// returns `SettingsFieldDescriptor[]`; the generic settings renderer builds
+// the form from it instead of hand-written per-field JSX.
+
+/** One option of a `select` widget. `value` is written to disk; `label` is
+ *  shown to the user. */
+export interface SettingsSelectOption {
+  value: string;
+  label: string;
+}
+
+/** Discriminated on `kind` (serde `#[serde(tag = "kind")]`). Carries
+ *  everything the generic renderer needs to draw the control. */
+export type SettingsWidget =
+  | { kind: "toggle" }
+  | { kind: "text"; multiline?: boolean; mono?: boolean }
+  | { kind: "optional_text"; mono?: boolean }
+  | { kind: "number"; min?: number; max?: number }
+  | { kind: "slider"; min: number; max: number; step: number }
+  | { kind: "select"; options: SettingsSelectOption[] }
+  | { kind: "list" }
+  /** Escape hatch: a bespoke widget keyed by `id`. The renderer maps the id
+   *  to a hand-written component (e.g. the logging per-target matrix). */
+  | { kind: "custom"; id: string };
+
+/** Whether the dashboard may write a field (serde `#[serde(tag = "policy")]`).
+ *  `local_only` fields are rejected by the server PATCH. */
+export type SettingsWebWritePolicy =
+  | { policy: "allow" }
+  | { policy: "requires_elevation"; reason: string }
+  | { policy: "local_only"; reason: string };
+
+/** Server-authoritative validation (serde `#[serde(tag = "rule")]`). The
+ *  widget's min/max is advisory; this is the gate the server enforces. */
+export type SettingsValidation =
+  | { rule: "none" }
+  | { rule: "range_u64"; min: number; max?: number }
+  | { rule: "non_empty_string" }
+  | { rule: "memory_limit" }
+  | { rule: "volume_list" };
+
+/** One configurable field. The dotted `${section}.${field}` is its stable id. */
+export interface SettingsFieldDescriptor {
+  section: string;
+  field: string;
+  /** Settings tab the row appears under. */
+  category: string;
+  label: string;
+  description: string;
+  widget: SettingsWidget;
+  web_write: SettingsWebWritePolicy;
+  /** `false` means global-only: shown but not overridable per profile/repo. */
+  profile_overridable: boolean;
+  validation: SettingsValidation;
+  /** Operational tuning shown under an "Advanced" fold. */
+  advanced: boolean;
+}
