@@ -1223,6 +1223,21 @@
       ]
     },
     {
+      "id": "cockpit.cancel-force-stop",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/cockpit/__tests__/WorkingSpinner.test.tsx",
+        "src/lib/cockpitTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/CockpitView.tsx",
+        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/hooks/useCockpit.ts",
+        "web/src/lib/cockpitTypes.ts"
+      ]
+    },
+    {
       "id": "cockpit.args",
       "kind": "vitest",
       "risk": "medium",

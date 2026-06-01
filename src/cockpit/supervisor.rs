@@ -1212,7 +1212,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     let mut rate_limited = false;
                     while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
-                            if reason == "agent_unresponsive" || reason == "prompt_orphaned" {
+                            if reason == "agent_unresponsive"
+                                || reason == "prompt_orphaned"
+                                || reason == "user_forced"
+                            {
+                                // `user_forced` is the explicit "Force stop":
+                                // same recovery as a wedged agent (kill the
+                                // worker process group, respawn, session/load).
+                                // See #1727.
                                 agent_unresponsive = true;
                             } else if reason == "rate_limited" {
                                 rate_limited = true;
@@ -1307,21 +1314,28 @@ impl<S: BroadcastSink> Supervisor<S> {
                     if agent_unresponsive {
                         #[cfg(unix)]
                         {
-                            use nix::sys::signal::{kill, Signal};
+                            use nix::sys::signal::{killpg, Signal};
                             use nix::unistd::Pid;
                             let old_pid = super::worker_registry::load(&session_id)
                                 .ok()
                                 .flatten()
                                 .map(|r| r.pid);
                             if let Some(pid) = old_pid {
+                                // The runner is spawned via `setsid`, so it
+                                // leads its own process group (PGID == PID).
+                                // Signal the whole GROUP, not just the runner
+                                // PID, so a tool the agent ran internally (a
+                                // monitor/until loop spawned as a grandchild
+                                // of claude-agent-acp) dies too instead of
+                                // surviving the restart orphaned. See #1727.
                                 if super::worker_registry::is_pid_alive(pid) {
                                     info!(
                                         target: "cockpit.supervisor",
                                         session = %session_id,
                                         pid,
-                                        "SIGTERM wedged runner before respawn (agent_unresponsive)"
+                                        "SIGTERM wedged runner process group before respawn (agent_unresponsive)"
                                     );
-                                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
                                 }
                                 // Poll for the runner to exit before
                                 // proceeding to respawn. ~3s budget, 100ms
@@ -1342,7 +1356,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         pid,
                                         "wedged runner survived SIGTERM grace; escalating to SIGKILL"
                                     );
-                                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
                                     // One more brief tick for the kernel
                                     // to reap and the socket inode to
                                     // drop. We don't loop forever; spawn
@@ -1658,14 +1672,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Escape hatch for the "spinner stuck because we never saw the
-    /// agent's `Stopped`" failure mode (#1100). Publishes a synthetic
-    /// `Stopped { reason: "user_forced" }` through the sink so every
-    /// connected UI flips `turnActive` off and any client-side prompt
-    /// queue can drain, then sends a best-effort `session/cancel` to
-    /// the agent in case it really is mid-turn. Idempotent: a second
-    /// call just publishes another (no-op for the reducer) Stopped.
+    /// User-initiated "Force stop". Two failure modes to cover:
+    ///
+    /// 1. A turn is genuinely in flight and the agent is ignoring
+    ///    `session/cancel` (a monitor/until loop). `force_cancel` ends the
+    ///    turn with `Stopped { reason: "user_forced" }` through the drain
+    ///    task, which kills the worker process group and respawns with
+    ///    `session/load`. This is what actually stops the runaway loop.
+    /// 2. The daemon already finished the turn but the UI is wedged on a
+    ///    `Stopped` it never saw (#1100). The synthetic `Stopped` published
+    ///    below frees `turnActive` for every connected UI immediately.
+    ///
+    /// Both are best-effort and idempotent: the synthetic `Stopped` bypasses
+    /// the drain (so it never triggers a restart on its own), and a second
+    /// `Stopped` is a capped no-op for the reducer. See #1727 / #1100.
     pub async fn force_end_turn(&self, session_id: &str) {
+        if let Ok(client) = self.client_for_session(session_id).await {
+            let _ = client.force_cancel().await;
+        }
         let seq = next_seq(&self.next_seqs, session_id);
         self.sink.publish(
             session_id,
@@ -1674,11 +1698,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason: "user_forced".into(),
             },
         );
-        // Best-effort cancel; ignore UnknownSession because the headline
-        // intent is "free the UI", which the publish above already did.
-        if let Ok(client) = self.client_for_session(session_id).await {
-            let _ = client.cancel_prompt().await;
-        }
     }
 
     /// Set the active session mode via ACP session/set_mode.

@@ -1419,22 +1419,14 @@ export function useCockpit(
     }
   }, [sessionId]);
 
-  // Escape hatch for the "spinner stuck" failure mode (#1100). Locally
-  // dispatches a synthetic Stopped so the reducer flips `turnActive`
-  // off immediately, then POSTs to the daemon to publish a Stopped
-  // server-side and best-effort cancel any in-flight turn. The local
-  // dispatch is optimistic; the server echo (which lands as a real
-  // frame on the WS) is idempotent against the reducer.
+  // Escape hatch for the "spinner stuck" failure mode (#1100). POSTs to
+  // the daemon and relies on the server-published Stopped event to drive
+  // reducer state: either the synthetic free-the-UI Stopped or the
+  // user_forced one from the worker restart. We do NOT fabricate a
+  // client-side Stopped seq; the server echo flows back as a real frame
+  // on the WS. See #1727.
   const forceEndTurn = useCallback(async () => {
     if (!sessionId) return;
-    dispatch({
-      kind: "frame",
-      frame: {
-        session_id: sessionId,
-        seq: lastSeqRef.current + 1,
-        event: { Stopped: { reason: "user_forced" } },
-      },
-    });
     lastActivityRef.current = Date.now();
     try {
       const res = await fetch(

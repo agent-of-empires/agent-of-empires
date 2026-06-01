@@ -404,6 +404,7 @@ impl CockpitTranscript {
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }
+            | Event::CancelRequested { .. }
             | Event::PromptRejected { .. }
             | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }

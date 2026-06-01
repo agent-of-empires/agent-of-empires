@@ -292,6 +292,9 @@ enum ClientCmd {
     /// forwards them to `session/prompt`. See #1000.
     Prompt(Vec<ContentBlock>),
     Cancel,
+    /// Force-stop now: end the in-flight turn with `user_forced` and let
+    /// the drain task kill the worker process group + respawn. See #1727.
+    ForceStop,
     SetMode(String),
     /// Send `session/set_config_option` for the given (`config_id`,
     /// `value`) pair. The connection task fires the request detached so
@@ -1561,6 +1564,22 @@ impl AcpClient {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         cmd_tx
             .send(ClientCmd::Cancel)
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Force-stop the in-flight turn immediately, bypassing the 10s
+    /// cancel-escalation grace. If a prompt is in flight the connection
+    /// task ends the turn with `Stopped { reason: "user_forced" }`, which
+    /// the drain task treats like `agent_unresponsive`: it kills the
+    /// worker's process group and respawns with `session/load`. This is
+    /// the only lever that reliably stops a tool the agent runs
+    /// internally (a monitor/until loop) and ignores `session/cancel` on.
+    /// Best-effort: returns Ok even if no turn is in flight. See #1727.
+    pub async fn force_cancel(&self) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ForceStop)
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -4120,6 +4139,11 @@ async fn run_connection_task<W, R>(
                         // stop from a clean turn completion.
                         let mut prompt_cancelled = false;
                         let mut cancelling = false;
+                        // Set when the user clicked "Force stop": ends the
+                        // turn with `user_forced` so the drain task kills the
+                        // process group + respawns, instead of waiting out
+                        // the 10s grace. See #1727.
+                        let mut force_stopped = false;
                         let cancel_grace = tokio::time::sleep(CANCEL_ESCALATION_GRACE);
                         tokio::pin!(cancel_grace);
 
@@ -4284,7 +4308,40 @@ async fn run_connection_task<W, R>(
                                                     tokio::time::Instant::now()
                                                         + CANCEL_ESCALATION_GRACE,
                                                 );
+                                                // Tell the UI a cancel is in
+                                                // flight so it can show
+                                                // "Stopping..." with an honest
+                                                // escalation countdown instead
+                                                // of a silent spinner. Once per
+                                                // turn. See #1727.
+                                                let escalates_at = chrono::Utc::now()
+                                                    + chrono::Duration::from_std(
+                                                        CANCEL_ESCALATION_GRACE,
+                                                    )
+                                                    .unwrap_or_else(|_| {
+                                                        chrono::Duration::seconds(10)
+                                                    });
+                                                let _ = event_tx_for_block
+                                                    .send(Event::CancelRequested { escalates_at })
+                                                    .await;
                                             }
+                                        }
+                                        Some(ClientCmd::ForceStop) => {
+                                            warn!(
+                                                target: "cockpit.acp",
+                                                "force-stop requested during in-flight prompt; ending turn and restarting worker"
+                                            );
+                                            // Best-effort cancel notification
+                                            // first (protocol politeness); the
+                                            // real lever is ending the turn so
+                                            // the drain task kills the process
+                                            // group and respawns. See #1727.
+                                            let _ = connection.send_notification(
+                                                CancelNotification::new(acp_session_id.clone()),
+                                            );
+                                            force_stopped = true;
+                                            shutdown = true;
+                                            break;
                                         }
                                         Some(ClientCmd::SetConfigOption { config_id, value }) => {
                                             info!(
@@ -4487,6 +4544,18 @@ async fn run_connection_task<W, R>(
                         //     #1240.
                         let reason = if rate_limited {
                             "rate_limited"
+                        } else if force_stopped {
+                            // Explicit user "Force stop" wins over the
+                            // orphan/unresponsive watchdog reasons: it's the
+                            // proximate cause of THIS turn ending (we broke
+                            // the loop the moment the user clicked), so it
+                            // must not be masked by a prompt_orphaned flag
+                            // that was set earlier. The drain task treats it
+                            // like `agent_unresponsive` (kill process group +
+                            // respawn) but the reason string keeps the
+                            // user-initiated signal distinct in postmortems.
+                            // See #1727.
+                            "user_forced"
                         } else if prompt_orphaned {
                             "prompt_orphaned"
                         } else if agent_unresponsive {
@@ -4517,6 +4586,15 @@ async fn run_connection_task<W, R>(
                         info!(target: "cockpit.acp", "sending session/cancel (no prompt in flight)");
                         connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()))?;
+                    }
+                    Some(ClientCmd::ForceStop) => {
+                        // No prompt in flight: nothing to kill here. The
+                        // supervisor's force_end_turn publishes a synthetic
+                        // `Stopped` to free a wedged UI (#1100); we only send
+                        // a best-effort cancel notification. See #1727.
+                        info!(target: "cockpit.acp", "force-stop requested with no prompt in flight; best-effort cancel only");
+                        let _ = connection
+                            .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         info!(target: "cockpit.acp", "sending session/set_mode mode={mode_id}");

@@ -279,6 +279,7 @@ export type CockpitEvent =
     }
   | { RawAgentUpdate: { payload: unknown } }
   | { AgentMessageChunk: { text: string } }
+  | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
@@ -509,6 +510,16 @@ export interface CockpitState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the cockpit banner next to the countdown. */
   nextWakeupReason: string | null;
+  /** True between a `CancelRequested` event (aoe sent `session/cancel`
+   *  and armed the escalation watchdog) and the next `Stopped`. Drives
+   *  the "Stopping..." spinner label and reveals the Force-stop
+   *  affordance even while a tool is in flight. Cleared on any `Stopped`
+   *  and on a fresh `UserPromptSent`. See #1727. */
+  cancelling: boolean;
+  /** ISO-8601 timestamp at which the cancel-escalation watchdog will
+   *  SIGTERM the worker if the agent keeps ignoring the cancel. Lets the
+   *  UI show an honest countdown. Null when not cancelling. See #1727. */
+  cancelEscalatesAt: string | null;
   /** Set when the agent emitted `SessionContextReset` after a prior
    *  user prompt: the model's context is empty but the visible
    *  transcript is intact, so the user can opt in to fetching a
@@ -685,6 +696,8 @@ export function emptyCockpitState(): CockpitState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
+    cancelling: false,
+    cancelEscalatesAt: null,
     contextPrimerAvailable: null,
     rejectedPrompts: [],
     agentUnresponsive: false,
@@ -706,6 +719,10 @@ function applyNewTurnResets(next: CockpitState): void {
   next.startupError = null;
   next.lastError = null;
   next.turnActive = isTurnActive(next);
+  // A fresh turn supersedes any stale "Stopping..." state from a prior
+  // turn's cancel. See #1727.
+  next.cancelling = false;
+  next.cancelEscalatesAt = null;
   // New turn; reset the no-output detector so Stopped fires the
   // empty-output notice if the agent produces nothing.
   next.turnHasOutput = false;
@@ -1090,6 +1107,10 @@ export function applyEvent(
     // inFlightTool reset above). See #1213.
     next.thinking = false;
     sweepOpenToolCalls(next, frame.seq);
+    // The turn ended (cleanly, cancelled, force-stopped, or escalated):
+    // clear the "Stopping..." state regardless of reason. See #1727.
+    next.cancelling = false;
+    next.cancelEscalatesAt = null;
     next.lastStoppedSeq = Math.min(
       next.lastStoppedSeq + 1,
       next.pendingUserPromptSeq,
@@ -1412,6 +1433,15 @@ export function applyEvent(
   if ("WakeupScheduled" in event) {
     next.nextWakeupAt = event.WakeupScheduled.at;
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
+    return next;
+  }
+  if ("CancelRequested" in event) {
+    // aoe sent session/cancel and armed the escalation watchdog; the
+    // turn is still active. Surface "Stopping..." and the escalation
+    // deadline so the user gets feedback instead of a silent spinner,
+    // and can reveal the Force-stop affordance. See #1727.
+    next.cancelling = true;
+    next.cancelEscalatesAt = event.CancelRequested.escalates_at;
     return next;
   }
   if ("AgentSwitched" in event) {

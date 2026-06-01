@@ -905,6 +905,82 @@ describe("applyEvent / WakeupScheduled lifecycle", () => {
   });
 });
 
+describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
+  function startedTurn() {
+    // A turn must be active for cancelling to be meaningful.
+    return applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "do a thing" } },
+    });
+  }
+
+  it("CancelRequested sets cancelling + the escalation deadline", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    const state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    expect(state.cancelling).toBe(true);
+    expect(state.cancelEscalatesAt).toBe(at);
+    // Turn is still active: CancelRequested is not a Stopped.
+    expect(state.turnActive).toBe(true);
+  });
+
+  it("any Stopped clears the cancelling state", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    let state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    expect(state.cancelling).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: { reason: "user_forced" } },
+    });
+    expect(state.cancelling).toBe(false);
+    expect(state.cancelEscalatesAt).toBeNull();
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("a fresh user prompt clears a stale cancelling flag", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    let state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "next turn" } },
+    });
+    expect(state.cancelling).toBe(false);
+    expect(state.cancelEscalatesAt).toBeNull();
+  });
+
+  it("replay reconstructs cancelling from the event stream", () => {
+    // REST replay applies the same ordered events; cancelling must
+    // survive a from-scratch rebuild, not depend on a local timer.
+    const at = new Date(Date.now() + 10_000).toISOString();
+    const frames = [
+      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "go" } } },
+      {
+        session_id: "s-1",
+        seq: 2,
+        event: { CancelRequested: { escalates_at: at } },
+      },
+    ];
+    let state = emptyCockpitState();
+    for (const f of frames) state = applyEvent(state, f);
+    expect(state.cancelling).toBe(true);
+    expect(state.cancelEscalatesAt).toBe(at);
+  });
+});
+
 describe("applyEvent / SessionCleared", () => {
   // /clear wipes the model's memory. The reducer appends a divider row
   // so the renderer can fold pre-clear turns behind a disclosure
