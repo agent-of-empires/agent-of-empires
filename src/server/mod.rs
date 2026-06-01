@@ -1798,20 +1798,30 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
     let now = chrono::Utc::now();
     let instances = { state.instances.read().await.clone() };
 
-    // Resolve each distinct profile's threshold once.
-    let mut thresholds: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for inst in &instances {
-        if inst.is_cockpit_mode() {
-            continue;
-        }
-        thresholds
-            .entry(inst.effective_profile())
-            .or_insert_with_key(|p| {
-                crate::session::profile_config::resolve_config_or_warn(p)
-                    .session
-                    .auto_stop_idle_secs
-            });
-    }
+    // Resolve each distinct profile's threshold once, off the async runtime:
+    // `resolve_config_or_warn` reads config files from disk, so building the
+    // map directly here would block the poll loop.
+    let profiles: Vec<String> = instances
+        .iter()
+        .filter(|inst| !inst.is_cockpit_mode())
+        .map(|inst| inst.effective_profile())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let thresholds: std::collections::HashMap<String, u32> =
+        tokio::task::spawn_blocking(move || {
+            profiles
+                .into_iter()
+                .map(|p| {
+                    let secs = crate::session::profile_config::resolve_config_or_warn(&p)
+                        .session
+                        .auto_stop_idle_secs;
+                    (p, secs)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
 
     let candidates =
         crate::session::idle_reap::idle_reap_candidates(&instances, now, &attached, |p| {
