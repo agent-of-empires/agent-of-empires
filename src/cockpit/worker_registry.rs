@@ -35,6 +35,16 @@ pub const RUNNER_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
+    /// Binary build identity (`build_info::BUILD_VERSION`) of the
+    /// `aoe __cockpit-runner` process that wrote this record, e.g.
+    /// `"1.9.5+g7f31a9c42e01"`. Distinct from `runner_version`, which is
+    /// the on-disk SCHEMA version. The daemon compares this against its
+    /// own `BUILD_VERSION` to detect a worker left running on an older
+    /// binary after `aoe update` and respawn it (see #1754). Defaulted on
+    /// load for legacy records that pre-date this field; the empty string
+    /// compares unequal to any current build, forcing a one-time respawn.
+    #[serde(default)]
+    pub build_version: String,
     pub session_id: String,
     /// PID of the `aoe __cockpit-runner` process. Used by the stale-sweep
     /// to decide whether the registry entry corresponds to a live owner.
@@ -94,6 +104,7 @@ impl WorkerRecord {
     ) -> Self {
         Self {
             runner_version: RUNNER_VERSION,
+            build_version: crate::build_info::BUILD_VERSION.to_string(),
             session_id,
             pid,
             socket_path,
@@ -401,6 +412,19 @@ pub fn is_record_live(rec: &WorkerRecord) -> bool {
     rec.runner_version == RUNNER_VERSION && is_pid_alive(rec.pid) && socket_exists(&rec.socket_path)
 }
 
+/// Whether the worker's recorded binary build matches the running
+/// daemon's. A live-but-stale worker (this returns `false`) is still
+/// "live" by `is_record_live`; the reconciler keeps it for any in-flight
+/// turn and respawns it on the current binary at the next idle boundary,
+/// rather than treating a version mismatch as death. See #1754.
+///
+/// Build identity is NOT folded into `is_record_live` on purpose: doing
+/// so would make a busy stale worker look dead and push the reconciler
+/// toward orphaning its in-flight turn.
+pub fn is_build_current(rec: &WorkerRecord) -> bool {
+    rec.build_version == crate::build_info::BUILD_VERSION
+}
+
 fn socket_exists(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => true,
@@ -517,6 +541,78 @@ mod tests {
             assert_eq!(loaded.runner_version, RUNNER_VERSION);
             assert_eq!(loaded.agent_name, "claude-agent-acp");
             assert_eq!(loaded.agent_key, "claude");
+        });
+    }
+
+    /// A fresh record is stamped with this binary's build identity and
+    /// reports as current; the empty-string legacy default reports stale.
+    /// This is the gate the reconciler uses to respawn workers left on an
+    /// old binary after `aoe update`. See #1754.
+    #[test]
+    #[serial]
+    fn build_version_stamped_and_current() {
+        with_temp_home(|| {
+            let rec = WorkerRecord::new(
+                "sess-bv".into(),
+                1,
+                PathBuf::from("/tmp/sess-bv.sock"),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            assert_eq!(rec.build_version, crate::build_info::BUILD_VERSION);
+            assert!(is_build_current(&rec));
+
+            let mut stale = rec.clone();
+            stale.build_version = String::new();
+            assert!(
+                !is_build_current(&stale),
+                "empty (legacy) build_version must read as stale"
+            );
+
+            stale.build_version = "0.0.0+gdeadbeef".into();
+            assert!(!is_build_current(&stale));
+        });
+    }
+
+    /// Legacy records written before `build_version` existed must load
+    /// with the empty-string default (and thus read as build-stale), not
+    /// fail to deserialize.
+    #[test]
+    #[serial]
+    fn load_legacy_record_without_build_version() {
+        with_temp_home(|| {
+            let dir = workers_dir().unwrap();
+            let legacy = serde_json::json!({
+                "runner_version": RUNNER_VERSION,
+                "session_id": "legacy-bv-1",
+                "pid": 7,
+                "socket_path": "/tmp/legacy-bv.sock",
+                "agent_name": "claude-agent-acp",
+                "agent_key": "claude",
+                "cwd": "/repo",
+                "model": null,
+                "additional_dirs": [],
+                "provider_env_keys": [],
+                "stored_acp_session_id": null,
+                "source_profile": null,
+                "started_at": 0,
+                "last_attached_at": null,
+                "detached_at": null
+            });
+            std::fs::write(
+                dir.join("legacy-bv-1.json"),
+                serde_json::to_string(&legacy).unwrap(),
+            )
+            .unwrap();
+            let loaded = load("legacy-bv-1").unwrap().unwrap();
+            assert_eq!(loaded.build_version, "");
+            assert!(!is_build_current(&loaded));
         });
     }
 
