@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type MutableRefObject,
@@ -92,6 +93,11 @@ import {
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
+import {
+  EMPTY_SELECTION,
+  classifyClick,
+  selectionReducer,
+} from "../lib/sidebarSelection";
 // Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
 // from this module; the definition now lives in `sidebarOptimistic.ts`.
 export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
@@ -422,7 +428,12 @@ function SortableSessionRow({
   rowKey?: string;
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  isSelected: boolean;
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
@@ -551,7 +562,8 @@ function SortableRepoGroup({
 export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
-  onClick,
+  isSelected,
+  onActivate,
   onDelete,
   readOnly,
   indented,
@@ -562,7 +574,16 @@ export const SessionRow = memo(function SessionRow({
 }: {
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  // Whether this row is part of the sidebar multi-select. See #1724.
+  isSelected: boolean;
+  // Row click. The parent interprets the modifier keys (plain navigates,
+  // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
+  // than navigating directly. See #1724.
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
@@ -889,13 +910,9 @@ export const SessionRow = memo(function SessionRow({
         data-testid="sidebar-session-row"
         draggable={false}
         onClick={(e) => {
-          if (
-            e.button !== 0 ||
-            e.metaKey ||
-            e.ctrlKey ||
-            e.shiftKey ||
-            e.altKey
-          ) {
+          // Let the browser handle non-primary clicks (middle-click still
+          // opens the session href in a new tab) and Alt+click.
+          if (e.button !== 0 || e.altKey) {
             return;
           }
           if (isDeleting) {
@@ -906,22 +923,31 @@ export const SessionRow = memo(function SessionRow({
             e.preventDefault();
             return;
           }
+          // Primary click (plain or with Shift / Cmd / Ctrl): the parent
+          // decides navigate vs. select. Always preventDefault so a modifier
+          // click builds the selection instead of following the href.
           e.preventDefault();
-          onClick();
+          onActivate(e);
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
         onTouchMove={clearLongPress}
         onTouchCancel={clearLongPress}
+        data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           indented ? "pl-6 pr-3" : "px-3"
         } ${
           isActive
             ? "bg-surface-850 border-l-2 border-brand-600"
             : "border-l-2 border-transparent hover:bg-surface-700/40"
+        } ${
+          isSelected
+            ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10"
+            : ""
         } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
+        {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <span
             className={`text-sm shrink-0 leading-none font-mono ${textClass}`}
@@ -2133,6 +2159,86 @@ export function WorkspaceSidebar({
     ? filteredNested.length > 0
     : filteredGroups.length > 0;
 
+  // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
+  // or persisted); the anchor pivots Shift+click ranges. See #1724.
+  const [selection, dispatchSelection] = useReducer(
+    selectionReducer,
+    EMPTY_SELECTION,
+  );
+
+  // Workspace ids in the exact order they render, so a Shift+click range
+  // spans only what the user can see: collapsed groups and (when collapsed)
+  // the sunk section contribute no rows, and a filter trims to matches. This
+  // must mirror the render below; both walk filteredGroups the same way.
+  const flatRenderedOrder = useMemo(() => {
+    const ids: string[] = [];
+    for (const g of filteredGroups) {
+      if (!sidebarGroupHasLiveWorkspace(g)) continue;
+      const expanded = q ? true : !g.collapsed;
+      if (!expanded) continue;
+      for (const v of g.workspaces) {
+        if (!workspaceIsSunk(v.workspace)) ids.push(v.workspace.id);
+      }
+    }
+    if (sunkExpanded) {
+      for (const g of filteredGroups) {
+        for (const v of g.workspaces) {
+          if (workspaceIsSunk(v.workspace)) ids.push(v.workspace.id);
+        }
+      }
+    }
+    return ids;
+  }, [filteredGroups, q, sunkExpanded]);
+
+  // Drop selected ids for workspaces that no longer exist (a session was
+  // deleted or moved). Existence-based, not visibility-based: collapsing a
+  // group or filtering keeps the selection, matching file-manager behavior;
+  // only a vanished workspace is pruned. Range math above is already scoped
+  // to the visible order.
+  const existingWorkspaceIds = useMemo(
+    () => new Set(allWorkspaces.map((w) => w.id)),
+    [allWorkspaces],
+  );
+  useEffect(() => {
+    dispatchSelection({ type: "prune", validIds: existingWorkspaceIds });
+  }, [existingWorkspaceIds]);
+
+  // Interpret a row click: plain click clears the selection and navigates
+  // (today's behavior), modifier clicks build the selection instead. The row
+  // has already guarded button / deleting / drag, and called preventDefault.
+  const handleRowActivate = useCallback(
+    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+      const intent = classifyClick(e);
+      switch (intent) {
+        case "navigate":
+          dispatchSelection({ type: "clear" });
+          setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+          onSelect(workspaceId);
+          break;
+        case "toggle":
+          dispatchSelection({ type: "toggle", id: workspaceId });
+          break;
+        case "range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: false,
+          });
+          break;
+        case "additive-range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: true,
+          });
+          break;
+      }
+    },
+    [activeId, onSelect, flatRenderedOrder],
+  );
+
   const toggleFilter = () => {
     setFilterOpen((o) => {
       if (o) setFilterQuery("");
@@ -2391,13 +2497,12 @@ export function WorkspaceSidebar({
                                 isActive={
                                   v.workspace.id === displayedActiveId
                                 }
-                                onClick={() => {
-                                  setOptimisticActive({
-                                    id: v.workspace.id,
-                                    fromActiveId: activeId,
-                                  });
-                                  onSelect(v.workspace.id);
-                                }}
+                                isSelected={selection.selectedIds.has(
+                                  v.workspace.id,
+                                )}
+                                onActivate={(e) =>
+                                  handleRowActivate(v.workspace.id, e)
+                                }
                                 onDelete={onDeleteSession}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(
@@ -2601,13 +2706,8 @@ export function WorkspaceSidebar({
                       key={v.key}
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
-                      onClick={() => {
-                        setOptimisticActive({
-                          id: v.workspace.id,
-                          fromActiveId: activeId,
-                        });
-                        onSelect(v.workspace.id);
-                      }}
+                      isSelected={selection.selectedIds.has(v.workspace.id)}
+                      onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}

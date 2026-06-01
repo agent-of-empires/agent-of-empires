@@ -93,7 +93,8 @@ function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
     <SessionRow
       workspace={ws}
       isActive={false}
-      onClick={() => {}}
+      isSelected={false}
+      onActivate={() => {}}
       readOnly={readOnly}
       optimistic={triage.optimisticFor(ws.id)}
       onPinToggle={triage.pinToggle}
