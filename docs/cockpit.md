@@ -109,6 +109,8 @@ Tools without ACP support continue to work exactly as they do today
 These are tracked for follow-up releases:
 
 - Mid-token interrupt (waiting on Anthropic's stable feature).
+- Syntax highlighting for code blocks in the TUI transcript (today they
+  render as a dim, uncolored block).
 - Plan-mode and elicitation event mappings (the SDK supports them; the
   cockpit's typed schema covers the common path).
 - Cross-agent handoff and unified search across cockpit sessions.
