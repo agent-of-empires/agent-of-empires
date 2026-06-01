@@ -497,6 +497,13 @@ impl HomeView {
         // on live-send exit, so the list always returns in the home view.
         if self.live_send.is_some() && self.sidebar_collapsed {
             self.divider_col = None;
+            // render_list is skipped, so its hit-test rects would otherwise
+            // keep last frame's values and a click in the now-preview area
+            // could resolve to an invisible list row (and switch the live
+            // target). Zero them so mouse hit-testing can't target the
+            // hidden sidebar.
+            self.list_area = Rect::default();
+            self.list_inner_area = Rect::default();
             self.render_preview(frame, main_chunks[0], theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;

@@ -6114,7 +6114,7 @@ mod scroll_pane_isolation {
         env.view.update_selected();
         let id = match env.view.flat_items.get(1) {
             Some(Item::Session { id, .. }) => id.clone(),
-            _ => "fake".to_string(),
+            _ => panic!("fixture should have a session at flat_items[1]"),
         };
         env.view.live_send = Some(LiveSendState {
             session_id: id,
@@ -6299,6 +6299,17 @@ mod scroll_pane_isolation {
         assert!(
             full_width > split_width,
             "collapsed sidebar should widen the preview ({full_width} vs {split_width})"
+        );
+        // The list isn't drawn while collapsed, so its hit-test rects must
+        // be cleared or a click in the preview area could resolve to a
+        // hidden list row.
+        assert!(
+            env.view.list_inner_area.width == 0 && env.view.list_inner_area.height == 0,
+            "collapsed sidebar must clear the list hit-test rect"
+        );
+        assert!(
+            env.view.handle_click(2, 2).is_none(),
+            "a click in collapsed live mode must not resolve to a list row"
         );
 
         // The which-key banner renders without panicking while armed.
