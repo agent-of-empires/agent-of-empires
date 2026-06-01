@@ -8,7 +8,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::input::Focus;
@@ -35,6 +35,12 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitViewS
         render_queue(frame, chunks[2], theme, state);
     }
     render_composer(frame, chunks[3], theme, state);
+    // Picker floats above the composer (the composer sits at the screen
+    // bottom, so a dropdown below it would render off-screen). Drawn
+    // last so it overlays the transcript's lower rows.
+    if state.slash_picker_open() {
+        render_slash_picker(frame, chunks[3], theme, state);
+    }
 }
 
 /// Up to this many queued prompts are previewed in the strip; the rest
@@ -90,6 +96,97 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitVie
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Most picker rows visible at once before the list windows around the
+/// selection. Keeps the popup from eating the whole transcript when the
+/// daemon advertises a long command list.
+const SLASH_PICKER_MAX_ROWS: usize = 8;
+
+fn render_slash_picker(
+    frame: &mut Frame,
+    composer_area: Rect,
+    theme: &Theme,
+    state: &CockpitViewState,
+) {
+    let matches = state.slash_matches();
+    if matches.is_empty() {
+        return;
+    }
+    // Cap the visible rows to the space above the composer (minus the 2
+    // border rows) before windowing, so on a short terminal the window
+    // can't hand back more rows than will paint and hide the selection
+    // at the bottom. width matches the composer so the popup lines up
+    // with the input it completes.
+    let max_rows = (composer_area.y as usize)
+        .saturating_sub(2)
+        .min(SLASH_PICKER_MAX_ROWS);
+    if max_rows == 0 {
+        return;
+    }
+    let lines = picker_lines(&matches, state.slash_selected, max_rows);
+    let desired = lines.len() as u16 + 2;
+    // Anchor the popup's bottom edge to the composer's top edge, growing
+    // upward. max_rows already guarantees the list fits above the
+    // composer, so the height below won't truncate the windowed rows.
+    let y = composer_area.y.saturating_sub(desired);
+    let area = Rect {
+        x: composer_area.x,
+        y,
+        width: composer_area.width,
+        height: composer_area.y - y,
+    };
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ")
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build the picker's visible rows, windowed around `selected` so a
+/// selection past the visible cap still shows. Each row is
+/// `▶ /name  description`, with the marker only on the selected row.
+fn picker_lines<'a>(
+    matches: &[&'a crate::cockpit::state::AvailableCommand],
+    selected: usize,
+    max_rows: usize,
+) -> Vec<Line<'a>> {
+    let total = matches.len();
+    let cap = max_rows.min(total).max(1);
+    // Slide the window so `selected` stays inside [start, start+cap).
+    let start = if selected >= cap {
+        (selected - cap + 1).min(total.saturating_sub(cap))
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(cap);
+    for (offset, cmd) in matches[start..(start + cap).min(total)].iter().enumerate() {
+        let idx = start + offset;
+        let is_sel = idx == selected;
+        let marker = if is_sel { "▶ " } else { "  " };
+        let mut spans = vec![Span::styled(
+            format!("{marker}/{}", cmd.name),
+            if is_sel {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        )];
+        if !cmd.description.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", cmd.description),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 /// Top + bottom border rows wrapping the composer textarea.
@@ -584,7 +681,9 @@ fn border_style(theme: &Theme, state: &CockpitViewState, this_focus: Focus) -> S
 
 fn help_hint(focus: Focus) -> &'static str {
     match focus {
-        Focus::Composer => " Enter=send · Shift+Enter=newline · Esc=back · Ctrl-C=cancel ",
+        Focus::Composer => {
+            " Enter=send · Shift+Enter=newline · /=commands · Esc=back · Ctrl-C=cancel "
+        }
         Focus::Transcript => " j/k=scroll · i=compose · Tab=approvals · o=browser · Esc=exit ",
         Focus::Approval => " a=allow · A=always · d=deny · Esc=back ",
     }
@@ -770,6 +869,18 @@ mod tests {
         }
     }
 
+    use crate::cockpit::state::AvailableCommand;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn cmd(name: &str, desc: &str) -> AvailableCommand {
+        AvailableCommand {
+            name: name.to_string(),
+            description: desc.to_string(),
+            accepts_input: false,
+        }
+    }
+
     #[test]
     fn agent_message_renders_list_markers_without_dashes() {
         let lines = render_agent_message_lines("- one\n- two\n\n1. first\n2. second");
@@ -795,5 +906,91 @@ mod tests {
             assert_eq!(lines.len(), 1, "input {input:?}");
             assert_eq!(line_text(&lines[0]), format!("{AGENT_GUTTER}…"));
         }
+    }
+
+    #[test]
+    fn picker_lines_window_follows_selection_past_cap() {
+        let cmds: Vec<AvailableCommand> = (0..10).map(|i| cmd(&format!("c{i}"), "")).collect();
+        let refs: Vec<&AvailableCommand> = cmds.iter().collect();
+        // Selecting row 9 with a 3-row cap must keep it inside the window.
+        let lines = picker_lines(&refs, 9, 3);
+        assert_eq!(lines.len(), 3);
+        // Window should be rows 7,8,9; row 9 is the last visible line.
+        let last = &lines[2];
+        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("/c9"), "expected /c9 in {text:?}");
+        assert!(text.starts_with("▶"), "selected row marked: {text:?}");
+    }
+
+    #[test]
+    fn render_shows_slash_picker_overlay() {
+        let endpoint = DaemonEndpoint {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            token: None,
+            source: Source::LocalDaemon,
+        };
+        let http = HttpClient::new(endpoint.clone()).expect("http client");
+        let mut state = CockpitViewState::new("sess".to_string(), endpoint, http, None);
+        state.focus = Focus::Composer;
+        state.transcript.available_commands =
+            vec![cmd("compact", "shrink context"), cmd("clear", "wipe")];
+        state.composer.insert_str("/comp");
+        assert!(state.slash_picker_open());
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Commands"), "picker title missing");
+        assert!(dump.contains("/compact"), "command label missing");
+        assert!(dump.contains('▶'), "selection marker missing");
+    }
+
+    #[test]
+    fn short_terminal_keeps_selected_row_visible() {
+        // Regression: on a short terminal the popup's drawable height is
+        // tiny, but the window was sized to SLASH_PICKER_MAX_ROWS, so a
+        // bottom selection painted above the fold and vanished. Render a
+        // 9-row terminal with many commands, select the last, and assert
+        // the selected label + marker actually paint.
+        let endpoint = DaemonEndpoint {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            token: None,
+            source: Source::LocalDaemon,
+        };
+        let http = HttpClient::new(endpoint.clone()).expect("http client");
+        let mut state = CockpitViewState::new("sess".to_string(), endpoint, http, None);
+        state.focus = Focus::Composer;
+        state.transcript.available_commands =
+            (0..12).map(|i| cmd(&format!("cmd{i:02}"), "")).collect();
+        state.composer.insert_str("/cmd");
+        assert!(state.slash_picker_open());
+        // Drive the highlight to the last match.
+        let last = state.slash_matches().len() - 1;
+        state.move_slash_selection(last as i32);
+        let last_name = state.slash_matches()[last].name.clone();
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let backend = TestBackend::new(40, 9);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            dump.contains('▶'),
+            "selection marker missing on short terminal"
+        );
+        assert!(
+            dump.contains(&format!("/{last_name}")),
+            "selected row /{last_name} scrolled off-screen: {dump:?}"
+        );
     }
 }
