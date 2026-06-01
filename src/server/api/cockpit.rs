@@ -1937,13 +1937,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("keep.rs"), "").unwrap();
         std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("real.rs"), "").unwrap();
+        // Dotfiles are skipped at every level, not just the top, so a
+        // nested dotfile must be dropped while its sibling is kept.
+        std::fs::write(dir.path().join("sub").join(".env"), "").unwrap();
         for skip in [".git", "node_modules", "target"] {
             std::fs::create_dir(dir.path().join(skip)).unwrap();
             std::fs::write(dir.path().join(skip).join("junk"), "").unwrap();
         }
 
         let (files, _) = list_files(dir.path(), 5000).unwrap();
-        assert_eq!(files, vec!["keep.rs"]);
+        assert_eq!(files, vec!["keep.rs", "sub/real.rs"]);
     }
 
     #[test]
@@ -1954,6 +1959,6 @@ mod tests {
         }
         let (files, truncated) = list_files(dir.path(), 3).unwrap();
         assert!(truncated);
-        assert!(files.len() <= 3);
+        assert_eq!(files.len(), 3);
     }
 }
