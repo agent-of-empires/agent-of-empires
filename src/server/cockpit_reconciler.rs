@@ -92,11 +92,19 @@ pub async fn reconcile_cockpit_workers(
         return;
     }
 
+    // Respawn build-stale workers that were adopted to drain an in-flight
+    // turn (see #1754) and have since gone idle. Runs BEFORE
+    // `reap_user_stopped` so the marker + registry-delete this writes is
+    // picked up by the same tick's reaper, which tears down the attached
+    // handle and clears `attempted` so the resume pass below fresh-spawns
+    // on the current binary.
+    respawn_drained_stale_workers(state).await;
+
     // Detect `aoe cockpit stop|kill|restart` (a separate process that
     // deletes the registry entry + SIGTERMs the runner) and surface it
     // as a typed Stopped event. The daemon's protocol-layer connection
     // task blocks on `cmd_rx.recv()` while idle, so socket EOF doesn't
-    // propagate to the drain task on its own — without this poll, the
+    // propagate to the drain task on its own, so without this poll the
     // UI stays stuck on "thinking" and the supervisor keeps a phantom
     // worker. For the `restart` case, the reaper returns the ids it
     // marked as `restart_pending`; clear them from `attempted` so the
@@ -517,6 +525,80 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     }
 }
 
+/// Respawn build-stale workers that were adopted mid-turn (flagged via
+/// `Supervisor::mark_build_respawn_pending` in `resume_one`) once their
+/// in-flight turn has finished. Idle is detected with the same
+/// `has_in_flight_turn` event-store probe the resume pass uses.
+///
+/// For each drained session this mirrors `aoe cockpit restart`: write the
+/// restart marker so the reaper publishes `restart_pending` (the UI shows
+/// "Restarting…" rather than a stop), then SIGTERM the stale runner group
+/// and delete its registry entry. The caller runs the reaper immediately
+/// after, which tears down the attached handle and clears `attempted`, so
+/// the resume pass fresh-spawns on the current binary. See #1754.
+async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
+    for id in state.cockpit_supervisor.build_respawn_pending_ids() {
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_probe = id.clone();
+        let in_flight =
+            match tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe)).await {
+                Ok(v) => v,
+                // Probe failed: assume still busy so a transient error
+                // never hard-kills a possibly-live turn. Retried next tick.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cockpit.supervisor",
+                        session = %id,
+                        error = %e,
+                        "in-flight probe failed for draining stale worker; deferring respawn"
+                    );
+                    true
+                }
+            };
+        if in_flight {
+            continue;
+        }
+        tracing::info!(
+            target: "cockpit.supervisor",
+            session = %id,
+            "build-stale cockpit worker drained; respawning on current binary"
+        );
+        crate::cockpit::worker_registry::mark_restart_pending(&id);
+        crate::cockpit::worker_registry::terminate(&id);
+        state.cockpit_supervisor.clear_build_respawn_pending(&id);
+    }
+}
+
+/// What `resume_one` should do with the worker registry record it found
+/// for a cockpit session that has no live in-memory worker yet. Split out
+/// as a pure function so the build-version respawn policy (#1754) is
+/// unit-testable without standing up a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptDecision {
+    /// No usable record (dead PID / missing socket): sweep and fresh-spawn.
+    FreshSpawn,
+    /// Live worker on the current binary: reattach.
+    Attach,
+    /// Live worker on an older binary with no in-flight turn: terminate
+    /// now and fresh-spawn on the current binary.
+    RespawnStaleIdle,
+    /// Live worker on an older binary mid-turn: adopt to keep the turn
+    /// streaming, then respawn at the next idle boundary.
+    AdoptStaleForDrain,
+}
+
+fn adopt_decision(live: bool, build_current: bool, in_flight_turn: bool) -> AdoptDecision {
+    if !live {
+        AdoptDecision::FreshSpawn
+    } else if build_current {
+        AdoptDecision::Attach
+    } else if in_flight_turn {
+        AdoptDecision::AdoptStaleForDrain
+    } else {
+        AdoptDecision::RespawnStaleIdle
+    }
+}
+
 async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
     let ResumeTarget {
         id,
@@ -535,7 +617,46 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
     if let Ok(Some(record)) = crate::cockpit::worker_registry::load(&id) {
-        if crate::cockpit::worker_registry::is_record_live(&record) {
+        let decision = adopt_decision(
+            crate::cockpit::worker_registry::is_record_live(&record),
+            crate::cockpit::worker_registry::is_build_current(&record),
+            in_flight_turn,
+        );
+        if decision == AdoptDecision::FreshSpawn {
+            // Dead PID or missing socket: sweep the orphan registry entry
+            // so the fall-through below is a clean fresh spawn.
+            crate::cockpit::worker_registry::delete(&id).ok();
+        } else if decision == AdoptDecision::RespawnStaleIdle {
+            // The runner survived a daemon restart but is executing an
+            // older binary (e.g. after `aoe update`) and has no in-flight
+            // turn. Replace it now: SIGTERM the stale runner group (which
+            // also deletes the registry entry) and fall through to a
+            // fresh spawn on the current binary. See #1754.
+            tracing::info!(
+                target: "cockpit.supervisor",
+                session = %id,
+                old_build = %record.build_version,
+                new_build = crate::build_info::BUILD_VERSION,
+                "respawning idle build-stale cockpit worker on current binary"
+            );
+            crate::cockpit::worker_registry::terminate(&id);
+        } else {
+            // Attach or AdoptStaleForDrain: dial the live runner.
+            if decision == AdoptDecision::AdoptStaleForDrain {
+                // Build-stale but mid-turn: adopt now so the in-flight
+                // turn keeps streaming, and flag the session so the next
+                // idle boundary respawns it on the current binary instead
+                // of hard-killing the turn. Preserves the #1037
+                // survive-restart contract. See #1754.
+                tracing::info!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    old_build = %record.build_version,
+                    new_build = crate::build_info::BUILD_VERSION,
+                    "adopting build-stale cockpit worker to drain in-flight turn before respawn"
+                );
+                state.cockpit_supervisor.mark_build_respawn_pending(&id);
+            }
             let supervisor = Arc::clone(&state.cockpit_supervisor);
             let cwd = PathBuf::from(&project_path);
             // Reconstruct sandbox context from the live instance state
@@ -604,10 +725,6 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
-        } else {
-            // Dead PID or missing socket: sweep the orphan registry
-            // entry so the next attempt is a clean fresh spawn.
-            crate::cockpit::worker_registry::delete(&id).ok();
         }
     }
 
@@ -879,9 +996,52 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_auto_stop;
+    use super::{adopt_decision, should_auto_stop, AdoptDecision};
 
     const HOUR_MS: i64 = 3_600_000;
+
+    // --- build-version respawn policy (#1754) ---
+
+    /// Story 1: a live worker whose build differs from the daemon and is
+    /// NOT mid-turn is respawned (terminate + fresh spawn), not adopted.
+    #[test]
+    fn stale_build_idle_worker_respawns() {
+        assert_eq!(
+            adopt_decision(true, false, false),
+            AdoptDecision::RespawnStaleIdle
+        );
+    }
+
+    /// Story 2: a live worker whose build differs from the daemon but is
+    /// mid-turn is adopted to drain, not hard-killed. The reconciler's
+    /// per-tick drain check respawns it once the turn finishes.
+    #[test]
+    fn stale_build_busy_worker_adopts_to_drain() {
+        assert_eq!(
+            adopt_decision(true, false, true),
+            AdoptDecision::AdoptStaleForDrain
+        );
+    }
+
+    /// A live worker on the current build is reattached regardless of
+    /// in-flight state: the survive-restart contract (#1037) is unchanged
+    /// for same-version restarts.
+    #[test]
+    fn current_build_worker_attaches() {
+        assert_eq!(adopt_decision(true, true, false), AdoptDecision::Attach);
+        assert_eq!(adopt_decision(true, true, true), AdoptDecision::Attach);
+    }
+
+    /// A dead record fresh-spawns no matter the build/turn state; build
+    /// currency only matters for a live worker.
+    #[test]
+    fn dead_record_fresh_spawns() {
+        assert_eq!(
+            adopt_decision(false, false, false),
+            AdoptDecision::FreshSpawn
+        );
+        assert_eq!(adopt_decision(false, true, true), AdoptDecision::FreshSpawn);
+    }
 
     #[test]
     fn disabled_threshold_never_stops() {
