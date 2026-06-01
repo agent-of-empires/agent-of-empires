@@ -541,114 +541,15 @@ pub fn apply_tmux_overrides(target: &mut super::config::TmuxConfig, source: &Tmu
     }
 }
 
-/// Merge profile overrides into global config
-pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
-    if let Some(ref theme_override) = profile.theme {
-        if let Some(ref name) = theme_override.name {
-            global.theme.name = name.clone();
-        }
-        if let Some(ref color_mode) = theme_override.color_mode {
-            global.theme.color_mode = color_mode.clone();
-        }
-        if let Some(idle_decay_minutes) = theme_override.idle_decay_minutes {
-            global.theme.idle_decay_minutes = idle_decay_minutes;
-        }
-    }
-
-    if let Some(ref updates_override) = profile.updates {
-        if let Some(update_check_mode) = updates_override.update_check_mode {
-            global.updates.update_check_mode = update_check_mode;
-        }
-        if let Some(check_interval_hours) = updates_override.check_interval_hours {
-            global.updates.check_interval_hours = check_interval_hours;
-        }
-        if let Some(notify_in_cli) = updates_override.notify_in_cli {
-            global.updates.notify_in_cli = notify_in_cli;
-        }
-        if let Some(web_poll_interval_minutes) = updates_override.web_poll_interval_minutes {
-            global.updates.web_poll_interval_minutes = web_poll_interval_minutes;
-        }
-    }
-
-    if let Some(ref worktree_override) = profile.worktree {
-        apply_worktree_overrides(&mut global.worktree, worktree_override);
-    }
-
-    if let Some(ref sandbox_override) = profile.sandbox {
-        apply_sandbox_overrides(&mut global.sandbox, sandbox_override);
-    }
-
-    if let Some(ref tmux_override) = profile.tmux {
-        apply_tmux_overrides(&mut global.tmux, tmux_override);
-    }
-
-    if let Some(ref session_override) = profile.session {
-        apply_session_overrides(&mut global.session, session_override);
-    }
-
-    if let Some(ref hooks_override) = profile.hooks {
-        apply_hooks_overrides(&mut global.hooks, hooks_override);
-    }
-
-    if let Some(ref sound_override) = profile.sound {
-        crate::sound::apply_sound_overrides(&mut global.sound, sound_override);
-    }
-
-    if let Some(ref status_hook_override) = profile.status_hooks {
-        crate::status_hooks::apply_status_hook_overrides(
-            &mut global.status_hooks,
-            status_hook_override,
-        );
-    }
-
-    if let Some(ref environment) = profile.environment {
-        // Replace semantics (matches sandbox.environment override behaviour).
-        global.environment = environment.clone();
-    }
-
-    if let Some(ref cockpit_override) = profile.cockpit {
-        if let Some(v) = cockpit_override.enabled {
-            global.cockpit.enabled = v;
-        }
-        if let Some(v) = cockpit_override.default_for_claude {
-            global.cockpit.default_for_claude = v;
-        }
-        if let Some(ref v) = cockpit_override.default_agent {
-            global.cockpit.default_agent = v.clone();
-        }
-        if let Some(v) = cockpit_override.max_concurrent_workers {
-            global.cockpit.max_concurrent_workers = v;
-        }
-        if let Some(v) = cockpit_override.replay_events {
-            global.cockpit.replay_events = v;
-        }
-        if let Some(v) = cockpit_override.replay_bytes {
-            global.cockpit.replay_bytes = v;
-        }
-        if let Some(ref v) = cockpit_override.node_path {
-            global.cockpit.node_path = v.clone();
-        }
-        if let Some(v) = cockpit_override.show_tool_durations {
-            global.cockpit.show_tool_durations = v;
-        }
-        if let Some(v) = cockpit_override.queue_drain_mode {
-            global.cockpit.queue_drain_mode = v;
-        }
-        if let Some(v) = cockpit_override.max_concurrent_resumes {
-            global.cockpit.max_concurrent_resumes = v;
-        }
-        if let Some(v) = cockpit_override.force_end_turn_threshold_secs {
-            global.cockpit.force_end_turn_threshold_secs = v;
-        }
-        if let Some(v) = cockpit_override.silent_orphan_grace_secs {
-            global.cockpit.silent_orphan_grace_secs = v;
-        }
-        if let Some(v) = cockpit_override.silent_orphan_fast_grace_secs {
-            global.cockpit.silent_orphan_fast_grace_secs = v;
-        }
-    }
-
-    global
+/// Merge profile overrides into global config.
+///
+/// Delegates to [`merge_configs_generic`]: the profile serializes to a sparse
+/// override tree that is JSON-merged onto the global config. Proven equivalent
+/// to the former per-field merge by `generic_merge_matches_typed_merge` (#1692),
+/// so adding a config field never touches this function.
+pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
+    let overrides = serde_json::to_value(profile).expect("ProfileConfig serializes to JSON");
+    merge_configs_generic(&global, &overrides)
 }
 
 /// Generic single-source merge (#1692): serialize the global config to JSON,
