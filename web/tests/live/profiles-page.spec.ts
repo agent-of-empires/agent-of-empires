@@ -52,7 +52,7 @@ test("set as default round-trips through PATCH /api/default-profile", async ({
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
-  await page.getByRole("button", { name: "work" }).click();
+  await page.getByRole("button", { name: "work", exact: true }).click();
   await page.getByRole("button", { name: "Set as default" }).click();
 
   await expect(async () => {
@@ -65,7 +65,7 @@ test("description edit persists across reload", async ({ serve, page }) => {
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
-  await page.getByRole("button", { name: "work" }).click();
+  await page.getByRole("button", { name: "work", exact: true }).click();
 
   const desc = page.getByPlaceholder("What this profile is for");
   await desc.fill("client repos");
@@ -79,7 +79,7 @@ test("description edit persists across reload", async ({ serve, page }) => {
   }).toPass({ timeout: 5_000 });
 
   await page.reload();
-  await page.getByRole("button", { name: "work" }).click();
+  await page.getByRole("button", { name: "work", exact: true }).click();
   await expect(page.getByPlaceholder("What this profile is for")).toHaveValue(
     "client repos",
   );
@@ -92,7 +92,7 @@ test("Edit configuration deep-links into Settings scoped to the profile", async 
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
-  await page.getByRole("button", { name: "work" }).click();
+  await page.getByRole("button", { name: "work", exact: true }).click();
   await page.getByRole("button", { name: /^Session/ }).click();
 
   await expect(page).toHaveURL(/\/settings\/session\?profile=work/);
