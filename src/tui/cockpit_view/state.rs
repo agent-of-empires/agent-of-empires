@@ -53,6 +53,18 @@ pub struct CockpitViewState {
     /// reopen it; the picker reappears only once the query text
     /// actually changes.
     pub dismissed_slash_query: Option<String>,
+    /// Workspace file list for the `@`-mention picker, fetched once per
+    /// session on the first `@` and cached for its lifetime.
+    pub file_index: FileIndex,
+    /// `Some` while the `@`-mention picker is open. Holds only the
+    /// highlighted-row index; the query and token range are always
+    /// recomputed from the composer via [`super::mention::active_mention`]
+    /// so there is a single source of truth for the typed text.
+    pub mention: Option<MentionSession>,
+    /// Anchor `(row, col)` of an `@`-token the user dismissed with Esc.
+    /// Keeps the picker closed while they keep typing in that same
+    /// token; cleared once the token goes away or a fresh `@` is typed.
+    pub dismissed_mention: Option<(usize, usize)>,
 }
 
 /// Build a composer textarea with the shared placeholder + cursor
@@ -60,9 +72,26 @@ pub struct CockpitViewState {
 /// composer means swapping in a fresh one from here.
 fn new_composer_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(" Message the agent…");
+    ta.set_placeholder_text(" Message the agent…  @ for files, / for commands");
     ta.set_cursor_line_style(ratatui::style::Style::default());
     ta
+}
+
+/// Lifecycle of the workspace file list backing the `@`-mention picker.
+/// Distinguishes "not fetched yet", "in flight", "loaded" (possibly
+/// empty), and "failed" so the picker can render the right placeholder.
+#[derive(Debug, Clone)]
+pub enum FileIndex {
+    Unloaded,
+    Loading,
+    Loaded { files: Vec<String>, truncated: bool },
+    Failed(String),
+}
+
+/// Open-picker UI state. Selection only; see [`CockpitViewState::mention`].
+#[derive(Debug, Clone, Default)]
+pub struct MentionSession {
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +129,9 @@ impl CockpitViewState {
             in_flight: false,
             slash_selected: 0,
             dismissed_slash_query: None,
+            file_index: FileIndex::Unloaded,
+            mention: None,
+            dismissed_mention: None,
         }
     }
 
@@ -121,6 +153,10 @@ impl CockpitViewState {
         self.composer = new_composer_textarea();
         self.slash_selected = 0;
         self.dismissed_slash_query = None;
+        // The fresh composer holds no `@`-token; close the mention picker
+        // too. The fetched file_index cache survives for the session.
+        self.mention = None;
+        self.dismissed_mention = None;
         text
     }
 
