@@ -9,6 +9,7 @@
 //! https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929.
 
 pub mod input;
+pub mod queue;
 pub mod reducer;
 pub mod render;
 pub mod state;
