@@ -65,13 +65,22 @@ test("description edit persists across reload", async ({ serve, page }) => {
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
-  await page.getByRole("button", { name: "work", exact: true }).click();
+  // Selecting a profile fires an async load (getProfileSettings +
+  // fetchSettings) whose .then resets the description field to the loaded
+  // value. Wait for both responses before typing, otherwise a late resolve
+  // clobbers the typed value back to empty and Save PATCHes null.
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.url().includes("/api/profiles/work/settings") &&
+        r.request().method() === "GET",
+    ),
+    page.waitForResponse((r) => /\/api\/settings(\?|$)/.test(r.url())),
+    page.getByRole("button", { name: "work", exact: true }).click(),
+  ]);
 
   const desc = page.getByPlaceholder("What this profile is for");
   await desc.fill("client repos");
-  // The field is a controlled input (value={description}); wait until the
-  // DOM value reflects committed React state before saving, otherwise the
-  // Save handler can read a stale empty description and PATCH null.
   await expect(desc).toHaveValue("client repos");
   await page.getByRole("button", { name: "Save" }).click();
 
