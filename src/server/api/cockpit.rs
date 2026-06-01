@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::cockpit::approvals::Nonce;
 use crate::cockpit::event_store::AttachmentBlob;
 use crate::cockpit::protocol::{
-    ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest, PromptAttachmentUpload,
-    PromptRequest, ReplayQuery, ReplayResponse, ResolveApprovalRequest, SwitchAgentRequest,
-    SwitchAgentResponse,
+    ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest, FilesResponse,
+    PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse, ResolveApprovalRequest,
+    SwitchAgentRequest, SwitchAgentResponse,
 };
 use crate::cockpit::state::PromptAttachmentKind;
 use crate::cockpit::supervisor::SupervisorError;
@@ -975,12 +975,6 @@ pub async fn cockpit_force_end_turn(
     StatusCode::ACCEPTED.into_response()
 }
 
-#[derive(Debug, Serialize)]
-pub struct FilesResponse {
-    pub files: Vec<String>,
-    pub truncated: bool,
-}
-
 /// List workspace files for the @-mention picker. Walks the session's
 /// project_path tree, skipping VCS/build dirs and dot-files at the
 /// top level. Capped at 5000 entries.
@@ -1175,11 +1169,16 @@ fn list_files(root: &std::path::Path, cap: usize) -> std::io::Result<(Vec<String
             truncated = true;
             break;
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
+        // Sort each directory's entries by name before walking them so
+        // the traversal (and therefore which files survive the `cap`) is
+        // deterministic; `read_dir` order is platform/filesystem
+        // dependent and otherwise unspecified.
+        let mut entries: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(e) => e.flatten().collect(),
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with('.') {
@@ -1923,5 +1922,50 @@ mod tests {
         assert!(exists);
         assert_eq!(lines.last().map(String::as_str), Some("real second"));
         assert!(!lines.iter().any(|l| l == &big_line));
+    }
+
+    #[test]
+    fn list_files_returns_sorted_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("c.rs"), "").unwrap();
+
+        let (files, truncated) = list_files(dir.path(), 5000).unwrap();
+        assert_eq!(files, vec!["a.rs", "b.rs", "sub/c.rs"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn list_files_skips_vcs_build_and_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("real.rs"), "").unwrap();
+        // Dotfiles are skipped at every level, not just the top, so a
+        // nested dotfile must be dropped while its sibling is kept.
+        std::fs::write(dir.path().join("sub").join(".env"), "").unwrap();
+        for skip in [".git", "node_modules", "target"] {
+            std::fs::create_dir(dir.path().join(skip)).unwrap();
+            std::fs::write(dir.path().join(skip).join("junk"), "").unwrap();
+        }
+
+        let (files, _) = list_files(dir.path(), 5000).unwrap();
+        assert_eq!(files, vec!["keep.rs", "sub/real.rs"]);
+    }
+
+    #[test]
+    fn list_files_reports_truncation_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "").unwrap();
+        }
+        // Per-directory sorting makes the truncated subset deterministic,
+        // so we can pin the exact files, not just the count.
+        let (files, truncated) = list_files(dir.path(), 3).unwrap();
+        assert!(truncated);
+        assert_eq!(files, vec!["f0.rs", "f1.rs", "f2.rs"]);
     }
 }

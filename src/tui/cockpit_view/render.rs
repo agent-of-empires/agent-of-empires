@@ -1,5 +1,7 @@
-//! Four-pane render of a cockpit session: transcript / status banner /
-//! queued-prompts strip / composer. Tool calls render through a
+//! Render of a cockpit session, stacked top to bottom: transcript /
+//! status banner / queued-prompts strip (zero height when empty) /
+//! composer. The slash and `@` mention pickers float above the composer
+//! when open rather than taking a pane. Tool calls render through a
 //! per-kind dispatcher (`render_tool_lines`): edit/write show a compact
 //! line diff, execute shows the command and an output preview, read
 //! shows the path and a content preview, delete shows the path, and any
@@ -16,7 +18,7 @@ use similar::{ChangeTag, TextDiff};
 
 use super::input::Focus;
 use super::reducer::{ActivityRow, CockpitTranscript, NoteKind, ToolCallRow};
-use super::state::CockpitViewState;
+use super::state::{CockpitViewState, FileIndex};
 use crate::cockpit::approvals::ApprovalDecision;
 use crate::tui::styles::Theme;
 
@@ -38,11 +40,14 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitViewS
         render_queue(frame, chunks[2], theme, state);
     }
     render_composer(frame, chunks[3], theme, state);
-    // Picker floats above the composer (the composer sits at the screen
+    // Pickers float above the composer (the composer sits at the screen
     // bottom, so a dropdown below it would render off-screen). Drawn
-    // last so it overlays the transcript's lower rows.
+    // last so they overlay the transcript's lower rows. Slash and `@`
+    // pickers are mutually exclusive; slash wins the tie defensively.
     if state.slash_picker_open() {
         render_slash_picker(frame, chunks[3], theme, state);
+    } else if state.mention.is_some() {
+        render_mention_picker(frame, chunks[3], theme, state);
     }
 }
 
@@ -190,6 +195,105 @@ fn picker_lines<'a>(
         out.push(Line::from(spans));
     }
     out
+}
+
+/// Most `@`-mention rows visible at once before the list windows around
+/// the selection.
+const MENTION_PICKER_MAX_ROWS: usize = 8;
+
+/// Floating `@`-mention picker, anchored above the composer like the
+/// slash picker. Shows a loading / error / empty placeholder when the
+/// file index is not ready or nothing matches, otherwise the windowed
+/// list of matching paths.
+fn render_mention_picker(
+    frame: &mut Frame,
+    composer_area: Rect,
+    theme: &Theme,
+    state: &CockpitViewState,
+) {
+    let selected = state.mention.as_ref().map(|s| s.selected).unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut truncated_note = false;
+    match &state.file_index {
+        FileIndex::Unloaded | FileIndex::Loading => {
+            lines.push(Line::from(Span::styled(
+                "  loading files…",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        FileIndex::Failed(err) => {
+            lines.push(Line::from(Span::styled(
+                format!("  file list unavailable: {err}"),
+                Style::default().fg(theme.error),
+            )));
+        }
+        FileIndex::Loaded { truncated, .. } => {
+            let files = super::filtered_mention_files(state);
+            if files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  no matching files",
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            } else {
+                let max_rows = (composer_area.y as usize)
+                    .saturating_sub(2)
+                    .min(MENTION_PICKER_MAX_ROWS);
+                if max_rows == 0 {
+                    return;
+                }
+                let total = files.len();
+                let cap = max_rows.min(total).max(1);
+                let start = if selected >= cap {
+                    (selected - cap + 1).min(total.saturating_sub(cap))
+                } else {
+                    0
+                };
+                for (offset, path) in files[start..(start + cap).min(total)].iter().enumerate() {
+                    let idx = start + offset;
+                    let marker = if idx == selected { "▶ " } else { "  " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker}{path}"),
+                        if idx == selected {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    )));
+                }
+                truncated_note = *truncated;
+            }
+        }
+    }
+    if truncated_note {
+        lines.push(Line::from(Span::styled(
+            "  (workspace over 5000 files; list capped)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    // Anchor the popup's bottom edge to the composer's top edge, growing
+    // upward, exactly like the slash picker.
+    let desired = lines.len() as u16 + 2;
+    let y = composer_area.y.saturating_sub(desired);
+    let area = Rect {
+        x: composer_area.x,
+        y,
+        width: composer_area.width,
+        height: composer_area.y - y,
+    };
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title(" Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ")
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Top + bottom border rows wrapping the composer textarea.
@@ -1191,6 +1295,7 @@ mod tests {
             "selected row /{last_name} scrolled off-screen: {dump:?}"
         );
     }
+
     fn tool_row(kind: &str, args: &str, completion: Option<(bool, &str)>) -> ToolCallRow {
         use super::super::reducer::ToolCompletion;
         ToolCallRow {
@@ -1311,5 +1416,49 @@ mod tests {
         let row = tool_row("edit", r#"{"file_path":"a.rs","old_str"#, None);
         let out = joined(&render_tool_lines(&row, &Theme::default()));
         assert!(out.contains("$ {\"file_path\""), "{out:?}");
+    }
+
+    fn mention_state(query: &str, files: &[&str]) -> CockpitViewState {
+        use super::super::state::MentionSession;
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        state.composer.insert_str(format!("@{query}"));
+        state.file_index = FileIndex::Loaded {
+            files: files.iter().map(|f| f.to_string()).collect(),
+            truncated: false,
+        };
+        state.mention = Some(MentionSession { selected: 0 });
+        state
+    }
+
+    fn render_dump(state: &CockpitViewState, w: u16, h: u16) -> String {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, f.area(), &theme, state))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn render_shows_mention_picker_lists_daemon_files() {
+        // Story 1: the open picker lists files from the (seeded) daemon
+        // index. Empty query lists everything.
+        let state = mention_state("", &["src/main.rs", "docs/readme.md"]);
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("Files"), "picker title missing: {dump:?}");
+        assert!(dump.contains("src/main.rs"), "file missing: {dump:?}");
+        assert!(dump.contains("docs/readme.md"), "file missing: {dump:?}");
+    }
+
+    #[test]
+    fn render_mention_picker_narrows_to_query() {
+        // Story 1: as the query grows, the list narrows to matches only.
+        let state = mention_state("src", &["src/main.rs", "zzz/other.md"]);
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("src/main.rs"), "match missing: {dump:?}");
+        assert!(!dump.contains("zzz/other.md"), "non-match leaked: {dump:?}");
     }
 }

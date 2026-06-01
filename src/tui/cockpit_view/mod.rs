@@ -9,6 +9,7 @@
 //! https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929.
 
 pub mod input;
+pub mod mention;
 pub mod queue;
 pub mod reducer;
 pub mod render;
@@ -26,7 +27,7 @@ use ratatui::Terminal;
 use tokio::time::Instant;
 
 use self::input::{Focus, InputContext, Intent};
-use self::state::{CockpitViewState, ToastBanner, ToastKind};
+use self::state::{CockpitViewState, FileIndex, MentionSession, ToastBanner, ToastKind};
 use crate::cockpit::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, ManagerError, WsError, WsMessage,
     REPLAY_PAGE_SIZE,
@@ -367,6 +368,7 @@ async fn handle_terminal_event(
     let ctx = InputContext {
         has_pending_approval: has_pending,
         slash_picker_open: state.slash_picker_open(),
+        mention_picker_open: state.mention.is_some(),
     };
     let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
@@ -394,6 +396,10 @@ async fn handle_terminal_event(
                 state.slash_selected = 0;
             }
             state.reconcile_slash_selection();
+            // The typed text may have opened, narrowed, or closed an
+            // `@`-mention; recompute and fetch the file list on first open.
+            refresh_mention(state);
+            ensure_files_loaded(state, toast_deadline).await;
             Ok(false)
         }
         Intent::SlashMove(delta) => {
@@ -406,6 +412,23 @@ async fn handle_terminal_event(
         }
         Intent::SlashDismiss => {
             state.dismiss_slash();
+            Ok(false)
+        }
+        Intent::MentionNavigate(delta) => {
+            navigate_mention(state, delta);
+            Ok(false)
+        }
+        Intent::MentionAccept => {
+            accept_mention(state);
+            Ok(false)
+        }
+        Intent::MentionClose => {
+            // Remember the dismissed anchor so the picker stays shut while
+            // the user keeps typing in this same token.
+            state.dismissed_mention =
+                mention::active_mention(state.composer.lines(), composer_cursor(state))
+                    .map(|m| (m.row, m.start_col));
+            state.mention = None;
             Ok(false)
         }
         Intent::SubmitPrompt => {
@@ -577,6 +600,120 @@ async fn reconnect_with_backoff(
         }
     }
     Err(last_err.expect("at least one attempt"))
+}
+
+/// The composer cursor as a plain `(row, col)` char-index tuple, the
+/// shape [`mention::active_mention`] expects.
+fn composer_cursor(state: &CockpitViewState) -> (usize, usize) {
+    let c = state.composer.cursor();
+    (c.0, c.1)
+}
+
+/// Recompute the `@`-mention picker from the composer's current text.
+/// Opens the picker when the cursor sits in a fresh `@`-token, keeps it
+/// open while the token narrows, and closes it when the token goes away
+/// or was dismissed with Esc. The query itself is never stored; it is
+/// always derived from the textarea so there is one source of truth.
+fn refresh_mention(state: &mut CockpitViewState) {
+    let active = mention::active_mention(state.composer.lines(), composer_cursor(state));
+    match active {
+        None => {
+            state.mention = None;
+            state.dismissed_mention = None;
+        }
+        Some(m) => {
+            let anchor = (m.row, m.start_col);
+            if state.dismissed_mention == Some(anchor) {
+                // Still inside the token the user dismissed; stay shut.
+                state.mention = None;
+            } else {
+                state.dismissed_mention = None;
+                let selected = state.mention.as_ref().map(|s| s.selected).unwrap_or(0);
+                state.mention = Some(MentionSession { selected });
+            }
+        }
+    }
+}
+
+/// Files currently matching the open mention's query, capped for the
+/// picker. Empty when the picker is closed or the index is not loaded.
+pub(super) fn filtered_mention_files(state: &CockpitViewState) -> Vec<String> {
+    if state.mention.is_none() {
+        return Vec::new();
+    }
+    let FileIndex::Loaded { files, .. } = &state.file_index else {
+        return Vec::new();
+    };
+    let query = mention::active_mention(state.composer.lines(), composer_cursor(state))
+        .map(|m| m.query)
+        .unwrap_or_default();
+    mention::fuzzy_filter(files, &query, mention::PICKER_LIMIT)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fetch the workspace file list the first time the picker opens, then
+/// cache it for the session. No-op once loaded, loading, or failed, and
+/// while the picker is closed.
+async fn ensure_files_loaded(state: &mut CockpitViewState, toast_deadline: &mut Option<Instant>) {
+    if state.mention.is_none() || !matches!(state.file_index, FileIndex::Unloaded) {
+        return;
+    }
+    state.file_index = FileIndex::Loading;
+    match state.http.files(&state.session_id).await {
+        Ok(resp) => {
+            state.file_index = FileIndex::Loaded {
+                files: resp.files,
+                truncated: resp.truncated,
+            };
+        }
+        Err(e) => {
+            tracing::warn!(target: "cockpit.tui", "file list fetch failed: {e}");
+            let msg = e.to_string();
+            state.file_index = FileIndex::Failed(msg.clone());
+            set_toast(
+                state,
+                toast_deadline,
+                format!("file list failed: {msg}"),
+                ToastKind::Error,
+            );
+        }
+    }
+}
+
+/// Move the picker highlight, clamped to the filtered result count.
+fn navigate_mention(state: &mut CockpitViewState, delta: i32) {
+    let len = filtered_mention_files(state).len();
+    let Some(session) = state.mention.as_mut() else {
+        return;
+    };
+    if len == 0 {
+        session.selected = 0;
+        return;
+    }
+    let cur = session.selected.min(len - 1) as i64;
+    let next = (cur + delta as i64).rem_euclid(len as i64);
+    session.selected = next as usize;
+}
+
+/// Insert the highlighted file and close the picker.
+fn accept_mention(state: &mut CockpitViewState) {
+    let files = filtered_mention_files(state);
+    let Some(session) = state.mention.as_ref() else {
+        return;
+    };
+    let Some(path) = files.get(session.selected.min(files.len().saturating_sub(1))) else {
+        // Nothing to insert (empty filter); just close.
+        state.mention = None;
+        return;
+    };
+    let path = path.clone();
+    if let Some(m) = mention::active_mention(state.composer.lines(), composer_cursor(state)) {
+        mention::apply_selection(&mut state.composer, &m, &path);
+    }
+    state.mention = None;
+    state.dismissed_mention = None;
 }
 
 fn apply_scroll(state: &mut CockpitViewState, delta: i32) {

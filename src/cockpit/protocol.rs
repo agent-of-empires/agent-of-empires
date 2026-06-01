@@ -202,6 +202,17 @@ pub struct ReplayResponse {
     pub has_more: bool,
 }
 
+/// `GET /api/sessions/{id}/cockpit/files` response. Workspace file
+/// list for the composer's `@`-mention picker, walked from the
+/// session's project root and capped at 5000 entries.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FilesResponse {
+    /// Relative paths (POSIX-style), sorted.
+    pub files: Vec<String>,
+    /// True when the walk hit the 5000-entry cap and stopped early.
+    pub truncated: bool,
+}
+
 /// `GET /api/sessions/{id}/cockpit/context-primer?before_seq=N` query.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContextPrimerQuery {
