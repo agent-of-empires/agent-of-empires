@@ -16,6 +16,7 @@ pub(crate) mod recovery;
 pub mod repo_config;
 pub mod scratch;
 pub(crate) mod serde_helpers;
+pub mod settings_schema;
 pub mod stop;
 mod storage;
 
