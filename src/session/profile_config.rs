@@ -1180,4 +1180,123 @@ mod tests {
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]);
     }
+
+    // Baseline pins for the Vec sandbox overrides that the single-source
+    // refactor (#1692) will regenerate. Replace semantics, not extend.
+    #[test]
+    fn test_merge_configs_replaces_extra_volumes() {
+        let mut global = Config::default();
+        global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
+
+        let profile = ProfileConfig {
+            sandbox: Some(SandboxConfigOverride {
+                extra_volumes: Some(vec!["/from-profile:/p".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.sandbox.extra_volumes, vec!["/from-profile:/p"]);
+    }
+
+    #[test]
+    fn test_merge_configs_extra_volumes_inherits_when_none() {
+        let mut global = Config::default();
+        global.sandbox.extra_volumes = vec!["/from-global:/g".to_string()];
+
+        let profile = ProfileConfig {
+            sandbox: Some(SandboxConfigOverride {
+                enabled_by_default: Some(true),
+                extra_volumes: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.sandbox.extra_volumes, vec!["/from-global:/g"]);
+    }
+
+    #[test]
+    fn test_merge_configs_replaces_port_mappings() {
+        let mut global = Config::default();
+        global.sandbox.port_mappings = vec!["3000:3000".to_string()];
+
+        let profile = ProfileConfig {
+            sandbox: Some(SandboxConfigOverride {
+                port_mappings: Some(vec!["8080:8080".to_string(), "9090:9090".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.sandbox.port_mappings, vec!["8080:8080", "9090:9090"]);
+    }
+
+    #[test]
+    fn test_merge_configs_port_mappings_inherits_when_none() {
+        let mut global = Config::default();
+        global.sandbox.port_mappings = vec!["3000:3000".to_string()];
+
+        let profile = ProfileConfig {
+            sandbox: Some(SandboxConfigOverride {
+                cpu_limit: Some("2".to_string()),
+                port_mappings: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.sandbox.port_mappings, vec!["3000:3000"]);
+    }
+
+    #[test]
+    fn test_merge_configs_with_cockpit_overrides() {
+        let global = Config::default();
+        assert!(!global.cockpit.enabled);
+
+        let profile = ProfileConfig {
+            cockpit: Some(CockpitConfigOverride {
+                enabled: Some(true),
+                default_agent: Some("claude-code".to_string()),
+                max_concurrent_workers: Some(9),
+                replay_bytes: Some(1024),
+                node_path: Some("/opt/node".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.cockpit.enabled);
+        assert_eq!(merged.cockpit.default_agent, "claude-code");
+        assert_eq!(merged.cockpit.max_concurrent_workers, 9);
+        assert_eq!(merged.cockpit.replay_bytes, 1024);
+        assert_eq!(merged.cockpit.node_path, "/opt/node");
+        // Not overridden: inherits global default.
+        assert!(merged.cockpit.show_tool_durations);
+    }
+
+    #[test]
+    fn test_merge_configs_cockpit_inherits_when_none() {
+        let mut global = Config::default();
+        global.cockpit.default_agent = "from-global".to_string();
+        global.cockpit.max_concurrent_workers = 7;
+
+        let profile = ProfileConfig {
+            cockpit: Some(CockpitConfigOverride {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.cockpit.enabled);
+        assert_eq!(merged.cockpit.default_agent, "from-global");
+        assert_eq!(merged.cockpit.max_concurrent_workers, 7);
+    }
 }
