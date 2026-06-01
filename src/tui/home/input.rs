@@ -82,9 +82,11 @@ const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 /// Without the wrapping, agents that submit on Enter (Claude Code,
 /// Codex, OpenCode, ...) post one user message per pasted line, which
 /// is the bug behind #1546. The whole payload (markers, printable
-/// runs, interior CRs, and tabs) goes through as a single `HexBytes`,
-/// so the worker fires one `tmux send-keys -H` subprocess per paste
-/// instead of one per chunk. `\r\n` pairs coalesce to a single CR so
+/// runs, interior CRs, and tabs) goes through as a single `HexBytes`
+/// action, which the worker dispatches as one or more size-bounded
+/// `tmux send-keys -H` forks (a per-byte argv overflows `ARG_MAX` on a
+/// large paste, so it can't always be one fork). `\r\n` pairs coalesce
+/// to a single CR so
 /// Windows-line-ending pastes don't double up; other control bytes
 /// (BEL, ESC, ...) are dropped rather than risk that an embedded
 /// escape closes the bracketed-paste sequence on the agent's side.

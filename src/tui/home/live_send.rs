@@ -475,11 +475,11 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // `-H` sends each subsequent arg as the hex byte value of an
             // ASCII character. We use this for control bytes (CR, TAB,
             // ESC) and the bracketed-paste markers, none of which can
-            // ride a `-l` payload safely.
-            cmd.args(["send-keys", "-t", &target, "-H"]);
-            for b in bytes {
-                cmd.arg(format!("{:02x}", b));
-            }
+            // ride a `-l` payload safely. One arg per byte means a large
+            // multi-line paste would overflow the OS `execve` argv limit
+            // (macOS ARG_MAX is 256 KiB) and fail with E2BIG, silently
+            // dropping the whole paste, so split it across bounded forks.
+            return dispatch_hex_bytes(&target, bytes);
         }
         TmuxAction::Resize { cols, rows } => {
             cmd.args([
@@ -500,6 +500,50 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
         anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
     }
     Ok(())
+}
+
+/// Upper bound on the number of bytes encoded into a single
+/// `tmux send-keys -H` fork. Each byte becomes one ~2-char hex argument
+/// plus its argv pointer (~11 bytes of kernel arg space), and macOS caps
+/// `execve` argv+envp at `ARG_MAX` = 256 KiB, so a per-byte encoding of
+/// a large paste overflows around 20 KB and fails wholesale with E2BIG.
+/// 4 KiB per fork keeps every argv under ~45 KiB, comfortably below the
+/// limit on every platform while keeping the fork count low.
+const MAX_HEX_BYTES_PER_SEND: usize = 4096;
+
+/// Dispatch a raw byte payload as one or more `tmux send-keys -H` forks,
+/// each bounded by [`MAX_HEX_BYTES_PER_SEND`]. tmux injects the bytes
+/// into the pane in order, so splitting a bracketed paste across forks is
+/// transparent to the agent: it still reassembles one contiguous paste
+/// from the `\e[200~` ... `\e[201~` byte stream.
+fn dispatch_hex_bytes(target: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    for batch in hex_send_batches(bytes) {
+        let mut cmd = Command::new("tmux");
+        cmd.stderr(Stdio::null());
+        cmd.args(["send-keys", "-t", target, "-H"]);
+        cmd.args(&batch);
+        let status = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
+        if !status.success() {
+            anyhow::bail!(
+                "live-send tmux subprocess exited non-zero for {} bytes",
+                bytes.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Split a byte payload into the hex-argument batches passed to
+/// successive `tmux send-keys -H` forks. Pure so the chunking bound and
+/// byte-order preservation are unit-testable without a tmux session.
+fn hex_send_batches(bytes: &[u8]) -> Vec<Vec<String>> {
+    bytes
+        .chunks(MAX_HEX_BYTES_PER_SEND)
+        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
+        .collect()
 }
 
 /// What the translator says to do with one incoming key event.
@@ -1108,5 +1152,47 @@ mod tests {
         // verifies the passthrough.
         assert_literal(translate(k(KeyCode::Char('q'))), "q");
         assert_literal(translate(k(KeyCode::Char('Q'))), "Q");
+    }
+
+    #[test]
+    fn large_hex_paste_splits_into_bounded_send_keys_batches() {
+        // Regression for the silently-dropped large paste: a ~100 KB
+        // bracketed paste, encoded one hex arg per byte, overflows the
+        // `execve` argv limit (macOS ARG_MAX = 256 KiB) and the whole
+        // `tmux send-keys` fails with E2BIG. The fix splits the payload
+        // into bounded batches; verify it splits, each batch stays under
+        // the cap, and the bytes reconstruct in order.
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = hex_send_batches(&payload);
+        assert!(
+            batches.len() > 1,
+            "a large paste must split across multiple forks, got {}",
+            batches.len()
+        );
+        for batch in &batches {
+            assert!(
+                batch.len() <= MAX_HEX_BYTES_PER_SEND,
+                "a single fork's argv must stay under the ARG_MAX bound",
+            );
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(
+            roundtrip, payload,
+            "chunking must preserve every byte and its order",
+        );
+    }
+
+    #[test]
+    fn small_hex_paste_stays_one_batch() {
+        // A short bracketed paste fits in a single fork: no behavior
+        // change for the common case.
+        let payload = b"\x1b[200~hi\x1b[201~".to_vec();
+        let batches = hex_send_batches(&payload);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].first().map(String::as_str), Some("1b"));
     }
 }
