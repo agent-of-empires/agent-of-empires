@@ -742,6 +742,15 @@ fn build_cockpit_fields(
             inherited_display: None,
         },
         SettingField {
+            key: FieldKey::CockpitRateLimitAutoResume,
+            label: "Auto-resume after rate limit",
+            description: "When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Default off, which keeps the parked-until-you-act behavior. Vendor-agnostic: any ACP backend reporting a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. See #1722.",
+            value: FieldValue::Bool(rate_limit_auto_resume),
+            category: SettingsCategory::Cockpit,
+            has_override: rlar_override,
+            inherited_display: None,
+        },
+        SettingField {
             key: FieldKey::SectionMarker,
             label: "Advanced",
             description: "Operational tuning, rarely needed after first setup. Adjust only if you've read the description and know what you're changing.",
@@ -826,15 +835,6 @@ fn build_cockpit_fields(
             value: FieldValue::Number(u64::from(auto_stop_idle_secs)),
             category: SettingsCategory::Cockpit,
             has_override: asis_override,
-            inherited_display: None,
-        },
-        SettingField {
-            key: FieldKey::CockpitRateLimitAutoResume,
-            label: "Auto-resume after rate limit",
-            description: "When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Default off, which keeps the parked-until-you-act behavior. Vendor-agnostic: any ACP backend reporting a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. See #1722.",
-            value: FieldValue::Bool(rate_limit_auto_resume),
-            category: SettingsCategory::Cockpit,
-            has_override: rlar_override,
             inherited_display: None,
         },
         SettingField {
@@ -3931,6 +3931,7 @@ mod tests {
             FieldKey::CockpitReplayEvents,
             FieldKey::CockpitNodePath,
             FieldKey::CockpitShowToolDurations,
+            FieldKey::CockpitRateLimitAutoResume,
         ];
         for k in common_keys {
             let pos = fields.iter().position(|f| f.key == k).unwrap();
@@ -3952,7 +3953,6 @@ mod tests {
             FieldKey::CockpitSilentOrphanGraceSecs,
             FieldKey::CockpitSilentOrphanFastGraceSecs,
             FieldKey::CockpitAutoStopIdleSecs,
-            FieldKey::CockpitRateLimitAutoResume,
             FieldKey::CockpitRateLimitAutoResumeGraceSecs,
         ];
         for k in advanced_keys {
