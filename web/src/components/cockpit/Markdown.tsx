@@ -77,9 +77,24 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
         CodeHeader,
         table: TableWithScroll,
         blockquote: Blockquote,
+        a: TranscriptLink,
       }}
     />
   );
+}
+
+/**
+ * Transcript link. Cockpit is a long-running debugging surface, so a
+ * link that navigates the current tab pulls the user out of the live
+ * session. Force every transcript anchor to open a new tab with the
+ * dashboard-standard safe rel (matches AboutModal, Dashboard, etc., and
+ * guards against tabnabbing). Existing anchor props (href, title,
+ * className, children) are forwarded untouched. See #1714.
+ */
+function TranscriptLink({
+  ...rest
+}: React.ComponentPropsWithoutRef<"a">) {
+  return <a {...rest} target="_blank" rel="noopener noreferrer" />;
 }
 
 /**
