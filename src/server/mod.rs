@@ -2522,6 +2522,15 @@ mod tests {
             }),
             Some(StatusIntent::HealError)
         );
+        // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
+        // the worker is coming back, so clear a sticky error without
+        // clobbering an in-progress turn. See #1722.
+        assert_eq!(
+            derive_cockpit_status(&Event::RateLimitAutoResumed {
+                resets_at: chrono::Utc::now()
+            }),
+            Some(StatusIntent::HealError)
+        );
     }
 
     #[cfg(feature = "serve")]
