@@ -13,7 +13,7 @@ use crate::session::{
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
-pub use fields::{FieldKey, FieldValue, SettingField, SettingsCategory};
+pub use fields::{FieldValue, HookField, SettingField, SettingsCategory};
 pub use input::SettingsAction;
 
 /// Which scope of settings is being edited
@@ -46,8 +46,10 @@ pub struct ListEditState {
 #[derive(Debug, Clone)]
 pub(super) struct SearchHit {
     pub category: SettingsCategory,
-    pub field_key: FieldKey,
-    pub field_label: &'static str,
+    /// Stable field identity (`SettingField::ident`) used to relocate the
+    /// cursor on jump, since fields are rebuilt from the schema per category.
+    pub field_ident: String,
+    pub field_label: String,
     pub category_label: &'static str,
 }
 
@@ -635,8 +637,8 @@ impl SettingsView {
                 }
                 hits.push(SearchHit {
                     category,
-                    field_key: field.key,
-                    field_label: field.label,
+                    field_ident: field.ident(),
+                    field_label: field.label.clone(),
                     category_label: category.label(),
                 });
             }
@@ -665,7 +667,11 @@ impl SettingsView {
             self.selected_category = idx;
         }
         self.rebuild_fields();
-        if let Some(idx) = self.fields.iter().position(|f| f.key == hit.field_key) {
+        if let Some(idx) = self
+            .fields
+            .iter()
+            .position(|f| f.ident() == hit.field_ident)
+        {
             self.selected_field = idx;
             self.ensure_field_visible(self.fields_viewport_height);
         }

@@ -6,7 +6,8 @@ use tui_input::Input;
 
 use crate::tui::dialogs::{CustomInstructionDialog, DialogResult};
 
-use super::{FieldKey, FieldValue, ListEditState, SettingsFocus, SettingsScope, SettingsView};
+use super::fields::ListItemValidation;
+use super::{FieldValue, ListEditState, SettingsFocus, SettingsScope, SettingsView};
 
 /// Result of handling a key event in the settings view
 pub enum SettingsAction {
@@ -281,7 +282,7 @@ impl SettingsView {
                             self.editing_input = Some(Input::new(value.clone()));
                         }
                         FieldValue::OptionalText(value) => {
-                            if field.key == FieldKey::CustomInstruction {
+                            if field.is_custom_instruction() {
                                 self.custom_instruction_dialog =
                                     Some(CustomInstructionDialog::new(value.clone()));
                             } else {
@@ -301,7 +302,7 @@ impl SettingsView {
                             };
                             self.apply_field_to_config(self.selected_field);
 
-                            if self.fields[self.selected_field].key == FieldKey::ThemeName {
+                            if self.fields[self.selected_field].is_theme_name() {
                                 if let FieldValue::Select { selected, options } =
                                     &self.fields[self.selected_field].value
                                 {
@@ -349,7 +350,7 @@ impl SettingsView {
                     && self.focus == SettingsFocus::Fields
                     && !self.fields.is_empty()
                 {
-                    let was_theme = self.fields[self.selected_field].key == FieldKey::ThemeName;
+                    let was_theme = self.fields[self.selected_field].is_theme_name();
                     // Clearing an override doesn't change which fields exist, only
                     // their inherited values. rebuild_fields() resets scroll to 0,
                     // which would yank the user away from the field they just reset.
@@ -364,9 +365,7 @@ impl SettingsView {
                     self.fields_scroll_offset = saved_scroll;
 
                     if was_theme {
-                        if let Some(field) =
-                            self.fields.iter().find(|f| f.key == FieldKey::ThemeName)
-                        {
+                        if let Some(field) = self.fields.iter().find(|f| f.is_theme_name()) {
                             if let FieldValue::Select { selected, options } = &field.value {
                                 if let Some(name) = options.get(*selected) {
                                     return SettingsAction::PreviewTheme(name.clone());
@@ -560,16 +559,19 @@ impl SettingsView {
                 if let Some(input) = input {
                     let text = input.value().to_string();
                     if !text.is_empty() {
-                        let field_key = self.fields[self.selected_field].key;
+                        let item_validation =
+                            self.fields[self.selected_field].list_item_validation();
 
                         // Validate key=value format for agent override fields
-                        let validation_result = match field_key {
-                            FieldKey::AgentExtraArgs | FieldKey::AgentCommandOverride => {
+                        let validation_result = match item_validation {
+                            ListItemValidation::AgentKeyValue => {
                                 Some(validate_agent_key_value(&text))
                             }
-                            FieldKey::CustomAgents => Some(validate_custom_agent_entry(&text)),
-                            FieldKey::AgentDetectAs => Some(validate_detect_as_entry(&text)),
-                            _ => None,
+                            ListItemValidation::CustomAgent => {
+                                Some(validate_custom_agent_entry(&text))
+                            }
+                            ListItemValidation::DetectAs => Some(validate_detect_as_entry(&text)),
+                            ListItemValidation::None | ListItemValidation::EnvEntry => None,
                         };
                         if let Some(Err(msg)) = validation_result {
                             self.error_message = Some(msg);
@@ -582,7 +584,7 @@ impl SettingsView {
                         }
 
                         // Validate env var references before accepting
-                        if field_key == FieldKey::Environment {
+                        if item_validation == ListItemValidation::EnvEntry {
                             self.error_message = crate::session::validate_env_entry(&text);
                         }
 
@@ -600,7 +602,7 @@ impl SettingsView {
                         }
                         self.apply_field_to_config(self.selected_field);
                         // Clear stale errors, but preserve env validation warnings set above
-                        if field_key != FieldKey::Environment {
+                        if item_validation != ListItemValidation::EnvEntry {
                             self.error_message = None;
                         }
                     }
@@ -621,464 +623,15 @@ impl SettingsView {
             return;
         }
 
-        let key = self.fields[field_index].key;
-
-        // Pick the right ProfileConfig to clear from based on scope
+        // Pick the right override store based on scope, then clear the field's
+        // path generically (global-only fields and section markers no-op).
+        let field = self.fields[field_index].clone();
         let config = if self.scope == SettingsScope::Repo {
             &mut self.repo_as_profile
         } else {
             &mut self.profile_config
         };
-
-        match key {
-            // Profile description: clears straight to None since there is no
-            // global counterpart to inherit from.
-            FieldKey::ProfileDescription => {
-                config.description = None;
-            }
-            // Theme
-            FieldKey::ThemeName => {
-                if let Some(ref mut t) = config.theme {
-                    t.name = None;
-                }
-            }
-            FieldKey::ThemeColorMode => {
-                if let Some(ref mut t) = config.theme {
-                    t.color_mode = None;
-                }
-            }
-            FieldKey::IdleDecayMinutes => {
-                if let Some(ref mut t) = config.theme {
-                    t.idle_decay_minutes = None;
-                }
-            }
-            // Updates
-            FieldKey::UpdateCheckMode => {
-                if let Some(ref mut u) = config.updates {
-                    u.update_check_mode = None;
-                }
-            }
-            FieldKey::CheckIntervalHours => {
-                if let Some(ref mut u) = config.updates {
-                    u.check_interval_hours = None;
-                }
-            }
-            FieldKey::NotifyInCli => {
-                if let Some(ref mut u) = config.updates {
-                    u.notify_in_cli = None;
-                }
-            }
-            FieldKey::WebPollIntervalMinutes => {
-                if let Some(ref mut u) = config.updates {
-                    u.web_poll_interval_minutes = None;
-                }
-            }
-            // Worktree
-            FieldKey::WorktreeEnabled => {
-                if let Some(ref mut w) = config.worktree {
-                    w.enabled = None;
-                }
-            }
-            FieldKey::PathTemplate => {
-                if let Some(ref mut w) = config.worktree {
-                    w.path_template = None;
-                }
-            }
-            FieldKey::BareRepoPathTemplate => {
-                if let Some(ref mut w) = config.worktree {
-                    w.bare_repo_path_template = None;
-                }
-            }
-            FieldKey::WorktreeAutoCleanup => {
-                if let Some(ref mut w) = config.worktree {
-                    w.auto_cleanup = None;
-                }
-            }
-            FieldKey::DeleteBranchOnCleanup => {
-                if let Some(ref mut w) = config.worktree {
-                    w.delete_branch_on_cleanup = None;
-                }
-            }
-            FieldKey::WorkspacePathTemplate => {
-                if let Some(ref mut w) = config.worktree {
-                    w.workspace_path_template = None;
-                }
-            }
-            FieldKey::InitSubmodules => {
-                if let Some(ref mut w) = config.worktree {
-                    w.init_submodules = None;
-                }
-            }
-            // Sandbox
-            FieldKey::DefaultImage => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.default_image = None;
-                }
-            }
-            FieldKey::Environment => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.environment = None;
-                }
-            }
-            FieldKey::SandboxAutoCleanup => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.auto_cleanup = None;
-                }
-            }
-            // Tmux
-            FieldKey::StatusBar => {
-                if let Some(ref mut t) = config.tmux {
-                    t.status_bar = None;
-                }
-            }
-            FieldKey::Mouse => {
-                if let Some(ref mut t) = config.tmux {
-                    t.mouse = None;
-                }
-            }
-            FieldKey::Clipboard => {
-                if let Some(ref mut t) = config.tmux {
-                    t.clipboard = None;
-                }
-            }
-            // Session
-            FieldKey::DefaultTool => {
-                if let Some(ref mut s) = config.session {
-                    s.default_tool = None;
-                }
-            }
-            FieldKey::SandboxEnabledByDefault => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.enabled_by_default = None;
-                }
-            }
-            FieldKey::YoloModeDefault => {
-                if let Some(ref mut s) = config.session {
-                    s.yolo_mode_default = None;
-                }
-            }
-            FieldKey::StrictHotkeys => {
-                if let Some(ref mut s) = config.session {
-                    s.strict_hotkeys = None;
-                }
-            }
-            FieldKey::SnoozeDurationMinutes => {
-                if let Some(ref mut s) = config.session {
-                    s.snooze_duration_minutes = None;
-                }
-            }
-            FieldKey::RestartWakeMessage => {
-                if let Some(ref mut s) = config.session {
-                    s.restart_wake_message = None;
-                }
-            }
-            FieldKey::LiveSendExitChord => {
-                if let Some(ref mut s) = config.session {
-                    s.live_send_exit_chord = None;
-                }
-            }
-            FieldKey::NewSessionAttachMode => {
-                if let Some(ref mut s) = config.session {
-                    s.new_session_attach_mode = None;
-                }
-            }
-            FieldKey::DefaultAttachMode => {
-                if let Some(ref mut s) = config.session {
-                    s.default_attach_mode = None;
-                }
-            }
-            FieldKey::ClickAction => {
-                if let Some(ref mut s) = config.session {
-                    s.click_action = None;
-                }
-            }
-            FieldKey::RowTag => {
-                if let Some(ref mut s) = config.session {
-                    s.row_tag = None;
-                }
-            }
-            FieldKey::AgentExtraArgs => {
-                if let Some(ref mut s) = config.session {
-                    s.agent_extra_args = None;
-                }
-            }
-            FieldKey::AgentCommandOverride => {
-                if let Some(ref mut s) = config.session {
-                    s.agent_command_override = None;
-                }
-            }
-            FieldKey::CustomAgents => {
-                if let Some(ref mut s) = config.session {
-                    s.custom_agents = None;
-                }
-            }
-            FieldKey::AgentDetectAs => {
-                if let Some(ref mut s) = config.session {
-                    s.agent_detect_as = None;
-                }
-            }
-            FieldKey::AgentStatusHooks => {
-                if let Some(ref mut s) = config.session {
-                    s.agent_status_hooks = None;
-                }
-            }
-            FieldKey::MouseCapture => {
-                if let Some(ref mut s) = config.session {
-                    s.mouse_capture = None;
-                }
-            }
-            FieldKey::DefaultTerminalMode => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.default_terminal_mode = None;
-                }
-            }
-            FieldKey::ExtraVolumes => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.extra_volumes = None;
-                }
-            }
-            FieldKey::PortMappings => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.port_mappings = None;
-                }
-            }
-            FieldKey::VolumeIgnores => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.volume_ignores = None;
-                }
-            }
-            FieldKey::MountSsh => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.mount_ssh = None;
-                }
-            }
-            FieldKey::SelinuxRelabel => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.selinux_relabel = None;
-                }
-            }
-            FieldKey::CpuLimit => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.cpu_limit = None;
-                }
-            }
-            FieldKey::MemoryLimit => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.memory_limit = None;
-                }
-            }
-            FieldKey::CustomInstruction => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.custom_instruction = None;
-                }
-            }
-            FieldKey::ContainerRuntime => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.container_runtime = None;
-                }
-            }
-            FieldKey::VolumeIgnoresStrategy => {
-                if let Some(ref mut s) = config.sandbox {
-                    s.volume_ignores_strategy = None;
-                }
-            }
-            // Sound
-            FieldKey::SoundEnabled => {
-                if let Some(ref mut s) = config.sound {
-                    s.enabled = None;
-                }
-            }
-            FieldKey::SoundMode => {
-                if let Some(ref mut s) = config.sound {
-                    s.mode = None;
-                }
-            }
-            FieldKey::SoundVolume => {
-                if let Some(ref mut s) = config.sound {
-                    s.volume = None;
-                }
-            }
-            FieldKey::SoundOnStart => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_start = None;
-                }
-            }
-            FieldKey::SoundOnRunning => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_running = None;
-                }
-            }
-            FieldKey::SoundOnWaiting => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_waiting = None;
-                }
-            }
-            FieldKey::SoundOnIdle => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_idle = None;
-                }
-            }
-            FieldKey::SoundOnError => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_error = None;
-                }
-            }
-            FieldKey::SoundOnApproval => {
-                if let Some(ref mut s) = config.sound {
-                    s.on_approval = None;
-                }
-            }
-            // Status hooks
-            FieldKey::StatusHooksEnabled => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.enabled = None;
-                }
-            }
-            FieldKey::StatusHookDebounceMs => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.debounce_ms = None;
-                }
-            }
-            FieldKey::StatusHookOnStarting => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_starting = None;
-                }
-            }
-            FieldKey::StatusHookOnRunning => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_running = None;
-                }
-            }
-            FieldKey::StatusHookOnWaiting => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_waiting = None;
-                }
-            }
-            FieldKey::StatusHookOnIdle => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_idle = None;
-                }
-            }
-            FieldKey::StatusHookOnError => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_error = None;
-                }
-            }
-            FieldKey::StatusHookOnChange => {
-                if let Some(ref mut s) = config.status_hooks {
-                    s.on_change = None;
-                }
-            }
-            // Hooks
-            FieldKey::HookOnCreate => {
-                if let Some(ref mut h) = config.hooks {
-                    h.on_create = None;
-                }
-            }
-            FieldKey::HookOnLaunch => {
-                if let Some(ref mut h) = config.hooks {
-                    h.on_launch = None;
-                }
-            }
-            FieldKey::HookOnDestroy => {
-                if let Some(ref mut h) = config.hooks {
-                    h.on_destroy = None;
-                }
-            }
-            // Web settings are server-global; no per-profile override to clear.
-            FieldKey::WebNotificationsEnabled
-            | FieldKey::WebNotifyOnWaiting
-            | FieldKey::WebNotifyOnIdle
-            | FieldKey::WebNotifyOnError
-            | FieldKey::WebNotifyOnWakeFire => {}
-            // Cockpit overrides clear by setting the override field to None.
-            FieldKey::CockpitEnabled => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.enabled = None;
-                }
-            }
-            FieldKey::CockpitDefaultForClaude => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.default_for_claude = None;
-                }
-            }
-            FieldKey::CockpitDefaultAgent => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.default_agent = None;
-                }
-            }
-            FieldKey::CockpitMaxConcurrentWorkers => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.max_concurrent_workers = None;
-                }
-            }
-            FieldKey::CockpitReplayEvents => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.replay_events = None;
-                }
-            }
-            FieldKey::CockpitReplayBytes => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.replay_bytes = None;
-                }
-            }
-            FieldKey::CockpitNodePath => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.node_path = None;
-                }
-            }
-            FieldKey::CockpitShowToolDurations => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.show_tool_durations = None;
-                }
-            }
-            FieldKey::CockpitQueueDrainMode => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.queue_drain_mode = None;
-                }
-            }
-            FieldKey::CockpitMaxConcurrentResumes => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.max_concurrent_resumes = None;
-                }
-            }
-            FieldKey::CockpitForceEndTurnThresholdSecs => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.force_end_turn_threshold_secs = None;
-                }
-            }
-            FieldKey::CockpitSilentOrphanGraceSecs => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.silent_orphan_grace_secs = None;
-                }
-            }
-            FieldKey::CockpitSilentOrphanFastGraceSecs => {
-                if let Some(c) = config.cockpit.as_mut() {
-                    c.silent_orphan_fast_grace_secs = None;
-                }
-            }
-            // Logging is global-only for v1 (no profile overrides); the
-            // "clear override" gesture is a no-op for these keys.
-            // SessionIdPollerMaxThreads and ConfirmBeforeQuit are also
-            // global-only.
-            FieldKey::ConfirmBeforeQuit
-            | FieldKey::LoggingDefaultLevel
-            | FieldKey::LoggingTarget(_)
-            | FieldKey::LoggingOutput
-            | FieldKey::LoggingFilePath
-            | FieldKey::LoggingRotation
-            | FieldKey::LoggingMaxSizeMib
-            | FieldKey::LoggingKeepCount
-            | FieldKey::LoggingShowSpans
-            | FieldKey::SessionIdPollerMaxThreads => {}
-            FieldKey::HostEnvironment => {
-                config.environment = None;
-            }
-            // Section markers are non-interactive dividers; navigation
-            // and the reset gesture never land here, but the match
-            // arm must exist for exhaustiveness.
-            FieldKey::SectionMarker => {}
-        }
+        super::fields::clear_override(&field, config);
 
         // Sync repo_config when in Repo scope
         if self.scope == SettingsScope::Repo {
@@ -1470,8 +1023,11 @@ mod tests {
             let (_t, mut view) = fresh_view();
             press(&mut view, KeyCode::Char('/'));
             type_text(&mut view, "live");
-            let labels: Vec<&'static str> =
-                view.search_hits.iter().map(|h| h.field_label).collect();
+            let labels: Vec<String> = view
+                .search_hits
+                .iter()
+                .map(|h| h.field_label.clone())
+                .collect();
             assert!(
                 labels
                     .iter()
@@ -1511,8 +1067,8 @@ mod tests {
                 "must jump to the Agents tab (where Default Tool lives now)"
             );
             assert_eq!(
-                view.fields[view.selected_field].key,
-                FieldKey::DefaultTool,
+                view.fields[view.selected_field].ident(),
+                "session.default_tool",
                 "must position the field cursor on Default Tool"
             );
         }

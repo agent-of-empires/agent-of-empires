@@ -23,10 +23,10 @@ pub struct StatusHookConfig {
     pub enabled: bool,
 
     /// Milliseconds a status must remain stable before running hook commands.
-    #[serde(
-        default = "default_debounce_ms",
-        skip_serializing_if = "is_default_debounce_ms"
-    )]
+    /// Always serialized (no skip-at-default) so every surface that reads the
+    /// config JSON, including the settings schema consumers, sees a concrete
+    /// value rather than an absent leaf that would display as 0 (#1692).
+    #[serde(default = "default_debounce_ms")]
     #[setting(label = "Debounce (ms)", widget = "number", min = 0)]
     pub debounce_ms: u64,
 
@@ -242,10 +242,6 @@ fn non_empty_command(value: Option<&str>) -> Option<&str> {
 
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
-}
-
-fn is_default_debounce_ms(value: &u64) -> bool {
-    *value == DEFAULT_DEBOUNCE_MS
 }
 
 fn spawn_transition_commands(
