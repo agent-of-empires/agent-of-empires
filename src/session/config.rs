@@ -2335,6 +2335,18 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_auto_stop_idle_secs_accepts_u32_range() {
+        assert!(validate_auto_stop_idle_secs(0).is_ok());
+        assert!(validate_auto_stop_idle_secs(3600).is_ok());
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auto_stop_idle_secs_rejects_above_u32() {
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
+    }
+
+    #[test]
     fn test_validate_snooze_duration_accepts_dialog_presets() {
         // The TUI dialog presets must all pass the validator; otherwise
         // the API silently rejects what the UI offered. Presets:
