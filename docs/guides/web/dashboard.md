@@ -101,6 +101,18 @@ The "Snoozed & archived" section sits at the very bottom of the sidebar and aggr
 
 In read-only mode (`aoe serve --read-only`) the three menu entries are hidden, matching the existing read-only gate on Delete.
 
+### Multi-select and bulk triage
+
+To triage many sessions at once, select more than one row and act on the whole selection:
+
+- **Cmd/Ctrl+click** a row toggles it in or out of the selection without navigating to it.
+- **Shift+click** selects every row between the last clicked row and this one, in the order they appear. The range spans only visible rows: collapsed groups and a collapsed "Snoozed & archived" footer contribute nothing, and an active filter trims the range to matches.
+- A plain click (no modifier) clears the selection and opens that session, the same as before.
+
+While a selection is active, a bulk action bar appears above the list showing the count and the actions that apply. Actions split by the rows they can affect, so a mixed selection shows, for example, **Pin 3** alongside **Unpin 2** rather than one ambiguous toggle: **Pin**, **Archive**, and **Snooze** target the live rows; **Unpin**, **Unarchive**, and **Unsnooze** target the already-triaged rows. **Snooze** offers the same duration presets as the single-row menu.
+
+Bulk actions are best-effort, not all-or-nothing: each session is updated independently, and the bar reports a summary (how many succeeded, failed, or were skipped) when the action finishes, then clears the selection. The selection survives collapsing a group or changing the filter and is dropped only when a session no longer exists; it is not saved across reloads. Like the single-row menu, the bulk bar is hidden in read-only mode.
+
 ## On mobile
 
 Below the `md` breakpoint the dashboard shows a single full-viewport pane rather than the desktop side-by-side split. The right-panel button in the top bar opens a picker that swaps the main pane between three views: the **Agent terminal**, the **Diff** (changed files and review), and the **Paired terminal** (host or container shell). A back chip in the top-left of the diff and paired views returns you to the agent terminal.
