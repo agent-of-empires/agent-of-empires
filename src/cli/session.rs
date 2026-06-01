@@ -1088,12 +1088,17 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let id = inst.id.clone();
-    let status = inst.status;
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
-    if status.blocks_worktree_edit() {
+    // Persisted status can lag the real tmux pane, and moving the worktree of
+    // a still-running session is unsafe. Recompute from live tmux state before
+    // enforcing the guard.
+    let mut live = inst.clone();
+    crate::tmux::refresh_session_cache();
+    live.update_status();
+    if live.status.blocks_worktree_edit() {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 
@@ -1108,19 +1113,25 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
 
-    storage.update(|instances, _groups| {
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-        inst.project_path = new_path.clone();
-        if let Some(branch) = &new_branch {
-            if let Some(wt) = inst.worktree_info.as_mut() {
-                wt.branch = branch.clone();
+    storage
+        .update(|instances, _groups| {
+            let inst = instances
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+            inst.project_path = new_path.clone();
+            if let Some(branch) = &new_branch {
+                if let Some(wt) = inst.worktree_info.as_mut() {
+                    wt.branch = branch.clone();
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
+            )
+        })?;
 
     println!("✓ Worktree moved to: {}", new_path);
     if let Some(branch) = &new_branch {
