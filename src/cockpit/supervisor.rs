@@ -997,12 +997,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
             }
             ResumeKind::Attach => {
-                if workers.len() >= self.max_concurrent_workers as usize {
-                    return Err(SupervisorError::CapacityFull {
-                        current: workers.len(),
-                        limit: self.max_concurrent_workers,
-                    });
-                }
+                // No capacity gate: attach takes over an already-running
+                // detached runner (already counted in `registry_count`),
+                // it does not create a new worker. Rejecting it would
+                // strand a live runner after a restart or after lowering
+                // `max_concurrent_workers`, leaving the session unmanaged.
             }
         }
         pending.insert(session_id.to_string(), kind);
