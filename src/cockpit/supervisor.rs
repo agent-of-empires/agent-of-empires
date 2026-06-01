@@ -293,6 +293,17 @@ pub enum ResumeKind {
     Spawn,
 }
 
+/// Outcome of `Supervisor::begin_resume`: either the caller now holds a
+/// fresh `pending_resumes` reservation it must carry into `spawn_inner`
+/// (or `attach`), or a worker is already running / already mid-resume so
+/// there is nothing to reserve. `CapacityFull` surfaces as the `Err` arm.
+pub(crate) enum ResumeReservationOutcome {
+    /// A reservation was placed; the caller owns the RAII guard.
+    Reserved(ResumeReservation),
+    /// The session is already in `workers` or `pending_resumes`.
+    AlreadyPresent,
+}
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -355,7 +366,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// was taken. Without this, a panic or early-return mid-resume would
 /// leave a phantom reservation that blocks every future resume for
 /// that session AND keeps the UI stuck on "Resuming…".
-struct ResumeReservation {
+pub(crate) struct ResumeReservation {
     pending: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>>,
     session_id: String,
     /// Wakes any `wait_for_worker` parked on the supervisor's
@@ -919,6 +930,98 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// at. The reservation makes the second caller fail fast with
     /// AlreadyRunning instead.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
+        let reservation = match self
+            .begin_resume(&req.session_id, ResumeKind::Spawn)
+            .await?
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => {
+                return Err(SupervisorError::AlreadyRunning(req.session_id));
+            }
+        };
+        self.spawn_inner(req, reservation).await
+    }
+
+    /// Synchronously reserve a `pending_resumes` slot BEFORE any async
+    /// resume work begins, so a caller that goes on to drive a detached
+    /// spawn (the idle-dormant prompt-wake path, see #1748) makes
+    /// `wait_for_worker` observe the reservation immediately rather than
+    /// failing fast. Returns `AlreadyPresent` when a worker is already
+    /// running or another task is mid-resume, and `Err(CapacityFull)`
+    /// when the worker cap is reached. The `workers` and `pending_resumes`
+    /// maps are checked under the same critical section so the
+    /// `(workers ∪ pending)` set is observed atomically; the existing
+    /// `spawn`/`attach` reservation logic now routes through here.
+    pub(crate) async fn begin_resume(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        let workers = self.workers.lock().await;
+        if workers.contains_key(session_id) {
+            return Ok(ResumeReservationOutcome::AlreadyPresent);
+        }
+        let mut pending = lock_recover(&self.pending_resumes);
+        if pending.contains_key(session_id) {
+            return Ok(ResumeReservationOutcome::AlreadyPresent);
+        }
+        match kind {
+            ResumeKind::Spawn => {
+                // Capacity check counts both running (in-memory) and
+                // detached (on-disk-only) workers PLUS any in-flight Spawn
+                // reservations, so a parallel reconciler can't pass the
+                // limit check for N concurrent callers before any have
+                // inserted into `workers`. Attach reservations don't
+                // contribute: they reattach to an existing live runner that
+                // is already counted in `registry_count`. See #1088.
+                let registry_count = super::worker_registry::list()
+                    .map(|recs| {
+                        recs.into_iter()
+                            .filter(|r| {
+                                super::worker_registry::is_record_live(r)
+                                    && !workers.contains_key(&r.session_id)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let pending_spawn_count = pending
+                    .values()
+                    .filter(|k| matches!(k, ResumeKind::Spawn))
+                    .count();
+                let combined = workers.len() + registry_count + pending_spawn_count;
+                if combined >= self.max_concurrent_workers as usize {
+                    return Err(SupervisorError::CapacityFull {
+                        current: combined,
+                        limit: self.max_concurrent_workers,
+                    });
+                }
+            }
+            ResumeKind::Attach => {
+                if workers.len() >= self.max_concurrent_workers as usize {
+                    return Err(SupervisorError::CapacityFull {
+                        current: workers.len(),
+                        limit: self.max_concurrent_workers,
+                    });
+                }
+            }
+        }
+        pending.insert(session_id.to_string(), kind);
+        Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
+            pending: Arc::clone(&self.pending_resumes),
+            session_id: session_id.to_string(),
+            notify: Arc::clone(&self.worker_notify),
+        }))
+    }
+
+    /// Spawn body proper, run while holding a `pending_resumes`
+    /// reservation acquired by `begin_resume`. Split out so the
+    /// prompt-wake path (#1748) can reserve synchronously, then drive
+    /// this in a detached task without re-reserving.
+    pub(crate) async fn spawn_inner(
+        &self,
+        req: SpawnRequest,
+        _reservation: ResumeReservation,
+    ) -> Result<(), SupervisorError> {
         let SpawnRequest {
             session_id,
             agent,
@@ -931,55 +1034,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             source_profile,
             yolo_mode,
         } = req;
-        let _reservation = {
-            let workers = self.workers.lock().await;
-            if workers.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            // Capacity check counts both running (in-memory) and
-            // detached (on-disk-only) workers PLUS any in-flight Spawn
-            // reservations, so a parallel reconciler can't pass the
-            // limit check for N concurrent callers before any have
-            // inserted into `workers`. Attach reservations don't
-            // contribute: they reattach to an existing live runner that
-            // is already counted in `registry_count`. See #1088.
-            let registry_count = super::worker_registry::list()
-                .map(|recs| {
-                    recs.into_iter()
-                        .filter(|r| {
-                            super::worker_registry::is_record_live(r)
-                                && !workers.contains_key(&r.session_id)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            // Acquire pending_resumes under the same critical section
-            // as the workers check so the (workers ∪ pending) set is
-            // observed atomically. A second caller arriving here sees
-            // either the workers entry (after insert below) or the
-            // pending entry; in both cases it returns AlreadyRunning.
-            let mut pending = lock_recover(&self.pending_resumes);
-            if pending.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            let pending_spawn_count = pending
-                .values()
-                .filter(|k| matches!(k, ResumeKind::Spawn))
-                .count();
-            let combined = workers.len() + registry_count + pending_spawn_count;
-            if combined >= self.max_concurrent_workers as usize {
-                return Err(SupervisorError::CapacityFull {
-                    current: combined,
-                    limit: self.max_concurrent_workers,
-                });
-            }
-            pending.insert(session_id.clone(), ResumeKind::Spawn);
-            ResumeReservation {
-                pending: Arc::clone(&self.pending_resumes),
-                session_id: session_id.clone(),
-                notify: Arc::clone(&self.worker_notify),
-            }
-        };
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
         // native binary on first ever run; two concurrent `session/new`
@@ -1963,6 +2017,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
     ) -> Result<(), SupervisorError> {
+        // Reserve a `pending_resumes` slot for the duration of the
+        // attach so the UI shows "Resuming…" while the socket dial +
+        // resume handshake runs, AND the capacity check in a concurrent
+        // `spawn` sees this id and avoids over-allocating. RAII guard
+        // removes the entry on every exit path. Reserving before the
+        // registry probe keeps the `(workers ∪ pending)` set atomic.
+        let _reservation = match self.begin_resume(&session_id, ResumeKind::Attach).await? {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => {
+                return Err(SupervisorError::AlreadyRunning(session_id));
+            }
+        };
+
         let record = match super::worker_registry::load(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
         {
@@ -1974,42 +2041,14 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resume requires a known ACP session id (the runner was holding
         // the agent loaded against it). If the registry doesn't carry
-        // one yet — e.g. the previous daemon crashed before the first
-        // `session/new` response was processed — there's nothing to
+        // one yet, e.g. the previous daemon crashed before the first
+        // `session/new` response was processed, there's nothing to
         // resume against; bail so the reconciler falls through to a
         // fresh spawn.
         let Some(stored_acp_session_id) = record.stored_acp_session_id.clone() else {
             return Err(SupervisorError::Acp(AcpError::Spawn(
                 "runner registry has no stored_acp_session_id; need fresh spawn".into(),
             )));
-        };
-
-        // Reserve a `pending_resumes` slot for the duration of the
-        // attach so the UI shows "Resuming…" while the socket dial +
-        // resume handshake runs, AND the capacity check in a
-        // concurrent `spawn` sees this id and avoids over-allocating.
-        // RAII guard removes the entry on every exit path.
-        let _reservation = {
-            let workers = self.workers.lock().await;
-            if workers.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            if workers.len() >= self.max_concurrent_workers as usize {
-                return Err(SupervisorError::CapacityFull {
-                    current: workers.len(),
-                    limit: self.max_concurrent_workers,
-                });
-            }
-            let mut pending = lock_recover(&self.pending_resumes);
-            if pending.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            pending.insert(session_id.clone(), ResumeKind::Attach);
-            ResumeReservation {
-                pending: Arc::clone(&self.pending_resumes),
-                session_id: session_id.clone(),
-                notify: Arc::clone(&self.worker_notify),
-            }
         };
 
         let cockpit_session_id = CockpitSessionId(session_id.clone());
