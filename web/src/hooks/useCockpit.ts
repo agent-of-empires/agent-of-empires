@@ -31,6 +31,7 @@ import {
   STATE_TTL_MS,
   clearQueueCount,
   setQueueCount,
+  setRateLimit,
   type PersistedEntry,
 } from "../lib/cockpitStateStorage";
 import { getToken } from "../lib/token";
@@ -151,6 +152,7 @@ function persistState(sessionId: string, state: CockpitState): void {
   const body = JSON.stringify({ savedAt: Date.now(), state } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
+    setRateLimit(sessionId, state.rateLimit);
     return;
   }
   // Storage write failed (likely QuotaExceeded). Evict a single oldest
@@ -160,6 +162,7 @@ function persistState(sessionId: string, state: CockpitState): void {
   if (!evictOldestPersistedCockpitState(key)) return;
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
+    setRateLimit(sessionId, state.rateLimit);
   }
 }
 
