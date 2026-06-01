@@ -101,7 +101,9 @@ in a dim block, and `-`/`1.` lists with bullet or number markers. The
 raw `#`, `**`, backtick, and fence characters are not shown. Styling
 uses text attributes only (bold, italic, dim) so it tracks your theme
 colors. Code-block syntax highlighting is deferred; press `o` to open
-the web dashboard for full-fidelity rendering.
+the web dashboard for full-fidelity rendering. In the web dashboard,
+links inside transcript messages open in a new browser tab so following
+a docs, CI, or repo link keeps your cockpit session open.
 
 **Tool cards.** Tool calls in the transcript render per kind rather than
 as a single generic line. An edit or write shows the file path and a
