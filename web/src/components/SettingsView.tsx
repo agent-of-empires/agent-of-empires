@@ -278,6 +278,17 @@ export function SettingsView({
               checked={(session.agent_status_hooks as boolean) ?? true}
               onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
             />
+            <NumberField
+              label="Auto-stop idle sessions (s)"
+              description="Seconds a plain tmux session may sit Idle before it is auto-stopped (its tmux session and any sandbox container are killed, leaving a restartable Stopped row). 0 disables (default). A session with an attached tmux client, or used more recently than the threshold, is spared. Checked about once a minute, so the stop can lag by up to a minute. Cockpit workers use the separate cockpit setting. Persists to config.toml as session.auto_stop_idle_secs; cross-device. See #1690."
+              value={
+                typeof session.auto_stop_idle_secs === "number"
+                  ? (session.auto_stop_idle_secs as number)
+                  : 0
+              }
+              min={0}
+              onChange={(v) => saveField("session", session, "auto_stop_idle_secs", v)}
+            />
           </div>
         );
 
