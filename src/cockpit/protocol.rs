@@ -348,4 +348,25 @@ mod tests {
         let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
         assert_eq!(parsed.reason.as_deref(), Some("manual"));
     }
+
+    #[test]
+    fn replay_query_defaults_limit_when_absent() {
+        // A pre-pagination client sends `{"since":N}` with no `limit`;
+        // the `#[serde(default)]` must keep it parsing (None = server
+        // default page).
+        let query: ReplayQuery = serde_json::from_str(r#"{"since":42}"#).unwrap();
+        assert_eq!(query.since, 42);
+        assert_eq!(query.limit, None);
+    }
+
+    #[test]
+    fn replay_response_defaults_paging_fields_when_absent() {
+        // A pre-pagination response body has no `next_cursor`/`has_more`;
+        // newer clients must still deserialize it with sane defaults.
+        let response: ReplayResponse =
+            serde_json::from_str(r#"{"frames":[],"lost":false,"highest_seq":0,"lowest_seq":null}"#)
+                .unwrap();
+        assert_eq!(response.next_cursor, None);
+        assert!(!response.has_more);
+    }
 }
