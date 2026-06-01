@@ -855,9 +855,17 @@ export function Composer({
               </div>
             )}
 
-            {/* Footer strip — affordances on the left, send/stop on the right */}
-            <div className="flex items-center justify-between gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5">
-              <div className="flex items-center gap-0.5">
+            {/* Footer strip: affordances on the left, send/stop on the
+                right. The left cluster wraps onto extra rows when crowded
+                (mode/model/effort/attachment) so the right action cluster
+                stays pinned and fully reachable on narrow viewports. No
+                overflow-x scroll here: it would force overflow-y to clip
+                the upward-opening model dropdown. See #1717. */}
+            <div
+              data-testid="composer-footer"
+              className="flex items-end gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5"
+            >
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-0.5 gap-y-1">
                 <ToolbarButton
                   icon={<AtSign className="h-3.5 w-3.5" />}
                   label="Add file context (@)"
@@ -912,7 +920,10 @@ export function Composer({
                 />
               </div>
 
-              <div className="flex items-center gap-2">
+              <div
+                data-testid="composer-actions"
+                className="flex shrink-0 items-center gap-2"
+              >
                 <UsageHint usage={sessionUsage} />
                 {turnActive ? (
                   <>
