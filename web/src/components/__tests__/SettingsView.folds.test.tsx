@@ -200,6 +200,11 @@ describe("Settings Advanced fold", () => {
       fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"),
       "28800",
     );
+    commit(
+      fieldInputByLabel(container, "Auto-resume grace (s)", "number"),
+      "20",
+    );
+    clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
@@ -212,6 +217,12 @@ describe("Settings Advanced fold", () => {
     });
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       cockpit: { auto_stop_idle_secs: 28800 },
+    });
+    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+      cockpit: { rate_limit_auto_resume_grace_secs: 20 },
+    });
+    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+      cockpit: { rate_limit_auto_resume: true },
     });
   });
 

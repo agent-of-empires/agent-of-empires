@@ -603,6 +603,89 @@ describe("useCockpit drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts).toEqual([]);
   });
 
+  it("drains a queued prompt only after rate-limit auto-resume (#1722)", async () => {
+    // Worker is absent while parked on a rate limit; once the daemon
+    // auto-resumes (breadcrumb clears the banner, REST poll flips the
+    // worker to running, AcpSessionAssigned lands) the drain effect must
+    // dispatch the prompt the user queued during the wait, and not before.
+    const { result, rerender } = renderHook(
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) =>
+        useCockpit("sess-rl-resume", ws),
+      { initialProps: { ws: "absent" as const } },
+    );
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // The provider reported a usage limit; the worker parks.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 1,
+          event: {
+            RateLimit: {
+              info: {
+                status: "usage limit reached",
+                resets_at: "2026-06-01T12:10:00Z",
+                kind: "rate_limit",
+              },
+            },
+          },
+        }),
+      } as MessageEvent);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 2,
+          event: { Stopped: { reason: "rate_limited" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.rateLimit).not.toBeNull();
+
+    // The user queues a follow-up during the park. Worker is absent, so
+    // it must NOT POST yet.
+    act(() => {
+      void result.current.sendPrompt("run after the reset");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+
+    // Auto-resume fires: the breadcrumb clears the banner, the reconciler
+    // respawns the worker (REST poll -> running) and emits
+    // AcpSessionAssigned. The drain effect now dispatches the queued prompt.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 3,
+          event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
+        }),
+      } as MessageEvent);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 4,
+          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+        }),
+      } as MessageEvent);
+    });
+    rerender({ ws: "running" as const });
+    await flushAsync();
+
+    expect(result.current.state.rateLimit).toBeNull();
+    expect(promptPostCount).toBe(1);
+    expect(promptPostBodies[0]).toContain("run after the reset");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
   it("retires the optimistic turn when prompt POST is rejected with 4xx", async () => {
     const { result } = renderHook(() => useCockpit("sess-reject-4xx"));
     await flushAsync();
