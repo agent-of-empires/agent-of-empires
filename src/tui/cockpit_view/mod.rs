@@ -9,6 +9,7 @@
 //! https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929.
 
 pub mod input;
+pub mod queue;
 pub mod reducer;
 pub mod render;
 pub mod state;
@@ -167,6 +168,22 @@ pub async fn run_for_endpoint(
 
     let mut toast_deadline: Option<Instant> = None;
 
+    // Resolve the queue drain mode from the daemon (not local config:
+    // this view can attach to a remote daemon). A failure here is
+    // non-fatal; the queue still works, it just uses the default mode.
+    match state.http.queue_drain_mode().await {
+        Ok(mode) => state.drain_mode = mode,
+        Err(e) => {
+            tracing::warn!(target: "cockpit.tui", "queue drain mode fetch failed: {e}");
+            set_toast(
+                &mut state,
+                &mut toast_deadline,
+                format!("queue drain mode unknown ({e}); using default"),
+                ToastKind::Error,
+            );
+        }
+    }
+
     // Capture both startup-path errors before showing a toast so we
     // can fold them into a single message when both fail (they
     // usually share a root cause, e.g. 401 from the auth middleware).
@@ -227,8 +244,21 @@ pub async fn run_for_endpoint(
             ws_msg = recv_ws(&mut state) => {
                 match ws_msg {
                     Some(Ok(WsMessage::Frame(frame))) => {
+                        let was_active = state.transcript.turn_active;
                         state.transcript.apply(&frame);
                         state.reconcile_selection();
+                        let now_active = state.transcript.turn_active;
+                        if !was_active && now_active {
+                            // Turn started (our own prompt echoed back, or
+                            // another client's). The optimistic lock has
+                            // served its purpose; release it.
+                            state.in_flight = false;
+                        } else if was_active && !now_active {
+                            // Turn ended: release the lock and drain the
+                            // next queued batch, if any.
+                            state.in_flight = false;
+                            maybe_drain(&mut state, &mut toast_deadline).await;
+                        }
                         redraw(terminal, theme, &state)?;
                     }
                     Some(Ok(WsMessage::Lagged)) => {
@@ -244,6 +274,11 @@ pub async fn run_for_endpoint(
                                     state.transcript.apply(frame);
                                 }
                                 state.reconcile_selection();
+                                // Re-derived turn state from the rebuilt
+                                // transcript; the lock no longer reflects
+                                // anything observable. Drain if idle.
+                                state.in_flight = false;
+                                maybe_drain(&mut state, &mut toast_deadline).await;
                             }
                             Err(e) => {
                                 set_toast(&mut state, &mut toast_deadline, format!("replay failed: {e}"), ToastKind::Error);
@@ -261,11 +296,21 @@ pub async fn run_for_endpoint(
                         tracing::warn!(target: "cockpit.tui.ws", "ws disconnect: {e}");
                         set_toast(&mut state, &mut toast_deadline, format!("ws disconnected: {e}; reconnecting…"), ToastKind::Error);
                         state.ws = None;
+                        // Can't observe turn boundaries while the socket
+                        // is down; drop the lock so a stuck send doesn't
+                        // wedge the composer, and queue any new prompts
+                        // (is_busy() is true while ws is None).
+                        state.in_flight = false;
                         let since = state.transcript.last_seq;
                         match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
                             Ok(handle) => {
                                 state.ws = Some(handle);
                                 set_toast(&mut state, &mut toast_deadline, "ws reconnected".into(), ToastKind::Info);
+                                // Resumed frames will re-derive turn state
+                                // and drain on the next edge, but if the
+                                // turn already ended before reconnect there
+                                // is no edge to wait for: drain now.
+                                maybe_drain(&mut state, &mut toast_deadline).await;
                             }
                             Err(e) => {
                                 set_toast(&mut state, &mut toast_deadline, format!("ws reconnect failed: {e}"), ToastKind::Error);
@@ -334,32 +379,54 @@ async fn handle_terminal_event(
         Intent::SubmitPrompt => {
             let text = state.take_composer_text();
             if text.is_empty() {
+                // Empty Enter is a manual flush: if the agent is idle and
+                // prompts are stuck in the queue (e.g. a drain POST failed
+                // earlier), retry the drain. Otherwise just nudge the user.
+                if !state.is_busy() && !state.queue.is_empty() {
+                    maybe_drain(state, toast_deadline).await;
+                } else {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "composer is empty".into(),
+                        ToastKind::Info,
+                    );
+                }
+                return Ok(false);
+            }
+            if state.is_busy() {
+                // A turn is running (or the socket is down): park the
+                // prompt so it drains when the agent next goes idle.
+                state.queue.push(text);
                 set_toast(
                     state,
                     toast_deadline,
-                    "composer is empty".into(),
+                    format!("queued ({} waiting)", state.queue.len()),
                     ToastKind::Info,
                 );
                 return Ok(false);
             }
-            match state.http.prompt(&state.session_id, &text).await {
-                Ok(()) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("prompt sent ({} bytes)", text.len()),
-                        ToastKind::Info,
-                    );
-                }
-                Err(e) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("send failed: {e}"),
-                        ToastKind::Error,
-                    );
-                }
+            if send_prompt_now(state, toast_deadline, &text).await {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("prompt sent ({} bytes)", text.len()),
+                    ToastKind::Info,
+                );
             }
+            Ok(false)
+        }
+        Intent::ClearQueue => {
+            if state.queue.is_empty() {
+                return Ok(false);
+            }
+            state.queue.clear();
+            set_toast(
+                state,
+                toast_deadline,
+                "queue cleared".into(),
+                ToastKind::Info,
+            );
             Ok(false)
         }
         Intent::Scroll(delta) => {
@@ -500,6 +567,55 @@ fn set_toast(
 ) {
     state.toast = Some(ToastBanner { text, kind });
     *deadline = Some(Instant::now() + TOAST_TTL);
+}
+
+/// POST one prompt to the daemon, taking the optimistic in-flight lock
+/// for the round-trip. The lock stays set on success (the WS turn-start
+/// echo clears it) so a rapid second Enter queues instead of double-
+/// firing; it is released on failure since no turn began. Returns whether
+/// the POST succeeded.
+async fn send_prompt_now(
+    state: &mut CockpitViewState,
+    toast_deadline: &mut Option<Instant>,
+    text: &str,
+) -> bool {
+    state.in_flight = true;
+    match state.http.prompt(&state.session_id, text).await {
+        Ok(()) => true,
+        Err(e) => {
+            state.in_flight = false;
+            set_toast(
+                state,
+                toast_deadline,
+                format!("send failed: {e}"),
+                ToastKind::Error,
+            );
+            false
+        }
+    }
+}
+
+/// Drain the next queued batch if the agent is idle. The batch is removed
+/// from the queue only after its POST succeeds, so a failed send leaves
+/// the prompts in place to retry (via the next turn-end edge or an empty-
+/// composer flush) instead of silently dropping them.
+async fn maybe_drain(state: &mut CockpitViewState, toast_deadline: &mut Option<Instant>) {
+    if state.is_busy() || state.queue.is_empty() {
+        return;
+    }
+    let Some((text, count)) = state.queue.next_batch(state.drain_mode) else {
+        return;
+    };
+    if send_prompt_now(state, toast_deadline, &text).await {
+        state.queue.drop_front(count);
+        let remaining = state.queue.len();
+        let msg = if remaining == 0 {
+            "queue drained".to_string()
+        } else {
+            format!("draining queue ({remaining} waiting)")
+        };
+        set_toast(state, toast_deadline, msg, ToastKind::Info);
+    }
 }
 
 fn redraw(
