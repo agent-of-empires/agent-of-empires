@@ -100,6 +100,7 @@ impl WorktreeNameDialog {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
+            .padding(Padding::horizontal(1))
             .border_style(Style::default().fg(theme.accent))
             .title(" Edit Workdir Name ")
             .title_style(Style::default().fg(theme.title).bold());
