@@ -807,6 +807,10 @@ fn worktree_edit_error_response(
             StatusCode::CONFLICT,
             format!("Branch '{name}' already exists"),
         ),
+        E::RollbackFailed { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to move the worktree, and rolling back the branch rename also failed; the repository may be left on the new branch".to_string(),
+        ),
         E::Git(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to move the worktree".to_string(),
@@ -921,6 +925,52 @@ pub async fn set_worktree_name(
         }
     };
 
+    // The git move has already landed, so persist to disk BEFORE mutating
+    // in-memory state. A silent persist failure here would leave stale
+    // metadata that points at the old (now-moved) path after a daemon
+    // restart, so any failure returns 500 instead of a misleading 200.
+    let persist_failed = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "persist_failed",
+                "message": "Worktree was moved on disk, but persisting the new session metadata failed"
+            })),
+        )
+            .into_response()
+    };
+
+    let storage = match Storage::new(&profile) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
+            return persist_failed();
+        }
+    };
+    let id_clone = id.clone();
+    let new_path_clone = new_path.clone();
+    let new_branch_clone = new_branch.clone();
+    match tokio::task::spawn_blocking(move || {
+        storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+            }
+            Ok(())
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
+            return persist_failed();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}");
+            return persist_failed();
+        }
+    }
+
     let response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
@@ -933,30 +983,6 @@ pub async fn set_worktree_name(
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
-
-    if let Ok(storage) = Storage::new(&profile) {
-        let id_clone = id.clone();
-        let new_path_clone = new_path.clone();
-        let new_branch_clone = new_branch.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
-                }
-                Ok(())
-            })
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}")
-            }
-            Err(e) => {
-                tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}")
-            }
-        }
-    }
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }

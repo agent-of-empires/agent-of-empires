@@ -66,6 +66,14 @@ pub enum WorktreeEditError {
     TargetExists(PathBuf),
     #[error("branch '{0}' already exists")]
     BranchExists(String),
+    #[error(
+        "worktree move failed ({move_err}), and rolling the branch rename back to '{branch}' also failed ({rollback_err}); the repo may be left on the new branch"
+    )]
+    RollbackFailed {
+        move_err: String,
+        rollback_err: String,
+        branch: String,
+    },
     #[error(transparent)]
     Git(#[from] GitError),
 }
@@ -137,6 +145,14 @@ pub fn edit_worktree_workdir(
                         old = %req.worktree_info.branch,
                         "worktree edit: branch-rename rollback failed after move error: {rollback}"
                     );
+                    // The repo is now on `new_branch` with the directory still
+                    // at its old path. Surface both failures so the caller does
+                    // not treat this as a clean "move failed, nothing changed".
+                    return Err(WorktreeEditError::RollbackFailed {
+                        move_err: e.to_string(),
+                        rollback_err: rollback.to_string(),
+                        branch: new_branch.clone(),
+                    });
                 }
             }
             return Err(e.into());
