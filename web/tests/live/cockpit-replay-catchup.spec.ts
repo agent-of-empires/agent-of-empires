@@ -93,6 +93,48 @@ test("cockpit/replay surfaces seeded events and signals lost frames", async ({},
     expect(tail.frames.length).toBe(0);
     expect(tail.highest_seq).toBe(highest);
     expect(tail.lost).toBe(false);
+
+    // Pagination: with a small `limit`, the endpoint returns bounded
+    // pages plus `next_cursor`/`has_more`, and following the cursor to
+    // exhaustion reassembles the same transcript a single unbounded
+    // (default-page) replay returns. `target` caps the loop at the
+    // snapshot head so a stray startup event appended mid-loop can't
+    // make the two reads disagree.
+    const full = body!;
+    const target = full.highest_seq!;
+    const fullSeqs = full.frames
+      .map((f) => f.seq)
+      .filter((s) => s <= target);
+
+    const PAGE = 2;
+    const pagedSeqs: number[] = [];
+    let cursor = 0;
+    let pages = 0;
+    for (;;) {
+      const page = (await fetch(
+        `${serve.baseUrl}/api/sessions/${sessionId}/cockpit/replay?since=${cursor}&limit=${PAGE}`,
+      ).then((r) => r.json())) as {
+        frames: { seq: number }[];
+        lost: boolean;
+        highest_seq: number;
+        next_cursor: number | null;
+        has_more: boolean;
+      };
+      pages++;
+      expect(page.frames.length).toBeLessThanOrEqual(PAGE);
+      for (const f of page.frames) {
+        if (f.seq <= target) pagedSeqs.push(f.seq);
+      }
+      const next = page.next_cursor;
+      if (page.has_more && next != null && next > cursor && next < target) {
+        cursor = next;
+        continue;
+      }
+      break;
+    }
+
+    expect(pages).toBeGreaterThan(1);
+    expect(pagedSeqs).toEqual(fullSeqs);
   } finally {
     await serve.stop();
   }

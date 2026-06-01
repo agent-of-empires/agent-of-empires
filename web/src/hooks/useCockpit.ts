@@ -309,6 +309,12 @@ function cacheSet(sessionId: string, value: CockpitState): void {
  *  dedupe makes the overlap idempotent. See #1100. */
 const REPLAY_OVERLAP = 50;
 
+/** Page size `fetchReplay` requests per call. The server paginates the
+ *  replay endpoint and bounds its own page; this stays at or under that
+ *  bound so a long session loads over several requests instead of one
+ *  giant response. The loop follows `next_cursor` while `has_more`. */
+const REPLAY_PAGE_SIZE = 1000;
+
 export function clearCockpitCache(sessionId?: string): void {
   if (sessionId === undefined) {
     stateCache.clear();
@@ -669,36 +675,61 @@ export function useCockpit(
         // window, etc.) get a second chance. The reducer's
         // `frame.seq <= state.lastSeq` dedupe drops the overlap, so
         // this is idempotent. See #1100.
-        const since = Math.max(0, lastSeqRef.current - REPLAY_OVERLAP);
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sid)}/cockpit/replay?since=${since}`,
-          { credentials: "same-origin" },
-        );
-        if (!res.ok) return;
-        const data = (await res.json()) as {
-          frames: CockpitFrame[];
-          lost: boolean;
-          highest_seq: number;
-        };
-        // Detect a server-side seq reset: the supervisor's per-session
-        // counter has been forgotten (cockpit_disable → cockpit_enable,
-        // or session delete+recreate with the same id), so the new
-        // conversation is starting fresh from seq=1. Without this reset
-        // the client-side dedupe would drop the new events because
-        // `frame.seq <= state.lastSeq` is true.
-        if (data.highest_seq < since) {
-          dispatch({ kind: "reset" });
-        }
-        if (data.lost) {
-          // The buffer doesn't go back far enough; surface this via
-          // the existing `lagged` flag (the UI shows a "history
-          // truncated" notice) and let the user reload if they want
-          // the full transcript back.
-          dispatch({ kind: "lagged", skipped: data.highest_seq });
-          return;
-        }
-        if (data.frames.length > 0) {
-          dispatch({ kind: "frames", frames: data.frames });
+        const firstSince = Math.max(0, lastSeqRef.current - REPLAY_OVERLAP);
+        let cursor = firstSince;
+        // Snapshot the highest seq seen on the first page and stop there:
+        // events appended after replay began arrive over the live WS and
+        // are deduped, so chasing them here would never converge on a
+        // busy session. Captured from page one's `highest_seq`.
+        let target: number | null = null;
+        for (;;) {
+          const res = await fetch(
+            `/api/sessions/${encodeURIComponent(sid)}/cockpit/replay?since=${cursor}&limit=${REPLAY_PAGE_SIZE}`,
+            { credentials: "same-origin" },
+          );
+          if (!res.ok) return;
+          const data = (await res.json()) as {
+            frames: CockpitFrame[];
+            lost: boolean;
+            highest_seq: number;
+            next_cursor?: number | null;
+            has_more?: boolean;
+          };
+          if (target === null) {
+            target = data.highest_seq;
+            // Detect a server-side seq reset: the supervisor's per-session
+            // counter has been forgotten (cockpit_disable → cockpit_enable,
+            // or session delete+recreate with the same id), so the new
+            // conversation is starting fresh from seq=1. Without this reset
+            // the client-side dedupe would drop the new events because
+            // `frame.seq <= state.lastSeq` is true. Only meaningful on the
+            // first page, where `cursor` is the client's resume point.
+            if (data.highest_seq < firstSince) {
+              dispatch({ kind: "reset" });
+            }
+          }
+          // Honor `lost` on every page: a retention prune between pages
+          // can open a real gap after page one, so surface it via the
+          // existing `lagged` flag and let the user reload for the full
+          // transcript. Stop the loop; a partial transcript is wrong.
+          if (data.lost) {
+            dispatch({ kind: "lagged", skipped: data.highest_seq });
+            return;
+          }
+          if (data.frames.length > 0) {
+            dispatch({ kind: "frames", frames: data.frames });
+          }
+          const next = data.next_cursor;
+          if (
+            data.has_more &&
+            next != null &&
+            next > cursor &&
+            next < target
+          ) {
+            cursor = next;
+            continue;
+          }
+          break;
         }
         dispatch({ kind: "lagged_resolved" });
       } catch {

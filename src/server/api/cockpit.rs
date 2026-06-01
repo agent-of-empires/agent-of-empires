@@ -1011,6 +1011,13 @@ pub async fn cockpit_files(
     }
 }
 
+/// Default replay page size when the client omits `limit`. Bounds the
+/// daemon's per-request buffer and response size for a long session.
+const DEFAULT_REPLAY_PAGE: usize = 1000;
+/// Hard cap on a client-requested replay page, so an oversized `limit`
+/// can't reintroduce the unbounded-buffer footprint this paging removes.
+const MAX_REPLAY_PAGE: usize = 2000;
+
 const WORKER_LOG_DEFAULT_TAIL: usize = 200;
 const WORKER_LOG_MAX_TAIL: usize = 2000;
 /// Cap the read size so a runaway log file can't pin the daemon. A 4 MiB
@@ -1662,10 +1669,28 @@ pub async fn cockpit_replay(
     // endpoint backstops that when the in-memory ring is cold (server
     // just restarted) or the client lagged far enough to need older
     // events than the ring holds.
-    let highest_seq = state.cockpit_event_store.highest_seq(&id);
-    let lowest_seq = state.cockpit_event_store.lowest_seq(&id);
-    let entries = state.cockpit_event_store.replay_from(&id, q.since);
-    let frames: Vec<crate::server::CockpitBroadcastFrame> = entries
+    // Bound the page so neither the daemon nor the response scales with
+    // total history. Omitted `limit` falls back to the default rather
+    // than unbounded, so a naive or older client can't make the daemon
+    // buffer an entire long session. All in-repo consumers paginate via
+    // `has_more`/`next_cursor`.
+    let limit = q
+        .limit
+        .map(|l| l as usize)
+        .unwrap_or(DEFAULT_REPLAY_PAGE)
+        .clamp(1, MAX_REPLAY_PAGE);
+    // One store call returns the page and its `highest_seq`/`lowest_seq`
+    // under a single lock, so the response is a consistent snapshot and a
+    // concurrent `record()` can't desync the cap from the page rows.
+    let page = state
+        .cockpit_event_store
+        .replay_page(&id, q.since, Some(limit));
+    let highest_seq = page.highest_seq;
+    let lowest_seq = page.lowest_seq;
+    let next_cursor = page.last_scanned_seq;
+    let has_more = page.has_more;
+    let frames: Vec<crate::server::CockpitBroadcastFrame> = page
+        .events
         .into_iter()
         .map(|(seq, event)| crate::server::CockpitBroadcastFrame {
             session_id: id.clone(),
@@ -1676,7 +1701,9 @@ pub async fn cockpit_replay(
     // `lost = true` when the client's `since` cursor predates the oldest
     // seq still on disk. The retention cap can evict older events, so a
     // client that returns after a long absence may legitimately need a
-    // full reload. With no events on disk yet, nothing is lost.
+    // full reload. With no events on disk yet, nothing is lost. Computed
+    // per request so a mid-loop prune is caught on whatever page first
+    // sees the gap, not only the first.
     let lost = match lowest_seq {
         Some(lo) => q.since < lo.saturating_sub(1),
         None => false,
@@ -1686,6 +1713,8 @@ pub async fn cockpit_replay(
         lost,
         highest_seq,
         lowest_seq,
+        next_cursor,
+        has_more,
     })
     .into_response()
 }
