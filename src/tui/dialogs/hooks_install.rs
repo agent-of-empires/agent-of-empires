@@ -270,7 +270,10 @@ impl HooksInstallDialog {
             button_area,
         );
 
-        if let Some(rect) = self.hover.current() {
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.accept_button_area, self.cancel_button_area])
+        {
             paint_hover_bg(frame, rect, theme.selection);
         }
     }

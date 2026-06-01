@@ -307,7 +307,10 @@ impl RestartDialog {
         self.tool_selector_area = chunks[5];
         self.render_hints(frame, chunks[7], theme);
 
-        if let Some(rect) = self.hover.current() {
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.profile_selector_area, self.tool_selector_area])
+        {
             paint_hover_bg(frame, rect, theme.selection);
         }
     }

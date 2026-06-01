@@ -41,6 +41,15 @@ impl HoverState {
         self.hovered
     }
 
+    /// Like [`current`](Self::current), but only when the hovered rect is
+    /// still one of `rects`. Paint sites pass the rects they computed this
+    /// frame so a stale rect from a previous layout (e.g. a terminal
+    /// resize with no intervening mouse move) is dropped instead of
+    /// tinting the wrong cells.
+    pub fn current_in(&self, rects: &[Rect]) -> Option<Rect> {
+        self.hovered.filter(|r| rects.contains(r))
+    }
+
     /// Recompute the hovered rect from a pointer position against the
     /// clickable rects captured on the previous frame. Returns `true`
     /// when the hovered rect changed, so callers redraw only on a real

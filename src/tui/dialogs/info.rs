@@ -121,7 +121,7 @@ impl InfoDialog {
             button_area,
         );
 
-        if let Some(rect) = self.hover.current() {
+        if let Some(rect) = self.hover.current_in(&[self.ok_button_area]) {
             paint_hover_bg(frame, rect, theme.selection);
         }
     }

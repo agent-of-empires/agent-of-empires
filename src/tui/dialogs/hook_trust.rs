@@ -263,7 +263,11 @@ impl HookTrustDialog {
             button_area,
         );
 
-        if let Some(rect) = self.hover.current() {
+        if let Some(rect) = self.hover.current_in(&[
+            self.trust_button_area,
+            self.skip_button_area,
+            self.cancel_button_area,
+        ]) {
             paint_hover_bg(frame, rect, theme.selection);
         }
     }

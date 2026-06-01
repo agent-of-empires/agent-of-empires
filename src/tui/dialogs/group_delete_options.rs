@@ -412,10 +412,9 @@ impl GroupDeleteOptionsDialog {
         // Paint the hover highlight last so it sits behind a row that
         // still exists this frame (the row set shrinks when "Move" is
         // selected, so a stale rect from a previous layout is dropped).
-        if let Some(rect) = self.hover.current() {
-            if self.focusable_rects.iter().any(|(_, r)| *r == rect) {
-                paint_hover_bg(frame, rect, theme.selection);
-            }
+        let rows: Vec<Rect> = self.focusable_rects.iter().map(|(_, r)| *r).collect();
+        if let Some(rect) = self.hover.current_in(&rows) {
+            paint_hover_bg(frame, rect, theme.selection);
         }
     }
 }

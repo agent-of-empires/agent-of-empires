@@ -7,7 +7,7 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::components::buttons::render_yes_no;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
-use crate::tui::components::hover::HoverState;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 /// Options for what to clean up when deleting a session
@@ -141,15 +141,22 @@ impl UnifiedDeleteDialog {
         None
     }
 
-    /// Highlight the Yes/No button under the cursor. Hover never moves
-    /// keyboard `focus` (mouse drift between reading the dialog and
-    /// pressing Enter would otherwise silently flip which action fires);
-    /// it only drives the visual highlight. Click still moves focus and
-    /// (for checkboxes) toggles state. Returns `true` when the
-    /// highlighted button changed so the caller can redraw.
+    /// Highlight the Yes/No button or checkbox row under the cursor.
+    /// Hover never moves keyboard `focus` (mouse drift between reading the
+    /// dialog and pressing Enter would otherwise silently flip which
+    /// action fires); it only drives the visual highlight. Click still
+    /// moves focus and (for checkboxes) toggles state. Returns `true` when
+    /// the highlighted target changed so the caller can redraw.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
-        self.hover
-            .update(col, row, &[self.yes_button_area, self.no_button_area])
+        let mut rects = vec![self.yes_button_area, self.no_button_area];
+        rects.extend(self.focusable_rects.iter().map(|(_, r)| *r));
+        self.hover.update(col, row, &rects)
+    }
+
+    /// Rects of the checkbox rows captured this frame, for the hover
+    /// highlight. Yes/No are excluded; they're painted by `render_yes_no`.
+    fn checkbox_rects(&self) -> Vec<Rect> {
+        self.focusable_rects.iter().map(|(_, r)| *r).collect()
     }
 
     fn hit_focusable(&self, col: u16, row: u16) -> Option<FocusElement> {
@@ -465,6 +472,13 @@ impl UnifiedDeleteDialog {
         chunk_idx += 1; // skip spacer
 
         self.render_hints(frame, chunks[chunk_idx], theme, checkbox_count > 0);
+
+        // Yes/No are highlighted by `render_yes_no`; a hovered checkbox
+        // row is painted here, guarded to this frame's rows so a stale
+        // rect (layout shrank between mouse moves) is dropped.
+        if let Some(rect) = self.hover.current_in(&self.checkbox_rects()) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -865,12 +879,18 @@ mod tests {
     }
 
     #[test]
-    fn hover_on_checkbox_row_does_not_steal_focus() {
+    fn hover_on_checkbox_row_highlights_without_stealing_focus() {
         let mut dialog = full_dialog();
         stage_rects_for_full(&mut dialog);
         dialog.focus = FocusElement::YesButton;
-        assert!(!dialog.handle_hover(10, 5));
-        assert_eq!(dialog.focus, FocusElement::YesButton);
+        // (10, 5) lands on the branch checkbox row staged by the helper.
+        assert!(dialog.handle_hover(10, 5));
+        assert_eq!(dialog.hover.current(), Some(Rect::new(5, 5, 30, 1)));
+        assert_eq!(
+            dialog.focus,
+            FocusElement::YesButton,
+            "hover must not move keyboard focus"
+        );
     }
 
     #[test]

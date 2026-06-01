@@ -235,7 +235,7 @@ impl ChangelogDialog {
             button_area,
         );
 
-        if let Some(rect) = self.hover.current() {
+        if let Some(rect) = self.hover.current_in(&[self.got_it_button_area]) {
             paint_hover_bg(frame, rect, theme.selection);
         }
     }
