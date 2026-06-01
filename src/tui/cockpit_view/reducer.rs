@@ -212,6 +212,7 @@ impl CockpitTranscript {
                 self.rows
                     .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
                 self.context_primer_pending = false;
+                self.turn_active = true;
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
