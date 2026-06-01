@@ -174,6 +174,191 @@ fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &Cockpit
     }
 }
 
+/// Gutter marking the first line of an agent message. Continuation
+/// lines align under the text with `AGENT_GUTTER_CONT`.
+const AGENT_GUTTER: &str = "aoe  ";
+const AGENT_GUTTER_CONT: &str = "     ";
+
+/// Render an agent message as markdown-styled transcript lines.
+///
+/// We parse the message with `pulldown-cmark` and map its events to
+/// ratatui `Line`s ourselves (see [`MarkdownBuilder`]). This strips the
+/// raw `#`/`**`/backtick/fence markers and styles content with modifiers
+/// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
+/// carrying hardcoded colors. Each line is prefixed with the `aoe` gutter
+/// on the first row and an aligned indent on continuation rows. Empty or
+/// marker-only input falls back to the bare `aoe  …` placeholder the
+/// streaming UI showed before.
+fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
+    if text.trim().is_empty() {
+        return vec![Line::from(format!("{AGENT_GUTTER}…"))];
+    }
+    let body = MarkdownBuilder::render(text);
+    if body.is_empty() {
+        return vec![Line::from(format!("{AGENT_GUTTER}…"))];
+    }
+    body.into_iter()
+        .enumerate()
+        .map(|(i, mut line)| {
+            let prefix = if i == 0 {
+                AGENT_GUTTER
+            } else {
+                AGENT_GUTTER_CONT
+            };
+            line.spans.insert(0, Span::raw(prefix));
+            line
+        })
+        .collect()
+}
+
+/// Accumulates `pulldown-cmark` events into themed ratatui lines.
+///
+/// Inline emphasis pushes/pops modifiers on `mod_stack`; the union of the
+/// stack is the active style. Block elements (headings, paragraphs, code
+/// blocks) are separated by a single blank line at top level. Code-block
+/// content is emitted line-by-line with `DIM`, never the ``` fences.
+#[derive(Default)]
+struct MarkdownBuilder {
+    lines: Vec<Line<'static>>,
+    current: Vec<Span<'static>>,
+    mod_stack: Vec<Modifier>,
+    /// One entry per open list; `Some(n)` is the next ordinal of an
+    /// ordered list, `None` an unordered list.
+    list_stack: Vec<Option<u64>>,
+    in_code_block: bool,
+}
+
+impl MarkdownBuilder {
+    fn render(text: &str) -> Vec<Line<'static>> {
+        let mut builder = MarkdownBuilder::default();
+        for event in
+            pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_STRIKETHROUGH)
+        {
+            builder.handle(event);
+        }
+        builder.finish()
+    }
+
+    fn active_modifier(&self) -> Modifier {
+        self.mod_stack
+            .iter()
+            .fold(Modifier::empty(), |acc, m| acc | *m)
+    }
+
+    fn push_span(&mut self, content: &str, extra: Modifier) {
+        let style = Style::default().add_modifier(self.active_modifier() | extra);
+        self.current.push(Span::styled(content.to_string(), style));
+    }
+
+    /// Flush the in-progress line, dropping it if it has no spans.
+    fn flush(&mut self) {
+        let spans = std::mem::take(&mut self.current);
+        if !spans.is_empty() {
+            self.lines.push(Line::from(spans));
+        }
+    }
+
+    /// Flush a code line, preserving blank lines inside the block.
+    fn flush_code_line(&mut self) {
+        let spans = std::mem::take(&mut self.current);
+        self.lines.push(Line::from(spans));
+    }
+
+    /// Insert a blank separator before a new top-level block.
+    fn block_break(&mut self) {
+        if self.list_stack.is_empty() && !self.lines.is_empty() {
+            self.lines.push(Line::default());
+        }
+    }
+
+    fn handle(&mut self, event: pulldown_cmark::Event) {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                self.block_break();
+                self.mod_stack.push(Modifier::BOLD);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                self.flush();
+                self.mod_stack.pop();
+            }
+            Event::Start(Tag::Paragraph) => self.block_break(),
+            Event::End(TagEnd::Paragraph) => self.flush(),
+            Event::Start(Tag::Strong) => self.mod_stack.push(Modifier::BOLD),
+            Event::Start(Tag::Emphasis) => self.mod_stack.push(Modifier::ITALIC),
+            Event::Start(Tag::Strikethrough) => self.mod_stack.push(Modifier::CROSSED_OUT),
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
+                self.mod_stack.pop();
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                self.block_break();
+                self.in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                self.flush();
+                self.in_code_block = false;
+            }
+            Event::Start(Tag::List(first)) => self.list_stack.push(first),
+            Event::End(TagEnd::List(_)) => {
+                self.list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                self.flush();
+                let depth = self.list_stack.len().saturating_sub(1);
+                let indent = "  ".repeat(depth);
+                let marker = match self.list_stack.last_mut() {
+                    Some(Some(n)) => {
+                        let m = format!("{n}. ");
+                        *n += 1;
+                        m
+                    }
+                    _ => "• ".to_string(),
+                };
+                self.current.push(Span::raw(format!("{indent}{marker}")));
+            }
+            Event::End(TagEnd::Item) => self.flush(),
+            Event::Text(text) => {
+                if self.in_code_block {
+                    self.push_code_text(&text);
+                } else {
+                    self.push_span(&text, Modifier::empty());
+                }
+            }
+            Event::Code(text) => self.push_span(&text, Modifier::DIM),
+            Event::SoftBreak if !self.in_code_block => self.current.push(Span::raw(" ")),
+            Event::HardBreak => self.flush(),
+            Event::Rule => {
+                self.block_break();
+                self.lines.push(Line::from("───"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Split code-block text on newlines, flushing one styled line per
+    /// row so multi-line blocks render distinctly without fence markers.
+    fn push_code_text(&mut self, text: &str) {
+        let style = Style::default().add_modifier(Modifier::DIM);
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                self.current.push(Span::styled(part.to_string(), style));
+            }
+            if parts.peek().is_some() {
+                self.flush_code_line();
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line<'static>> {
+        self.flush();
+        while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
+            self.lines.pop();
+        }
+        self.lines
+    }
+}
+
 fn transcript_lines<'a>(
     transcript: &'a CockpitTranscript,
     selected_approval: Option<usize>,
@@ -191,12 +376,7 @@ fn transcript_lines<'a>(
                 out.push(Line::default());
             }
             ActivityRow::AgentMessage(text) => {
-                for chunk_line in text.lines() {
-                    out.push(Line::from(format!("aoe  {chunk_line}")));
-                }
-                if text.is_empty() {
-                    out.push(Line::from("aoe  …"));
-                }
+                out.extend(render_agent_message_lines(text));
                 out.push(Line::default());
             }
             ActivityRow::ToolCall(tool) => {
@@ -410,5 +590,114 @@ mod tests {
         let s = "日本語のテスト";
         let head = truncate_chars(s, 3).expect("longer than 3 chars");
         assert_eq!(head, "日本語");
+    }
+
+    /// Concatenated text of every span on a line, gutter included.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// True if any span on the line carries the given modifier.
+    fn line_has_modifier(line: &Line, modifier: Modifier) -> bool {
+        line.spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(modifier))
+    }
+
+    /// No span on any rendered line should keep a foreground color, so
+    /// markdown output tracks the app theme instead of tui-markdown's
+    /// built-in palette.
+    fn no_span_has_fg(lines: &[Line]) -> bool {
+        lines
+            .iter()
+            .all(|l| l.spans.iter().all(|s| s.style.fg.is_none()))
+    }
+
+    #[test]
+    fn agent_message_styles_markdown_and_drops_raw_markers() {
+        let lines = render_agent_message_lines("# Title\n\n**bold** and `code`");
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        // Raw markdown punctuation is consumed by the parser.
+        assert!(!joined.contains('#'), "heading marker leaked: {joined:?}");
+        assert!(!joined.contains("**"), "bold marker leaked: {joined:?}");
+        assert!(!joined.contains('`'), "code-span marker leaked: {joined:?}");
+        // Visible text survives.
+        assert!(joined.contains("Title"));
+        assert!(joined.contains("bold"));
+        assert!(joined.contains("code"));
+        // At least one line carries BOLD styling (heading and/or strong).
+        assert!(
+            lines.iter().any(|l| line_has_modifier(l, Modifier::BOLD)),
+            "expected BOLD styling somewhere: {lines:?}"
+        );
+        // Colors are stripped so the theme owns the palette.
+        assert!(no_span_has_fg(&lines), "fg color leaked: {lines:?}");
+    }
+
+    #[test]
+    fn agent_message_renders_fenced_code_without_fence_lines() {
+        let lines = render_agent_message_lines("before\n\n```\nlet x = 1;\n```\n\nafter");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // The ``` fence markers must not appear as literal text.
+        assert!(
+            texts.iter().all(|t| !t.contains("```")),
+            "fence markers leaked: {texts:?}"
+        );
+        // Code content and surrounding prose are present.
+        let joined = texts.join("\n");
+        assert!(joined.contains("let x = 1;"));
+        assert!(joined.contains("before"));
+        assert!(joined.contains("after"));
+    }
+
+    #[test]
+    fn agent_message_gutter_marks_first_line_then_indents() {
+        let lines = render_agent_message_lines("line one\n\nline two");
+        // First rendered line gets the `aoe  ` gutter.
+        assert!(
+            line_text(&lines[0]).starts_with(AGENT_GUTTER),
+            "first line missing gutter: {:?}",
+            line_text(&lines[0])
+        );
+        // Every continuation line aligns under the text with spaces, no
+        // repeated `aoe` literal.
+        for line in &lines[1..] {
+            let text = line_text(line);
+            assert!(
+                text.is_empty() || text.starts_with(AGENT_GUTTER_CONT),
+                "continuation line not indented: {text:?}"
+            );
+            assert!(
+                !text.trim_start().starts_with("aoe"),
+                "gutter literal repeated on continuation: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_message_renders_list_markers_without_dashes() {
+        let lines = render_agent_message_lines("- one\n- two\n\n1. first\n2. second");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = texts.join("\n");
+        // Bullet items get `•`, not the raw `-` marker.
+        assert!(joined.contains("• one"), "{texts:?}");
+        assert!(joined.contains("• two"), "{texts:?}");
+        // Ordered items keep their numbers.
+        assert!(joined.contains("1. first"), "{texts:?}");
+        assert!(joined.contains("2. second"), "{texts:?}");
+        // No line is just the raw `- ` source marker.
+        assert!(
+            texts.iter().all(|t| !t.trim_start().starts_with("- ")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn agent_message_empty_falls_back_to_placeholder() {
+        for input in ["", "   ", "\n\n"] {
+            let lines = render_agent_message_lines(input);
+            assert_eq!(lines.len(), 1, "input {input:?}");
+            assert_eq!(line_text(&lines[0]), format!("{AGENT_GUTTER}…"));
+        }
     }
 }
