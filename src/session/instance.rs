@@ -64,6 +64,22 @@ impl Status {
             Status::Creating => "creating",
         }
     }
+
+    /// Whether this status blocks an in-place worktree edit (move dir /
+    /// rename branch). The worktree's checkout must be quiescent: an
+    /// actively running agent, a session mid-start, or one being
+    /// created/deleted can hold the directory or race the metadata write.
+    /// Idle/Stopped/Error/Unknown sessions are safe to edit.
+    pub fn blocks_worktree_edit(self) -> bool {
+        matches!(
+            self,
+            Status::Running
+                | Status::Waiting
+                | Status::Starting
+                | Status::Creating
+                | Status::Deleting
+        )
+    }
 }
 
 /// Outcome of a `start_with_resume_fallback` cascade.

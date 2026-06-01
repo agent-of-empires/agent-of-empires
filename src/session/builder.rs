@@ -719,7 +719,7 @@ fn resolve_worktree_branch(
 /// `git-check-ref-format(1)`) with '-'. Unlike `branch_name_from_title`
 /// this keeps the user's casing and preserves '/' so `feat/auth`-style
 /// branches survive when the user types them explicitly.
-fn git_sanitize_branch_name(s: &str) -> String {
+pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_was_dash = false;
     for ch in s.trim().chars() {

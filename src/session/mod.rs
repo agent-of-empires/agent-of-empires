@@ -18,6 +18,7 @@ pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod stop;
 mod storage;
+pub mod worktree_edit;
 
 pub use crate::sound::{SoundConfig, SoundConfigOverride};
 pub use crate::status_hooks::{StatusHookConfig, StatusHookConfigOverride};
