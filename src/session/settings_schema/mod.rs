@@ -19,9 +19,11 @@
 use serde::{Deserialize, Serialize};
 
 mod merge;
+mod registry;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
+pub use registry::{descriptor, schema};
 pub use validate::{validate_value, ValidationError};
 
 /// Widget the surfaces render for a field. The variant carries everything a
@@ -145,6 +147,11 @@ pub struct FieldDescriptor {
     /// value is global-only (the field is still shown, but not overridable).
     pub profile_overridable: bool,
     pub validation: ValidationKind,
+    /// Operational tuning that sits under an "Advanced" fold in both surfaces.
+    /// The web groups advanced fields into a collapsible section; the TUI
+    /// renders them after the primary fields under an "Advanced" divider.
+    #[serde(default)]
+    pub advanced: bool,
 }
 
 impl FieldDescriptor {

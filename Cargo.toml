@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "xtask", "aoe-settings-derive"]
 
 [package]
 name = "agent-of-empires"
@@ -27,6 +27,9 @@ tui-input = "0.15"
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
+
+# Settings single-source-of-truth derive (#1692)
+aoe-settings-derive = { path = "aoe-settings-derive" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

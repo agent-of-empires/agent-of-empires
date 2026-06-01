@@ -3,6 +3,7 @@
 use super::get_app_dir;
 use super::repo_config::HooksConfig;
 use anyhow::Result;
+use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -204,52 +205,76 @@ fn default_show_spans() -> bool {
 
 /// Configuration for the cockpit (ACP-based native rendering of agent
 /// state). Defaults match the documented v4 design and v005 migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `#[derive(SettingsSection)]` makes every `#[setting]`-annotated field the
+/// single source of truth for the TUI, web dashboard, server policy, and
+/// validation (#1692). Adding a field here, with its `#[setting]` attributes,
+/// is the only edit needed for it to appear and round-trip everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "cockpit", category = "Cockpit")]
 pub struct CockpitConfig {
-    /// Master kill switch for cockpit mode. When false, every session
+    /// Master kill switch for cockpit mode. When off, every session
     /// runs as plain tmux even if --cockpit is passed.
     #[serde(default)]
+    #[setting(label = "Cockpit enabled", widget = "toggle")]
     pub enabled: bool,
     /// On mobile viewports, default new Claude sessions to cockpit mode.
     #[serde(default = "default_true")]
+    #[setting(label = "Default for Claude (mobile)", widget = "toggle")]
     pub default_for_claude: bool,
-    /// The agent name to use when --agent is not specified.
+    /// Cockpit agent used when --agent is not specified (e.g. aoe-agent,
+    /// claude-code, gemini).
     #[serde(default = "default_agent")]
+    #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
-    /// Hard cap on simultaneously running agent worker subprocesses.
+    /// Hard cap on simultaneously running cockpit agent subprocesses;
+    /// additional sessions queue.
     #[serde(default = "default_max_workers")]
+    #[setting(
+        label = "Max concurrent workers",
+        widget = "number",
+        min = 1,
+        validate = "range:1",
+        advanced
+    )]
     pub max_concurrent_workers: u32,
-    /// Replay buffer event-count cap (per session).
+    /// Per-session retention cap on cockpit events. 0 = unlimited (default);
+    /// set a non-zero value to bound disk usage on long-running sessions.
     #[serde(default = "default_replay_events")]
+    #[setting(label = "History cap (events)", widget = "number", min = 0)]
     pub replay_events: u32,
-    /// Replay buffer byte cap (per session).
+    /// Maximum bytes of cockpit events kept in the per-session replay buffer.
     #[serde(default = "default_replay_bytes")]
+    #[setting(label = "Replay buffer bytes", widget = "number", min = 0, advanced)]
     pub replay_bytes: u64,
-    /// Optional path to the Node runtime used to spawn aoe-agent. If
-    /// empty, aoe resolves Node via PATH then bundled fallback.
+    /// Override Node.js binary location. Empty resolves via
+    /// AOE_COCKPIT_NODE then PATH then the bundled fallback.
     #[serde(default)]
+    #[setting(
+        label = "Node path",
+        widget = "text",
+        web = "local_only:host Node binary path, a local execution surface"
+    )]
     pub node_path: String,
-    /// Whether the cockpit web UI shows a per-tool elapsed-time label on
-    /// every tool card. Default true. Honoured by the web client via
-    /// `ServerAbout.cockpit_show_tool_durations` so toggling here flows
-    /// across every device that connects to the same daemon. The
-    /// underlying measurement is currently imprecise on
-    /// claude-agent-acp (no `status: "in_progress"` is emitted, so we
-    /// can't re-stamp `started_at` to the real subprocess start;
-    /// see the comment on `CardChromeProps.startedAt` in
-    /// `web/src/components/cockpit/ToolCards.tsx`); this setting lets
-    /// users hide the label until upstream provides a trustworthy
-    /// "subprocess started" signal.
+    /// Render a per-tool elapsed-time label on every cockpit tool card.
+    /// Cross-device via config.toml. The underlying measurement is currently
+    /// imprecise on claude-agent-acp (no `status: in_progress` signal), so
+    /// durations include stream-arrival skew; turn off if the inflated
+    /// numbers are more confusing than useful.
     #[serde(default = "default_true")]
+    #[setting(label = "Show tool-call durations", widget = "toggle")]
     pub show_tool_durations: bool,
-    /// How the web composer drains client-side queued follow-up prompts
-    /// when the agent finishes a turn (see #1031). `Combined` (default)
-    /// joins every queued entry with a blank line and dispatches as one
-    /// prompt; `Serial` pops the head and waits for the next Stopped to
-    /// fire the next entry. The setting is surfaced via
-    /// `ServerAbout.cockpit_queue_drain_mode` so toggling it here flows
-    /// to every connected web client without restarting the daemon.
+    /// How the web composer dispatches follow-up prompts queued while the
+    /// agent was busy (see #1031). Combined (default) joins every queued
+    /// entry with a blank line and sends them as one prompt on the next
+    /// Stopped; Serial fires one entry at a time, each with its own response.
     #[serde(default)]
+    #[setting(
+        label = "Queue drain mode",
+        widget = "select",
+        options = "combined:Combined,serial:Serial",
+        advanced
+    )]
     pub queue_drain_mode: QueueDrainMode,
     /// Maximum number of cockpit worker resumes (spawn or attach) the
     /// reconciler runs in parallel on `aoe serve` cold start. Bounded
@@ -259,6 +284,13 @@ pub struct CockpitConfig {
     /// claude-agent-acp processes are around 200-320MB transient. Lower
     /// it on constrained hosts; raise on beefier machines. See #1088.
     #[serde(default = "default_max_concurrent_resumes")]
+    #[setting(
+        label = "Max concurrent resumes",
+        widget = "number",
+        min = 1,
+        validate = "range:1",
+        advanced
+    )]
     pub max_concurrent_resumes: u32,
     /// Seconds of streaming inactivity after which the cockpit web UI
     /// shows a "Force end turn" button. When `turnActive=true` and no
@@ -268,6 +300,12 @@ pub struct CockpitConfig {
     /// synthetic `Stopped { reason: "user_forced" }` and best-effort
     /// `session/cancel` the agent. Default 30s.
     #[serde(default = "default_force_end_turn_threshold_secs")]
+    #[setting(
+        label = "Force end turn threshold (s)",
+        widget = "number",
+        min = 0,
+        advanced
+    )]
     pub force_end_turn_threshold_secs: u32,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
@@ -293,6 +331,12 @@ pub struct CockpitConfig {
     /// below 120 clamp up at runtime so a typo cannot disable the
     /// watchdog accidentally. See #1240, #1360.
     #[serde(default = "default_silent_orphan_grace_secs")]
+    #[setting(
+        label = "Silent-orphan grace (s)",
+        widget = "number",
+        min = 0,
+        advanced
+    )]
     pub silent_orphan_grace_secs: u32,
     /// Silent-orphan watchdog: accelerated grace used when the current
     /// prompt has already received a cost-populated `UsageUpdate`
@@ -302,6 +346,12 @@ pub struct CockpitConfig {
     /// Default 20s. If `silent_orphan_grace_secs` is 0 (disabled), this
     /// has no effect. See #1240.
     #[serde(default = "default_silent_orphan_fast_grace_secs")]
+    #[setting(
+        label = "Silent-orphan fast grace (s)",
+        widget = "number",
+        min = 0,
+        advanced
+    )]
     pub silent_orphan_fast_grace_secs: u32,
 }
 
