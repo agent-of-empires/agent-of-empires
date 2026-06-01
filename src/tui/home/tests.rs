@@ -6224,6 +6224,52 @@ mod scroll_pane_isolation {
         assert!(!env.view.live_send_pending_leader);
     }
 
+    /// A modified key after the leader (e.g. Ctrl+K) cancels the menu
+    /// rather than firing a command: only the leader-again passthrough
+    /// claims a modified form, so the user can't accidentally trigger the
+    /// palette by holding Ctrl out of muscle memory.
+    #[test]
+    #[serial]
+    fn live_leader_then_modified_key_cancels() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(ctrl('k'), None);
+        assert!(!env.view.live_send_pending_leader, "menu disarms");
+        assert!(
+            env.view.command_palette.is_none(),
+            "leader + Ctrl+K must NOT open the palette"
+        );
+        assert!(env.view.live_send.is_some(), "still live");
+    }
+
+    /// Committing a palette command while live (here a jump) exits live
+    /// mode first, so the preview can never show one session while
+    /// keystrokes target another. Cancelling the palette is covered
+    /// separately and must stay live.
+    #[test]
+    #[serial]
+    fn palette_command_while_live_exits_live() {
+        let mut env = live_env_with_leader();
+        // Open the palette from within live mode via the leader.
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert!(env.view.command_palette.is_some());
+        assert!(env.view.live_send.is_some(), "palette opens over live mode");
+
+        // Filter to a jump entry and commit it.
+        for ch in "jump".chars() {
+            env.view.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert!(
+            env.view.live_send.is_none(),
+            "committing a palette command must drop out of live mode"
+        );
+        assert!(env.view.command_palette.is_none());
+        assert!(!env.view.sidebar_collapsed, "live-only state is reset");
+    }
+
     /// Collapsing the sidebar in live mode hands the preview the full
     /// width: the preview sub-rect grows past the normal side-by-side
     /// width, and rendering the which-key banner doesn't panic.

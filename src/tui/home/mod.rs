@@ -2943,6 +2943,10 @@ impl HomeView {
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
         self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name));
+        // Start every live-mode entry (including a switch from another
+        // session) with a disarmed leader menu, so a half-entered chord
+        // can't carry over from a prior target.
+        self.live_send_pending_leader = false;
         // Clear the resize dedup so `finalize_live_send_resize` always
         // issues its sync resize, even if the cached geometry from a
         // prior session happens to match the current preview_pane_area.

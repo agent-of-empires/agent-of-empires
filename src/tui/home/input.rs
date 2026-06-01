@@ -2320,6 +2320,17 @@ impl HomeView {
         action: PaletteAction,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // The palette can now be opened over live mode (via the leader),
+        // but every palette command steps out of the per-session relay:
+        // jumping navigates away, Invoke/Activate/ToolSession change what's
+        // focused, and the preview follows `selected_session` while
+        // keystrokes target `live_send`. Committing any of them while still
+        // live would desync the preview from the keystroke target, so leave
+        // live mode first. Cancelling the palette (Esc) never reaches here,
+        // so it still drops the user straight back into live mode.
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
         match action {
             PaletteAction::Invoke(id) => {
                 // The palette's mental model is "run the named action," so clear
@@ -3565,15 +3576,24 @@ impl HomeView {
                     return;
                 }
             }
+            // Command letters match only when unmodified: the leader-again
+            // passthrough above already claimed the modified form (`C-b`),
+            // and folding `Ctrl+K` / `Alt+b` into a command would surprise
+            // users reaching for a modified chord. Shift is allowed since
+            // it just yields the uppercase code.
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             match key.code {
-                KeyCode::Char('k') | KeyCode::Char('K') => self.open_command_palette(),
-                KeyCode::Char('b') | KeyCode::Char('B') => self.toggle_sidebar_collapsed(),
-                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                KeyCode::Char('k') | KeyCode::Char('K') if plain => self.open_command_palette(),
+                KeyCode::Char('b') | KeyCode::Char('B') if plain => self.toggle_sidebar_collapsed(),
+                KeyCode::Char('q') | KeyCode::Char('Q') if plain => {
                     self.exit_live_send_and_restore_sizing(&state)
                 }
-                // Esc (or any unbound key) cancels the menu without
-                // forwarding: the leader already swallowed this keystroke,
-                // and tmux's prefix behaves the same way for unknown keys.
+                // Esc (or any unbound / modified key) cancels the menu
+                // without forwarding: the leader already swallowed this
+                // keystroke, and tmux's prefix behaves the same way for
+                // unknown keys.
                 _ => {}
             }
             return;
