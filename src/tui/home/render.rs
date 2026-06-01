@@ -1314,16 +1314,7 @@ impl HomeView {
             return;
         };
 
-        let cache = select(self);
-        cache.captured_lines = content.lines().count();
-        cache.content = content;
-        // Invalidate the cached parse; the next render that needs
-        // `ensure_parsed` will re-run `ansi-to-tui`.
-        cache.parsed_text = None;
-        cache.session_id = Some(id);
-        cache.dimensions = (width, height);
-        cache.last_refresh = Instant::now();
-        let captured_lines = cache.captured_lines;
+        let captured_lines = select(self).store_capture(content, id, (width, height));
 
         self.preview_scroll_offset = clamp_scroll_to_capture(
             self.preview_scroll_offset,
@@ -1345,6 +1336,14 @@ impl HomeView {
         // path (#1485 revert); there is no socket round-trip and no
         // `%output` wake. Profile the result via `capture_us` on the trace.
         let in_live = self.live_send.is_some();
+        // The agent preview can render (ViewMode::Agent) while live-send is
+        // pointed at a non-agent pane. Only agent live-send should bypass the
+        // throttle / use the capture worker; otherwise this preview is a
+        // background view and must stay 250ms-throttled like any other.
+        let agent_live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| s.target == live_send::LiveSendTarget::Agent);
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
@@ -1393,30 +1392,21 @@ impl HomeView {
         // already skips empty captures, so the #1501 kill switch (don't flash
         // blank when a capture comes back empty) is preserved by simply not
         // overwriting the cache when there's no new content.
-        if in_live {
+        if agent_live {
             if let Some(id) = self.selected_session.clone() {
                 let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
                 let latest = self.live_capture_worker.as_ref().map(|worker| {
                     worker.set_capture_lines(capture_lines);
-                    let mut latest = None;
-                    while let Some(content) = worker.try_recv() {
-                        latest = Some(content);
-                    }
-                    latest
+                    worker.take_latest()
                 });
                 // `Some(None)` = worker present, nothing new this frame (keep
-                // the cache). `None` = no worker (non-agent target); fall
-                // through to the synchronous path below.
+                // the cache). `None` = no worker; fall through to the
+                // synchronous path below.
                 if let Some(latest) = latest {
                     if let Some(content) = latest {
-                        let cache = &mut self.preview_cache;
-                        cache.captured_lines = content.lines().count();
-                        cache.content = content;
-                        cache.parsed_text = None;
-                        cache.session_id = Some(id);
-                        cache.dimensions = (width, height);
-                        cache.last_refresh = Instant::now();
-                        let captured_lines = cache.captured_lines;
+                        let captured_lines =
+                            self.preview_cache
+                                .store_capture(content, id, (width, height));
                         self.preview_scroll_offset = clamp_scroll_to_capture(
                             self.preview_scroll_offset,
                             captured_lines,
@@ -1446,10 +1436,13 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            in_live,
+            agent_live,
             |s| &mut s.preview_cache,
             |s, id, capture_lines| {
-                let in_live = s.live_send.is_some();
+                let in_live = s
+                    .live_send
+                    .as_ref()
+                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Agent);
                 // Only treat an empty fork capture as "preserve the existing
                 // cache" when the cache is FOR THIS SAME SESSION. If the user
                 // just switched live-send from session A to session B and B's

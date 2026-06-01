@@ -272,6 +272,28 @@ impl PreviewCache {
             ));
         }
     }
+
+    /// Store a fresh capture, invalidating the parsed cache and stamping
+    /// the session/dimensions/time the content belongs to. Returns the
+    /// captured line count so the caller can clamp scroll. Shared by the
+    /// synchronous fork path (`refresh_preview_cache_core`) and the
+    /// off-thread worker path so the two can't drift.
+    pub(super) fn store_capture(
+        &mut self,
+        content: String,
+        session_id: String,
+        dimensions: (u16, u16),
+    ) -> usize {
+        self.captured_lines = content.lines().count();
+        self.content = content;
+        // Invalidate the cached parse; the next `ensure_parsed` re-runs
+        // `ansi-to-tui`.
+        self.parsed_text = None;
+        self.session_id = Some(session_id);
+        self.dimensions = dimensions;
+        self.last_refresh = Instant::now();
+        self.captured_lines
+    }
 }
 
 /// Per-frame durations for the preview pipeline's two fork/CPU phases.
@@ -2905,6 +2927,13 @@ impl HomeView {
             // Stop the old session's capture worker too; a fresh one
             // (if the new target is the agent) is spawned below.
             self.live_capture_worker = None;
+            // Drop the previous session's cached preview so the first
+            // frames after the switch don't paint session A's content
+            // under session B's header while B's capture worker spins up.
+            // (The synchronous path got this for free via its cross-session
+            // kill-switch branch; the worker path applies content lazily,
+            // so clear it explicitly here.)
+            self.preview_cache = PreviewCache::default();
             if let Some(name) = &prev_tmux_name {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }

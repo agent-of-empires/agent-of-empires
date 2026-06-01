@@ -437,20 +437,24 @@ impl LiveSendWorker {
 
 /// How often the off-thread capture worker forks `tmux capture-pane`.
 /// It free-runs at roughly this cadence (a fork is ~3-13ms on macOS, so
-/// the real cycle is interval + fork time), keeping the preview cache
-/// fresh on a background thread so the render loop never forks
-/// capture-pane itself. A touch tighter than the 33ms render ticker so a
-/// frame almost always finds content that postdates the last keystroke.
-const LIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// the real cycle is interval + fork time), keeping the preview fresh on
+/// a background thread so the render loop never forks capture-pane
+/// itself. Sits just under the 33ms render ticker so a frame almost
+/// always finds content that postdates the last keystroke, while keeping
+/// the steady-state fork rate close to the old render-driven ~30/s (a
+/// tighter value buys little perceived freshness for a lot more idle
+/// forks, since the render only paints every ~33ms anyway).
+const LIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Off-thread preview capture for agent live-send. Spawned alongside
 /// [`LiveSendWorker`] when live-send targets the agent pane, it forks
-/// `tmux capture-pane` on its own thread and ships fresh pane content
-/// back to the render loop over a channel. The render loop applies the
-/// latest content without forking, which is what moves the per-frame
-/// capture cost (~8.5ms measured on macOS, ~90% of a live-send frame)
-/// off the hot path. Dropping the worker flips `stop` so the thread
-/// exits after its current cycle; like `LiveSendWorker` we don't join.
+/// `tmux capture-pane` on its own thread and publishes fresh pane content
+/// into a single-slot mailbox the render loop drains. The render loop
+/// applies the latest content without forking, which is what moves the
+/// per-frame capture cost (~8.5ms measured on macOS, ~90% of a live-send
+/// frame) off the hot path. Dropping the worker flips `stop` so the
+/// thread exits after its current cycle; like `LiveSendWorker` we don't
+/// join.
 ///
 /// Scoped to the agent target on purpose: only the agent preview
 /// force-refreshes every frame in live-send (the terminal/container/tool
@@ -461,8 +465,11 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// `0` means "not set yet"; the worker skips capturing until the first
     /// render publishes a real value. `capture_lines_for` never yields 0.
     capture_lines: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Fresh pane content, newest-last. The render loop drains to the tail.
-    rx: std::sync::mpsc::Receiver<String>,
+    /// Single-slot mailbox holding the newest capture not yet consumed by
+    /// the render loop. A new capture overwrites an unconsumed one (the
+    /// render only ever wants the latest), so this can't grow unbounded if
+    /// the render thread stalls.
+    latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -475,15 +482,16 @@ impl Drop for LiveCaptureWorker {
 impl LiveCaptureWorker {
     pub(in crate::tui) fn spawn(tmux_name: String) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
+        let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
         let lines_cell = capture_lines.clone();
+        let slot = latest.clone();
         let stop_flag = stop.clone();
         std::thread::spawn(move || {
             let session = crate::tmux::Session::from_name(&tmux_name);
-            let mut last_sent: Option<String> = None;
+            let mut last_captured: Option<String> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 if lines > 0 {
@@ -491,12 +499,13 @@ impl LiveCaptureWorker {
                         // Skip empties (preserve the last-good preview, the
                         // #1501 kill switch) and unchanged frames (no point
                         // waking a re-parse). Only changed, non-empty
-                        // captures cross the channel.
-                        if !content.is_empty() && last_sent.as_deref() != Some(content.as_str()) {
-                            if tx.send(content.clone()).is_err() {
-                                break; // render loop dropped the worker
+                        // captures reach the render loop.
+                        if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
+                        {
+                            if let Ok(mut guard) = slot.lock() {
+                                *guard = Some(content.clone());
                             }
-                            last_sent = Some(content);
+                            last_captured = Some(content);
                         }
                     }
                 }
@@ -505,7 +514,7 @@ impl LiveCaptureWorker {
         });
         Self {
             capture_lines,
-            rx,
+            latest,
             stop,
         }
     }
@@ -518,9 +527,11 @@ impl LiveCaptureWorker {
             .store(lines, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Non-blocking pull of the next fresh capture, if any.
-    pub(in crate::tui) fn try_recv(&self) -> Option<String> {
-        self.rx.try_recv().ok()
+    /// Take the newest capture the worker has produced since the last
+    /// call, if any. Returns `None` when nothing new has arrived (the
+    /// render loop then keeps the current preview).
+    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
+        self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 }
 
@@ -1290,9 +1301,9 @@ mod tests {
         // With no line count published the worker must not capture at all,
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
         let worker = LiveCaptureWorker::spawn("aoe_test_capture_no_geometry".into());
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
-            worker.try_recv().is_none(),
+            worker.take_latest().is_none(),
             "worker should stay idle until set_capture_lines is called",
         );
     }
@@ -1305,9 +1316,9 @@ mod tests {
         // without a real tmux session: a missing pane always reads empty.
         let worker = LiveCaptureWorker::spawn("aoe_test_capture_missing_session".into());
         worker.set_capture_lines(40);
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(
-            worker.try_recv().is_none(),
+            worker.take_latest().is_none(),
             "empty captures must never be forwarded",
         );
     }

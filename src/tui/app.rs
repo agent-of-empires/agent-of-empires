@@ -539,15 +539,6 @@ impl App {
         // the 20Hz loop rate.
         let mut last_update_eval = std::time::Instant::now();
         const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-        // While in live-send, the off-thread capture worker forks
-        // `tmux capture-pane` continuously on a background thread. The
-        // status poller (also background) sweeps every session's pane plus
-        // container health on its own thread, and that concurrent tmux /
-        // docker load contends on the tmux server, inflating the capture
-        // fork's tail latency. The user is watching one session's preview,
-        // not the sidebar, so back the sweep off to 2s for the duration;
-        // the first tick after exit re-checks against the 500ms interval.
-        const STATUS_REFRESH_INTERVAL_LIVE: Duration = Duration::from_secs(2);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
@@ -1065,12 +1056,7 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            let status_interval = if self.home.live_send.is_some() {
-                STATUS_REFRESH_INTERVAL_LIVE
-            } else {
-                STATUS_REFRESH_INTERVAL
-            };
-            if last_status_refresh.elapsed() >= status_interval {
+            if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
                 last_status_refresh = std::time::Instant::now();
             }
