@@ -353,6 +353,13 @@ pub struct Supervisor<S: BroadcastSink> {
     /// just after the spawn handshake finishes resumes within a
     /// scheduler tick instead of waiting up to 50 ms.
     worker_notify: Arc<tokio::sync::Notify>,
+    /// Sessions whose adopted worker is running an older binary than the
+    /// daemon (detected at reconcile after `aoe update`) and carried an
+    /// in-flight turn, so the reconciler attached to drain it rather than
+    /// hard-killing the turn. The reconciler's per-tick drain check
+    /// respawns these on the current binary once the turn finishes. See
+    /// #1754.
+    build_respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Cap on concurrently-running workers, snapshotted from
     /// `[cockpit] max_concurrent_workers` at startup. Enforced in
     /// `spawn`; new workers past the cap return `CapacityFull`.
@@ -453,8 +460,31 @@ impl<S: BroadcastSink> Supervisor<S> {
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
+            build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
+    }
+
+    /// Flag a session whose build-stale worker was adopted to drain an
+    /// in-flight turn; the reconciler respawns it on the current binary
+    /// at the next idle boundary. Idempotent. See #1754.
+    pub fn mark_build_respawn_pending(&self, session_id: &str) {
+        lock_recover(&self.build_respawn_pending).insert(session_id.to_string());
+    }
+
+    /// Snapshot the sessions awaiting a post-drain respawn. The reconciler
+    /// polls this each tick and respawns those that have gone idle.
+    pub fn build_respawn_pending_ids(&self) -> Vec<String> {
+        lock_recover(&self.build_respawn_pending)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Drop a session from the pending set once it has been respawned (or
+    /// is gone). Idempotent.
+    pub fn clear_build_respawn_pending(&self, session_id: &str) {
+        lock_recover(&self.build_respawn_pending).remove(session_id);
     }
 
     /// Snapshot the lifecycle state of every cockpit session known to
