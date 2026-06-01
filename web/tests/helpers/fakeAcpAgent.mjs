@@ -523,7 +523,7 @@ async function handleRequest(msg) {
         sendError(id, -32000, process.env.FAKE_ACP_REJECT_CONFIG_OPTION);
         return;
       }
-      if (configId === "mode") {
+      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION && configId === "mode") {
         // OpenCode-shaped mode switch via the config-option channel.
         if (!OPENCODE_MODE_CHOICES.some((m) => m.value === value)) {
           sendError(id, -32000, `mode not found: ${value}`);
