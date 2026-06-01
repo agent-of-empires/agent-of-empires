@@ -1073,6 +1073,16 @@ impl SettingsView {
                     c.auto_stop_idle_secs = None;
                 }
             }
+            FieldKey::CockpitRateLimitAutoResume => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.rate_limit_auto_resume = None;
+                }
+            }
+            FieldKey::CockpitRateLimitAutoResumeGraceSecs => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.rate_limit_auto_resume_grace_secs = None;
+                }
+            }
             // Logging is global-only for v1 (no profile overrides); the
             // "clear override" gesture is a no-op for these keys.
             // SessionIdPollerMaxThreads and ConfirmBeforeQuit are also

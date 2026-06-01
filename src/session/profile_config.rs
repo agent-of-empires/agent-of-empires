@@ -98,6 +98,10 @@ pub struct CockpitConfigOverride {
     pub silent_orphan_fast_grace_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_stop_idle_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_auto_resume: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_auto_resume_grace_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -662,6 +666,12 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.auto_stop_idle_secs {
             global.cockpit.auto_stop_idle_secs = v;
+        }
+        if let Some(v) = cockpit_override.rate_limit_auto_resume {
+            global.cockpit.rate_limit_auto_resume = v;
+        }
+        if let Some(v) = cockpit_override.rate_limit_auto_resume_grace_secs {
+            global.cockpit.rate_limit_auto_resume_grace_secs = v;
         }
     }
 
