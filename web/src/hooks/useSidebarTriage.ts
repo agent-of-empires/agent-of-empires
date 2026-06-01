@@ -149,14 +149,51 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     [snooze],
   );
 
+  // Bulk fan-out. Serial on purpose: each single-id PATCH re-persists the
+  // whole profile's session list, so firing them concurrently could race on
+  // that write. For the handful of rows a user bulk-triages against a local
+  // server this is sub-second, and it keeps the per-session semantics
+  // (lock, persist-first, archive side effects) exactly as the single path.
+  // Best-effort, not atomic: a failure rolls back only its own row. See
+  // #1724. Swapping this loop for a real bulk endpoint later is a localized
+  // change.
+  const runBulk = useCallback(
+    async (
+      workspaces: readonly Workspace[],
+      action: (ws: Workspace) => Promise<TriageResult>,
+    ): Promise<TriageResult[]> => {
+      const results: TriageResult[] = [];
+      for (const ws of workspaces) {
+        results.push(await action(ws));
+      }
+      return results;
+    },
+    [],
+  );
+
+  const bulkPin = useCallback(
+    (wss: readonly Workspace[], pinned: boolean) =>
+      runBulk(wss, (ws) => pin(ws, pinned)),
+    [runBulk, pin],
+  );
+  const bulkArchive = useCallback(
+    (wss: readonly Workspace[], archived: boolean) =>
+      runBulk(wss, (ws) => archive(ws, archived)),
+    [runBulk, archive],
+  );
+  const bulkSnooze = useCallback(
+    (wss: readonly Workspace[], minutes: number | null) =>
+      runBulk(wss, (ws) => snooze(ws, minutes)),
+    [runBulk, snooze],
+  );
+
   return {
     optimisticFor,
     pinToggle,
     archiveToggle,
     snooze: snoozeOne,
-    // Raw promise-returning primitives, reused by the bulk runner in #1724.
-    pin,
-    archive,
-    snoozeRaw: snooze,
+    bulkPin,
+    bulkArchive,
+    bulkSnooze,
   };
 }

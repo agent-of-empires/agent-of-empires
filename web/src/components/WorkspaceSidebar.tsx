@@ -98,6 +98,12 @@ import {
   classifyClick,
   selectionReducer,
 } from "../lib/sidebarSelection";
+import {
+  bucketSelectionForBulk,
+  summarizeBulkResults,
+} from "../lib/sidebarBulk";
+import { reportError, reportInfo } from "../lib/toastBus";
+import { BulkActionBar } from "./BulkActionBar";
 // Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
 // from this module; the definition now lives in `sidebarOptimistic.ts`.
 export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
@@ -2203,6 +2209,61 @@ export function WorkspaceSidebar({
     dispatchSelection({ type: "prune", validIds: existingWorkspaceIds });
   }, [existingWorkspaceIds]);
 
+  const clearSelection = useCallback(
+    () => dispatchSelection({ type: "clear" }),
+    [],
+  );
+
+  // Selected workspaces (existing ones only) and their per-action eligibility
+  // buckets, for the bulk bar. Deduped against existence so a stale id never
+  // resolves to a phantom workspace.
+  const selectedWorkspaces = useMemo(
+    () => allWorkspaces.filter((w) => selection.selectedIds.has(w.id)),
+    [allWorkspaces, selection.selectedIds],
+  );
+  const bulkBuckets = useMemo(
+    () => bucketSelectionForBulk(selectedWorkspaces, triage.optimisticFor),
+    [selectedWorkspaces, triage],
+  );
+
+  // Run a bulk triage action over its eligible subset, then summarize and
+  // clear the selection. One summary toast instead of per-row toasts.
+  const runBulkAction = useCallback(
+    async (
+      verb: string,
+      run: () => Promise<readonly { ok: boolean; skipped?: boolean }[]>,
+    ) => {
+      const results = await run();
+      const summary = summarizeBulkResults(verb, results);
+      if (results.some((r) => !r.ok && !r.skipped)) reportError(summary);
+      else reportInfo(summary);
+      clearSelection();
+    },
+    [clearSelection],
+  );
+
+  const onBulkPin = useCallback(
+    (wss: Workspace[], pinned: boolean) =>
+      void runBulkAction(pinned ? "Pinned" : "Unpinned", () =>
+        triage.bulkPin(wss, pinned),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkArchive = useCallback(
+    (wss: Workspace[], archived: boolean) =>
+      void runBulkAction(archived ? "Archived" : "Unarchived", () =>
+        triage.bulkArchive(wss, archived),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkSnooze = useCallback(
+    (wss: Workspace[], minutes: number | null) =>
+      void runBulkAction(minutes == null ? "Unsnoozed" : "Snoozed", () =>
+        triage.bulkSnooze(wss, minutes),
+      ),
+    [runBulkAction, triage],
+  );
+
   // Interpret a row click: plain click clears the selection and navigates
   // (today's behavior), modifier clicks build the selection instead. The row
   // has already guarded button / deleting / drag, and called preventDefault.
@@ -2426,6 +2487,18 @@ export function WorkspaceSidebar({
               className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
           </div>
+        )}
+
+        {!readOnly && (
+          <BulkActionBar
+            selectedCount={selection.selectedIds.size}
+            buckets={bulkBuckets}
+            snoozePresets={SNOOZE_PRESETS}
+            onBulkPin={onBulkPin}
+            onBulkArchive={onBulkArchive}
+            onBulkSnooze={onBulkSnooze}
+            onClear={clearSelection}
+          />
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden">

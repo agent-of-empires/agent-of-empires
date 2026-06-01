@@ -15,3 +15,7 @@ export const toastBus: ToastBus = { handler: null };
 export function reportError(message: string): void {
   toastBus.handler?.error(message);
 }
+
+export function reportInfo(message: string): void {
+  toastBus.handler?.info(message);
+}
