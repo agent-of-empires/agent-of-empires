@@ -1,12 +1,12 @@
 // Live coverage for the sidebar group-edit flow (#1726):
-//   - Right-click a session row -> context menu -> Edit group -> inline input.
-//   - Enter commits, firing PATCH /api/sessions/:id/group with `{ group }`.
+//   - Right-click a session row -> context menu -> Edit group -> modal.
+//   - Save fires PATCH /api/sessions/:id/group with `{ group }`.
 //   - Assigning a brand-new group path creates the group (it shows up in
 //     GET /api/groups) and the session joins it; the change persists.
 //   - Clearing the field commits `{ group: "" }`, ungrouping the session.
 //
-// The UI contract under test lives in `SessionRow.commitGroupEdit`
-// (web/src/components/WorkspaceSidebar.tsx); the PATCH handler is
+// The UI contract under test lives in `SessionGroupModal`
+// (web/src/components/SessionGroupModal.tsx); the PATCH handler is
 // `update_session_group` in `src/server/api/sessions.rs`. Live coverage
 // catches wire-format drift on either side that a mocked spec would miss.
 
@@ -18,7 +18,7 @@ import {
 } from "../helpers/aoeServe";
 
 base.describe("session group edit via sidebar context menu (#1726)", () => {
-  base("Enter commits a new group path, creating the group and round-tripping through PATCH", async ({ page }, testInfo) => {
+  base("Save commits a new group path, creating the group and round-tripping through PATCH", async ({ page }, testInfo) => {
     const title = "group-edit-new";
     const newGroup = "team/alpha";
     const serve = await spawnAoeServe({
@@ -53,14 +53,16 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
       await menu
         .locator("[data-testid='sidebar-context-menu-edit-group']")
         .click();
-      const input = page.locator("[data-testid='sidebar-group-input']");
-      await expect(input).toBeVisible();
+      const modal = page.locator("[data-testid='session-group-modal']");
+      await expect(modal).toBeVisible();
+      const input = modal.locator("[data-testid='session-group-modal-input']");
       await input.fill(newGroup);
-      await input.press("Enter");
+      await modal.locator("[data-testid='session-group-modal-save']").click();
 
       const patchRes = await patchPromise;
       expect(patchRes.ok()).toBe(true);
       expect(patchRes.request().postDataJSON()).toEqual({ group: newGroup });
+      await expect(modal).toBeHidden();
 
       // The session persists under the new group...
       await expect
@@ -123,15 +125,18 @@ base.describe("session group edit via sidebar context menu (#1726)", () => {
       await menu
         .locator("[data-testid='sidebar-context-menu-edit-group']")
         .click();
-      const input = page.locator("[data-testid='sidebar-group-input']");
+      const modal = page.locator("[data-testid='session-group-modal']");
+      await expect(modal).toBeVisible();
+      const input = modal.locator("[data-testid='session-group-modal-input']");
       // The input is prefilled with the current group; clear it.
       await expect(input).toHaveValue(startGroup);
       await input.fill("");
-      await input.press("Enter");
+      await modal.locator("[data-testid='session-group-modal-save']").click();
 
       const patchRes = await patchPromise;
       expect(patchRes.ok()).toBe(true);
       expect(patchRes.request().postDataJSON()).toEqual({ group: "" });
+      await expect(modal).toBeHidden();
 
       await expect
         .poll(async () => (await listSessions(serve.baseUrl))[0]?.group_path, {

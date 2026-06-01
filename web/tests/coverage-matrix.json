@@ -861,6 +861,7 @@
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SessionGroupModal.tsx",
         "web/src/lib/api.ts"
       ]
     },
