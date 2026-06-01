@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import {
   Archive,
+  ArrowLeftRight,
   Clock,
   GripVertical,
   Layers,
@@ -68,6 +69,8 @@ import {
   setSessionSnooze,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import { requestOpenSession } from "../lib/sessionRoute";
+import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
 import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
@@ -564,6 +567,11 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // The cockpit session backing this row, if any. Drives the "Switch
+  // agent" context-menu item, which only makes sense for an ACP cockpit
+  // session (tmux rows have no agent to hand off). Multi-session rows are
+  // rare; pick the first cockpit session in the workspace.
+  const cockpitSession = workspace.sessions.find((s) => s.cockpit_mode);
   const runningSession = workspace.sessions.find((s) =>
     isSessionActive(s, idleDecayWindowMs),
   );
@@ -734,6 +742,19 @@ export const SessionRow = memo(function SessionRow({
   const openSnoozeModal = () => {
     setContextMenu(null);
     setSnoozeModalOpen(true);
+  };
+
+  // Open the switch-agent dialog for this row's cockpit session. The
+  // dialog lives in that session's Composer (it prefills the composer on
+  // confirm), so we navigate to the session first, then request the open.
+  // When the row is already the active session the navigation is a no-op
+  // and the dispatched event opens the dialog immediately; otherwise the
+  // Composer consumes the pending latch once it mounts.
+  const handleSwitchAgent = () => {
+    setContextMenu(null);
+    if (!cockpitSession) return;
+    requestOpenSession(cockpitSession.id);
+    requestSwitchAgent(cockpitSession.id);
   };
 
   // Effective state for rendering: optimistic overrides win until the
@@ -1065,6 +1086,16 @@ export const SessionRow = memo(function SessionRow({
           >
             Rename
           </button>
+          {!readOnly && cockpitSession && (
+            <button
+              onClick={handleSwitchAgent}
+              data-testid="sidebar-context-menu-switch-agent"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+            >
+              <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+              Switch agent
+            </button>
+          )}
           <div className="border-t border-surface-700/20 my-1" />
           <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
             Notifications

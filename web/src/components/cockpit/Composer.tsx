@@ -20,7 +20,6 @@ import {
 } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeftRight,
   AtSign,
   ChevronUp,
   Paperclip,
@@ -32,6 +31,11 @@ import {
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
+import {
+  OPEN_SWITCH_AGENT_EVENT,
+  consumePendingSwitchAgent,
+  type OpenSwitchAgentDetail,
+} from "../../lib/switchAgentTrigger";
 import type {
   CockpitState,
   PromptAttachmentInput,
@@ -453,11 +457,30 @@ export function Composer({
     );
   }, [composerRuntime, enqueuePrompt, pendingAttachments, setPendingAttachments]);
 
-  // Manual agent switch dialog, opened from the toolbar control. Unlike
-  // the rate-limit recovery path (which lives up in CockpitView), this
-  // is available at any time so a user can hand back to, say, claude
-  // after a rate-limit handoff to codex.
+  // Manual agent switch dialog. Opened from the sidebar row context menu
+  // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
+  // trigger below. Unlike the rate-limit recovery path (which lives up in
+  // CockpitView), this is available at any time so a user can hand back
+  // to, say, claude after a rate-limit handoff to codex.
   const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
+  // Open on a switch-agent request targeting this session. The dispatched
+  // event covers the already-open session; the pending latch (consumed on
+  // mount) covers the case where the user picked the menu item on another
+  // session and navigation mounted this Composer a tick later.
+  useEffect(() => {
+    if (consumePendingSwitchAgent(sessionId)) setSwitchAgentOpen(true);
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
+      if (detail?.sessionId === sessionId) {
+        // Clear the latch we also set, so a later remount of this
+        // already-open session does not reopen the dialog.
+        consumePendingSwitchAgent(sessionId);
+        setSwitchAgentOpen(true);
+      }
+    };
+    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+  }, [sessionId]);
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -882,12 +905,6 @@ export function Composer({
                   configOptions={configOptions}
                   pendingConfigOption={pendingConfigOption}
                   onSetConfigOption={setConfigOption}
-                />
-                <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
-                <ToolbarButton
-                  icon={<ArrowLeftRight className="h-3.5 w-3.5" />}
-                  label="Switch agent"
-                  onClick={() => setSwitchAgentOpen(true)}
                 />
               </div>
 

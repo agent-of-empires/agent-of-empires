@@ -152,7 +152,7 @@ After the switch, the modal fetches the context primer and pre-fills the compose
 
 The same hand-off is available at any time, not just when an agent is rate-limited. This matters when you handed a session off (say, claude to codex during a rate limit) and later want to return to the original agent once the limit clears.
 
-- **Web dashboard:** the composer toolbar carries a "Switch agent" control. Clicking it opens the same picker, lists the cockpit ACP registry, and switches on confirm. The composer is pre-filled with a recap so the new agent has context; review and send manually.
+- **Web dashboard:** right-click a cockpit session in the sidebar and pick "Switch agent". It opens the same picker, lists the cockpit ACP registry, and switches on confirm. The composer is pre-filled with a recap so the new agent has context; review and send manually.
 - **CLI:** `aoe cockpit switch-agent <session> <target>` (run `aoe cockpit agents` to list valid target keys). Pass `--model <name>` to override the model the new agent starts with.
 
 Both paths hit `POST /api/sessions/{id}/cockpit/switch-agent` with `reason: "manual"`, so the transcript divider reads `Switched cockpit agent from <from> to <to> (manual)`, distinct from the `(rate_limited)` divider the recovery flow emits.
