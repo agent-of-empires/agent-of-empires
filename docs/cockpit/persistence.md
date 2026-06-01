@@ -32,7 +32,9 @@ files. `aoe cockpit ps` lists running workers.
 Practical implications:
 
 - `aoe update` followed by `aoe serve --stop` + `aoe serve` keeps
-  every cockpit agent's in-flight turn alive.
+  every cockpit agent's in-flight turn alive; a worker left on the old
+  build then respawns on the new binary once its turn finishes (see
+  [Build-version upgrade after `aoe update`](#build-version-upgrade-after-aoe-update)).
 - Closing the laptop or restarting the host with `aoe serve` running:
   the daemon dies on suspend, but the runner continues. On wake the
   next `aoe serve` reattaches.
@@ -79,6 +81,36 @@ Practical implications:
   agent starts so the UI clears immediately. The same path covers the
   `main`-branch case where there is no runner at all and every cockpit
   session takes the fresh-spawn branch on restart.
+
+## Build-version upgrade after `aoe update`
+
+Surviving a daemon restart is the right behavior for in-flight turns,
+but it means a daemon restarted on a newly-installed binary would
+otherwise re-adopt workers still executing the previous build, running
+mixed versions silently. To prevent that, each runner records the build
+identity of the binary that spawned it (`build_version` in its registry
+JSON, shown as the `BUILD` column in `aoe cockpit ps`), and the daemon
+compares it against its own on every reattach:
+
+- A worker whose build matches the daemon is reattached as usual; a
+  same-version `aoe serve` restart keeps in-flight turns alive exactly as
+  before.
+- A worker on an older build with **no** in-flight turn is terminated and
+  respawned on the new binary immediately.
+- A worker on an older build that is **mid-turn** is adopted so the turn
+  keeps streaming, then respawned on the new binary at the next idle
+  boundary. The in-flight turn is drained, never hard-killed.
+
+`aoe cockpit ps` tags any such not-yet-respawned worker `(stale)` in its
+`BUILD` column so a mixed-version state is visible rather than silent.
+
+Note that the new binary takes effect only once the daemon itself
+restarts: `aoe update` swaps the binary on disk but does not restart a
+running `aoe serve`, so you must `aoe serve --stop` and start it again
+for the reconciler pass above to run. A worker's build identity pairs the
+package version with a git commit hash, so local rebuilds across commits
+are detected, not just shipped release upgrades. See
+[#1754](https://github.com/agent-of-empires/agent-of-empires/issues/1754).
 
 ## Session deletion
 
