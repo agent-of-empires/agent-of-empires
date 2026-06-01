@@ -144,6 +144,12 @@ pub fn claim_idle_stop(
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);
         };
+        // Defense in depth: never stop a cockpit row through the plain-session
+        // path, even if a caller reached here without going through
+        // `idle_reap_candidates` (which already excludes cockpit sessions).
+        if inst.is_cockpit_mode() {
+            return Ok(None);
+        }
         let eligible = should_auto_stop_session(
             now,
             inst.status,
@@ -353,12 +359,43 @@ mod tests {
         assert!(idle_reap_candidates(&[inst], n, &attached, |_| 60).is_empty());
     }
 
+    /// Saves and restores `HOME` / `XDG_CONFIG_HOME` so a test that points the
+    /// app dir at a tempdir does not leak that into sibling tests sharing the
+    /// process.
+    struct EnvGuard {
+        home: Option<std::ffi::OsString>,
+        xdg: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                home: std::env::var_os("HOME"),
+                xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn claim_is_single_shot_under_storage_lock() {
         // The double-reap guard: the first claim wins and flips the on-disk
         // status to Stopped; a second claim (the peer reaper) sees a non-Idle
         // session and returns None, so the session is never stopped twice.
+        let _env = EnvGuard::capture();
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
         #[cfg(target_os = "linux")]
