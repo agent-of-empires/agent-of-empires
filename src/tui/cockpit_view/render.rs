@@ -1,5 +1,5 @@
-//! Three-pane render of a cockpit session: transcript / status banner /
-//! composer. Tool-card breakdowns are intentionally minimal in the MVP
+//! Four-pane render of a cockpit session: transcript / status banner /
+//! queued-prompts strip / composer. Tool-card breakdowns are intentionally minimal in the MVP
 //! (one-liner per tool call); rich diff / image / file previews are
 //! deferred to the followup issues called out in the implementation
 //! plan. Press `o` from the transcript pane to open the web cockpit
@@ -8,7 +8,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::input::Focus;
@@ -60,6 +60,8 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitVie
     );
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
         .title(title)
         .border_style(Style::default().fg(theme.border));
     let inner = block.inner(area);
@@ -67,9 +69,13 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &CockpitVie
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, prompt) in state.queue.iter().take(QUEUE_PREVIEW_ROWS).enumerate() {
-        let preview = match truncate_chars(prompt, 80) {
+        // Queued prompts can hold newlines (Shift+Enter in the composer);
+        // ratatui's Line strips them, so collapse whitespace first to keep
+        // the preview on one tidy line and truncate predictably.
+        let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = match truncate_chars(&one_line, 80) {
             Some(head) => format!("{}. {head}…", i + 1),
-            None => format!("{}. {prompt}", i + 1),
+            None => format!("{}. {one_line}", i + 1),
         };
         lines.push(Line::from(Span::styled(
             preview,
