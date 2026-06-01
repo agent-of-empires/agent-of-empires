@@ -208,10 +208,15 @@ export function SettingsView({
   const loadSettings = useCallback(() => {
     if (!selectedProfile) return;
     const seq = ++loadSeq.current;
-    fetchSettings(selectedProfile).then((s) => {
-      if (seq !== loadSeq.current) return;
-      if (s) setSettings(s);
-    });
+    fetchSettings(selectedProfile)
+      .then((s) => {
+        if (seq !== loadSeq.current) return;
+        if (s) setSettings(s);
+      })
+      .catch(() => {
+        if (seq !== loadSeq.current) return;
+        setSettings(null);
+      });
   }, [selectedProfile]);
 
   useEffect(() => {
