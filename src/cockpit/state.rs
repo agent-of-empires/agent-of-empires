@@ -607,6 +607,17 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
     },
+    /// A cancel was requested for the in-flight turn: aoe sent the ACP
+    /// `session/cancel` notification and armed the escalation watchdog.
+    /// The turn is NOT over yet (no `Stopped`); this lets the UI show a
+    /// "Stopping..." state and reveal a force-stop affordance instead of
+    /// a silent spinner. `escalates_at` is when the watchdog will SIGTERM
+    /// the worker if the agent keeps ignoring the cancel, so the UI can
+    /// show an honest countdown without depending on a local timer for
+    /// correctness. Emitted once per turn on the first cancel. See #1727.
+    CancelRequested {
+        escalates_at: DateTime<Utc>,
+    },
     /// Final stop signal from the agent. Carries an opaque reason string
     /// so the UI can render "completed" / "ended early" / "cancelled".
     Stopped {
@@ -868,6 +879,11 @@ impl CockpitState {
             // made progress.
             Event::RawAgentUpdate { .. } => {}
             Event::AgentMessageChunk { .. } => {}
+            // No in-memory mutation: the turn is still active (turnActive
+            // stays true until a real `Stopped`). The reducer/UI derive the
+            // "Stopping..." state from the broadcast/replayed event. Bumps
+            // seq so the WS replay surfaces it to live clients. See #1727.
+            Event::CancelRequested { .. } => {}
             Event::Stopped { .. } => {}
             Event::AgentStartupError { .. } => {}
             Event::IncompatibleAgent { detail } => {

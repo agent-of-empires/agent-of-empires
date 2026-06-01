@@ -169,7 +169,16 @@ export function CockpitRuntime({
       setPendingAttachments([]);
     },
     onCancel: async () => {
-      await cockpit.cancelPrompt();
+      // First Stop sends a graceful cancel. If a cancel is already in
+      // flight (the agent is ignoring session/cancel on a stuck loop),
+      // a second Stop escalates to a force-stop instead of resending a
+      // no-op notification, so the user's instinct to click again
+      // actually ends the turn. See #1727.
+      if (cockpit.state.cancelling) {
+        await cockpit.forceEndTurn();
+      } else {
+        await cockpit.cancelPrompt();
+      }
     },
   });
 

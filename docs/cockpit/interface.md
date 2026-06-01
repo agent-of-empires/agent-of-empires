@@ -188,6 +188,14 @@ reopening the tab on the same origin) keeps them across the reconnect
 window. Server-side durability is not currently implemented; clearing
 site data wipes the queue.
 
+## Stopping a turn
+
+While an agent turn is running, the composer shows a **Stop** button. Clicking it sends a graceful cancel to the agent and the working spinner switches to **Stopping...** with a short countdown to the escalation deadline.
+
+Some tools the agent runs internally (a monitor or `until` loop, a long blocking command) do not honor a graceful cancel. When that happens a **Force stop** button appears next to the spinner, even while a tool is in flight. Force stop ends the turn immediately: it restarts the agent worker and kills the whole command tree the agent had running, so a runaway loop actually stops instead of waiting out the grace window. Clicking **Stop** again while it already reads "Stopping..." does the same thing.
+
+Force stop is a hard interrupt. The agent resumes from its saved transcript on the next prompt, but any partial output from the tool that was in flight is lost. Reach for **Force stop** only when a turn is genuinely wedged; the graceful **Stop** is enough for a turn that is merely taking a while.
+
 ## Timeline card grouping
 
 To keep the timeline readable, cockpit folds two kinds of runs into

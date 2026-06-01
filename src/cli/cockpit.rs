@@ -849,6 +849,7 @@ fn event_kind(event: &crate::cockpit::Event) -> &'static str {
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
+        Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
