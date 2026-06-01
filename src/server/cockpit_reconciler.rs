@@ -769,6 +769,15 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
             continue;
         }
+        // Re-check liveness right before publishing: several awaits sit
+        // between the candidate snapshot and here, so a manual
+        // `/cockpit/spawn` could have brought the worker back in the gap.
+        // Without this guard we would emit a spurious auto-resume
+        // breadcrumb (and clear `attempted`) for an already-running
+        // session. Let the manual resume win. See #1722.
+        if state.cockpit_supervisor.is_running(&id).await {
+            continue;
+        }
         // Eligible: publish the breadcrumb (supersedes Stopped{rate_limited})
         // and free the `attempted` slot so the main resume loop spawns a
         // fresh worker this tick.
