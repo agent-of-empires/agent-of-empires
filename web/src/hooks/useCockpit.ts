@@ -1096,8 +1096,15 @@ export function useCockpit(
           // the next AcpSessionAssigned. A capacity 503 ("worker_capacity_full")
           // is NOT this case: it needs operator action, so it keeps its
           // banner. See #1748.
+          //
+          // Only suppress for text-only sends: the local queue does not
+          // carry attachments, so an attachment send that hits this 503 has
+          // no retry path. Keep its banner so the user knows to resend
+          // rather than seeing a silent optimistic bubble. See #1748.
           const workerNotReady =
-            res.status === 503 && detail.startsWith("worker_not_ready");
+            res.status === 503 &&
+            detail.startsWith("worker_not_ready") &&
+            (!attachments || attachments.length === 0);
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           }

@@ -559,6 +559,50 @@ describe("useCockpit drain race (#1144)", () => {
     );
   });
 
+  it("keeps the error banner on a worker_not_ready 503 for an attachment send (#1748)", async () => {
+    // Attachments cannot be re-queued (the local queue is text-only), so a
+    // worker_not_ready 503 for an attachment send has no retry path. The
+    // banner must show rather than being suppressed as transient.
+    const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-attach",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "shot.png",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    expect(result.current.state.lastError ?? "").toContain(
+      "Could not send prompt (503)",
+    );
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
   it("retires the optimistic turn when prompt POST is rejected with 4xx", async () => {
     const { result } = renderHook(() => useCockpit("sess-reject-4xx"));
     await flushAsync();
