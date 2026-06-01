@@ -79,16 +79,21 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       return;
     }
     const seq = ++loadSeq.current;
-    Promise.all([getProfileSettings(selected), fetchSettings()]).then(
-      ([profile, global]) => {
+    Promise.all([getProfileSettings(selected), fetchSettings()])
+      .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
         setGlobalHooks(global?.hooks as HooksOverride | undefined);
         setDescription(
           typeof profile?.description === "string" ? profile.description : "",
         );
-      },
-    );
+      })
+      .catch(() => {
+        if (seq !== loadSeq.current) return;
+        setProfileSettings(null);
+        setGlobalHooks(undefined);
+        setError("Failed to load profile settings");
+      });
   }, [selected]);
 
   const closeInput = () => {
