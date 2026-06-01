@@ -61,8 +61,14 @@ pub fn filter_commands<'a>(
         })
         .collect();
     scored.sort_by(|a, b| {
+        // Tie-break case-insensitively so mixed-case names sort the same
+        // way the (case-insensitive) scoring ranks them, matching web
+        // parity; fall back to raw bytes only to keep the order total.
+        let a_lc = a.1.name.to_lowercase();
+        let b_lc = b.1.name.to_lowercase();
         b.0.cmp(&a.0)
             .then_with(|| a.1.name.len().cmp(&b.1.name.len()))
+            .then_with(|| a_lc.cmp(&b_lc))
             .then_with(|| a.1.name.cmp(&b.1.name))
     });
     scored
