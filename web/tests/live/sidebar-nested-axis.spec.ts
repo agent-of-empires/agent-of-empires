@@ -69,8 +69,12 @@ async function cycleAxisTo(
   target: string,
 ) {
   for (let i = 0; i < 3; i++) {
-    if ((await toggle.getAttribute("data-axis")) === target) return;
+    const current = await toggle.getAttribute("data-axis");
+    if (current === target) return;
     await toggle.click();
+    // Wait for the axis to actually advance before reading again, so a
+    // not-yet-flushed re-render cannot trigger an extra overshooting click.
+    await expect(toggle).not.toHaveAttribute("data-axis", current ?? "");
   }
   await expect(toggle).toHaveAttribute("data-axis", target);
 }
