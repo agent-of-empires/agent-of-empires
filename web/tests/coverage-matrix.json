@@ -1722,6 +1722,28 @@
       ]
     },
     {
+      "id": "story.sidebar-rate-limit",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/cockpit-stories/sidebar-rate-limit.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.rate-limit-hook",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/__tests__/useCockpitRateLimit.test.tsx"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
       "id": "story.sidebar-select-focuses-input",
       "kind": "live-playwright",
       "risk": "medium",

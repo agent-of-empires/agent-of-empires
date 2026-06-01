@@ -522,6 +522,19 @@ async function handleRequest(msg) {
       }
       const wasCancelled = sessionId ? cancelFlags.get(sessionId) : false;
       if (sessionId) cancelFlags.set(sessionId, false);
+      // Rate-limit park: a turn with `rateLimit` returns session/prompt as
+      // a JSON-RPC error carrying the fingerprint aoe's
+      // classify_rate_limit_error reads (errorKind "rate_limit" plus a
+      // resets_at), instead of a normal stopReason. The cockpit worker
+      // then emits a typed RateLimit event and parks the session. See
+      // #1281 / #1715. A cancel mid-turn still wins over the park.
+      if (!wasCancelled && turn.rateLimit) {
+        sendError(id, -32000, turn.rateLimit.message ?? "rate limit reached", {
+          errorKind: "rate_limit",
+          resets_at: turn.rateLimit.resets_at,
+        });
+        return;
+      }
       sendResult(id, {
         stopReason: wasCancelled ? "cancelled" : (turn.stopReason ?? "end_turn"),
       });
