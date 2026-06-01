@@ -2710,7 +2710,7 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.session.snooze_duration_minutes = *v as u32;
         }
         (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
-            config.session.auto_stop_idle_secs = *v as u32;
+            config.session.auto_stop_idle_secs = (*v).min(u32::MAX as u64) as u32;
         }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             config.session.restart_wake_message = v.clone();
@@ -3224,9 +3224,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             });
         }
         (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
-            set_profile_override(*v as u32, &mut config.session, |s, val| {
-                s.auto_stop_idle_secs = val
-            });
+            set_profile_override(
+                (*v).min(u32::MAX as u64) as u32,
+                &mut config.session,
+                |s, val| s.auto_stop_idle_secs = val,
+            );
         }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.session, |s, val| {
