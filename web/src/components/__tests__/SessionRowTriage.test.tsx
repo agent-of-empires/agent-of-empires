@@ -16,6 +16,11 @@ import {
   SessionRow,
 } from "../WorkspaceSidebar";
 import type { SessionResponse, Workspace } from "../../lib/types";
+import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
+import {
+  OPEN_SWITCH_AGENT_EVENT,
+  consumePendingSwitchAgent,
+} from "../../lib/switchAgentTrigger";
 
 function session(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -90,6 +95,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  // Drain any switch-agent latch a click left behind so tests stay
+  // independent.
+  consumePendingSwitchAgent("sess-switch-it");
 });
 
 describe("SessionRow chips", () => {
@@ -221,8 +229,38 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).toContain("Snooze…");
   });
 
+  it("shows Switch agent for a cockpit row", () => {
+    const ws = workspace("w-cockpit", [
+      session({ id: "sess-cockpit", cockpit_mode: true }),
+    ]);
+    render(
+      <Wrap>
+        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(
+      screen.queryByTestId("sidebar-context-menu-switch-agent"),
+    ).not.toBeNull();
+  });
+
+  it("hides Switch agent for a non-cockpit (tmux) row", () => {
+    const ws = workspace("w-tmux", [session({ cockpit_mode: false })]);
+    render(
+      <Wrap>
+        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(
+      screen.queryByTestId("sidebar-context-menu-switch-agent"),
+    ).toBeNull();
+  });
+
   it("hides the triage section in read-only mode", () => {
-    const ws = workspace("w-live", [session({})]);
+    // cockpit_mode is set so the Switch agent gate is also exercised:
+    // it must stay hidden in read-only even on a cockpit row.
+    const ws = workspace("w-live", [session({ cockpit_mode: true })]);
     render(
       <Wrap>
         <SessionRow
@@ -239,6 +277,9 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).not.toContain("Archive");
     expect(menu.textContent).not.toContain("Snooze");
     expect(menu.textContent).not.toContain("Delete");
+    expect(
+      screen.queryByTestId("sidebar-context-menu-switch-agent"),
+    ).toBeNull();
   });
 });
 
@@ -405,5 +446,37 @@ describe("SessionRow triage actions", () => {
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe("/api/sessions/sess-unsnooze-it/snooze");
     expect(JSON.parse(init!.body as string)).toEqual({ minutes: null });
+  });
+
+  it("Switch agent click navigates to the session and requests the dialog", () => {
+    const ws = workspace("w-cockpit", [
+      session({ id: "sess-switch-it", cockpit_mode: true }),
+    ]);
+    const opened: string[] = [];
+    const switched: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent).detail.sessionId);
+    const onSwitch = (e: Event) =>
+      switched.push((e as CustomEvent).detail.sessionId);
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
+    try {
+      render(
+        <Wrap>
+          <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        </Wrap>,
+      );
+      fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+      fireEvent.click(
+        screen.getByTestId("sidebar-context-menu-switch-agent"),
+      );
+      expect(opened).toEqual(["sess-switch-it"]);
+      expect(switched).toEqual(["sess-switch-it"]);
+      // No PATCH: switching is deferred to the dialog in the composer.
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+      window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
+    }
   });
 });

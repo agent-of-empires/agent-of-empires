@@ -1142,6 +1142,19 @@
       ]
     },
     {
+      "id": "cockpit.switch-agent-context-menu",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/__tests__/switchAgentTrigger.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/cockpit/Composer.tsx"
+      ]
+    },
+    {
       "id": "cockpit.silent-orphan-watchdog",
       "kind": "vitest",
       "risk": "medium",
