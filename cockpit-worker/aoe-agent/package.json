@@ -22,7 +22,7 @@
     "@ai-sdk/google": "^3.0.75",
     "@ai-sdk/openai-compatible": "^2.0.42",
     "ai": "^6.0.185",
-    "zod": "^4.3.6"
+    "zod": "^4.4.3"
   },
   "license": "MIT"
 }
