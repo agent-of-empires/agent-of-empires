@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMatch, useNavigate } from "react-router-dom";
+import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
@@ -195,6 +195,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
@@ -814,9 +815,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <SettingsView
           tab={settingsTab}
           onClose={handleCloseSettings}
-          onSelectTab={(t) => navigate(`/settings/${t}`)}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            navigate(
+              `/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`,
+            );
+          }}
           serverAbout={serverAbout}
           onServerAboutRefresh={refreshServerAbout}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
         />
       );
     }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { NotificationSettings } from "./NotificationSettings";
@@ -86,6 +86,12 @@ interface Props {
   onSelectTab: (tab: TabId) => void;
   serverAbout: ServerAbout | null;
   onServerAboutRefresh: () => Promise<void> | void;
+  /** Profile to preselect, sourced from the `?profile=` query so the
+   *  Profiles page can deep-link into a specific profile's section. */
+  profile?: string | null;
+  /** Notifies the host when the profile changes via the header dropdown,
+   *  so it can keep `?profile=` in sync for shareable/refreshable URLs. */
+  onSelectProfile?: (profile: string) => void;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -129,6 +135,8 @@ export function SettingsView({
   onSelectTab,
   serverAbout,
   onServerAboutRefresh,
+  profile,
+  onSelectProfile,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(
@@ -146,7 +154,9 @@ export function SettingsView({
   // setSettings could race ahead of an optimistic user edit and
   // clobber it. See #1383 (profile-settings-isolation / settings-
   // tmux-* flakes).
-  const [selectedProfile, setSelectedProfile] = useState("");
+  // Seed from the `?profile=` query (deep-link from the Profiles page) when
+  // present, else empty (see the note above on why not "default").
+  const [selectedProfile, setSelectedProfile] = useState(profile ?? "");
   // Bumped only on a user-initiated profile switch (the header picker), never
   // on the mount-time fetchProfiles resolution that flips selectedProfile from
   // its "" seed to the default. The content fieldset keys its remount on this
@@ -155,10 +165,15 @@ export function SettingsView({
   // profile switches still remount (reset folds, clear half-typed drafts, break
   // sibling-tab reconciliation), which is what user story #4 wants.
   const [profileEpoch, setProfileEpoch] = useState(0);
-  const handleSelectProfile = useCallback((profile: string) => {
-    setSelectedProfile(profile);
-    setProfileEpoch((e) => e + 1);
-  }, []);
+  const handleSelectProfile = useCallback(
+    (next: string) => {
+      setSelectedProfile(next);
+      setProfileEpoch((e) => e + 1);
+      // Keep ?profile= in sync so the URL stays shareable/refreshable.
+      onSelectProfile?.(next);
+    },
+    [onSelectProfile],
+  );
   const sidebar = buildSidebar();
   const tabs = sidebar.filter(
     (s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab",
@@ -173,6 +188,12 @@ export function SettingsView({
     });
   }, []);
 
+  // Follow `?profile=` when it changes after mount (e.g. a second deep-link
+  // from the Profiles page while Settings stays mounted).
+  useEffect(() => {
+    if (profile) setSelectedProfile(profile);
+  }, [profile]);
+
   const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
 
   const handleSetDefault = async (name: string) => {
@@ -180,9 +201,15 @@ export function SettingsView({
     if (ok) fetchProfiles().then(setProfiles);
   };
 
+  // Guard against a slow fetch for a previously-selected profile landing
+  // after a fast switch and clobbering the current profile's settings. The
+  // Profiles page deep-links raise the odds of rapid profile changes.
+  const loadSeq = useRef(0);
   const loadSettings = useCallback(() => {
     if (!selectedProfile) return;
+    const seq = ++loadSeq.current;
     fetchSettings(selectedProfile).then((s) => {
+      if (seq !== loadSeq.current) return;
       if (s) setSettings(s);
     });
   }, [selectedProfile]);
