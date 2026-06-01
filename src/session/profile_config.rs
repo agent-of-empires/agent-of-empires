@@ -651,6 +651,20 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
     global
 }
 
+/// Generic single-source merge (#1692): serialize the global config to JSON,
+/// apply the profile's overrides as a sparse JSON merge (object keys recurse,
+/// scalars and arrays replace), and deserialize back into a typed [`Config`].
+///
+/// This works for every section without per-field arms, so adding a config
+/// field never touches a merge function. It is proven equivalent to the legacy
+/// hand-written [`merge_configs`] by `generic_merge_matches_typed_merge` before
+/// it becomes the only merge path.
+pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> Config {
+    let mut base = serde_json::to_value(global).expect("Config serializes to JSON");
+    crate::session::settings_schema::merge_json(&mut base, overrides);
+    serde_json::from_value(base).expect("merged config deserializes")
+}
+
 /// Validate Docker volume format (host:container[:options])
 pub fn validate_volume_format(volume: &str) -> Result<(), String> {
     if volume.is_empty() {
@@ -1298,5 +1312,162 @@ mod tests {
         assert!(merged.cockpit.enabled);
         assert_eq!(merged.cockpit.default_agent, "from-global");
         assert_eq!(merged.cockpit.max_concurrent_workers, 7);
+    }
+
+    /// Build a profile that overrides at least one field in every section, so
+    /// the equivalence check below exercises every merge path.
+    fn fully_populated_profile() -> ProfileConfig {
+        use crate::session::config::{
+            ClickAction, ColorMode, ContainerRuntimeName, DefaultTerminalMode,
+            NewSessionAttachMode, QueueDrainMode, RowTagMode, UpdateCheckMode,
+        };
+        let one = |k: &str, v: &str| {
+            let mut m = HashMap::new();
+            m.insert(k.to_string(), v.to_string());
+            m
+        };
+        ProfileConfig {
+            description: Some("equivalence fixture".to_string()),
+            theme: Some(ThemeConfigOverride {
+                name: Some("tokyo-night".to_string()),
+                color_mode: Some(ColorMode::Palette),
+                idle_decay_minutes: Some(7),
+            }),
+            updates: Some(UpdatesConfigOverride {
+                update_check_mode: Some(UpdateCheckMode::Off),
+                check_interval_hours: Some(48),
+                notify_in_cli: Some(false),
+                web_poll_interval_minutes: Some(15),
+            }),
+            worktree: Some(WorktreeConfigOverride {
+                enabled: Some(true),
+                path_template: Some("wt/{name}".to_string()),
+                bare_repo_path_template: Some("bare/{name}".to_string()),
+                auto_cleanup: Some(false),
+                show_branch_in_tui: Some(true),
+                delete_branch_on_cleanup: Some(true),
+                workspace_path_template: Some("ws/{name}".to_string()),
+                init_submodules: Some(true),
+            }),
+            sandbox: Some(SandboxConfigOverride {
+                enabled_by_default: Some(true),
+                default_image: Some("img:latest".to_string()),
+                extra_volumes: Some(vec!["/a:/a".to_string()]),
+                port_mappings: Some(vec!["1:1".to_string()]),
+                environment: Some(vec!["X=1".to_string()]),
+                auto_cleanup: Some(false),
+                cpu_limit: Some("2".to_string()),
+                memory_limit: Some("512m".to_string()),
+                default_terminal_mode: Some(DefaultTerminalMode::Container),
+                volume_ignores: Some(vec!["target".to_string()]),
+                mount_ssh: Some(true),
+                selinux_relabel: Some(true),
+                custom_instruction: Some("ci".to_string()),
+                container_runtime: Some(ContainerRuntimeName::Podman),
+                volume_ignores_strategy: Some(VolumeIgnoresStrategy::Named),
+            }),
+            tmux: Some(TmuxConfigOverride {
+                status_bar: Some(TmuxStatusBarMode::Enabled),
+                mouse: Some(TmuxMouseMode::Enabled),
+                clipboard: Some(TmuxClipboardMode::Disabled),
+            }),
+            session: Some(SessionConfigOverride {
+                default_tool: Some("claude".to_string()),
+                yolo_mode_default: Some(true),
+                agent_extra_args: Some(one("claude", "--verbose")),
+                agent_command_override: Some(one("claude", "/opt/claude")),
+                agent_status_hooks: Some(true),
+                mouse_capture: Some(true),
+                custom_agents: Some(one("mine", "my-cmd")),
+                agent_detect_as: Some(one("mine", "claude")),
+                strict_hotkeys: Some(true),
+                snooze_duration_minutes: Some(30),
+                restart_wake_message: Some("wake".to_string()),
+                row_tag: Some(RowTagMode::Profile),
+                live_send_exit_chord: Some("C-x".to_string()),
+                new_session_attach_mode: Some(NewSessionAttachMode::LiveSend),
+                default_attach_mode: Some(NewSessionAttachMode::LiveSend),
+                click_action: Some(ClickAction::SelectOnly),
+            }),
+            hooks: Some(HooksConfigOverride {
+                on_create: Some(vec!["a".to_string()]),
+                on_launch: Some(vec!["b".to_string()]),
+                on_destroy: Some(vec!["c".to_string()]),
+            }),
+            sound: Some(crate::sound::SoundConfigOverride {
+                enabled: Some(true),
+                mode: Some(crate::sound::SoundMode::Random),
+                on_start: Some("start.wav".to_string()),
+                on_running: Some("run.wav".to_string()),
+                on_waiting: Some("wait.wav".to_string()),
+                on_idle: Some("idle.wav".to_string()),
+                on_error: Some("err.wav".to_string()),
+                on_approval: Some("ok.wav".to_string()),
+                volume: Some(0.5),
+            }),
+            status_hooks: Some(crate::status_hooks::StatusHookConfigOverride {
+                enabled: Some(true),
+                debounce_ms: Some(250),
+                on_starting: Some("s".to_string()),
+                on_running: Some("r".to_string()),
+                on_waiting: Some("w".to_string()),
+                on_idle: Some("i".to_string()),
+                on_error: Some("e".to_string()),
+                on_change: Some("c".to_string()),
+            }),
+            cockpit: Some(CockpitConfigOverride {
+                enabled: Some(true),
+                default_for_claude: Some(false),
+                default_agent: Some("claude-code".to_string()),
+                max_concurrent_workers: Some(9),
+                replay_events: Some(100),
+                replay_bytes: Some(2048),
+                node_path: Some("/opt/node".to_string()),
+                show_tool_durations: Some(false),
+                queue_drain_mode: Some(QueueDrainMode::Serial),
+                max_concurrent_resumes: Some(2),
+                force_end_turn_threshold_secs: Some(45),
+                silent_orphan_grace_secs: Some(90),
+                silent_orphan_fast_grace_secs: Some(15),
+            }),
+            environment: Some(vec!["G=1".to_string()]),
+        }
+    }
+
+    /// The generic single-source merge must reproduce the legacy typed merge
+    /// for every section. This is the gate that lets `merge_configs_generic`
+    /// replace `merge_configs` without changing behavior (#1692).
+    #[test]
+    fn generic_merge_matches_typed_merge() {
+        // Start from a non-default global so overrides must actually replace
+        // values rather than coincidentally matching defaults.
+        let mut global = Config::default();
+        global.theme.name = "catppuccin-latte".to_string();
+        global.cockpit.default_agent = "global-agent".to_string();
+        global.environment = vec!["FROM_GLOBAL=1".to_string()];
+        global.sandbox.extra_volumes = vec!["/global:/g".to_string()];
+
+        let profile = fully_populated_profile();
+
+        let typed = merge_configs(global.clone(), &profile);
+        let overrides = serde_json::to_value(&profile).unwrap();
+        let generic = merge_configs_generic(&global, &overrides);
+
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap(),
+            serde_json::to_value(&generic).unwrap(),
+            "generic merge diverged from typed merge"
+        );
+    }
+
+    #[test]
+    fn generic_merge_inherits_with_empty_overrides() {
+        let mut global = Config::default();
+        global.cockpit.max_concurrent_workers = 7;
+        let generic = merge_configs_generic(&global, &serde_json::json!({}));
+        assert_eq!(
+            serde_json::to_value(&global).unwrap(),
+            serde_json::to_value(&generic).unwrap(),
+        );
     }
 }
