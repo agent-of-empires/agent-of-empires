@@ -78,7 +78,10 @@ test("worktree, cockpit, and logging advanced folds expand in the browser", asyn
   page,
 }) => {
   const cases: Array<{ tab: string; anchor: string; field: RegExp }> = [
-    { tab: "worktree", anchor: "Worktrees enabled", field: /^Bare repo path template$/ },
+    // Worktree is schema-driven (#1692): labels + the advanced fold come from
+    // the settings schema, so they match the TUI ("Enabled by Default",
+    // "Bare Repo Template") rather than the old hand-written web copy.
+    { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
     { tab: "cockpit", anchor: "Cockpit master switch", field: /^Replay buffer bytes$/ },
     { tab: "logging", anchor: "Default level", field: /^Output$/ },
   ];

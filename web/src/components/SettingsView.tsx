@@ -7,12 +7,14 @@ import { TerminalSettings } from "./TerminalSettings";
 import {
   fetchProfiles,
   fetchSettings,
+  getSettingsSchema,
   setCockpitMaster,
   setDefaultProfile,
   updateProfileSettings,
   type ServerAbout,
 } from "../lib/api";
-import type { ProfileInfo } from "../lib/types";
+import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
+import { SchemaSection } from "./settings/SchemaSection";
 import {
   CollapsibleSection,
   ListField,
@@ -153,11 +155,21 @@ export function SettingsView({
   );
   const activeTab: TabId = isTabId(tab) ? tab : "session";
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  // Settings schema (single source of truth, #1692). The generic SchemaSection
+  // renderer builds sandbox/worktree from this; empty until the one-shot fetch
+  // resolves, at which point those tabs populate.
+  const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
 
   useEffect(() => {
     fetchProfiles().then((p) => {
       setProfiles(p);
       setSelectedProfile((current) => resolveSelectedProfile(current, p));
+    });
+  }, []);
+
+  useEffect(() => {
+    getSettingsSchema().then((s) => {
+      if (s) setSchema(s);
     });
   }, []);
 
@@ -386,61 +398,13 @@ export function SettingsView({
 
       case "worktree":
         return (
-          <div className="space-y-4">
-            <ToggleField
-              label="Worktrees enabled"
-              description="Create git worktrees for new sessions"
-              checked={(worktree.enabled as boolean) ?? false}
-              onChange={(v) => saveField("worktree", worktree, "enabled", v)}
-            />
-            <TextField
-              label="Path template"
-              description="Template for worktree directories in regular repos ({repo-name}, {branch})"
-              value={(worktree.path_template as string) ?? ""}
-              onChange={(v) => saveField("worktree", worktree, "path_template", v)}
-              placeholder="../{repo-name}-worktrees/{branch}"
-              mono
-            />
-            <ToggleField
-              label="Auto cleanup"
-              description="Delete worktrees when sessions are removed"
-              checked={(worktree.auto_cleanup as boolean) ?? true}
-              onChange={(v) => saveField("worktree", worktree, "auto_cleanup", v)}
-            />
-            <CollapsibleSection
-              title="Advanced"
-              subtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
-            >
-              <TextField
-                label="Bare repo path template"
-                description="Template for worktree directories in bare repos ({branch})"
-                value={(worktree.bare_repo_path_template as string) ?? ""}
-                onChange={(v) => saveField("worktree", worktree, "bare_repo_path_template", v)}
-                placeholder="./{branch}"
-                mono
-              />
-              <TextField
-                label="Workspace path template"
-                description="Template for multi-repo workspace directories ({branch}, {session-id})"
-                value={(worktree.workspace_path_template as string) ?? ""}
-                onChange={(v) => saveField("worktree", worktree, "workspace_path_template", v)}
-                placeholder="../{branch}-workspace-{session-id}"
-                mono
-              />
-              <ToggleField
-                label="Delete branch on cleanup"
-                description="Also delete the git branch when cleaning up a worktree"
-                checked={(worktree.delete_branch_on_cleanup as boolean) ?? false}
-                onChange={(v) => saveField("worktree", worktree, "delete_branch_on_cleanup", v)}
-              />
-              <ToggleField
-                label="Init submodules"
-                description="Run `git submodule update --init --recursive` after creating a worktree"
-                checked={(worktree.init_submodules as boolean) ?? true}
-                onChange={(v) => saveField("worktree", worktree, "init_submodules", v)}
-              />
-            </CollapsibleSection>
-          </div>
+          <SchemaSection
+            section="worktree"
+            schema={schema}
+            values={worktree}
+            onSaveField={saveSubField}
+            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+          />
         );
 
       case "theme":

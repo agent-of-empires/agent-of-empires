@@ -1239,7 +1239,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Bare Repo Template",
         widget = "text",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        advanced
     )]
     pub bare_repo_path_template: String,
 
@@ -1263,7 +1264,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Delete Branch on Cleanup",
         widget = "toggle",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        advanced
     )]
     pub delete_branch_on_cleanup: bool,
 
@@ -1272,7 +1274,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Workspace Path Template",
         widget = "text",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        advanced
     )]
     pub workspace_path_template: String,
 
@@ -1285,7 +1288,8 @@ pub struct WorktreeConfig {
     #[setting(
         label = "Init Submodules",
         widget = "toggle",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        advanced
     )]
     pub init_submodules: bool,
 }

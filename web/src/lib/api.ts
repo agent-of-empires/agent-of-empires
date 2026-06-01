@@ -9,6 +9,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  SettingsFieldDescriptor,
 } from "./types";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -133,6 +134,13 @@ export interface SettingsResponse {
 export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
+}
+
+/** Fetch the settings schema (single source of truth, #1692). The generic
+ *  settings renderer builds form rows from these descriptors instead of
+ *  hand-written per-field JSX. */
+export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
+  return fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema");
 }
 
 export async function updateSettings(

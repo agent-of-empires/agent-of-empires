@@ -19,11 +19,35 @@ const PROFILES = [
   { name: "work", is_default: false },
 ];
 
+// Worktree is schema-driven (#1692): the generic SchemaSection builds its rows
+// from this descriptor list, so labels + the advanced fold come from the schema
+// (matching the TUI), not hand-written JSX. Mirrors the real WorktreeConfig
+// `#[setting(...)]` annotations: 3 primary fields, 4 advanced.
+const elev = { policy: "requires_elevation", reason: "host filesystem" } as const;
+const WORKTREE_SCHEMA = [
+  { field: "enabled", label: "Enabled by Default", widget: { kind: "toggle" }, advanced: false },
+  { field: "path_template", label: "Path Template", widget: { kind: "text" }, advanced: false },
+  { field: "auto_cleanup", label: "Auto Cleanup", widget: { kind: "toggle" }, advanced: false },
+  { field: "bare_repo_path_template", label: "Bare Repo Template", widget: { kind: "text" }, advanced: true },
+  { field: "workspace_path_template", label: "Workspace Path Template", widget: { kind: "text" }, advanced: true },
+  { field: "delete_branch_on_cleanup", label: "Delete Branch on Cleanup", widget: { kind: "toggle" }, advanced: true },
+  { field: "init_submodules", label: "Init Submodules", widget: { kind: "toggle" }, advanced: true },
+].map((d) => ({
+  section: "worktree",
+  category: "Worktree",
+  description: "",
+  web_write: elev,
+  profile_overridable: true,
+  validation: { rule: "none" },
+  ...d,
+}));
+
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
     Promise.resolve({ cockpit: {}, sandbox: {}, worktree: {} }),
   ),
+  getSettingsSchema: vi.fn(() => Promise.resolve(WORKTREE_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   setCockpitMaster: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -166,8 +190,8 @@ describe("Settings Advanced fold", () => {
         onServerAboutRefresh={() => {}}
       />,
     );
-    await screen.findByText("Worktrees enabled");
-    expect(screen.queryByText("Bare repo path template")).toBeNull();
+    await screen.findByText("Enabled by Default");
+    expect(screen.queryByText("Bare Repo Template")).toBeNull();
 
     // Back to sandbox: the fold reset to collapsed.
     rerender(
@@ -231,22 +255,22 @@ describe("Settings Advanced fold", () => {
 
   it("expands the worktree fold and saves every advanced field", async () => {
     const { container } = renderView("worktree");
-    await screen.findByText("Worktrees enabled");
+    await screen.findByText("Enabled by Default");
 
-    expect(screen.queryByText("Workspace path template")).toBeNull();
+    expect(screen.queryByText("Workspace Path Template")).toBeNull();
     expandAdvanced(container);
-    expect(screen.getByText("Workspace path template")).toBeTruthy();
+    expect(screen.getByText("Workspace Path Template")).toBeTruthy();
 
     commit(
-      fieldInputByLabel(container, "Bare repo path template", "text"),
+      fieldInputByLabel(container, "Bare Repo Template", "text"),
       "./{branch}",
     );
     commit(
-      fieldInputByLabel(container, "Workspace path template", "text"),
+      fieldInputByLabel(container, "Workspace Path Template", "text"),
       "../wt-{branch}",
     );
-    clickToggle(container, "Delete branch on cleanup");
-    clickToggle(container, "Init submodules");
+    clickToggle(container, "Delete Branch on Cleanup");
+    clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {

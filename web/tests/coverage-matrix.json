@@ -240,6 +240,19 @@
       ]
     },
     {
+      "id": "settings.schema-renderer",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/SchemaSection.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/FormFields.tsx"
+      ]
+    },
+    {
       "id": "settings.logging-payload",
       "kind": "vitest",
       "risk": "medium",
