@@ -442,6 +442,8 @@ fn ps(json: bool) -> Result<()> {
                     "pid": r.pid,
                     "alive": worker_registry::is_record_live(r),
                     "agent": r.agent_name,
+                    "build_version": r.build_version,
+                    "build_stale": !worker_registry::is_build_current(r),
                     "socket": r.socket_path,
                     "cwd": r.cwd,
                     "started_at": r.started_at,
@@ -458,8 +460,8 @@ fn ps(json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<8} {:<14} {:<10} SOCKET",
-        "SESSION", "PID", "AGENT", "STATE"
+        "{:<24} {:<8} {:<14} {:<10} {:<24} SOCKET",
+        "SESSION", "PID", "AGENT", "STATE", "BUILD"
     );
     for r in &records {
         let state = if !worker_registry::is_record_live(r) {
@@ -471,16 +473,36 @@ fn ps(json: bool) -> Result<()> {
         } else {
             "attached"
         };
+        let build = render_build_cell(&r.build_version, !worker_registry::is_build_current(r));
         println!(
-            "{:<24} {:<8} {:<14} {:<10} {}",
+            "{:<24} {:<8} {:<14} {:<10} {:<24} {}",
             truncate(&r.session_id, 24),
             r.pid,
             truncate(&r.agent_name, 14),
             state,
+            truncate(&build, 24),
             r.socket_path.display()
         );
     }
     Ok(())
+}
+
+/// Render the BUILD cell for `aoe cockpit ps`. An empty `build_version`
+/// (a legacy record written before the field existed) shows `<legacy>`;
+/// any worker whose build differs from the running daemon's is tagged
+/// `(stale)` so a not-yet-respawned worker is visible rather than silent.
+/// See #1754.
+fn render_build_cell(build_version: &str, stale: bool) -> String {
+    let base = if build_version.is_empty() {
+        "<legacy>"
+    } else {
+        build_version
+    };
+    if stale {
+        format!("{base} (stale)")
+    } else {
+        base.to_string()
+    }
 }
 
 async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<()> {
@@ -879,5 +901,21 @@ mod tests {
         assert_eq!(parse_node_major("v20.0.0"), Some(20));
         assert_eq!(parse_node_major("18.17.1"), Some(18));
         assert_eq!(parse_node_major("not a version"), None);
+    }
+
+    /// Story 3: `aoe cockpit ps` surfaces the worker build version, tags
+    /// a build-stale worker, and renders an empty (legacy) version as
+    /// `<legacy>`. See #1754.
+    #[test]
+    fn render_build_cell_cases() {
+        // Current build: bare version, no marker.
+        assert_eq!(render_build_cell("1.9.5+gabc123", false), "1.9.5+gabc123");
+        // Stale build: version plus marker.
+        assert_eq!(
+            render_build_cell("1.9.4+gdeadbe", true),
+            "1.9.4+gdeadbe (stale)"
+        );
+        // Legacy record (field absent on disk): placeholder, always stale.
+        assert_eq!(render_build_cell("", true), "<legacy> (stale)");
     }
 }
