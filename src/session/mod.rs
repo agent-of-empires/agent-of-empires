@@ -8,6 +8,7 @@ pub(crate) mod container_config;
 pub mod deletion;
 pub(crate) mod environment;
 mod groups;
+pub mod idle_reap;
 mod instance;
 pub mod poller;
 pub mod profile_config;
