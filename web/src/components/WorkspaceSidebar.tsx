@@ -1304,6 +1304,7 @@ export function WorkdirNameModal({
   }, [onCancel]);
 
   const submit = async () => {
+    if (busy) return;
     const trimmed = name.trim();
     if (!trimmed) {
       setError("Enter a new workdir name.");
@@ -1351,21 +1352,27 @@ export function WorkdirNameModal({
           <input
             type="text"
             autoFocus
+            aria-label="New workdir name"
+            disabled={busy}
             value={name}
             onChange={(e) => {
               setName(e.target.value);
               setError(null);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") void submit();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submit();
+              }
             }}
             placeholder="new-workdir-name"
             data-testid="workdir-modal-name"
-            className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none focus:border-brand-600"
+            className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none focus:border-brand-600 disabled:opacity-50"
           />
           <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
             <input
               type="checkbox"
+              disabled={busy}
               checked={renameBranch}
               onChange={(e) => setRenameBranch(e.target.checked)}
               data-testid="workdir-modal-rename-branch"
