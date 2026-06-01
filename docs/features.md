@@ -101,6 +101,12 @@ Alternative runtimes that share the same code paths:
 
 Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane content and agent-specific heuristics. The TUI, web dashboard, and cockpit all show the same status column.
 
+### Auto-stop idle sessions
+
+Reclaim resources from forgotten sessions: set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. It is off by default, never stops a session with an attached tmux client or one you used recently, and runs from both the TUI and `aoe serve`. Cockpit workers have the separate `cockpit.auto_stop_idle_secs` knob.
+
+[Configuration: session section](guides/configuration.md#session)
+
 ### Session resume
 
 Persist and resume Claude Code conversations across reboots, upgrades, and runtime rotations. AoE captures the resume token so the next launch picks up where the agent left off.
