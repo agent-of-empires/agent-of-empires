@@ -112,6 +112,7 @@ describe("Markdown wrapper config", () => {
         "CodeHeader",
         "table",
         "blockquote",
+        "a",
       ]),
     );
   });
@@ -167,6 +168,43 @@ describe("Blockquote override", () => {
     expect(container.querySelector("blockquote")?.className).toContain(
       "cockpit-callout-warn",
     );
+  });
+});
+
+// #1714: transcript links must open in a new tab with a safe rel so
+// clicking a docs/CI/repo link does not replace the live cockpit page.
+describe("anchor override", () => {
+  function getAnchor(): React.ComponentType<
+    React.ComponentPropsWithoutRef<"a">
+  > {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.a as React.ComponentType<
+      React.ComponentPropsWithoutRef<"a">
+    >;
+  }
+
+  it("forces transcript links to open in a new tab with a safe rel", () => {
+    const Anchor = getAnchor();
+    const { container } = render(
+      <Anchor href="https://example.com">docs</Anchor>,
+    );
+    const a = container.querySelector("a");
+    expect(a).not.toBeNull();
+    expect(a?.getAttribute("target")).toBe("_blank");
+    expect(a?.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("preserves the original href and children", () => {
+    const Anchor = getAnchor();
+    const { container } = render(
+      <Anchor href="https://example.com/path" title="t">
+        link text
+      </Anchor>,
+    );
+    const a = container.querySelector("a");
+    expect(a?.getAttribute("href")).toBe("https://example.com/path");
+    expect(a?.getAttribute("title")).toBe("t");
+    expect(a?.textContent).toBe("link text");
   });
 });
 
