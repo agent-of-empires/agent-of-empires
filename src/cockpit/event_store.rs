@@ -98,6 +98,47 @@ pub struct ReplayPage {
     /// the page rows under the same lock and never depends on a
     /// separately queried `highest_seq`.
     pub has_more: bool,
+    /// Highest seq stored for the session, or 0 if none. Read under the
+    /// same lock as the page rows so the replay response is a single
+    /// consistent snapshot (a concurrent `record()` can't make `has_more`
+    /// and `highest_seq` disagree). See #1705 review.
+    pub highest_seq: u64,
+    /// Lowest seq still stored, or `None` when empty. Same-snapshot
+    /// guarantee as `highest_seq`; lets the caller compute `lost`.
+    pub lowest_seq: Option<u64>,
+}
+
+/// Highest seq stored for `session_id`, or 0 if none. Free fn so both
+/// the public [`EventStore::highest_seq`] and the single-snapshot
+/// [`EventStore::replay_page`] can share it under one held lock.
+fn query_highest_seq(conn: &Connection, session_id: &str) -> u64 {
+    match conn
+        .query_row(
+            "SELECT MAX(seq) FROM cockpit_events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+    {
+        Ok(Some(Some(max))) => max as u64,
+        _ => 0,
+    }
+}
+
+/// Lowest seq still stored for `session_id`, or `None` when empty.
+/// Companion to [`query_highest_seq`].
+fn query_lowest_seq(conn: &Connection, session_id: &str) -> Option<u64> {
+    match conn
+        .query_row(
+            "SELECT MIN(seq) FROM cockpit_events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+    {
+        Ok(Some(Some(m))) => Some(m as u64),
+        _ => None,
+    }
 }
 
 /// SQLite-backed cockpit event log. One row per (session_id, seq).
@@ -363,6 +404,17 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // Snapshot the bounds under the same lock as the page rows so the
+        // whole response is consistent: a concurrent `record()` cannot
+        // land between these reads and the page query and make
+        // `has_more`/`highest_seq` disagree (which would let the client's
+        // paging cap stop early). See #1705 review.
+        let highest_seq = query_highest_seq(&conn, session_id);
+        let lowest_seq = query_lowest_seq(&conn, session_id);
+        // `seq` is a signed SQLite column; clamp before the cast so the
+        // status probe's `since = u64::MAX` doesn't wrap to -1 and match
+        // every row (`seq > -1`) instead of returning an empty page.
+        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
         // Probe one extra row beyond `limit` to detect `has_more` without
         // a second query against `highest_seq`.
         let probe = limit.map(|n| n.saturating_add(1));
@@ -386,6 +438,8 @@ impl EventStore {
                     events: Vec::new(),
                     last_scanned_seq: None,
                     has_more: false,
+                    highest_seq,
+                    lowest_seq,
                 };
             }
         };
@@ -395,8 +449,8 @@ impl EventStore {
             Ok((seq as u64, json))
         };
         let rows = match probe {
-            Some(p) => stmt.query_map(params![session_id, since as i64, p as i64], map_row),
-            None => stmt.query_map(params![session_id, since as i64], map_row),
+            Some(p) => stmt.query_map(params![session_id, since_i64, p as i64], map_row),
+            None => stmt.query_map(params![session_id, since_i64], map_row),
         };
         let rows = match rows {
             Ok(r) => r,
@@ -406,6 +460,8 @@ impl EventStore {
                     events: Vec::new(),
                     last_scanned_seq: None,
                     has_more: false,
+                    highest_seq,
+                    lowest_seq,
                 };
             }
         };
@@ -450,6 +506,8 @@ impl EventStore {
             events: out,
             last_scanned_seq,
             has_more,
+            highest_seq,
+            lowest_seq,
         }
     }
 
@@ -707,17 +765,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let max = match conn
-            .query_row(
-                "SELECT MAX(seq) FROM cockpit_events WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-        {
-            Ok(Some(Some(max))) => max as u64,
-            _ => 0,
-        };
+        let max = query_highest_seq(&conn, session_id);
         trace!(
             target: "cockpit.event_store",
             session = %session_id,
@@ -737,17 +785,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let min = match conn
-            .query_row(
-                "SELECT MIN(seq) FROM cockpit_events WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-        {
-            Ok(Some(Some(m))) => Some(m as u64),
-            _ => None,
-        };
+        let min = query_lowest_seq(&conn, session_id);
         trace!(
             target: "cockpit.event_store",
             session = %session_id,
@@ -1541,6 +1579,23 @@ mod tests {
             vec![3]
         );
         assert!(!page2.has_more);
+    }
+
+    #[test]
+    fn replay_page_since_u64_max_returns_empty() {
+        // The status probe passes `since = u64::MAX` to read metadata
+        // only. Without clamping, `u64::MAX as i64` is -1 and `seq > -1`
+        // would return the whole transcript. It must return no rows but
+        // still report the bounds.
+        let (_tmp, store) = open_store(1000);
+        for i in 1..=3 {
+            store.record("s-1", i, &Event::ThinkingStarted).unwrap();
+        }
+        let page = store.replay_page("s-1", u64::MAX, Some(1000));
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.highest_seq, 3);
+        assert_eq!(page.lowest_seq, Some(1));
     }
 
     #[test]

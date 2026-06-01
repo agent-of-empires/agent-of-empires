@@ -1669,8 +1669,6 @@ pub async fn cockpit_replay(
     // endpoint backstops that when the in-memory ring is cold (server
     // just restarted) or the client lagged far enough to need older
     // events than the ring holds.
-    let highest_seq = state.cockpit_event_store.highest_seq(&id);
-    let lowest_seq = state.cockpit_event_store.lowest_seq(&id);
     // Bound the page so neither the daemon nor the response scales with
     // total history. Omitted `limit` falls back to the default rather
     // than unbounded, so a naive or older client can't make the daemon
@@ -1681,9 +1679,14 @@ pub async fn cockpit_replay(
         .map(|l| l as usize)
         .unwrap_or(DEFAULT_REPLAY_PAGE)
         .clamp(1, MAX_REPLAY_PAGE);
+    // One store call returns the page and its `highest_seq`/`lowest_seq`
+    // under a single lock, so the response is a consistent snapshot and a
+    // concurrent `record()` can't desync the cap from the page rows.
     let page = state
         .cockpit_event_store
         .replay_page(&id, q.since, Some(limit));
+    let highest_seq = page.highest_seq;
+    let lowest_seq = page.lowest_seq;
     let next_cursor = page.last_scanned_seq;
     let has_more = page.has_more;
     let frames: Vec<crate::server::CockpitBroadcastFrame> = page
