@@ -77,7 +77,7 @@ different MCP naming scheme, file an issue or PR adjusting the profile's
   claude-family agents only, claude's built-in Default / Plan / Accept
   edits / Yolo taxonomy. A non-claude agent that advertises no modes
   shows no picker rather than a vocabulary it would reject. OpenCode has
-  no "default" mode: it operates on agents such as `build` and `plan`,
+  no "default" mode: it operates in modes such as `build` and `plan`,
   so the picker surfaces those real names and switches through the
   config-option channel.
 
