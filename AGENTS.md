@@ -47,7 +47,46 @@
 
 ## Settings & Configuration
 
-Every configurable field must be editable in the settings TUI. When adding one to `SandboxConfig`, `WorktreeConfig`, etc., also: add a `FieldKey` in `src/tui/settings/fields.rs`; add a `SettingField` entry in the matching `build_*_fields()`; wire `apply_field_to_global()` + `apply_field_to_profile()`; add a `clear_profile_override()` case in `src/tui/settings/input.rs`; include the field in the `*ConfigOverride` struct in `profile_config.rs` with merge logic in `merge_configs()`.
+Settings are single-source (#1692): a field is declared once on its `Config`
+sub-struct and every surface derives from that declaration. Adding a setting is
+one edit, the `#[setting(...)]` annotation on the field:
+
+```rust
+/// Doc comment becomes the field's description on every surface.
+#[serde(default)]
+#[setting(label = "My Setting", widget = "toggle")]
+pub my_setting: bool,
+```
+
+`#[derive(SettingsSection)]` (the `aoe-settings-derive` crate) turns each
+annotated field into a `FieldDescriptor` in `settings_schema::schema()`. From
+there everything is automatic:
+
+- **TUI** builds its rows from the schema (`src/tui/settings/fields.rs`); reads
+  and writes go through the serialized `Config` JSON and the generic
+  `merge_json` / `clear_path`. No `FieldKey`, `build_*_fields`, or
+  `apply_field_*` to touch.
+- **Web** fetches `GET /api/settings/schema` and renders generic FormFields
+  (`web/src/components/settings/SchemaSection.tsx`). (Migration is incremental;
+  some sections are still hand-written and consume the schema as they move
+  over.)
+- **Server** validates each PATCH leaf against the schema's `web_write` policy
+  and `validation` rule (`settings_schema::validate_patch`); no hand-kept
+  allowlist.
+- **Profile/repo overrides** are stored as sparse JSON and merged generically,
+  so there is no `*ConfigOverride` struct or merge arm to extend.
+
+Attribute keys: `label`, `desc` (defaults to the doc comment), `widget`
+(`toggle` / `text` / `optional_text` / `number` / `slider` / `select` /
+`list` / `custom:<id>`), `options` (for `select`, `value:Label,...`),
+`min` / `max` / `step`, `validate` (`range:MIN[:MAX]` / `nonempty` /
+`memory_limit` / `volume_list`), `web` (`elevation:<reason>` /
+`local_only:<reason>`; omit for plain allow), `category` (override the
+section's default tab), `advanced` (group under an Advanced fold), `global_only`
+(shown but not profile-overridable), and `skip` (exclude from the schema). The
+section itself is declared with `#[setting_section(name = "...", category =
+"...")]`. A `custom:<id>` widget keeps a bespoke control: register the id in the
+TUI custom-widget map (and, when the web renders that section, the web one too).
 
 ## Coding Style & Naming Conventions
 
