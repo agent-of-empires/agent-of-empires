@@ -10,46 +10,17 @@
 //! ```
 #![cfg(feature = "serve")]
 
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{pick_free_port, require_tmux, wait_for_port, TuiTestHarness};
 
 /// Resolve the daemon's PID file inside the harness's isolated home.
 /// Mirrors `crate::session::get_app_dir`'s platform split.
 fn daemon_pid_path(h: &TuiTestHarness) -> PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("serve.pid")
-}
-
-/// Bind a TCP listener to an ephemeral port, drop it, and return the port.
-/// Tiny TOCTOU window before the daemon binds, but acceptable for a serial
-/// test.
-fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().expect("local_addr").port()
-}
-
-/// Poll until the daemon accepts a TCP connection on `port`. The parent
-/// `aoe serve --daemon` returns as soon as it has spawned the child, so a
-/// successful exit doesn't prove the child bound the port; this is the
-/// real signal that the daemon is up.
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", port).parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
 }
 
 /// True iff the kernel still has a process with this PID.
