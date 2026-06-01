@@ -11,6 +11,7 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -55,6 +56,59 @@ macro_rules! require_tmux {
     };
 }
 pub(crate) use require_tmux;
+
+pub fn node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Skip the calling test if Node.js is not installed. Cockpit e2e tests
+/// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
+/// is a Node script; without Node the worker can't speak ACP.
+macro_rules! require_node {
+    () => {
+        if !$crate::harness::node_available() {
+            eprintln!("Skipping test: node not available");
+            return;
+        }
+    };
+}
+pub(crate) use require_node;
+
+// ---------------------------------------------------------------------------
+// Daemon port helpers (shared by serve.rs and cockpit e2e)
+// ---------------------------------------------------------------------------
+
+/// Bind a TCP listener to an ephemeral port, drop it, and return the port.
+/// Tiny TOCTOU window before the daemon binds, but acceptable for a serial
+/// test.
+pub fn pick_free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    l.local_addr().expect("local_addr").port()
+}
+
+/// Poll until the daemon accepts a TCP connection on `port`. The parent
+/// `aoe serve --daemon` returns as soon as it has spawned the child, so a
+/// successful exit doesn't prove the child bound the port; this is the
+/// real signal that the daemon is up.
+pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Recording helpers
@@ -130,6 +184,18 @@ pub struct TuiTestHarness {
     spawned: bool,
     recording: bool,
     cast_path: Option<PathBuf>,
+    /// Extra env vars exported on every spawned process (tmux session +
+    /// `run_cli` subprocesses). Used by cockpit tests to thread
+    /// FAKE_ACP_* and the runner-socket timeout into the daemon (and
+    /// thus the daemon-spawned worker, which inherits this env).
+    extra_env: Vec<(String, String)>,
+    /// Dirs prepended to PATH ahead of the `claude` stub. Cockpit tests
+    /// install the ACP shim here so it shadows the exit-0 stub.
+    extra_path_dirs: Vec<PathBuf>,
+    /// When set, `Drop` stops the cockpit workers and the serve daemon
+    /// before killing the tmux session, so a panicking assertion can't
+    /// leak a daemon between serial tests.
+    stop_daemon_on_drop: bool,
 }
 
 #[allow(dead_code)]
@@ -138,6 +204,22 @@ impl TuiTestHarness {
     /// so tool detection succeeds.
     pub fn new(test_name: &str) -> Self {
         let home_dir = TempDir::new().expect("failed to create temp home");
+        Self::with_home(test_name, home_dir)
+    }
+
+    /// Like [`new`](Self::new) but roots the isolated `$HOME` under `/tmp`.
+    /// Cockpit workers bind a unix socket at
+    /// `$HOME/.agent-of-empires-dev/cockpit-workers/<id>.sock`; a deep
+    /// tempdir (macOS `/var/folders/...` is ~95 chars) blows past the
+    /// 104-byte `sun_path` limit on Darwin, so the runner's
+    /// `UnixListener::bind` fails. `/tmp` keeps the path short.
+    #[cfg(unix)]
+    pub fn new_in_tmp(test_name: &str) -> Self {
+        let home_dir = TempDir::new_in("/tmp").expect("failed to create temp home under /tmp");
+        Self::with_home(test_name, home_dir)
+    }
+
+    fn with_home(test_name: &str, home_dir: TempDir) -> Self {
         let stub_dir = TempDir::new().expect("failed to create stub dir");
 
         // Unique session name to avoid collisions.
@@ -197,13 +279,88 @@ last_seen_version = "{}"
             spawned: false,
             recording,
             cast_path: None,
+            extra_env: Vec::new(),
+            extra_path_dirs: Vec::new(),
+            stop_daemon_on_drop: false,
         }
     }
 
-    /// Build the PATH with the stub directory prepended so fake `claude` is found.
+    /// Build the PATH with cockpit shim dirs (if any) and the stub
+    /// directory prepended so the fake agent / fake `claude` is found.
+    /// `extra_path_dirs` come first so an installed ACP shim shadows the
+    /// exit-0 `claude` stub.
     fn env_path(&self) -> String {
         let system_path = std::env::var("PATH").unwrap_or_default();
-        format!("{}:{}", self.stub_path.display(), system_path)
+        let mut parts: Vec<String> = self
+            .extra_path_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        parts.push(self.stub_path.display().to_string());
+        parts.push(system_path);
+        parts.join(":")
+    }
+
+    /// Export an extra env var on every spawned process (tmux + `run_cli`).
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.extra_env.push((key.to_string(), value.to_string()));
+    }
+
+    /// Append `[cockpit] enabled = true` to the pre-seeded config so the
+    /// daemon flips its cockpit master atomic on at construction
+    /// (`src/server/mod.rs`).
+    pub fn enable_cockpit_master(&self) {
+        let cfg = app_dir_in(self.home_dir.path()).join("config.toml");
+        let mut content = std::fs::read_to_string(&cfg).unwrap_or_default();
+        content.push_str("\n[cockpit]\nenabled = true\n");
+        std::fs::write(&cfg, content).expect("append cockpit config");
+    }
+
+    /// Install the shared Node fake-ACP agent as the `claude`,
+    /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The cockpit
+    /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
+    /// command via `AgentRegistry`, so all three names must point at the
+    /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
+    /// shim (the daemon -> runner -> node spawn chain does not reliably
+    /// propagate process env). Also sets the runner-socket timeout high
+    /// so a contended CI box doesn't trip the spawn deadline.
+    pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
+        let bin = self.home_dir.path().join("acp-bin");
+        std::fs::create_dir_all(&bin).expect("create acp-bin dir");
+        let fake_agent =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/tests/helpers/fakeAcpAgent.mjs");
+        assert!(
+            fake_agent.exists(),
+            "fake ACP agent not found at {}",
+            fake_agent.display()
+        );
+        let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        let script = format!(
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\nexec node \"{}\" \"$@\"\n",
+            fake_acp_script.display(),
+            debug_log.display(),
+            fake_agent.display(),
+        );
+        for name in ["claude", "claude-agent-acp", "aoe-agent"] {
+            let path = bin.join(name);
+            std::fs::write(&path, &script).expect("write acp shim");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod acp shim");
+            }
+        }
+        self.extra_path_dirs.push(bin);
+        // Belt-and-suspenders: the shim bakes these in, but keep them on
+        // the daemon env too for any path that bypasses the shim.
+        self.set_env("FAKE_ACP_DEBUG_LOG", &debug_log.display().to_string());
+        self.set_env("AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS", "60000");
+    }
+
+    /// Make `Drop` tear down cockpit workers and the serve daemon.
+    pub fn stop_daemon_on_drop(&mut self) {
+        self.stop_daemon_on_drop = true;
     }
 
     /// Build the shell command string to run inside the tmux session.
@@ -255,6 +412,7 @@ last_seen_version = "{}"
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("failed to run tmux new-session");
 
@@ -450,6 +608,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("failed to run aoe CLI")
     }
@@ -509,6 +668,14 @@ last_seen_version = "{}"
 
 impl Drop for TuiTestHarness {
     fn drop(&mut self) {
+        // Stop cockpit workers and the daemon before tearing down tmux so
+        // a panicking assertion can't leak a daemon (which holds the test
+        // port / pid file) into the next serial test. Worker first, then
+        // daemon, so the fake-ACP child exits cleanly.
+        if self.stop_daemon_on_drop {
+            let _ = self.run_cli(&["cockpit", "stop", "--all"]);
+            let _ = self.run_cli(&["serve", "--stop"]);
+        }
         if self.spawned {
             self.kill_session();
         }
