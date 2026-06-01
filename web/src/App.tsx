@@ -1083,6 +1083,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !activeSessionId &&
     !showSettings &&
     !showProjects &&
+    !showProfiles &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
