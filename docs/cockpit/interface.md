@@ -52,8 +52,9 @@ status banner at the bottom of the screen shows the current focus.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
-| Composer    | `Enter`         | Send the buffered text as a prompt                    |
+| Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
 | Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
+| Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
 | Composer    | `Esc`           | Return focus to the transcript                        |
 | Transcript  | `j` / `↓`       | Scroll down one line                                  |
 | Transcript  | `k` / `↑`       | Scroll up one line                                    |
@@ -69,6 +70,7 @@ status banner at the bottom of the screen shows the current focus.
 | Approval    | `Esc`           | Return focus to the transcript                        |
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
+| Any         | `Ctrl+X`        | Clear every queued (not-yet-sent) prompt              |
 
 **Focus isolation.** Approval keys (`a`/`Shift+A`/`d`) only resolve
 when the approval card itself has focus. Typing "always allow" into
@@ -196,6 +198,20 @@ Queued entries persist in the per-origin localStorage snapshot at
 reopening the tab on the same origin) keeps them across the reconnect
 window. Server-side durability is not currently implemented; clearing
 site data wipes the queue.
+
+**TUI cockpit.** The TUI cockpit view has the same client-side queue.
+Pressing `Enter` while a turn is active (or while the WebSocket is
+down) parks the prompt in a **Queued (N)** strip above the composer
+instead of sending it; the queue drains on the next `Stopped` per the
+daemon's `cockpit.queue_drain_mode`, which the view reads from
+`/api/about` so a remote attach honors the remote daemon's setting.
+`Ctrl+X` clears the queue, and pressing `Enter` on an empty composer
+when idle retries the drain (useful if a send failed and left prompts
+parked). Two small differences from the web composer: there is no
+in-place edit of queued rows (clear and retype), and combined mode
+slices batches only at the `/clear` and `/new` boundaries rather than
+the full per-agent clear-alias list. The TUI queue is in-memory only,
+so it does not survive leaving the cockpit view.
 
 ## Stopping a turn
 

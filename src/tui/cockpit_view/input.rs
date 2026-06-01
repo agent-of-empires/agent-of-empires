@@ -33,6 +33,8 @@ pub enum Intent {
     ResolveApproval(ApprovalDecisionWire),
     /// Cancel the in-flight prompt (Ctrl-C style).
     CancelInFlight,
+    /// Drop every queued (not-yet-sent) prompt.
+    ClearQueue,
     /// Open the daemon URL for this session in the user's browser.
     OpenInBrowser,
     /// Move focus to the named region.
@@ -59,6 +61,13 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, has_pending_approval: bool) -> Int
     // browser tab.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
         return Intent::OpenInBrowser;
+    }
+    // Universal: Ctrl-x drops every queued prompt. Intercepted here,
+    // before the composer sees it, so it works from any focus and a
+    // queued backlog can always be abandoned without leaving the
+    // composer. A no-op when the queue is empty.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+        return Intent::ClearQueue;
     }
 
     match focus {
@@ -219,6 +228,23 @@ mod tests {
             );
             assert_eq!(intent, Intent::CancelInFlight);
         }
+    }
+
+    #[test]
+    fn ctrl_x_clears_queue_from_any_focus() {
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            let intent = dispatch(
+                focus,
+                &key_mod(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                false,
+            );
+            assert_eq!(intent, Intent::ClearQueue);
+        }
+        // Plain 'x' in the composer is still a typed character.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('x')), false),
+            Intent::Compose(_)
+        ));
     }
 
     #[test]
