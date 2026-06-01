@@ -491,7 +491,14 @@ impl HomeView {
         // stacking gives the preview the full width.
         let available_width = main_chunks[0].width;
         self.main_area_width = available_width;
-        if available_width < responsive::STACKED_BREAKPOINT {
+        // Collapsed sidebar (live mode only): hand the whole main area to
+        // the preview so the agent pane fills the terminal. The live-send
+        // resize loop then reflows the agent to the wider geometry. Reset
+        // on live-send exit, so the list always returns in the home view.
+        if self.live_send.is_some() && self.sidebar_collapsed {
+            self.divider_col = None;
+            self.render_preview(frame, main_chunks[0], theme);
+        } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
@@ -2099,6 +2106,37 @@ impl HomeView {
             // dialog's title.
             let raw_title = live_send::format_target_label(base_title, state.target);
             let chip = " \u{25CF} LIVE \u{2192} ";
+            let chip_style = Style::default()
+                .fg(theme.background)
+                .bg(theme.running)
+                .bold();
+
+            // Which-key menu: the leader is armed, so surface the live-send
+            // commands the next key can pick instead of the normal exit
+            // hint. This is the discoverability moment the issue asked for;
+            // pressing the leader shows exactly what it does.
+            if self.live_send_pending_leader {
+                if let Some(leader) = state.leader {
+                    let lead = live_send::display_chord(leader);
+                    let sidebar_cmd = if self.sidebar_collapsed {
+                        "b show sidebar"
+                    } else {
+                        "b hide sidebar"
+                    };
+                    let menu =
+                        format!("  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} q exit ");
+                    let menu_budget = (area.width as usize)
+                        .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
+                    let menu = truncate_to_width(&menu, menu_budget);
+                    let spans = vec![
+                        Span::styled(chip, chip_style),
+                        Span::styled(menu, Style::default().fg(theme.accent).bold()),
+                    ];
+                    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+                    return;
+                }
+            }
+
             // The chord display is built from the user's configured
             // exit-chord list so the hint always shows what actually
             // exits live mode for this user. Empty list (impossible
@@ -2112,6 +2150,14 @@ impl HomeView {
                 live_send::display_chord_list(&state.exit_chords)
             };
             let suffix = " to exit ";
+            // Compact reminder that the leader opens the command menu, so
+            // the user can discover the palette / sidebar toggle without
+            // having entered the menu yet. Empty when the leader is
+            // disabled (the user cleared the setting).
+            let leader_hint = state
+                .leader
+                .map(|l| format!(" \u{00b7} {} menu", live_send::display_chord(l)))
+                .unwrap_or_default();
             // `preview_visible_rows` is the output-body height the renderer
             // last painted into (pane height minus the inner banner row only
             // when that banner is shown). Reuse it so the live `[offset/max]`
@@ -2136,17 +2182,12 @@ impl HomeView {
                 + 2 // double space before the chord
                 + unicode_width::UnicodeWidthStr::width(chord.as_str())
                 + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
                 + unicode_width::UnicodeWidthStr::width(scroll.as_str());
             let title_budget = (area.width as usize).saturating_sub(fixed_width);
             let title = truncate_to_width(&raw_title, title_budget);
             let mut spans: Vec<Span<'static>> = vec![
-                Span::styled(
-                    chip,
-                    Style::default()
-                        .fg(theme.background)
-                        .bg(theme.running)
-                        .bold(),
-                ),
+                Span::styled(chip, chip_style),
                 Span::raw(" "),
                 Span::styled(title, Style::default().fg(theme.text).bold()),
             ];
@@ -2162,6 +2203,12 @@ impl HomeView {
                 Style::default().fg(theme.accent).bold(),
             ));
             spans.push(Span::styled(suffix, Style::default().fg(theme.dimmed)));
+            if !leader_hint.is_empty() {
+                spans.push(Span::styled(
+                    leader_hint,
+                    Style::default().fg(theme.dimmed).italic(),
+                ));
+            }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }

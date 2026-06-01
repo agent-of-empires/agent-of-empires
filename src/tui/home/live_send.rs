@@ -61,6 +61,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// settings (or hand-editing the line out) restores the new default.
 pub(super) const DEFAULT_EXIT_CHORD: &str = "C-q";
 
+/// Default live-send leader (prefix) chord. `Ctrl+b` matches the tmux
+/// and herdr leader, so multiplexer users already have the muscle
+/// memory, and it's the one chord we steal from the agent (double-tap
+/// `C-b C-b` still delivers a literal `C-b` downstream). Kept in sync
+/// with `default_live_send_leader()` in `session::config`. An empty
+/// configured value disables the leader entirely.
+pub(super) const DEFAULT_LEADER: &str = "C-b";
+
 /// Parse a tmux-style chord spec into a `(KeyCode, KeyModifiers)`
 /// pair. Accepts `C-` / `Ctrl-`, `M-` / `Alt-`, `S-` / `Shift-`
 /// prefixes (any order, separated by `-` or `+`) followed by a key
@@ -275,6 +283,14 @@ pub(in crate::tui) struct LiveSendState {
     /// setting at entry time. Captured per-entry so config edits
     /// don't change behavior mid-session.
     pub exit_chords: Vec<(KeyCode, KeyModifiers)>,
+    /// Leader (prefix) chord parsed from the user's configured leader
+    /// setting at entry time. `None` when the user cleared the setting
+    /// (leader disabled, every key passes through). When `Some`, the
+    /// first press arms the live-send command menu; the next key picks
+    /// a command (or a second leader press passes a literal leader to
+    /// the agent). Snapshotted per-entry for the same reason as
+    /// `exit_chords`.
+    pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
 /// Which paired tmux pane a live-send dispatch targets. The agent
@@ -803,6 +819,32 @@ mod tests {
         // hand exit configure one explicitly.
         assert!(!chords.contains(&(KeyCode::Char(']'), KeyModifiers::CONTROL)));
         assert!(!chords.contains(&(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn default_leader_is_ctrl_b() {
+        // Ctrl+B matches the tmux/herdr leader. Kept in sync with
+        // session::config::default_live_send_leader().
+        assert_eq!(
+            parse_chord(DEFAULT_LEADER),
+            Some((KeyCode::Char('b'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn leader_matches_only_its_exact_chord() {
+        let leader = parse_chord(DEFAULT_LEADER).unwrap();
+        // The armed leader: Ctrl+B fires it again (passthrough path).
+        assert!(chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+        // Bare `b` is a menu command, not a second leader press, so it
+        // must NOT match the leader chord.
+        assert!(!chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
