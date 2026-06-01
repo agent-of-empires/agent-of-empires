@@ -15,7 +15,7 @@
 // publishes it on every write, and cross-tab `storage` events parse the
 // new value exactly once.
 
-import type { CockpitState } from "./cockpitTypes";
+import type { CockpitState, RateLimitInfo } from "./cockpitTypes";
 
 export const STORAGE_KEY_PREFIX = "aoe:cockpit-state:v1:";
 export const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -40,6 +40,15 @@ function sessionIdFromKey(key: string): string | null {
 // from localStorage on first read so inactive sessions (no mounted
 // cockpit hook writing) still resolve a count.
 const queueCounts = new Map<string, number>();
+
+// Last-known rate-limit info per session id, kept in sync alongside
+// queueCounts by setRateLimit (same-tab writes) and the cross-tab
+// storage listener. Mirrors the queued-prompt cache so the sidebar can
+// render a rate-limited indicator for a session whose cockpit view is
+// not mounted. A stored `null` means "known, not rate-limited"; a
+// missing (`undefined`) entry means "not yet read this page load", which
+// getRateLimit lazily fills from localStorage.
+const rateLimits = new Map<string, RateLimitInfo | null>();
 
 type Listener = () => void;
 
@@ -76,6 +85,32 @@ function parseQueuedCount(raw: string | null): number | null {
   }
 }
 
+// Parse the rate-limit info out of a raw persisted entry, honoring the
+// TTL. Returns null when the entry is missing, expired, corrupt, or has
+// no (or malformed) rate-limit, so callers treat the session as not
+// rate-limited rather than caching a bogus value.
+function parseRateLimit(raw: string | null): RateLimitInfo | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedEntry | null;
+    if (
+      !parsed ||
+      typeof parsed.savedAt !== "number" ||
+      Number.isNaN(parsed.savedAt) ||
+      Date.now() - parsed.savedAt > STATE_TTL_MS
+    ) {
+      return null;
+    }
+    const rl = (parsed.state as Partial<CockpitState> | undefined)?.rateLimit;
+    if (rl && typeof rl.resets_at === "string" && typeof rl.kind === "string") {
+      return rl;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // Publish a session's current queued-prompt count. Called by useCockpit's
 // persistState on every successful write; the length is already in hand
 // there, so no JSON parsing happens on the write hot path.
@@ -84,15 +119,29 @@ export function setQueueCount(sessionId: string, count: number): void {
   notify(sessionId);
 }
 
-// Drop a session's cached count (session delete / cache clear). With no
-// argument, clears the whole cache.
+// Publish a session's current rate-limit info (null when not rate
+// limited). Called by useCockpit's persistState on every successful
+// write; the value is already in hand there, so no JSON parsing happens
+// on the write hot path.
+export function setRateLimit(
+  sessionId: string,
+  info: RateLimitInfo | null,
+): void {
+  rateLimits.set(sessionId, info);
+  notify(sessionId);
+}
+
+// Drop a session's cached count and rate-limit (session delete / cache
+// clear). With no argument, clears the whole cache.
 export function clearQueueCount(sessionId?: string): void {
   if (sessionId === undefined) {
     queueCounts.clear();
+    rateLimits.clear();
     notify(null);
     return;
   }
   queueCounts.delete(sessionId);
+  rateLimits.delete(sessionId);
   notify(sessionId);
 }
 
@@ -116,6 +165,24 @@ export function getQueuedCount(sessionId: string): number {
   return count;
 }
 
+// Side-effect-free read of a session's last-known rate-limit info (null
+// when not rate limited). Same contract as getQueuedCount: cache first,
+// parse localStorage once on a miss and memoise.
+export function getRateLimit(sessionId: string): RateLimitInfo | null {
+  const cached = rateLimits.get(sessionId);
+  if (cached !== undefined) return cached;
+  if (typeof window === "undefined") return null;
+  let info: RateLimitInfo | null;
+  try {
+    info = parseRateLimit(window.localStorage.getItem(storageKey(sessionId)));
+  } catch {
+    // localStorage blocked/threw: don't memoise a transient failure.
+    return null;
+  }
+  rateLimits.set(sessionId, info);
+  return info;
+}
+
 // Subscribe to cockpit-state changes. `filter` scopes the listener to a
 // set of session ids; null receives every change. Fires for same-tab
 // writes (via the notify in setQueueCount) and cross-tab writes (storage
@@ -130,14 +197,16 @@ export function subscribeCockpitState(
     // whole count cache and fire unconditionally.
     if (e.key === null) {
       queueCounts.clear();
+      rateLimits.clear();
       cb();
       return;
     }
     const sid = sessionIdFromKey(e.key);
     if (sid === null) return;
-    // Refresh the cache from the cross-tab value (parsed once) so the
-    // next snapshot read is consistent, then notify if in scope.
+    // Refresh both caches from the cross-tab value (parsed once each) so
+    // the next snapshot read is consistent, then notify if in scope.
     queueCounts.set(sid, parseQueuedCount(e.newValue) ?? 0);
+    rateLimits.set(sid, parseRateLimit(e.newValue));
     if (filter === null || filter.has(sid)) cb();
   };
   window.addEventListener("storage", onStorage);
