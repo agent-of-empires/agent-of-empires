@@ -3610,6 +3610,83 @@ mod tests {
         );
     }
 
+    /// #1748: `begin_resume` must place a `pending_resumes` reservation
+    /// synchronously so a subsequent `wait_for_worker` BLOCKS until the
+    /// worker lands instead of failing fast. This is the core of the
+    /// idle-dormant prompt-wake fix: before it, the prompt handler cleared
+    /// dormancy but started no resume, so `send_prompt`'s `wait_for_worker`
+    /// returned false immediately (no pending entry) and the prompt 404'd.
+    #[tokio::test]
+    async fn begin_resume_reserves_so_wait_for_worker_blocks() {
+        let sink = VecSink::new();
+        let sup = Arc::new(Supervisor::new(sink));
+
+        // Pre-fix shape: no worker and no reservation, so `wait_for_worker`
+        // returns false immediately. This is exactly what made the wake
+        // prompt 404 before the fix.
+        assert!(
+            !sup.wait_for_worker("s-1748", std::time::Duration::from_secs(60))
+                .await,
+            "with no reservation, wait_for_worker must fail fast"
+        );
+        assert!(!sup.is_running("s-1748").await);
+
+        // Reserve synchronously, the way the prompt-wake path now does
+        // before driving the detached spawn.
+        let reservation = match sup
+            .begin_resume("s-1748", ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+        assert!(
+            sup.is_running("s-1748").await,
+            "a reservation must count as running-ish so the reconciler skips it"
+        );
+        assert!(matches!(
+            sup.worker_state("s-1748").await,
+            CockpitWorkerState::Resuming
+        ));
+
+        // A second begin_resume for the same id must not double-reserve.
+        assert!(matches!(
+            sup.begin_resume("s-1748", ResumeKind::Spawn).await.unwrap(),
+            ResumeReservationOutcome::AlreadyPresent
+        ));
+
+        // With the reservation held, `wait_for_worker` BLOCKS: the worker
+        // is mid-resume, so it must not return within a short window.
+        let sup_clone = Arc::clone(&sup);
+        let waiter = tokio::spawn(async move {
+            sup_clone
+                .wait_for_worker("s-1748", std::time::Duration::from_secs(60))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_for_worker must block while the reservation is held"
+        );
+
+        // Dropping the reservation without a worker landing (the spawn
+        // failed) wakes the waiter, which then returns false.
+        drop(reservation);
+        let woke = tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter must wake on reservation drop")
+            .expect("waiter task must not panic");
+        assert!(
+            !woke,
+            "no worker landed, so wait_for_worker returns false after the reservation drops"
+        );
+        assert!(matches!(
+            sup.worker_state("s-1748").await,
+            CockpitWorkerState::Absent
+        ));
+    }
+
     /// Regression: `shutdown` arriving while a spawn is mid-handshake
     /// must mark the in-flight spawn for cancellation, so the spawn's
     /// pre-insert check drops the freshly-built client instead of
