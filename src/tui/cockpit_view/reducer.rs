@@ -428,6 +428,7 @@ impl CockpitTranscript {
             }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
+            | Event::RateLimitAutoResumed { .. }
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }

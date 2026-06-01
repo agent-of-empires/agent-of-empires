@@ -864,6 +864,7 @@ fn event_kind(event: &crate::cockpit::Event) -> &'static str {
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
         Event::RateLimit { .. } => "rate_limit",
+        Event::RateLimitAutoResumed { .. } => "rate_limit_auto_resumed",
         Event::UsageUpdated { .. } => "usage_updated",
         Event::ModeChanged { .. } => "mode_changed",
         Event::ModesAvailable { .. } => "modes_available",

@@ -702,6 +702,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         seq
     }
 
+    /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
+    /// reconciler is about to auto-respawn after a rate-limit park. The
+    /// `resets_at` is the adapter-reported reset time that gated the
+    /// resume. This event doubles as the supersede marker: it becomes the
+    /// session's latest status event (see `latest_status_event`'s filter),
+    /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
+    /// and falls through to a fresh spawn instead of re-parking. The web
+    /// reducer also keys off it to clear the rate-limit banner and drain a
+    /// queued prompt. See #1722.
+    pub fn publish_rate_limit_auto_resumed(
+        &self,
+        session_id: &str,
+        resets_at: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink
+            .publish(session_id, seq, &Event::RateLimitAutoResumed { resets_at });
+        seq
+    }
+
     /// Like `shutdown` but waits for the runner process to actually exit
     /// before returning, so a subsequent `spawn` for the same session id
     /// doesn't race the SIGTERM and collide on the worker socket file.

@@ -532,6 +532,16 @@ pub enum Event {
     RateLimit {
         info: RateLimitInfo,
     },
+    /// Opt-in auto-resume breadcrumb. Published by the reconciler (not the
+    /// agent) when a session parked on `Stopped { reason: "rate_limited" }`
+    /// crosses its reset deadline and `cockpit.rate_limit_auto_resume` is
+    /// enabled, just before the same worker is respawned. Carries the
+    /// `resets_at` that gated the resume so the timeline can show why the
+    /// worker came back, and so the web reducer can clear the rate-limit
+    /// lock and drain any queued prompt. See #1722.
+    RateLimitAutoResumed {
+        resets_at: DateTime<Utc>,
+    },
     /// Agent-reported context-window usage. Comes from ACP
     /// `SessionUpdate::UsageUpdate` (gated on the
     /// `unstable_session_usage` schema feature). Latest snapshot wins;
@@ -832,6 +842,11 @@ impl CockpitState {
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
+            // Auto-resume fired: the park is over and a fresh worker is
+            // being respawned. Clear the rate-limit snapshot so a client
+            // seeding state from the store (or the persistent reducer)
+            // doesn't keep showing the parked banner after the resume.
+            Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             // ModesAvailable + CurrentModeChanged carry the real ACP-
