@@ -54,11 +54,12 @@ status banner at the bottom of the screen shows the current focus.
 | ----------- | --------------- | ----------------------------------------------------- |
 | Composer    | `Enter`         | Send the buffered text, or queue it if a turn is active |
 | Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
+| Composer    | `@`             | Open the file-mention picker; keep typing to filter   |
 | Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
 | Composer    | `/`             | Type a slash at the start of an empty line to open the command picker |
 | Composer    | `↑` / `↓`       | Move the picker highlight (picker open)               |
 | Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight down / up (picker open) |
-| Composer    | `Enter` / `Tab` | Insert the highlighted command (picker open)          |
+| Composer    | `Enter` / `Tab` | Insert the highlighted command or file (picker open)  |
 | Composer    | `Esc`           | Dismiss the picker, or return focus to the transcript |
 | Transcript  | `j` / `↓`       | Scroll down one line                                  |
 | Transcript  | `k` / `↑`       | Scroll up one line                                    |
@@ -111,6 +112,15 @@ The diff is capped at 20 changed lines and previews at 12 lines, with a
 "+N more" footer when there is more; press `o` to open the web dashboard
 for the full diff and output. Any other tool kind falls back to the
 generic one-liner (name, arguments, output snapshot).
+
+**File-mention picker.** Typing `@` in the composer opens a picker
+listing the session's workspace files, fetched once per session from
+the daemon (the same `cockpit/files` index the web composer uses, capped
+at 5000 entries). Keep typing to fuzzy-filter; prefix matches rank above
+substring matches. Selecting a file inserts it as `:file[<path>]`,
+matching the text the web composer sends, so both surfaces hand the
+agent identical prompts. The picker closes on `Esc` and stays closed
+while you keep typing in that same token until you start a fresh `@`.
 
 ### Web composer Enter behavior
 
