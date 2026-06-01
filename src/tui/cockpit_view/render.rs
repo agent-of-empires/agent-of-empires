@@ -113,13 +113,22 @@ fn render_slash_picker(
     if matches.is_empty() {
         return;
     }
-    let lines = picker_lines(&matches, state.slash_selected, SLASH_PICKER_MAX_ROWS);
-    // border rows (2) + content; width matches the composer so the
-    // popup lines up with the input it completes.
+    // Cap the visible rows to the space above the composer (minus the 2
+    // border rows) before windowing, so on a short terminal the window
+    // can't hand back more rows than will paint and hide the selection
+    // at the bottom. width matches the composer so the popup lines up
+    // with the input it completes.
+    let max_rows = (composer_area.y as usize)
+        .saturating_sub(2)
+        .min(SLASH_PICKER_MAX_ROWS);
+    if max_rows == 0 {
+        return;
+    }
+    let lines = picker_lines(&matches, state.slash_selected, max_rows);
     let desired = lines.len() as u16 + 2;
     // Anchor the popup's bottom edge to the composer's top edge, growing
-    // upward; clamp the top to row 0 so a tall list never underflows.
-    // When clamped, the visible height shrinks to the space available.
+    // upward. max_rows already guarantees the list fits above the
+    // composer, so the height below won't truncate the windowed rows.
     let y = composer_area.y.saturating_sub(desired);
     let area = Rect {
         x: composer_area.x,
@@ -940,5 +949,48 @@ mod tests {
         assert!(dump.contains("Commands"), "picker title missing");
         assert!(dump.contains("/compact"), "command label missing");
         assert!(dump.contains('▶'), "selection marker missing");
+    }
+
+    #[test]
+    fn short_terminal_keeps_selected_row_visible() {
+        // Regression: on a short terminal the popup's drawable height is
+        // tiny, but the window was sized to SLASH_PICKER_MAX_ROWS, so a
+        // bottom selection painted above the fold and vanished. Render a
+        // 9-row terminal with many commands, select the last, and assert
+        // the selected label + marker actually paint.
+        let endpoint = DaemonEndpoint {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            token: None,
+            source: Source::LocalDaemon,
+        };
+        let http = HttpClient::new(endpoint.clone()).expect("http client");
+        let mut state = CockpitViewState::new("sess".to_string(), endpoint, http, None);
+        state.focus = Focus::Composer;
+        state.transcript.available_commands =
+            (0..12).map(|i| cmd(&format!("cmd{i:02}"), "")).collect();
+        state.composer.insert_str("/cmd");
+        assert!(state.slash_picker_open());
+        // Drive the highlight to the last match.
+        let last = state.slash_matches().len() - 1;
+        state.move_slash_selection(last as i32);
+        let last_name = state.slash_matches()[last].name.clone();
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let backend = TestBackend::new(40, 9);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            dump.contains('▶'),
+            "selection marker missing on short terminal"
+        );
+        assert!(
+            dump.contains(&format!("/{last_name}")),
+            "selected row /{last_name} scrolled off-screen: {dump:?}"
+        );
     }
 }
