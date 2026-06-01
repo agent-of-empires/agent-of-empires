@@ -735,7 +735,14 @@ async fn build_spawn_request(
 /// and is by definition not mid-turn.
 async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<ResumeTarget> {
     let instances = state.instances.read().await;
-    let inst = instances.iter().find(|i| i.id == id && i.cockpit_mode)?;
+    // Filter the same triage states the reconciler skips everywhere else.
+    // The wake path drops `instance_lock` before calling this, so an archive
+    // or snooze can win the race after dormancy was cleared; resolving to
+    // None (then NotFound) keeps us from respawning a session the reconciler
+    // intentionally leaves sunk. See #1748.
+    let inst = instances.iter().find(|i| {
+        i.id == id && i.cockpit_mode && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+    })?;
     Some(ResumeTarget {
         id: inst.id.clone(),
         tool: inst.tool.clone(),
