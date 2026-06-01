@@ -27,7 +27,7 @@ pub mod test_support {
     };
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -183,6 +183,52 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         "batch pane metadata fetched",
     );
     result
+}
+
+/// Names of aoe tmux sessions that currently have at least one attached
+/// client, from a single `tmux list-sessions` call.
+///
+/// Used by the idle auto-stop reapers (#1690) to spare a session the user is
+/// reading. Returns `Err` when the underlying tmux call fails to spawn or
+/// exits non-zero: callers MUST treat `Err` as "don't know, skip this reap
+/// pass" rather than "nothing attached", so a transient tmux glitch cannot
+/// kill a pane the user is sitting in.
+pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut attached = HashSet::new();
+            for line in stdout.lines() {
+                if let Some((name, flag)) = line.split_once(FIELD_SEP) {
+                    // `#{session_attached}` is the attached client count; any
+                    // non-zero value means a client is attached.
+                    if name.starts_with(SESSION_PREFIX) && flag.trim() != "0" {
+                        attached.insert(name.to_string());
+                    }
+                }
+            }
+            Ok(attached)
+        }
+        Ok(out) => {
+            tracing::warn!(
+                target: "tmux.cache",
+                status = ?out.status,
+                "list-sessions (attached) returned non-zero",
+            );
+            Err(anyhow::anyhow!(
+                "tmux list-sessions returned non-zero status: {:?}",
+                out.status
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(target: "tmux.cache", error = %e, "list-sessions (attached) spawn failed");
+            Err(anyhow::anyhow!("tmux list-sessions spawn failed: {}", e))
+        }
+    }
 }
 
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
