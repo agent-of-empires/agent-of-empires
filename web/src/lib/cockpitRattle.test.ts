@@ -12,6 +12,7 @@ import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
   THINKING_VERBS,
+  TOOL_LABEL_MAX,
   VERB_INTERVAL_MS,
   WORKING_VERBS,
 } from "./cockpitRattle";
@@ -68,6 +69,31 @@ describe("chooseVerb", () => {
     const out = chooseVerb("tool", 3, "Bash");
     expect(out.endsWith("…")).toBe(true);
     expect(out.endsWith(" Bash…")).toBe(true);
+  });
+
+  it("clamps a long tool title so it does not flood the spinner (#1728)", () => {
+    // inFlightTool.name carries the ACP title, which for Bash is the full
+    // command line. A heredoc-into-consult-llm dispatch can run hundreds
+    // of chars; the inline spinner must not inline it verbatim.
+    const longCommand =
+      "cat <<'__CONSULT_LLM_END__' | consult-llm --task plan -m gemini -m openai -f /Users/foo/terminal_handler.rs";
+    const out = chooseVerb("tool", 3, longCommand);
+    expect(out.endsWith("…")).toBe(true);
+    // The inlined name is bounded; the full command never reaches the row.
+    expect(out).not.toContain(longCommand);
+    expect(out).not.toContain("consult-llm");
+    // Whole label = "<verb> <clamped>…"; clamped slice is <= TOOL_LABEL_MAX.
+    const verb = out.split(" ")[0];
+    const inlined = out.slice(verb.length + 1, -1);
+    expect(inlined.length).toBeLessThanOrEqual(TOOL_LABEL_MAX);
+    expect(longCommand.startsWith(inlined.trimEnd())).toBe(true);
+  });
+
+  it("leaves short tool titles unchanged (#1728)", () => {
+    expect(chooseVerb("tool", 3, "Bash").endsWith(" Bash…")).toBe(true);
+    expect(chooseVerb("tool", 3, "Read foo.ts").endsWith(" Read foo.ts…")).toBe(
+      true,
+    );
   });
 
   it("falls back to WORKING_VERBS when state=tool but toolName is null", () => {
