@@ -1222,7 +1222,7 @@ function ModePicker({
   const select = (id: string) => {
     setOpen(false);
     if (id === channel.activeId || id === channel.pendingId) return;
-    if (channel.kind === "config" && channel.configId) {
+    if (channel.kind === "config") {
       void setConfigOption(channel.configId, id);
     } else {
       void postLegacyMode(sessionId, id);

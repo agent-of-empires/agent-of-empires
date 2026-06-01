@@ -51,16 +51,28 @@ export interface ModeOption {
 /** The resolved channel the picker should read and write. `kind`
  *  selects the write path: "config" -> session/set_config_option on
  *  `configId`; "legacy" -> session/set_mode. `pendingId` is the value
- *  currently in flight (config channel only; pessimistic UI). */
-export interface ModeChannel {
-  kind: "config" | "legacy";
-  configId: string | null;
-  modes: ModeOption[];
-  activeId: string;
-  pendingId: string | null;
-  /** Menu header label. */
-  label: string;
-}
+ *  currently in flight (config channel only; pessimistic UI). A
+ *  discriminated union so the "config" variant guarantees a non-null
+ *  `configId`. */
+export type ModeChannel =
+  | {
+      kind: "config";
+      configId: string;
+      modes: ModeOption[];
+      activeId: string;
+      pendingId: string | null;
+      /** Menu header label. */
+      label: string;
+    }
+  | {
+      kind: "legacy";
+      configId: null;
+      modes: ModeOption[];
+      activeId: string;
+      pendingId: null;
+      /** Menu header label. */
+      label: string;
+    };
 
 export interface ResolveModeChannelArgs {
   configOptions: CockpitState["configOptions"];
