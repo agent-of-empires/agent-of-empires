@@ -103,6 +103,19 @@ test("Edit configuration deep-links into Settings scoped to the profile", async 
   await expect(profileSelect).toHaveValue("work");
 });
 
+test("opens from the sidebar footer and closes back to the dashboard", async ({
+  serve,
+  page,
+}) => {
+  await page.goto(serve.baseUrl);
+  await page.getByRole("button", { name: "Profiles", exact: true }).click();
+  await expect(page).toHaveURL(/\/profiles$/);
+  await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page).not.toHaveURL(/\/profiles/);
+});
+
 test("lifecycle hooks render read-only with the explain-why note", async ({
   serve,
   page,
