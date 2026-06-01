@@ -135,6 +135,7 @@ dependencies = [
  "nucleo-matcher",
  "p256",
  "portable-pty",
+ "pulldown-cmark",
  "qrcode",
  "rand 0.10.1",
  "ratatui",
@@ -2802,6 +2803,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.11.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

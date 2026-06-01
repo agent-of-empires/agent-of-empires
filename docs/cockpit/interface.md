@@ -75,6 +75,15 @@ when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
 
+**Markdown rendering.** Agent messages in the transcript are parsed as
+markdown and rendered with styling: headings and `**bold**` show in
+bold, `*italics*` in italic, `` `inline code` `` and fenced code blocks
+in a dim block, and `-`/`1.` lists with bullet or number markers. The
+raw `#`, `**`, backtick, and fence characters are not shown. Styling
+uses text attributes only (bold, italic, dim) so it tracks your theme
+colors. Code-block syntax highlighting is deferred; press `o` to open
+the web dashboard for full-fidelity rendering.
+
 ### Web composer Enter behavior
 
 On desktop, Enter sends the prompt and Shift+Enter inserts a

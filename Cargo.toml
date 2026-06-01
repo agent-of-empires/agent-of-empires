@@ -24,6 +24,11 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ansi-to-tui = "8.0"
 ratatui-textarea = "0.9"
 tui-input = "0.15"
+# Markdown parsing for the cockpit transcript. We map events to ratatui
+# Lines ourselves (see src/tui/cockpit_view/render.rs) so raw markers are
+# stripped and styling tracks the app theme; default-features = false
+# drops the unused HTML renderer.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
