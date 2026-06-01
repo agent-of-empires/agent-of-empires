@@ -690,7 +690,13 @@ mod tests {
     fn turn_active_tracks_prompt_and_stop_edges() {
         let mut t = CockpitTranscript::new("s-1");
         assert!(!t.turn_active, "fresh transcript is idle");
-        t.apply(&frame(1, Event::UserPromptSent { text: "go".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
         assert!(t.turn_active, "UserPromptSent opens the turn");
         t.apply(&frame(2, Event::ThinkingStarted));
         assert!(t.turn_active, "thinking keeps the turn open");
@@ -706,7 +712,13 @@ mod tests {
     #[test]
     fn turn_active_clears_on_startup_error_and_rejection() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "go".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
         t.apply(&frame(
             2,
             Event::AgentStartupError {
@@ -719,6 +731,7 @@ mod tests {
             3,
             Event::UserPromptSent {
                 text: "again".into(),
+                attachments: vec![],
             },
         ));
         assert!(t.turn_active);
@@ -735,7 +748,13 @@ mod tests {
     #[test]
     fn reset_returns_to_idle() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "go".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
         assert!(t.turn_active);
         t.reset();
         assert!(!t.turn_active, "reset drops derived turn state for replay");
