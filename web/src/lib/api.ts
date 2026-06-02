@@ -129,6 +129,9 @@ export interface SettingsResponse {
   theme?: {
     idle_decay_minutes?: number;
   };
+  app_state?: {
+    has_seen_web_tour?: boolean;
+  };
   [key: string]: unknown;
 }
 
@@ -152,6 +155,24 @@ export async function updateSettings(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Marks the first-run dashboard tour as seen for this server. Single-purpose
+ * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
+ * passphrase/elevation wall. Returns false on read-only servers (403) or
+ * network failure; callers treat that as nonfatal and suppress the tour in
+ * memory for the current page.
+ */
+export async function markWebTourSeen(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-tour-seen", {
+      method: "POST",
     });
     return res.ok;
   } catch {

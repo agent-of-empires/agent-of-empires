@@ -618,6 +618,14 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_welcome: bool,
 
+    /// Whether the user has completed or skipped the web dashboard's
+    /// first-run interactive tour. Stored server-side (rather than in
+    /// per-browser localStorage) so a new browser or device does not
+    /// re-show the tour. Distinct from `has_seen_welcome`, which gates
+    /// the native TUI intro.
+    #[serde(default)]
+    pub has_seen_web_tour: bool,
+
     #[serde(default)]
     pub last_seen_version: Option<String>,
 
@@ -2350,6 +2358,7 @@ mod tests {
     fn test_app_state_config_default() {
         let app = AppStateConfig::default();
         assert!(!app.has_seen_welcome);
+        assert!(!app.has_seen_web_tour);
         assert!(app.last_seen_version.is_none());
         assert!(app.dismissed_update_version.is_none());
     }
@@ -2363,8 +2372,20 @@ mod tests {
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_welcome);
+        // Absent from the toml: defaults to false (backward compatible).
+        assert!(!app.has_seen_web_tour);
         assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
         assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_app_state_config_web_tour_roundtrip() {
+        let toml = r#"
+            has_seen_web_tour = true
+        "#;
+        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        assert!(app.has_seen_web_tour);
+        assert!(!app.has_seen_welcome);
     }
 
     // Full config serialization roundtrip

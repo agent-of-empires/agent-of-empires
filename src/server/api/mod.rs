@@ -46,7 +46,7 @@ pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
     get_settings, get_settings_schema, get_update_status, list_agents, list_devices, list_groups,
-    list_profiles, list_sounds, list_themes, rename_profile, serve_sound_file,
+    list_profiles, list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
     update_profile_settings, update_settings,
 };
 pub use telemetry::{get_telemetry_status, post_telemetry_seen, set_telemetry_consent};
@@ -173,6 +173,7 @@ mod tests {
                 include_str!("system.rs"),
                 &[
                     "update_settings",
+                    "mark_web_tour_seen",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",

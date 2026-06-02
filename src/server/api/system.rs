@@ -234,6 +234,60 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
     Json(crate::session::settings_schema::schema())
 }
 
+/// Marks the web dashboard's first-run tour as seen for this server.
+///
+/// Single-purpose write so the cosmetic flag never widens the
+/// `PATCH /api/settings` surface (which carries security-sensitive
+/// sections like `sandbox`/`worktree` and the `app_state`
+/// hooks-acknowledgement field). Deliberately exempt from the
+/// elevation/passphrase wall: it flips one cosmetic bool, grants no
+/// capability, and `read_only` still blocks it. Uses `Config::load()`
+/// (not `load_or_warn`) so a corrupt config is not silently replaced
+/// with defaults just to persist this flag.
+pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.has_seen_web_tour = true;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"has_seen_web_tour": true})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // --- Devices ---
 
 pub async fn list_devices(
