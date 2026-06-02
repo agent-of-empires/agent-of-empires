@@ -146,6 +146,9 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
 
   useEffect(() => {
     let cancelled = false;
+    // Clear immediately so a profile switch never shows the previous
+    // profile's override while the new fetch is in flight.
+    setCommandMaps({ agentCommandOverride: {}, customAgents: {} });
     void (async () => {
       const settings = await fetchSettings(data.profile || undefined);
       if (cancelled || !settings) return;

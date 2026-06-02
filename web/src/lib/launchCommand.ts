@@ -32,5 +32,5 @@ export function resolveLaunchCommand(input: ResolveLaunchCommandInput): string {
   const custom = input.customAgents?.[input.tool]?.trim();
   if (custom) return custom;
 
-  return (input.binary || input.tool).trim();
+  return input.binary?.trim() || input.tool.trim();
 }
