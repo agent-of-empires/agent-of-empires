@@ -127,9 +127,22 @@ pub async fn run(args: CockpitRunnerArgs) -> Result<()> {
     init_runner_logging(&args.session_id)?;
 
     // Watch the shared runtime_filter file so `aoe log-level` from the
-    // daemon propagates to this runner subprocess without restart.
+    // daemon propagates to this runner subprocess without restart. The
+    // FileWatchService primitive is process-local to this subprocess; each
+    // entry path constructs its own Arc.
     if let Ok(app_dir) = crate::session::get_app_dir() {
-        tokio::spawn(crate::logging::watch_runtime_filter(app_dir));
+        match crate::file_watch::FileWatchService::new() {
+            Ok(svc) => {
+                tokio::spawn(crate::logging::watch_runtime_filter(svc, app_dir));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "cockpit.runner",
+                    error = %e,
+                    "FileWatchService init failed; runtime filter live propagation disabled"
+                );
+            }
+        }
     }
 
     info!(

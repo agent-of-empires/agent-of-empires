@@ -23,10 +23,10 @@ pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
     let Ok(instance_id) = std::env::var("AOE_INSTANCE_ID") else {
         return Ok(());
     };
-    if !is_safe_instance_id(&instance_id) {
+    if let Err(e) = crate::session::validate_instance_id(&instance_id) {
         tracing::debug!(
             target: "hooks.session_id",
-            "rejecting unsafe AOE_INSTANCE_ID"
+            "rejecting unsafe AOE_INSTANCE_ID: {e}"
         );
         return Ok(());
     }
@@ -40,18 +40,7 @@ pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reject any `AOE_INSTANCE_ID` that is not safe to use as a single
-/// path component. Production IDs are 16 lowercase hex chars (per
-/// `session::instance::generate_id`); the wider `[A-Za-z0-9_-]` allowlist
-/// accommodates dev / test identifiers. Modeled on `validate_session_id`
-/// in `cockpit::worker_registry`, which guards an identical threat model.
-fn is_safe_instance_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
+/// Caller MUST validate `instance_id` first; this fn path-joins without re-checking.
 fn run_inner<R: Read>(stdin: R, base: &str, instance_id: &str) -> Result<()> {
     let mut buf = String::new();
     stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
@@ -202,33 +191,5 @@ mod tests {
         let result = run_inner(InfiniteReader, tmp.path().to_str().unwrap(), "infinite");
         assert!(result.is_err(), "should reject after the 1 MiB cap");
         assert!(read_sidecar(tmp.path(), "infinite").is_none());
-    }
-
-    #[test]
-    fn rejects_path_unsafe_instance_id() {
-        assert!(!is_safe_instance_id(""), "empty");
-        assert!(!is_safe_instance_id(".."), "parent ref");
-        assert!(!is_safe_instance_id("."), "current ref");
-        assert!(!is_safe_instance_id("/etc"), "absolute path");
-        assert!(!is_safe_instance_id("foo/bar"), "subdir traversal");
-        assert!(!is_safe_instance_id("foo\\bar"), "backslash");
-        assert!(!is_safe_instance_id("foo\0bar"), "NUL byte");
-        assert!(!is_safe_instance_id("foo bar"), "whitespace");
-        assert!(!is_safe_instance_id(&"x".repeat(65)), "over length cap");
-    }
-
-    #[test]
-    fn accepts_production_and_test_instance_ids() {
-        assert!(is_safe_instance_id("a3f7c2d1e4b89012"), "production hex");
-        assert!(
-            is_safe_instance_id("0123456789abcdef"),
-            "production hex lower"
-        );
-        assert!(is_safe_instance_id("compact"), "test label");
-        assert!(
-            is_safe_instance_id("nested_first"),
-            "test label with underscore"
-        );
-        assert!(is_safe_instance_id("a-b-c"), "test label with hyphen");
     }
 }

@@ -95,7 +95,7 @@ rattles = "0.3"
 regex = "1.10"
 
 # Git operations
-git2 = { version = "0.20", features = ["vendored-openssl"] }
+git2 = { version = "0.21", features = ["vendored-openssl"] }
 
 # Diff computation
 similar = "3.1"

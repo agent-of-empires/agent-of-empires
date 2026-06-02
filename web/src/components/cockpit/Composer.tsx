@@ -46,6 +46,7 @@ import { getDraft, setDraft } from "../../lib/cockpitDrafts";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 
@@ -900,6 +901,9 @@ export function Composer({
                   availableModes={availableModes}
                   currentModeId={currentModeId}
                   legacyMode={legacyMode}
+                  configOptions={configOptions}
+                  pendingConfigOption={pendingConfigOption}
+                  setConfigOption={setConfigOption}
                 />
                 <SessionConfigControls
                   configOptions={configOptions}
@@ -1136,23 +1140,30 @@ function ToolbarButton({
 
 /* ── Mode picker ─────────────────────────────────────────────────── */
 
-const LEGACY_MODES: ReadonlyArray<{
-  id: string;
-  legacyId: CockpitState["mode"];
-  name: string;
-  description: string;
-}> = [
-  { id: "default", legacyId: "Default", name: "Default", description: "Approve each tool individually" },
-  { id: "plan", legacyId: "Plan", name: "Plan", description: "Plan first, no edits applied" },
-  { id: "accept_edits", legacyId: "AcceptEdits", name: "Accept edits", description: "Auto-approve safe file edits" },
-  { id: "bypass_permissions", legacyId: "BypassPermissions", name: "Yolo", description: "Skip all approvals (destructive)" },
-];
-
 interface ModePickerProps {
   sessionId: string;
   availableModes: CockpitState["availableModes"];
   currentModeId: string | null;
   legacyMode: CockpitState["mode"];
+  configOptions: CockpitState["configOptions"];
+  pendingConfigOption: CockpitState["pendingConfigOption"];
+  setConfigOption: (configId: string, value: string) => void | Promise<void>;
+}
+
+/** POST the legacy `session/set_mode` path. Used by the SessionModeState
+ *  and claude-fallback channels; the config-option channel switches via
+ *  `setConfigOption` instead. */
+async function postLegacyMode(sessionId: string, id: string): Promise<void> {
+  try {
+    await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/cockpit/mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode_id: id }),
+    });
+  } catch {
+    // The agent broadcasts CurrentModeChanged on success; if the request
+    // fails the UI stays on the current mode.
+  }
 }
 
 function ModePicker({
@@ -1160,37 +1171,28 @@ function ModePicker({
   availableModes,
   currentModeId,
   legacyMode,
+  configOptions,
+  pendingConfigOption,
+  setConfigOption,
 }: ModePickerProps) {
+  const profile = useAgentProfile();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
 
-  // Use real agent-advertised modes when available, otherwise fall
-  // back to the four-mode taxonomy. Even with agent modes, we still
-  // tint by id pattern (default/plan/accept/bypass) because Claude's
-  // adapter happens to use those tokens.
-  const usingAgentModes = availableModes.length > 0;
-  const modes = usingAgentModes
-    ? availableModes.map((m) => ({
-        id: m.id,
-        name: m.name,
-        description: m.description ?? "",
-      }))
-    : LEGACY_MODES.map((m) => ({
-        id: m.id,
-        name: m.name,
-        description: m.description,
-      }));
+  // Resolve which channel drives the picker (config option vs ACP
+  // SessionModeState vs claude fallback) and pair each with its own
+  // write path so the two never drift. See lib/modeChannel.ts.
+  const channel = resolveModeChannel({
+    configOptions,
+    availableModes,
+    currentModeId,
+    legacyMode,
+    pendingConfigOption,
+    allowLegacyFallback: profile.capabilities.legacyModeFallback,
+  });
 
-  // Pick "current": agent-reported id wins; else map legacyMode → id.
-  const fallbackId =
-    LEGACY_MODES.find((m) => m.legacyId === legacyMode)?.id ?? "default";
-  const activeId = currentModeId ?? fallbackId;
-  const current = modes.find((m) => m.id === activeId) ?? modes[0]!;
-
-  // Tint the chip by id pattern so destructive modes are visually loud.
-  const tone = toneForId(activeId);
-
-  // Close on outside click / Esc.
+  // Close on outside click / Esc. Declared before the early return so
+  // hook order stays stable across renders where `channel` is null.
   useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
@@ -1207,21 +1209,23 @@ function ModePicker({
     };
   }, [open]);
 
-  const select = async (id: string) => {
+  // Nothing advertised on an agent without a claude-style taxonomy:
+  // render no picker rather than a phantom vocabulary it would reject.
+  if (!channel) return null;
+
+  const current =
+    channel.modes.find((m) => m.id === channel.activeId) ?? channel.modes[0]!;
+
+  // Tint the chip by id pattern so destructive modes are visually loud.
+  const tone = toneForId(channel.activeId);
+
+  const select = (id: string) => {
     setOpen(false);
-    if (id === activeId) return;
-    try {
-      await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/mode`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode_id: id }),
-        },
-      );
-    } catch {
-      // The agent broadcasts CurrentModeChanged on success; if the
-      // request fails the UI stays on the current mode.
+    if (id === channel.activeId || id === channel.pendingId) return;
+    if (channel.kind === "config") {
+      void setConfigOption(channel.configId, id);
+    } else {
+      void postLegacyMode(sessionId, id);
     }
   };
 
@@ -1246,39 +1250,47 @@ function ModePicker({
           role="menu"
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-            {usingAgentModes ? "Agent modes" : "Modes"}
+            {channel.label}
           </div>
-          {modes.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              role="menuitem"
-              onClick={() => void select(opt.id)}
-              className={[
-                "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
-                opt.id === activeId ? "bg-surface-800/60" : "",
-              ].join(" ")}
-            >
-              <span
+          {channel.modes.map((opt) => {
+            const isPending = opt.id === channel.pendingId;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                role="menuitem"
+                disabled={isPending}
+                onClick={() => select(opt.id)}
                 className={[
-                  "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
-                  opt.id === activeId
-                    ? "border-brand-500 bg-brand-500"
-                    : "border-surface-700",
+                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
+                  opt.id === channel.activeId ? "bg-surface-800/60" : "",
+                  isPending ? "cursor-not-allowed opacity-50" : "",
                 ].join(" ")}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block font-medium text-text-primary">
-                  {opt.name}
-                </span>
-                {opt.description && (
-                  <span className="block text-[11px] text-text-dim">
-                    {opt.description}
+              >
+                <span
+                  className={[
+                    "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
+                    opt.id === channel.activeId
+                      ? "border-brand-500 bg-brand-500"
+                      : "border-surface-700",
+                  ].join(" ")}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium text-text-primary">
+                    {opt.name}
                   </span>
+                  {opt.description && (
+                    <span className="block text-[11px] text-text-dim">
+                      {opt.description}
+                    </span>
+                  )}
+                </span>
+                {isPending && (
+                  <span className="text-[10px] uppercase text-text-dim">…</span>
                 )}
-              </span>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       )}
     </div>

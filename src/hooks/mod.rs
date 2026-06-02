@@ -101,8 +101,15 @@ fn hook_command(status: &str) -> String {
 }
 
 fn hook_command_with_base(status: &str, base: &str) -> String {
+    // `[ -n ]` is load-bearing: `*[!...]*` does not match the empty
+    // string. `exit 0` on rejection: a non-zero hook exit blocks the
+    // agent's tool calls.
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; mkdir -p {base}/$AOE_INSTANCE_ID 2>/dev/null; printf {status} > {base}/$AOE_INSTANCE_ID/status 2>/dev/null; exit 0'"
+        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+         case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+         mkdir -p \"{base}/$AOE_INSTANCE_ID\" 2>/dev/null; \
+         printf {status} > \"{base}/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
+         exit 0'"
     )
 }
 
@@ -138,7 +145,8 @@ fn hook_command_session_id_host() -> String {
 fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         D={base}/$AOE_INSTANCE_ID; mkdir -p \"$D\" 2>/dev/null; \
+         case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+         D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
          SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
          [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0'"
@@ -2788,5 +2796,84 @@ hooks_auto_accept: false
                 "status-only event {event_name} should emit 1 hook"
             );
         }
+    }
+
+    #[test]
+    fn hook_command_with_base_quotes_and_guards() {
+        let cmd = hook_command_with_base("running", "/tmp/aoe-hooks");
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
+            "missing shell guard: {cmd}"
+        );
+        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
+        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\""));
+    }
+
+    #[test]
+    fn hook_command_session_id_sandbox_quotes_and_guards() {
+        let cmd = hook_command_session_id_sandbox("/tmp/aoe-hooks");
+        assert!(cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*"));
+        assert!(cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
+    }
+
+    #[test]
+    fn shell_guard_actually_rejects_traversal() {
+        // Nesting <tmp>/level1/base + canary file: any escape (one or
+        // two levels) or in-place mkdir/write surfaces in one of the
+        // three read_dir assertions below.
+        let tmp = tempfile::tempdir().unwrap();
+        let level1 = tmp.path().join("level1");
+        std::fs::create_dir(&level1).unwrap();
+        let base = level1.join("base");
+        std::fs::create_dir(&base).unwrap();
+        let canary_name = ".canary-deadbeef";
+        std::fs::write(base.join(canary_name), b"do not delete").unwrap();
+        let cmd = hook_command_with_base("running", base.to_str().unwrap());
+
+        for poisoned in ["..", "../../escape", "/etc", "foo/bar", "; rm -rf /;", ""] {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("AOE_INSTANCE_ID", poisoned)
+                .status()
+                .unwrap();
+            assert!(status.success(), "hook MUST exit 0 (id={poisoned:?})");
+        }
+
+        let base_entries: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            base_entries,
+            vec![std::ffi::OsString::from(canary_name)],
+            "shell guard must prevent any mkdir/write under {:?}",
+            base
+        );
+
+        let level1_entries: Vec<_> = std::fs::read_dir(&level1)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            level1_entries,
+            vec![std::ffi::OsString::from("base")],
+            "shell guard must prevent one-level escape into {:?}",
+            level1
+        );
+
+        let tmp_entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            tmp_entries,
+            vec![std::ffi::OsString::from("level1")],
+            "shell guard must prevent two-level escape into {:?}",
+            tmp.path()
+        );
     }
 }

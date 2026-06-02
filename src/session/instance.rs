@@ -89,6 +89,27 @@ pub enum StartOutcome {
     Fresh,
 }
 
+/// What `start_with_size_opts` did with the agent's session id this call.
+/// `start_with_resume_fallback` matches on `Existing` to gate the Tier-1
+/// settle probe; without the gate, fresh Claude launches mislabel as
+/// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
+/// UUID for Claude.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchSidOutcome {
+    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`,
+    /// observed `agent_session_id`, or retroactive-capture hit. The launch
+    /// command embedded the agent's resume flag.
+    Existing,
+    /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
+    /// or `None`. No prior conversation continued.
+    Fresh,
+    /// `start_with_size_opts` short-circuited before `apply_session_flags`
+    /// ran: cockpit-mode session, or pre-existing tmux pane (kill_clean
+    /// cache race). `agent_session_id` was not mutated this call.
+    Skipped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeResult {
     Alive,
@@ -512,15 +533,6 @@ pub struct Instance {
     /// will re-set it within one tick if the pane is genuinely dead).
     #[serde(skip)]
     pub pane_dead_observed: bool,
-
-    /// Mirrors the `is_existing` flag from the most recent
-    /// `acquire_session_id`. `start_with_resume_fallback` reads it
-    /// post-call to gate the settle probe; without this gate, every
-    /// fresh Claude launch would mislabel as `StartOutcome::Resumed`
-    /// because acquire always assigns a UUID. Stale-between-launches
-    /// is benign: every fallback re-runs acquire before reading.
-    #[serde(skip)]
-    pub(crate) last_acquired_existing_sid: bool,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -573,13 +585,13 @@ fn append_resume_flags(
     is_existing_session: bool,
     cmd: &mut String,
     context: &str,
-) {
+) -> bool {
     use crate::agents::{get_agent, ResumeStrategy};
 
     if let Some(session_id) = session_id {
         let resume_part = build_resume_flags(tool, session_id, is_existing_session);
         if resume_part.is_empty() {
-            return;
+            return false;
         }
         let is_subcommand = matches!(
             get_agent(tool).map(|a| &a.resume_strategy),
@@ -597,7 +609,9 @@ fn append_resume_flags(
             *cmd = format!("{} {}", cmd, resume_part);
         }
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
+        return true;
     }
+    false
 }
 
 /// Outcome of a CAS-guarded `agent_session_id` or `resume_intent` write.
@@ -736,7 +750,6 @@ impl Instance {
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
-            last_acquired_existing_sid: false,
         }
     }
 
@@ -826,11 +839,10 @@ impl Instance {
         // Carry runtime-only fields (`#[serde(skip)]`) and locally-mutated
         // launch-time state from `self` onto the disk snapshot. This carry
         // set is not required to match `merge_runtime_fields` exactly: each
-        // reconciliation path feeds a different consumer, and each
-        // consumer rewrites the runtime field it observes before reading
-        // (`last_acquired_existing_sid` is reset at the entry of
-        // `start_with_resume_fallback`; `pane_dead_observed` is rewritten
-        // by the TUI's status poller before its TUI-only consumers read).
+        // reconciliation path feeds a different consumer, and each consumer
+        // rewrites the runtime field it observes before reading
+        // (`pane_dead_observed` is rewritten by the TUI's status poller
+        // before its TUI-only consumers read).
         disk.last_error_check = self.last_error_check;
         disk.last_start_time = self.last_start_time;
         disk.last_error = self.last_error.take();
@@ -1193,12 +1205,6 @@ impl Instance {
     /// (`agent_session_id`), then retroactive capture, then fresh UUID for
     /// Claude.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        let result = self.acquire_session_id_inner();
-        self.last_acquired_existing_sid = result.1;
-        result
-    }
-
-    fn acquire_session_id_inner(&mut self) -> (Option<String>, bool) {
         match &self.resume_intent {
             ResumeIntent::Use(sid) => {
                 let sid = sid.clone();
@@ -1347,9 +1353,11 @@ impl Instance {
         result.and_then(validated_session_id)
     }
 
-    fn apply_session_flags(&mut self, cmd: &mut String, context: &str) {
+    fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
         let (session_id, is_existing) = self.acquire_session_id();
-        append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
+        let emitted =
+            append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
+        is_existing && emitted
     }
 
     pub fn has_custom_command(&self) -> bool {
@@ -1567,7 +1575,7 @@ impl Instance {
     }
 
     pub fn start_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
-        self.start_with_size_opts(size, false)
+        self.start_with_size_opts(size, false).map(|_| ())
     }
 
     /// Start the session, optionally skipping on_launch hooks (e.g. when they
@@ -1576,20 +1584,28 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
-    ) -> Result<()> {
+    ) -> Result<LaunchSidOutcome> {
+        // Validate before any shell-command construction in
+        // `build_launch_command` (covers `status_hook_env_prefix` and
+        // the sandbox docker_args interpolation). Runs before the
+        // cockpit short-circuit so a tampered id surfaces as `Err` for
+        // cockpit sessions too.
+        crate::session::validate_instance_id(&self.id)
+            .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
+
         // Cockpit-mode sessions are not backed by tmux. The cockpit
         // worker supervisor spawns the ACP agent process directly;
         // calling start() on a cockpit session is a no-op (status
         // updates flow through the ACP event channel, not tmux).
         #[cfg(feature = "serve")]
         if self.cockpit_mode {
-            return Ok(());
+            return Ok(LaunchSidOutcome::Skipped);
         }
 
         let session = self.tmux_session()?;
 
         if session.exists() {
-            return Ok(());
+            return Ok(LaunchSidOutcome::Skipped);
         }
 
         // Refresh peer-writable persisted fields (`agent_session_id`,
@@ -1609,7 +1625,7 @@ impl Instance {
         let expected_prior_intent = self.resume_intent.clone();
 
         let profile = self.effective_profile();
-        let cmd = self.build_launch_command(skip_on_launch, &profile)?;
+        let (cmd, is_existing) = self.build_launch_command(skip_on_launch, &profile)?;
 
         tracing::debug!(target: "session.store",
             "container cmd: {}",
@@ -1619,8 +1635,9 @@ impl Instance {
         );
 
         if self.tool == "claude" {
-            let sidecar = crate::hooks::hook_status_dir(&self.id).join("session_id");
-            let _ = std::fs::remove_file(&sidecar);
+            if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
+                let _ = std::fs::remove_file(dir.join("session_id"));
+            }
         }
 
         session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
@@ -1632,7 +1649,11 @@ impl Instance {
             expected_prior_intent,
         );
 
-        Ok(())
+        Ok(if is_existing {
+            LaunchSidOutcome::Existing
+        } else {
+            LaunchSidOutcome::Fresh
+        })
     }
 
     /// Build the launch command string the way `start_with_size_opts` would,
@@ -1645,14 +1666,14 @@ impl Instance {
         &mut self,
         skip_on_launch: bool,
         profile: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, bool)> {
         let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
 
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
         self.install_agent_status_hooks(agent);
 
-        let cmd = if self.is_sandboxed() {
+        let (cmd, is_existing) = if self.is_sandboxed() {
             let container = self.get_container_for_instance()?;
             if let Some(ref hook_cmds) = on_launch_hooks {
                 let hook_env = super::repo_config::lifecycle_env_vars(self);
@@ -1702,7 +1723,7 @@ impl Instance {
                 }
             }
 
-            self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
@@ -1714,17 +1735,19 @@ impl Instance {
                 sandbox,
                 std::path::Path::new(&self.project_path),
             );
-            // AOE_INSTANCE_ID is not secret, goes directly in docker args
             let docker_args = format!("{} -e AOE_INSTANCE_ID={}", env_info.docker_args, self.id);
             let env_part = format!("{} ", docker_args);
             let wrapped =
                 wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
-            Some(prepend_exports(&env_info.exports, wrapped))
+            (
+                Some(prepend_exports(&env_info.exports, wrapped)),
+                is_existing,
+            )
         } else {
             self.build_host_command(agent, &on_launch_hooks)
         };
 
-        Ok(cmd)
+        Ok((cmd, is_existing))
     }
 
     /// Resolve on_launch hooks from the full config chain (global > profile > repo).
@@ -1850,8 +1873,7 @@ impl Instance {
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
         on_launch_hooks: &Option<Vec<String>>,
-    ) -> Option<String> {
-        // Run on_launch hooks on host for non-sandboxed sessions
+    ) -> (Option<String>, bool) {
         if let Some(ref hook_cmds) = on_launch_hooks {
             let hook_env = super::repo_config::lifecycle_env_vars(self);
             if let Err(e) = super::repo_config::execute_hooks(
@@ -1863,7 +1885,6 @@ impl Instance {
             }
         }
 
-        // Prepend AOE_INSTANCE_ID env var if this agent supports hooks.
         let mut env_prefix = status_hook_env_prefix(&self.id, &self.tool, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
@@ -1881,20 +1902,29 @@ impl Instance {
         }
 
         if self.command.is_empty() {
-            crate::agents::get_agent(&self.tool).map(|a| {
-                let mut cmd = a.binary.to_string();
-                if !self.extra_args.is_empty() {
-                    cmd = format!("{} {}", cmd, self.extra_args);
-                }
-                if self.is_yolo_mode() {
-                    if let Some(ref yolo) = a.yolo {
-                        apply_yolo_mode(&mut cmd, yolo, false);
+            match crate::agents::get_agent(&self.tool) {
+                Some(a) => {
+                    let mut cmd = a.binary.to_string();
+                    if !self.extra_args.is_empty() {
+                        cmd = format!("{} {}", cmd, self.extra_args);
                     }
+                    if self.is_yolo_mode() {
+                        if let Some(ref yolo) = a.yolo {
+                            apply_yolo_mode(&mut cmd, yolo, false);
+                        }
+                    }
+                    let is_existing = self.apply_session_flags(&mut cmd, "host agent");
+                    apply_agent_launch_env(&mut cmd, agent);
+                    (
+                        Some(wrap_command_ignore_suspend(&format!(
+                            "{}{}",
+                            env_prefix, cmd
+                        ))),
+                        is_existing,
+                    )
                 }
-                self.apply_session_flags(&mut cmd, "host agent");
-                apply_agent_launch_env(&mut cmd, agent);
-                wrap_command_ignore_suspend(&format!("{}{}", env_prefix, cmd))
-            })
+                None => (None, false),
+            }
         } else {
             let mut cmd = self.command.clone();
             if !self.extra_args.is_empty() {
@@ -1905,12 +1935,15 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            self.apply_session_flags(&mut cmd, "host custom");
+            let is_existing = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
-            Some(wrap_command_ignore_suspend(&format!(
-                "{}{}",
-                env_prefix, cmd
-            )))
+            (
+                Some(wrap_command_ignore_suspend(&format!(
+                    "{}{}",
+                    env_prefix, cmd
+                ))),
+                is_existing,
+            )
         }
     }
 
@@ -1987,7 +2020,7 @@ impl Instance {
     /// Atomic single-flock CAS+write of `agent_session_id` and (when
     /// `expected_prior_intent == Cleared`) the auto-promote to `Default`.
     /// A split would let a daemon crash freeze disk at `(new_sid, Cleared)`,
-    /// which the next launch's `acquire_session_id_inner` short-circuits
+    /// which the next launch's `acquire_session_id` short-circuits
     /// on, orphaning the conversation just created with `new_sid`.
     ///
     /// On sid CAS skip: rollback both fields from disk.
@@ -2636,7 +2669,7 @@ impl Instance {
 
         #[cfg(feature = "serve")]
         if self.cockpit_mode {
-            self.start_with_size_opts(size, skip_on_launch)?;
+            let _ = self.start_with_size_opts(size, skip_on_launch)?;
             return Ok(StartOutcome::Fresh);
         }
 
@@ -2656,16 +2689,7 @@ impl Instance {
         // attempted, the race is just kill_clean cache staleness).
         let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
 
-        // Reset before `start_with_size_opts` so the post-call read at line
-        // ~2562 reflects THIS call's `acquire_session_id` decision. Without
-        // this, when `pane_was_preexisting=true` (rare `kill_clean` cache
-        // race) `start_with_size_opts` short-circuits without running
-        // `acquire_session_id`, and the diagnostic warning below would emit
-        // the wrong branch using a value carried from a prior launch via
-        // `merge_runtime_fields`.
-        self.last_acquired_existing_sid = false;
-
-        self.start_with_size_opts(size, skip_on_launch)?;
+        let outcome = self.start_with_size_opts(size, skip_on_launch)?;
 
         // Computed post-`start_with_size_opts` so it reflects post-reconcile
         // state. A pre-call read would miss a peer-CLI `Use(X)` write that
@@ -2673,12 +2697,12 @@ impl Instance {
         // to skip the very Use(X_dead) case Tier-1's downgrade is meant to
         // handle.
         //
-        // Gated on `last_acquired_existing_sid` so fresh launches (Cleared,
+        // Gated on `LaunchSidOutcome::Existing` so fresh launches (Cleared,
         // no observed sid + Claude UUID generation) skip the probe and
         // honestly report `Fresh`. Without this gate, every Claude launch
         // would probe (~2s) and return `Resumed` because acquire always
         // assigns a UUID, even when no `--resume` was passed.
-        let attempting_resume = self.last_acquired_existing_sid
+        let attempting_resume = matches!(outcome, LaunchSidOutcome::Existing)
             && should_attempt_resume(self.agent_session_id.as_deref(), &self.tool);
 
         if pane_was_preexisting {
@@ -2709,6 +2733,10 @@ impl Instance {
             self.id
         );
 
+        // Defensive `|| pane_was_preexisting`: covers the TOCTOU window
+        // where a peer killed the pane between the snapshot above and
+        // `start_with_size_opts`'s internal `session.exists()` check, in
+        // which case `outcome` could be `Existing` despite the snapshot.
         if !attempting_resume || pane_was_preexisting {
             return Ok(StartOutcome::Fresh);
         }
@@ -2750,7 +2778,9 @@ impl Instance {
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
 
         self.agent_session_id = None;
-        let _ = std::fs::remove_file(crate::hooks::hook_status_dir(&self.id).join("session_id"));
+        if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
+            let _ = std::fs::remove_file(dir.join("session_id"));
+        }
         // Populate the poller exclusion before calling
         // `clear_session_for_resume_fallback` so its `Failed` bail
         // still keeps the bad sid out of the next retroactive capture
@@ -2771,7 +2801,7 @@ impl Instance {
             }
         }
 
-        self.start_with_size_opts(size, true).with_context(|| {
+        let _ = self.start_with_size_opts(size, true).with_context(|| {
             format!(
                 "fresh restart after resume fallback failed for {} (stale sid {} was cleared)",
                 self.id, stale_sid,
@@ -4911,29 +4941,21 @@ mod tests {
     }
 
     #[test]
-    fn last_acquired_existing_sid_mirrors_acquire_bool() {
+    fn apply_session_flags_returns_acquire_is_existing() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "claude".to_string();
-        assert!(!inst.last_acquired_existing_sid);
+        let mut cmd = String::from("claude");
+        assert!(!inst.apply_session_flags(&mut cmd, "test"));
+        assert!(inst.apply_session_flags(&mut cmd, "test"));
+    }
 
-        let (sid_fresh, fresh_existing) = inst.acquire_session_id();
-        assert!(sid_fresh.is_some());
-        assert!(!fresh_existing);
-        assert!(!inst.last_acquired_existing_sid);
-
-        let (_, second_existing) = inst.acquire_session_id();
-        assert!(second_existing);
-        assert!(inst.last_acquired_existing_sid);
-
-        inst.resume_intent = ResumeIntent::Cleared;
-        let (_, cleared_existing) = inst.acquire_session_id();
-        assert!(!cleared_existing);
-        assert!(!inst.last_acquired_existing_sid);
-
-        inst.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".to_string());
-        let (_, use_existing) = inst.acquire_session_id();
-        assert!(use_existing);
-        assert!(inst.last_acquired_existing_sid);
+    #[cfg(feature = "serve")]
+    #[test]
+    fn start_with_size_opts_returns_skipped_for_cockpit_mode() {
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.cockpit_mode = true;
+        let outcome = inst.start_with_size_opts(None, false).unwrap();
+        assert_eq!(outcome, LaunchSidOutcome::Skipped);
     }
 
     #[test]
@@ -5029,7 +5051,7 @@ mod tests {
     fn test_build_host_command_basic() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let cmd = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
         assert!(cmd.is_some());
         assert!(cmd.as_ref().unwrap().contains("codex"));
     }
@@ -5039,7 +5061,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         inst.yolo_mode = true;
-        let cmd = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
         let cmd_str = cmd.unwrap();
         let agent = crate::agents::get_agent("codex").unwrap();
         match agent.yolo.as_ref().unwrap() {
@@ -5054,7 +5076,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("ses_abc123def456".to_string());
-        let cmd = inst.build_host_command(crate::agents::get_agent("claude"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("claude"), &None);
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
         assert!(cmd_str.contains("--session-id") || cmd_str.contains("--resume"));
@@ -5064,7 +5086,7 @@ mod tests {
     fn test_build_host_command_antigravity_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
-        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5078,7 +5100,7 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
         inst.command = "agy --some-flag".to_string();
-        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5091,7 +5113,7 @@ mod tests {
     fn test_build_host_command_codex_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let cmd = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("codex"), &None);
         let cmd_str = cmd.unwrap();
 
         assert!(cmd_str.contains("env -u NO_COLOR"));
@@ -5104,7 +5126,7 @@ mod tests {
     fn test_build_host_command_color_env_is_limited_to_color_sensitive_agents() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "cursor".to_string();
-        let cmd = inst.build_host_command(crate::agents::get_agent("cursor"), &None);
+        let (cmd, _) = inst.build_host_command(crate::agents::get_agent("cursor"), &None);
         let cmd_str = cmd.unwrap();
 
         assert!(!cmd_str.contains("env -u NO_COLOR"));
@@ -5710,7 +5732,8 @@ mod tests {
         }
 
         fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
-            let dir = crate::hooks::hook_status_dir(instance_id);
+            let dir =
+                crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("session_id"), sid).unwrap();
             dir
@@ -6752,6 +6775,32 @@ mod tests {
             }
             assert!(inst.retroactive_capture_excludes.contains(&stale_sid));
             assert!(inst.agent_session_id.as_deref() != Some(stale_sid.as_str()));
+        }
+    }
+
+    fn instance_with_id(id: &str) -> Instance {
+        let mut inst = Instance::new("tampered-id-test", "/tmp");
+        inst.id = id.to_string();
+        inst
+    }
+
+    #[test]
+    fn start_with_size_opts_rejects_tampered_instance_id() {
+        for poisoned in ["; rm -rf $HOME #", "../etc", ""] {
+            let mut instance = instance_with_id(poisoned);
+            let result = instance.start_with_size_opts(None, false);
+            let err = match result {
+                Ok(_) => panic!("must refuse tampered id at launch (id={poisoned:?})"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("AOE_INSTANCE_ID"),
+                "error must surface validator failure for id={poisoned:?}, got: {err}"
+            );
+            assert!(
+                !instance.tmux_session().map(|s| s.exists()).unwrap_or(false),
+                "no tmux session must exist after refusal for id={poisoned:?}"
+            );
         }
     }
 }

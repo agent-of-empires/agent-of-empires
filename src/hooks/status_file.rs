@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Result;
 use uuid::Uuid;
 
 use crate::session::Status;
@@ -16,9 +17,11 @@ use super::HOOK_STATUS_BASE;
 /// Maximum age before a sidecar `session_id` file is considered stale.
 pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
-/// Return the directory for a given instance's hook status file.
-pub fn hook_status_dir(instance_id: &str) -> PathBuf {
-    PathBuf::from(HOOK_STATUS_BASE).join(instance_id)
+/// `<HOOK_STATUS_BASE>/<instance_id>`. `Err` if `instance_id` fails
+/// `validate_instance_id`.
+pub fn hook_status_dir(instance_id: &str) -> Result<PathBuf> {
+    crate::session::validate_instance_id(instance_id)?;
+    Ok(PathBuf::from(HOOK_STATUS_BASE).join(instance_id))
 }
 
 /// Read the hook-written status file for the given instance.
@@ -28,7 +31,7 @@ pub fn hook_status_dir(instance_id: &str) -> PathBuf {
 /// (wrapper scripts may keep a shell alive). Callers should still use
 /// `is_pane_dead()` to detect truly dead panes.
 pub fn read_hook_status(instance_id: &str) -> Option<Status> {
-    let status_path = hook_status_dir(instance_id).join("status");
+    let status_path = hook_status_dir(instance_id).ok()?.join("status");
 
     let content = std::fs::read_to_string(&status_path).ok()?;
     match content.trim() {
@@ -49,7 +52,7 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
 /// than [`SESSION_ID_SIDECAR_MAX_AGE`]. Filesystems that report
 /// `mtime > now` (clock skew) are treated as stale.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
-    let path = hook_status_dir(instance_id).join("session_id");
+    let path = hook_status_dir(instance_id).ok()?.join("session_id");
     let metadata = std::fs::metadata(&path).ok()?;
     let mtime = metadata.modified().ok()?;
     if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
@@ -72,7 +75,10 @@ pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
 /// already passed (auto-expiry; keeps stale flags from pinning the row
 /// forever after the deadline lapses).
 pub fn read_hook_urgent(instance_id: &str) -> bool {
-    let path = hook_status_dir(instance_id).join("attention.json");
+    let Ok(dir) = hook_status_dir(instance_id) else {
+        return false;
+    };
+    let path = dir.join("attention.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -100,7 +106,14 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
 
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
 pub fn cleanup_hook_status_dir(instance_id: &str) {
-    let dir = hook_status_dir(instance_id);
+    let dir = match hook_status_dir(instance_id) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(target: "hooks.status",
+                "Skipping hook cleanup for invalid instance id: {e}");
+            return;
+        }
+    };
     if dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             tracing::warn!(target: "hooks.status", "Failed to cleanup hook status dir {}: {}", dir.display(), e);
@@ -115,7 +128,7 @@ mod tests {
     use std::io::Write;
 
     fn setup_status_file(instance_id: &str, content: &str) -> PathBuf {
-        let dir = hook_status_dir(instance_id);
+        let dir = hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("status");
         let mut f = fs::File::create(&path).unwrap();
@@ -171,7 +184,7 @@ mod tests {
     #[test]
     fn test_read_dangling_symlink() {
         let id = "test_dangling_symlink";
-        let dir = hook_status_dir(id);
+        let dir = hook_status_dir(id).expect("test id must be allowlist-safe");
         fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink("/nonexistent/target", dir.join("status")).unwrap();
         assert_eq!(read_hook_status(id), None);
@@ -203,12 +216,12 @@ mod tests {
 
     #[test]
     fn test_hook_status_dir_path() {
-        let dir = hook_status_dir("abc123");
+        let dir = hook_status_dir("abc123").expect("test id must be allowlist-safe");
         assert_eq!(dir, PathBuf::from("/tmp/aoe-hooks/abc123"));
     }
 
     fn write_attention_json(instance_id: &str, body: &str) -> PathBuf {
-        let dir = hook_status_dir(instance_id);
+        let dir = hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("attention.json");
         fs::write(&path, body).unwrap();
@@ -269,7 +282,7 @@ mod tests {
     }
 
     fn write_session_id_sidecar(instance_id: &str, content: &str) -> PathBuf {
-        let dir = hook_status_dir(instance_id);
+        let dir = hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("session_id"), content).unwrap();
         dir
@@ -323,5 +336,34 @@ mod tests {
         let dir = write_session_id_sidecar(id, &format!("{uuid}\n"));
         assert_eq!(read_hook_session_id(id), Some(uuid.to_string()));
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hook_status_dir_returns_err_for_unsafe_id() {
+        assert!(hook_status_dir("../etc").is_err());
+        assert!(hook_status_dir("").is_err());
+    }
+
+    #[test]
+    fn read_hook_status_returns_none_for_unsafe_id() {
+        assert_eq!(read_hook_status("../etc"), None);
+        assert_eq!(read_hook_status(""), None);
+        assert_eq!(read_hook_status("foo/bar"), None);
+    }
+
+    #[test]
+    fn read_hook_session_id_returns_none_for_unsafe_id() {
+        assert_eq!(read_hook_session_id("../etc"), None);
+    }
+
+    #[test]
+    fn read_hook_urgent_returns_false_for_unsafe_id() {
+        assert!(!read_hook_urgent("../etc"));
+    }
+
+    #[test]
+    fn cleanup_hook_status_dir_is_noop_for_unsafe_id() {
+        cleanup_hook_status_dir("../etc");
+        cleanup_hook_status_dir("");
     }
 }

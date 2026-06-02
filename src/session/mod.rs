@@ -38,8 +38,8 @@ pub use groups::{
 };
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, StartOutcome, Status,
-    TerminalInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
+    Status, TerminalInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
@@ -307,6 +307,24 @@ mod profile_listing_tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+/// Validate `AOE_INSTANCE_ID` is safe as a single path component and
+/// for shell interpolation. Allowlist `[A-Za-z0-9_-]`, max 64 bytes.
+pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("AOE_INSTANCE_ID must not be empty");
+    }
+    if id.len() > 64 {
+        anyhow::bail!("AOE_INSTANCE_ID too long ({} bytes, max 64)", id.len());
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("AOE_INSTANCE_ID contains disallowed characters");
+    }
+    Ok(())
 }
 
 /// Validate that `name` is a safe, single-component profile name.
@@ -834,6 +852,58 @@ mod tests {
         assert!(
             !unknown_dir.exists(),
             "load_profile_config must not create profiles/<unknown>/ as a side effect",
+        );
+    }
+
+    #[test]
+    fn validate_instance_id_rejects_unsafe() {
+        assert!(validate_instance_id("").is_err(), "empty");
+        assert!(validate_instance_id("..").is_err(), "parent ref");
+        assert!(validate_instance_id(".").is_err(), "current ref");
+        assert!(validate_instance_id("/etc").is_err(), "absolute path");
+        assert!(validate_instance_id("foo/bar").is_err(), "subdir traversal");
+        assert!(validate_instance_id("foo\\bar").is_err(), "backslash");
+        assert!(validate_instance_id("foo\0bar").is_err(), "NUL byte");
+        assert!(validate_instance_id("foo bar").is_err(), "whitespace");
+        assert!(
+            validate_instance_id(&"x".repeat(65)).is_err(),
+            "over length cap"
+        );
+    }
+
+    #[test]
+    fn validate_instance_id_accepts_production_and_test() {
+        assert!(
+            validate_instance_id("a3f7c2d1e4b89012").is_ok(),
+            "production hex"
+        );
+        assert!(
+            validate_instance_id("0123456789abcdef").is_ok(),
+            "production hex lower"
+        );
+        assert!(validate_instance_id("compact").is_ok(), "test label");
+        assert!(validate_instance_id("nested_first").is_ok(), "underscore");
+        assert!(validate_instance_id("a-b-c").is_ok(), "hyphen");
+    }
+
+    #[test]
+    fn validate_instance_id_error_messages_do_not_echo_input() {
+        const SENTINEL: &str = "ZZ_unique_sentinel_aabbcc";
+
+        let bad = format!("{SENTINEL}/x");
+        let e = validate_instance_id(&bad).unwrap_err().to_string();
+        assert!(e.contains("disallowed"));
+        assert!(
+            !e.contains(SENTINEL),
+            "must not echo input bytes; risk of log injection"
+        );
+
+        let bad = format!("{SENTINEL}{}", "x".repeat(70));
+        let e = validate_instance_id(&bad).unwrap_err().to_string();
+        assert!(e.contains("too long"));
+        assert!(
+            !e.contains(SENTINEL),
+            "must not echo input bytes from oversize branch"
         );
     }
 }

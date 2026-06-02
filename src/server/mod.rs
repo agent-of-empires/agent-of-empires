@@ -1604,7 +1604,6 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error = prior.last_error;
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-    fresh.last_acquired_existing_sid = prior.last_acquired_existing_sid;
     fresh
 }
 
@@ -2438,19 +2437,6 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
 mod tests {
     use super::*;
 
-    #[test]
-    fn merge_runtime_fields_carries_last_acquired_existing_sid() {
-        let mut prior = crate::session::Instance::new("title", "/tmp/x");
-        prior.last_acquired_existing_sid = true;
-        let fresh = crate::session::Instance::new("title", "/tmp/x");
-        assert!(!fresh.last_acquired_existing_sid);
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert!(
-            merged.last_acquired_existing_sid,
-            "merge_runtime_fields must carry last_acquired_existing_sid across status_poll reloads",
-        );
-    }
     #[cfg(feature = "serve")]
     #[test]
     fn derive_cockpit_status_maps_terminal_events() {

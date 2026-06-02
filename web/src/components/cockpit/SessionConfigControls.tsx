@@ -2,10 +2,11 @@
 //
 // Renders the model dropdown + reasoning-effort selector by filtering
 // the unified `configOptions` snapshot the daemon publishes from
-// ACP `SessionUpdate::ConfigOptionUpdate`. Mode is handled by the
-// existing ModePicker because the legacy mode pipeline still drives
-// `availableModes`/`currentModeId`; a follow-up migrates it onto this
-// same path.
+// ACP `SessionUpdate::ConfigOptionUpdate`. The mode picker lives in the
+// composer (`ModePicker`); it reads a `category:"mode"` config option
+// from this same `configOptions` snapshot when the agent advertises one
+// (OpenCode, claude-agent-acp v0.37.0+), and only falls back to the ACP
+// SessionModeState channel otherwise. See lib/modeChannel.ts (#1764).
 //
 // Behavior:
 // - Pessimistic UI. Current value stays put until the adapter pushes a

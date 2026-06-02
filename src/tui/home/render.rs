@@ -1400,8 +1400,15 @@ impl HomeView {
             .live_send
             .as_ref()
             .is_some_and(|s| self.preview_capture_target.as_deref() == Some(s.tmux_name.as_str()));
+        // Terminal / container panes forward empty captures so a cleared
+        // shell drops its stale text; agent / tool panes preserve the
+        // last-good frame (the #1501 kill switch). The policy follows the
+        // displayed pane, not just the live-send target, so a backgrounded
+        // terminal preview clears the same way the live one does.
+        let forward_empty = matches!(self.view_mode, ViewMode::Terminal);
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
+            worker.set_forward_empty(forward_empty);
         }
     }
 

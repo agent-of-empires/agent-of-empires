@@ -29,6 +29,20 @@ aoe logs --path                # Print the resolved log file path
 
 Requires `tmux` to be installed.
 
+### Web dashboard dev server
+
+```bash
+cargo xtask dev    # Unix only
+```
+
+Builds the serve-enabled binary, then runs `aoe serve` (8081) and the Vite dev
+server (5173) together with hot module reload. Open
+[http://localhost:5173](http://localhost:5173); Vite proxies `/api` and the
+`/sessions/*/ws` relays to the backend (via `VITE_PROXY`). One Ctrl-C stops
+both. Ports are overridable with `--serve-port` / `--web-port`. See the
+[web dashboard guide](guides/web-dashboard.md#frontend-development) for the
+manual two-shell alternative.
+
 ### Dev namespace
 
 Debug builds use an isolated namespace so a local `cargo run` shares no

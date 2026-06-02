@@ -2360,6 +2360,18 @@
       ]
     },
     {
+      "id": "cockpit.edit-card-diff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/cockpit-edit-card-diff.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolCards.tsx",
+        "web/src/components/diff/StringDiff.tsx"
+      ]
+    },
+    {
       "id": "cockpit.story.queue-follow-up-with-nav",
       "kind": "live-playwright",
       "risk": "high",

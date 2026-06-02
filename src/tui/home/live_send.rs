@@ -411,7 +411,12 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(tmux_name: String) -> Self {
+    /// `capture_wake`, when present, nudges the preview capture worker out
+    /// of its inter-capture wait right after each dispatched keystroke
+    /// batch, so the typed echo is captured immediately instead of waiting
+    /// up to a full fast-cadence cycle. That ties echo latency to actual
+    /// input rather than the background capture phase.
+    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
             // Block until the first message, then drain anything else
@@ -426,6 +431,9 @@ impl LiveSendWorker {
                     batch.push(msg);
                 }
                 dispatch_batch(&tmux_name, batch);
+                if let Some(wake) = &capture_wake {
+                    wake.wake();
+                }
             }
         });
         Self { tx }
@@ -468,6 +476,24 @@ const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
 const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 
+/// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its
+/// inter-capture wait. Handed to [`LiveSendWorker`] so a dispatched
+/// keystroke batch triggers an immediate capture of the typed echo rather
+/// than waiting up to a full fast-cadence cycle. Backed by the same condvar
+/// `set_live` / `set_target` use, so a wake just runs one capture early.
+#[derive(Clone)]
+pub(in crate::tui) struct LiveCaptureWake {
+    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+}
+
+impl LiveCaptureWake {
+    fn wake(&self) {
+        if let Ok(_guard) = self.nudge.0.lock() {
+            self.nudge.1.notify_one();
+        }
+    }
+}
+
 /// Off-thread preview capture. One long-lived thread forks `tmux
 /// capture-pane` and publishes fresh pane content into a single-slot
 /// mailbox the render loop drains, so the render loop applies the latest
@@ -503,6 +529,12 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
     /// otherwise. Read by the worker thread each cycle.
     interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether an empty capture should be forwarded (clearing stale preview
+    /// text) or dropped (preserving the last-good frame, the #1501 kill
+    /// switch). Terminal / container panes forward empties so a cleared
+    /// shell doesn't keep showing stale output; agent / tool panes preserve.
+    /// Set per target by `set_forward_empty`, read by the worker each cycle.
+    forward_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Interrupts the worker's inter-capture wait so a cadence or target
     /// change takes effect immediately instead of after the current (up to
     /// 250ms idle) sleep. Without this, entering live-send mid-idle-sleep
@@ -528,12 +560,14 @@ impl LiveCaptureWorker {
         let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
+        let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
         let interval_cell = interval_ms.clone();
+        let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
         std::thread::spawn(move || {
@@ -557,14 +591,22 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let session = crate::tmux::Session::from_name(&name);
-                    if let Ok(content) = session.capture_pane(lines) {
-                        // Skip empties (preserve the last-good preview, the
-                        // #1501 kill switch) and unchanged frames (no point
-                        // waking a re-parse). Only changed, non-empty
-                        // captures reach the render loop, and only those
-                        // wake it: an idle pane never repaints.
-                        if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
-                        {
+                    let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // A failed fork reads as "gone". For preserve panes that
+                    // means hold the last-good frame (drop it); for forward
+                    // panes (terminals) surface it as empty so stale text clears.
+                    let capture = match session.capture_pane(lines) {
+                        Ok(content) => Some(content),
+                        Err(_) if forward_empty => Some(String::new()),
+                        Err(_) => None,
+                    };
+                    if let Some(content) = capture {
+                        // Skip unchanged frames (no point waking a re-parse).
+                        // Empties are skipped too unless this pane forwards
+                        // them; only changed captures reach (and wake) the
+                        // render loop, so an idle pane never repaints.
+                        let changed = last_captured.as_deref() != Some(content.as_str());
+                        if (forward_empty || !content.is_empty()) && changed {
                             // Publish only if the target hasn't changed during
                             // the fork. Otherwise these are the *old* pane's
                             // bytes and would flash under the new view's header
@@ -599,9 +641,30 @@ impl LiveCaptureWorker {
             target,
             latest,
             interval_ms,
+            forward_empty,
             nudge,
             stop,
         }
+    }
+
+    /// A cloneable handle the send worker uses to nudge this worker after
+    /// each dispatched keystroke batch (echo latency). Backed by the same
+    /// condvar `set_live` / `set_target` use, so a wake just runs one
+    /// capture cycle early.
+    pub(in crate::tui) fn waker(&self) -> LiveCaptureWake {
+        LiveCaptureWake {
+            nudge: self.nudge.clone(),
+        }
+    }
+
+    /// Choose whether empty captures clear the preview (terminal / container
+    /// panes) or preserve the last-good frame (agent / tool panes, the #1501
+    /// kill switch). Cheap (one atomic store); called from the render
+    /// reconcile alongside `set_target` so the policy tracks the displayed
+    /// pane type without a respawn.
+    pub(in crate::tui) fn set_forward_empty(&self, forward: bool) {
+        self.forward_empty
+            .store(forward, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wake the worker out of its inter-capture wait so a just-changed
@@ -1509,6 +1572,29 @@ mod tests {
         assert!(
             worker.take_latest().is_none(),
             "retarget must drop the previous pane's queued capture",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_forwards_empty_when_policy_set() {
+        // Terminal / container panes set `forward_empty`, so a missing or
+        // cleared pane must surface as an empty capture (clearing stale
+        // preview text) instead of being dropped like the agent kill switch.
+        // Deterministic without a real tmux session: a missing pane reads empty.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_forward_empty".into());
+        worker.set_forward_empty(true);
+        // Fast cadence so the worker captures within the wait rather than
+        // still being in its first idle sleep when we assert.
+        worker.set_live(true);
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(
+            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
+        ));
+        assert_eq!(
+            worker.take_latest(),
+            Some(String::new()),
+            "forward-empty policy must surface empty captures",
         );
     }
 }

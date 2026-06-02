@@ -3012,16 +3012,32 @@ impl HomeView {
             exit_chords,
             leader,
         });
+        // Ensure the long-lived preview capture worker exists so we can hand
+        // its waker to the send worker below. The worker isn't otherwise
+        // spawned here (it follows the displayed pane for every view, not
+        // just agent live-send, and is (re)targeted and retuned by
+        // `sync_preview_capture_worker` on the next render); but it's already
+        // running whenever a session was previewed before live-send entry,
+        // which is the common path. Spawning it now closes the rare cold gap.
+        if self.preview_capture_worker.is_none() {
+            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
+                self.preview_wake.clone(),
+            ));
+        }
+        // Nudge the capture worker right after each dispatched keystroke
+        // batch so typed echo is captured immediately instead of waiting up
+        // to a full fast-cadence cycle. This keeps echo latency tied to
+        // actual input rather than the background capture phase.
+        let capture_wake = self
+            .preview_capture_worker
+            .as_ref()
+            .map(live_send::LiveCaptureWorker::waker);
         // Spawn the background worker that dispatches translated
         // keystrokes as one-shot `tmux send-keys` subprocesses (the
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name));
-        // The preview capture worker is not spawned here: it follows the
-        // displayed pane for every view (not just agent live-send) and is
-        // (re)targeted by `sync_preview_capture_worker` on the next render,
-        // which also retunes its cadence to the now-live pane.
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name, capture_wake));
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

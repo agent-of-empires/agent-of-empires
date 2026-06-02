@@ -36,6 +36,7 @@ pub fn scratch_root() -> Result<PathBuf> {
 /// pre-existing directory surfaces as an error rather than silently reusing
 /// the directory's contents, which would violate the freshness contract.
 pub fn provision_scratch_dir(instance_id: &str) -> Result<PathBuf> {
+    super::validate_instance_id(instance_id)?;
     let path = scratch_root()?.join(instance_id);
     fs::create_dir(&path)
         .with_context(|| format!("Failed to create scratch directory at {}", path.display()))?;
@@ -154,5 +155,14 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    #[serial]
+    fn provision_scratch_dir_rejects_unsafe_id() {
+        let _tmp = isolate_app_dir();
+        assert!(provision_scratch_dir("../etc").is_err());
+        assert!(provision_scratch_dir("foo bar").is_err());
+        assert!(provision_scratch_dir("").is_err());
     }
 }

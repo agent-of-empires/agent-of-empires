@@ -38,7 +38,10 @@ jobs:
           node-version: '22'
 
       - name: Generate CLI documentation
-        run: cargo xtask gen-docs
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
 
       - name: Build site
         run: ./scripts/build-site.sh

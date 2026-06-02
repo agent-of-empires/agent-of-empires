@@ -229,6 +229,28 @@ const DEFAULT_PERMISSION_OPTIONS = [
 // "cancelled" instead of running the rest of the scripted updates.
 const cancelFlags = new Map();
 
+// OpenCode-shaped mode advertisement (#1764). When
+// FAKE_ACP_MODE_VIA_CONFIG_OPTION is set, the fake advertises its modes
+// ONLY as a `category:"mode"` config option (no ACP SessionModeState
+// `modes` field) and rejects any mode value outside this list, exactly
+// like `opencode acp`. Lets a test prove the cockpit picker reads the
+// config-option channel and never offers a phantom "default" mode.
+const OPENCODE_MODE_CHOICES = [
+  { value: "build", name: "Build" },
+  { value: "plan", name: "Plan" },
+];
+const opencodeModeBySession = new Map();
+function makeOpencodeModeOption(currentValue) {
+  return {
+    id: "mode",
+    name: "Session Mode",
+    category: "mode",
+    type: "select",
+    currentValue,
+    options: OPENCODE_MODE_CHOICES,
+  };
+}
+
 async function emitSessionUpdates(sessionId, updates) {
   for (const u of updates) {
     if (cancelFlags.get(sessionId)) return;
@@ -447,6 +469,14 @@ async function handleRequest(msg) {
           },
         ];
       }
+      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
+        const current = opencodeModeBySession.get(sessionId) ?? "build";
+        opencodeModeBySession.set(sessionId, current);
+        result.configOptions = [
+          ...(result.configOptions ?? []),
+          makeOpencodeModeOption(current),
+        ];
+      }
       sendResult(id, result);
       return;
     }
@@ -458,6 +488,15 @@ async function handleRequest(msg) {
       // rename doesn't silently regress this fake.
       const sessionId = params?.sessionId;
       const modeId = params?.modeId;
+      if (
+        process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION &&
+        !OPENCODE_MODE_CHOICES.some((m) => m.value === modeId)
+      ) {
+        // OpenCode rejects set_mode for any id outside its real mode
+        // list (this is the "mode not found" the trapped user hit).
+        sendError(id, -32000, `mode not found: ${modeId}`);
+        return;
+      }
       sendResult(id, {});
       if (sessionId && modeId) {
         // Emit the ACP-correct variant so the supervisor translates to
@@ -482,6 +521,17 @@ async function handleRequest(msg) {
       const value = params?.value;
       if (process.env.FAKE_ACP_REJECT_CONFIG_OPTION) {
         sendError(id, -32000, process.env.FAKE_ACP_REJECT_CONFIG_OPTION);
+        return;
+      }
+      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION && configId === "mode") {
+        // OpenCode-shaped mode switch via the config-option channel.
+        if (!OPENCODE_MODE_CHOICES.some((m) => m.value === value)) {
+          sendError(id, -32000, `mode not found: ${value}`);
+          return;
+        }
+        const sessionId = params?.sessionId;
+        if (sessionId) opencodeModeBySession.set(sessionId, value);
+        sendResult(id, { configOptions: [makeOpencodeModeOption(value)] });
         return;
       }
       const configOptions =
