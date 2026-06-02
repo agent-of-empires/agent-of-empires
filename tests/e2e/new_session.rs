@@ -238,6 +238,7 @@ update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
+has_responded_to_telemetry = true
 last_seen_version = "{version}"
 has_acknowledged_agent_hooks = true
 "#,
@@ -395,6 +396,7 @@ update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
+has_responded_to_telemetry = true
 last_seen_version = "{version}"
 has_acknowledged_agent_hooks = true
 
