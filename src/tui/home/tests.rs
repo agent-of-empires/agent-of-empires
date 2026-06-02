@@ -9558,3 +9558,299 @@ mod right_click_context_menu {
         );
     }
 }
+
+mod apply_session_id_updates {
+    //! Post-CAS env publish: env mirrors the disk-confirmed sid
+    //! (Applied) or reloaded peer value (Skipped); filter paths
+    //! republish the memory mirror to clear `on_change`'s pre-CAS write.
+
+    use super::*;
+    use crate::session::poller::SessionPoller;
+    use crate::session::ResumeIntent;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
+
+    struct TmuxSession(String);
+
+    impl TmuxSession {
+        fn create(id: &str, title: &str) -> Self {
+            let name = crate::tmux::Session::generate_name(id, title);
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .output();
+            let status = Command::new("tmux")
+                .args(["new-session", "-d", "-s", &name])
+                .status()
+                .expect("failed to spawn tmux");
+            assert!(status.success(), "tmux new-session failed for {}", name);
+            crate::tmux::refresh_session_cache();
+            Self(name)
+        }
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for TmuxSession {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+            crate::tmux::refresh_session_cache();
+        }
+    }
+
+    fn skip_if_no_tmux() -> bool {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return true;
+        }
+        false
+    }
+
+    fn captured_env(name: &str) -> Option<String> {
+        crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+    }
+
+    fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
+        use crate::session::config::GroupByMode;
+        let storage = Storage::new(profile).unwrap();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = GroupTree::new_with_groups(std::slice::from_ref(inst), &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(Some(profile.to_string()), tools).unwrap();
+        view.group_by = GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+        view
+    }
+
+    fn attach_poller_with_update(view: &mut HomeView, instance_id: &str, sid: &str) {
+        let poller = SessionPoller::new("test-session".to_string());
+        poller.inject_test_update(instance_id, sid);
+        let arc = Arc::new(Mutex::new(poller));
+        for i in &mut view.instances {
+            if i.id == instance_id {
+                i.session_id_poller = Some(arc.clone());
+            }
+        }
+        if let Some(i) = view.instance_map.get_mut(instance_id) {
+            i.session_id_poller = Some(arc);
+        }
+    }
+
+    fn fresh_instance(profile: &str, title: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/x");
+        inst.tool = "claude".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        inst.resume_intent = ResumeIntent::Default;
+        inst
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_publishes_after_cas() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-publish";
+        let inst = fresh_instance(profile, "apa");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Applied CAS must report a touch");
+        assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_skips_retroactive_excludes() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-excludes";
+        let inst = fresh_instance(profile, "aer");
+        let mut view = build_view_with_inst(profile, &inst);
+        for i in &mut view.instances {
+            if i.id == inst.id {
+                i.retroactive_capture_excludes.insert(NEW_SID.to_string());
+            }
+        }
+        if let Some(i) = view.instance_map.get_mut(&inst.id) {
+            i.retroactive_capture_excludes.insert(NEW_SID.to_string());
+        }
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "stale-untouched",
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            !updated,
+            "filtered sid must not propagate to memory (returned bool tracks memory)"
+        );
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert!(
+            mem_sid.is_none(),
+            "filtered sid must not enter in-memory mirror"
+        );
+        assert!(
+            captured_env(tmux.name()).is_none(),
+            "filtered sid must not survive in tmux env: env converges on disk (None)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_skipped_publishes_disk_value() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-skipped";
+        let peer_sid = "019342aa-3333-7eee-8fff-aaaabbbbcccc";
+        let other_peer = "019342bb-4444-7fff-8000-111122223333";
+
+        let mut inst = fresh_instance(profile, "ase");
+        inst.agent_session_id = Some(peer_sid.to_string());
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let storage = Storage::new(profile).unwrap();
+        storage
+            .update(|i, _g| {
+                i[0].agent_session_id = Some(other_peer.to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            NEW_SID,
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Skipped path still touches state");
+
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(other_peer),
+            "memory rolls back to disk after CAS skip"
+        );
+        assert_eq!(
+            captured_env(tmux.name()).as_deref(),
+            Some(other_peer),
+            "env converges from poller's pre-published NEW_SID to disk's other_peer"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_invalid_sid_corrects_env() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-invalid";
+        let inst = fresh_instance(profile, "aiv");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "bad sid!",
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, "bad sid!");
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            !updated,
+            "validation-filtered sid must not propagate to memory"
+        );
+        assert!(
+            captured_env(tmux.name()).is_none(),
+            "env converges to disk-backed memory mirror (None) after validation failure"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_no_tmux_session_skips_publish() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-pane-dead";
+        let inst = fresh_instance(profile, "apds");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            updated,
+            "CAS still applies even when no tmux session exists"
+        );
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(NEW_SID),
+            "memory still mirrors the CAS-applied sid",
+        );
+        let expected_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        assert!(
+            captured_env(&expected_name).is_none(),
+            "no tmux session means no publish target"
+        );
+    }
+}

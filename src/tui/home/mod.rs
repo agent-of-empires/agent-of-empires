@@ -1403,9 +1403,12 @@ impl HomeView {
     }
 
     /// Apply any pending session ID updates from background pollers.
-    /// Returns true if any instance was updated.
+    /// Returns true if any instance's in-memory `agent_session_id` changed.
+    /// Tmux env may also be republished when this returns `false`
+    /// (filtered or Failed paths republish the memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
         let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut filtered_ids: HashSet<String> = HashSet::new();
 
         for inst in &self.instances {
             if let Some((_id, session_id)) = inst
@@ -1416,6 +1419,9 @@ impl HomeView {
             {
                 let Some(session_id) = crate::session::capture::validated_session_id(session_id)
                 else {
+                    // `on_change` already published this raw sid to env;
+                    // republish the memory mirror to overwrite it.
+                    filtered_ids.insert(inst.id.clone());
                     continue;
                 };
                 // Defense-in-depth against the resume-fallback cascade: a sid
@@ -1432,6 +1438,7 @@ impl HomeView {
                         session_id,
                         inst.id,
                     );
+                    filtered_ids.insert(inst.id.clone());
                     continue;
                 }
                 if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
@@ -1442,7 +1449,7 @@ impl HomeView {
             }
         }
 
-        if updates.is_empty() {
+        if updates.is_empty() && filtered_ids.is_empty() {
             return false;
         }
 
@@ -1463,17 +1470,29 @@ impl HomeView {
                     to_apply.push((id.clone(), session_id.clone()));
                 }
                 crate::session::SidWrite::Skipped => {
-                    // Peer wrote during our poller observation; reload memory
-                    // from disk so the in-memory mirror matches the peer's value.
+                    let mut reloaded = false;
                     if let Ok(storage) = crate::session::Storage::new(&profile) {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
                                 to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
+                                reloaded = true;
                             }
                         }
                     }
+                    if !reloaded {
+                        // Memory is known stale (Skipped CAS proved
+                        // memory != disk) and we cannot read disk.
+                        // Leave env at the poller's last write; the next
+                        // poller event reconciles.
+                        tracing::warn!(target: "tui.home",
+                            instance = %id,
+                            "Skipped reload failed; deferring env reconcile");
+                    }
                 }
-                crate::session::SidWrite::Failed => {}
+                crate::session::SidWrite::Failed => {
+                    // `on_change` published an unvalidated sid; republish memory.
+                    filtered_ids.insert(id.clone());
+                }
             }
         }
 
@@ -1487,6 +1506,61 @@ impl HomeView {
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = disk_sid.clone();
             });
+        }
+
+        let touched_ids: Vec<&str> = to_apply
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .chain(to_rollback.iter().map(|(id, _)| id.as_str()))
+            .chain(filtered_ids.iter().map(|s| s.as_str()))
+            .collect();
+        let mut set_batch: Vec<(String, String, String)> = Vec::new();
+        let mut unset_batch: Vec<(String, String)> = Vec::new();
+        for id in &touched_ids {
+            let Some(inst) = self.instance_map.get(*id) else {
+                continue;
+            };
+            // `s.exists()` reads a 2s-TTL cache; tests bypassing
+            // `Session::create` must call `refresh_session_cache()`.
+            let tmux_name = match inst.tmux_session() {
+                Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(target: "tui.home",
+                        instance = %id,
+                        "Skipping tmux env publish; tmux_session() error: {}", e);
+                    continue;
+                }
+            };
+            match &inst.agent_session_id {
+                Some(sid) => set_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    sid.clone(),
+                )),
+                None => unset_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                )),
+            }
+        }
+        if !set_batch.is_empty() {
+            let refs: Vec<(&str, &str, &str)> = set_batch
+                .iter()
+                .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
+                .collect();
+            if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
+                tracing::warn!(target: "tui.home", "Post-CAS env publish failed: {}", e);
+            }
+        }
+        if !unset_batch.is_empty() {
+            let refs: Vec<(&str, &str)> = unset_batch
+                .iter()
+                .map(|(s, k)| (s.as_str(), k.as_str()))
+                .collect();
+            if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+                tracing::warn!(target: "tui.home", "Post-CAS env unset failed: {}", e);
+            }
         }
 
         !to_apply.is_empty() || !to_rollback.is_empty()

@@ -627,6 +627,20 @@ pub(crate) enum SidWrite {
     Failed,
 }
 
+/// Caller contract for `persist_session_id`: whether to publish the
+/// post-CAS `agent_session_id` to the tmux hidden env.
+///
+/// `Published`: memory reflects disk (Applied: just committed; Skipped:
+/// reloaded). Caller publishes.
+/// `Skip`: memory unchanged on invalid sid, storage error, or row gone.
+/// Caller must not touch env.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidPersistOutcome {
+    Published,
+    Skip,
+}
+
 /// CAS-write `agent_session_id` to disk. Caller passes the value the
 /// in-memory mirror held at last reconcile as `expected_prior`; the closure
 /// inside `Storage::update`'s flock skips the write if disk has diverged
@@ -1955,7 +1969,12 @@ impl Instance {
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
     ) {
-        let claude_sid: Option<String> = if self.tool == "claude" {
+        let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
+
+        // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
+        // runs before any poller publish, so env is empty for fresh sessions.
+        let publish_sid = matches!(outcome, SidPersistOutcome::Published);
+        let captured_sid: Option<String> = if publish_sid {
             self.agent_session_id.clone()
         } else {
             None
@@ -1966,7 +1985,7 @@ impl Instance {
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
             &self.id,
         )];
-        if let Some(ref sid) = claude_sid {
+        if let Some(ref sid) = captured_sid {
             entries.push((
                 session_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
@@ -1979,7 +1998,17 @@ impl Instance {
                 "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
         }
 
-        self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
+        if publish_sid && self.agent_session_id.is_none() {
+            if let Err(e) = crate::tmux::env::remove_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            ) {
+                tracing::warn!(target: "session.store",
+                    instance = %self.id,
+                    "Failed to clear captured sid in tmux env: {}", e);
+            }
+        }
+
         self.maybe_start_poller();
 
         self.status = Status::Starting;
@@ -2026,12 +2055,17 @@ impl Instance {
     /// On sid CAS skip: rollback both fields from disk.
     /// On intent CAS skip with sid match: persist sid, leave intent as
     /// peer wrote it, reload intent in memory.
+    ///
+    /// Returns `Published` if `self.agent_session_id` after return reflects
+    /// disk (Applied: committed under flock; Skipped: reloaded). Returns
+    /// `Skip` for invalid sid early-return, storage error, or `SidWrite::Failed`:
+    /// memory is unchanged and the caller must not touch the tmux env.
     fn persist_session_id(
         &mut self,
         profile: &str,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
-    ) {
+    ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
         let promote_cleared = matches!(expected_prior_intent, ResumeIntent::Cleared);
 
@@ -2042,7 +2076,7 @@ impl Instance {
                     sid,
                     self.id
                 );
-                return;
+                return SidPersistOutcome::Skip;
             }
         }
 
@@ -2054,7 +2088,7 @@ impl Instance {
                     self.id,
                     e
                 );
-                return;
+                return SidPersistOutcome::Skip;
             }
         };
 
@@ -2103,20 +2137,37 @@ impl Instance {
                         }
                     }
                 }
+                SidPersistOutcome::Published
             }
-            Ok(SidWrite::Skipped) => {
-                if let Ok(insts) = storage.load() {
-                    if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
+            Ok(SidWrite::Skipped) => match storage.load() {
+                Ok(insts) => match insts.into_iter().find(|i| i.id == self.id) {
+                    Some(disk) => {
                         self.agent_session_id = disk.agent_session_id;
                         self.resume_intent = disk.resume_intent;
+                        SidPersistOutcome::Published
                     }
+                    None => {
+                        tracing::warn!(target: "session.store",
+                            "Skipped reload found no row for {}; leaving memory and env untouched",
+                            self.id
+                        );
+                        SidPersistOutcome::Skip
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(target: "session.store",
+                        "Skipped reload failed for {}: {}; leaving memory and env untouched",
+                        self.id, e
+                    );
+                    SidPersistOutcome::Skip
                 }
-            }
+            },
             Ok(SidWrite::Failed) => {
                 tracing::warn!(target: "session.store",
                     "Finalize persist found no instance row for {}",
                     self.id
                 );
+                SidPersistOutcome::Skip
             }
             Err(e) => {
                 tracing::warn!(target: "session.store",
@@ -2124,6 +2175,7 @@ impl Instance {
                     self.id,
                     e
                 );
+                SidPersistOutcome::Skip
             }
         }
     }
@@ -6034,7 +6086,7 @@ mod tests {
             // Daemon thinks disk is "stale" but peer wrote "peer-wrote".
             // After persist_session_id, in-memory should converge on disk.
             inst.agent_session_id = Some("daemon-fresh".to_string());
-            inst.persist_session_id(
+            let _ = inst.persist_session_id(
                 "persist-skipped-reload",
                 Some("stale"),
                 ResumeIntent::Default,
@@ -6070,7 +6122,7 @@ mod tests {
                 .unwrap();
 
             inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".to_string());
-            inst.persist_session_id("persist-atomic-match", None, ResumeIntent::Cleared);
+            let _ = inst.persist_session_id("persist-atomic-match", None, ResumeIntent::Cleared);
 
             let loaded = storage.load().unwrap();
             assert_eq!(
@@ -6113,7 +6165,7 @@ mod tests {
                 .unwrap();
 
             inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".to_string());
-            inst.persist_session_id("persist-default-intent", None, ResumeIntent::Default);
+            let _ = inst.persist_session_id("persist-default-intent", None, ResumeIntent::Default);
 
             let loaded = storage.load().unwrap();
             assert_eq!(
@@ -6162,7 +6214,7 @@ mod tests {
                 .unwrap();
 
             inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".to_string());
-            inst.persist_session_id("persist-intent-mismatch", None, ResumeIntent::Cleared);
+            let _ = inst.persist_session_id("persist-intent-mismatch", None, ResumeIntent::Cleared);
 
             let loaded = storage.load().unwrap();
             assert_eq!(
@@ -6211,7 +6263,7 @@ mod tests {
 
             inst.agent_session_id = Some("daemon-fresh".to_string());
             inst.resume_intent = ResumeIntent::Cleared;
-            inst.persist_session_id(
+            let _ = inst.persist_session_id(
                 "persist-skipped-reload-both",
                 Some("stale"),
                 ResumeIntent::Cleared,
@@ -6775,6 +6827,277 @@ mod tests {
             }
             assert!(inst.retroactive_capture_excludes.contains(&stale_sid));
             assert!(inst.agent_session_id.as_deref() != Some(stale_sid.as_str()));
+        }
+    }
+
+    mod publish_captured_sid {
+        use super::super::{Instance, ResumeIntent};
+        use serial_test::serial;
+        use std::process::Command;
+        use tempfile::{tempdir, TempDir};
+
+        const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
+        const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+
+        struct TmuxSession(String);
+
+        impl TmuxSession {
+            fn create(id: &str, title: &str) -> Self {
+                let name = crate::tmux::Session::generate_name(id, title);
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &name])
+                    .output();
+                let status = Command::new("tmux")
+                    .args(["new-session", "-d", "-s", &name])
+                    .status()
+                    .expect("failed to spawn tmux");
+                assert!(status.success(), "tmux new-session failed for {}", name);
+                Self(name)
+            }
+            fn name(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Drop for TmuxSession {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+            }
+        }
+
+        fn skip_if_no_tmux() -> bool {
+            if Command::new("tmux").arg("-V").output().is_err() {
+                eprintln!("Skipping: tmux not available");
+                return true;
+            }
+            false
+        }
+
+        fn isolate_home(temp: &TempDir) {
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        fn captured_env(name: &str) -> Option<String> {
+            crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+        }
+
+        fn make_inst(profile: &str, title: &str) -> Instance {
+            let mut inst = Instance::new(title, "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = profile.to_string();
+            inst
+        }
+
+        fn seed_disk_row(profile: &str, inst: &Instance) {
+            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_applied_writes_env() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-applied";
+            let mut inst = make_inst(profile, "fpaw");
+            inst.agent_session_id = None;
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+
+            assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_applied_writes_env_for_non_claude_tool() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-applied-opencode";
+            let mut inst = make_inst(profile, "fpaw-oc");
+            inst.tool = "opencode".to_string();
+            inst.agent_session_id = None;
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+
+            assert_eq!(
+                captured_env(tmux.name()).as_deref(),
+                Some(VALID_SID),
+                "non-claude tools must also publish AOE_CAPTURED_SESSION_ID at finalize"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_skipped_disk_some_publishes_disk_value() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-skipped-some";
+            let mut inst = make_inst(profile, "fpsdspd");
+            inst.agent_session_id = Some(PEER_SID.to_string());
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+
+            assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
+            assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_skipped_disk_none_unsets_env() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-skipped-none";
+            let mut inst = make_inst(profile, "fpsdne");
+            inst.agent_session_id = None;
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                "stale-leftover",
+            )
+            .unwrap();
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+
+            assert!(inst.agent_session_id.is_none());
+            assert!(captured_env(tmux.name()).is_none());
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_failed_leaves_env_unchanged() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-failed";
+            let _ = crate::session::storage::Storage::new(profile).unwrap();
+            let mut inst = make_inst(profile, "fpfle");
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                "stale-untouched",
+            )
+            .unwrap();
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+
+            assert_eq!(
+                captured_env(tmux.name()).as_deref(),
+                Some("stale-untouched")
+            );
+            assert_eq!(
+                inst.agent_session_id.as_deref(),
+                Some(VALID_SID),
+                "memory must keep the daemon-set sid when persist returns Failed"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_invalid_sid_skips_publish() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-invalid";
+            let mut inst = make_inst(profile, "fpisp");
+            inst.agent_session_id = None;
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                "stale-untouched",
+            )
+            .unwrap();
+
+            inst.agent_session_id = Some("bad sid!".to_string());
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+
+            assert_eq!(
+                captured_env(tmux.name()).as_deref(),
+                Some("stale-untouched")
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_publish_promote_cleared_applied_uses_new_sid() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-promote";
+            let mut inst = make_inst(profile, "fppca");
+            inst.agent_session_id = None;
+            inst.resume_intent = ResumeIntent::Cleared;
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared);
+
+            assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
+            assert_eq!(inst.resume_intent, ResumeIntent::Default);
+            assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
         }
     }
 
