@@ -390,14 +390,30 @@ each and lifts the effective grace to `OFF_PROTOCOL_WORK_GRACE_FLOOR`
   ID:` (either signal alone is enough; defense in depth so a single
   SDK string drift can't reintroduce the false-positive class).
 
-The off-protocol branch takes precedence over the cost-seen fast path
-(a cost-populated UsageUpdate mid-wait could be intermediate billing
-telemetry rather than turn termination). The grace stays finite by
-design so a real adapter wedge during off-protocol work still
-recovers, just slower. The async-agent path is a bandaid until
-upstream `agentclientprotocol/claude-agent-acp#336` forwards the
-SDK's `task_notification` / `task_started` system messages as proper
-ACP SessionUpdates.
+The off-protocol branch takes precedence over the cost-seen fast path,
+with one carve-out by kind (#1858):
+
+- `Bash run_in_background` (`BackgroundCommand`) is fire-and-forget: the
+  agent launches it and moves on, so it legitimately outlives the turn.
+  Once a cost-populated `UsageUpdate` arrives (the end-of-turn marker;
+  mid-turn usages carry `cost: null`), the background-command
+  suppression is dropped so a turn that streamed its final usage but
+  never sent the `PromptResponse` recovers on the fast grace instead of
+  hanging out the 30-minute floor. The clear is self-correcting: if the
+  turn continues, the next progress / tool event re-arms suppression on
+  the next backgrounded launch.
+- `Agent isAsync` (`AsyncAgent`) blocks the turn: the agent idles
+  waiting for the sub-agent and resumes in-band, and the genuine waits
+  emit `cost: null` usages (so the cost-populated marker does not arrive
+  mid-wait). Its floor is left intact, so the #1360 false-fire fix is
+  preserved.
+
+The grace stays finite by design so a real adapter wedge during
+off-protocol work still recovers, just slower. The async-agent path is
+a bandaid until upstream
+`agentclientprotocol/claude-agent-acp#336` forwards the SDK's
+`task_notification` / `task_started` system messages as proper ACP
+SessionUpdates.
 
 **Scheduled wakeup suppression (#1401):** when the agent calls the
 Claude SDK `ScheduleWakeup` tool with `delaySeconds: N`, the daemon

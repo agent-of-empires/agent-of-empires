@@ -794,8 +794,25 @@ async fn cancel(session: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     client.cancel(session).await.map_err(map_http)?;
-    println!("cancel sent");
+    println!(
+        "{}",
+        cancel_confirmation_message(crate::cockpit::acp_client::CANCEL_ESCALATION_GRACE.as_secs())
+    );
     Ok(())
+}
+
+/// Honest confirmation for `aoe cockpit cancel`. The daemon only arms
+/// the auto-restart escalation when a prompt is in flight; for an idle
+/// session the cancel is a no-op notification, and the CLI cannot tell
+/// which from the 202 it gets back. Spell both out so the operator does
+/// not read a bare "cancel sent" as "nothing happened" and reach for
+/// `aoe cockpit restart` before the escalation has a chance to fire. See
+/// #1858.
+fn cancel_confirmation_message(escalation_grace_secs: u64) -> String {
+    format!(
+        "cancel sent. If a prompt is in flight and the agent does not stop within ~{escalation_grace_secs}s, \
+the worker is restarted automatically and the transcript is preserved. If the session is idle, this is a no-op."
+    )
 }
 
 async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Result<()> {
@@ -918,5 +935,27 @@ mod tests {
         );
         // Legacy record (field absent on disk): placeholder, always stale.
         assert_eq!(render_build_cell("", true), "<legacy> (stale)");
+    }
+
+    /// #1858: `aoe cockpit cancel` must explain the conditional
+    /// auto-restart escalation and the idle no-op, not print a bare
+    /// "cancel sent" that reads as "nothing happened".
+    #[test]
+    fn cancel_confirmation_message_states_escalation_and_no_op() {
+        let msg = cancel_confirmation_message(
+            crate::cockpit::acp_client::CANCEL_ESCALATION_GRACE.as_secs(),
+        );
+        assert!(
+            msg.contains("10s"),
+            "must surface the escalation grace: {msg}"
+        );
+        assert!(
+            msg.contains("restarted automatically"),
+            "must mention the auto-restart escalation: {msg}"
+        );
+        assert!(
+            msg.contains("no-op"),
+            "must spell out the idle no-op case: {msg}"
+        );
     }
 }
