@@ -307,6 +307,27 @@ export interface ProfileInfo {
   description?: string;
 }
 
+/** Per-profile lifecycle-hook overrides, as returned by
+ *  GET /api/profiles/:name/settings. Mirrors the Rust
+ *  HooksConfigOverride (src/session/profile_config.rs): a field that is
+ *  absent/undefined means "inherit the global hooks"; an explicit array
+ *  (including the empty array) means "override". Hooks are read-only on
+ *  the dashboard; see HooksReadOnlyPanel and PROFILE_WRITABLE_SECTIONS. */
+export interface HooksOverride {
+  on_create?: string[];
+  on_launch?: string[];
+  on_destroy?: string[];
+}
+
+/** Shape of GET /api/profiles/:name/settings: the serialized
+ *  ProfileConfig. Only the fields the dashboard reads are typed; the rest
+ *  stays indexable. `hooks` is present on reads but never writable. */
+export interface ProfileSettingsResponse {
+  description?: string | null;
+  hooks?: HooksOverride;
+  [key: string]: unknown;
+}
+
 /** Directory entry returned by /api/filesystem/browse */
 export interface DirEntry {
   name: string;

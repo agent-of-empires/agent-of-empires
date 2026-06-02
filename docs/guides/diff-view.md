@@ -41,8 +41,18 @@ After saving and exiting, the diff view refreshes automatically to show your cha
 | `s` | Toggle split/unified layout |
 | `b` | Change base branch (persists per-session as `base_branch_override`) |
 | `r` | Refresh the diff |
+| `y` | Copy the selected file's relative path to the clipboard |
 | `?` | Show help |
 | `Esc` | Close diff view |
+
+## Copying a file's path
+
+Copy a changed file's repo-relative path to the clipboard:
+
+- **TUI**: press `y` (yank) on the selected file. A `Copied <path>` confirmation shows in the footer.
+- **Web dashboard**: right-click a file in the Changes list (or a folder row in tree view) and choose **Copy relative path**. A `Copied <path>` toast confirms it.
+
+The path is relative to the file's repository root, so it pastes straight into commands or comments.
 
 ## Commenting on the diff (web only, cockpit sessions)
 

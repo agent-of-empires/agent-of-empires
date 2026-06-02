@@ -1,39 +1,43 @@
 ---
 name: aoe
-description: Manage AI coding agent sessions via Agent of Empires (aoe)
+description: Use when launching, monitoring, or controlling AI coding agents (Claude Code, Codex, OpenCode, etc.) in tmux via Agent of Empires (aoe). Covers creating sessions, capturing agent output, running parallel worktree agents, and organizing work into groups and profiles. Prefer aoe over raw tmux for agent management.
+version: 1.0.0
+author: njbrake (Agent of Empires)
+license: MIT
 metadata:
-  openclaw:
-    requires:
-      bins:
-        - aoe
-        - tmux
-    homepage: https://github.com/agent-of-empires/agent-of-empires
+  hermes:
+    tags: [coding-agents, tmux, orchestration, sessions, worktrees, automation]
+    related_skills: [subagent-driven-development]
 ---
 
-# Agent of Empires (aoe) Skill
+# Agent of Empires (aoe)
 
-Use `aoe` to create, manage, and monitor AI coding agent sessions (Claude Code, Codex, OpenCode, etc.) in tmux. Prefer `aoe` over raw `tmux` commands for agent management.
+## Overview
 
-## When to use this skill
+`aoe` creates, manages, and monitors AI coding agent sessions (Claude Code, Codex, OpenCode, and others) inside tmux. Each session is an agent process with an ID, title, tool, project path, and live status. Use `aoe` instead of raw `tmux` commands whenever the work is about coding agents: it tracks status, captures output, manages git worktrees for parallel branches, and organizes sessions into groups and profiles.
 
-- Launching one or more AI coding agents on project directories
-- Monitoring agent progress (waiting vs running vs idle)
-- Capturing agent output for review
-- Organizing agents into groups or profiles
-- Setting up parallel worktree-based development
+## When to Use
 
-Do NOT use this skill for general tmux window/pane management unrelated to coding agents.
+- Launching one or more AI coding agents on project directories.
+- Monitoring agent progress (waiting vs running vs idle).
+- Capturing agent output for review.
+- Organizing agents into groups or profiles.
+- Setting up parallel worktree-based development.
 
-## Core concepts
+**Don't use for:** general tmux window/pane management unrelated to coding agents.
 
-- **Session**: An agent process running in a tmux session. Each session has an ID, title, tool (e.g. `claude`), and project path.
+## Requirements
+
+The `aoe` and `tmux` binaries must be on `PATH`, and commands run through a shell. Install aoe from https://github.com/agent-of-empires/agent-of-empires.
+
+## Core Concepts
+
+- **Session**: An agent process running in a tmux session. Each has an ID, title, tool (e.g. `claude`), and project path.
 - **Group**: A named folder for organizing sessions (supports nesting with `/`, e.g. `backend/api`).
 - **Profile**: A separate workspace with its own sessions and config. Use `-p <name>` globally or set `AGENT_OF_EMPIRES_PROFILE`.
 - **Status**: One of `running`, `waiting`, `idle`, `stopped`, `error`, `starting`, `unknown`.
 
-## Command reference
-
-### Adding sessions
+## Adding Sessions
 
 ```bash
 # Add a session for the current directory
@@ -58,20 +62,15 @@ aoe add . -t "sub task" -P <parent-id>
 aoe add . -t "yolo" -y -l
 ```
 
-### Listing sessions
+## Listing Sessions
 
 ```bash
-# Human-readable list
-aoe list
-
-# JSON output for parsing
-aoe list --json
-
-# List across all profiles
-aoe list --all
+aoe list              # human-readable
+aoe list --json       # JSON for parsing
+aoe list --all        # across all profiles
 ```
 
-**JSON output shape** (`aoe list --json`):
+**JSON shape** (`aoe list --json`):
 ```json
 [
   {
@@ -88,9 +87,9 @@ aoe list --all
 ]
 ```
 
-`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `list --json` does not include live status: use `aoe status --json` or `aoe session capture --json` for that.
 
-### Session lifecycle
+## Session Lifecycle
 
 ```bash
 aoe session start <id-or-title>
@@ -99,10 +98,10 @@ aoe session restart <id-or-title>
 aoe session attach <id-or-title>   # interactive attach
 ```
 
-### Inspecting sessions
+## Inspecting Sessions
 
 ```bash
-# Show session metadata
+# Session metadata
 aoe session show <id-or-title> --json
 
 # Capture tmux pane content (key for monitoring)
@@ -115,7 +114,7 @@ aoe status --json
 aoe status -q   # just the waiting count (for scripting)
 ```
 
-**JSON output shape** (`aoe session capture --json`):
+**JSON shape** (`aoe session capture --json`):
 ```json
 {
   "id": "a1b2c3d4-...",
@@ -127,7 +126,7 @@ aoe status -q   # just the waiting count (for scripting)
 }
 ```
 
-**JSON output shape** (`aoe session show --json`):
+**JSON shape** (`aoe session show --json`):
 ```json
 {
   "id": "a1b2c3d4-...",
@@ -141,7 +140,9 @@ aoe status -q   # just the waiting count (for scripting)
 }
 ```
 
-**JSON output shape** (`aoe status --json`):
+`parent_session_id` is included only for sub-sessions.
+
+**JSON shape** (`aoe status --json`):
 ```json
 {
   "waiting": 1,
@@ -155,7 +156,7 @@ aoe status -q   # just the waiting count (for scripting)
 
 ### Auto-detection (inside a tmux pane)
 
-When called from within an aoe-managed tmux session, identifier can be omitted:
+When called from within an aoe-managed tmux session, the identifier can be omitted:
 
 ```bash
 aoe session show          # auto-detects current session
@@ -163,7 +164,7 @@ aoe session capture       # auto-detects current session
 aoe session current --json
 ```
 
-### Renaming and organizing
+## Renaming and Organizing
 
 ```bash
 aoe session rename <id> -t "new title"
@@ -175,17 +176,17 @@ aoe group list --json
 aoe group delete mygroup --force
 ```
 
-### Profiles
+## Profiles
 
 ```bash
 aoe profile list
 aoe profile create staging
 aoe profile delete staging
 aoe profile default staging   # set default
-aoe -p staging list            # use inline
+aoe -p staging list           # use inline
 ```
 
-### Worktrees
+## Worktrees
 
 ```bash
 aoe worktree list
@@ -193,14 +194,14 @@ aoe worktree info <id-or-title>
 aoe worktree cleanup -f
 ```
 
-### Removing sessions
+## Removing Sessions
 
 ```bash
 aoe remove <id-or-title>
 aoe remove <id-or-title> --delete-worktree --force
 ```
 
-## Workflow patterns
+## Workflow Patterns
 
 ### Single agent
 
@@ -221,7 +222,7 @@ aoe status --json   # check all at once
 
 ### Monitoring loop
 
-Poll all sessions until none are running:
+Poll all sessions until none are running or waiting:
 
 ```bash
 while true; do
@@ -247,6 +248,16 @@ for id in $(aoe list --json | jq -r '.[].id'); do
 done
 ```
 
-### Group operations via TUI
+## Common Pitfalls
 
-Groups are primarily managed through the `aoe` TUI (run `aoe` with no arguments). The TUI supports bulk start/stop/restart on groups. Use CLI commands above for scripted workflows.
+1. **Expecting `aoe list --json` to carry live status.** It does not. The fields are static session metadata (`path`, `group`, `tool`, `command`, etc.). For status, call `aoe status --json` or `aoe session capture --json`.
+2. **Using raw `tmux` to start or stop agents.** That bypasses aoe's tracking; the session's status and metadata go stale. Always use `aoe session start/stop/restart`.
+3. **Forgetting `-l`/`--launch`.** `aoe add` creates a session but does not start it unless you pass `-l`.
+4. **Running across the wrong profile.** Sessions are profile-scoped; use `-p <name>` or set `AGENT_OF_EMPIRES_PROFILE` when scripting, and `aoe list --all` to see everything.
+
+## Verification Checklist
+
+- [ ] `aoe` and `tmux` are on `PATH`.
+- [ ] `aoe add` was followed by a launch (`-l`) or an explicit `aoe session start`.
+- [ ] JSON parsing reads `path`/`group` (not `project_path`/`group_path`) and gets status from `aoe status`/`aoe session capture`, not `aoe list`.
+- [ ] Scripted polling exits when both `running` and `waiting` reach 0.

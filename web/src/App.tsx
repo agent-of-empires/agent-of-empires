@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMatch, useNavigate } from "react-router-dom";
+import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
@@ -67,6 +67,7 @@ import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectsView } from "./components/ProjectsView";
+import { ProfilesPage } from "./components/profiles/ProfilesPage";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
 import type { TourScope } from "./lib/tourSteps";
@@ -194,15 +195,18 @@ function isInsideEditable(target: EventTarget | null): boolean {
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const projectsMatch = useMatch("/projects");
+  const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
+  const showProfiles = profilesMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -610,6 +614,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
   }, [navigate, activeSessionId]);
 
+  const handleOpenProfiles = useCallback(() => {
+    navigate("/profiles");
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }, [navigate]);
+
+  const handleCloseProfiles = useCallback(() => {
+    if (activeSessionId) {
+      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
+    } else {
+      navigate("/");
+    }
+  }, [navigate, activeSessionId]);
+
   const handleCloseSettings = useCallback(() => {
     if (activeSessionId) {
       navigate(`/session/${encodeURIComponent(activeSessionId)}`);
@@ -798,9 +815,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <SettingsView
           tab={settingsTab}
           onClose={handleCloseSettings}
-          onSelectTab={(t) => navigate(`/settings/${t}`)}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            navigate(
+              `/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`,
+            );
+          }}
           serverAbout={serverAbout}
           onServerAboutRefresh={refreshServerAbout}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
         />
       );
     }
@@ -809,6 +837,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return (
         <ProjectsView
           onClose={handleCloseProjects}
+          readOnly={serverAbout?.read_only}
+        />
+      );
+    }
+
+    if (showProfiles) {
+      return (
+        <ProfilesPage
+          onClose={handleCloseProfiles}
           readOnly={serverAbout?.read_only}
         />
       );
@@ -1046,6 +1083,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !activeSessionId &&
     !showSettings &&
     !showProjects &&
+    !showProfiles &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
@@ -1099,6 +1137,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}
             onProjects={handleOpenProjects}
+            onProfiles={handleOpenProfiles}
             onDeleteSession={handleDeleteSession}
             readOnly={serverAbout?.read_only}
             sortMode={sidebarSortMode}

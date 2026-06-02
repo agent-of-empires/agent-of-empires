@@ -12,7 +12,13 @@ on:
 
 jobs:
   check-template:
-    if: github.event_name == 'pull_request_target' && github.actor != 'dependabot[bot]'
+    # Key the skip on the PR author, not github.actor. The actor is whoever
+    # triggered the event; on an `edited` event fired by a maintainer or
+    # another bot the actor is the editor, so a github.actor guard would let
+    # the check run against Dependabot's templateless body. Matches the
+    # close-stale job and the nix-npm-hash escape hatch, which both key on
+    # pull_request.user.login.
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       issues: write
