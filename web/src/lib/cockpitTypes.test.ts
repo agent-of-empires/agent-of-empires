@@ -2611,6 +2611,40 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
     expect(rows[0]?.tool?.args_preview).toBe('{"command":"pwd"}');
     expect(rows[0]?.tool?.kind).toBe("execute");
   });
+
+  it("prefers the later started_at when a real start follows a permission start", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-3", {
+            kind: "other",
+            args_preview: "",
+            started_at: "2026-01-01T00:00:00Z",
+          }),
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-3", {
+            kind: "execute",
+            args_preview: '{"command":"pwd"}',
+            started_at: "2026-01-01T00:00:05Z",
+          }),
+        },
+      },
+    });
+    const row = state.activity.find(
+      (r) => r.kind === "tool_start" && r.toolCallId === "dup-3",
+    );
+    expect(row?.tool?.started_at).toBe("2026-01-01T00:00:05Z");
+    expect(row?.at).toBe("2026-01-01T00:00:05Z");
+  });
 });
 
 describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
