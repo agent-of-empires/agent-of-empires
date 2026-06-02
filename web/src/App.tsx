@@ -18,6 +18,7 @@ import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import { sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -234,6 +235,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     if (!sessionsLoaded) return;
     sweptDraftsRef.current = true;
     sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
+  // deleted sessions and retroactively removes empty keys written before the
+  // empty-removal fix. Mirrors the draft sweep above.
+  const sweptCommentsRef = useRef(false);
+  useEffect(() => {
+    if (sweptCommentsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptCommentsRef.current = true;
+    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
   }, [sessionsLoaded, sessions]);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
