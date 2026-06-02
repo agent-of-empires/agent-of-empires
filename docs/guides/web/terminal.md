@@ -50,9 +50,9 @@ The paired shell stays alive in the background when you switch away, so
 its scrollback and focus survive view switches.
 
 For sandboxed sessions, the **Container** tab launches the container
-user's login shell, resolved inside the container (`$SHELL`, then the
-passwd entry, then zsh, bash, sh), so your prompt, aliases, and
-oh-my-zsh setup load just like the Host tab.
+user's login shell, resolved inside the container (the passwd entry,
+then `$SHELL`, then bash, sh), so your prompt, aliases, and oh-my-zsh
+setup load just like the Host tab.
 
 ## Reconnect
 

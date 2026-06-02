@@ -3353,16 +3353,19 @@ fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents
 /// Resolves the container user's login shell at spawn time, inside the container,
 /// and execs it as a login shell so profile/rc files load (parity with the Host
 /// terminal tab, which launches the user's default shell as a login shell).
-/// Resolution order: the container's `$SHELL`, then the passwd entry (the
-/// authoritative login shell, e.g. set by `chsh`), then zsh, bash, sh. Each
-/// candidate is run through `command -v` so an unset, stale, or non-executable
-/// value falls through to the next instead of killing the pane.
+/// Resolution order: the passwd entry (the authoritative login shell, what
+/// `chsh` writes and what `login(1)` reads into `$SHELL`), then the container's
+/// `$SHELL`, then bash, sh. Passwd comes first because `docker exec` never goes
+/// through `login(1)`, so `$SHELL` is usually unset or a generic image default
+/// rather than the user's configured shell. Each candidate is run through
+/// `command -v` so an unset, stale, or non-executable value falls through to the
+/// next instead of killing the pane.
 ///
 /// The single-quoted body is evaluated by the container's `sh`, not the host
 /// shell tmux uses to spawn the session, so the embedded `$()` runs in the
 /// container. The host does not propagate its own `$SHELL` into the container,
 /// so this reads the container's value, not the host's.
-const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$SHELL" 2>/dev/null || { s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -n "$s" ] && command -v "$s" 2>/dev/null; } || command -v zsh || command -v bash || command -v sh)" -l'"#;
+const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7)" 2>/dev/null || command -v "$SHELL" 2>/dev/null || command -v bash || command -v sh)" -l'"#;
 
 /// When running agents directly as tmux session commands (without a parent shell),
 /// pressing Ctrl-Z suspends the process with no way to recover via job control.
@@ -3508,15 +3511,16 @@ mod tests {
     #[test]
     fn container_terminal_autodetect_cmd_resolves_login_shell() {
         let cmd = CONTAINER_TERMINAL_AUTODETECT_CMD;
-        // Resolution order: $SHELL, then the passwd entry, then zsh -> bash -> sh.
-        // Each candidate is guarded by `command -v` so an unset, stale, or
-        // non-executable value falls through rather than killing the pane.
-        assert!(cmd.contains(r#"command -v "$SHELL""#));
+        // Resolution order: passwd entry first (authoritative, since docker exec
+        // skips login(1) and so $SHELL is usually unset), then $SHELL, then
+        // bash, sh. Each candidate is guarded by `command -v` so an unset, stale,
+        // or non-executable value falls through rather than killing the pane.
         assert!(cmd.contains("getent passwd"));
-        assert!(cmd.contains(r#"command -v "$s""#));
-        assert!(cmd.contains("command -v zsh"));
+        assert!(cmd.contains(r#"command -v "$SHELL""#));
         assert!(cmd.contains("command -v bash"));
         assert!(cmd.contains("command -v sh"));
+        // Passwd is resolved ahead of $SHELL.
+        assert!(cmd.find("getent passwd").unwrap() < cmd.find(r#"command -v "$SHELL""#).unwrap());
         // Login shell so profile/rc files load, matching the Host terminal tab.
         assert!(cmd.contains("-l"));
         // Single-quoted body: the embedded command substitution is evaluated by
