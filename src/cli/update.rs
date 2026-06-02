@@ -178,19 +178,19 @@ fn restart_decision(
 fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<()> {
     use crate::cli::serve;
     let running = serve::daemon_pid().is_some();
-    let decision = restart_decision(
-        running,
-        serve::serve_launch_exists(),
-        io::stdin().is_terminal(),
-        yes,
-    );
-    match decision {
+    let launch_present = serve::serve_launch_exists();
+    match restart_decision(running, launch_present, io::stdin().is_terminal(), yes) {
         RestartDecision::NotApplicable => {
-            // Something is up that we will not restart for the user
-            // (foreground / supervised, or non-interactive): point at the
-            // manual step. Nothing running means no hint is needed.
-            if running {
+            // Nothing running means no hint is needed. Otherwise point at
+            // the right manual step: a self-managed daemon we just cannot
+            // drive right now (non-interactive, no -y) restarts with
+            // `aoe serve --restart`, but a foreground or supervised daemon
+            // (no launch state) must be bounced by its own manager, for
+            // which --restart would correctly refuse.
+            if running && launch_present {
                 println!("{}", daemon_restart_hint());
+            } else if running {
+                println!("{}", external_restart_hint());
             }
         }
         RestartDecision::Prompt => {
@@ -208,6 +208,17 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
         RestartDecision::Auto => restart_via_new_binary(binary_path),
     }
     Ok(())
+}
+
+/// Hint for a running daemon that aoe did not start itself (foreground,
+/// or under systemd/launchd): `aoe serve --restart` would refuse it, so
+/// point the user at the supervisor that owns the process instead.
+#[cfg(feature = "serve")]
+fn external_restart_hint() -> &'static str {
+    "  An `aoe serve` daemon is running but was not started by\n  \
+     `aoe serve --daemon`; restart it through whatever launched it (your\n  \
+     service manager, or the terminal it runs in) so it picks up the new\n  \
+     binary."
 }
 
 /// Spawn the freshly installed binary as `aoe serve --restart`. Best

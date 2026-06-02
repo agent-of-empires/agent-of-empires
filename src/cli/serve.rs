@@ -541,6 +541,11 @@ pub fn daemon_pid() -> Option<u32> {
             // Stale PID file; the ESRCH case is handled the same as any
             // other error — the process is not reachable.
             let _ = std::fs::remove_file(&path);
+            // Drop the launch state too so `serve_launch_exists()` does
+            // not keep reporting a self-managed daemon that has died.
+            if let Ok(dir) = crate::session::get_app_dir() {
+                let _ = std::fs::remove_file(dir.join("serve.launch"));
+            }
             None
         }
     }
