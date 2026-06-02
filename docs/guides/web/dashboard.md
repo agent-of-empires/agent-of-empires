@@ -58,9 +58,11 @@ open settings, start a new session, toggle the right panel. It is the
 fastest path to anything the dashboard can do without reaching for the
 mouse.
 
-## First-run tutorial
+## First-run onboarding
 
-The first time you open the dashboard in a browser, an interactive walkthrough launches automatically and highlights the major regions: the command bar, the workspace sidebar, how to start a session, settings, and (inside a session) the diff panel and composer. Each step lists the keyboard shortcuts that apply to it, and every step has a **Skip** button so you can dismiss the whole tour in one click.
+The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else, so you can set the look of the dashboard and TUI right away. Picking a theme applies it live and saves it to your default profile; you can switch between themes as many times as you like, then click **Continue**. You can always change the theme later from Settings, under Appearance. The card is skipped in read-only mode (where it cannot save) and for anyone who already finished the tutorial in an earlier version. Dismissing it records a per-browser `aoe-welcome-seen` flag in `localStorage` so it does not show again.
+
+After the theme card, an interactive walkthrough launches automatically and highlights the major regions: the command bar, the workspace sidebar, how to start a session, settings, and (inside a session) the diff panel and composer. Each step lists the keyboard shortcuts that apply to it, and every step has a **Skip** button so you can dismiss the whole tour in one click.
 
 Completing or skipping the tour records that you have seen it (a per-browser `aoe-tour-seen` flag in `localStorage`), so it does not launch again on reload. Because the flag is per origin, a debug build on port 8081 and a release build on port 8080 each track it separately.
 

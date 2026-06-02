@@ -3007,6 +3007,29 @@
       ]
     },
     {
+      "id": "onboarding.theme-welcome",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/theme-onboarding.spec.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.theme-welcome-unit",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
+        "src/lib/__tests__/onboarding.test.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
+      ]
+    },
+    {
       "id": "shortcuts.single-source",
       "kind": "vitest",
       "risk": "medium",
