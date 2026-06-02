@@ -67,6 +67,19 @@ it exits 2; otherwise 0. Pass `--json` for machine-readable output.
 
 ### Per session
 
+#### From the web wizard (primary)
+
+When the cockpit master switch is on, the web new-session wizard shows a
+per-session **Use cockpit** toggle, on by default for supported agents.
+Open `aoe serve`, click **New session**, pick the agent, leave the toggle
+on, and create. No CLI required. Tools without a verified ACP adapter (and
+custom agents without `agent_cockpit_cmd`) have no toggle and stay in tmux.
+
+#### From the CLI (optional)
+
+For scripting, headless, or non-interactive launches, `aoe add` starts
+cockpit sessions too:
+
 ```bash
 # Force cockpit on for this session, regardless of defaults.
 aoe add . --cmd claude --cockpit
