@@ -9,12 +9,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useRef, type ReactNode } from "react";
+import { useMemo, useRef, type ReactNode } from "react";
 
 import {
   DragSuppressContext,
   SessionRow,
 } from "../WorkspaceSidebar";
+import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
 import {
@@ -79,6 +80,30 @@ function Wrap({ children }: { children: ReactNode }) {
   );
 }
 
+// Mounts a SessionRow wired to the real `useSidebarTriage` controller, the
+// same way `WorkspaceSidebar` wires it in production. Triage state and the
+// pin/archive/snooze PATCH calls live in the hook now (lifted out of the row
+// so bulk actions can share them, see #1724), so the row + hook are
+// exercised together here rather than the row owning the mutation. Returns
+// `null` while the workspace has no row to render.
+function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
+  const workspaces = useMemo(() => [ws], [ws]);
+  const triage = useSidebarTriage(workspaces);
+  return (
+    <SessionRow
+      workspace={ws}
+      isActive={false}
+      isSelected={false}
+      onActivate={() => {}}
+      readOnly={readOnly}
+      optimistic={triage.optimisticFor(ws.id)}
+      onPinToggle={triage.pinToggle}
+      onArchiveToggle={triage.archiveToggle}
+      onSnooze={triage.snooze}
+    />
+  );
+}
+
 const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
@@ -107,7 +132,7 @@ describe("SessionRow chips", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     expect(screen.queryByLabelText("Pinned")).not.toBeNull();
@@ -121,7 +146,7 @@ describe("SessionRow chips", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     expect(screen.queryByLabelText("Archived")).not.toBeNull();
@@ -134,7 +159,7 @@ describe("SessionRow chips", () => {
     const ws = workspace("w-snoozed", [session({ snoozed_until: future })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     const chip = screen.queryByLabelText("Snoozed");
@@ -154,7 +179,7 @@ describe("SessionRow chips", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     expect(screen.queryByLabelText("Archived")).not.toBeNull();
@@ -173,7 +198,7 @@ describe("SessionRow context menu", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     const row = screen.getByTestId("sidebar-session-row");
@@ -190,7 +215,7 @@ describe("SessionRow context menu", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -205,7 +230,7 @@ describe("SessionRow context menu", () => {
     const ws = workspace("w-snoozed", [session({ snoozed_until: future })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -219,7 +244,7 @@ describe("SessionRow context menu", () => {
     const ws = workspace("w-live", [session({})]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -235,7 +260,7 @@ describe("SessionRow context menu", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -248,7 +273,7 @@ describe("SessionRow context menu", () => {
     const ws = workspace("w-tmux", [session({ cockpit_mode: false })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -263,12 +288,7 @@ describe("SessionRow context menu", () => {
     const ws = workspace("w-live", [session({ cockpit_mode: true })]);
     render(
       <Wrap>
-        <SessionRow
-          workspace={ws}
-          isActive={false}
-          onClick={() => {}}
-          readOnly
-        />
+        <Row ws={ws} readOnly />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -288,7 +308,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-pin-it" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -305,7 +325,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-arch-it" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -328,7 +348,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-opt-archive" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -345,7 +365,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-snooze-it" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -360,7 +380,7 @@ describe("SessionRow triage actions", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -377,7 +397,7 @@ describe("SessionRow triage actions", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -399,7 +419,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-pin-fail" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -419,7 +439,7 @@ describe("SessionRow triage actions", () => {
     const ws = workspace("w-live", [session({ id: "sess-arch-fail" })]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -437,7 +457,7 @@ describe("SessionRow triage actions", () => {
     ]);
     render(
       <Wrap>
-        <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+        <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
@@ -463,7 +483,7 @@ describe("SessionRow triage actions", () => {
     try {
       render(
         <Wrap>
-          <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+          <Row ws={ws} />
         </Wrap>,
       );
       fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));

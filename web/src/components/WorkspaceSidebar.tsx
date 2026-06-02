@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type MutableRefObject,
@@ -66,10 +67,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   renameSession,
-  setSessionArchive,
   setSessionNotifications,
-  setSessionPin,
-  setSessionSnooze,
   setWorktreeName,
   updateSessionGroup,
 } from "../lib/api";
@@ -80,16 +78,34 @@ import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
 import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
 import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
-import { reportError } from "../lib/toastBus";
 import {
-  resolveEffectiveSnoozedUntil,
-  snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
   workspaceIsPinned,
   workspaceIsSunk,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
+import {
+  effectiveArchivedOf,
+  effectivePinnedOf,
+  effectiveSnoozedUntilOf,
+  type OptimisticTriage,
+} from "../lib/sidebarOptimistic";
+import { useSidebarTriage } from "../hooks/useSidebarTriage";
+import {
+  EMPTY_SELECTION,
+  classifyClick,
+  selectionReducer,
+} from "../lib/sidebarSelection";
+import {
+  bucketSelectionForBulk,
+  summarizeBulkResults,
+} from "../lib/sidebarBulk";
+import { reportError, reportInfo } from "../lib/toastBus";
+import { BulkActionBar } from "./BulkActionBar";
+// Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
+// from this module; the definition now lives in `sidebarOptimistic.ts`.
+export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
@@ -328,17 +344,6 @@ function formatDurationSecondsShort(seconds: number): string {
   return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
-/** Wall-clock target for an optimistic snooze: `Date.now() + minutes
- *  * 60_000` as an RFC3339 ISO string. Sits outside the component so
- *  the `Date.now()` call doesn't trip
- *  `react-hooks/purity`; the event handler that calls it is itself a
- *  closure, not a render. The exact value is throwaway (the server's
- *  response on the next poll is the source of truth), so a few ms
- *  of jitter is harmless. See #1581. */
-export function makeOptimisticSnoozedUntil(minutes: number): string {
-  return new Date(Date.now() + minutes * 60_000).toISOString();
-}
-
 /** Compact "time remaining" label for the snooze chip computed once at
  *  render time (no per-second timer, by design: snooze rows poll the
  *  sessions API at the existing cadence and the static label is more
@@ -429,10 +434,19 @@ function SortableSessionRow({
   rowKey?: string;
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  isSelected: boolean;
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -554,17 +568,39 @@ function SortableRepoGroup({
 export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
-  onClick,
+  isSelected,
+  onActivate,
   onDelete,
   readOnly,
   indented,
+  optimistic,
+  onPinToggle,
+  onArchiveToggle,
+  onSnooze,
 }: {
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  // Whether this row is part of the sidebar multi-select. See #1724.
+  isSelected: boolean;
+  // Row click. The parent interprets the modifier keys (plain navigates,
+  // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
+  // than navigating directly. See #1724.
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
+  // Optimistic triage overlay for this row plus the parent-owned mutation
+  // callbacks. Triage state used to live in the row as three `useState`s;
+  // it now lives in the sidebar so bulk actions can drive many rows from
+  // one place. See #1724.
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(
@@ -661,25 +697,12 @@ export const SessionRow = memo(function SessionRow({
     await setSessionNotifications(sessionId, preset);
   };
 
-  // Triage actions (pin / archive / snooze). Optimistic state lets the
-  // glyph, chip, and tier flip immediately on click; on PATCH failure we
-  // revert and surface a toast. The optimistic snap clears itself once
-  // the next sessions-poll reflects the same value, so a successful
-  // round-trip is invisible to the user (just feels fast).
-  const [optimisticPinned, setOptimisticPinned] = useState<boolean | null>(
-    null,
-  );
-  const [optimisticArchived, setOptimisticArchived] = useState<boolean | null>(
-    null,
-  );
-  // Optimistic `snoozed_until` override. `undefined` = no override
-  // (use the prop), a string = pretend the server already returned
-  // this RFC3339 timestamp, `null` = pretend the server already
-  // unsnoozed. Clears once the prop matches the override on the next
-  // poll, matching the pin / archive pattern above.
-  const [optimisticSnoozedUntil, setOptimisticSnoozedUntil] = useState<
-    string | null | undefined
-  >(undefined);
+  // Triage actions (pin / archive / snooze). The optimistic overlay and the
+  // network calls live in the sidebar parent now (keyed by workspace id) so
+  // a bulk action can drive many rows at once; the row just closes its own
+  // menu/modal and delegates the mutation. See #1724. The optimistic snap
+  // still clears itself once the next sessions-poll reflects the same value,
+  // so a successful round-trip is invisible to the user (just feels fast).
   // Snooze duration picker. Lives in its own portal-rendered modal,
   // independent of the context menu's lifecycle so the parent-menu
   // dismissal listener cannot close the picker out from under us.
@@ -687,83 +710,21 @@ export const SessionRow = memo(function SessionRow({
   // Edit-workdir-name picker, also in its own portal-rendered modal so the
   // context-menu dismissal listener does not close it. See #1723.
   const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
-  useEffect(() => {
-    if (optimisticPinned !== null && optimisticPinned === isPinned) {
-      setOptimisticPinned(null);
-    }
-  }, [isPinned, optimisticPinned]);
-  useEffect(() => {
-    if (optimisticArchived !== null && optimisticArchived === isArchived) {
-      setOptimisticArchived(null);
-    }
-  }, [isArchived, optimisticArchived]);
-  useEffect(() => {
-    if (optimisticSnoozedUntil === undefined) return;
-    // Clear the override only when the server value actually matches
-    // it. A naive "both non-null" check used to fire prematurely
-    // when the user re-snoozed an already-snoozed row: the prop
-    // was still the OLD timestamp but non-null, the override was
-    // the NEW timestamp, the effect treated them as a match, and
-    // the chip snapped back to the stale time until the next
-    // poll. See #1581 CodeRabbit review.
-    if (optimisticSnoozedUntil === null && snoozedUntil == null) {
-      setOptimisticSnoozedUntil(undefined);
-      return;
-    }
-    if (
-      optimisticSnoozedUntil != null &&
-      snoozedUntil != null &&
-      snoozeTimestampCloseEnough(optimisticSnoozedUntil, snoozedUntil)
-    ) {
-      setOptimisticSnoozedUntil(undefined);
-    }
-  }, [snoozedUntil, optimisticSnoozedUntil]);
 
-  const togglePin = async () => {
+  const togglePin = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isPinned;
-    setOptimisticPinned(next);
-    const result = await setSessionPin(sessionId, next);
-    if (!result) {
-      setOptimisticPinned(null);
-      reportError(next ? "Failed to pin session" : "Failed to unpin session");
-    }
+    onPinToggle(workspace, !effectivePinnedOf(optimistic, isPinned));
   };
 
-  const toggleArchive = async () => {
+  const toggleArchive = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isArchived;
-    setOptimisticArchived(next);
-    const result = await setSessionArchive(sessionId, next);
-    if (!result) {
-      setOptimisticArchived(null);
-      reportError(
-        next ? "Failed to archive session" : "Failed to unarchive session",
-      );
-    }
+    onArchiveToggle(workspace, !effectiveArchivedOf(optimistic, isArchived));
   };
 
-  const applySnooze = async (minutes: number | null) => {
+  const applySnooze = (minutes: number | null) => {
     setContextMenu(null);
     setSnoozeModalOpen(false);
-    if (!sessionId) return;
-    // Optimistic flip: render the snooze chip + sink the row before
-    // the PATCH round-trip lands, matching the pin / archive
-    // affordance. For positive minutes we synthesise a target
-    // timestamp; the server is the source of truth and the value is
-    // discarded on the next poll, so a few ms of drift is harmless.
-    const optimisticUntil =
-      minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
-    setOptimisticSnoozedUntil(optimisticUntil);
-    const result = await setSessionSnooze(sessionId, minutes);
-    if (!result) {
-      setOptimisticSnoozedUntil(undefined);
-      reportError(
-        minutes == null ? "Failed to unsnooze session" : "Failed to snooze session",
-      );
-    }
+    onSnooze(workspace, minutes);
   };
 
   // Close the context menu first, then open the modal in the next
@@ -788,13 +749,10 @@ export const SessionRow = memo(function SessionRow({
   };
 
   // Effective state for rendering: optimistic overrides win until the
-  // prop catches up (cleared in the effects above).
-  const effectivePinned = optimisticPinned ?? isPinned;
-  const effectiveArchived = optimisticArchived ?? isArchived;
-  const effectiveSnoozedUntil = resolveEffectiveSnoozedUntil(
-    optimisticSnoozedUntil,
-    snoozedUntil,
-  );
+  // sidebar's overlay reconciler drops them once the prop catches up.
+  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
+  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
   const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -958,13 +916,9 @@ export const SessionRow = memo(function SessionRow({
         data-testid="sidebar-session-row"
         draggable={false}
         onClick={(e) => {
-          if (
-            e.button !== 0 ||
-            e.metaKey ||
-            e.ctrlKey ||
-            e.shiftKey ||
-            e.altKey
-          ) {
+          // Let the browser handle non-primary clicks (middle-click still
+          // opens the session href in a new tab) and Alt+click.
+          if (e.button !== 0 || e.altKey) {
             return;
           }
           if (isDeleting) {
@@ -975,22 +929,31 @@ export const SessionRow = memo(function SessionRow({
             e.preventDefault();
             return;
           }
+          // Primary click (plain or with Shift / Cmd / Ctrl): the parent
+          // decides navigate vs. select. Always preventDefault so a modifier
+          // click builds the selection instead of following the href.
           e.preventDefault();
-          onClick();
+          onActivate(e);
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
         onTouchMove={clearLongPress}
         onTouchCancel={clearLongPress}
+        data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           indented ? "pl-6 pr-3" : "px-3"
         } ${
           isActive
             ? "bg-surface-850 border-l-2 border-brand-600"
             : "border-l-2 border-transparent hover:bg-surface-700/40"
+        } ${
+          isSelected
+            ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10"
+            : ""
         } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
+        {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <span
             className={`text-sm shrink-0 leading-none font-mono ${textClass}`}
@@ -2147,6 +2110,28 @@ export function WorkspaceSidebar({
     [groups, onReorderWorkspaces, onReorderGroups],
   );
 
+  // All workspaces flattened across groups, deduped by id. A workspace can
+  // appear under more than one group (group axis), so without the dedupe the
+  // same id would surface twice in `selectedWorkspaces` and bulk actions
+  // would fan out to the same session more than once. First occurrence wins.
+  const allWorkspaces = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Workspace[] = [];
+    for (const g of groups) {
+      for (const v of g.workspaces) {
+        if (seen.has(v.workspace.id)) continue;
+        seen.add(v.workspace.id);
+        out.push(v.workspace);
+      }
+    }
+    return out;
+  }, [groups]);
+
+  // Optimistic triage overlay + single-id PATCH wiring, lifted out of
+  // SessionRow so single-row and (in #1724) bulk actions share one source of
+  // truth. Triage always targets the workspace's primary session.
+  const triage = useSidebarTriage(allWorkspaces);
+
   const q = filterQuery.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
@@ -2188,6 +2173,165 @@ export function WorkspaceSidebar({
   const hasResults = isNested
     ? filteredNested.length > 0
     : filteredGroups.length > 0;
+
+  // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
+  // or persisted); the anchor pivots Shift+click ranges. See #1724.
+  const [selection, dispatchSelection] = useReducer(
+    selectionReducer,
+    EMPTY_SELECTION,
+  );
+
+  // Workspace ids in the exact order they render, so a Shift+click range
+  // spans only what the user can see: collapsed groups and (when collapsed)
+  // the sunk section contribute no rows, and a filter trims to matches. This
+  // must mirror the render below; both walk filteredGroups the same way.
+  const flatRenderedOrder = useMemo(() => {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    // A workspace that renders under more than one group still resolves to a
+    // single selectable id, so the range order keeps only its first
+    // occurrence; pushing it twice would make Shift+range math ambiguous.
+    const push = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    };
+    for (const g of filteredGroups) {
+      if (!sidebarGroupHasLiveWorkspace(g)) continue;
+      const expanded = q ? true : !g.collapsed;
+      if (!expanded) continue;
+      for (const v of g.workspaces) {
+        if (!workspaceIsSunk(v.workspace)) push(v.workspace.id);
+      }
+    }
+    if (sunkExpanded) {
+      for (const g of filteredGroups) {
+        for (const v of g.workspaces) {
+          if (workspaceIsSunk(v.workspace)) push(v.workspace.id);
+        }
+      }
+    }
+    return ids;
+  }, [filteredGroups, q, sunkExpanded]);
+
+  // Drop selected ids for workspaces that no longer exist (a session was
+  // deleted or moved). Existence-based, not visibility-based: collapsing a
+  // group or filtering keeps the selection, matching file-manager behavior;
+  // only a vanished workspace is pruned. Range math above is already scoped
+  // to the visible order.
+  const existingWorkspaceIds = useMemo(
+    () => new Set(allWorkspaces.map((w) => w.id)),
+    [allWorkspaces],
+  );
+  useEffect(() => {
+    dispatchSelection({ type: "prune", validIds: existingWorkspaceIds });
+  }, [existingWorkspaceIds]);
+
+  const clearSelection = useCallback(
+    () => dispatchSelection({ type: "clear" }),
+    [],
+  );
+
+  // Read-only viewers can't act on a selection (the bulk bar is hidden), so
+  // never let one accumulate: drop any existing selection when read-only
+  // turns on. Row clicks are forced down the navigate path below.
+  useEffect(() => {
+    if (readOnly) dispatchSelection({ type: "clear" });
+  }, [readOnly]);
+
+  // Selected workspaces (existing ones only) and their per-action eligibility
+  // buckets, for the bulk bar. Deduped against existence so a stale id never
+  // resolves to a phantom workspace.
+  const selectedWorkspaces = useMemo(
+    () => allWorkspaces.filter((w) => selection.selectedIds.has(w.id)),
+    [allWorkspaces, selection.selectedIds],
+  );
+  const bulkBuckets = useMemo(
+    () => bucketSelectionForBulk(selectedWorkspaces, triage.optimisticFor),
+    [selectedWorkspaces, triage],
+  );
+
+  // Run a bulk triage action over its eligible subset, then summarize and
+  // clear the selection. One summary toast instead of per-row toasts.
+  const runBulkAction = useCallback(
+    async (
+      verb: string,
+      run: () => Promise<readonly { ok: boolean; skipped?: boolean }[]>,
+    ) => {
+      const results = await run();
+      const summary = summarizeBulkResults(verb, results);
+      if (results.some((r) => !r.ok && !r.skipped)) reportError(summary);
+      else reportInfo(summary);
+      clearSelection();
+    },
+    [clearSelection],
+  );
+
+  const onBulkPin = useCallback(
+    (wss: Workspace[], pinned: boolean) =>
+      void runBulkAction(pinned ? "Pinned" : "Unpinned", () =>
+        triage.bulkPin(wss, pinned),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkArchive = useCallback(
+    (wss: Workspace[], archived: boolean) =>
+      void runBulkAction(archived ? "Archived" : "Unarchived", () =>
+        triage.bulkArchive(wss, archived),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkSnooze = useCallback(
+    (wss: Workspace[], minutes: number | null) =>
+      void runBulkAction(minutes == null ? "Unsnoozed" : "Snoozed", () =>
+        triage.bulkSnooze(wss, minutes),
+      ),
+    [runBulkAction, triage],
+  );
+
+  // Interpret a row click: plain click clears the selection and navigates
+  // (today's behavior), modifier clicks build the selection instead. The row
+  // has already guarded button / deleting / drag, and called preventDefault.
+  const handleRowActivate = useCallback(
+    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+      // Read-only: ignore modifier gestures entirely and always navigate, so
+      // no hidden selection state can build up.
+      if (readOnly) {
+        dispatchSelection({ type: "clear" });
+        setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+        onSelect(workspaceId);
+        return;
+      }
+      const intent = classifyClick(e);
+      switch (intent) {
+        case "navigate":
+          dispatchSelection({ type: "clear" });
+          setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+          onSelect(workspaceId);
+          break;
+        case "toggle":
+          dispatchSelection({ type: "toggle", id: workspaceId });
+          break;
+        case "range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: false,
+          });
+          break;
+        case "additive-range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: true,
+          });
+          break;
+      }
+    },
+    [activeId, onSelect, flatRenderedOrder, readOnly],
+  );
 
   const toggleFilter = () => {
     setFilterOpen((o) => {
@@ -2378,6 +2522,18 @@ export function WorkspaceSidebar({
           </div>
         )}
 
+        {!readOnly && (
+          <BulkActionBar
+            selectedCount={selection.selectedIds.size}
+            buckets={bulkBuckets}
+            snoozePresets={SNOOZE_PRESETS}
+            onBulkPin={onBulkPin}
+            onBulkArchive={onBulkArchive}
+            onBulkSnooze={onBulkSnooze}
+            onClear={clearSelection}
+          />
+        )}
+
         <div className="flex-1 overflow-y-auto overflow-x-hidden">
           {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
@@ -2447,15 +2603,21 @@ export function WorkspaceSidebar({
                                 isActive={
                                   v.workspace.id === displayedActiveId
                                 }
-                                onClick={() => {
-                                  setOptimisticActive({
-                                    id: v.workspace.id,
-                                    fromActiveId: activeId,
-                                  });
-                                  onSelect(v.workspace.id);
-                                }}
+                                isSelected={
+                                  !readOnly &&
+                                  selection.selectedIds.has(v.workspace.id)
+                                }
+                                onActivate={(e) =>
+                                  handleRowActivate(v.workspace.id, e)
+                                }
                                 onDelete={onDeleteSession}
                                 readOnly={readOnly}
+                                optimistic={triage.optimisticFor(
+                                  v.workspace.id,
+                                )}
+                                onPinToggle={triage.pinToggle}
+                                onArchiveToggle={triage.archiveToggle}
+                                onSnooze={triage.snooze}
                                 // Drag is disabled when the tier
                                 // comparator already controls placement:
                                 // lastActivity mode has no manual
@@ -2576,15 +2738,21 @@ export function WorkspaceSidebar({
                                     isActive={
                                       v.workspace.id === displayedActiveId
                                     }
-                                    onClick={() => {
-                                      setOptimisticActive({
-                                        id: v.workspace.id,
-                                        fromActiveId: activeId,
-                                      });
-                                      onSelect(v.workspace.id);
-                                    }}
+                                    isSelected={
+                                      !readOnly &&
+                                      selection.selectedIds.has(v.workspace.id)
+                                    }
+                                    onActivate={(e) =>
+                                      handleRowActivate(v.workspace.id, e)
+                                    }
                                     onDelete={onDeleteSession}
                                     readOnly={readOnly}
+                                    optimistic={triage.optimisticFor(
+                                      v.workspace.id,
+                                    )}
+                                    onPinToggle={triage.pinToggle}
+                                    onArchiveToggle={triage.archiveToggle}
+                                    onSnooze={triage.snooze}
                                     indented
                                   />
                                 ))}
@@ -2651,15 +2819,16 @@ export function WorkspaceSidebar({
                       key={v.key}
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
-                      onClick={() => {
-                        setOptimisticActive({
-                          id: v.workspace.id,
-                          fromActiveId: activeId,
-                        });
-                        onSelect(v.workspace.id);
-                      }}
+                      isSelected={
+                        !readOnly && selection.selectedIds.has(v.workspace.id)
+                      }
+                      onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
+                      optimistic={triage.optimisticFor(v.workspace.id)}
+                      onPinToggle={triage.pinToggle}
+                      onArchiveToggle={triage.archiveToggle}
+                      onSnooze={triage.snooze}
                       indented
                     />
                   ))}
