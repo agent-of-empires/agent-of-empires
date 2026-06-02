@@ -378,7 +378,7 @@ const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from
 /// against the adapter ignoring the signal, not against socket /
 /// stdout / process-level wedges that prevent the PromptResponse from
 /// reaching the daemon at all. See #1196.
-const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Vendor-agnostic silent-orphan grace fallback used when no config
 /// value is available. Mirrors `CockpitConfig::silent_orphan_grace_secs`
@@ -683,6 +683,25 @@ impl SilentOrphanWatchdog {
             }
             LifecycleSignal::TerminalUsage => {
                 self.cost_seen = true;
+                // A cost-resolved UsageUpdate is the end-of-turn marker
+                // (mid-turn usages carry `cost: null`, see #1360). A
+                // backgrounded command is fire-and-forget: the agent
+                // launches it and moves on, so it legitimately outlives
+                // the turn and its suppression is moot once the turn
+                // ends. Drop it here, otherwise `effective_grace` keeps
+                // the 30-minute floor and a turn that streamed its final
+                // usage but never returned the PromptResponse hangs for
+                // half an hour instead of recovering on the fast grace
+                // (#1858). Self-correcting: if the turn somehow
+                // continues, the next Progress / ToolStarted /
+                // ToolCompleted clears `cost_seen` and the next
+                // backgrounded tool re-arms suppression. An AsyncAgent
+                // await blocks the turn (the agent idles waiting and
+                // resumes in-band), so its floor is left intact to
+                // preserve the #1360 fix.
+                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
+                    self.off_protocol_work_seen = None;
+                }
             }
             LifecycleSignal::WakeupPending { at } => {
                 self.saw_first_progress = true;
@@ -5537,7 +5556,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_background_command_lifts_grace_above_fast_grace() {
+    async fn watchdog_terminal_usage_clears_background_command_suppression() {
+        // Regression for #1858. A backgrounded command lifts the grace to
+        // the 30-minute off-protocol floor mid-turn (so a legit `cmd &`
+        // is not killed), but a backgrounded command is fire-and-forget
+        // and outlives the turn. Once the cost-resolved UsageUpdate
+        // (TerminalUsage, the end-of-turn marker) arrives, the floor must
+        // drop so a turn that streamed its final usage but never returned
+        // the PromptResponse recovers on the fast grace instead of
+        // hanging for 30 minutes.
         let cfg = watchdog_test_cfg();
         let t0 = tokio::time::Instant::now();
         let wall = chrono::Utc::now();
@@ -5564,19 +5591,76 @@ mod tests {
             wall,
             cfg,
         );
+        // Before the terminal usage the floor holds: 60s in must not fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
         w.apply_signal(
             LifecycleSignal::TerminalUsage,
             t0 + std::time::Duration::from_secs(3),
             wall,
             cfg,
         );
-        // 60s after last progress: well past fast grace (20s) and past
-        // base grace (120s)? No. Past fast but inside base. Off-protocol
-        // floor lifts grace to 30 min so we must NOT fire here.
+        // TerminalUsage cleared the background-command suppression.
+        assert!(w.off_protocol_work_seen().is_none());
+        // Now the fast grace (20s) applies, measured from the last
+        // progress at t0+2s. Inside the window: no fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(10), cfg));
+        // Past the fast grace (elapsed 23s > 20s): the wedge recovers
+        // instead of waiting out the 30-minute floor.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_terminal_usage_then_background_command_rearms_floor() {
+        // Self-correction: TerminalUsage clearing background suppression
+        // must not be permanent. If activity resumes after the terminal
+        // usage (cost_seen flips false on Progress) and a new backgrounded
+        // command completes, the off-protocol floor re-arms.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-a".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(w.off_protocol_work_seen().is_none());
+        // Turn continues: more progress, then another backgrounded tool.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-b".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(4),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "a fresh backgrounded command after terminal usage must re-arm the floor",
+        );
+        // Floor is back: must not fire well past the fast grace.
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
-        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
-        // Past the 30-min floor: watchdog finally recovers.
-        assert!(w.should_fire(t0 + std::time::Duration::from_secs(60 * 35), cfg));
     }
 
     #[tokio::test]
