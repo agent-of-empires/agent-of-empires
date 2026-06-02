@@ -1339,11 +1339,10 @@ impl HomeView {
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
         // Outside live-send, captures fork a fresh `tmux capture-pane` so we
-        // throttle to 250ms (4 Hz). Inside agent live-send the fork moves off
-        // the render thread entirely: `LiveCaptureWorker` keeps the cache
-        // fresh on its own thread and the block below just applies the newest
-        // content (the core's `force` flag and the synchronous fork remain
-        // for non-agent live-send targets and the throttled non-live path).
+        // throttle to 250ms (4 Hz). Inside live-send the fork moves off the
+        // render thread entirely for the active target:
+        // `LiveCaptureWorker` keeps the cache fresh on its own thread and
+        // the target-specific branch applies the newest content.
         // This replaced the old per-frame on-thread fork, which the
         // `tui.render` trace measured at ~8.5ms on macOS (~90% of a frame).
         // Control-mode capture was removed with the rest of the `tmux -C`
@@ -1434,8 +1433,7 @@ impl HomeView {
 
         // Captures otherwise go through the fork-based path
         // (`Session::capture_pane_with_size` via the instance helper); the
-        // synchronous path runs outside live-send (250ms-throttled) and for
-        // non-agent live-send targets, which don't force-refresh per frame.
+        // synchronous path runs outside live-send (250ms-throttled).
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
         // capture (which is what `Session::capture_pane_with_size` returns when
@@ -1489,6 +1487,32 @@ impl HomeView {
         // the visible output area so a window resize or info-header toggle
         // reflows the shell instead of waiting for a live-mode re-enter.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
+        let terminal_live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| s.target == live_send::LiveSendTarget::Terminal);
+        if terminal_live {
+            if let Some(id) = self.selected_session.clone() {
+                let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
+                let latest = self.live_capture_worker.as_ref().map(|worker| {
+                    worker.set_capture_lines(capture_lines);
+                    worker.take_latest()
+                });
+                if let Some(latest) = latest {
+                    if let Some(content) = latest {
+                        let captured_lines =
+                            self.terminal_preview_cache
+                                .store_capture(content, id, (width, height));
+                        self.preview_scroll_offset = clamp_scroll_to_capture(
+                            self.preview_scroll_offset,
+                            captured_lines,
+                            self.preview_visible_rows,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
         self.refresh_preview_cache_core(
             width,
             height,
@@ -1515,6 +1539,34 @@ impl HomeView {
             width,
             height,
         );
+        let container_live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| s.target == live_send::LiveSendTarget::ContainerTerminal);
+        if container_live {
+            if let Some(id) = self.selected_session.clone() {
+                let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
+                let latest = self.live_capture_worker.as_ref().map(|worker| {
+                    worker.set_capture_lines(capture_lines);
+                    worker.take_latest()
+                });
+                if let Some(latest) = latest {
+                    if let Some(content) = latest {
+                        let captured_lines = self.container_terminal_preview_cache.store_capture(
+                            content,
+                            id,
+                            (width, height),
+                        );
+                        self.preview_scroll_offset = clamp_scroll_to_capture(
+                            self.preview_scroll_offset,
+                            captured_lines,
+                            self.preview_visible_rows,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
         self.refresh_preview_cache_core(
             width,
             height,

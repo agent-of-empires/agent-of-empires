@@ -2948,15 +2948,17 @@ impl HomeView {
             // against the old session before we reset its sizing.
             self.live_send_worker = None;
             // Stop the old session's capture worker too; a fresh one
-            // (if the new target is the agent) is spawned below.
+            // for the new live target is spawned below.
             self.live_capture_worker = None;
-            // Drop the previous session's cached preview so the first
+            // Drop the previous session's cached previews so the first
             // frames after the switch don't paint session A's content
-            // under session B's header while B's capture worker spins up.
+            // under session B's header while the capture worker spins up.
             // (The synchronous path got this for free via its cross-session
             // kill-switch branch; the worker path applies content lazily,
             // so clear it explicitly here.)
             self.preview_cache = PreviewCache::default();
+            self.terminal_preview_cache = PreviewCache::default();
+            self.container_terminal_preview_cache = PreviewCache::default();
             if let Some(name) = &prev_tmux_name {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
@@ -2996,24 +2998,23 @@ impl HomeView {
             exit_chords,
             leader,
         });
+        // Spawn the off-thread preview capture first so the send worker can
+        // wake it after each dispatched batch. That keeps echo latency tied
+        // to actual input rather than the background capture phase.
+        self.live_capture_worker = Some(live_send::LiveCaptureWorker::spawn(tmux_name.clone()));
+        let capture_wake = self
+            .live_capture_worker
+            .as_ref()
+            .map(live_send::LiveCaptureWorker::waker);
         // Spawn the background worker that dispatches translated
         // keystrokes as one-shot `tmux send-keys` subprocesses (the
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name.clone()));
-        // Spawn the off-thread preview capture only for the agent target:
-        // it's the one preview that force-refreshes every frame in
-        // live-send, so it's the only path paying the per-frame
-        // capture-pane fork. `tmux_name` is the agent session here.
-        self.live_capture_worker = match target {
-            live_send::LiveSendTarget::Agent => {
-                Some(live_send::LiveCaptureWorker::spawn(tmux_name))
-            }
-            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
-                None
-            }
-        };
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(
+            tmux_name.clone(),
+            capture_wake,
+        ));
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

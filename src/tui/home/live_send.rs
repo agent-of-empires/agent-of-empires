@@ -411,7 +411,7 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(tmux_name: String) -> Self {
+    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
             // Block until the first message, then drain anything else
@@ -426,6 +426,9 @@ impl LiveSendWorker {
                     batch.push(msg);
                 }
                 dispatch_batch(&tmux_name, batch);
+                if let Some(wake) = &capture_wake {
+                    wake.wake();
+                }
             }
         });
         Self { tx }
@@ -462,20 +465,25 @@ impl LiveSendWorker {
 /// forks, since the render only paints every ~33ms anyway).
 const LIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Off-thread preview capture for agent live-send. Spawned alongside
-/// [`LiveSendWorker`] when live-send targets the agent pane, it forks
-/// `tmux capture-pane` on its own thread and publishes fresh pane content
-/// into a single-slot mailbox the render loop drains. The render loop
-/// applies the latest content without forking, which is what moves the
-/// per-frame capture cost (~8.5ms measured on macOS, ~90% of a live-send
-/// frame) off the hot path. Dropping the worker flips `stop` so the
-/// thread exits after its current cycle; like `LiveSendWorker` we don't
-/// join.
-///
-/// Scoped to the agent target on purpose: only the agent preview
-/// force-refreshes every frame in live-send (the terminal/container/tool
-/// previews stay 250ms-throttled), so it's the only path paying the
-/// per-frame fork. Non-agent targets keep the synchronous capture.
+#[derive(Clone)]
+pub(in crate::tui) struct LiveCaptureWake {
+    tx: Sender<()>,
+}
+
+impl LiveCaptureWake {
+    fn wake(&self) {
+        let _ = self.tx.send(());
+    }
+}
+
+/// Off-thread preview capture for live-send. Spawned alongside
+/// [`LiveSendWorker`] for the targeted tmux pane, it forks
+/// `tmux capture-pane` on its own thread and publishes fresh pane
+/// content into a single-slot mailbox the render loop drains. The render
+/// loop applies the latest content without forking, which moves the
+/// per-frame capture cost off the hot path. Dropping the worker flips
+/// `stop` so the thread exits after its current cycle; like
+/// `LiveSendWorker` we don't join.
 pub(in crate::tui) struct LiveCaptureWorker {
     /// Lines the render loop wants captured (height + scrollback + buffer).
     /// `0` means "not set yet"; the worker skips capturing until the first
@@ -487,11 +495,13 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// the render thread stalls.
     latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake_tx: Sender<()>,
 }
 
 impl Drop for LiveCaptureWorker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.wake_tx.send(());
     }
 }
 
@@ -502,6 +512,7 @@ impl LiveCaptureWorker {
         let capture_lines = Arc::new(AtomicUsize::new(0));
         let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let (wake_tx, wake_rx) = channel::<()>();
         let lines_cell = capture_lines.clone();
         let slot = latest.clone();
         let stop_flag = stop.clone();
@@ -525,13 +536,24 @@ impl LiveCaptureWorker {
                         }
                     }
                 }
-                std::thread::sleep(LIVE_CAPTURE_INTERVAL);
+                match wake_rx.recv_timeout(LIVE_CAPTURE_INTERVAL) {
+                    Ok(_) => while wake_rx.try_recv().is_ok() {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
         Self {
             capture_lines,
             latest,
             stop,
+            wake_tx,
+        }
+    }
+
+    pub(in crate::tui) fn waker(&self) -> LiveCaptureWake {
+        LiveCaptureWake {
+            tx: self.wake_tx.clone(),
         }
     }
 
