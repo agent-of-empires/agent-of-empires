@@ -246,7 +246,7 @@ export function SettingsView({
   );
 
   const renderTabContent = () => {
-    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "cockpit") {
+    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "cockpit" && activeTab !== "telemetry") {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 

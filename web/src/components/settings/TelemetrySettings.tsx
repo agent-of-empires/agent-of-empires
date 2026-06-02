@@ -17,9 +17,15 @@ export function TelemetrySettings() {
 
   useEffect(() => {
     let active = true;
-    void fetchTelemetryStatus().then((s) => {
-      if (active) setStatus(s);
-    });
+    void (async () => {
+      try {
+        const s = await fetchTelemetryStatus();
+        if (active) setStatus(s);
+      } catch {
+        // fetchTelemetryStatus already swallows network errors and returns
+        // null, but guard here too so a throw can never leave the panel blank.
+      }
+    })();
     return () => {
       active = false;
     };
@@ -27,9 +33,13 @@ export function TelemetrySettings() {
 
   const onToggle = async (enabled: boolean) => {
     setSaving(true);
-    const next = await setTelemetryConsent(enabled);
-    if (next) setStatus(next);
-    setSaving(false);
+    try {
+      const next = await setTelemetryConsent(enabled);
+      if (next) setStatus(next);
+    } finally {
+      // Always clear the saving flag so the toggle can't get stuck disabled.
+      setSaving(false);
+    }
   };
 
   const dnt = status?.do_not_track ?? false;

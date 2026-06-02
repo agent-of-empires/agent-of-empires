@@ -37,7 +37,9 @@ describe("TelemetrySettings contract", () => {
   it("toggling on calls setTelemetryConsent(true)", async () => {
     fetchTelemetryStatus.mockResolvedValue(status({ enabled: false }));
     const { container } = render(<TelemetrySettings />);
-    await waitFor(() => fetchTelemetryStatus.mock.calls.length > 0);
+    await waitFor(() => {
+      expect(fetchTelemetryStatus).toHaveBeenCalled();
+    });
 
     const toggle = container.querySelector(
       "button[role=switch]",
@@ -53,7 +55,7 @@ describe("TelemetrySettings contract", () => {
       const t = container.querySelector(
         "button[role=switch]",
       ) as HTMLButtonElement | null;
-      return t?.getAttribute("aria-checked") === "true";
+      expect(t?.getAttribute("aria-checked")).toBe("true");
     });
 
     const toggle = container.querySelector(

@@ -56,13 +56,13 @@ export function TelemetryConsentModal({ onChoose }: Props) {
           <button
             ref={declineRef}
             onClick={() => onChoose(false)}
-            className="px-4 py-2 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors cursor-pointer"
+            className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer"
           >
             Not now
           </button>
           <button
             onClick={() => onChoose(true)}
-            className="px-4 py-2 rounded-md bg-brand-600 text-sm text-white hover:bg-brand-500 transition-colors cursor-pointer"
+            className="h-8 px-3 rounded-md bg-brand-600 text-sm text-white hover:bg-brand-500 transition-colors duration-150 cursor-pointer"
           >
             Enable telemetry
           </button>

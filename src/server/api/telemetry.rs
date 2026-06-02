@@ -85,12 +85,21 @@ pub struct SeenRequest {
 }
 
 /// Record that the web dashboard / cockpit web UI was opened. Folded into the
-/// daemon's next opt-in snapshot. A no-op (still 200) when telemetry is off so
-/// the client need not branch on consent state.
+/// daemon's next opt-in snapshot. Returns 204 on success; the client need not
+/// branch on consent state (the daemon only sends the flag when opted in).
 pub async fn post_telemetry_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SeenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
     let Json(req) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),

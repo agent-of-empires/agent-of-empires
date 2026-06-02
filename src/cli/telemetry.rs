@@ -48,9 +48,13 @@ fn run_status() -> Result<()> {
         println!("Telemetry: disabled (default)");
     }
 
-    match endpoint {
-        Some(ep) => println!("  endpoint: {ep}"),
-        None => println!("  endpoint: (none configured; nothing is sent)"),
+    let overridden = std::env::var("AOE_TELEMETRY_ENDPOINT")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if overridden {
+        println!("  endpoint: {endpoint}  (overridden via AOE_TELEMETRY_ENDPOINT)");
+    } else {
+        println!("  endpoint: {endpoint}  (default)");
     }
     Ok(())
 }
@@ -74,6 +78,12 @@ fn run_set_enabled(enabled: bool) -> Result<()> {
                 println!("  anonymous install id: {id}");
             }
         }
+    } else if crate::telemetry::install_id().is_some() {
+        // apply_opt_in_change only logs delete failures, so confirm rather
+        // than assume the file is gone.
+        println!(
+            "Telemetry disabled, but the local install id could not be removed; see the debug log."
+        );
     } else {
         println!("Telemetry disabled. The local install id has been deleted.");
     }
@@ -92,7 +102,13 @@ fn run_reset_id() -> Result<()> {
         return Ok(());
     }
     match crate::telemetry::reset_install_id() {
-        Some(id) => println!("Generated a fresh anonymous install id: {id}"),
+        Some(id) => {
+            println!("Generated a fresh anonymous install id: {id}");
+            println!(
+                "Note: the old id is gone, so this install now counts as a new one in \
+                 aggregate stats (distinct-install and retention counts)."
+            );
+        }
         None => println!("Could not generate a new install id."),
     }
     Ok(())

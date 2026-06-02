@@ -37,10 +37,13 @@ impl TelemetryConsentDialog {
         match key.code {
             // Esc is the standard cancel; treat it as a decline.
             KeyCode::Esc => DialogResult::Submit(false),
-            // Enter only confirms once a side has been chosen; with no focus
-            // it is a no-op so the user can't blow past the prompt.
+            // Enter confirms a chosen side. With no choice it is a no-op so the
+            // user can't blow past the prompt, EXCEPT under DO_NOT_TRACK, where
+            // the dialog shows no buttons and explicitly says "Press Enter or
+            // Esc to dismiss", so Enter must dismiss (as a decline).
             KeyCode::Enter | KeyCode::Char(' ') => match self.selected {
                 Some(choice) => DialogResult::Submit(choice),
+                None if crate::telemetry::do_not_track() => DialogResult::Submit(false),
                 None => DialogResult::Continue,
             },
             KeyCode::Left | KeyCode::Char('h') => {
@@ -263,6 +266,7 @@ impl TelemetryConsentDialog {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use serial_test::serial;
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -294,10 +298,14 @@ mod tests {
         assert_eq!(TelemetryConsentDialog::new().selected, None);
     }
 
+    // `#[serial]` because `handle_key` reads the `DO_NOT_TRACK` env var, which
+    // other telemetry tests mutate; serializing keeps it deterministic.
     #[test]
+    #[serial]
     fn enter_with_no_focus_is_inert() {
         // The whole point of no default focus: a reflexive Enter must not
         // dismiss the prompt until the user has chosen a side.
+        unsafe { std::env::remove_var("DO_NOT_TRACK") };
         let mut d = TelemetryConsentDialog::new();
         assert!(matches!(
             d.handle_key(k(KeyCode::Enter)),
@@ -307,6 +315,18 @@ mod tests {
             d.handle_key(k(KeyCode::Char(' '))),
             DialogResult::Continue
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn enter_dismisses_under_do_not_track() {
+        // Under DO_NOT_TRACK the popup shows no buttons and says "Press Enter
+        // or Esc to dismiss", so Enter with no selection must decline-dismiss.
+        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let mut d = TelemetryConsentDialog::new();
+        let result = d.handle_key(k(KeyCode::Enter));
+        unsafe { std::env::remove_var("DO_NOT_TRACK") };
+        assert!(matches!(result, DialogResult::Submit(false)));
     }
 
     #[test]

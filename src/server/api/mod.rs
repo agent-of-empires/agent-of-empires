@@ -308,6 +308,11 @@ mod tests {
                 include_str!("../push.rs"),
                 &["subscribe", "unsubscribe", "test"],
             ),
+            (
+                "api/telemetry.rs",
+                include_str!("telemetry.rs"),
+                &["set_telemetry_consent", "post_telemetry_seen"],
+            ),
         ];
 
         let guard_patterns: &[&str] = &[

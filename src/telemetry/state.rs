@@ -91,7 +91,9 @@ pub fn delete_install_id() -> Result<()> {
 /// `aoe telemetry reset-id`. Returns the new id, or `None` if suppressed by
 /// `DO_NOT_TRACK`.
 pub fn reset_install_id() -> Option<String> {
-    let _ = delete_install_id();
+    if let Err(e) = delete_install_id() {
+        tracing::debug!(target: "telemetry", "failed to delete install id during reset: {e}");
+    }
     ensure_install_id()
 }
 

@@ -525,6 +525,13 @@ impl SettingsView {
 
         match self.scope {
             SettingsScope::Global => {
+                // Saving the Telemetry page counts as answering the opt-in
+                // prompt even if the toggle was left untouched, so the one-time
+                // standalone popup doesn't reappear for someone who reviewed it
+                // here and chose to leave it off.
+                if self.current_category() == SettingsCategory::Telemetry {
+                    self.global_config.app_state.has_responded_to_telemetry = true;
+                }
                 save_config(&self.global_config)?;
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);

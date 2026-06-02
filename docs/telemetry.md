@@ -42,7 +42,9 @@ Counting distinct installs needs a stable id. On opt-in, aoe generates a random
 `uuid::Uuid::new_v4()` and stores it in `<app_dir>/telemetry.json` (owner-only).
 It is kept **out of `config.toml`** on purpose, since people routinely paste
 their config into bug reports. Opting out deletes the file; `aoe telemetry
-reset-id` rotates it.
+reset-id` rotates it. Resetting mints a brand-new id, so that install then
+counts as a new one in the aggregate distinct-install and retention numbers;
+only reset if you actually want to disassociate from prior counts.
 
 ## Controlling it
 
@@ -71,13 +73,20 @@ on exit, or crashes the tool. There is no retry, no offline buffering.
 
 ## Backend
 
-The client is **backend-neutral**. The send endpoint is read from the
-`AOE_TELEMETRY_ENDPOINT` environment variable; there is no hardcoded server.
-With no endpoint configured, nothing is ever sent even when opted in. The web
-dashboard never posts to the telemetry backend directly (that would leak the
+Opted-in events go to the collection gateway at
+`https://telemetry.agent-of-empires.com/v1/ingest`. The gateway validates the
+envelope and re-sanitizes every field as a defense-in-depth backstop, then
+folds the payload into aggregate counts. `AOE_TELEMETRY_ENDPOINT` overrides the
+target (point it at a local sink to see exactly what is sent). A compiled-in
+`X-Telemetry-Key` header lets the gateway drop unkeyed drive-by traffic; it is
+visible in the source, so it is noise-shedding, not authentication.
+
+The web dashboard never posts to the gateway directly (that would leak the
 browser's IP and User-Agent); it reports local state to `aoe serve`, which owns
 the install id and does all sending.
 
-The collection service lives in a separate repository and is wired in by
-pointing `AOE_TELEMETRY_ENDPOINT` at it; until then opting in is a no-op beyond
-generating the local install id.
+**Schema contract.** The wire format is the flat, closed schema in
+`src/telemetry/events.rs`, mirrored by the gateway. New fields must be counts,
+booleans, or short identifier-like strings (and the two allowlisted bucket
+maps); the gateway drops free text, paths, branch-name-like strings, and any
+nested object, so anything richer than a count or flag will not survive ingest.

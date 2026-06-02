@@ -5,14 +5,15 @@
 //!   [`crate::session::TelemetryConfig::enabled`] in any settings surface.
 //! - **`DO_NOT_TRACK` is absolute.** When set (`1` / `true` / `yes`), it
 //!   suppresses both sending and install-id generation regardless of config.
-//! - **Backend-neutral.** The send endpoint is resolved from
-//!   `AOE_TELEMETRY_ENDPOINT`; there is no hardcoded server. With no endpoint
-//!   configured, nothing is ever sent (the collection infra lives in a
-//!   separate private repo). The opt-in state and install id still work, so
-//!   the consent surfaces and tests are exercised without a live backend.
-//! - **Fire-and-forget.** Sends run detached with a hard timeout and swallow
-//!   every error (logged only at `debug`, `target: "telemetry"`). Telemetry
-//!   must never slow, stall, or crash the tool.
+//! - **Endpoint.** Opted-in sends go to the collection gateway at
+//!   [`DEFAULT_ENDPOINT`] (which validates and re-sanitizes as a backstop);
+//!   `AOE_TELEMETRY_ENDPOINT` overrides it, e.g. to point at a local sink. A
+//!   compiled-in [`TELEMETRY_KEY`] is sent as `X-Telemetry-Key` so the gateway
+//!   can shed drive-by noise (it is visible in source, so not real auth).
+//! - **Fire-and-forget.** Sends run detached with a hard timeout (plus a short
+//!   connect timeout so a down endpoint fails fast) and swallow every error
+//!   (logged only at `debug`, `target: "telemetry"`). Telemetry must never
+//!   slow, stall, or crash the tool.
 //! - **Sanitized.** No content ever leaves [`sanitize`]: agent/model strings
 //!   are coerced to a closed allowlist; raw commands, paths, titles, branch
 //!   names, and prompts are never emitted.
@@ -34,6 +35,22 @@ use crate::session::Instance;
 /// the CLI's exit or a daemon tick beyond this.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Connect timeout for the send. Much shorter than [`SEND_TIMEOUT`] so a
+/// black-holed or slow-DNS endpoint fails in well under a second rather than
+/// costing a CLI run the full send budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Default collection gateway. Overridable via `AOE_TELEMETRY_ENDPOINT` (handy
+/// for pointing at a local sink to inspect what is sent). The gateway
+/// validates the envelope and re-sanitizes every field as a defense-in-depth
+/// backstop. Nothing reaches it unless the user has opted in.
+const DEFAULT_ENDPOINT: &str = "https://telemetry.agent-of-empires.com/v1/ingest";
+
+/// Static key sent as `X-Telemetry-Key`. NOT authentication: it is visible in
+/// this source, so it only lets the gateway drop unkeyed drive-by traffic. The
+/// gateway must be configured to require this exact value.
+const TELEMETRY_KEY: &str = "7bc5a4e45ce861662b9690a7105da988";
+
 /// CLI `process_start` is the only unbounded event source (one per `aoe`
 /// invocation), so it is throttled to at most once per install per day. That
 /// still answers "did this install run the CLI today" without a POST per
@@ -52,13 +69,15 @@ pub fn do_not_track() -> bool {
     }
 }
 
-/// The configured send endpoint, if any. Resolved from `AOE_TELEMETRY_ENDPOINT`.
-/// Empty/whitespace is treated as unset.
-pub fn endpoint() -> Option<String> {
-    std::env::var("AOE_TELEMETRY_ENDPOINT")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// The send endpoint. `AOE_TELEMETRY_ENDPOINT` overrides when set to a
+/// non-empty value; otherwise the compiled-in [`DEFAULT_ENDPOINT`] is used.
+/// Always returns a target, so the opt-in gate (not a missing endpoint) is
+/// what decides whether anything is sent.
+pub fn endpoint() -> String {
+    match std::env::var("AOE_TELEMETRY_ENDPOINT") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_ENDPOINT.to_string(),
+    }
 }
 
 /// Consent state, ignoring whether a backend is wired. True when the user has
@@ -194,15 +213,14 @@ pub fn build_usage_snapshot(
     })
 }
 
-/// POST a serialized event to the configured endpoint. No-op when no endpoint
-/// is configured. Every error is swallowed and logged at `debug` only.
+/// POST a serialized event to the endpoint. Every error is swallowed and
+/// logged at `debug` only. Bounded by both a short connect timeout and the
+/// overall [`SEND_TIMEOUT`] so a down endpoint can never delay the caller.
 async fn post<T: serde::Serialize>(event: &T) {
-    let Some(endpoint) = endpoint() else {
-        tracing::debug!(target: "telemetry", "no AOE_TELEMETRY_ENDPOINT configured; not sending");
-        return;
-    };
+    let endpoint = endpoint();
     let client = match reqwest::Client::builder()
         .user_agent(concat!("agent-of-empires/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
         .timeout(SEND_TIMEOUT)
         .build()
     {
@@ -212,7 +230,13 @@ async fn post<T: serde::Serialize>(event: &T) {
             return;
         }
     };
-    match client.post(&endpoint).json(event).send().await {
+    match client
+        .post(&endpoint)
+        .header("X-Telemetry-Key", TELEMETRY_KEY)
+        .json(event)
+        .send()
+        .await
+    {
         Ok(resp) => tracing::debug!(target: "telemetry", status = %resp.status(), "telemetry sent"),
         Err(e) => tracing::debug!(target: "telemetry", "telemetry send failed: {e}"),
     }
@@ -227,9 +251,9 @@ pub fn spawn_process_start(surface: Surface) {
 }
 
 /// Emit a `process_start`, awaiting delivery with a hard timeout so the event
-/// has a chance to flush before the process exits. Bounded by [`SEND_TIMEOUT`],
-/// so a dead endpoint can never hang the caller; a no-op for the common
-/// default-off / no-endpoint case.
+/// has a chance to flush before the process exits. Bounded by the connect and
+/// send timeouts, so a dead endpoint can never hang the caller; a no-op for the
+/// common default-off (not opted in) case.
 pub async fn flush_process_start(surface: Surface) {
     if let Some(event) = build_process_start(surface) {
         let _ = tokio::time::timeout(SEND_TIMEOUT, post(&event)).await;
@@ -262,14 +286,15 @@ pub async fn flush_snapshot(snapshot: UsageSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
-    /// Guards mutation of `DO_NOT_TRACK` / `AOE_TELEMETRY_ENDPOINT` across
-    /// tests in this module, which otherwise race on the shared process env.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // `#[serial]` (the default global group) serializes these env-mutating
+    // tests against every other telemetry test that reads `DO_NOT_TRACK` /
+    // `AOE_TELEMETRY_ENDPOINT`, including the consent-dialog tests in another
+    // module, so none of them race on the shared process env.
     #[test]
+    #[serial]
     fn do_not_track_recognises_affirmative_values() {
-        let _g = ENV_LOCK.lock().unwrap();
         for v in ["1", "true", "TRUE", "yes", "Yes"] {
             unsafe { std::env::set_var("DO_NOT_TRACK", v) };
             assert!(do_not_track(), "{v} should suppress");
@@ -283,14 +308,16 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_unset_is_none() {
-        let _g = ENV_LOCK.lock().unwrap();
+    #[serial]
+    fn endpoint_falls_back_to_default_and_env_overrides() {
+        // Unset or blank => the compiled-in default gateway.
         unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
-        assert_eq!(endpoint(), None);
+        assert_eq!(endpoint(), DEFAULT_ENDPOINT);
         unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", "   ") };
-        assert_eq!(endpoint(), None);
-        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", "https://x/y") };
-        assert_eq!(endpoint().as_deref(), Some("https://x/y"));
+        assert_eq!(endpoint(), DEFAULT_ENDPOINT);
+        // A non-empty value overrides (trimmed).
+        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", " https://x/y ") };
+        assert_eq!(endpoint(), "https://x/y");
         unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
     }
 }
