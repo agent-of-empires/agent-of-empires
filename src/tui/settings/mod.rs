@@ -304,6 +304,11 @@ impl SettingsView {
 
         push_section(&mut rows, "System");
         push_tab(&mut rows, SettingsCategory::Updates);
+        // Telemetry is an install-level consent toggle, not a per-profile or
+        // per-repo setting, so it only appears under the Global scope.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Telemetry);
+        }
         push_tab(&mut rows, SettingsCategory::Logging);
 
         rows
@@ -476,6 +481,7 @@ impl SettingsView {
         }
 
         let field = &self.fields[field_index];
+        let field_key = field.key;
 
         match self.scope {
             SettingsScope::Global | SettingsScope::Profile => {
@@ -485,6 +491,12 @@ impl SettingsView {
                     &mut self.global_config,
                     &mut self.profile_config,
                 );
+                // Editing the telemetry toggle counts as responding to the
+                // opt-in prompt, so the one-time standalone consent popup
+                // never re-appears for a user who already made a choice here.
+                if field_key == FieldKey::TelemetryEnabled {
+                    self.global_config.app_state.has_responded_to_telemetry = true;
+                }
             }
             SettingsScope::Repo => {
                 // Use Profile logic but against resolved_base and repo_as_profile
@@ -530,6 +542,10 @@ impl SettingsView {
                 crate::session::poller::set_session_id_poller_max_threads(
                     self.global_config.session.session_id_poller_max_threads,
                 );
+                // Reconcile the on-disk install id with the saved opt-in
+                // state: generate one when enabled, delete it on opt-out.
+                // Idempotent, so running it on every global save is safe.
+                crate::telemetry::apply_opt_in_change(self.global_config.telemetry.enabled);
             }
             SettingsScope::Profile => {
                 save_profile_config(&self.profile, &self.profile_config)?;

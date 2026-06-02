@@ -17,6 +17,7 @@ use super::SettingsScope;
 pub enum SettingsCategory {
     Theme,
     Updates,
+    Telemetry,
     Worktree,
     Sandbox,
     Tmux,
@@ -37,6 +38,7 @@ impl SettingsCategory {
         match self {
             Self::Theme => "Theme",
             Self::Updates => "Updates",
+            Self::Telemetry => "Telemetry",
             Self::Worktree => "Worktree",
             Self::Sandbox => "Sandbox",
             Self::Tmux => "Tmux",
@@ -68,6 +70,8 @@ pub enum FieldKey {
     CheckIntervalHours,
     NotifyInCli,
     WebPollIntervalMinutes,
+    // Telemetry
+    TelemetryEnabled,
     // Worktree
     WorktreeEnabled,
     PathTemplate,
@@ -376,6 +380,7 @@ pub fn build_fields_for_category(
     match category {
         SettingsCategory::Theme => build_theme_fields(scope, global, profile),
         SettingsCategory::Updates => build_updates_fields(scope, global, profile),
+        SettingsCategory::Telemetry => build_telemetry_fields(global),
         SettingsCategory::Worktree => build_worktree_fields(scope, global, profile),
         SettingsCategory::Sandbox => build_sandbox_fields(scope, global, profile),
         SettingsCategory::Tmux => build_tmux_fields(scope, global, profile),
@@ -1106,6 +1111,29 @@ fn build_updates_fields(
             ),
         },
     ]
+}
+
+/// Telemetry is a single install-level consent toggle, so it is global-only
+/// (no profile override) and mirrors the `build_logging_fields` shape. When
+/// `DO_NOT_TRACK` is set the description calls out that nothing is sent
+/// regardless of the toggle, so the suppressed state is never silent.
+fn build_telemetry_fields(global: &Config) -> Vec<SettingField> {
+    let description = if crate::telemetry::do_not_track() {
+        "Anonymous, opt-in usage telemetry. DO_NOT_TRACK is set, so nothing is sent and no \
+         install id is generated regardless of this toggle. Off by default; never sends content."
+    } else {
+        "Anonymous, opt-in usage telemetry (counts of sessions, agents, version, OS). Off by \
+         default. Never sends prompts, paths, names, or commands. Honors DO_NOT_TRACK."
+    };
+    vec![SettingField {
+        key: FieldKey::TelemetryEnabled,
+        label: "Enable usage telemetry",
+        description,
+        value: FieldValue::Bool(global.telemetry.enabled),
+        category: SettingsCategory::Telemetry,
+        has_override: false,
+        inherited_display: None,
+    }]
 }
 
 fn build_worktree_fields(
@@ -2687,6 +2715,8 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::WebPollIntervalMinutes, FieldValue::Number(v)) => {
             config.updates.web_poll_interval_minutes = *v
         }
+        // Telemetry
+        (FieldKey::TelemetryEnabled, FieldValue::Bool(v)) => config.telemetry.enabled = *v,
         // Worktree
         (FieldKey::WorktreeEnabled, FieldValue::Bool(v)) => config.worktree.enabled = *v,
         (FieldKey::PathTemplate, FieldValue::Text(v)) => config.worktree.path_template = v.clone(),

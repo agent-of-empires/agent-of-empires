@@ -25,6 +25,7 @@ use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
+use super::telemetry::TelemetryCommands;
 use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
 use super::uninstall::UninstallArgs;
@@ -142,6 +143,12 @@ pub enum Commands {
     Theme {
         #[command(subcommand)]
         command: ThemeCommands,
+    },
+
+    /// Manage anonymous opt-in usage telemetry
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommands,
     },
 
     /// Start a web dashboard for remote session access

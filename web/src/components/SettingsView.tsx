@@ -25,6 +25,7 @@ import { ThemeSettings } from "./settings/ThemeSettings";
 import { DiffSettings } from "./settings/DiffSettings";
 import { SoundSettings } from "./settings/SoundSettings";
 import { UpdateSettings } from "./settings/UpdateSettings";
+import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { TmuxSettings } from "./settings/TmuxSettings";
 import { LoggingSettings } from "./settings/LoggingSettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
@@ -38,6 +39,7 @@ type TabId =
   | "sound"
   | "tmux"
   | "updates"
+  | "telemetry"
   | "notifications"
   | "terminal"
   | "security"
@@ -79,6 +81,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "tab", id: "devices", label: "Devices" },
     { kind: "divider", label: "System" },
     { kind: "tab", id: "updates", label: "Updates" },
+    { kind: "tab", id: "telemetry", label: "Telemetry" },
     { kind: "tab", id: "logging", label: "Logging" },
   ];
 }
@@ -100,6 +103,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "sound",
   "tmux",
   "updates",
+  "telemetry",
   "notifications",
   "terminal",
   "security",
@@ -469,6 +473,8 @@ export function SettingsView({
         return <TmuxSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
       case "updates":
         return <UpdateSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "telemetry":
+        return <TelemetrySettings />;
       case "logging":
         return <LoggingSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
 

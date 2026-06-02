@@ -22,6 +22,7 @@ pub mod serve;
 pub mod session;
 pub mod sounds;
 pub mod status;
+pub mod telemetry;
 pub mod theme;
 pub mod tmux;
 pub mod uninstall;

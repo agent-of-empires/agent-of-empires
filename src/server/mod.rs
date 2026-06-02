@@ -331,6 +331,13 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Set when a browser reports the web dashboard / cockpit web UI was
+    /// opened, so the next opt-in telemetry snapshot can carry `web_seen` /
+    /// `cockpit_seen`. Reset after each snapshot. The browser never posts to
+    /// the telemetry backend; it pings the local daemon (`POST
+    /// /api/telemetry/seen`), which folds the flag into its own snapshot.
+    pub telemetry_web_seen: std::sync::atomic::AtomicBool,
+    pub telemetry_cockpit_seen: std::sync::atomic::AtomicBool,
     /// Resolved when the daemon receives SIGINT/SIGTERM/SIGHUP. Long-lived
     /// handlers (cockpit WS, terminal WS) clone this and `select!` on
     /// `cancelled()` so they exit promptly instead of holding axum's
@@ -604,8 +611,15 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        telemetry_web_seen: std::sync::atomic::AtomicBool::new(false),
+        telemetry_cockpit_seen: std::sync::atomic::AtomicBool::new(false),
         shutdown: CancellationToken::new(),
     });
+
+    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot
+    // and refresh an aggregate snapshot periodically. Detached; errors are
+    // swallowed.
+    spawn_telemetry_loop(state.clone());
 
     let app = build_router(state.clone());
 
@@ -1180,6 +1194,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_log_level).patch(api::patch_log_level),
         )
         .route("/api/client-log", post(api::post_client_log))
+        // Telemetry consent (browser manages opt-in via the daemon; it never
+        // posts to the telemetry backend directly).
+        .route("/api/telemetry/status", get(api::get_telemetry_status))
+        .route("/api/telemetry/consent", post(api::set_telemetry_consent))
+        .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
@@ -1605,6 +1624,51 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh
+}
+
+/// Background task: emit an opt-in telemetry `process_start` for the serve
+/// surface, then a `usage_snapshot` immediately and every hour, plus a final
+/// one on graceful shutdown. All sends are best-effort and swallow errors;
+/// nothing leaves the box unless the user opted in and an endpoint is
+/// configured.
+fn spawn_telemetry_loop(state: Arc<AppState>) {
+    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            tokio::select! {
+                _ = state.shutdown.cancelled() => {
+                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                        crate::telemetry::flush_snapshot(snapshot).await;
+                    }
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                        crate::telemetry::spawn_snapshot(snapshot);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Build a serve `usage_snapshot` from the live session list, folding in (and
+/// resetting) the `web_seen` / `cockpit_seen` flags reported by browsers. The
+/// session-create trend counter is left at 0 for v1. Returns `None` when
+/// telemetry is not opted in.
+async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::UsageSnapshot> {
+    use std::sync::atomic::Ordering;
+    let web_seen = state.telemetry_web_seen.swap(false, Ordering::Relaxed);
+    let cockpit_seen = state.telemetry_cockpit_seen.swap(false, Ordering::Relaxed);
+    let instances = state.instances.read().await.clone();
+    crate::telemetry::build_usage_snapshot(
+        crate::telemetry::Surface::Serve,
+        &instances,
+        web_seen,
+        cockpit_seen,
+        0,
+    )
 }
 
 /// Background task that periodically refreshes session statuses. On each

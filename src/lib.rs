@@ -19,6 +19,7 @@ pub mod session;
 pub mod sound;
 mod status_hooks;
 pub mod task_util;
+pub mod telemetry;
 pub mod terminal;
 pub mod tmux;
 pub mod tui;

@@ -20,6 +20,9 @@ pub struct Config {
     pub updates: UpdatesConfig,
 
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+
+    #[serde(default)]
     pub worktree: WorktreeConfig,
 
     #[serde(default)]
@@ -506,6 +509,13 @@ pub struct AppStateConfig {
     /// users hide it with `i` when they want the full pane for live output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_preview_info: Option<bool>,
+
+    /// True once the user has answered the telemetry opt-in prompt (in any
+    /// surface, either by enabling or declining). Gates the one-time
+    /// standalone consent popup shown to users who completed the walkthrough
+    /// before telemetry existed, so it appears once and never again.
+    #[serde(default)]
+    pub has_responded_to_telemetry: bool,
 
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
@@ -1139,6 +1149,21 @@ fn default_web_poll_interval_minutes() -> u64 {
     60
 }
 
+/// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
+/// posture of [`UpdatesConfig`] (the only other outbound call in the tool).
+///
+/// The single `enabled` flag is the consent boundary the user controls in
+/// every settings surface. The anonymous install id lives in a dedicated
+/// `telemetry.json` (NOT here), so pasting `config.toml` into a bug report
+/// can never leak it. `DO_NOT_TRACK` overrides this flag at runtime and
+/// suppresses both sending and id generation regardless of its value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// User opted in to anonymous usage telemetry. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     #[serde(default)]
@@ -1555,6 +1580,10 @@ pub fn effective_profile(profile: &str) -> String {
 
 pub fn get_update_settings() -> UpdatesConfig {
     Config::load_or_warn().updates
+}
+
+pub fn get_telemetry_settings() -> TelemetryConfig {
+    Config::load_or_warn().telemetry
 }
 
 #[cfg(test)]

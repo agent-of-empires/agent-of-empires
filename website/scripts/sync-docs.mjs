@@ -314,6 +314,13 @@ const PAGES = [
     description:
       "REST endpoints for driving Agent of Empires sessions from external orchestrators.",
   },
+  {
+    source: "docs/telemetry.md",
+    dest: "docs/telemetry.md",
+    title: "Telemetry",
+    description:
+      "How Agent of Empires' anonymous, opt-in usage telemetry works: what is and isn't collected, the DO_NOT_TRACK override, and how to enable or disable it.",
+  },
 ];
 
 // Every known docs path → website URL, used for link rewriting.
@@ -341,6 +348,7 @@ const URL_MAP = {
   "docs/cockpit/persistence.md": "/docs/cockpit/persistence/",
   "docs/cockpit/troubleshooting.md": "/docs/cockpit/troubleshooting/",
   "docs/api.md": "/docs/api/",
+  "docs/telemetry.md": "/docs/telemetry/",
   // Guides
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",

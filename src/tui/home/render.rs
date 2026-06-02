@@ -601,6 +601,7 @@ impl HomeView {
             intro_dialog,
             no_agents_dialog,
             changelog_dialog,
+            telemetry_consent_dialog,
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,

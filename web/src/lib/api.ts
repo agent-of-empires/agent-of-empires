@@ -348,6 +348,45 @@ export function fetchAbout(): Promise<ServerAbout | null> {
   return fetchJson<ServerAbout>("/api/about");
 }
 
+export interface TelemetryStatus {
+  enabled: boolean;
+  responded: boolean;
+  do_not_track: boolean;
+}
+
+export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
+  return fetchJson<TelemetryStatus>("/api/telemetry/status");
+}
+
+/// Set the opt-in state. The daemon owns the anonymous install id; the
+/// browser never posts to the telemetry backend itself. Returns the updated
+/// status, or null on failure.
+export async function setTelemetryConsent(
+  enabled: boolean,
+): Promise<TelemetryStatus | null> {
+  try {
+    const res = await fetch("/api/telemetry/consent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/// Tell the daemon the web dashboard or cockpit UI was opened, so its next
+/// opt-in snapshot can carry web_seen / cockpit_seen. Best-effort.
+export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
+  void fetch("/api/telemetry/seen", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ surface }),
+  }).catch(() => {});
+}
+
 /** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
 export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
   if (!about) return false;

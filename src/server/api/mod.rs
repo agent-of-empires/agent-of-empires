@@ -19,6 +19,7 @@ mod log_level;
 mod projects;
 mod sessions;
 mod system;
+mod telemetry;
 
 #[cfg(feature = "serve")]
 pub use cockpit::{
@@ -48,6 +49,7 @@ pub use system::{
     list_sounds, list_themes, rename_profile, serve_sound_file, update_profile_settings,
     update_settings,
 };
+pub use telemetry::{get_telemetry_status, post_telemetry_seen, set_telemetry_consent};
 
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',
