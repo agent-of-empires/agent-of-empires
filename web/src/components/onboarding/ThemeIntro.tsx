@@ -104,10 +104,18 @@ export function ThemeIntro({ onDone }: Props) {
   const [error, setError] = useState<string | null>(null);
   const { select, pending } = useThemeMutation();
   const continueRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
+  // Capture the previously focused element on mount and restore it on unmount
+  // so keyboard users return to where they were instead of losing focus to
+  // document.body, matching DeleteSessionDialog and CommandPalette.
   useEffect(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
     fetchThemes().then(setThemes);
     continueRef.current?.focus();
+    return () => {
+      previousFocusRef.current?.focus?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -173,7 +181,7 @@ export function ThemeIntro({ onDone }: Props) {
                   type="button"
                   role="option"
                   aria-selected={active}
-                  disabled={pending}
+                  disabled={pending && !active}
                   onClick={() => pick(t)}
                   className={`text-left text-sm rounded-md border px-3 py-2 cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
                     active
