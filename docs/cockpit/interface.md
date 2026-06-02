@@ -94,6 +94,16 @@ when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
 
+**Approval card detail.** The web dashboard approval card shows a
+one-line preview of the tool call in its header (the command for a
+shell call, the path for a read or edit) so you can act without
+expanding. A benign approval starts collapsed with that preview; a
+destructive one starts expanded so the full arguments are in view
+before a hold-to-allow. Click the header to toggle the full argument
+list, and the Allow / Always / Deny buttons stay reachable in either
+state. The toggle is per-card and never re-expands on its own after a
+plan is approved.
+
 **Markdown rendering.** Agent messages in the transcript are parsed as
 markdown and rendered with styling: headings and `**bold**` show in
 bold, `*italics*` in italic, `` `inline code` `` and fenced code blocks
@@ -286,3 +296,12 @@ TodoWrite sandwiched between real tool work (Read, Edit) stays inline as
 its own card rather than being hidden inside a group, so a status update
 between actions is never buried. Two-in-a-row stays inline as well; the
 fold threshold is three.
+
+Automatic grouping needs an unbroken run, so a phase where the agent
+narrates between each action (common right after a plan is approved)
+produces a long stream of individual cards instead. The **Compact
+tools** toggle at the top of the transcript collapses every tool card to
+its header for scanning, and new cards arrive collapsed while it stays
+on; the agent's narration stays visible and errored cards stay open so a
+failure is never hidden. It is a per-browser preference saved locally,
+and you can still expand any single card while compact mode is on.
