@@ -29,7 +29,14 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
 
     await page.goto(serve.baseUrl);
 
-    // Story 1: auto-launches on first load, with a Skip button on the step.
+    // Phase 1 of onboarding (#1834): the theme welcome modal shows first on a
+    // fresh browser. Dismiss it; the tour then takes over.
+    await expect(page.getByText("Choose your theme")).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    // Story 1: tour auto-launches once the welcome closes, with a Skip button.
     await expect(page.getByText(FIRST_STEP)).toBeVisible({ timeout: 10_000 });
     const skip = page.getByRole("button", { name: "Skip" });
     await expect(skip).toBeVisible();
@@ -41,10 +48,12 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
       .poll(() => page.evaluate(() => localStorage.getItem("aoe-tour-seen")))
       .toBe("1");
 
-    // Story 1 (persistence): a reload must not auto-launch again.
+    // Story 1 (persistence): a reload must not auto-launch the tour or
+    // re-show the theme welcome modal.
     await page.reload();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
     await expect(page.getByText(FIRST_STEP)).toBeHidden();
+    await expect(page.getByText("Choose your theme")).toBeHidden();
 
     // Story 2: re-trigger from the fixed entry point (TopBar overflow menu).
     await page.getByRole("button", { name: "More options" }).click();
