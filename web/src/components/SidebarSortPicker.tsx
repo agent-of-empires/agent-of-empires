@@ -52,7 +52,8 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
     };
   }, [open]);
 
-  const active = MODES.find((m) => m.mode === sortMode) ?? MODES[0];
+  // MODES is non-empty by construction, so the fallback is always defined.
+  const active = MODES.find((m) => m.mode === sortMode) ?? MODES[0]!;
   const ActiveIcon = active.Icon;
 
   return (
