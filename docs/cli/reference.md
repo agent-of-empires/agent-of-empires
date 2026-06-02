@@ -21,6 +21,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session rename`↴](#aoe-session-rename)
+* [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
 * [`aoe session set-session-id`↴](#aoe-session-set-session-id)
@@ -299,6 +300,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `attach` — Attach to session interactively
 * `show` — Show session details
 * `rename` — Rename a session
+* `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
 * `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
@@ -397,6 +399,23 @@ Rename a session
 
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
+
+
+
+## `aoe session set-worktree-name`
+
+Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
+
+**Usage:** `aoe session set-worktree-name [OPTIONS] --name <NAME> [IDENTIFIER]`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title (optional, auto-detects in tmux)
+
+###### **Options:**
+
+* `--name <NAME>` — New workdir (worktree directory) name
+* `--rename-branch` — Also rename the underlying git branch to match the new name
 
 
 

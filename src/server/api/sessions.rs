@@ -760,6 +760,242 @@ pub async fn rename_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+// --- Edit worktree workdir name ---
+
+#[derive(Deserialize)]
+pub struct SetWorktreeNameBody {
+    pub name: String,
+    /// Also rename the underlying git branch to match. Off by default: the
+    /// session may have done meaningful work on its branch already.
+    #[serde(default)]
+    pub rename_branch: bool,
+}
+
+/// Map a worktree-edit failure to an HTTP status + client-safe message.
+/// Validation failures are 400/409; git/IO failures stay generic (raw git
+/// stderr and IO paths must not reach the wire).
+fn worktree_edit_error_response(
+    e: &crate::session::worktree_edit::WorktreeEditError,
+) -> (StatusCode, String) {
+    use crate::session::worktree_edit::WorktreeEditError as E;
+    match e {
+        E::NotManaged => (
+            StatusCode::BAD_REQUEST,
+            "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
+        ),
+        E::EmptyName => (
+            StatusCode::BAD_REQUEST,
+            "Workdir name cannot be empty".to_string(),
+        ),
+        E::Unchanged => (
+            StatusCode::BAD_REQUEST,
+            "The workdir name is unchanged".to_string(),
+        ),
+        E::NoParent(_) => (
+            StatusCode::BAD_REQUEST,
+            "Cannot determine the worktree's parent directory".to_string(),
+        ),
+        E::SourceMissing(_) => (
+            StatusCode::CONFLICT,
+            "The worktree directory no longer exists on disk".to_string(),
+        ),
+        E::TargetExists(_) => (
+            StatusCode::CONFLICT,
+            "A directory with that name already exists".to_string(),
+        ),
+        E::BranchExists(name) => (
+            StatusCode::CONFLICT,
+            format!("Branch '{name}' already exists"),
+        ),
+        E::RollbackFailed { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to move the worktree, and rolling back the branch rename also failed; the repository may be left on the new branch".to_string(),
+        ),
+        E::Git(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to move the worktree".to_string(),
+        ),
+    }
+}
+
+pub async fn set_worktree_name(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Workdir name cannot be empty" })),
+        )
+            .into_response();
+    }
+    if let Err(msg) = validate_no_shell_injection(&name, "name") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": msg })),
+        )
+            .into_response();
+    }
+
+    // Serialize against other mutations on this session (start, delete,
+    // another rename) so the git ops and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
+        )
+    };
+
+    let Some(worktree_info) = worktree_info else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Session does not use a worktree" })),
+        )
+            .into_response();
+    };
+    if status.blocks_worktree_edit() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "message": "Cannot edit the workdir name while the session is active; stop it first"
+            })),
+        )
+            .into_response();
+    }
+
+    let wt = worktree_info.clone();
+    let cur = current_path.clone();
+    let new_name = name.clone();
+    let rename_branch = body.rename_branch;
+    let edit = tokio::task::spawn_blocking(move || {
+        crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &wt,
+                current_path: std::path::Path::new(&cur),
+                new_name: &new_name,
+                rename_branch,
+            },
+        )
+        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+    })
+    .await;
+
+    let (new_path, new_branch) = match edit {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
+            let (code, msg) = worktree_edit_error_response(&e);
+            return (code, Json(serde_json::json!({ "message": msg }))).into_response();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "worktree edit join failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    // The git move has already landed, so persist to disk BEFORE mutating
+    // in-memory state. A silent persist failure here would leave stale
+    // metadata that points at the old (now-moved) path after a daemon
+    // restart, so any failure returns 500 instead of a misleading 200.
+    let persist_failed = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "persist_failed",
+                "message": "Worktree was moved on disk, but persisting the new session metadata failed"
+            })),
+        )
+            .into_response()
+    };
+
+    let storage = match Storage::new(&profile) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
+            return persist_failed();
+        }
+    };
+    let id_clone = id.clone();
+    let new_path_clone = new_path.clone();
+    let new_branch_clone = new_branch.clone();
+    match tokio::task::spawn_blocking(move || {
+        storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+            }
+            Ok(())
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
+            return persist_failed();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}");
+            return persist_failed();
+        }
+    }
+
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Option<&str>) {
+    inst.project_path = new_path.to_string();
+    if let Some(branch) = new_branch {
+        if let Some(wt) = inst.worktree_info.as_mut() {
+            wt.branch = branch.to_string();
+        }
+    }
+}
+
 // --- Update session notification preferences ---
 
 /// Body for `PATCH /api/sessions/:id/notifications`. Each field is an
@@ -3570,6 +3806,38 @@ mod tests {
         assert_eq!(
             inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
             Some("feature/test")
+        );
+    }
+
+    #[test]
+    fn worktree_name_edit_updates_path_and_optionally_branch() {
+        let mut inst = make_test_instance();
+        inst.project_path = "/tmp/repo-worktrees/old".to_string();
+        inst.title = "My Session".to_string();
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "old".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        // Path-only edit leaves the branch and title untouched.
+        apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/new", None);
+        assert_eq!(inst.project_path, "/tmp/repo-worktrees/new");
+        assert_eq!(inst.title, "My Session");
+        assert_eq!(
+            inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("old")
+        );
+
+        // Branch rename also updates worktree_info.branch.
+        apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/newer", Some("newer"));
+        assert_eq!(inst.project_path, "/tmp/repo-worktrees/newer");
+        assert_eq!(inst.title, "My Session");
+        assert_eq!(
+            inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("newer")
         );
     }
 
