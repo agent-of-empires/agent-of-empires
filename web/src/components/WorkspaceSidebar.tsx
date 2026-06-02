@@ -2231,6 +2231,13 @@ export function WorkspaceSidebar({
     [],
   );
 
+  // Read-only viewers can't act on a selection (the bulk bar is hidden), so
+  // never let one accumulate: drop any existing selection when read-only
+  // turns on. Row clicks are forced down the navigate path below.
+  useEffect(() => {
+    if (readOnly) dispatchSelection({ type: "clear" });
+  }, [readOnly]);
+
   // Selected workspaces (existing ones only) and their per-action eligibility
   // buckets, for the bulk bar. Deduped against existence so a stale id never
   // resolves to a phantom workspace.
@@ -2286,6 +2293,14 @@ export function WorkspaceSidebar({
   // has already guarded button / deleting / drag, and called preventDefault.
   const handleRowActivate = useCallback(
     (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+      // Read-only: ignore modifier gestures entirely and always navigate, so
+      // no hidden selection state can build up.
+      if (readOnly) {
+        dispatchSelection({ type: "clear" });
+        setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+        onSelect(workspaceId);
+        return;
+      }
       const intent = classifyClick(e);
       switch (intent) {
         case "navigate":
@@ -2314,7 +2329,7 @@ export function WorkspaceSidebar({
           break;
       }
     },
-    [activeId, onSelect, flatRenderedOrder],
+    [activeId, onSelect, flatRenderedOrder, readOnly],
   );
 
   const toggleFilter = () => {
@@ -2587,9 +2602,10 @@ export function WorkspaceSidebar({
                                 isActive={
                                   v.workspace.id === displayedActiveId
                                 }
-                                isSelected={selection.selectedIds.has(
-                                  v.workspace.id,
-                                )}
+                                isSelected={
+                                  !readOnly &&
+                                  selection.selectedIds.has(v.workspace.id)
+                                }
                                 onActivate={(e) =>
                                   handleRowActivate(v.workspace.id, e)
                                 }
@@ -2796,7 +2812,9 @@ export function WorkspaceSidebar({
                       key={v.key}
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
-                      isSelected={selection.selectedIds.has(v.workspace.id)}
+                      isSelected={
+                        !readOnly && selection.selectedIds.has(v.workspace.id)
+                      }
                       onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
