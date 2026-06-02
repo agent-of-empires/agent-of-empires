@@ -611,17 +611,23 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// argv. Never mutates the registry, so two profiles defining the
     /// same custom name with different commands don't clobber each other
     /// and `/cockpit/switch-agent` validation stays per-session.
+    ///
+    /// The returned bool is true when the spec came from the built-in
+    /// registry (vs an `agent_cockpit_cmd` custom spec); callers use it
+    /// to decide whether a command override may overlay the spec without
+    /// taking the registry lock a second time. See #1766.
     pub async fn resolve_agent_spec(
         &self,
         name: &str,
         config: &crate::session::config::SessionConfig,
-    ) -> Result<AgentSpec, SupervisorError> {
+    ) -> Result<(AgentSpec, bool), SupervisorError> {
         if let Some(spec) = self.registry.lock().await.get(name).cloned() {
-            return Ok(spec);
+            return Ok((spec, true));
         }
         if let Some(cmd) = config.agent_cockpit_cmd.get(name) {
-            return AgentSpec::from_cockpit_cmd(name, cmd)
-                .map_err(SupervisorError::InvalidAgentCommand);
+            let spec = AgentSpec::from_cockpit_cmd(name, cmd)
+                .map_err(SupervisorError::InvalidAgentCommand)?;
+            return Ok((spec, false));
         }
         Err(SupervisorError::UnknownAgent(name.into()))
     }
@@ -1196,12 +1202,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         .map_err(|e| {
             SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
         })?;
-        // Whether the resolved spec came from the built-in registry
-        // (vs an `agent_cockpit_cmd` custom spec). The command override
-        // only overlays registry specs; custom ACP commands own their
-        // full argv already.
-        let spec_from_registry = self.registry.lock().await.get(&agent).is_some();
-        let mut spec = self
+        // `spec_from_registry` distinguishes a built-in registry spec
+        // from an `agent_cockpit_cmd` custom spec: the command override
+        // only overlays registry specs (custom ACP commands own their
+        // full argv already). Returned by `resolve_agent_spec` so the
+        // registry is locked once, not raced across two reads.
+        let (mut spec, spec_from_registry) = self
             .resolve_agent_spec(&agent, &resolved_cfg.session)
             .await?;
         // Overlay the instance command override (e.g. opencode →
