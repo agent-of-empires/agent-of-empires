@@ -143,6 +143,17 @@ describe("resolveToRepoRelative", () => {
     });
   });
 
+  it("matches a Windows drive root case-insensitively", () => {
+    const win: FileRefSession = {
+      project_path: "C:\\Users\\me\\repo",
+      main_repo_path: null,
+      workspace_repos: [],
+    };
+    expect(
+      resolveToRepoRelative("c:\\Users\\me\\repo\\src\\app.ts", win),
+    ).toEqual({ relativePath: "src/app.ts" });
+  });
+
   it("resolves against a workspace repo root and returns its name", () => {
     const workspace: FileRefSession = {
       project_path: "/Users/me/.aoe/worktrees/ws",

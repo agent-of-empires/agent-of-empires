@@ -99,10 +99,18 @@ export function parseFileRef(href: string): FileRef | null {
   return { path, line, column };
 }
 
+// Forward-slash separators, a trailing slash, and a lowercased Windows
+// drive letter so prefix matching is uniform. Drive-letter case is the
+// only case folding applied: POSIX paths stay case-sensitive, and the
+// drive prefix is stripped from the returned relative path anyway, so
+// folding it never leaks into output.
+function normalizePathForMatch(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^([a-zA-Z]):\//, (_, d) => `${d.toLowerCase()}:/`);
+}
+
 function normalizeRoot(root: string): string {
-  let norm = root.replace(/\\/g, "/");
-  if (!norm.endsWith("/")) norm += "/";
-  return norm;
+  const norm = normalizePathForMatch(root);
+  return norm.endsWith("/") ? norm : `${norm}/`;
 }
 
 /**
@@ -122,9 +130,9 @@ export function resolveToRepoRelative(
   path: string,
   session: FileRefSession,
 ): { relativePath: string; repoName?: string } | null {
-  const target = path.replace(/\\/g, "/");
+  const target = normalizePathForMatch(path);
 
-  const isAbsolute = target.startsWith("/") || /^[a-zA-Z]:\//.test(target);
+  const isAbsolute = target.startsWith("/") || /^[a-z]:\//.test(target);
   if (!isAbsolute) {
     // Already repo-relative; strip a leading `./` for cleanliness.
     const rel = target.replace(/^\.\//, "");
