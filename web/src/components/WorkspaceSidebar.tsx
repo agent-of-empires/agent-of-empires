@@ -46,7 +46,9 @@ import type {
 } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
+  nestedSidebarGroupHasLiveWorkspace,
   sidebarGroupHasLiveWorkspace,
+  type NestedSidebarGroup,
   type SidebarGroup,
 } from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
@@ -143,6 +145,10 @@ const typedClosestCenter: CollisionDetection = (args) => {
 
 interface Props {
   groups: SidebarGroup[];
+  // The nested `repo+group` axis model (#1720). Only consumed when
+  // `axis === "repo+group"`; the flat `groups` list drives the other axes.
+  nestedGroups: NestedSidebarGroup[];
+  onToggleSubgroup: (repoId: string, groupPath: string) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
@@ -1958,8 +1964,37 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   );
 }
 
+// The grouping toggle cycles through the three axes on each click. Order is
+// chosen so the first click off the default still lands on the flat group
+// axis (preserving the pre-#1720 repo -> group step), then adds nesting.
+const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
+  repo: "group",
+  group: "repo+group",
+  "repo+group": "repo",
+};
+
+const AXIS_HEADING: Record<SidebarAxis, string> = {
+  repo: "Projects",
+  group: "Groups",
+  "repo+group": "Projects",
+};
+
+const AXIS_TOOLTIP: Record<SidebarAxis, string> = {
+  repo: "Grouping: by repository",
+  group: "Grouping: by user group",
+  "repo+group": "Grouping: by repository, then user group",
+};
+
+const AXIS_ARIA: Record<SidebarAxis, string> = {
+  repo: "Group sessions by repository",
+  group: "Group sessions by user group",
+  "repo+group": "Group sessions by repository, then user group",
+};
+
 export function WorkspaceSidebar({
   groups,
+  nestedGroups,
+  onToggleSubgroup,
   onReorderWorkspaces,
   onReorderGroups,
   activeId,
@@ -2081,6 +2116,8 @@ export function WorkspaceSidebar({
 
   const q = filterQuery.trim().toLowerCase();
 
+  const isNested = axis === "repo+group";
+
   const filteredGroups = q
     ? groups
         .map((g) => ({
@@ -2093,7 +2130,31 @@ export function WorkspaceSidebar({
         .filter((g) => g.workspaces.length > 0)
     : groups;
 
-  const hasResults = filteredGroups.length > 0;
+  // Filter the nested model the same way the flat list is filtered: a row
+  // survives if it matches, or if its subgroup or repo header name matches;
+  // empty subgroups and then empty repos drop out. See #1720.
+  const filteredNested: NestedSidebarGroup[] = q
+    ? nestedGroups
+        .map((ng) => ({
+          repo: ng.repo,
+          subgroups: ng.subgroups
+            .map((sg) => ({
+              ...sg,
+              workspaces: sg.workspaces.filter(
+                (v) =>
+                  workspaceMatchesFilter(v.workspace, q) ||
+                  sg.displayName.toLowerCase().includes(q) ||
+                  ng.repo.displayName.toLowerCase().includes(q),
+              ),
+            }))
+            .filter((sg) => sg.workspaces.length > 0),
+        }))
+        .filter((ng) => ng.subgroups.length > 0)
+    : nestedGroups;
+
+  const hasResults = isNested
+    ? filteredNested.length > 0
+    : filteredGroups.length > 0;
 
   const toggleFilter = () => {
     setFilterOpen((o) => {
@@ -2156,27 +2217,21 @@ export function WorkspaceSidebar({
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span className="text-sm text-text-muted flex-1">
-            {axis === "group" ? "Groups" : "Projects"}
+            {AXIS_HEADING[axis]}
           </span>
-          <Tooltip
-            text={
-              axis === "group"
-                ? "Grouping: by user group"
-                : "Grouping: by repository"
-            }
-          >
+          <Tooltip text={AXIS_TOOLTIP[axis]}>
             <button
-              onClick={() => onAxisChange(axis === "repo" ? "group" : "repo")}
-              aria-pressed={axis === "group"}
+              onClick={() => onAxisChange(NEXT_AXIS[axis])}
+              aria-pressed={axis !== "repo"}
               aria-label={
-                axis === "group"
-                  ? "Group sessions by user group, currently pressed"
-                  : "Group sessions by repository"
+                axis === "repo"
+                  ? AXIS_ARIA[axis]
+                  : `${AXIS_ARIA[axis]}, currently pressed`
               }
               data-testid="sidebar-axis-toggle"
               data-axis={axis}
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                axis === "group"
+                axis !== "repo"
                   ? "text-brand-500"
                   : "text-text-dim hover:text-text-secondary"
               }`}
@@ -2291,6 +2346,7 @@ export function WorkspaceSidebar({
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden">
+          {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
             sensors={sensors}
@@ -2415,6 +2471,96 @@ export function WorkspaceSidebar({
             })()}
           </DndContext>
           </DragSuppressContext.Provider>
+          )}
+          {isNested &&
+            filteredNested
+              .filter(nestedSidebarGroupHasLiveWorkspace)
+              .map((ng) => {
+                const repo = ng.repo;
+                const repoExpanded = q ? true : !repo.collapsed;
+                const repoHasActiveChild = ng.subgroups.some((sg) =>
+                  sg.workspaces.some(
+                    (v) => v.workspace.id === displayedActiveId,
+                  ),
+                );
+                return (
+                  <div
+                    key={repo.id}
+                    data-testid="sidebar-nested-repo"
+                    data-repo-id={repo.id}
+                  >
+                    <SidebarGroupHeader
+                      group={{ ...repo, collapsed: !repoExpanded }}
+                      hasActiveChild={!repoExpanded && repoHasActiveChild}
+                      onClick={() => !q && onToggleGroup(repo.id)}
+                      onUpdateAppearance={onUpdateRepoAppearance}
+                      onNewSession={() =>
+                        repo.capabilities.create === "repo" && repo.repoPath
+                          ? onCreateSession(repo.repoPath)
+                          : onNew()
+                      }
+                      offline={offline}
+                    />
+                    {repoExpanded &&
+                      ng.subgroups
+                        .filter(sidebarGroupHasLiveWorkspace)
+                        .map((sg) => {
+                          const groupPath = sg.groupPath ?? "";
+                          const subExpanded = q ? true : !sg.collapsed;
+                          const subHasActiveChild = sg.workspaces.some(
+                            (v) => v.workspace.id === displayedActiveId,
+                          );
+                          // Sunk rows are pulled into the single global
+                          // footer below, exactly like the flat axes, so
+                          // each subgroup renders only its live tier.
+                          const liveWorkspaces = sg.workspaces.filter(
+                            (v) => !workspaceIsSunk(v.workspace),
+                          );
+                          return (
+                            <div
+                              key={`${repo.id}::${groupPath}`}
+                              className="pl-3"
+                              data-testid="sidebar-nested-subgroup"
+                              data-repo-id={repo.id}
+                            >
+                              <SidebarGroupHeader
+                                group={{ ...sg, collapsed: !subExpanded }}
+                                hasActiveChild={
+                                  !subExpanded && subHasActiveChild
+                                }
+                                onClick={() =>
+                                  !q && onToggleSubgroup(repo.id, groupPath)
+                                }
+                                onUpdateAppearance={onUpdateRepoAppearance}
+                                onNewSession={onNew}
+                                offline={offline}
+                              />
+                              {subExpanded &&
+                                liveWorkspaces.map((v) => (
+                                  <SessionRow
+                                    key={`${repo.id}::${groupPath}::${v.key}`}
+                                    workspace={v.workspace}
+                                    isActive={
+                                      v.workspace.id === displayedActiveId
+                                    }
+                                    onClick={() => {
+                                      setOptimisticActive({
+                                        id: v.workspace.id,
+                                        fromActiveId: activeId,
+                                      });
+                                      onSelect(v.workspace.id);
+                                    }}
+                                    onDelete={onDeleteSession}
+                                    readOnly={readOnly}
+                                    indented
+                                  />
+                                ))}
+                            </div>
+                          );
+                        })}
+                  </div>
+                );
+              })}
           {(() => {
             // Single global "Snoozed & archived" section at the very
             // bottom of the sidebar. Aggregates sunk workspaces from
@@ -2423,10 +2569,18 @@ export function WorkspaceSidebar({
             // Rows are listed flat in the order they appear inside
             // their respective groups; each row's SessionRow already
             // surfaces the title/branch/repo chips that anchor it to
-            // its project. See #1581.
-            const sunkWorkspaces = filteredGroups.flatMap((g) =>
-              g.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
-            );
+            // its project. The nested axis flattens across its
+            // repo -> subgroup tree to feed the same bucket. See #1581,
+            // #1720.
+            const sunkWorkspaces = isNested
+              ? filteredNested.flatMap((ng) =>
+                  ng.subgroups.flatMap((sg) =>
+                    sg.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
+                  ),
+                )
+              : filteredGroups.flatMap((g) =>
+                  g.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
+                );
             if (sunkWorkspaces.length === 0) return null;
             return (
               <div data-testid="sidebar-sunk-section">
