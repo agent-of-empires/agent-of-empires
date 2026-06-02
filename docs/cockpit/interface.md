@@ -127,8 +127,12 @@ an execute shows the command and a bounded preview of its output; a read
 shows the path and a content preview; a delete shows the target path.
 The diff is capped at 20 changed lines and previews at 12 lines, with a
 "+N more" footer when there is more; press `o` to open the web dashboard
-for the full diff and output. Any other tool kind falls back to the
-generic one-liner (name, arguments, output snapshot).
+for the full diff and output. Edit cards read the path and diff from the
+structured diff content the agent emits (Codex routes `apply_patch` edits
+this way, one entry per file), falling back to the legacy argument shape
+when an agent sends that instead; a single patch touching several files
+shows each file's path and diff in one card. Any other tool kind falls
+back to the generic one-liner (name, arguments, output snapshot).
 
 **File-mention picker.** Typing `@` in the composer opens a picker
 listing the session's workspace files, fetched once per session from

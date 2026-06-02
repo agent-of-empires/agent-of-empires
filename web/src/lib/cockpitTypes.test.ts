@@ -286,6 +286,71 @@ describe("applyEvent / UserPromptSent", () => {
     );
   });
 
+  it("patches a Codex diff onto the edit card when it arrives via ToolCallUpdated, and preserves it on a later text-only update", () => {
+    // Codex emits the apply_patch diff on the update/completion frames,
+    // not the initial tool_call. A non-empty diff list replaces the
+    // card's diffs; a later text-only update must not blank them. See
+    // #1721.
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-edit",
+            name: "Edit src/foo.rs",
+            kind: "edit",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-edit",
+          title: null,
+          args_preview: null,
+          diffs: [
+            {
+              path: "src/foo.rs",
+              old_text: "old",
+              new_text: "new",
+              created_at: new Date().toISOString(),
+            },
+          ],
+        },
+      },
+    });
+    const row = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
+    );
+    expect(row?.tool?.diffs?.length).toBe(1);
+    expect(row?.tool?.diffs?.[0].path).toBe("src/foo.rs");
+    expect(state.inFlightTool?.diffs?.length).toBe(1);
+
+    // A subsequent text-only update (no diffs) must preserve them.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-edit",
+          title: "Edit src/foo.rs",
+          args_preview: null,
+          diffs: null,
+        },
+      },
+    });
+    const rowAfter = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
+    );
+    expect(rowAfter?.tool?.diffs?.length).toBe(1);
+  });
+
   it("uses 'tool failed' when error event has no content", () => {
     const state = applyEvent(emptyCockpitState(), {
       session_id: "s-1",

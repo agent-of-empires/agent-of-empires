@@ -750,6 +750,7 @@ mod tests {
                     started_at: Utc::now(),
                     parent_tool_call_id: None,
                     memory_recall: None,
+                    diffs: Vec::new(),
                 },
             },
         )
@@ -834,6 +835,7 @@ mod tests {
                         r#"{"file_path":"src/foo.rs","old_string":"x","new_string":"y"}"#.into(),
                     ),
                     started_at: None,
+                    diffs: None,
                 },
             ),
             completed_event(4, "t1", false),
@@ -949,6 +951,7 @@ mod tests {
                             started_at: Utc::now(),
                             parent_tool_call_id: None,
                             memory_recall: None,
+                            diffs: Vec::new(),
                         },
                         destructive: false,
                         requested_at: Utc::now(),

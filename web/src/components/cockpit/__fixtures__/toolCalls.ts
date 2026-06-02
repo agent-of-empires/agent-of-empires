@@ -68,6 +68,44 @@ export const fixtures = {
       content: "fn main() {}",
     }),
   }),
+  // Codex apply_patch: structured diff content, no legacy old_string/
+  // new_string args. The card must read path + diff from tool.diffs and
+  // never fall back to "(unknown file)". See #1721.
+  codexEdit: makeToolCall({
+    id: "codex-edit-1",
+    name: "Edit src/codex.rs",
+    kind: "edit",
+    args_preview: "{}",
+    diffs: [
+      {
+        path: "src/codex.rs",
+        old_text: "let x = 1;",
+        new_text: "let x = 2;",
+        created_at: "2026-05-21T00:00:00Z",
+      },
+    ],
+  }),
+  // One patch touching multiple files: each path must render.
+  codexEditMultiFile: makeToolCall({
+    id: "codex-edit-multi-1",
+    name: "apply_patch",
+    kind: "edit",
+    args_preview: "{}",
+    diffs: [
+      {
+        path: "src/alpha.rs",
+        old_text: "alpha old",
+        new_text: "alpha new",
+        created_at: "2026-05-21T00:00:00Z",
+      },
+      {
+        path: "src/beta.rs",
+        old_text: null,
+        new_text: "beta created",
+        created_at: "2026-05-21T00:00:00Z",
+      },
+    ],
+  }),
   del: makeToolCall({
     id: "del-1",
     name: "Delete",
