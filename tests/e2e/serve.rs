@@ -23,6 +23,12 @@ fn daemon_pid_path(h: &TuiTestHarness) -> PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("serve.pid")
 }
 
+/// Resolve the daemon's persisted launch-state file inside the harness's
+/// isolated home.
+fn daemon_launch_path(h: &TuiTestHarness) -> PathBuf {
+    crate::harness::app_dir_in(h.home_path()).join("serve.launch")
+}
+
 /// True iff the kernel still has a process with this PID.
 fn pid_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
@@ -135,6 +141,90 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
         !pid_path.exists(),
         "serve.pid should be cleaned up after --stop, found at {}",
         pid_path.display()
+    );
+}
+
+/// `aoe serve --restart` must stop the running daemon and spawn a fresh
+/// one from the persisted launch state: a new PID, the old one gone, the
+/// same port rebound, and `serve.launch` rewritten. Locks in #1794's
+/// restart primitive end to end.
+#[test]
+#[serial]
+fn cli_serve_restart_replays_launch_state() {
+    let h = TuiTestHarness::new("serve_restart_replays");
+    let port = pick_free_port();
+    let port_s = port.to_string();
+
+    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(
+        start.status.success(),
+        "initial --daemon failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let pid_path = daemon_pid_path(&h);
+    let launch_path = daemon_launch_path(&h);
+    let pid1: i32 = std::fs::read_to_string(&pid_path)
+        .expect("serve.pid after start")
+        .trim()
+        .parse()
+        .expect("serve.pid holds an integer");
+    assert!(
+        launch_path.exists(),
+        "serve.launch should be written on daemon start, missing at {}",
+        launch_path.display()
+    );
+
+    let restart = h.run_cli(&["serve", "--restart"]);
+    assert!(
+        restart.status.success(),
+        "aoe serve --restart failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&restart.stdout),
+        String::from_utf8_lossy(&restart.stderr),
+    );
+
+    // The replacement child rebinds the same persisted port.
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "restarted daemon never rebound port {port}"
+    );
+
+    // serve.pid now names a different, live process; the old one is gone.
+    let pid2: i32 = std::fs::read_to_string(&pid_path)
+        .expect("serve.pid after restart")
+        .trim()
+        .parse()
+        .expect("serve.pid holds an integer");
+    assert_ne!(pid1, pid2, "restart should spawn a new daemon PID");
+    assert!(
+        pid_alive(pid2),
+        "restarted daemon PID {pid2} should be alive"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_alive(pid1) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !pid_alive(pid1),
+        "old daemon PID {pid1} still alive after restart"
+    );
+    assert!(
+        launch_path.exists(),
+        "serve.launch should be rewritten by the restart"
+    );
+
+    let stop = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stop.status.success(),
+        "--stop after restart failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
     );
 }
 
