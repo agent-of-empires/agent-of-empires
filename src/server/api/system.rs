@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedSession;
-use crate::session::settings_schema::{clear_path, validate_patch, PatchRejection, Scope};
+use crate::session::settings_schema::{
+    clear_path, strip_local_only, validate_patch, PatchRejection, Scope,
+};
 
 // --- Agents ---
 
@@ -152,14 +154,19 @@ pub async fn update_settings(
         )
             .into_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Validate every leaf against the schema (single source of truth, #1692):
-    // unknown section/field -> 400, host-execution surface -> 403, bad value ->
-    // 400. `PATCH /api/settings` is already elevation-gated by the auth
-    // middleware, so any field reaching here is treated as elevated.
+    // Strip host-execution surfaces (`local_only`: node_path, agent
+    // argv/command, status-hook commands) before anything else, so a bundled
+    // or echoed-back patch keeps its safe leaves and silently drops the
+    // local-only ones (#1692). They can never reach disk from the web.
+    strip_local_only(&mut body);
+    // Validate every remaining leaf against the schema (single source of
+    // truth): unknown section/field -> 400, bad value -> 400. `PATCH
+    // /api/settings` is already elevation-gated by the auth middleware, so any
+    // field reaching here is treated as elevated.
     if let Err(rej) = validate_patch(&body, Scope::Global, true) {
         return reject_response(rej);
     }
@@ -947,7 +954,7 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
@@ -958,6 +965,10 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
+    // Strip host-execution surfaces (`local_only`) before validation + merge,
+    // so a bundled patch keeps its safe leaves and silently drops the
+    // local-only ones; they can never become a profile override (#1692).
+    strip_local_only(&mut body);
     // Resolve elevation up front. With login disabled (single-user local) the
     // caller is always treated as elevated; with login enabled, only an
     // elevated session may write a requires-elevation field.
@@ -972,13 +983,12 @@ pub async fn update_profile_settings(
         true
     };
 
-    // Validate every leaf against the schema (single source of truth, #1692):
-    // unknown section/field -> 400, host-execution surface -> 403
-    // forbidden_field, requires-elevation without elevation -> 403
-    // elevation_required (mirrors the path-shape gate's payload so
-    // web/src/lib/fetchInterceptor.ts fires the passphrase prompt unchanged,
-    // see #1510), bad value -> 400. `description` is accepted here (a
-    // profile-only field) but rejected on the global endpoint.
+    // Validate every remaining leaf against the schema (single source of
+    // truth, #1692): unknown section/field -> 400, requires-elevation without
+    // elevation -> 403 elevation_required (mirrors the path-shape gate's
+    // payload so web/src/lib/fetchInterceptor.ts fires the passphrase prompt
+    // unchanged, see #1510), bad value -> 400. `description` is accepted here
+    // (a profile-only field) but rejected on the global endpoint.
     if let Err(rej) = validate_patch(&body, Scope::Profile, elevated) {
         return reject_response(rej);
     }

