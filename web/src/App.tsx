@@ -106,14 +106,6 @@ export default function App() {
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
-  // First-run tour "seen" state, now sourced from the backend (app_state) so it
-  // follows the user across browsers and devices. `tourSeenKnown` stays false
-  // until settings resolve, so the tour never flashes on a `false` default
-  // while the request is in flight (and never auto-launches when the fetch
-  // fails). `LEGACY_TOUR_SEEN_KEY` is the pre-#1832 per-browser flag, read once
-  // to migrate existing users and avoid re-showing them the tour.
-  const [tourSeen, setTourSeen] = useState(false);
-  const [tourSeenKnown, setTourSeenKnown] = useState(false);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -145,29 +137,7 @@ export default function App() {
   useEffect(() => {
     fetchSettings().then((settings) => {
       setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
-      // Fetch failed: leave the seen state unknown so the tour does not
-      // auto-launch over an error/recovery screen. The menu trigger still works.
-      if (!settings) return;
-      const backendSeen = settings.app_state?.has_seen_web_tour === true;
-      const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
-      // Treat the legacy local flag as a suppression hint while the migration
-      // POST is in flight, so the tour cannot flash before the backend agrees.
-      setTourSeen(backendSeen || legacySeen);
-      setTourSeenKnown(true);
-      if (legacySeen && !backendSeen) {
-        void markWebTourSeen().then((ok) => {
-          if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
-        });
-      }
     });
-  }, []);
-
-  // Persist the seen flag when the user finishes or skips the tour. Optimistic:
-  // flip local state immediately so a failed POST (e.g. read-only 403) cannot
-  // re-auto-launch the tour for the rest of this page's lifetime.
-  const handleTourSeen = useCallback(() => {
-    setTourSeen(true);
-    void markWebTourSeen();
   }, []);
 
   const handleTokenSuccess = () => {
@@ -1104,6 +1074,43 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       : activeSession.cockpit_mode
         ? "cockpit"
         : "session";
+  // First-run tour "seen" state, sourced from the backend (app_state) so it
+  // follows the user across browsers and devices. `tourSeenKnown` stays false
+  // until settings resolve, so the tour never flashes on a `false` default
+  // while the request is in flight (and never auto-launches when the fetch
+  // fails). Fetched here in AppContent (post-auth) so the request runs as the
+  // authenticated user. `LEGACY_TOUR_SEEN_KEY` is the pre-#1832 per-browser
+  // flag, read once to migrate existing users so they are not re-shown the tour.
+  const [tourSeen, setTourSeen] = useState(false);
+  const [tourSeenKnown, setTourSeenKnown] = useState(false);
+
+  useEffect(() => {
+    fetchSettings().then((settings) => {
+      // Fetch failed: leave the seen state unknown so the tour does not
+      // auto-launch over an error/recovery screen. The menu trigger still works.
+      if (!settings) return;
+      const backendSeen = settings.app_state?.has_seen_web_tour === true;
+      const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
+      // Treat the legacy local flag as a suppression hint while the migration
+      // POST is in flight, so the tour cannot flash before the backend agrees.
+      setTourSeen(backendSeen || legacySeen);
+      setTourSeenKnown(true);
+      if (legacySeen && !backendSeen) {
+        void markWebTourSeen().then((ok) => {
+          if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
+        });
+      }
+    });
+  }, []);
+
+  // Persist the seen flag when the user finishes or skips the tour. Optimistic:
+  // flip local state immediately so a failed POST (e.g. read-only 403) cannot
+  // re-auto-launch the tour for the rest of this page's lifetime.
+  const handleTourSeen = useCallback(() => {
+    setTourSeen(true);
+    void markWebTourSeen();
+  }, []);
+
   // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
   // an in-flight session route defers it (the flag stays unset until then).
   const tourAutoLaunchReady =
