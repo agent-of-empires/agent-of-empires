@@ -78,7 +78,6 @@ import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
 import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
 import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
-import { reportError } from "../lib/toastBus";
 import {
   triageMenuShape,
   triageStateOf,
@@ -2737,15 +2736,21 @@ export function WorkspaceSidebar({
                                     isActive={
                                       v.workspace.id === displayedActiveId
                                     }
-                                    onClick={() => {
-                                      setOptimisticActive({
-                                        id: v.workspace.id,
-                                        fromActiveId: activeId,
-                                      });
-                                      onSelect(v.workspace.id);
-                                    }}
+                                    isSelected={
+                                      !readOnly &&
+                                      selection.selectedIds.has(v.workspace.id)
+                                    }
+                                    onActivate={(e) =>
+                                      handleRowActivate(v.workspace.id, e)
+                                    }
                                     onDelete={onDeleteSession}
                                     readOnly={readOnly}
+                                    optimistic={triage.optimisticFor(
+                                      v.workspace.id,
+                                    )}
+                                    onPinToggle={triage.pinToggle}
+                                    onArchiveToggle={triage.archiveToggle}
+                                    onSnooze={triage.snooze}
                                     indented
                                   />
                                 ))}

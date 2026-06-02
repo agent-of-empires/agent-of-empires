@@ -10,6 +10,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, type ReactNode } from "react";
 
 import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { EMPTY_OPTIMISTIC } from "../../lib/sidebarOptimistic";
 import type { SessionResponse, Workspace } from "../../lib/types";
 
 function session(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -91,7 +92,16 @@ afterEach(() => {
 function openMenu(ws: Workspace) {
   render(
     <Wrap>
-      <SessionRow workspace={ws} isActive={false} onClick={() => {}} />
+      <SessionRow
+        workspace={ws}
+        isActive={false}
+        isSelected={false}
+        onActivate={() => {}}
+        optimistic={EMPTY_OPTIMISTIC}
+        onPinToggle={() => {}}
+        onArchiveToggle={() => {}}
+        onSnooze={() => {}}
+      />
     </Wrap>,
   );
   fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
