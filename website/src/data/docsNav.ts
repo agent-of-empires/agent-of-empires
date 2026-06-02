@@ -80,6 +80,10 @@ export const docsNav: NavSection[] = [
       { title: "Logging", href: "/docs/development/logging/" },
       { title: "Playwright + Vitest testing", href: "/docs/development/playwright/" },
       { title: "Releases", href: "/docs/development/releases/" },
+      {
+        title: "Web Dashboard Development",
+        href: "/docs/development/web-dashboard/",
+      },
     ],
   },
 ];
