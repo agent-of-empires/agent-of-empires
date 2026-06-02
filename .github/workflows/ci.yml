@@ -66,7 +66,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check CLI docs are up-to-date
         run: |
-          cargo xtask gen-docs
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
           git diff --exit-code docs/cli/reference.md \
             || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
 
