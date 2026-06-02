@@ -41,6 +41,13 @@ export interface SessionResponse {
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** True when the agent has flagged this session as urgent via the
+   *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
+   *  (false for archived / snoozed sessions). The sidebar's Attention sort
+   *  floats urgent rows above non-urgent ones within their triage tier.
+   *  Optional so older payloads and test fixtures without the field read as
+   *  not-urgent. See #1640. */
+  urgent?: boolean;
   /** RFC3339 timestamp at which the session was web-pinned, or null /
    *  undefined when not pinned. Distinct from `favorited`: favorite is
    *  the TUI within-tier attention-sort signal; pin is the hard
