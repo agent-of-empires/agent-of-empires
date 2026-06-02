@@ -766,7 +766,8 @@
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx"
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/Tooltip.tsx"
       ]
     },
     {
