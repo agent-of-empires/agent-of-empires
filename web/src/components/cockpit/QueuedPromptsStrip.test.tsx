@@ -108,6 +108,42 @@ describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
   });
 });
 
+describe("QueuedPromptRow attachment indicator (#1833)", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const withImage: QueuedPrompt = {
+    id: "img",
+    text: "look at this",
+    queuedAt: "2026-05-21T00:00:00.000Z",
+    attachments: [
+      {
+        kind: "image",
+        mimeType: "image/png",
+        dataB64: "aA==",
+        name: "shot.png",
+      },
+    ],
+  };
+
+  it("renders a thumbnail for an image attachment on a queued row", () => {
+    const { getByTestId, getByAltText } = renderWithProfile("claude", [
+      withImage,
+    ]);
+    expect(getByTestId("queued-attachments")).toBeTruthy();
+    const img = getByAltText("shot.png") as HTMLImageElement;
+    expect(img.src).toContain("data:image/png;base64,aA==");
+  });
+
+  it("renders no attachment strip for a text-only queued row", () => {
+    const { queryByTestId } = renderWithProfile("claude", [
+      mk("a", "plain text"),
+    ]);
+    expect(queryByTestId("queued-attachments")).toBeNull();
+  });
+});
+
 describe("QueuedPromptRow expanded-state bounds (#1642)", () => {
   afterEach(() => {
     cleanup();
