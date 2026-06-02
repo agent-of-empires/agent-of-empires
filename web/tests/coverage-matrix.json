@@ -1323,6 +1323,21 @@
       ]
     },
     {
+      "id": "cockpit.file-links",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-file-links.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/CockpitFileRefContext.tsx",
+        "web/src/components/cockpit/Markdown.tsx",
+        "web/src/components/cockpit/CockpitView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx"
+      ]
+    },
+    {
       "id": "cockpit.story.composer-single-newline",
       "kind": "live-playwright",
       "risk": "high",
