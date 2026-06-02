@@ -341,7 +341,7 @@ impl GitWorktree {
         let repo = open_repo_at(&self.repo_path).ok()?;
         let remotes = repo.remotes().ok()?;
         let mut best: Option<(String, i64)> = None;
-        for remote in remotes.iter().flatten() {
+        for remote in remotes.iter().filter_map(|r| r.ok().flatten()) {
             let full = format!("{remote}/{branch_name}");
             let Ok(b) = repo.find_branch(&full, git2::BranchType::Remote) else {
                 continue;
@@ -882,7 +882,7 @@ impl GitWorktree {
             });
         }
 
-        for name_str in worktrees.iter().flatten() {
+        for name_str in worktrees.iter().filter_map(|r| r.ok().flatten()) {
             if let Ok(wt) = repo.find_worktree(name_str) {
                 if let Ok(path) = wt.path().canonicalize() {
                     entries.push(WorktreeEntry {
@@ -1010,7 +1010,7 @@ impl GitWorktree {
         let repo = open_repo_at(path)?;
         let head = repo.head()?;
 
-        if let Some(branch_name) = head.shorthand() {
+        if let Ok(branch_name) = head.shorthand() {
             Ok(branch_name.to_string())
         } else {
             Err(GitError::NotAGitRepo)
@@ -1039,7 +1039,12 @@ fn collect_default_branch_candidates(repo: &git2::Repository) -> Vec<Candidate> 
         .remotes()
         .ok()
         .as_ref()
-        .map(|rs| rs.iter().flatten().map(String::from).collect())
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| r.ok().flatten())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut stated_defaults: Vec<(String, String)> = Vec::new();
@@ -1048,7 +1053,7 @@ fn collect_default_branch_candidates(repo: &git2::Repository) -> Vec<Candidate> 
         let Ok(reference) = repo.find_reference(&head_ref_name) else {
             continue;
         };
-        let Some(target) = reference.symbolic_target() else {
+        let Ok(Some(target)) = reference.symbolic_target() else {
             continue;
         };
         let prefix = format!("refs/remotes/{remote}/");
@@ -1751,7 +1756,7 @@ mod tests {
         let head_branch = repo
             .head()
             .ok()
-            .and_then(|h| h.shorthand().map(String::from))
+            .and_then(|h| h.shorthand().ok().map(String::from))
             .expect("HEAD should be a branch");
 
         let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
