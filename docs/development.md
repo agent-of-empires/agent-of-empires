@@ -10,6 +10,8 @@ cargo build --profile dev-release  # Optimized build without LTO (faster compile
 
 The release binary is at `target/release/aoe`.
 
+The web dashboard needs the `serve` feature and Node.js: `cargo build --release --features serve`. See [Web Dashboard Development](development/web-dashboard.md).
+
 ## Running
 
 ```bash
