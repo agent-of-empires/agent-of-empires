@@ -78,9 +78,14 @@ export function selectionReducer(
       return { selectedIds: next, anchorId: action.id };
     }
     case "range": {
-      // Pivot from the existing anchor; if there is none, the clicked row
-      // becomes the anchor and the "range" is just that row.
-      const anchor = state.anchorId ?? action.targetId;
+      // Pivot from the existing anchor; if there is none, or it scrolled out
+      // of the rendered order (collapsed group, filter), re-anchor on the
+      // clicked row so the next Shift+click forms a range from here instead
+      // of repeatedly collapsing to a single row.
+      const anchor =
+        state.anchorId != null && action.orderedIds.includes(state.anchorId)
+          ? state.anchorId
+          : action.targetId;
       const range = rangeBetween(action.orderedIds, anchor, action.targetId);
       const next = action.additive
         ? new Set([...state.selectedIds, ...range])
