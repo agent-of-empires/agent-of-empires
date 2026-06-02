@@ -2375,7 +2375,7 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           open ? "translate-x-0" : "-translate-x-full md:hidden"
         }`}
       >
@@ -2491,7 +2491,7 @@ export function WorkspaceSidebar({
           />
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
