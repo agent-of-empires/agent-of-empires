@@ -1184,10 +1184,65 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use serial_test::serial;
     use tempfile::TempDir;
+
+    /// RAII guard that allows git's `file://` transport for this process and
+    /// any `git` subprocess it spawns, via `GIT_CONFIG_*` environment
+    /// injection. `git submodule update` blocks the file transport by
+    /// default (CVE-2022-39253), and `create_worktree` intentionally does
+    /// not override that, so the submodule fixture tests opt in here for the
+    /// production-side update. Restores the prior environment on drop.
+    ///
+    /// Every caller is `#[serial(submodule)]` so this permissive setting
+    /// never overlaps `test_create_worktree_skips_blocked_local_submodules`,
+    /// which depends on the default block.
+    struct AllowFileTransport {
+        prev_count: Option<String>,
+        prev_key: Option<String>,
+        prev_value: Option<String>,
+    }
+
+    impl AllowFileTransport {
+        fn set() -> Self {
+            let guard = Self {
+                prev_count: std::env::var("GIT_CONFIG_COUNT").ok(),
+                prev_key: std::env::var("GIT_CONFIG_KEY_0").ok(),
+                prev_value: std::env::var("GIT_CONFIG_VALUE_0").ok(),
+            };
+            // SAFETY: mutating the environment is unsafe in the 2024 edition
+            // because it can race with concurrent reads on other threads.
+            // The `#[serial(submodule)]` annotation on every caller, plus the
+            // fact that no other test reads these `GIT_CONFIG_*` vars, keeps
+            // this race-free in practice.
+            unsafe {
+                std::env::set_var("GIT_CONFIG_COUNT", "1");
+                std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
+                std::env::set_var("GIT_CONFIG_VALUE_0", "always");
+            }
+            guard
+        }
+    }
+
+    impl Drop for AllowFileTransport {
+        fn drop(&mut self) {
+            // SAFETY: see `AllowFileTransport::set`.
+            unsafe {
+                match &self.prev_count {
+                    Some(v) => std::env::set_var("GIT_CONFIG_COUNT", v),
+                    None => std::env::remove_var("GIT_CONFIG_COUNT"),
+                }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var("GIT_CONFIG_KEY_0", v),
+                    None => std::env::remove_var("GIT_CONFIG_KEY_0"),
+                }
+                match &self.prev_value {
+                    Some(v) => std::env::set_var("GIT_CONFIG_VALUE_0", v),
+                    None => std::env::remove_var("GIT_CONFIG_VALUE_0"),
+                }
+            }
+        }
+    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -1202,64 +1257,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    struct GitDaemonGuard {
-        child: std::process::Child,
-    }
-
-    impl Drop for GitDaemonGuard {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    fn pick_free_port() -> u16 {
-        TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    fn spawn_git_daemon(base_path: &Path, repo_name: &str) -> (GitDaemonGuard, String) {
-        let port = pick_free_port();
-        let child = std::process::Command::new("git")
-            .args([
-                "daemon",
-                "--reuseaddr",
-                "--export-all",
-                &format!("--base-path={}", base_path.display()),
-                "--listen=127.0.0.1",
-                &format!("--port={port}"),
-                base_path.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let guard = GitDaemonGuard { child };
-        let url = format!("git://127.0.0.1:{port}/{repo_name}");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let output = std::process::Command::new("git")
-                .args(["ls-remote", &url])
-                .output()
-                .unwrap();
-            if output.status.success() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "git daemon did not become ready for {url}:\nstdout: {}\nstderr: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        (guard, url)
     }
 
     fn setup_test_repo() -> (TempDir, git2::Repository) {
@@ -2816,18 +2813,28 @@ mod tests {
         );
     }
 
-    /// Build a main repo with a single submodule served by a `git daemon`
-    /// fixture, then create a `test-feature` branch on its current HEAD.
-    /// Returns the `TempDir` containers, the daemon guard (must stay alive
-    /// for `git submodule update` to reach the URL), and the repo path.
+    /// Build a main repo with a single submodule served from a local
+    /// `file://` bare repo, then create a `test-feature` branch on its
+    /// current HEAD. Returns the `TempDir` containers (which must stay
+    /// alive for `git submodule update` to reach the URL) and the repo
+    /// path.
+    ///
+    /// Uses a local `file://` transport rather than a `git daemon`: the
+    /// daemon variant cloned over `git://` with no timeout, so a stalled
+    /// clone could hang the whole test run indefinitely on slower CI
+    /// runners (observed on macOS). `file://` is deterministic and
+    /// offline. git blocks the file transport for submodules by default
+    /// (the CVE-2022-39253 mitigation); the `submodule add` here opts in
+    /// per-command with `-c protocol.file.allow=always`, and the caller
+    /// installs an [`AllowFileTransport`] env guard so the production-side
+    /// `git submodule update` (which inherits the test process env) can
+    /// clone too.
     ///
     /// The submodule is added at `.claude/` and contains a `skill.md` file,
     /// so tests can assert on `wt_path.join(".claude").join("skill.md")` to
     /// distinguish "submodule initialized" from "only .gitmodules checked
     /// out".
-    fn build_repo_with_submodule_and_branch(
-        branch: &str,
-    ) -> (TempDir, TempDir, GitDaemonGuard, TempDir) {
+    fn build_repo_with_submodule_and_branch(branch: &str) -> (TempDir, TempDir, TempDir) {
         let submodule_src_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_src_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -2854,9 +2861,9 @@ mod tests {
             )
             .unwrap();
 
-        let daemon_root = TempDir::new().unwrap();
+        let submodule_bare_dir = TempDir::new().unwrap();
         run_git(
-            daemon_root.path(),
+            submodule_bare_dir.path(),
             &[
                 "clone",
                 "--bare",
@@ -2864,7 +2871,10 @@ mod tests {
                 "submodule.git",
             ],
         );
-        let (daemon, submodule_url) = spawn_git_daemon(daemon_root.path(), "submodule.git");
+        let submodule_url = format!(
+            "file://{}",
+            submodule_bare_dir.path().join("submodule.git").display()
+        );
 
         let repo_dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(repo_dir.path()).unwrap();
@@ -2890,9 +2900,20 @@ mod tests {
             repo_dir.path(),
             &["config", "user.email", "test@example.com"],
         );
+        // `git submodule add` blocks the `file://` transport by default
+        // (CVE-2022-39253); allow it for just this command. The later
+        // production-side `git submodule update` is allowed via the
+        // `AllowFileTransport` env guard the calling test installs.
         run_git(
             repo_dir.path(),
-            &["submodule", "add", &submodule_url, ".claude"],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &submodule_url,
+                ".claude",
+            ],
         );
         run_git(repo_dir.path(), &["commit", "-am", "Add submodule"]);
 
@@ -2900,12 +2921,14 @@ mod tests {
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch(branch, &head_commit, false).unwrap();
 
-        (submodule_src_dir, daemon_root, daemon, repo_dir)
+        (submodule_src_dir, submodule_bare_dir, repo_dir)
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_initializes_submodules() {
-        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+        let _git_allow = AllowFileTransport::set();
+        let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
         let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
@@ -2922,10 +2945,13 @@ mod tests {
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_skips_submodules_when_disabled() {
         // with_init_submodules(false) must skip the `git submodule update`
         // step entirely so the worktree shows up before submodules clone.
-        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+        // The guard only covers the fixture's `submodule add`; init is off.
+        let _git_allow = AllowFileTransport::set();
+        let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
         let git_wt = GitWorktree::new(repo_dir.path().to_path_buf())
@@ -2952,7 +2978,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_skips_blocked_local_submodules() {
+        // Serial with the other submodule tests (but installs no
+        // `AllowFileTransport` guard) so it always observes git's default
+        // file-transport block that this test asserts on.
         let submodule_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
