@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: Format
@@ -33,13 +36,23 @@ jobs:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -- -D warnings
+      - name: file_watch consolidation guard
+        run: |
+          set -euo pipefail
+          hits="$(grep -rl 'notify::recommended_watcher' src/ || true)"
+          unexpected="$(printf '%s\n' "$hits" | grep -v '^src/file_watch.rs$' | grep . || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::New notify::recommended_watcher found outside src/file_watch.rs:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
 
   deny:
     name: Supply Chain
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
+      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823 # v2.0.19
 
   docs:
     name: Docs
@@ -130,8 +143,6 @@ jobs:
     name: Nix Build Web
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
     steps:

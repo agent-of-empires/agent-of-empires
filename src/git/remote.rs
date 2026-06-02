@@ -138,7 +138,7 @@ pub(crate) fn parse_owner_from_remote_url(url: &str) -> Option<String> {
 pub fn get_remote_owner(path: &Path) -> Option<String> {
     let repo = open_repo_at(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
-    let url = remote.url()?;
+    let url = remote.url().ok()?;
     parse_owner_from_remote_url(url)
 }
 

@@ -6,6 +6,7 @@ pub mod cli;
 #[cfg(feature = "serve")]
 pub mod cockpit;
 pub mod containers;
+pub mod file_watch;
 pub mod git;
 pub mod github;
 pub mod hooks;
