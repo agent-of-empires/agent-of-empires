@@ -232,6 +232,12 @@ fn build_widget(field: &syn::Field, attrs: &FieldAttrs) -> syn::Result<proc_macr
                 max.ok_or_else(|| syn::Error::new_spanned(field, "slider needs max"))?,
                 step.unwrap_or(1),
             );
+            if step <= 0 {
+                return Err(syn::Error::new_spanned(field, "slider step must be > 0"));
+            }
+            if min > max {
+                return Err(syn::Error::new_spanned(field, "slider min must be <= max"));
+            }
             quote!(WidgetKind::Slider { min: #min, max: #max, step: #step })
         }
         "select" => {
@@ -297,6 +303,12 @@ fn build_validation(
         "volume_list" => quote!(ValidationKind::VolumeList),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();
+            if parts.is_empty() || parts.len() > 2 {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "range must be `range:min` or `range:min:max`",
+                ));
+            }
             let min: u64 = parts
                 .first()
                 .and_then(|s| s.parse().ok())
