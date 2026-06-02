@@ -41,6 +41,7 @@ import {
   useIdleDecayWindowMs,
 } from "./lib/idleDecay";
 import { toastBus } from "./lib/toastBus";
+import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import {
   dispatchFocusTerminal,
@@ -590,6 +591,28 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [],
   );
 
+  // Open a local file reference cited in a cockpit transcript (Codex
+  // `path:line` markdown links). Resolve the absolute path back to a
+  // repo-relative path for the active session and open it in the in-app
+  // diff/file viewer, keeping the current session route. A path outside
+  // the session's known repo roots surfaces a non-destructive toast
+  // rather than navigating away. Line/column are parsed but not yet
+  // wired to viewer scroll-to-line. See #1718.
+  const handleOpenFileRef = useCallback(
+    (ref: FileRef) => {
+      if (!activeSession) return;
+      const resolved = resolveToRepoRelative(ref.path, activeSession);
+      if (!resolved) {
+        toastBus.handler?.error(
+          `Could not open ${ref.path}: not inside this session's repo`,
+        );
+        return;
+      }
+      handleSelectFile(resolved.relativePath, resolved.repoName);
+    },
+    [activeSession, handleSelectFile],
+  );
+
   const handleCloseFile = useCallback(() => {
     setSelectedFile(null);
   }, []);
@@ -871,6 +894,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           warning={warning}
           diffFilesLoading={diffFilesLoading}
           onSelectFile={handleSelectFile}
+          onOpenFileRef={handleOpenFileRef}
           onCloseFile={handleCloseFile}
           onDiffRefresh={refreshDiffFiles}
           commentsEnabled={commentsEnabled}
@@ -909,6 +933,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                       tool={activeSession.tool}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
+                      onOpenFileRef={handleOpenFileRef}
                     />
                   </Suspense>
                 ) : (

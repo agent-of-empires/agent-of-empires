@@ -31,6 +31,8 @@ import {
 } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
+import { CockpitFileRefContext } from "./CockpitFileRefContext";
+import type { FileRef } from "../../lib/fileRef";
 import {
   CockpitRuntime,
   SUBAGENT_TASK_NAME,
@@ -108,6 +110,12 @@ interface Props {
    *  timestamps come back as null and we fall through to the live
    *  variant. See #1581. */
   snoozedUntil: string | null;
+  /** Open a local file reference cited in the transcript (Codex
+   *  `path:line` markdown links). Provided to the markdown anchor
+   *  override via context so a click opens the in-app file viewer
+   *  instead of navigating away. Omit to leave such links as normal
+   *  anchors. See #1718. */
+  onOpenFileRef?: (ref: FileRef) => void;
 }
 
 const STARTER_PROMPTS = [
@@ -122,6 +130,7 @@ export function CockpitView({
   tool,
   archivedAt,
   snoozedUntil,
+  onOpenFileRef,
 }: Props) {
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -129,27 +138,29 @@ export function CockpitView({
   // event-log state. See #1101.
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   return (
-    <AgentProfileProvider toolKey={tool}>
-      <CockpitRuntime
-        sessionId={sessionId}
-        cockpitWorkerState={cockpitWorkerState}
-        archivedAt={archivedAt}
-        snoozedUntil={snoozedUntil}
-        showClearedTurns={showClearedTurns}
-      >
-        {(ctx) => (
-          <CockpitChrome
-            sessionId={sessionId}
-            cockpitWorkerState={cockpitWorkerState}
-            showClearedTurns={showClearedTurns}
-            onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-            archivedAt={archivedAt}
-            snoozedUntil={snoozedUntil}
-            {...ctx}
-          />
-        )}
-      </CockpitRuntime>
-    </AgentProfileProvider>
+    <CockpitFileRefContext.Provider value={{ onOpenFileRef }}>
+      <AgentProfileProvider toolKey={tool}>
+        <CockpitRuntime
+          sessionId={sessionId}
+          cockpitWorkerState={cockpitWorkerState}
+          archivedAt={archivedAt}
+          snoozedUntil={snoozedUntil}
+          showClearedTurns={showClearedTurns}
+        >
+          {(ctx) => (
+            <CockpitChrome
+              sessionId={sessionId}
+              cockpitWorkerState={cockpitWorkerState}
+              showClearedTurns={showClearedTurns}
+              onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+              archivedAt={archivedAt}
+              snoozedUntil={snoozedUntil}
+              {...ctx}
+            />
+          )}
+        </CockpitRuntime>
+      </AgentProfileProvider>
+    </CockpitFileRefContext.Provider>
   );
 }
 
