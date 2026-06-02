@@ -836,7 +836,8 @@
         "tests/sidebar-sort-mode.spec.ts"
       ],
       "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx"
       ]
     },
     {
@@ -847,7 +848,8 @@
         "tests/live/sidebar-sort-mode.spec.ts"
       ],
       "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx"
       ]
     },
     {

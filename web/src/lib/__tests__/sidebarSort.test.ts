@@ -4,17 +4,25 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { RepoGroup, SessionResponse, Workspace } from "../types";
 import {
   SIDEBAR_SORT_MODE_KEY,
+  compareWorkspacesByAttention,
   compareWorkspacesByLastActivityDesc,
+  compareWorkspacesForComputedSortMode,
   loadSidebarSortMode,
+  repoGroupAttentionRank,
   repoGroupHasLiveWorkspace,
+  repoGroupIsUrgent,
   repoGroupLastActivityMs,
   resolveEffectiveSnoozedUntil,
   saveSidebarSortMode,
+  sessionAttentionRank,
   snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
+  workspaceAttentionRank,
+  workspaceIsFavorited,
   workspaceIsPinned,
   workspaceIsSunk,
+  workspaceIsUrgent,
   workspaceLastActivityMs,
   workspaceTriageTier,
 } from "../sidebarSort";
@@ -651,5 +659,229 @@ describe("repoGroupHasLiveWorkspace", () => {
       ]),
     ]);
     expect(repoGroupHasLiveWorkspace(g)).toBe(true);
+  });
+});
+
+describe("sessionAttentionRank (#1640)", () => {
+  it("ranks live statuses in the TUI attention_tier order", () => {
+    const rank = (status: string) =>
+      sessionAttentionRank(session({ status: status as never }));
+    expect(rank("Waiting")).toBe(0);
+    expect(rank("Error")).toBe(1);
+    expect(rank("Idle")).toBe(2);
+    expect(rank("Unknown")).toBe(3);
+    expect(rank("Running")).toBe(4);
+    expect(rank("Stopped")).toBe(5);
+    expect(rank("Starting")).toBe(6);
+    expect(rank("Creating")).toBe(6);
+    expect(rank("Deleting")).toBe(6);
+  });
+
+  it("sinks archived and snoozed sessions to rank 99 regardless of status", () => {
+    expect(
+      sessionAttentionRank(
+        session({ status: "Waiting", archived_at: "2026-01-01T00:00:00Z" }),
+      ),
+    ).toBe(99);
+    expect(
+      sessionAttentionRank(
+        session({ status: "Error", snoozed_until: "2999-01-01T00:00:00Z" }),
+      ),
+    ).toBe(99);
+  });
+});
+
+describe("workspaceAttentionRank (#1640)", () => {
+  it("returns the best (lowest) rank across sessions", () => {
+    const ws = workspace("w", [
+      session({ id: "a", status: "Running" }),
+      session({ id: "b", status: "Waiting" }),
+      session({ id: "c", status: "Idle" }),
+    ]);
+    expect(workspaceAttentionRank(ws)).toBe(0);
+  });
+
+  it("ignores a snoozed Waiting session so it does not falsely lift the workspace", () => {
+    const ws = workspace("w", [
+      session({ id: "live", status: "Running" }),
+      session({
+        id: "snoozed",
+        status: "Waiting",
+        snoozed_until: "2999-01-01T00:00:00Z",
+      }),
+    ]);
+    // Running (4) wins over the sunk snoozed Waiting (99).
+    expect(workspaceAttentionRank(ws)).toBe(4);
+  });
+});
+
+describe("workspaceIsUrgent / workspaceIsFavorited (#1640)", () => {
+  it("is urgent when any session carries the flag", () => {
+    expect(
+      workspaceIsUrgent(
+        workspace("w", [session({ id: "a" }), session({ id: "b", urgent: true })]),
+      ),
+    ).toBe(true);
+    expect(workspaceIsUrgent(workspace("w", [session({ id: "a" })]))).toBe(
+      false,
+    );
+  });
+
+  it("is favorited when any session is favorited", () => {
+    expect(
+      workspaceIsFavorited(
+        workspace("w", [session({ id: "a", favorited: true })]),
+      ),
+    ).toBe(true);
+    expect(workspaceIsFavorited(workspace("w", [session({ id: "a" })]))).toBe(
+      false,
+    );
+  });
+});
+
+describe("compareWorkspacesByAttention (#1640)", () => {
+  // Shared activity timestamp so the status rank, not the within-tier
+  // recency key, drives ordering in the pure-rank cases.
+  const TS = "2025-06-01T00:00:00Z";
+  const wsStatus = (id: string, status: string) =>
+    workspace(id, [session({ id: `${id}-s`, status: status as never, created_at: TS })]);
+
+  function order(list: Workspace[]): string[] {
+    return [...list].sort(compareWorkspacesByAttention).map((w) => w.id);
+  }
+
+  it("floats Waiting and Error above Idle, Running, and Stopped", () => {
+    const list = [
+      wsStatus("stopped", "Stopped"),
+      wsStatus("running", "Running"),
+      wsStatus("idle", "Idle"),
+      wsStatus("error", "Error"),
+      wsStatus("waiting", "Waiting"),
+    ];
+    expect(order(list)).toEqual([
+      "waiting",
+      "error",
+      "idle",
+      "running",
+      "stopped",
+    ]);
+  });
+
+  it("promotes an urgent workspace above all non-urgent regardless of status rank", () => {
+    const urgentRunning = workspace("urgent", [
+      session({ id: "u", status: "Running", urgent: true, created_at: TS }),
+    ]);
+    const plainWaiting = wsStatus("waiting", "Waiting");
+    expect(order([plainWaiting, urgentRunning])).toEqual([
+      "urgent",
+      "waiting",
+    ]);
+  });
+
+  it("breaks ties within a rank by favorite, then newest activity, then id", () => {
+    const favorited = workspace("fav", [
+      session({ id: "f", status: "Idle", favorited: true, created_at: TS }),
+    ]);
+    const plain = wsStatus("plain", "Idle");
+    expect(order([plain, favorited])).toEqual(["fav", "plain"]);
+
+    const newer = workspace("newer", [
+      session({ id: "n", status: "Idle", created_at: "2025-07-01T00:00:00Z" }),
+    ]);
+    const older = workspace("older", [
+      session({ id: "o", status: "Idle", created_at: "2025-01-01T00:00:00Z" }),
+    ]);
+    expect(order([older, newer])).toEqual(["newer", "older"]);
+  });
+
+  it("keeps pinned at the top tier and sunk at the bottom tier", () => {
+    const pinned = workspace("pinned", [
+      session({ id: "p", status: "Stopped", pinned_at: TS, created_at: TS }),
+    ]);
+    const liveWaiting = wsStatus("waiting", "Waiting");
+    const sunk = workspace("sunk", [
+      session({ id: "s", status: "Waiting", archived_at: TS, created_at: TS }),
+    ]);
+    expect(order([liveWaiting, sunk, pinned])).toEqual([
+      "pinned",
+      "waiting",
+      "sunk",
+    ]);
+  });
+
+  it("is deterministic when both workspaces have no usable timestamp", () => {
+    const a = workspace("a", [
+      session({
+        id: "a-s",
+        status: "Idle",
+        created_at: "bad",
+        idle_entered_at: null,
+        last_accessed_at: null,
+      }),
+    ]);
+    const b = workspace("b", [
+      session({
+        id: "b-s",
+        status: "Idle",
+        created_at: "bad",
+        idle_entered_at: null,
+        last_accessed_at: null,
+      }),
+    ]);
+    // -Infinity vs -Infinity must not poison the comparator into skipping
+    // the id tie-break; "a" sorts before "b".
+    expect(order([b, a])).toEqual(["a", "b"]);
+  });
+});
+
+describe("compareWorkspacesForComputedSortMode (#1640)", () => {
+  it("returns the attention comparator only for attention mode", () => {
+    expect(compareWorkspacesForComputedSortMode("attention")).toBe(
+      compareWorkspacesByAttention,
+    );
+    expect(compareWorkspacesForComputedSortMode("lastActivity")).toBe(
+      compareWorkspacesByLastActivityDesc,
+    );
+    // The group/nested axes have no manual order, so manual falls back to
+    // last-activity there.
+    expect(compareWorkspacesForComputedSortMode("manual")).toBe(
+      compareWorkspacesByLastActivityDesc,
+    );
+  });
+});
+
+describe("repoGroup attention helpers (#1640)", () => {
+  it("repoGroupAttentionRank takes the best rank across the group", () => {
+    const workspaces = [
+      workspace("w1", [session({ id: "a", status: "Running" })]),
+      workspace("w2", [session({ id: "b", status: "Waiting" })]),
+    ];
+    expect(repoGroupAttentionRank(workspaces)).toBe(0);
+  });
+
+  it("repoGroupIsUrgent is true when any workspace is urgent", () => {
+    expect(
+      repoGroupIsUrgent([
+        workspace("w1", [session({ id: "a" })]),
+        workspace("w2", [session({ id: "b", urgent: true })]),
+      ]),
+    ).toBe(true);
+    expect(
+      repoGroupIsUrgent([workspace("w1", [session({ id: "a" })])]),
+    ).toBe(false);
+  });
+});
+
+describe("loadSidebarSortMode accepts attention (#1640)", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  it("round-trips the attention mode through storage", () => {
+    saveSidebarSortMode("attention");
+    expect(loadSidebarSortMode()).toBe("attention");
+  });
+
+  it("falls back to manual for an unknown stored value", () => {
+    window.localStorage.setItem(SIDEBAR_SORT_MODE_KEY, "bogus");
+    expect(loadSidebarSortMode()).toBe("manual");
   });
 });
