@@ -2107,6 +2107,26 @@ fn validate_session_tool_identity(
     }
 }
 
+/// Insert `instance` into the live registry, replacing any entry that
+/// already carries the same id rather than blind-pushing a second copy.
+///
+/// `create_session` persists the new session to disk (in `persist_and_start`)
+/// before it pushes the in-memory copy here. A `status_poll_loop` tick that
+/// fires in that window calls `load_all_instances`, reads the just-persisted
+/// row, and inserts it first. A blind `push` would then leave two entries
+/// with the same id in `state.instances` until the next poll tick collapses
+/// them, and `GET /api/sessions` would briefly return the session twice.
+fn upsert_instance(
+    instances: &mut Vec<crate::session::Instance>,
+    instance: crate::session::Instance,
+) {
+    if let Some(existing) = instances.iter_mut().find(|i| i.id == instance.id) {
+        *existing = instance;
+    } else {
+        instances.push(instance);
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
@@ -2476,7 +2496,7 @@ pub async fn create_session(
                 None
             };
             let mut instances = state.instances.write().await;
-            instances.push(instance);
+            upsert_instance(&mut instances, instance);
             drop(instances);
 
             // Count the create for the opt-in telemetry trend counter. Bounded
@@ -3561,6 +3581,45 @@ mod tests {
         inst.status = Status::Running;
         inst.group_path = "work/projects".to_string();
         inst
+    }
+
+    #[test]
+    fn upsert_instance_replaces_same_id_instead_of_duplicating() {
+        // Race regression: `create_session` persists to disk before pushing
+        // the in-memory copy, so a `status_poll_loop` tick can load the row
+        // and insert it first. The handler's insert must replace that entry,
+        // not append a second one with the same id.
+        let poll_loaded = make_test_instance();
+        let id = poll_loaded.id.clone();
+        let mut instances = vec![poll_loaded];
+
+        let mut handler_copy = make_test_instance();
+        handler_copy.id = id.clone();
+        handler_copy.status = Status::Starting;
+
+        upsert_instance(&mut instances, handler_copy);
+
+        assert_eq!(
+            instances.len(),
+            1,
+            "same id must not duplicate in the registry"
+        );
+        assert_eq!(instances[0].id, id);
+        assert_eq!(
+            instances[0].status,
+            Status::Starting,
+            "handler copy must win"
+        );
+    }
+
+    #[test]
+    fn upsert_instance_appends_a_new_id() {
+        let mut instances = vec![make_test_instance()];
+        let other = Instance::new("other-session", "/tmp/other-project");
+        let other_id = other.id.clone();
+        upsert_instance(&mut instances, other);
+        assert_eq!(instances.len(), 2);
+        assert!(instances.iter().any(|i| i.id == other_id));
     }
 
     #[test]
