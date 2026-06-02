@@ -171,6 +171,8 @@ export function SettingsView({
   // renderer builds sandbox/worktree from this; empty until the one-shot fetch
   // resolves, at which point those tabs populate.
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
+  const [schemaLoading, setSchemaLoading] = useState(true);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -179,11 +181,26 @@ export function SettingsView({
     });
   }, []);
 
-  useEffect(() => {
-    getSettingsSchema().then((s) => {
-      if (s) setSchema(s);
-    });
+  const loadSchema = useCallback(async () => {
+    setSchemaLoading(true);
+    setSchemaError(null);
+    try {
+      const s = await getSettingsSchema();
+      if (!s) {
+        setSchemaError("Failed to load settings schema.");
+        return;
+      }
+      setSchema(s);
+    } catch {
+      setSchemaError("Failed to load settings schema.");
+    } finally {
+      setSchemaLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void loadSchema();
+  }, [loadSchema]);
 
   const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
 
@@ -409,6 +426,23 @@ export function SettingsView({
         );
 
       case "worktree":
+        if (schemaLoading) {
+          return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        }
+        if (schemaError) {
+          return (
+            <div className="space-y-3">
+              <div className="text-sm text-status-error">{schemaError}</div>
+              <button
+                type="button"
+                onClick={() => void loadSchema()}
+                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
+              >
+                Retry
+              </button>
+            </div>
+          );
+        }
         return (
           <SchemaSection
             section="worktree"
