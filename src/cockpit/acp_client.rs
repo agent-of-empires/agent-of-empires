@@ -2799,6 +2799,11 @@ fn map_update_to_events(
             } else {
                 None
             };
+            // Codex (and any ACP agent) can attach structured file diffs to
+            // the initial tool_call via `ToolCallContent::Diff`. Bridge them
+            // onto the ToolCall so the edit card shows the path + preview
+            // instead of "(unknown file)". See #1721.
+            let diffs = extract_diffs_from_content(&tc.content);
             let tool_call = ToolCall {
                 id: tc.tool_call_id.0.to_string(),
                 name: tc.title.clone(),
@@ -2807,14 +2812,11 @@ fn map_update_to_events(
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id,
                 memory_recall,
+                diffs,
             };
             let mut events = vec![Event::ToolCallStarted { tool_call }];
             if is_destructive(&tc.title, &args_preview) {
                 debug!(target: "cockpit.acp", "tool {} flagged destructive on tool_call ingest", tc.title);
-            }
-            // If the same payload carries diff content, surface it.
-            if let Some(diff) = extract_diff_from_locations(&tc.locations) {
-                events.push(Event::DiffEmitted { diff });
             }
             // claude-agent-acp routes Claude's built-in ExitPlanMode through
             // the tool channel (kind=switch_mode, plan markdown in
@@ -2873,10 +2875,25 @@ fn map_update_to_events(
                 .as_ref()
                 .map(|blocks| extract_tool_content_text(blocks))
                 .unwrap_or_default();
+            // Codex emits `apply_patch` diffs on the in-progress and
+            // completion updates, not only the initial tool_call. Pull any
+            // Diff blocks off this frame so the edit card's path + preview
+            // survive when they arrive late. `Some` here REPLACES the card's
+            // diffs in the reducer; absent diff blocks stay `None` so a
+            // text-only update can't wipe diffs from an earlier frame. See
+            // #1721.
+            let new_diffs = update.fields.content.as_ref().and_then(|blocks| {
+                let diffs = extract_diffs_from_content(blocks);
+                (!diffs.is_empty()).then_some(diffs)
+            });
             let new_args_preview = update.fields.raw_input.as_ref().map(preview_args);
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
-            if new_title.is_some() || new_args_preview.is_some() || in_progress {
+            if new_title.is_some()
+                || new_args_preview.is_some()
+                || in_progress
+                || new_diffs.is_some()
+            {
                 events.push(Event::ToolCallUpdated {
                     tool_call_id: id.clone(),
                     title: new_title,
@@ -2886,6 +2903,7 @@ fn map_update_to_events(
                     } else {
                         None
                     },
+                    diffs: new_diffs,
                 });
             }
             if completed {
@@ -2976,6 +2994,7 @@ fn map_update_to_events(
                         started_at: now,
                         parent_tool_call_id: None,
                         memory_recall: None,
+                        diffs: Vec::new(),
                     },
                 },
                 Event::PlanUpdated {
@@ -3222,9 +3241,8 @@ fn preview_args(raw: &serde_json::Value) -> String {
 
 /// Concat the textual portion of a tool call's `content` array. Drops
 /// non-text content blocks (images, resources, embedded terminals); the
-/// per-tool renderer fall-back path only knows how to display text. Diffs
-/// are surfaced separately via `extract_diff_from_locations` (and could
-/// later be picked up here too via `ToolCallContent::Diff`).
+/// per-tool renderer fall-back path only knows how to display text. Diff
+/// blocks are bridged separately by `extract_diffs_from_content`.
 fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallContent]) -> String {
     use agent_client_protocol::schema::ToolCallContent;
     let mut out = String::new();
@@ -3288,13 +3306,59 @@ fn extract_memory_recall(
     })
 }
 
-fn extract_diff_from_locations(
-    _locations: &[agent_client_protocol::schema::ToolCallLocation],
-) -> Option<DiffPreview> {
-    // Pulling structured diffs out of a ToolCall update requires reading
-    // the `content` array (ToolCallContent::Diff). Left as a follow-up;
-    // the cockpit UI already reuses the existing diff viewer for this.
-    None
+/// Max bytes of diff text kept per side (old/new) when bridging an ACP
+/// `ToolCallContent::Diff` into a cockpit `DiffPreview`. The card only
+/// previews ~20 lines, but the untrimmed text is persisted in the event
+/// store and shipped over every WS replay frame, so a large `apply_patch`
+/// would bloat both without a cap here. Mirrors `preview_args`' 16 KB ceiling.
+const MAX_DIFF_TEXT_BYTES: usize = 16 * 1024;
+
+/// Max number of per-file diffs kept from a single tool call. A patch
+/// touching more files than this keeps the first `MAX_TOOL_DIFFS` rather
+/// than letting one event grow unbounded.
+const MAX_TOOL_DIFFS: usize = 16;
+
+/// Truncate diff text to `MAX_DIFF_TEXT_BYTES` on a UTF-8 char boundary,
+/// appending a sentinel so the cut reads as intentional rather than as a
+/// corrupt diff.
+fn cap_diff_text(text: &str) -> String {
+    if text.len() <= MAX_DIFF_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_DIFF_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_string();
+    out.push_str("\n\u{2026}[truncated]");
+    out
+}
+
+/// Bridge ACP `ToolCallContent::Diff` blocks into cockpit `DiffPreview`
+/// entries. Codex routes `apply_patch` edits through this channel (one
+/// block per touched file) instead of the legacy `old_string`/`new_string`
+/// raw_input keys, so the edit card reads the path and +/- preview from
+/// here. Non-diff blocks (text, images, terminals) are ignored; the enum
+/// is `#[non_exhaustive]`, so the wildcard arm keeps this compiling as the
+/// schema grows. Per-side text is capped and the list bounded. See #1721.
+fn extract_diffs_from_content(
+    blocks: &[agent_client_protocol::schema::ToolCallContent],
+) -> Vec<DiffPreview> {
+    use agent_client_protocol::schema::ToolCallContent;
+    let created_at = chrono::Utc::now();
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolCallContent::Diff(d) => Some(DiffPreview {
+                path: d.path.to_string_lossy().to_string(),
+                old_text: d.old_text.as_deref().map(cap_diff_text),
+                new_text: Some(cap_diff_text(&d.new_text)),
+                created_at,
+            }),
+            _ => None,
+        })
+        .take(MAX_TOOL_DIFFS)
+        .collect()
 }
 
 /// Dispatch the experimental `session/delete` RPC from the connect
@@ -5200,6 +5264,7 @@ async fn handle_permission_request(
         started_at: chrono::Utc::now(),
         parent_tool_call_id: profile.parent_tool_use_id_from_meta(&request.tool_call.meta),
         memory_recall: None,
+        diffs: Vec::new(),
     };
     let approval = build_approval(tool_call);
     let nonce = approval.nonce.clone();
@@ -6769,6 +6834,7 @@ mod tests {
                 started_at,
                 title,
                 args_preview,
+                diffs,
             } => {
                 assert_eq!(tool_call_id, "tc-3");
                 assert!(
@@ -6777,8 +6843,138 @@ mod tests {
                 );
                 assert!(title.is_none());
                 assert!(args_preview.is_none());
+                assert!(diffs.is_none());
             }
             other => panic!("expected ToolCallUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_diffs_from_content_bridges_diff_blocks_and_ignores_others() {
+        use agent_client_protocol::schema::{Content, Diff, ToolCallContent};
+        let blocks = vec![
+            ToolCallContent::Content(Content::new("some text")),
+            ToolCallContent::Diff(Diff::new("src/foo.rs", "new body").old_text("old body")),
+            // New-file diff: old_text is None.
+            ToolCallContent::Diff(Diff::new("src/new.rs", "created")),
+        ];
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), 2, "text blocks must be ignored");
+        assert_eq!(diffs[0].path, "src/foo.rs");
+        assert_eq!(diffs[0].old_text.as_deref(), Some("old body"));
+        assert_eq!(diffs[0].new_text.as_deref(), Some("new body"));
+        assert_eq!(diffs[1].path, "src/new.rs");
+        assert_eq!(diffs[1].old_text, None, "new file carries no old_text");
+        assert_eq!(diffs[1].new_text.as_deref(), Some("created"));
+    }
+
+    #[test]
+    fn extract_diffs_from_content_caps_per_side_text() {
+        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        let huge = "x".repeat(MAX_DIFF_TEXT_BYTES + 4096);
+        let blocks = vec![ToolCallContent::Diff(
+            Diff::new("src/big.rs", huge.clone()).old_text(huge),
+        )];
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), 1);
+        let new_len = diffs[0].new_text.as_deref().unwrap().len();
+        let old_len = diffs[0].old_text.as_deref().unwrap().len();
+        assert!(
+            new_len < MAX_DIFF_TEXT_BYTES + 64,
+            "new_text must be capped, got {new_len}"
+        );
+        assert!(
+            old_len < MAX_DIFF_TEXT_BYTES + 64,
+            "old_text must be capped, got {old_len}"
+        );
+        assert!(diffs[0]
+            .new_text
+            .as_deref()
+            .unwrap()
+            .contains("[truncated]"));
+    }
+
+    #[test]
+    fn extract_diffs_from_content_caps_diff_count() {
+        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        let blocks: Vec<ToolCallContent> = (0..MAX_TOOL_DIFFS + 8)
+            .map(|i| ToolCallContent::Diff(Diff::new(format!("f{i}.rs"), "x")))
+            .collect();
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), MAX_TOOL_DIFFS, "diff count must be bounded");
+    }
+
+    #[test]
+    fn map_tool_call_bridges_diff_content_onto_started_tool() {
+        // Codex attaches the apply_patch diff to the initial `tool_call`
+        // frame as ToolCallContent::Diff. The edit card reads path + preview
+        // from ToolCall.diffs, so it must survive ingest. See #1721.
+        use agent_client_protocol::schema::{Diff, ToolCall, ToolCallContent, ToolKind};
+        let mut tc = ToolCall::new("tc-edit-1", "Edit src/foo.rs");
+        tc.kind = ToolKind::Edit;
+        tc.content = vec![ToolCallContent::Diff(
+            Diff::new("src/foo.rs", "new").old_text("old"),
+        )];
+        let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CODEX);
+        match &events[0] {
+            Event::ToolCallStarted { tool_call } => {
+                assert_eq!(tool_call.diffs.len(), 1);
+                assert_eq!(tool_call.diffs[0].path, "src/foo.rs");
+                assert_eq!(tool_call.diffs[0].new_text.as_deref(), Some("new"));
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_carries_diff_content() {
+        // Codex also re-sends the diff on the in-progress and completion
+        // updates; those must reach the reducer via ToolCallUpdated.diffs so
+        // a late-arriving diff still lands on the card. See #1721.
+        use agent_client_protocol::schema::{
+            Diff, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/foo.rs", "new").old_text("old"),
+            )]);
+        let update = ToolCallUpdate::new("tc-edit-1", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CODEX,
+        );
+        let updated = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolCallUpdated { diffs, .. } => Some(diffs),
+                _ => None,
+            })
+            .expect("a ToolCallUpdated event must be emitted for a diff-only update");
+        let diffs = updated.as_ref().expect("diffs must be Some");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "src/foo.rs");
+    }
+
+    #[test]
+    fn map_tool_call_update_text_only_leaves_diffs_none() {
+        // A text-only update must not carry Some([]) (which would wipe an
+        // earlier frame's diffs in the reducer). See #1721.
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new("done"))]);
+        let update = ToolCallUpdate::new("tc-edit-1", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CODEX,
+        );
+        for e in &events {
+            if let Event::ToolCallUpdated { diffs, .. } = e {
+                assert!(diffs.is_none(), "text-only update must leave diffs None");
+            }
         }
     }
 

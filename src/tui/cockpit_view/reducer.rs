@@ -484,6 +484,7 @@ mod tests {
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         }
     }
 
