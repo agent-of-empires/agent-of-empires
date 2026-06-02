@@ -5,7 +5,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { parseJsonObject, pickFirst, pickStr } from "./cockpitArgs";
+import {
+  hasArgsBody,
+  parseJsonObject,
+  pickFirst,
+  pickStr,
+  previewFromArgs,
+} from "./cockpitArgs";
 
 describe("parseJsonObject", () => {
   it("returns the object for valid JSON object input", () => {
@@ -95,5 +101,54 @@ describe("pickFirst", () => {
     expect(pickFirst(null, undefined, "")).toBeNull();
     expect(pickFirst()).toBeNull();
     expect(pickFirst("   ", "\t")).toBeNull();
+  });
+});
+
+describe("previewFromArgs", () => {
+  it("prefers a shell command", () => {
+    expect(previewFromArgs(JSON.stringify({ command: "ls -al" }))).toBe(
+      "ls -al",
+    );
+  });
+
+  it("falls back to a file path for read/edit shapes", () => {
+    expect(previewFromArgs(JSON.stringify({ file_path: "src/a.ts" }))).toBe(
+      "src/a.ts",
+    );
+  });
+
+  it("surfaces query/pattern and url shapes", () => {
+    expect(previewFromArgs(JSON.stringify({ pattern: "TODO" }))).toBe("TODO");
+    expect(previewFromArgs(JSON.stringify({ url: "https://x" }))).toBe(
+      "https://x",
+    );
+  });
+
+  it("falls back to the ACP-forwarded _aoe_title", () => {
+    expect(
+      previewFromArgs(JSON.stringify({ _aoe_title: "Run the suite" })),
+    ).toBe("Run the suite");
+  });
+
+  it("returns null when no usable primary argument is present", () => {
+    expect(previewFromArgs("{}")).toBeNull();
+    expect(previewFromArgs(JSON.stringify({ _aoe_parent: "p" }))).toBeNull();
+    expect(previewFromArgs("not json")).toBeNull();
+  });
+});
+
+describe("hasArgsBody", () => {
+  it("is true for an object with a non-bookkeeping key", () => {
+    expect(hasArgsBody(JSON.stringify({ command: "ls" }))).toBe(true);
+  });
+
+  it("is false for an empty object or _aoe_-only object", () => {
+    expect(hasArgsBody("{}")).toBe(false);
+    expect(hasArgsBody(JSON.stringify({ _aoe_title: "x" }))).toBe(false);
+  });
+
+  it("is true for non-blank non-object payloads, false when blank", () => {
+    expect(hasArgsBody("raw text [truncated]")).toBe(true);
+    expect(hasArgsBody("   ")).toBe(false);
   });
 });

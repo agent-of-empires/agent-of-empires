@@ -55,7 +55,32 @@ describe("ApprovalCard (benign)", () => {
     expect(screen.getByText("Bash")).toBeTruthy();
   });
 
-  it("renders the args JSON as a key/value list", () => {
+  it("collapses to a command preview and hides args until expanded", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: {
+            id: "t-1",
+            name: "Bash",
+            kind: "execute",
+            args_preview: JSON.stringify({ command: "ls -al", cwd: "/tmp" }),
+            started_at: "2026-05-21T00:00:00Z",
+          },
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    // Command preview is in the collapsed header; the args <dl> is not.
+    expect(screen.getByText("ls -al")).toBeTruthy();
+    expect(screen.queryByText("cwd")).toBeNull();
+    expect(screen.queryByText("/tmp")).toBeNull();
+    // Action surface stays reachable without expanding.
+    expect(screen.getByText("Allow")).toBeTruthy();
+    expect(screen.getByText("Deny")).toBeTruthy();
+  });
+
+  it("renders the args JSON as a key/value list once expanded", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(
       <ApprovalCard
@@ -71,13 +96,39 @@ describe("ApprovalCard (benign)", () => {
         onResolve={onResolve}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
     expect(screen.getByText("command")).toBeTruthy();
-    expect(screen.getByText("ls")).toBeTruthy();
+    // "ls" shows in both the header preview and the expanded args row.
+    expect(screen.getAllByText("ls")).toHaveLength(2);
     expect(screen.getByText("cwd")).toBeTruthy();
     expect(screen.getByText("/tmp")).toBeTruthy();
   });
 
-  it("hides bookkeeping keys whose name starts with _aoe_", () => {
+  it("toggles the args open and closed on header clicks", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: {
+            id: "t-1",
+            name: "Bash",
+            kind: "execute",
+            args_preview: JSON.stringify({ command: "ls", cwd: "/tmp" }),
+            started_at: "2026-05-21T00:00:00Z",
+          },
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    const header = screen.getByRole("button", { name: /Approval needed/i });
+    expect(screen.queryByText("cwd")).toBeNull();
+    fireEvent.click(header);
+    expect(screen.getByText("cwd")).toBeTruthy();
+    fireEvent.click(header);
+    expect(screen.queryByText("cwd")).toBeNull();
+  });
+
+  it("hides bookkeeping keys whose name starts with _aoe_ when expanded", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(
       <ApprovalCard
@@ -96,6 +147,7 @@ describe("ApprovalCard (benign)", () => {
         onResolve={onResolve}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
     expect(screen.queryByText("_aoe_parent_tool_call_id")).toBeNull();
     expect(screen.queryByText("parent-123")).toBeNull();
     expect(screen.getByText("command")).toBeTruthy();
@@ -117,7 +169,29 @@ describe("ApprovalCard (benign)", () => {
         onResolve={onResolve}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
     expect(screen.getByText("raw text [truncated]")).toBeTruthy();
+  });
+
+  it("offers no expand toggle when there is no args body", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: {
+            id: "t-1",
+            name: "Bash",
+            kind: "execute",
+            args_preview: JSON.stringify({ _aoe_title: "noop" }),
+            started_at: "2026-05-21T00:00:00Z",
+          },
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: /Approval needed/i }),
+    ).toBeNull();
   });
 
   it("routes the Allow button to onResolve('Allow')", async () => {
@@ -173,6 +247,18 @@ describe("ApprovalCard (destructive)", () => {
     expect(screen.getByText("Destructive action")).toBeTruthy();
     expect(screen.getByText("Hold to allow")).toBeTruthy();
     expect(screen.queryByText("Always")).toBeNull();
+  });
+
+  it("defaults to expanded so the full command is in view", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({ destructive: true })}
+        onResolve={onResolve}
+      />,
+    );
+    // The args <dl> renders without a click in the destructive branch.
+    expect(screen.getByText("command")).toBeTruthy();
   });
 
   it("does not approve on a quick click of Hold to allow", () => {

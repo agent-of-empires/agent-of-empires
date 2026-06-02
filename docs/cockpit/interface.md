@@ -94,6 +94,16 @@ when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
 
+**Approval card detail.** The web dashboard approval card shows a
+one-line preview of the tool call in its header (the command for a
+shell call, the path for a read or edit) so you can act without
+expanding. A benign approval starts collapsed with that preview; a
+destructive one starts expanded so the full arguments are in view
+before a hold-to-allow. Click the header to toggle the full argument
+list, and the Allow / Always / Deny buttons stay reachable in either
+state. The toggle is per-card and never re-expands on its own after a
+plan is approved.
+
 **Markdown rendering.** Agent messages in the transcript are parsed as
 markdown and rendered with styling: headings and `**bold**` show in
 bold, `*italics*` in italic, `` `inline code` `` and fenced code blocks
