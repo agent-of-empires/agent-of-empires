@@ -2954,6 +2954,22 @@
         "web/src/lib/tourSteps.ts",
         "web/src/hooks/useTour.tsx"
       ]
+    },
+    {
+      "id": "shortcuts.single-source",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/shortcuts.test.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/components/HelpOverlay.tsx",
+        "web/src/components/tour/TourRunner.tsx",
+        "web/src/lib/shortcuts.ts",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/tourSteps.ts"
+      ]
     }
   ]
 }

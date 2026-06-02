@@ -15,7 +15,12 @@ import {
   type Step,
   type Styles,
 } from "react-joyride";
-import { type TourStep, tourSelector } from "../../lib/tourSteps";
+import {
+  type TourShortcutHint,
+  type TourStep,
+  tourSelector,
+} from "../../lib/tourSteps";
+import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 
 export interface TourRunnerProps {
   run: boolean;
@@ -64,21 +69,25 @@ const STYLES: Partial<Styles> = {
   buttonSkip: { color: "var(--color-text-dim)" },
 };
 
+function hintLine(hint: TourShortcutHint): string {
+  return `${formatTourShortcut(SHORTCUTS_BY_ID[hint.id].chord)} ${hint.verb}`;
+}
+
 function StepBody({
   body,
-  shortcuts,
+  shortcutHints,
 }: {
   body: string;
-  shortcuts?: readonly string[];
+  shortcutHints?: readonly TourShortcutHint[];
 }) {
   return (
     <div>
       <p>{body}</p>
-      {shortcuts && shortcuts.length > 0 && (
+      {shortcutHints && shortcutHints.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11px] text-text-muted">
-          {shortcuts.map((s) => (
-            <li key={s} className="font-mono">
-              {s}
+          {shortcutHints.map((hint) => (
+            <li key={`${hint.id}:${hint.verb}`} className="font-mono">
+              {hintLine(hint)}
             </li>
           ))}
         </ul>
@@ -92,7 +101,7 @@ function toJoyrideStep(step: TourStep): Step {
     id: step.id,
     target: tourSelector(step.anchor),
     title: step.title,
-    content: <StepBody body={step.body} shortcuts={step.shortcuts} />,
+    content: <StepBody body={step.body} shortcutHints={step.shortcutHints} />,
     placement: "auto",
   };
 }
