@@ -26,6 +26,7 @@ import {
   Clock,
   Info,
   ListChecks,
+  Paperclip,
   RotateCcw,
   X,
 } from "lucide-react";
@@ -2320,6 +2321,30 @@ function QueuedPromptRow({
             >
               {rowExpanded ? "Show less" : "…"}
             </button>
+          )}
+          {prompt.attachments && prompt.attachments.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1.5" data-testid="queued-attachments">
+              {prompt.attachments.map((att, i) => (
+                <span
+                  key={`${att.name ?? att.kind}-${i}`}
+                  className="flex items-center gap-1 rounded border border-sky-700/40 bg-sky-950/30 py-0.5 pl-0.5 pr-1.5 text-[10px] text-sky-200"
+                  title={att.name ?? att.kind}
+                >
+                  {att.kind === "image" ? (
+                    <img
+                      src={`data:${att.mimeType};base64,${att.dataB64}`}
+                      alt={att.name ?? "attachment"}
+                      className="h-5 w-5 rounded object-cover"
+                    />
+                  ) : (
+                    <Paperclip className="h-3 w-3" />
+                  )}
+                  <span className="max-w-[100px] truncate">
+                    {att.name ?? att.kind}
+                  </span>
+                </span>
+              ))}
+            </div>
           )}
         </div>
       )}

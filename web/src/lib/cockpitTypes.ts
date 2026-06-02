@@ -617,6 +617,12 @@ export interface QueuedPrompt {
   /** ISO-8601 client wall clock at enqueue time. Displayed as a
    *  relative age in the strip. */
   queuedAt: string;
+  /** Attachments staged with this queued prompt. EPHEMERAL: these carry
+   *  raw base64 bytes, so `persistState` drops any queued row that has
+   *  them rather than writing megabytes into the per-origin localStorage
+   *  quota. They survive a component remount (the in-memory `stateCache`
+   *  keeps the full row) but not a full page reload. See #1833 / #1000. */
+  attachments?: PromptAttachmentInput[];
 }
 
 export interface ActivityRow {
