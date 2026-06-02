@@ -10,7 +10,7 @@
 //!   alarm.wav, start.wav
 //!
 //! Layout:
-//!   - `config`    — `SoundConfig`, overrides, volume helpers
+//!   - `config`    — `SoundConfig`, `SoundMode`, volume helpers
 //!   - `discovery` — sounds directory + available-files probing
 //!   - `bundled`   — GitHub-hosted default sound pack installer
 //!   - `playback`  — afplay / paplay / aplay dispatch
