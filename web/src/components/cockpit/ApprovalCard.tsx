@@ -258,6 +258,17 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 function ArgsView({ raw }: { raw: string }) {
   const parsed = useMemo(() => parseJsonObject(raw), [raw]);
 
+  // Gemini's confirm-required tools ship no raw_input, so the backend
+  // sends an empty args_preview (rather than the literal "null"). Render
+  // a dedicated empty-state instead of an empty <pre>. See #1713.
+  if (raw.trim() === "") {
+    return (
+      <p className="border-b border-surface-800/60 bg-surface-950 px-3 py-2 font-mono text-[11px] italic text-text-dim">
+        No raw args provided by agent.
+      </p>
+    );
+  }
+
   if (!parsed) {
     return (
       <pre className="border-b border-surface-800/60 bg-surface-950 px-3 py-2 font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
