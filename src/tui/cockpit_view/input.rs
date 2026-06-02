@@ -33,20 +33,46 @@ pub enum Intent {
     ResolveApproval(ApprovalDecisionWire),
     /// Cancel the in-flight prompt (Ctrl-C style).
     CancelInFlight,
+    /// Drop every queued (not-yet-sent) prompt.
+    ClearQueue,
     /// Open the daemon URL for this session in the user's browser.
     OpenInBrowser,
     /// Move focus to the named region.
     SetFocus(Focus),
+    /// Move the slash-picker highlight by one row (positive = down).
+    SlashMove(i32),
+    /// Insert the highlighted slash command into the composer.
+    SlashAccept,
+    /// Dismiss the slash picker without inserting, latching the query.
+    SlashDismiss,
+    /// Move the `@`-mention picker highlight by N rows (positive = down).
+    MentionNavigate(i32),
+    /// Insert the highlighted mention and close the picker.
+    MentionAccept,
+    /// Close the mention picker without inserting.
+    MentionClose,
     /// Exit the cockpit view; return to the home screen.
     Exit,
     /// Nothing to do (unhandled key).
     Ignore,
 }
 
+/// Ambient state the dispatcher needs beyond the raw key: whether an
+/// approval is pending (gates Tab routing) and whether the slash or
+/// `@`-mention picker is currently open (each claims navigation keys in
+/// the composer). Passed as a struct instead of positional bools so call
+/// sites stay readable.
+#[derive(Debug, Clone, Copy)]
+pub struct InputContext {
+    pub has_pending_approval: bool,
+    pub slash_picker_open: bool,
+    pub mention_picker_open: bool,
+}
+
 /// Translate a key event into an [`Intent`] based on the current
 /// focus. Pure function so the entire focus model is unit-testable
 /// without instantiating a real ratatui surface.
-pub fn dispatch(focus: Focus, key: &KeyEvent, has_pending_approval: bool) -> Intent {
+pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     // Universal: Ctrl-C cancels any in-flight prompt (matches the web
     // composer's stop button). We intentionally do NOT exit the view
     // on Ctrl-C because the user's natural reflex from a tmux session
@@ -60,15 +86,56 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, has_pending_approval: bool) -> Int
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
         return Intent::OpenInBrowser;
     }
+    // Universal: Ctrl-x drops every queued prompt. Intercepted here,
+    // before the composer sees it, so it works from any focus and a
+    // queued backlog can always be abandoned without leaving the
+    // composer. A no-op when the queue is empty.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+        return Intent::ClearQueue;
+    }
 
     match focus {
-        Focus::Composer => composer_keys(key),
-        Focus::Transcript => transcript_keys(key, has_pending_approval),
+        Focus::Composer => composer_keys(key, ctx.slash_picker_open, ctx.mention_picker_open),
+        Focus::Transcript => transcript_keys(key, ctx.has_pending_approval),
         Focus::Approval => approval_keys(key),
     }
 }
 
-fn composer_keys(key: &KeyEvent) -> Intent {
+fn composer_keys(key: &KeyEvent, slash_picker_open: bool, mention_picker_open: bool) -> Intent {
+    // When a picker is open it claims navigation + accept/dismiss keys
+    // so the user can drive it without the textarea swallowing them.
+    // Everything else (typing, cursor motion the picker doesn't use)
+    // falls through to the normal composer rules below. Slash and
+    // mention pickers are mutually exclusive (a line can't both start
+    // with `/` and hold an `@`-token at the cursor), but slash wins the
+    // tie defensively.
+    if slash_picker_open {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Down) if m.is_empty() => return Intent::SlashMove(1),
+            (m, KeyCode::Up) if m.is_empty() => return Intent::SlashMove(-1),
+            (m, KeyCode::Char('n')) if m == KeyModifiers::CONTROL => return Intent::SlashMove(1),
+            (m, KeyCode::Char('p')) if m == KeyModifiers::CONTROL => return Intent::SlashMove(-1),
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::SlashAccept,
+            (m, KeyCode::Tab) if m.is_empty() => return Intent::SlashAccept,
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::SlashDismiss,
+            _ => {}
+        }
+    } else if mention_picker_open {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Down) if m.is_empty() => return Intent::MentionNavigate(1),
+            (m, KeyCode::Up) if m.is_empty() => return Intent::MentionNavigate(-1),
+            (m, KeyCode::Char('n')) if m == KeyModifiers::CONTROL => {
+                return Intent::MentionNavigate(1)
+            }
+            (m, KeyCode::Char('p')) if m == KeyModifiers::CONTROL => {
+                return Intent::MentionNavigate(-1)
+            }
+            (m, KeyCode::Enter) if m.is_empty() => return Intent::MentionAccept,
+            (m, KeyCode::Tab) if m.is_empty() => return Intent::MentionAccept,
+            (m, KeyCode::Esc) if m.is_empty() => return Intent::MentionClose,
+            _ => {}
+        }
+    }
     match (key.modifiers, key.code) {
         // Plain Enter submits.
         (m, KeyCode::Enter) if m.is_empty() => Intent::SubmitPrompt,
@@ -143,13 +210,47 @@ mod tests {
         KeyEvent::new(code, m)
     }
 
+    /// No pending approval, pickers closed: the common case for the
+    /// pre-existing focus tests.
+    fn ctx() -> InputContext {
+        InputContext {
+            has_pending_approval: false,
+            slash_picker_open: false,
+            mention_picker_open: false,
+        }
+    }
+
+    fn ctx_pending() -> InputContext {
+        InputContext {
+            has_pending_approval: true,
+            slash_picker_open: false,
+            mention_picker_open: false,
+        }
+    }
+
+    fn ctx_picker() -> InputContext {
+        InputContext {
+            has_pending_approval: false,
+            slash_picker_open: true,
+            mention_picker_open: false,
+        }
+    }
+
+    fn ctx_mention() -> InputContext {
+        InputContext {
+            has_pending_approval: false,
+            slash_picker_open: false,
+            mention_picker_open: true,
+        }
+    }
+
     #[test]
     fn composer_swallows_approval_letters() {
         // Regression test for the composer-eats-approval bug: typing
         // "always allow" with a pending approval must NOT fire any
         // approval intent.
         for ch in "always allow deny".chars() {
-            let intent = dispatch(Focus::Composer, &key(KeyCode::Char(ch)), true);
+            let intent = dispatch(Focus::Composer, &key(KeyCode::Char(ch)), ctx_pending());
             match intent {
                 Intent::Compose(_) => {}
                 other => panic!("char {ch:?} produced {other:?} from composer focus"),
@@ -171,7 +272,7 @@ mod tests {
                         KeyModifiers::NONE
                     },
                 ),
-                true,
+                ctx_pending(),
             );
             assert!(
                 !matches!(intent, Intent::ResolveApproval(_)),
@@ -180,32 +281,32 @@ mod tests {
         }
         // But the same letters DO resolve under approval focus.
         assert!(matches!(
-            dispatch(Focus::Approval, &key(KeyCode::Char('a')), true),
+            dispatch(Focus::Approval, &key(KeyCode::Char('a')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Allow)
         ));
         assert!(matches!(
             dispatch(
                 Focus::Approval,
                 &key_mod(KeyCode::Char('A'), KeyModifiers::SHIFT),
-                true
+                ctx_pending()
             ),
             Intent::ResolveApproval(ApprovalDecisionWire::AllowAlways)
         ));
         assert!(matches!(
-            dispatch(Focus::Approval, &key(KeyCode::Char('d')), true),
+            dispatch(Focus::Approval, &key(KeyCode::Char('d')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Deny)
         ));
     }
 
     #[test]
     fn esc_from_composer_returns_focus_to_transcript() {
-        let intent = dispatch(Focus::Composer, &key(KeyCode::Esc), false);
+        let intent = dispatch(Focus::Composer, &key(KeyCode::Esc), ctx());
         assert_eq!(intent, Intent::SetFocus(Focus::Transcript));
     }
 
     #[test]
     fn esc_from_transcript_exits() {
-        let intent = dispatch(Focus::Transcript, &key(KeyCode::Esc), false);
+        let intent = dispatch(Focus::Transcript, &key(KeyCode::Esc), ctx());
         assert_eq!(intent, Intent::Exit);
     }
 
@@ -215,25 +316,42 @@ mod tests {
             let intent = dispatch(
                 focus,
                 &key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                true,
+                ctx_pending(),
             );
             assert_eq!(intent, Intent::CancelInFlight);
         }
     }
 
     #[test]
+    fn ctrl_x_clears_queue_from_any_focus() {
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Approval] {
+            let intent = dispatch(
+                focus,
+                &key_mod(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                ctx(),
+            );
+            assert_eq!(intent, Intent::ClearQueue);
+        }
+        // Plain 'x' in the composer is still a typed character.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('x')), ctx()),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
     fn plain_o_opens_browser_only_from_transcript() {
         // Composer focus must pass through.
-        let composer = dispatch(Focus::Composer, &key(KeyCode::Char('o')), false);
+        let composer = dispatch(Focus::Composer, &key(KeyCode::Char('o')), ctx());
         assert!(matches!(composer, Intent::Compose(_)));
         // Transcript focus opens browser.
-        let transcript = dispatch(Focus::Transcript, &key(KeyCode::Char('o')), false);
+        let transcript = dispatch(Focus::Transcript, &key(KeyCode::Char('o')), ctx());
         assert_eq!(transcript, Intent::OpenInBrowser);
     }
 
     #[test]
     fn enter_in_composer_submits() {
-        let intent = dispatch(Focus::Composer, &key(KeyCode::Enter), false);
+        let intent = dispatch(Focus::Composer, &key(KeyCode::Enter), ctx());
         assert_eq!(intent, Intent::SubmitPrompt);
     }
 
@@ -242,28 +360,156 @@ mod tests {
         let intent = dispatch(
             Focus::Composer,
             &key_mod(KeyCode::Enter, KeyModifiers::SHIFT),
-            false,
+            ctx(),
         );
         assert!(matches!(intent, Intent::Compose(_)));
     }
 
     #[test]
     fn tab_from_transcript_routes_to_approval_when_pending() {
-        let with_pending = dispatch(Focus::Transcript, &key(KeyCode::Tab), true);
+        let with_pending = dispatch(Focus::Transcript, &key(KeyCode::Tab), ctx_pending());
         assert_eq!(with_pending, Intent::SetFocus(Focus::Approval));
-        let without = dispatch(Focus::Transcript, &key(KeyCode::Tab), false);
+        let without = dispatch(Focus::Transcript, &key(KeyCode::Tab), ctx());
         assert_eq!(without, Intent::SetFocus(Focus::Composer));
     }
 
     #[test]
     fn vim_scroll_keys_only_active_in_transcript() {
         assert_eq!(
-            dispatch(Focus::Transcript, &key(KeyCode::Char('j')), false),
+            dispatch(Focus::Transcript, &key(KeyCode::Char('j')), ctx()),
             Intent::Scroll(1)
         );
         // 'j' in composer is a typed character, not a scroll.
         assert!(matches!(
-            dispatch(Focus::Composer, &key(KeyCode::Char('j')), false),
+            dispatch(Focus::Composer, &key(KeyCode::Char('j')), ctx()),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn picker_open_claims_navigation_and_accept_keys() {
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Down), ctx_picker()),
+            Intent::SlashMove(1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Up), ctx_picker()),
+            Intent::SlashMove(-1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                ctx_picker()
+            ),
+            Intent::SlashMove(1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                ctx_picker()
+            ),
+            Intent::SlashMove(-1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), ctx_picker()),
+            Intent::SlashAccept
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Tab), ctx_picker()),
+            Intent::SlashAccept
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx_picker()),
+            Intent::SlashDismiss
+        );
+    }
+
+    #[test]
+    fn picker_open_still_passes_typed_chars_through() {
+        // Typing a letter while the picker is open narrows the query;
+        // it must NOT be stolen as a picker command.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('a')), ctx_picker()),
+            Intent::Compose(_)
+        ));
+    }
+
+    #[test]
+    fn picker_closed_enter_still_submits() {
+        // Focus-isolation regression: with the picker closed, Enter must
+        // submit even if an approval is pending.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), ctx_pending()),
+            Intent::SubmitPrompt
+        );
+    }
+
+    #[test]
+    fn mention_picker_routes_navigation_keys() {
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Down), ctx_mention()),
+            Intent::MentionNavigate(1)
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Up), ctx_mention()),
+            Intent::MentionNavigate(-1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                ctx_mention()
+            ),
+            Intent::MentionNavigate(1)
+        );
+        assert_eq!(
+            dispatch(
+                Focus::Composer,
+                &key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                ctx_mention()
+            ),
+            Intent::MentionNavigate(-1)
+        );
+    }
+
+    #[test]
+    fn mention_picker_enter_and_tab_accept() {
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Enter), ctx_mention()),
+            Intent::MentionAccept
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Tab), ctx_mention()),
+            Intent::MentionAccept
+        );
+    }
+
+    #[test]
+    fn mention_picker_esc_closes_not_focus() {
+        // With the picker open, Esc closes it; with it closed, Esc moves
+        // focus to the transcript as usual.
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx_mention()),
+            Intent::MentionClose
+        );
+        assert_eq!(
+            dispatch(Focus::Composer, &key(KeyCode::Esc), ctx()),
+            Intent::SetFocus(Focus::Transcript)
+        );
+    }
+
+    #[test]
+    fn mention_picker_passes_typed_chars_through() {
+        // Typing narrows the query; Backspace edits the textarea. Neither
+        // is stolen by the picker.
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Char('s')), ctx_mention()),
+            Intent::Compose(_)
+        ));
+        assert!(matches!(
+            dispatch(Focus::Composer, &key(KeyCode::Backspace), ctx_mention()),
             Intent::Compose(_)
         ));
     }

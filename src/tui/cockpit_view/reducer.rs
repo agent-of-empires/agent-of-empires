@@ -40,6 +40,13 @@ pub struct CockpitTranscript {
     /// "context lost, re-prime?" banner until the user dismisses it
     /// or sends the next prompt.
     pub context_primer_pending: bool,
+    /// Whether the agent is mid-turn, derived purely from daemon events:
+    /// true on `UserPromptSent` / `ThinkingStarted`, false on `Stopped`
+    /// / `AgentStartupError` / `PromptRejected`. Server truth (mirrors
+    /// the web reducer's `turnActive`), so it lives here and is rebuilt
+    /// by `/replay` after a `reset()`. The composer reads it to decide
+    /// whether Enter sends now or parks the prompt in the local queue.
+    pub turn_active: bool,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view
     /// layer should clear and rehydrate via HTTP /replay.
     pub lagged: bool,
@@ -73,6 +80,12 @@ pub enum ActivityRow {
 #[derive(Debug, Clone)]
 pub struct ToolCallRow {
     pub name: String,
+    /// ACP `ToolKind` lowercased (`read` / `edit` / `delete` / `execute`
+    /// / …), forwarded from `ToolCall::kind`. Drives the per-kind
+    /// renderer in `render_tool_lines`; empty string falls back to the
+    /// generic one-liner. `ToolCallUpdated` does not carry kind, so the
+    /// value set at `ToolCallStarted` is authoritative for the row.
+    pub kind: String,
     pub args: String,
     pub completed: Option<ToolCompletion>,
 }
@@ -121,6 +134,7 @@ impl CockpitTranscript {
             current_mode: None,
             available_commands: Vec::new(),
             context_primer_pending: false,
+            turn_active: false,
             lagged: false,
             last_seq: 0,
             pending_message_idx: None,
@@ -179,15 +193,37 @@ impl CockpitTranscript {
                 self.rows.push(ActivityRow::AgentMessage(text.clone()));
                 self.pending_message_idx = Some(self.rows.len() - 1);
             }
-            Event::UserPromptSent { text } => {
+            Event::UserPromptSent { text, attachments } => {
                 self.flush_pending_chunk();
-                self.rows.push(ActivityRow::UserPrompt(text.clone()));
+                // The TUI cockpit view renders text only; note the
+                // attachment count inline so a prompt sent from the web
+                // composer with images doesn't look empty here.
+                let row = if attachments.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text} [{} attachment(s)]", attachments.len())
+                };
+                self.rows.push(ActivityRow::UserPrompt(row));
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
+                self.turn_active = true;
+            }
+            Event::UserDiffCommentsPrompt {
+                assembled_markdown, ..
+            } => {
+                // The TUI has no rich diff-comments card; render the
+                // assembled markdown (exactly what the agent received) as
+                // a plain user prompt row, same as UserPromptSent.
+                self.flush_pending_chunk();
+                self.rows
+                    .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
+                self.context_primer_pending = false;
+                self.turn_active = true;
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
                 self.status_text = Some("thinking…".to_string());
+                self.turn_active = true;
             }
             Event::ThinkingEnded => {
                 self.flush_pending_chunk();
@@ -199,6 +235,7 @@ impl CockpitTranscript {
                 self.flush_pending_chunk();
                 let row = ToolCallRow {
                     name: tool_call.name.clone(),
+                    kind: tool_call.kind.clone(),
                     args: tool_call.args_preview.clone(),
                     completed: None,
                 };
@@ -310,6 +347,7 @@ impl CockpitTranscript {
                     kind: NoteKind::Info,
                     text: format!("agent stopped: {reason}"),
                 });
+                self.turn_active = false;
             }
             Event::AgentStartupError { message } => {
                 self.flush_pending_chunk();
@@ -318,6 +356,7 @@ impl CockpitTranscript {
                     kind: NoteKind::Error,
                     text: format!("agent startup failed: {message}"),
                 });
+                self.turn_active = false;
             }
             Event::IncompatibleAgent { .. } => {
                 // Structured detail for the web cockpit's StartupErrorScreen.
@@ -380,12 +419,20 @@ impl CockpitTranscript {
                 // Legacy hard-coded mode enum. Fold to the same field.
                 self.current_mode = Some(format!("{mode:?}"));
             }
+            Event::PromptRejected { .. } => {
+                // The daemon refused the prompt (e.g. read-only mode); no
+                // turn started, so clear the busy flag the optimistic
+                // submit path may have set. The richer rejected-prompt
+                // renderer is followup work (see the no-op group below).
+                self.turn_active = false;
+            }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
             | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             | Event::WakeupScheduled { .. }
-            | Event::PromptRejected { .. }
+            | Event::CancelRequested { .. }
+            | Event::PromptCapabilities { .. }
             | Event::AgentSwitched { .. }
             | Event::ModeSwitchFailed { .. }
             | Event::ConfigOptionsUpdated { .. }
@@ -432,7 +479,13 @@ mod tests {
     #[test]
     fn user_prompt_creates_row() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         assert_eq!(t.rows.len(), 1);
         match &t.rows[0] {
             ActivityRow::UserPrompt(text) => assert_eq!(text, "hi"),
@@ -521,6 +574,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_started_carries_kind_to_row() {
+        let mut t = CockpitTranscript::new("s-1");
+        let mut tc = tool("t-1", "Edit");
+        tc.kind = "edit".into();
+        tc.args_preview = r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into();
+        t.apply(&frame(1, Event::ToolCallStarted { tool_call: tc }));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.kind, "edit");
+                assert!(row.args.contains("old_string"));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
     fn approval_request_and_resolution() {
         let mut t = CockpitTranscript::new("s-1");
         let approval = Approval {
@@ -552,13 +621,20 @@ mod tests {
     #[test]
     fn duplicate_seq_is_ignored() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         // Replay-vs-live overlap can deliver the same seq twice; the
         // reducer must dedupe.
         t.apply(&frame(
             1,
             Event::UserPromptSent {
                 text: "ignored".into(),
+                attachments: Vec::new(),
             },
         ));
         assert_eq!(t.rows.len(), 1);
@@ -575,7 +651,13 @@ mod tests {
         ));
         assert!(t.context_primer_pending);
         // Sending a prompt clears the hint.
-        t.apply(&frame(2, Event::UserPromptSent { text: "go".into() }));
+        t.apply(&frame(
+            2,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: Vec::new(),
+            },
+        ));
         assert!(!t.context_primer_pending);
     }
 
@@ -629,9 +711,89 @@ mod tests {
     }
 
     #[test]
+    fn turn_active_tracks_prompt_and_stop_edges() {
+        let mut t = CockpitTranscript::new("s-1");
+        assert!(!t.turn_active, "fresh transcript is idle");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active, "UserPromptSent opens the turn");
+        t.apply(&frame(2, Event::ThinkingStarted));
+        assert!(t.turn_active, "thinking keeps the turn open");
+        t.apply(&frame(
+            3,
+            Event::Stopped {
+                reason: "completed".into(),
+            },
+        ));
+        assert!(!t.turn_active, "Stopped closes the turn");
+    }
+
+    #[test]
+    fn turn_active_clears_on_startup_error_and_rejection() {
+        let mut t = CockpitTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+        ));
+        assert!(!t.turn_active, "startup error ends any in-flight turn");
+
+        t.apply(&frame(
+            3,
+            Event::UserPromptSent {
+                text: "again".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active);
+        t.apply(&frame(
+            4,
+            Event::PromptRejected {
+                text: "again".into(),
+                reason: "read-only".into(),
+            },
+        ));
+        assert!(!t.turn_active, "a rejected prompt never started a turn");
+    }
+
+    #[test]
+    fn reset_returns_to_idle() {
+        let mut t = CockpitTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+            },
+        ));
+        assert!(t.turn_active);
+        t.reset();
+        assert!(!t.turn_active, "reset drops derived turn state for replay");
+    }
+
+    #[test]
     fn reset_clears_state_but_preserves_session_id() {
         let mut t = CockpitTranscript::new("s-1");
-        t.apply(&frame(1, Event::UserPromptSent { text: "hi".into() }));
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        ));
         t.reset();
         assert_eq!(t.session_id, "s-1");
         assert_eq!(t.last_seq, 0);

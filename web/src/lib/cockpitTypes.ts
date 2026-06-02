@@ -4,6 +4,8 @@
 // side can add new variants without breaking the UI as long as the
 // component renders unknown frames gracefully.
 
+import type { DiffComment } from "../components/diff/comments/types";
+
 export type ApprovalDecision =
   | "Allow"
   | "AllowAlways"
@@ -277,15 +279,76 @@ export type CockpitEvent =
     }
   | { RawAgentUpdate: { payload: unknown } }
   | { AgentMessageChunk: { text: string } }
+  | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
-  | { UserPromptSent: { text: string } }
+  | { UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] } }
+  | {
+      UserDiffCommentsPrompt: {
+        intro: string;
+        outro: string;
+        isMultiRepo: boolean;
+        comments: DiffComment[];
+        assembledMarkdown: string;
+      };
+    }
+  | {
+      PromptCapabilities: {
+        image: boolean;
+        audio: boolean;
+        embedded_context: boolean;
+      };
+    }
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } };
+
+/** Metadata-only attachment ref as it rides on a `UserPromptSent`
+ *  event from the server (mirrors Rust `PromptAttachmentRef`). The
+ *  bytes are fetched lazily from the replay GET endpoint. See #1000. */
+export interface PromptAttachmentRefWire {
+  id: string;
+  kind: PromptAttachmentKind;
+  mime_type: string;
+  name?: string;
+  size: number;
+}
+
+export type PromptAttachmentKind = "image" | "audio" | "resource";
+
+/** What the agent will accept on a prompt, from the ACP `initialize`
+ *  handshake. Drives the composer's attachment button gating. */
+export interface PromptCapabilities {
+  image: boolean;
+  audio: boolean;
+  embeddedContext: boolean;
+}
+
+/** One attachment as the composer hands it to `sendPrompt`: the raw
+ *  base64 bytes plus metadata. The hook turns this into both the POST
+ *  upload body and the optimistic preview row. See #1000 / #965. */
+export interface PromptAttachmentInput {
+  kind: PromptAttachmentKind;
+  mimeType: string;
+  name?: string;
+  /** Standard base64, no `data:` URL prefix. */
+  dataB64: string;
+}
+
+/** One attachment as the composer and transcript render it. `url` is
+ *  the replay GET endpoint for server-confirmed rows, or a local
+ *  object URL for the optimistic echo before the server confirms. */
+export interface CockpitAttachment {
+  id: string;
+  kind: PromptAttachmentKind;
+  mimeType: string;
+  name?: string;
+  size: number;
+  url: string;
+}
 
 export interface CockpitFrame {
   session_id: string;
@@ -297,6 +360,10 @@ export interface CockpitState {
   agent: string | null;
   model: string | null;
   mode: SessionMode;
+  /** Attachment kinds the current agent accepts, from the latest
+   *  `PromptCapabilities` event. Null until the handshake reports it;
+   *  the composer keeps the attachment button disabled while null. */
+  promptCapabilities: PromptCapabilities | null;
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
@@ -416,6 +483,17 @@ export interface CockpitState {
    *  transient "Restarting…" banner appears without a reconnect button;
    *  cleared on AcpSessionAssigned or UserPromptSent. */
   workerRestarting: boolean;
+  /** Set true when the daemon publishes `Stopped { reason: "idle_auto_stop" }`,
+   *  meaning the reconciler reaped the worker for inactivity
+   *  (`cockpit.auto_stop_idle_secs`) and marked the session dormant. Unlike
+   *  `workerStopped`, this is recoverable without any explicit reconnect:
+   *  the next prompt POST wakes it (the server's `touch_and_wake_if_sunk`
+   *  clears dormancy, the reconciler respawns, and `send_prompt`'s
+   *  `wait_for_worker` holds the request until the fresh worker is ready).
+   *  `sendPrompt` and the drain effect read this so a dormant worker does
+   *  NOT park prompts in the local queue forever; instead the POST itself
+   *  is the wake path. Cleared on AcpSessionAssigned or UserPromptSent. */
+  workerIdleStopped: boolean;
   /** Follow-up prompts the user typed and submitted while a turn was
    *  already running. The composer enqueues them client-side instead
    *  of racing the agent (claude-agent-acp serialises session/prompt
@@ -432,6 +510,16 @@ export interface CockpitState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the cockpit banner next to the countdown. */
   nextWakeupReason: string | null;
+  /** True between a `CancelRequested` event (aoe sent `session/cancel`
+   *  and armed the escalation watchdog) and the next `Stopped`. Drives
+   *  the "Stopping..." spinner label and reveals the Force-stop
+   *  affordance even while a tool is in flight. Cleared on any `Stopped`
+   *  and on a fresh `UserPromptSent`. See #1727. */
+  cancelling: boolean;
+  /** ISO-8601 timestamp at which the cancel-escalation watchdog will
+   *  SIGTERM the worker if the agent keeps ignoring the cancel. Lets the
+   *  UI show an honest countdown. Null when not cancelling. See #1727. */
+  cancelEscalatesAt: string | null;
   /** Set when the agent emitted `SessionContextReset` after a prior
    *  user prompt: the model's context is empty but the visible
    *  transcript is intact, so the user can opt in to fetching a
@@ -528,6 +616,7 @@ export interface ActivityRow {
     | "message"
     | "thinking"
     | "user_prompt"
+    | "user_diff_comments"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -538,6 +627,20 @@ export interface ActivityRow {
    *  pick a per-kind renderer without needing to look the call up by
    *  toolCallId. */
   tool?: ToolCall;
+  /** Structured payload on `user_diff_comments` rows. The runtime
+   *  attaches it to the assistant-ui message metadata so the
+   *  transcript renders the rich `DiffCommentsUserCard`; `text` holds
+   *  the assembled markdown as the fallback / agent-visible body. */
+  diffComments?: {
+    intro: string;
+    outro: string;
+    isMultiRepo: boolean;
+    comments: DiffComment[];
+  };
+  /** Attachments on a `user_prompt` row (images / audio / resources).
+   *  Set from the optimistic local preview on send, or from the
+   *  server `UserPromptSent` refs on replay. See #1000 / #965. */
+  attachments?: CockpitAttachment[];
   at: string; // ISO-8601
 }
 
@@ -563,6 +666,7 @@ export function emptyCockpitState(): CockpitState {
     agent: null,
     model: null,
     mode: "Default",
+    promptCapabilities: null,
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
@@ -588,9 +692,12 @@ export function emptyCockpitState(): CockpitState {
     turnHasOutput: false,
     workerStopped: false,
     workerRestarting: false,
+    workerIdleStopped: false,
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
+    cancelling: false,
+    cancelEscalatesAt: null,
     contextPrimerAvailable: null,
     rejectedPrompts: [],
     agentUnresponsive: false,
@@ -601,6 +708,55 @@ export function emptyCockpitState(): CockpitState {
     configOptionSwitchFailed: null,
     pendingConfigOption: null,
   };
+}
+
+/** Per-turn state resets shared by every "a new user turn started"
+ *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
+ *  Mutates `next` in place; the caller has already appended the
+ *  activity row and bumped `pendingUserPromptSeq`. */
+function applyNewTurnResets(next: CockpitState): void {
+  next.assistantMessage = "";
+  next.startupError = null;
+  next.lastError = null;
+  next.turnActive = isTurnActive(next);
+  // A fresh turn supersedes any stale "Stopping..." state from a prior
+  // turn's cancel. See #1727.
+  next.cancelling = false;
+  next.cancelEscalatesAt = null;
+  // New turn; reset the no-output detector so Stopped fires the
+  // empty-output notice if the agent produces nothing.
+  next.turnHasOutput = false;
+  // A fresh prompt means the worker is alive again; clear the
+  // user_stopped banner without waiting for AcpSessionAssigned.
+  next.workerStopped = false;
+  next.workerRestarting = false;
+  // A prompt also wakes an idle-dormant worker (the POST cleared
+  // dormancy server-side); drop the marker so the drain effect stops
+  // treating the worker as wakeable-but-down.
+  next.workerIdleStopped = false;
+  // The user is moving on. Clear any pending Retry pills and the
+  // agent-unresponsive banner; if the rejection was legitimate the
+  // new prompt will end up rejected too and a fresh pill will land.
+  // See #1196.
+  next.rejectedPrompts = [];
+  next.agentUnresponsive = false;
+  next.agentOrphaned = false;
+  // /loop dynamic mode self-fires a prompt on wake, but a user-typed
+  // follow-up during the wait is NOT the wake firing; only clear when
+  // the scheduled time has already elapsed. The countdown UI continues
+  // counting down through a mid-wait user prompt; the next
+  // ScheduleWakeup turn (or the wake itself) overrides it cleanly.
+  // See #1091.
+  if (next.nextWakeupAt) {
+    const wakeAt = new Date(next.nextWakeupAt).getTime();
+    if (!Number.isNaN(wakeAt) && Date.now() >= wakeAt) {
+      next.nextWakeupAt = null;
+      next.nextWakeupReason = null;
+    }
+  }
+  // Any pending context-primer offer is consumed once the user submits
+  // a new prompt; the recovery affordance is one-shot.
+  next.contextPrimerAvailable = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -699,6 +855,10 @@ export function applyEvent(
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
     next.inFlightTool = tc;
+    // The reasoning block produced output (a tool call), so the agent is
+    // no longer thinking. The adapter often skips ThinkingEnded when it
+    // transitions into tool calls, so clear it here. See #1213.
+    next.thinking = false;
     // Skip duplicate tool_start rows. SQLite stores accumulated from
     // pre-fix runs (where post-load history-replay leaked through) can
     // contain the same tool_call_id twice; rendering both makes
@@ -915,6 +1075,10 @@ export function applyEvent(
   }
   if ("AgentMessageChunk" in event) {
     next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
+    // Visible assistant text means the agent is answering, not thinking.
+    // A later reasoning block re-sets `thinking` via ThinkingStarted. See
+    // #1213.
+    next.thinking = false;
     next.activity = pushActivity(next.activity, {
       id: `msg-${frame.seq}`,
       kind: "message",
@@ -938,7 +1102,15 @@ export function applyEvent(
     // optimistic message above any still-arriving prior-turn agent
     // chunks. See #1170.
     next.inFlightTool = null;
+    // Belt-and-suspenders against a missed ThinkingEnded leaking the
+    // thinking state into the next turn (same defensive shape as the
+    // inFlightTool reset above). See #1213.
+    next.thinking = false;
     sweepOpenToolCalls(next, frame.seq);
+    // The turn ended (cleanly, cancelled, force-stopped, or escalated):
+    // clear the "Stopping..." state regardless of reason. See #1727.
+    next.cancelling = false;
+    next.cancelEscalatesAt = null;
     next.lastStoppedSeq = Math.min(
       next.lastStoppedSeq + 1,
       next.pendingUserPromptSeq,
@@ -996,6 +1168,19 @@ export function applyEvent(
       next.workerStopped = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = true;
+    } else if (event.Stopped.reason === "idle_auto_stop") {
+      // The reconciler reaped the worker for inactivity and marked the
+      // session dormant (#1689). This is NOT a user stop: no reconnect
+      // banner, no composer lockdown. The next prompt POST wakes the
+      // worker server-side (`touch_and_wake_if_sunk` clears dormancy,
+      // the reconciler respawns, `send_prompt` waits for it), so the
+      // composer stays usable and `sendPrompt` / the drain effect read
+      // `workerIdleStopped` to route a queued prompt through the POST
+      // wake path instead of parking it forever. Cleared on the next
+      // UserPromptSent or AcpSessionAssigned.
+      next.workerIdleStopped = true;
+      next.workerStopped = false;
+      next.workerRestarting = false;
     }
     // Some upstream slash commands (e.g. /usage, /status, /memory in
     // claude-agent-acp) advertise via available_commands_update but
@@ -1060,8 +1245,32 @@ export function applyEvent(
     next.turnActive = isTurnActive(next);
     return next;
   }
+  if ("PromptCapabilities" in event) {
+    const c = event.PromptCapabilities;
+    next.promptCapabilities = {
+      image: c.image,
+      audio: c.audio,
+      embeddedContext: c.embedded_context,
+    };
+    return next;
+  }
   if ("UserPromptSent" in event) {
     const text = event.UserPromptSent.text;
+    // Map server attachment refs to render-ready attachments backed by
+    // the replay GET endpoint. Used on the replay/no-optimistic path;
+    // the optimistic row already carries local preview URLs. See #1000.
+    const serverAttachments: CockpitAttachment[] = (
+      event.UserPromptSent.attachments ?? []
+    ).map((a) => ({
+      id: a.id,
+      kind: a.kind,
+      mimeType: a.mime_type,
+      name: a.name,
+      size: a.size,
+      url: `/api/sessions/${encodeURIComponent(
+        frame.session_id,
+      )}/cockpit/attachments/${encodeURIComponent(a.id)}`,
+    }));
     // Dedupe against the optimistic row that useCockpit's sendPrompt
     // dispatched a moment ago: find the OLDEST matching un-promoted
     // user_prompt with the same text and promote it to the
@@ -1086,7 +1295,18 @@ export function applyEvent(
       const match = next.activity[matchIdx];
       if (match) {
         const updated = next.activity.slice();
-        updated[matchIdx] = { ...match, id: `user-seq-${frame.seq}` };
+        // Keep the optimistic local previews if present (no refetch);
+        // otherwise adopt the server refs so the bubble still renders.
+        updated[matchIdx] = {
+          ...match,
+          id: `user-seq-${frame.seq}`,
+          attachments:
+            match.attachments && match.attachments.length > 0
+              ? match.attachments
+              : serverAttachments.length > 0
+                ? serverAttachments
+                : undefined,
+        };
         next.activity = updated;
       }
     } else {
@@ -1101,44 +1321,35 @@ export function applyEvent(
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
+        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
         at: new Date().toISOString(),
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
     }
-    next.assistantMessage = "";
-    next.startupError = null;
-    next.lastError = null;
-    next.turnActive = isTurnActive(next);
-    // New turn; reset the no-output detector so Stopped fires the
-    // empty-output notice if the agent produces nothing.
-    next.turnHasOutput = false;
-    // A fresh prompt means the worker is alive again; clear the
-    // user_stopped banner without waiting for AcpSessionAssigned.
-    next.workerStopped = false;
-    next.workerRestarting = false;
-    // The user is moving on. Clear any pending Retry pills and the
-    // agent-unresponsive banner; if the rejection was legitimate the
-    // new prompt will end up rejected too and a fresh pill will land.
-    // See #1196.
-    next.rejectedPrompts = [];
-    next.agentUnresponsive = false;
-    next.agentOrphaned = false;
-    // /loop dynamic mode self-fires a UserPromptSent on wake, but a
-    // user-typed follow-up during the wait is NOT the wake firing;
-    // only clear when the scheduled time has already elapsed. The
-    // countdown UI continues counting down through a mid-wait user
-    // prompt; the next ScheduleWakeup turn (or the wake itself)
-    // overrides it cleanly. See #1091.
-    if (next.nextWakeupAt) {
-      const wakeAt = new Date(next.nextWakeupAt).getTime();
-      if (!Number.isNaN(wakeAt) && Date.now() >= wakeAt) {
-        next.nextWakeupAt = null;
-        next.nextWakeupReason = null;
-      }
-    }
-    // Any pending context-primer offer is consumed once the user
-    // submits a new prompt; the recovery affordance is one-shot.
-    next.contextPrimerAvailable = null;
+    applyNewTurnResets(next);
+    return next;
+  }
+  if ("UserDiffCommentsPrompt" in event) {
+    // The "Send diff comments" dialog posts directly (no optimistic
+    // row), so there is never a placeholder to promote: always append a
+    // typed `user_diff_comments` row. `text` carries the assembled
+    // markdown (agent-visible body / fallback); `diffComments` carries
+    // the structured payload the runtime hands to the transcript card.
+    const p = event.UserDiffCommentsPrompt;
+    next.activity = pushActivity(next.activity, {
+      id: `user-seq-${frame.seq}`,
+      kind: "user_diff_comments",
+      text: p.assembledMarkdown,
+      diffComments: {
+        intro: p.intro,
+        outro: p.outro,
+        isMultiRepo: p.isMultiRepo,
+        comments: p.comments,
+      },
+      at: new Date().toISOString(),
+    });
+    next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+    applyNewTurnResets(next);
     return next;
   }
   if ("AcpSessionAssigned" in event) {
@@ -1164,6 +1375,9 @@ export function applyEvent(
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
+    // The respawn may have been triggered by waking an idle-dormant
+    // worker; the fresh handshake means it is no longer dormant.
+    next.workerIdleStopped = false;
     // The respawn after an `agent_unresponsive` escalation completed;
     // clear the banner so the user can interact again. See #1196.
     next.agentUnresponsive = false;
@@ -1190,7 +1404,9 @@ export function applyEvent(
     // order, so checking `activity` here captures "any prompt with a
     // lower seq than this reset"; later prompts won't retroactively
     // surface the suppressed row.
-    const hasPriorPrompt = next.activity.some((r) => r.kind === "user_prompt");
+    const hasPriorPrompt = next.activity.some(
+      (r) => r.kind === "user_prompt" || r.kind === "user_diff_comments",
+    );
     if (!hasPriorPrompt) {
       return next;
     }
@@ -1217,6 +1433,15 @@ export function applyEvent(
   if ("WakeupScheduled" in event) {
     next.nextWakeupAt = event.WakeupScheduled.at;
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
+    return next;
+  }
+  if ("CancelRequested" in event) {
+    // aoe sent session/cancel and armed the escalation watchdog; the
+    // turn is still active. Surface "Stopping..." and the escalation
+    // deadline so the user gets feedback instead of a silent spinner,
+    // and can reveal the Force-stop affordance. See #1727.
+    next.cancelling = true;
+    next.cancelEscalatesAt = event.CancelRequested.escalates_at;
     return next;
   }
   if ("AgentSwitched" in event) {

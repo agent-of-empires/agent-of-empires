@@ -2320,6 +2320,17 @@ impl HomeView {
         action: PaletteAction,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // The palette can now be opened over live mode (via the leader),
+        // but every palette command steps out of the per-session relay:
+        // jumping navigates away, Invoke/Activate/ToolSession change what's
+        // focused, and the preview follows `selected_session` while
+        // keystrokes target `live_send`. Committing any of them while still
+        // live would desync the preview from the keystroke target, so leave
+        // live mode first. Cancelling the palette (Esc) never reaches here,
+        // so it still drops the user straight back into live mode.
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
         match action {
             PaletteAction::Invoke(id) => {
                 // The palette's mental model is "run the named action," so clear
@@ -3323,6 +3334,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.intro_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.info_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.changelog_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
 
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
             Some((col, row))
@@ -3546,6 +3563,48 @@ impl HomeView {
             return;
         };
 
+        // Leader menu: a prior keystroke matched the configured leader
+        // (tmux-style prefix, default Ctrl+B), so this key picks a
+        // live-send command instead of being forwarded. Always disarm
+        // first so a stray second key can't leave the menu stuck open.
+        if self.live_send_pending_leader {
+            self.live_send_pending_leader = false;
+            // Leader pressed twice: deliver a literal leader keystroke to
+            // the agent (matches tmux `send-prefix`), so binding the
+            // leader never fully steals the chord from downstream programs.
+            if let Some(leader) = state.leader {
+                if live_send::chord_matches(leader, key) {
+                    if let live_send::LiveDispatch::Send(tmux_key) = live_send::translate(key) {
+                        if let Some(worker) = &self.live_send_worker {
+                            worker.send(tmux_key);
+                        }
+                    }
+                    return;
+                }
+            }
+            // Command letters match only when unmodified: the leader-again
+            // passthrough above already claimed the modified form (`C-b`),
+            // and folding `Ctrl+K` / `Alt+b` into a command would surprise
+            // users reaching for a modified chord. Shift is allowed since
+            // it just yields the uppercase code.
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Char('k') | KeyCode::Char('K') if plain => self.open_command_palette(),
+                KeyCode::Char('b') | KeyCode::Char('B') if plain => self.toggle_sidebar_collapsed(),
+                KeyCode::Char('q') | KeyCode::Char('Q') if plain => {
+                    self.exit_live_send_and_restore_sizing(&state)
+                }
+                // Esc (or any unbound / modified key) cancels the menu
+                // without forwarding: the leader already swallowed this
+                // keystroke, and tmux's prefix behaves the same way for
+                // unknown keys.
+                _ => {}
+            }
+            return;
+        }
+
         // `handle_key` already cleared any finalized preview
         // selection at the top, so the highlight doesn't linger
         // across the keystroke that switched the user out of
@@ -3587,6 +3646,16 @@ impl HomeView {
             self.exit_live_send_and_restore_sizing(&state);
             return;
         }
+        // Leader (prefix) press: arm the live-send command menu and
+        // swallow the keystroke. The next key is handled by the
+        // pending-leader branch at the top. Checked after the exit chord
+        // so a misconfigured leader == exit chord still exits.
+        if let Some(leader) = state.leader {
+            if live_send::chord_matches(leader, key) {
+                self.live_send_pending_leader = true;
+                return;
+            }
+        }
         if let Some(reason) = self.live_send_drift_reason(&state) {
             self.exit_live_send_and_restore_sizing(&state);
             self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
@@ -3615,7 +3684,13 @@ impl HomeView {
         session.reset_size_to_latest_client();
         self.live_send = None;
         self.live_send_worker = None;
+        self.live_capture_worker = None;
         self.live_send_last_resize = None;
+        // The leader menu and sidebar collapse are live-mode-only: drop
+        // any half-entered leader chord and re-reveal the session list so
+        // the normal home view is never left in a collapsed or armed state.
+        self.live_send_pending_leader = false;
+        self.sidebar_collapsed = false;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).

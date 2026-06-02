@@ -15,8 +15,10 @@ import {
   normaliseTurnCounters,
   setActivityLimit,
   type ApprovalDecision,
+  type CockpitAttachment,
   type CockpitFrame,
   type CockpitState,
+  type PromptAttachmentInput,
   type QueuedPrompt,
 } from "../lib/cockpitTypes";
 import { useCockpitPrefs } from "../lib/cockpitPrefs";
@@ -34,11 +36,17 @@ import {
 import { getToken } from "../lib/token";
 import { setSessionArchive, setSessionSnooze } from "../lib/api";
 
+/** Outcome of an immediate prompt POST, used by the drain effect to
+ *  decide whether to retire queued items (delivered or permanently
+ *  rejected) or keep them for a later retry (transient failure). */
+type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
+
 export type Action =
   | { kind: "frame"; frame: CockpitFrame }
   | { kind: "frames"; frames: CockpitFrame[] }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string }
+  | { kind: "user_prompt"; text: string; attachments?: CockpitAttachment[] }
+  | { kind: "prompt_send_rejected" }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "lagged_resolved" }
@@ -301,6 +309,12 @@ function cacheSet(sessionId: string, value: CockpitState): void {
  *  dedupe makes the overlap idempotent. See #1100. */
 const REPLAY_OVERLAP = 50;
 
+/** Page size `fetchReplay` requests per call. The server paginates the
+ *  replay endpoint and bounds its own page; this stays at or under that
+ *  bound so a long session loads over several requests instead of one
+ *  giant response. The loop follows `next_cursor` while `has_more`. */
+const REPLAY_PAGE_SIZE = 1000;
+
 export function clearCockpitCache(sessionId?: string): void {
   if (sessionId === undefined) {
     stateCache.clear();
@@ -372,6 +386,10 @@ function reducer(state: CockpitState, action: Action): CockpitState {
         id: `user-${Date.now()}-${state.activity.length}`,
         kind: "user_prompt",
         text: action.text,
+        attachments:
+          action.attachments && action.attachments.length > 0
+            ? action.attachments
+            : undefined,
         at: new Date().toISOString(),
       }),
       assistantMessage: "",
@@ -383,6 +401,26 @@ function reducer(state: CockpitState, action: Action): CockpitState {
       turnActive: isTurnActive({
         pendingUserPromptSeq,
         lastStoppedSeq: state.lastStoppedSeq,
+      }),
+    };
+  }
+  if (action.kind === "prompt_send_rejected") {
+    // Optimistic submit already bumped pendingUserPromptSeq. When the
+    // prompt POST is rejected client-side (for example unsupported
+    // attachments), retire exactly one pending turn so Stop unlocks and
+    // the composer returns to idle without waiting for a Stopped frame
+    // that will never arrive.
+    const lastStoppedSeq = Math.min(
+      state.lastStoppedSeq + 1,
+      state.pendingUserPromptSeq,
+    );
+    return {
+      ...state,
+      inFlightTool: null,
+      lastStoppedSeq,
+      turnActive: isTurnActive({
+        pendingUserPromptSeq: state.pendingUserPromptSeq,
+        lastStoppedSeq,
       }),
     };
   }
@@ -637,36 +675,61 @@ export function useCockpit(
         // window, etc.) get a second chance. The reducer's
         // `frame.seq <= state.lastSeq` dedupe drops the overlap, so
         // this is idempotent. See #1100.
-        const since = Math.max(0, lastSeqRef.current - REPLAY_OVERLAP);
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sid)}/cockpit/replay?since=${since}`,
-          { credentials: "same-origin" },
-        );
-        if (!res.ok) return;
-        const data = (await res.json()) as {
-          frames: CockpitFrame[];
-          lost: boolean;
-          highest_seq: number;
-        };
-        // Detect a server-side seq reset: the supervisor's per-session
-        // counter has been forgotten (cockpit_disable → cockpit_enable,
-        // or session delete+recreate with the same id), so the new
-        // conversation is starting fresh from seq=1. Without this reset
-        // the client-side dedupe would drop the new events because
-        // `frame.seq <= state.lastSeq` is true.
-        if (data.highest_seq < since) {
-          dispatch({ kind: "reset" });
-        }
-        if (data.lost) {
-          // The buffer doesn't go back far enough; surface this via
-          // the existing `lagged` flag (the UI shows a "history
-          // truncated" notice) and let the user reload if they want
-          // the full transcript back.
-          dispatch({ kind: "lagged", skipped: data.highest_seq });
-          return;
-        }
-        if (data.frames.length > 0) {
-          dispatch({ kind: "frames", frames: data.frames });
+        const firstSince = Math.max(0, lastSeqRef.current - REPLAY_OVERLAP);
+        let cursor = firstSince;
+        // Snapshot the highest seq seen on the first page and stop there:
+        // events appended after replay began arrive over the live WS and
+        // are deduped, so chasing them here would never converge on a
+        // busy session. Captured from page one's `highest_seq`.
+        let target: number | null = null;
+        for (;;) {
+          const res = await fetch(
+            `/api/sessions/${encodeURIComponent(sid)}/cockpit/replay?since=${cursor}&limit=${REPLAY_PAGE_SIZE}`,
+            { credentials: "same-origin" },
+          );
+          if (!res.ok) return;
+          const data = (await res.json()) as {
+            frames: CockpitFrame[];
+            lost: boolean;
+            highest_seq: number;
+            next_cursor?: number | null;
+            has_more?: boolean;
+          };
+          if (target === null) {
+            target = data.highest_seq;
+            // Detect a server-side seq reset: the supervisor's per-session
+            // counter has been forgotten (cockpit_disable → cockpit_enable,
+            // or session delete+recreate with the same id), so the new
+            // conversation is starting fresh from seq=1. Without this reset
+            // the client-side dedupe would drop the new events because
+            // `frame.seq <= state.lastSeq` is true. Only meaningful on the
+            // first page, where `cursor` is the client's resume point.
+            if (data.highest_seq < firstSince) {
+              dispatch({ kind: "reset" });
+            }
+          }
+          // Honor `lost` on every page: a retention prune between pages
+          // can open a real gap after page one, so surface it via the
+          // existing `lagged` flag and let the user reload for the full
+          // transcript. Stop the loop; a partial transcript is wrong.
+          if (data.lost) {
+            dispatch({ kind: "lagged", skipped: data.highest_seq });
+            return;
+          }
+          if (data.frames.length > 0) {
+            dispatch({ kind: "frames", frames: data.frames });
+          }
+          const next = data.next_cursor;
+          if (
+            data.has_more &&
+            next != null &&
+            next > cursor &&
+            next < target
+          ) {
+            cursor = next;
+            continue;
+          }
+          break;
         }
         dispatch({ kind: "lagged_resolved" });
       } catch {
@@ -983,53 +1046,114 @@ export function useCockpit(
 
   // Dispatch a prompt immediately, no queueing. Internal helper used by
   // both sendPrompt (when the turn is idle) and the drain effect below
-  // (when popping the head of queuedPrompts on Stopped). Returns true
-  // when the POST succeeded so the drain effect knows whether to retire
-  // the items it just sent; false on any disconnect / non-OK response /
-  // network error so the queue stays intact for the next turn-end retry.
+  // (when popping the head of queuedPrompts on Stopped). The result tells
+  // the drain effect what to do with the items it just sent:
+  //   - "ok": delivered, retire them.
+  //   - "non_retryable_failure": the server rejected them with a 4xx, so
+  //     retrying would just re-POST the same failing batch every turn-end;
+  //     retire them too (the error banner already surfaced the reason).
+  //   - "retryable_failure": a transient disconnect / 5xx / network error,
+  //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
-    async (text: string): Promise<boolean> => {
-      if (!sessionId) return false;
+    async (
+      text: string,
+      attachments?: PromptAttachmentInput[],
+    ): Promise<PromptSendResult> => {
+      if (!sessionId) return "retryable_failure";
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
           message: "Cockpit disconnected; message not sent. Reconnect to retry.",
         });
-        return false;
+        return "retryable_failure";
       }
+      // Optimistic preview rows: render the attachment inline from a
+      // local data URL so the bubble shows immediately, before the
+      // server confirms and replay would otherwise back it with the
+      // GET endpoint. See #1000 / #965.
+      const previews: CockpitAttachment[] = (attachments ?? []).map(
+        (a, i) => ({
+          id: `local-${Date.now()}-${i}`,
+          kind: a.kind,
+          mimeType: a.mimeType,
+          name: a.name,
+          size: Math.floor((a.dataB64.length * 3) / 4),
+          url: `data:${a.mimeType};base64,${a.dataB64}`,
+        }),
+      );
       // Optimistically echo the user's message; the agent reply
       // streams back as session/update events on the WS. If the POST
       // fails we'll surface a banner and the user can retry; the
       // optimistic row stays so they see what they tried to send.
-      dispatch({ kind: "user_prompt", text });
+      dispatch({
+        kind: "user_prompt",
+        text,
+        attachments: previews.length > 0 ? previews : undefined,
+      });
       // Submit counts as activity so the force-end-turn watchdog
       // doesn't surface the escape hatch immediately on a fresh prompt
       // (the agent's first chunk can be a few seconds out).
       lastActivityRef.current = Date.now();
       try {
+        const body = {
+          text,
+          attachments: (attachments ?? []).map((a) => ({
+            kind: a.kind,
+            mime_type: a.mimeType,
+            data: a.dataB64,
+            name: a.name,
+          })),
+        };
         const res = await fetch(
           `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }),
+            body: JSON.stringify(body),
           },
         );
         if (!res.ok) {
           const detail = await safeText(res);
-          dispatch({
-            kind: "error",
-            message: `Could not send prompt (${res.status}). ${detail}`.trim(),
-          });
-          return false;
+          // 4xx means the server rejected the prompt (validation,
+          // capability gate, unknown session), so there is no in-flight
+          // turn to cancel and no Stopped frame to retire our optimistic
+          // turn marker.
+          const rejected = res.status >= 400 && res.status < 500;
+          // Typed transient: the session was idle-auto-stopped (#1689) and
+          // its worker did not finish respawning within send_prompt's wait
+          // window. The worker is still coming online, so this is
+          // retryable; suppress the error banner (the queued indicator and
+          // respawn are the right signal) and let the drain re-fire it on
+          // the next AcpSessionAssigned. A capacity 503 ("worker_capacity_full")
+          // is NOT this case: it needs operator action, so it keeps its
+          // banner. See #1748.
+          //
+          // Only suppress for text-only sends: the local queue does not
+          // carry attachments, so an attachment send that hits this 503 has
+          // no retry path. Keep its banner so the user knows to resend
+          // rather than seeing a silent optimistic bubble. See #1748.
+          const workerNotReady =
+            res.status === 503 &&
+            detail.startsWith("worker_not_ready") &&
+            (!attachments || attachments.length === 0);
+          if (rejected) {
+            dispatch({ kind: "prompt_send_rejected" });
+          }
+          if (!workerNotReady) {
+            dispatch({
+              kind: "error",
+              message: `Could not send prompt (${res.status}). ${detail}`.trim(),
+            });
+          }
+          return rejected ? "non_retryable_failure" : "retryable_failure";
         }
-        return true;
+        return "ok";
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
         });
-        return false;
+        return "retryable_failure";
       }
     },
     [sessionId],
@@ -1048,7 +1172,7 @@ export function useCockpit(
   // its own status guard for the drain effect, which can race the WS
   // reopen window (see #1144).
   const sendPrompt = useCallback(
-    async (text: string) => {
+    async (text: string, attachments?: PromptAttachmentInput[]) => {
       if (!sessionId) return;
       // Auto-wake an archived or actively-snoozed session before
       // routing. The tmux send path runs this via
@@ -1080,18 +1204,58 @@ export function useCockpit(
       }
       const wsClosed = statusRef.current !== "open";
       const workerNotRunning = workerStateRef.current !== "running";
-      const shouldEnqueue = wsClosed || workerNotRunning || state.turnActive || state.workerStopped || state.workerRestarting;
+      // An idle-auto-stopped worker is dormant, not dead: the prompt POST
+      // itself wakes it (the server clears dormancy, the reconciler
+      // respawns, and `send_prompt`'s `wait_for_worker` holds the request
+      // until the fresh worker is ready). So a dormant worker must NOT
+      // park the prompt on `workerNotRunning` (the REST poll reads
+      // "absent" until the respawn lands); parking would leave it in the
+      // local queue forever and the worker would never come back. Only a
+      // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
+      const blockedAsideFromWorker =
+        wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      const shouldEnqueue = state.workerIdleStopped
+        ? blockedAsideFromWorker
+        : blockedAsideFromWorker || workerNotRunning;
       if (shouldEnqueue) {
+        // The local prompt queue is text-only (persisted to
+        // localStorage, where megabytes of base64 would blow the
+        // quota). Attachments must go through the immediate POST, so
+        // surface why rather than silently dropping them. The composer
+        // keeps the text + attachments so the user can resend once the
+        // agent is idle. See #1000 / #965.
+        if (attachments && attachments.length > 0) {
+          dispatch({
+            kind: "error",
+            message:
+              "Attachments can only be sent while the agent is idle and connected. Your message was not sent; try again in a moment.",
+          });
+          return;
+        }
         dispatch({ kind: "enqueue_prompt", text });
         return;
       }
-      await dispatchPromptNow(text);
+      const result = await dispatchPromptNow(text, attachments);
+      // Idle-dormant direct send: the worker was respawning and did not
+      // come online within send_prompt's wait window, so the POST returned
+      // a retryable typed 503. Park the prompt instead of dropping it; the
+      // drain effect re-fires it once AcpSessionAssigned brings the worker
+      // online (text-only, since the queue does not carry attachments).
+      // See #1748.
+      if (
+        result === "retryable_failure" &&
+        state.workerIdleStopped &&
+        (!attachments || attachments.length === 0)
+      ) {
+        dispatch({ kind: "enqueue_prompt", text });
+      }
     },
     [
       sessionId,
       state.turnActive,
       state.workerStopped,
       state.workerRestarting,
+      state.workerIdleStopped,
       dispatchPromptNow,
     ],
   );
@@ -1117,7 +1281,14 @@ export function useCockpit(
     // came online). Park queued prompts so they don't POST into a
     // worker that's not online yet; the next REST poll flips
     // workerState to "running" and re-runs this effect. See #1088.
-    if (workerStateRef.current !== "running") return;
+    //
+    // Exception: an idle-auto-stopped (dormant) worker reads "absent"
+    // too, but here the POST is the wake path, so we must let the drain
+    // fire to issue it. The server's `touch_and_wake_if_sunk` clears
+    // dormancy and `send_prompt`'s `wait_for_worker` holds the POST
+    // until the respawned worker is ready. Without this, a prompt the
+    // user queued while the worker was dormant would never drain. #1689.
+    if (workerStateRef.current !== "running" && !state.workerIdleStopped) return;
     // Reconnect race: connect() awaits fetchReplay BEFORE opening the
     // WS, and replay can dispatch a Stopped frame that flips turnActive
     // off. If we drain here while the WS is still in "connecting",
@@ -1165,8 +1336,12 @@ export function useCockpit(
       const combined = combineQueuedPrompts(snapshot);
       const sentIds = snapshot.map((q) => q.id);
       void dispatchPromptNow(combined)
-        .then((ok) => {
-          if (ok) dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+        .then((result) => {
+          // Retire on success and on non-retryable rejection; only a
+          // transient failure keeps the batch queued for the next retry.
+          if (result !== "retryable_failure") {
+            dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+          }
         })
         .finally(() => {
           drainingRef.current = false;
@@ -1175,8 +1350,10 @@ export function useCockpit(
       const head = state.queuedPrompts[0]!;
       const headId = head.id;
       void dispatchPromptNow(head.text)
-        .then((ok) => {
-          if (ok) dispatch({ kind: "dequeue_prompt", id: headId });
+        .then((result) => {
+          if (result !== "retryable_failure") {
+            dispatch({ kind: "dequeue_prompt", id: headId });
+          }
         })
         .finally(() => {
           drainingRef.current = false;
@@ -1189,6 +1366,7 @@ export function useCockpit(
     state.turnActive,
     state.workerStopped,
     state.workerRestarting,
+    state.workerIdleStopped,
     state.queuedPrompts,
     dispatchPromptNow,
   ]);
@@ -1304,22 +1482,14 @@ export function useCockpit(
     }
   }, [sessionId]);
 
-  // Escape hatch for the "spinner stuck" failure mode (#1100). Locally
-  // dispatches a synthetic Stopped so the reducer flips `turnActive`
-  // off immediately, then POSTs to the daemon to publish a Stopped
-  // server-side and best-effort cancel any in-flight turn. The local
-  // dispatch is optimistic; the server echo (which lands as a real
-  // frame on the WS) is idempotent against the reducer.
+  // Escape hatch for the "spinner stuck" failure mode (#1100). POSTs to
+  // the daemon and relies on the server-published Stopped event to drive
+  // reducer state: either the synthetic free-the-UI Stopped or the
+  // user_forced one from the worker restart. We do NOT fabricate a
+  // client-side Stopped seq; the server echo flows back as a real frame
+  // on the WS. See #1727.
   const forceEndTurn = useCallback(async () => {
     if (!sessionId) return;
-    dispatch({
-      kind: "frame",
-      frame: {
-        session_id: sessionId,
-        seq: lastSeqRef.current + 1,
-        event: { Stopped: { reason: "user_forced" } },
-      },
-    });
     lastActivityRef.current = Date.now();
     try {
       const res = await fetch(

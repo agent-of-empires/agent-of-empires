@@ -269,14 +269,16 @@ async function flushAsync(): Promise<void> {
 
 describe("useCockpit drain race (#1144)", () => {
   let promptPostCount: number;
-  let promptPostShouldFail: boolean;
+  let promptPostStatus: number;
+  let promptPostBody: string;
   let promptPostBodies: string[];
   let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
 
   beforeEach(() => {
     sockets.length = 0;
     promptPostCount = 0;
-    promptPostShouldFail = false;
+    promptPostStatus = 200;
+    promptPostBody = "simulated failure";
     promptPostBodies = [];
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
@@ -291,10 +293,10 @@ describe("useCockpit drain race (#1144)", () => {
           if (typeof init?.body === "string") {
             promptPostBodies.push(init.body);
           }
-          if (promptPostShouldFail) {
-            return new Response("simulated failure", { status: 500 });
+          if (promptPostStatus >= 400) {
+            return new Response(promptPostBody, { status: promptPostStatus });
           }
-          return new Response("{}", { status: 200 });
+          return new Response("{}", { status: promptPostStatus });
         }
         return new Response("{}", { status: 200 });
       }),
@@ -390,6 +392,249 @@ describe("useCockpit drain race (#1144)", () => {
     );
   });
 
+  it("a fresh prompt POSTs (wakes) instead of parking when the worker is idle-dormant (#1689)", async () => {
+    // workerState="absent": the reconciler reaped the worker for
+    // inactivity. The REST poll reads "absent" until the respawn lands.
+    const { result } = renderHook(() => useCockpit("sess-idle-fresh", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // Control: a plain absent worker (cold resume, no idle_auto_stop)
+    // still parks — that guard is unchanged.
+    act(() => {
+      void result.current.sendPrompt("typed during cold resume");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    act(() => {
+      void result.current.removeQueuedPrompt(
+        result.current.state.queuedPrompts[0]!.id,
+      );
+    });
+    await flushAsync();
+
+    // The daemon publishes idle_auto_stop: the worker is dormant and a
+    // prompt POST is the wake path. A freshly-typed prompt must POST
+    // directly (the server clears dormancy + respawns + delivers)
+    // rather than parking in the local queue forever — the bug.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-fresh",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    act(() => {
+      void result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(promptPostBodies[0]).toContain("wake me up");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("drains a prompt parked before idle_auto_stop once dormancy lands (#1689)", async () => {
+    // The real stuck scenario: a prompt was queued while the worker was
+    // a cold-absent resume, then the reconciler reaped it to dormant.
+    // The dormancy signal must let the drain effect fire the parked
+    // prompt (the wake POST), otherwise it sits queued forever.
+    const { result } = renderHook(() => useCockpit("sess-idle-drain", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    act(() => {
+      void result.current.sendPrompt("parked before dormancy");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-drain",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+    expect(promptPostCount).toBe(1);
+    expect(promptPostBodies[0]).toContain("parked before dormancy");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("keeps an idle-dormant prompt queued without an error banner on a worker_not_ready 503 (#1748)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-idle-503", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // Worker reaped for inactivity: dormant.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-503",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    // The wake POST goes out, but the respawn did not finish within the
+    // server's wait window, so it returns the typed retryable 503. The
+    // prompt must NOT be dropped (it re-queues) and NO error banner shows;
+    // the drain re-fires it once the worker comes online. See #1748.
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
+    );
+  });
+
+  it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {
+    // Control: the capacity 503 needs operator action, so unlike
+    // worker_not_ready it must keep its banner rather than being silently
+    // swallowed as a transient.
+    const { result } = renderHook(() => useCockpit("sess-idle-cap", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-cap",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_capacity_full (4/4)";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up");
+    });
+    await flushAsync();
+
+    expect(result.current.state.lastError ?? "").toContain(
+      "Could not send prompt (503)",
+    );
+  });
+
+  it("keeps the error banner on a worker_not_ready 503 for an attachment send (#1748)", async () => {
+    // Attachments cannot be re-queued (the local queue is text-only), so a
+    // worker_not_ready 503 for an attachment send has no retry path. The
+    // banner must show rather than being suppressed as transient.
+    const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-idle-attach",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    await act(async () => {
+      await result.current.sendPrompt("wake me up", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "shot.png",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    expect(result.current.state.lastError ?? "").toContain(
+      "Could not send prompt (503)",
+    );
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("retires the optimistic turn when prompt POST is rejected with 4xx", async () => {
+    const { result } = renderHook(() => useCockpit("sess-reject-4xx"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    promptPostStatus = 400;
+    await act(async () => {
+      await result.current.sendPrompt("send bad attachment", [
+        {
+          kind: "image",
+          mimeType: "image/x-xcf",
+          dataB64: "aA==",
+          name: "bad.xcf",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.pendingUserPromptSeq).toBe(1);
+    expect(result.current.state.lastStoppedSeq).toBe(1);
+    expect(result.current.state.turnActive).toBe(false);
+    expect(result.current.state.lastError).toContain(
+      "Could not send prompt (400)",
+    );
+  });
+
   it("combined-mode drain leaves the queue intact when the prompt POST fails", async () => {
     const { result } = renderHook(() => useCockpit("sess-drain-2"));
     await flushAsync();
@@ -426,7 +671,7 @@ describe("useCockpit drain race (#1144)", () => {
 
     // Configure the prompt POST to fail, then end the turn so the drain
     // fires.
-    promptPostShouldFail = true;
+    promptPostStatus = 500;
     act(() => {
       ws.onmessage?.({
         data: JSON.stringify({

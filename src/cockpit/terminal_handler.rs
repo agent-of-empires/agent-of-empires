@@ -140,7 +140,11 @@ impl TerminalManager {
                 cmd.args(&full_args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stderr(Stdio::piped())
+                    // If the prompt task is dropped (worker teardown on a
+                    // force-stop / cancel-escalation restart), kill the child
+                    // instead of leaking it. See #1727.
+                    .kill_on_drop(true);
                 for (k, v) in inherit_pairs {
                     cmd.env(k, v);
                 }
@@ -152,6 +156,9 @@ impl TerminalManager {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                // Kill the child if the prompt task is dropped on a
+                // force-stop / cancel-escalation worker teardown. See #1727.
+                .kill_on_drop(true)
                 .spawn()?,
         };
 

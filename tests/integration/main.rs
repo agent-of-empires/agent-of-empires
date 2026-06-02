@@ -20,6 +20,7 @@ mod parallel_capture;
 mod profile_management;
 mod repo_config;
 mod sandbox_integration;
+mod session_id_acquisition;
 mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;

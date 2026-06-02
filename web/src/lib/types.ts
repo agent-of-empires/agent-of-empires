@@ -78,6 +78,12 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the cockpit view. See #1088. */
   cockpit_worker_state?: CockpitWorkerState;
+  /** True when this session's agent can run in cockpit: a built-in with
+   *  an ACP adapter, or a custom agent whose profile config declares a
+   *  valid `agent_cockpit_cmd`. The terminal view's "switch to cockpit"
+   *  affordance reads this instead of a hardcoded tool list. Absent on
+   *  builds without the cockpit feature. */
+  acp_capable?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
    *  ~/.claude/settings.json). The mobile rendering path uses this to
@@ -161,6 +167,25 @@ export interface ResumeOutputMessage {
 export interface PrimaryStatusMessage {
   type: "primary_status";
   is_primary: boolean;
+}
+
+/** Client → server latency probe, sent only under
+ *  `?debug=terminal-timing`. `client_t` is a `performance.now()` stamp
+ *  echoed back unchanged in the pong. Never touches the PTY. See #1453. */
+export interface TimingPingMessage {
+  type: "timing_ping";
+  seq: number;
+  client_t: number;
+}
+
+/** Server → client reply to {@link TimingPingMessage}. `server_busy_us`
+ *  is the server's own recv-to-send duration, so the client can subtract
+ *  it from the round trip without clock synchronisation. See #1453. */
+export interface TimingPongMessage {
+  type: "timing_pong";
+  seq: number;
+  client_t: number;
+  server_busy_us: number;
 }
 
 /** Rich diff file info with addition/deletion stats */
@@ -265,6 +290,11 @@ export interface AgentInfo {
   host_only: boolean;
   installed: boolean;
   install_hint: string;
+  /** True when the agent can run in cockpit: a built-in with an ACP
+   *  adapter, or a custom agent that declares a valid `agent_cockpit_cmd`.
+   *  The wizard reads this to decide whether a new session runs in
+   *  cockpit or tmux, replacing the hardcoded client-side tool list. */
+  acp_capable: boolean;
 }
 
 /** Profile info returned by /api/profiles */

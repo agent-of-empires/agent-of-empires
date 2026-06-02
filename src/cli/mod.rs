@@ -5,6 +5,7 @@ pub mod agents;
 #[cfg(feature = "serve")]
 pub mod cockpit;
 pub mod definition;
+pub mod extract_session_id;
 pub mod group;
 pub mod init;
 pub mod list;

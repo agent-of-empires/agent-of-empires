@@ -143,6 +143,8 @@ pub enum SupervisorError {
     Acp(#[from] AcpError),
     #[error("agent {0:?} not in registry")]
     UnknownAgent(String),
+    #[error("{0}")]
+    InvalidAgentCommand(String),
     #[error("session {0:?} already has a running cockpit worker")]
     AlreadyRunning(String),
     /// Configured `[cockpit] max_concurrent_workers` cap is full. The
@@ -171,6 +173,13 @@ pub enum SupervisorError {
 /// See #1038.
 pub trait BroadcastSink: Send + Sync + 'static {
     fn publish(&self, session_id: &str, seq: u64, event: &Event);
+    /// Like `publish`, but reports whether the event write reached the
+    /// durable event store. Default assumes success for sinks that don't
+    /// persist (tests / in-memory fixtures).
+    fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.publish(session_id, seq, event);
+        true
+    }
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -179,6 +188,23 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
         Vec::new()
     }
+    /// Persist one prompt attachment blob keyed to the seq of the
+    /// `UserPromptSent` it rides with, so the retention prune and
+    /// session delete drop it in lockstep. Default no-op so test sinks
+    /// without an event store opt out cleanly, mirroring
+    /// `unresolved_approval_nonces`. See #1000 / #965.
+    fn record_attachment(
+        &self,
+        _session_id: &str,
+        _seq: u64,
+        _blob: &crate::cockpit::event_store::AttachmentBlob,
+    ) -> bool {
+        true
+    }
+    /// Roll back blobs for one prompt seq. Used when publishing the
+    /// matching `UserPromptSent` fails durability, so refs and blobs
+    /// never diverge on disk.
+    fn delete_attachments_for_seq(&self, _session_id: &str, _seq: u64) {}
 }
 
 /// How this supervisor acquired the worker. Drives both reap (which
@@ -267,6 +293,17 @@ pub enum ResumeKind {
     Spawn,
 }
 
+/// Outcome of `Supervisor::begin_resume`: either the caller now holds a
+/// fresh `pending_resumes` reservation it must carry into `spawn_inner`
+/// (or `attach`), or a worker is already running / already mid-resume so
+/// there is nothing to reserve. `CapacityFull` surfaces as the `Err` arm.
+pub(crate) enum ResumeReservationOutcome {
+    /// A reservation was placed; the caller owns the RAII guard.
+    Reserved(ResumeReservation),
+    /// The session is already in `workers` or `pending_resumes`.
+    AlreadyPresent,
+}
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -329,7 +366,7 @@ pub struct Supervisor<S: BroadcastSink> {
 /// was taken. Without this, a panic or early-return mid-resume would
 /// leave a phantom reservation that blocks every future resume for
 /// that session AND keeps the UI stuck on "Resuming…".
-struct ResumeReservation {
+pub(crate) struct ResumeReservation {
     pending: Arc<std::sync::Mutex<HashMap<String, ResumeKind>>>,
     session_id: String,
     /// Wakes any `wait_for_worker` parked on the supervisor's
@@ -465,34 +502,98 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or_else(|| SupervisorError::UnknownAgent(name.into()))
     }
 
+    /// Resolve the agent spec for a cockpit session, overlaying the
+    /// session's (already profile-resolved) config onto the built-in
+    /// registry. Built-in agents resolve from the registry; a custom
+    /// agent resolves from its `agent_cockpit_cmd` entry, parsed into
+    /// argv. Never mutates the registry, so two profiles defining the
+    /// same custom name with different commands don't clobber each other
+    /// and `/cockpit/switch-agent` validation stays per-session.
+    pub async fn resolve_agent_spec(
+        &self,
+        name: &str,
+        config: &crate::session::config::SessionConfig,
+    ) -> Result<AgentSpec, SupervisorError> {
+        if let Some(spec) = self.registry.lock().await.get(name).cloned() {
+            return Ok(spec);
+        }
+        if let Some(cmd) = config.agent_cockpit_cmd.get(name) {
+            return AgentSpec::from_cockpit_cmd(name, cmd)
+                .map_err(SupervisorError::InvalidAgentCommand);
+        }
+        Err(SupervisorError::UnknownAgent(name.into()))
+    }
+
     /// Pick the agent name to spawn for an instance. Precedence:
     ///   1. explicit `cockpit_agent` override on the instance
     ///   2. registry entry keyed on the instance's tool name
     ///      (so `tool="opencode"` → registry `"opencode"` →
     ///      `opencode acp`, etc.)
-    ///   3. legacy fallback: `claude` for the claude tool, otherwise
+    ///   3. custom agent declaring an ACP command via
+    ///      `agent_cockpit_cmd` in the session's profile config
+    ///   4. legacy fallback: `claude` for the claude tool, otherwise
     ///      `aoe-agent` (our bundled multi-provider agent)
-    pub async fn pick_agent_for_tool(&self, tool: &str, explicit_override: Option<&str>) -> String {
+    ///
+    /// `profile` is the session's source profile (`""` resolves the
+    /// user's default) and `project_path` is its working directory;
+    /// both are consulted for step 3 so repo-local `agent_cockpit_cmd`
+    /// overrides are honored.
+    pub async fn pick_agent_for_tool(
+        &self,
+        tool: &str,
+        explicit_override: Option<&str>,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> String {
         if let Some(name) = explicit_override {
             if !name.is_empty() {
                 return name.to_string();
             }
         }
-        // Step 2: tool-keyed registry lookup. Done under the same
-        // lock as resolve_agent so a custom override registered via
-        // upsert_agent is honored.
+        // Step 2: tool-keyed registry lookup.
         {
             let reg = self.registry.lock().await;
             if reg.get(tool).is_some() {
                 return tool.to_string();
             }
         }
-        // Step 3: legacy fallbacks.
+        // Step 3: custom agent with a configured ACP command resolves to
+        // its own name; spawn builds the spec from config (no registry
+        // mutation).
+        if self
+            .custom_agent_has_cockpit_cmd(tool, profile, project_path)
+            .await
+        {
+            return tool.to_string();
+        }
+        // Step 4: legacy fallbacks.
         if tool == "claude" {
             "claude".into()
         } else {
             "aoe-agent".into()
         }
+    }
+
+    /// True iff `tool` is a custom agent that declares an
+    /// `agent_cockpit_cmd` in its profile + repo-resolved config.
+    pub async fn custom_agent_has_cockpit_cmd(
+        &self,
+        tool: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> bool {
+        let tool = tool.to_string();
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
+                .session
+                .agent_cockpit_cmd
+                .get(&tool)
+                .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(&tool, cmd).is_ok())
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn registry_snapshot(&self) -> AgentRegistry {
@@ -680,16 +781,88 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) {
+        self.publish_user_prompt_with_attachments(session_id, text, &[])
+            .await;
+    }
+
+    /// Like `publish_user_prompt` but also persists the prompt's
+    /// attachment blobs (keyed to the same seq as the `UserPromptSent`)
+    /// and records metadata-only refs on the event so replay can render
+    /// them. The bytes never enter the event JSON; only the refs do.
+    /// See #1000 / #965.
+    pub async fn publish_user_prompt_with_attachments(
+        &self,
+        session_id: &str,
+        text: String,
+        attachments: &[crate::cockpit::event_store::AttachmentBlob],
+    ) {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
         let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish(session_id, seq, &Event::UserPromptSent { text });
+        let mut refs = Vec::with_capacity(attachments.len());
+        for blob in attachments {
+            if !self.sink.record_attachment(session_id, seq, blob) {
+                // A blob failed to persist; roll back any siblings already
+                // written for this seq and abort before publishing, so the
+                // UserPromptSent never carries refs load_attachment() can't serve.
+                self.sink.delete_attachments_for_seq(session_id, seq);
+                return;
+            }
+            refs.push(crate::cockpit::state::PromptAttachmentRef {
+                id: blob.id.clone(),
+                kind: blob.kind,
+                mime_type: blob.mime_type.clone(),
+                name: blob.name.clone(),
+                size: blob.data.len() as u64,
+            });
+        }
+        let persisted = self.sink.publish_persisted(
+            session_id,
+            seq,
+            &Event::UserPromptSent {
+                text,
+                attachments: refs,
+            },
+        );
+        if !persisted {
+            self.sink.delete_attachments_for_seq(session_id, seq);
+            return;
+        }
         if is_clear {
             let seq = next_seq(&self.next_seqs, session_id);
             self.sink.publish(session_id, seq, &Event::SessionCleared);
         }
+    }
+
+    /// Publish a "Send diff comments" submission as a typed
+    /// `Event::UserDiffCommentsPrompt`. Unlike `publish_user_prompt`
+    /// this skips the `/clear` detection: assembled diff-comment
+    /// markdown is never a clear command, and treating it as one would
+    /// wrongly fold the transcript. The caller forwards
+    /// `assembled_markdown` to the agent separately, exactly as it does
+    /// the plain text of a normal prompt.
+    pub async fn publish_user_diff_comments_prompt(
+        &self,
+        session_id: &str,
+        intro: String,
+        outro: String,
+        is_multi_repo: bool,
+        comments: Vec<super::state::DiffComment>,
+        assembled_markdown: String,
+    ) {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink.publish(
+            session_id,
+            seq,
+            &Event::UserDiffCommentsPrompt {
+                intro,
+                outro,
+                is_multi_repo,
+                comments,
+                assembled_markdown,
+            },
+        );
     }
 
     /// Resolve the agent registry key for a session. Reads the live
@@ -757,6 +930,97 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// at. The reservation makes the second caller fail fast with
     /// AlreadyRunning instead.
     pub async fn spawn(&self, req: SpawnRequest) -> Result<(), SupervisorError> {
+        let reservation = match self
+            .begin_resume(&req.session_id, ResumeKind::Spawn)
+            .await?
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => {
+                return Err(SupervisorError::AlreadyRunning(req.session_id));
+            }
+        };
+        self.spawn_inner(req, reservation).await
+    }
+
+    /// Synchronously reserve a `pending_resumes` slot BEFORE any async
+    /// resume work begins, so a caller that goes on to drive a detached
+    /// spawn (the idle-dormant prompt-wake path, see #1748) makes
+    /// `wait_for_worker` observe the reservation immediately rather than
+    /// failing fast. Returns `AlreadyPresent` when a worker is already
+    /// running or another task is mid-resume, and `Err(CapacityFull)`
+    /// when the worker cap is reached. The `workers` and `pending_resumes`
+    /// maps are checked under the same critical section so the
+    /// `(workers ∪ pending)` set is observed atomically; the existing
+    /// `spawn`/`attach` reservation logic now routes through here.
+    pub(crate) async fn begin_resume(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        let workers = self.workers.lock().await;
+        if workers.contains_key(session_id) {
+            return Ok(ResumeReservationOutcome::AlreadyPresent);
+        }
+        let mut pending = lock_recover(&self.pending_resumes);
+        if pending.contains_key(session_id) {
+            return Ok(ResumeReservationOutcome::AlreadyPresent);
+        }
+        match kind {
+            ResumeKind::Spawn => {
+                // Capacity check counts both running (in-memory) and
+                // detached (on-disk-only) workers PLUS any in-flight Spawn
+                // reservations, so a parallel reconciler can't pass the
+                // limit check for N concurrent callers before any have
+                // inserted into `workers`. Attach reservations don't
+                // contribute: they reattach to an existing live runner that
+                // is already counted in `registry_count`. See #1088.
+                let registry_count = super::worker_registry::list()
+                    .map(|recs| {
+                        recs.into_iter()
+                            .filter(|r| {
+                                super::worker_registry::is_record_live(r)
+                                    && !workers.contains_key(&r.session_id)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let pending_spawn_count = pending
+                    .values()
+                    .filter(|k| matches!(k, ResumeKind::Spawn))
+                    .count();
+                let combined = workers.len() + registry_count + pending_spawn_count;
+                if combined >= self.max_concurrent_workers as usize {
+                    return Err(SupervisorError::CapacityFull {
+                        current: combined,
+                        limit: self.max_concurrent_workers,
+                    });
+                }
+            }
+            ResumeKind::Attach => {
+                // No capacity gate: attach takes over an already-running
+                // detached runner (already counted in `registry_count`),
+                // it does not create a new worker. Rejecting it would
+                // strand a live runner after a restart or after lowering
+                // `max_concurrent_workers`, leaving the session unmanaged.
+            }
+        }
+        pending.insert(session_id.to_string(), kind);
+        Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
+            pending: Arc::clone(&self.pending_resumes),
+            session_id: session_id.to_string(),
+            notify: Arc::clone(&self.worker_notify),
+        }))
+    }
+
+    /// Spawn body proper, run while holding a `pending_resumes`
+    /// reservation acquired by `begin_resume`. Split out so the
+    /// prompt-wake path (#1748) can reserve synchronously, then drive
+    /// this in a detached task without re-reserving.
+    pub(crate) async fn spawn_inner(
+        &self,
+        req: SpawnRequest,
+        _reservation: ResumeReservation,
+    ) -> Result<(), SupervisorError> {
         let SpawnRequest {
             session_id,
             agent,
@@ -769,55 +1033,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             source_profile,
             yolo_mode,
         } = req;
-        let _reservation = {
-            let workers = self.workers.lock().await;
-            if workers.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            // Capacity check counts both running (in-memory) and
-            // detached (on-disk-only) workers PLUS any in-flight Spawn
-            // reservations, so a parallel reconciler can't pass the
-            // limit check for N concurrent callers before any have
-            // inserted into `workers`. Attach reservations don't
-            // contribute: they reattach to an existing live runner that
-            // is already counted in `registry_count`. See #1088.
-            let registry_count = super::worker_registry::list()
-                .map(|recs| {
-                    recs.into_iter()
-                        .filter(|r| {
-                            super::worker_registry::is_record_live(r)
-                                && !workers.contains_key(&r.session_id)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            // Acquire pending_resumes under the same critical section
-            // as the workers check so the (workers ∪ pending) set is
-            // observed atomically. A second caller arriving here sees
-            // either the workers entry (after insert below) or the
-            // pending entry; in both cases it returns AlreadyRunning.
-            let mut pending = lock_recover(&self.pending_resumes);
-            if pending.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            let pending_spawn_count = pending
-                .values()
-                .filter(|k| matches!(k, ResumeKind::Spawn))
-                .count();
-            let combined = workers.len() + registry_count + pending_spawn_count;
-            if combined >= self.max_concurrent_workers as usize {
-                return Err(SupervisorError::CapacityFull {
-                    current: combined,
-                    limit: self.max_concurrent_workers,
-                });
-            }
-            pending.insert(session_id.clone(), ResumeKind::Spawn);
-            ResumeReservation {
-                pending: Arc::clone(&self.pending_resumes),
-                session_id: session_id.clone(),
-                notify: Arc::clone(&self.worker_notify),
-            }
-        };
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
         // native binary on first ever run; two concurrent `session/new`
@@ -842,7 +1057,25 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
-        let mut spec = self.resolve_agent(&agent).await?;
+        // Resolve the spec config-aware: built-ins come from the
+        // registry, custom agents from this session's profile + repo
+        // resolved `agent_cockpit_cmd`. Read off-thread; config
+        // resolution touches disk.
+        let profile_for_cfg = source_profile.clone().unwrap_or_default();
+        let cwd_for_cfg = cwd.clone();
+        let resolved_cfg = tokio::task::spawn_blocking(move || {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &profile_for_cfg,
+                &cwd_for_cfg,
+            )
+        })
+        .await
+        .map_err(|e| {
+            SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
+        })?;
+        let mut spec = self
+            .resolve_agent_spec(&agent, &resolved_cfg.session)
+            .await?;
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
@@ -1032,7 +1265,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     let mut rate_limited = false;
                     while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
-                            if reason == "agent_unresponsive" || reason == "prompt_orphaned" {
+                            if reason == "agent_unresponsive"
+                                || reason == "prompt_orphaned"
+                                || reason == "user_forced"
+                            {
+                                // `user_forced` is the explicit "Force stop":
+                                // same recovery as a wedged agent (kill the
+                                // worker process group, respawn, session/load).
+                                // See #1727.
                                 agent_unresponsive = true;
                             } else if reason == "rate_limited" {
                                 rate_limited = true;
@@ -1127,21 +1367,28 @@ impl<S: BroadcastSink> Supervisor<S> {
                     if agent_unresponsive {
                         #[cfg(unix)]
                         {
-                            use nix::sys::signal::{kill, Signal};
+                            use nix::sys::signal::{killpg, Signal};
                             use nix::unistd::Pid;
                             let old_pid = super::worker_registry::load(&session_id)
                                 .ok()
                                 .flatten()
                                 .map(|r| r.pid);
                             if let Some(pid) = old_pid {
+                                // The runner is spawned via `setsid`, so it
+                                // leads its own process group (PGID == PID).
+                                // Signal the whole GROUP, not just the runner
+                                // PID, so a tool the agent ran internally (a
+                                // monitor/until loop spawned as a grandchild
+                                // of claude-agent-acp) dies too instead of
+                                // surviving the restart orphaned. See #1727.
                                 if super::worker_registry::is_pid_alive(pid) {
                                     info!(
                                         target: "cockpit.supervisor",
                                         session = %session_id,
                                         pid,
-                                        "SIGTERM wedged runner before respawn (agent_unresponsive)"
+                                        "SIGTERM wedged runner process group before respawn (agent_unresponsive)"
                                     );
-                                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
                                 }
                                 // Poll for the runner to exit before
                                 // proceeding to respawn. ~3s budget, 100ms
@@ -1162,7 +1409,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         pid,
                                         "wedged runner survived SIGTERM grace; escalating to SIGKILL"
                                     );
-                                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
                                     // One more brief tick for the kernel
                                     // to reap and the socket inode to
                                     // drop. We don't loop forever; spawn
@@ -1453,12 +1700,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))
     }
 
-    /// Send a user prompt to a running cockpit worker.
-    pub async fn send_prompt(&self, session_id: &str, text: &str) -> Result<(), SupervisorError> {
+    /// Send a user prompt (with optional attachments) to a running
+    /// cockpit worker.
+    pub async fn send_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[crate::cockpit::event_store::AttachmentBlob],
+    ) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
         let client = self.client_for_session(session_id).await?;
-        client.send_prompt(text).await?;
+        client.send_prompt(text, attachments).await?;
         Ok(())
     }
 
@@ -1472,14 +1725,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Escape hatch for the "spinner stuck because we never saw the
-    /// agent's `Stopped`" failure mode (#1100). Publishes a synthetic
-    /// `Stopped { reason: "user_forced" }` through the sink so every
-    /// connected UI flips `turnActive` off and any client-side prompt
-    /// queue can drain, then sends a best-effort `session/cancel` to
-    /// the agent in case it really is mid-turn. Idempotent: a second
-    /// call just publishes another (no-op for the reducer) Stopped.
+    /// User-initiated "Force stop". Two failure modes to cover:
+    ///
+    /// 1. A turn is genuinely in flight and the agent is ignoring
+    ///    `session/cancel` (a monitor/until loop). `force_cancel` ends the
+    ///    turn with `Stopped { reason: "user_forced" }` through the drain
+    ///    task, which kills the worker process group and respawns with
+    ///    `session/load`. This is what actually stops the runaway loop.
+    /// 2. The daemon already finished the turn but the UI is wedged on a
+    ///    `Stopped` it never saw (#1100). The synthetic `Stopped` published
+    ///    below frees `turnActive` for every connected UI immediately.
+    ///
+    /// Both are best-effort and idempotent: the synthetic `Stopped` bypasses
+    /// the drain (so it never triggers a restart on its own), and a second
+    /// `Stopped` is a capped no-op for the reducer. See #1727 / #1100.
     pub async fn force_end_turn(&self, session_id: &str) {
+        if let Ok(client) = self.client_for_session(session_id).await {
+            let _ = client.force_cancel().await;
+        }
         let seq = next_seq(&self.next_seqs, session_id);
         self.sink.publish(
             session_id,
@@ -1488,11 +1751,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason: "user_forced".into(),
             },
         );
-        // Best-effort cancel; ignore UnknownSession because the headline
-        // intent is "free the UI", which the publish above already did.
-        if let Ok(client) = self.client_for_session(session_id).await {
-            let _ = client.cancel_prompt().await;
-        }
     }
 
     /// Set the active session mode via ACP session/set_mode.
@@ -1531,8 +1789,48 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Shutdown a single cockpit worker.
+    /// Shutdown a single cockpit worker, preserving its agent-side
+    /// transcript so the next respawn can resume it via `session/load`.
+    ///
+    /// This is the temporary-teardown path: cockpit stop, snooze,
+    /// archive, idle auto-stop, and supersede all funnel here. They are
+    /// reversible, so we must NOT fire `session/delete` (which deletes
+    /// the agent's on-disk transcript); doing so left every snooze /
+    /// archive / idle-stop unable to resume, resetting context on the
+    /// next prompt (#1710). For permanent removal use
+    /// [`Self::shutdown_and_delete`].
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "user_stopped", false)
+            .await
+    }
+
+    /// Like `shutdown`, but tags the synthetic `Stopped` event with
+    /// `reason: "idle_auto_stop"` so the cockpit timeline shows the
+    /// worker was reclaimed for inactivity rather than user-stopped.
+    /// Used by the reconciler's idle-reap pass (#1689). Seamless: no UI
+    /// banner, the next prompt respawns the worker. Preserves the
+    /// agent transcript so that respawn resumes instead of resetting.
+    pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false)
+            .await
+    }
+
+    /// Shutdown a worker AND release its agent-side persisted state via
+    /// the experimental `session/delete` RPC. Use only when the session
+    /// is being permanently discarded (session delete, or disabling
+    /// cockpit mode), never for reversible teardown, which must keep the
+    /// transcript resumable. See #1710 and `shutdown`.
+    pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "user_stopped", true)
+            .await
+    }
+
+    async fn shutdown_with_reason(
+        &self,
+        session_id: &str,
+        stop_reason: &str,
+        delete_adapter_state: bool,
+    ) -> Result<(), SupervisorError> {
         // Hold workers + pending_resumes simultaneously so the spawn
         // can't observe an empty workers map, finish the handshake,
         // and insert a WorkerHandle while we're walking through this
@@ -1545,13 +1843,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             // Best-effort experimental `session/delete` RPC before
             // SIGTERM. Adapters that advertise
             // `sessionCapabilities.delete: {}` (claude-agent-acp >= 0.36)
-            // release adapter-side persisted state here. Other
-            // adapters return -32601 and we proceed to the existing
-            // kill path either way. Bounded by
-            // `ACP_SESSION_DELETE_TIMEOUT` inside `delete_session`
-            // (~2s) so a wedged adapter cannot stall the user's
-            // delete. See #1404.
-            try_session_delete(&handle.client, session_id).await;
+            // release adapter-side persisted state here, deleting the
+            // agent's on-disk transcript. Other adapters return -32601
+            // and we proceed to the existing kill path either way.
+            // Bounded by `ACP_SESSION_DELETE_TIMEOUT` inside
+            // `delete_session` (~2s) so a wedged adapter cannot stall
+            // the caller. See #1404.
+            //
+            // Gated on `delete_adapter_state`: only permanent removal
+            // (session delete / disabling cockpit) deletes the
+            // transcript. Reversible teardown (snooze, archive, idle
+            // auto-stop, stop, supersede) must keep it so the next
+            // respawn resumes via `session/load` instead of resetting
+            // the conversation. See #1710.
+            if delete_adapter_state {
+                try_session_delete(&handle.client, session_id).await;
+            }
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
             // SIGTERM the runner (if there is one) so the agent
@@ -1575,7 +1882,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session_id,
                     seq,
                     &Event::Stopped {
-                        reason: "user_stopped".into(),
+                        reason: stop_reason.into(),
                     },
                 );
             }
@@ -1647,14 +1954,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             handle.drain_task.abort();
         }
 
-        // SIGTERM every runner we knew about, so detached agents that
-        // outlived a previous daemon are also taken down by an explicit
-        // "kill them all" request.
-        #[cfg(unix)]
+        // Group-SIGTERM every runner we knew about, so detached agents that
+        // outlived a previous daemon (and their node/SDK grandchildren) are
+        // also taken down by an explicit "kill them all" request, not left
+        // orphaned under PID 1. See #1689.
         for (session_id, pid) in registry_pids {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            super::worker_registry::terminate_runner_group(pid);
             super::worker_registry::delete(&session_id).ok();
         }
         #[cfg(not(unix))]
@@ -1711,6 +2016,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
     ) -> Result<(), SupervisorError> {
+        // Reserve a `pending_resumes` slot for the duration of the
+        // attach so the UI shows "Resuming…" while the socket dial +
+        // resume handshake runs, AND the capacity check in a concurrent
+        // `spawn` sees this id and avoids over-allocating. RAII guard
+        // removes the entry on every exit path. Reserving before the
+        // registry probe keeps the `(workers ∪ pending)` set atomic.
+        let _reservation = match self.begin_resume(&session_id, ResumeKind::Attach).await? {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => {
+                return Err(SupervisorError::AlreadyRunning(session_id));
+            }
+        };
+
         let record = match super::worker_registry::load(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
         {
@@ -1722,42 +2040,14 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resume requires a known ACP session id (the runner was holding
         // the agent loaded against it). If the registry doesn't carry
-        // one yet — e.g. the previous daemon crashed before the first
-        // `session/new` response was processed — there's nothing to
+        // one yet, e.g. the previous daemon crashed before the first
+        // `session/new` response was processed, there's nothing to
         // resume against; bail so the reconciler falls through to a
         // fresh spawn.
         let Some(stored_acp_session_id) = record.stored_acp_session_id.clone() else {
             return Err(SupervisorError::Acp(AcpError::Spawn(
                 "runner registry has no stored_acp_session_id; need fresh spawn".into(),
             )));
-        };
-
-        // Reserve a `pending_resumes` slot for the duration of the
-        // attach so the UI shows "Resuming…" while the socket dial +
-        // resume handshake runs, AND the capacity check in a
-        // concurrent `spawn` sees this id and avoids over-allocating.
-        // RAII guard removes the entry on every exit path.
-        let _reservation = {
-            let workers = self.workers.lock().await;
-            if workers.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            if workers.len() >= self.max_concurrent_workers as usize {
-                return Err(SupervisorError::CapacityFull {
-                    current: workers.len(),
-                    limit: self.max_concurrent_workers,
-                });
-            }
-            let mut pending = lock_recover(&self.pending_resumes);
-            if pending.contains_key(&session_id) {
-                return Err(SupervisorError::AlreadyRunning(session_id));
-            }
-            pending.insert(session_id.clone(), ResumeKind::Attach);
-            ResumeReservation {
-                pending: Arc::clone(&self.pending_resumes),
-                session_id: session_id.clone(),
-                notify: Arc::clone(&self.worker_notify),
-            }
         };
 
         let cockpit_session_id = CockpitSessionId(session_id.clone());
@@ -2012,17 +2302,10 @@ impl<S: BroadcastSink> Supervisor<S> {
 /// then delete the entry. Used by `shutdown` and `shutdown_all` to take
 /// down detached workers explicitly.
 fn terminate_runner_for_session(session_id: &str) {
-    if let Ok(Some(record)) = super::worker_registry::load(session_id) {
-        #[cfg(unix)]
-        if super::worker_registry::is_pid_alive(record.pid) {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM);
-        }
-        #[cfg(not(unix))]
-        let _ = record;
-    }
-    super::worker_registry::delete(session_id).ok();
+    // Group-kill (runner + agent + grandchildren) then delete the entry.
+    // Single-pid SIGTERM here used to orphan the agent's node/SDK children
+    // under PID 1; see worker_registry::terminate and #1689.
+    super::worker_registry::terminate(session_id);
 }
 
 #[derive(Debug)]
@@ -2173,6 +2456,10 @@ pub struct ChannelSink {
 
 impl BroadcastSink for ChannelSink {
     fn publish(&self, session_id: &str, seq: u64, event: &Event) {
+        let _ = self.publish_persisted(session_id, seq, event);
+    }
+
+    fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
         // Persist FIRST so a disk failure can be surfaced before
         // broadcast subscribers see an event the on-disk log doesn't
         // have. If the write fails the seq is already burned (the
@@ -2199,6 +2486,7 @@ impl BroadcastSink for ChannelSink {
             }
             _ => self.event_store.record(session_id, seq, event),
         };
+        let persisted = record_result.is_ok();
         let event_ref: &Event = match record_result {
             Ok(()) => event,
             Err(e) => {
@@ -2221,10 +2509,36 @@ impl BroadcastSink for ChannelSink {
             event: Arc::new(event_ref.clone()),
         };
         let _ = self.tx.send(frame);
+        persisted
     }
 
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
         self.event_store.unresolved_approval_nonces(session_id)
+    }
+
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::cockpit::event_store::AttachmentBlob,
+    ) -> bool {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.record_attachment(session_id, seq, blob)
+            }),
+            _ => self.event_store.record_attachment(session_id, seq, blob),
+        }
+    }
+
+    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.delete_attachments_for_seq(session_id, seq)
+                });
+            }
+            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
+        }
     }
 }
 
@@ -2860,6 +3174,93 @@ mod tests {
         );
     }
 
+    /// Reversible teardown must keep the agent transcript resumable, so
+    /// `shutdown` (snooze, archive, idle auto-stop, stop, supersede)
+    /// must NOT fire `session/delete`; only permanent removal via
+    /// `shutdown_and_delete` may. Regression test for the snooze /
+    /// archive / idle-stop context loss in #1710. Isolates HOME so the
+    /// registry record (which carries the stored ACP id that
+    /// `try_session_delete` needs) stays out of real state, and uses a
+    /// reaped, never-leader pid so the teardown's process-group SIGTERM
+    /// resolves to a harmless ESRCH.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_skips_session_delete_permanent_delete_fires_it() {
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; matches the existing pattern.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        // Dead pid that was never a process-group leader, so the
+        // teardown's killpg/kill signal nothing (ESRCH).
+        let dead_pid = {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn helper");
+            let id = child.id();
+            let _ = child.wait();
+            id
+        };
+
+        async fn register(
+            sup: &Supervisor<VecSink>,
+            session: &str,
+            pid: u32,
+            socket: std::path::PathBuf,
+        ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+            let record = crate::cockpit::worker_registry::WorkerRecord::new(
+                session.into(),
+                pid,
+                socket,
+                "claude-agent-acp".into(),
+                "claude-code".into(),
+                std::env::temp_dir(),
+                None,
+                vec![],
+                vec![],
+                Some("acp-test-id".into()),
+                None,
+            );
+            crate::cockpit::worker_registry::save(&record).unwrap();
+            let (client, _tx, saw_delete) =
+                AcpClient::fake_for_test_recording(CockpitSessionId(session.into()));
+            let mut workers = sup.workers.lock().await;
+            workers.insert(
+                session.into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+            saw_delete
+        }
+
+        let sup = Supervisor::new(VecSink::new());
+
+        let keep = register(&sup, "s-keep", dead_pid, tmp.path().join("keep.sock")).await;
+        sup.shutdown("s-keep").await.expect("shutdown ok");
+        assert!(
+            !keep.load(Ordering::SeqCst),
+            "shutdown must NOT send session/delete; the transcript must \
+             stay resumable so the next respawn restores context (#1710)"
+        );
+
+        let purge = register(&sup, "s-del", dead_pid, tmp.path().join("del.sock")).await;
+        sup.shutdown_and_delete("s-del")
+            .await
+            .expect("shutdown_and_delete ok");
+        assert!(
+            purge.load(Ordering::SeqCst),
+            "shutdown_and_delete (permanent removal) must send session/delete"
+        );
+    }
+
     /// Claude profile's `is_clear_command` matches the user's `/clear`
     /// invocation in the shapes the adapter accepts: bare, with flags,
     /// surrounded by whitespace. Anything else falls through so a
@@ -2893,7 +3294,7 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(matches!(
             &frames[0].2,
-            Event::UserPromptSent { text } if text == "/clear"
+            Event::UserPromptSent { text, .. } if text == "/clear"
         ));
         assert!(matches!(&frames[1].2, Event::SessionCleared));
         assert_eq!(frames[1].1, 2, "SessionCleared must use the next seq");
@@ -3056,13 +3457,13 @@ mod tests {
         assert_eq!(*seq, 1);
         assert!(matches!(
             event,
-            Event::UserPromptSent { text } if text == "first prompt"
+            Event::UserPromptSent { text, .. } if text == "first prompt"
         ));
         let (_, seq2, event2) = &frames[1];
         assert_eq!(*seq2, 2);
         assert!(matches!(
             event2,
-            Event::UserPromptSent { text } if text == "second prompt"
+            Event::UserPromptSent { text, .. } if text == "second prompt"
         ));
     }
 
@@ -3206,6 +3607,83 @@ mod tests {
             elapsed < std::time::Duration::from_millis(50),
             "wait_for_worker must wake within 50 ms (= old poll interval), got {elapsed:?}"
         );
+    }
+
+    /// #1748: `begin_resume` must place a `pending_resumes` reservation
+    /// synchronously so a subsequent `wait_for_worker` BLOCKS until the
+    /// worker lands instead of failing fast. This is the core of the
+    /// idle-dormant prompt-wake fix: before it, the prompt handler cleared
+    /// dormancy but started no resume, so `send_prompt`'s `wait_for_worker`
+    /// returned false immediately (no pending entry) and the prompt 404'd.
+    #[tokio::test]
+    async fn begin_resume_reserves_so_wait_for_worker_blocks() {
+        let sink = VecSink::new();
+        let sup = Arc::new(Supervisor::new(sink));
+
+        // Pre-fix shape: no worker and no reservation, so `wait_for_worker`
+        // returns false immediately. This is exactly what made the wake
+        // prompt 404 before the fix.
+        assert!(
+            !sup.wait_for_worker("s-1748", std::time::Duration::from_secs(60))
+                .await,
+            "with no reservation, wait_for_worker must fail fast"
+        );
+        assert!(!sup.is_running("s-1748").await);
+
+        // Reserve synchronously, the way the prompt-wake path now does
+        // before driving the detached spawn.
+        let reservation = match sup
+            .begin_resume("s-1748", ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+        assert!(
+            sup.is_running("s-1748").await,
+            "a reservation must count as running-ish so the reconciler skips it"
+        );
+        assert!(matches!(
+            sup.worker_state("s-1748").await,
+            CockpitWorkerState::Resuming
+        ));
+
+        // A second begin_resume for the same id must not double-reserve.
+        assert!(matches!(
+            sup.begin_resume("s-1748", ResumeKind::Spawn).await.unwrap(),
+            ResumeReservationOutcome::AlreadyPresent
+        ));
+
+        // With the reservation held, `wait_for_worker` BLOCKS: the worker
+        // is mid-resume, so it must not return within a short window.
+        let sup_clone = Arc::clone(&sup);
+        let waiter = tokio::spawn(async move {
+            sup_clone
+                .wait_for_worker("s-1748", std::time::Duration::from_secs(60))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_for_worker must block while the reservation is held"
+        );
+
+        // Dropping the reservation without a worker landing (the spawn
+        // failed) wakes the waiter, which then returns false.
+        drop(reservation);
+        let woke = tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter must wake on reservation drop")
+            .expect("waiter task must not panic");
+        assert!(
+            !woke,
+            "no worker landed, so wait_for_worker returns false after the reservation drops"
+        );
+        assert!(matches!(
+            sup.worker_state("s-1748").await,
+            CockpitWorkerState::Absent
+        ));
     }
 
     /// Regression: `shutdown` arriving while a spawn is mid-handshake
@@ -3456,6 +3934,7 @@ mod tests {
             1,
             &Event::UserPromptSent {
                 text: "hello world".into(),
+                attachments: Vec::new(),
             },
         );
         sink.publish(
@@ -3479,7 +3958,7 @@ mod tests {
         assert_eq!(stored[0].0, 1);
         assert!(matches!(
             stored[0].1,
-            Event::UserPromptSent { ref text } if text == "hello world"
+            Event::UserPromptSent { ref text, .. } if text == "hello world"
         ));
         assert_eq!(stored[1].0, 2);
         assert!(matches!(
@@ -3544,7 +4023,7 @@ mod tests {
         let texts: Vec<String> = stored
             .iter()
             .filter_map(|(_, ev)| match ev {
-                Event::UserPromptSent { text } => Some(text.clone()),
+                Event::UserPromptSent { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();

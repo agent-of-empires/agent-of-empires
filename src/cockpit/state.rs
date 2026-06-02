@@ -374,6 +374,77 @@ pub enum StateError {
     ApprovalAlreadyResolved(Nonce),
 }
 
+/// A single user-authored diff-line review comment, carried verbatim
+/// in `Event::UserDiffCommentsPrompt` so the cockpit transcript can
+/// re-render the rich review card on replay without parsing the
+/// assembled markdown. Field names mirror the frontend `DiffComment`
+/// type (`web/src/components/diff/comments/types.ts`) one-for-one; the
+/// server never interprets these, it only stores and replays them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffComment {
+    pub id: String,
+    /// Workspace member name. Absent for single-repo sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    pub file_path: String,
+    /// `"old"` or `"new"`. Stored as a string so an unrecognised side
+    /// from a future frontend never fails replay of the whole log.
+    pub side: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub body: String,
+    pub captured_snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Which ACP `ContentBlock` an attachment maps to. The string form
+/// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
+/// with the web composer and the prompt-request DTO in `protocol.rs`,
+/// so renaming a variant breaks the build on both sides rather than
+/// silently dropping attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptAttachmentKind {
+    Image,
+    Audio,
+    Resource,
+}
+
+impl PromptAttachmentKind {
+    /// Stable lowercase tag, matching the serde wire form. Used by the
+    /// attachment store to persist the kind as a TEXT column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptAttachmentKind::Image => "image",
+            PromptAttachmentKind::Audio => "audio",
+            PromptAttachmentKind::Resource => "resource",
+        }
+    }
+}
+
+/// Replay-side view of one prompt attachment. Carries metadata only,
+/// never the bytes: the decoded blob lives in the `cockpit_attachments`
+/// table keyed by `(session_id, id)` and is fetched lazily over
+/// `GET /cockpit/attachments/{id}`. Keeping bytes out of the event log
+/// is what stops `event_json` (and every WS replay frame) from bloating
+/// to megabytes per screenshot. See #1000 / #965.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptAttachmentRef {
+    pub id: String,
+    pub kind: PromptAttachmentKind,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Decoded byte length, for the UI to show a size hint without
+    /// fetching the blob.
+    pub size: u64,
+}
+
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
 /// become variants and flow through the same path.
@@ -536,6 +607,17 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
     },
+    /// A cancel was requested for the in-flight turn: aoe sent the ACP
+    /// `session/cancel` notification and armed the escalation watchdog.
+    /// The turn is NOT over yet (no `Stopped`); this lets the UI show a
+    /// "Stopping..." state and reveal a force-stop affordance instead of
+    /// a silent spinner. `escalates_at` is when the watchdog will SIGTERM
+    /// the worker if the agent keeps ignoring the cancel, so the UI can
+    /// show an honest countdown without depending on a local timer for
+    /// correctness. Emitted once per turn on the first cancel. See #1727.
+    CancelRequested {
+        escalates_at: DateTime<Utc>,
+    },
     /// Final stop signal from the agent. Carries an opaque reason string
     /// so the UI can render "completed" / "ended early" / "cancelled".
     Stopped {
@@ -567,6 +649,46 @@ pub enum Event {
     /// every turn collapses into one assistant blob.
     UserPromptSent {
         text: String,
+        /// Attachments the user sent alongside the text (images, audio,
+        /// embedded resources). Metadata only; bytes live in the
+        /// `cockpit_attachments` store. `#[serde(default)]` keeps
+        /// pre-attachment events on disk deserialising as text-only, so
+        /// no migration is needed. See #1000 / #965.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PromptAttachmentRef>,
+    },
+    /// The agent's prompt capabilities, captured from the ACP
+    /// `initialize` response right after the handshake (and re-emitted
+    /// on every connect, since `initialize` runs in both Fresh and
+    /// Resume modes). Persisted + replayed so the web composer can gate
+    /// the attachment button on the current agent without a round-trip,
+    /// and so a reconnecting client reconstructs the gate from history.
+    /// The server prompt handler reads the latest one to reject
+    /// attachments an agent cannot accept. See #1000.
+    PromptCapabilities {
+        image: bool,
+        audio: bool,
+        embedded_context: bool,
+    },
+    /// Echo of a "Send diff comments" submission, published by the
+    /// `POST /cockpit/prompt/diff-comments` handler before
+    /// `assembled_markdown` is forwarded to the agent. The agent only
+    /// ever sees `assembled_markdown` (no sentinel); the structured
+    /// fields exist so the cockpit transcript re-renders the rich
+    /// `DiffCommentsUserCard` on replay without parsing the markdown.
+    /// `intro`/`outro` are the effective values the user approved in the
+    /// dialog (trimmed intro, defaulted outro), so replay matches what
+    /// the agent received. Replaces the legacy
+    /// `<!-- aoe:diff-comments:v1 ... -->` sentinel carried inside an
+    /// ordinary `UserPromptSent`; older persisted sentinel events keep
+    /// rendering via the frontend decode fallback.
+    #[serde(rename_all = "camelCase")]
+    UserDiffCommentsPrompt {
+        intro: String,
+        outro: String,
+        is_multi_repo: bool,
+        comments: Vec<DiffComment>,
+        assembled_markdown: String,
     },
     /// A user prompt arrived at the daemon while another `session/prompt`
     /// was still in flight. The daemon refused to forward it (claude-agent-acp
@@ -757,12 +879,26 @@ impl CockpitState {
             // made progress.
             Event::RawAgentUpdate { .. } => {}
             Event::AgentMessageChunk { .. } => {}
+            // No in-memory mutation: the turn is still active (turnActive
+            // stays true until a real `Stopped`). The reducer/UI derive the
+            // "Stopping..." state from the broadcast/replayed event. Bumps
+            // seq so the WS replay surfaces it to live clients. See #1727.
+            Event::CancelRequested { .. } => {}
             Event::Stopped { .. } => {}
             Event::AgentStartupError { .. } => {}
             Event::IncompatibleAgent { detail } => {
                 self.startup_error = Some(detail);
             }
             Event::UserPromptSent { .. } => {}
+            // Like UserPromptSent, the diff-comments prompt doesn't mutate
+            // persistent CockpitState; it bumps seq so the replay buffer
+            // and on-disk store capture the user's side of the turn.
+            Event::UserDiffCommentsPrompt { .. } => {}
+            // Surfaced to the web composer via replay and read by the
+            // server prompt handler from the event store; no persistent
+            // CockpitState field consumes it, so this arm only bumps
+            // seq/updated_at like the streaming events above.
+            Event::PromptCapabilities { .. } => {}
             Event::AcpSessionAssigned { .. } => {
                 // A fresh agent that passed the compatibility check
                 // has come online; heal any sticky startup error so a

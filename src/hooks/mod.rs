@@ -27,6 +27,20 @@ pub(crate) const HOOK_STATUS_BASE: &str = "/tmp/aoe-hooks";
 /// Any hook command containing this string is considered ours.
 const AOE_HOOK_MARKER: &str = "aoe-hooks";
 
+/// Where an agent's settings file lives. Determines which shell command
+/// `hook_command_session_id` emits.
+///
+/// `Host`: emits a call to the `aoe __extract-session-id` Rust subcommand.
+/// `Sandbox`: emits a POSIX shell pipeline because `aoe` is not installed
+/// inside the sandbox image. The pipeline keeps a known schema-ordering
+/// quirk: a textually-earlier nested `session_id` wins over the top-level
+/// one, accepted because Claude does not emit such payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookInstallTarget {
+    Host,
+    Sandbox,
+}
+
 /// Resolve the host Codex config path.
 ///
 /// Codex treats `CODEX_HOME` as the directory containing `config.toml`, falling
@@ -95,26 +109,33 @@ fn hook_command_with_base(status: &str, base: &str) -> String {
 /// Build the shell command for a hook that extracts `session_id` from the
 /// agent's stdin JSON payload and writes it to a sidecar file.
 ///
-/// **Schema requirement**: the payload's top-level `session_id` must
-/// appear textually before any nested object that uses the same key. If
-/// the inner copy is emitted first, `head -1` captures the wrong UUID.
+/// Both variants must exit 0 even on failure: a non-zero hook blocks the
+/// agent's tool calls. The trailing `# AOE_HOOK_MARKER` on the host
+/// variant is load-bearing: `is_aoe_hook_command` recognises AoE hooks by
+/// substring; the sandbox variant gets the marker via its baked-in
+/// `HOOK_STATUS_BASE` path.
 ///
-/// The pipeline:
-///   1. `tr -d '\n'` collapses pretty-printed multi-line JSON onto a
-///      single line so the line-oriented `grep` can match `"session_id"
-///      :"<UUID>"` even when key/value are split across lines.
-///   2. `grep -oE` matches `[{,] "session_id":"<UUID>"`. The leading
-///      `[{,]` anchors the field to a JSON-structural boundary so a user
-///      prompt containing the literal substring `"session_id":"<uuid>"`
-///      cannot be captured (a JSON serializer escapes inner quotes as
-///      `\"`, breaking the structural prefix). `[0-9a-fA-F]` accepts
-///      either case for parity with `Uuid::parse_str`.
-///   3. `head -1` keeps the first match.
-///   4. The second `grep -oE` strips the framing, leaving the bare UUID.
-///   5. `printf > $D/.session_id.$$.tmp && mv ... $D/session_id`:
-///      PID-suffixed tempfile + atomic POSIX `rename(2)` makes concurrent
-///      hook invocations race-free.
-fn hook_command_session_id(base: &str) -> String {
+/// Host-variant silent-failure modes (acceptable, equivalent to a regex
+/// miss in the sandbox variant): `aoe` not on PATH at hook-exec time, or
+/// a stale `aoe` on PATH that predates `__extract-session-id`. Both yield
+/// no sidecar without surfacing an error; session resume falls back to
+/// the filesystem scan.
+fn hook_command_session_id(target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => hook_command_session_id_host(),
+        HookInstallTarget::Sandbox => hook_command_session_id_sandbox(HOOK_STATUS_BASE),
+    }
+}
+
+fn hook_command_session_id_host() -> String {
+    format!(
+        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+         command -v aoe >/dev/null 2>&1 || exit 0; \
+         aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+    )
+}
+
+fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          D={base}/$AOE_INSTANCE_ID; mkdir -p \"$D\" 2>/dev/null; \
@@ -139,12 +160,12 @@ fn is_aoe_hook_command(cmd: &str) -> bool {
 ///
 /// An event with both produces two `hooks` array entries under the same
 /// matcher block. An event with neither is skipped.
-fn build_aoe_hooks(events: &[crate::agents::HookEvent]) -> Value {
+fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
     let mut hooks_obj = serde_json::Map::new();
     for event in events {
         let mut commands: Vec<String> = Vec::new();
         if event.session_id_capture {
-            commands.push(hook_command_session_id(HOOK_STATUS_BASE));
+            commands.push(hook_command_session_id(target));
         }
         if let Some(status) = event.status {
             commands.push(hook_command(status));
@@ -197,7 +218,11 @@ fn remove_aoe_entries(matchers: &mut Vec<Value>) {
 /// any user-defined hooks. Existing AoE hooks are replaced (idempotent).
 ///
 /// If the file doesn't exist, it will be created with just the hooks.
-pub fn install_hooks(settings_path: &Path, events: &[crate::agents::HookEvent]) -> Result<()> {
+pub fn install_hooks(
+    settings_path: &Path,
+    events: &[crate::agents::HookEvent],
+    target: HookInstallTarget,
+) -> Result<()> {
     let mut settings: Value = if settings_path.exists() {
         let content = std::fs::read_to_string(settings_path)?;
         serde_json::from_str(&content).unwrap_or_else(|e| {
@@ -208,7 +233,7 @@ pub fn install_hooks(settings_path: &Path, events: &[crate::agents::HookEvent]) 
         serde_json::json!({})
     };
 
-    let aoe_hooks = build_aoe_hooks(events);
+    let aoe_hooks = build_aoe_hooks(events, target);
 
     if !settings.get("hooks").is_some_and(|h| h.is_object()) {
         settings
@@ -1345,7 +1370,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let settings_path = tmp.path().join(".claude").join("settings.json");
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1379,7 +1404,7 @@ mod tests {
         )
         .unwrap();
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1403,8 +1428,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let settings_path = tmp.path().join("settings.json");
 
-        install_hooks(&settings_path, claude_events()).unwrap();
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1430,7 +1455,7 @@ mod tests {
         )
         .unwrap();
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1921,7 +1946,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_notification_hook_has_matcher() {
-        let hooks = build_aoe_hooks(claude_events());
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         let notification = hooks["Notification"].as_array().unwrap();
         assert_eq!(notification.len(), 1);
         let matcher = notification[0]["matcher"].as_str().unwrap();
@@ -1932,7 +1957,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_stop_hook_writes_idle() {
-        let hooks = build_aoe_hooks(claude_events());
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         let stop = hooks["Stop"].as_array().unwrap();
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(
@@ -1944,7 +1969,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_elicitation_result_hook_writes_running() {
-        let hooks = build_aoe_hooks(claude_events());
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         let er = hooks["ElicitationResult"].as_array().unwrap();
         assert_eq!(er.len(), 1);
         let cmd = er[0]["hooks"][0]["command"].as_str().unwrap();
@@ -1957,7 +1982,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_hooks_are_synchronous() {
-        let hooks = build_aoe_hooks(claude_events());
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         for (_, matchers) in hooks.as_object().unwrap() {
             for matcher in matchers.as_array().unwrap() {
                 for hook in matcher["hooks"].as_array().unwrap() {
@@ -1976,7 +2001,7 @@ command = "echo user-hook"
         let tmp = TempDir::new().unwrap();
         let settings_path = tmp.path().join("settings.json");
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -2016,7 +2041,7 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
         let modified = uninstall_hooks(&settings_path).unwrap();
         assert!(modified);
 
@@ -2099,7 +2124,7 @@ command = "echo user-hook"
         )
         .unwrap();
 
-        install_hooks(&settings_path, claude_events()).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -2566,7 +2591,7 @@ hooks_auto_accept: false
     }
 
     fn run_session_id_hook(payload: &str, instance_id: &str, base: &Path) -> std::process::Output {
-        let cmd = hook_command_session_id(base.to_str().unwrap());
+        let cmd = hook_command_session_id_sandbox(base.to_str().unwrap());
         let mut child = std::process::Command::new("sh")
             .args(["-c", &cmd])
             .env("AOE_INSTANCE_ID", instance_id)
@@ -2613,27 +2638,24 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_hook_command_session_id_locks_top_level_first_contract() {
-        // The grep regex `[{,]"session_id":"<UUID>"` cannot distinguish a
-        // nested object literal from the top-level field: a nested copy
-        // emitted textually before the top-level one is captured by
-        // `head -1`. This test pins the resulting behavior so any drift in
-        // the upstream payload schema (or in the extractor) shows up as a
-        // test failure rather than as silent wrong-UUID capture.
+    fn test_hook_command_session_id_sandbox_pins_nested_first_quirk() {
         let tmp = TempDir::new().unwrap();
         let nested = "11111111-2222-3333-4444-555555555555";
         let top_level = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let payload =
             format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top_level}"}}"#);
-        let output = run_session_id_hook(&payload, "nested_first", tmp.path());
+        let output = run_session_id_hook(&payload, "sandbox_nested_first", tmp.path());
         assert!(output.status.success());
-        let written = std::fs::read_to_string(tmp.path().join("nested_first").join("session_id"))
-            .expect("sidecar file");
+        let written =
+            std::fs::read_to_string(tmp.path().join("sandbox_nested_first").join("session_id"))
+                .expect("sidecar file");
         assert_eq!(
             written, nested,
-            "current extractor returns the nested UUID; replace with a JSON-aware \
-             parser if Claude ever emits a payload where a nested `session_id` \
-             precedes the top-level field"
+            "the sandbox shell pipeline's `[{{,]` regex anchor cannot \
+             distinguish a nested object literal from the top-level field; \
+             a textually-earlier nested `session_id` wins. The host variant \
+             fixes this via `serde_json`. Documented limitation; pinned so \
+             a regex tweak does not silently change ordering semantics."
         );
     }
 
@@ -2672,19 +2694,47 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_hook_command_session_id_uses_pid_suffixed_tempfile() {
-        let cmd = hook_command_session_id("/tmp/aoe-hooks");
+    fn test_hook_command_session_id_host_invokes_aoe_subcommand() {
+        let cmd = hook_command_session_id(HookInstallTarget::Host);
         assert!(
-            cmd.contains(".session_id.$$.tmp"),
-            "expected PID-suffixed tempfile in command, got: {cmd}"
+            cmd.contains("aoe __extract-session-id"),
+            "host hook should invoke the Rust subcommand, got: {cmd}"
         );
-        assert!(cmd.contains("mv"));
+        assert!(
+            cmd.contains("command -v aoe"),
+            "host hook should guard on `aoe` being on PATH, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(AOE_HOOK_MARKER),
+            "host hook must carry the AoE marker so uninstall can find it, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("grep -oE"),
+            "host hook must not use the legacy GNU/BSD grep pipeline, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_hook_command_session_id_sandbox_keeps_shell_pipeline() {
+        let cmd = hook_command_session_id(HookInstallTarget::Sandbox);
+        assert!(
+            cmd.contains("grep -oE"),
+            "sandbox hook must keep the POSIX pipeline since `aoe` is not in the image, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("aoe __extract-session-id"),
+            "sandbox hook must not invoke the Rust subcommand, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(AOE_HOOK_MARKER),
+            "sandbox hook must carry the AoE marker, got: {cmd}"
+        );
     }
 
     #[test]
     fn test_build_aoe_hooks_emits_session_id_capture_for_session_start() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events);
+        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
         let session_start = hooks
             .get("SessionStart")
             .expect("SessionStart matcher block")
@@ -2701,7 +2751,7 @@ hooks_auto_accept: false
     #[test]
     fn test_build_aoe_hooks_emits_both_for_user_prompt_submit() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events);
+        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
         let user_prompt = hooks
             .get("UserPromptSubmit")
             .expect("UserPromptSubmit matcher block")
@@ -2724,7 +2774,7 @@ hooks_auto_accept: false
     #[test]
     fn test_build_aoe_hooks_status_only_events_unchanged() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events);
+        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
         for event_name in &["PreToolUse", "Stop", "Notification", "ElicitationResult"] {
             let block = hooks
                 .get(*event_name)

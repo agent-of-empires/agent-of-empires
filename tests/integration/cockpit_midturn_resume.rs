@@ -88,6 +88,51 @@ async fn spawn_shim_socket_bridge() -> (PathBuf, tempfile::TempDir) {
     spawn_shim_socket_bridge_with_preseed(None).await
 }
 
+/// Variant for the watchdog-disarm test: preseeds `session_id` AND tells
+/// the shim to emit one unsolicited `agent_message_chunk` after
+/// `emit_delay_ms`, then stay silent. Mimics a still-alive runner
+/// forwarding a single mid-turn notification right after reattach.
+async fn spawn_shim_socket_bridge_emitting_unsolicited(
+    session_id: &str,
+    emit_delay_ms: u64,
+) -> (PathBuf, tempfile::TempDir) {
+    let shim = shim_path();
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("runner.sock");
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&shim);
+    cmd.env("SHIM_PRESEED_SESSION_ID", session_id);
+    cmd.env("SHIM_EMIT_UNSOLICITED_NOTIF", emit_delay_ms.to_string());
+    let mut shim_proc = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn shim");
+    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
+    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
+
+    let listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+    tokio::spawn(async move {
+        let _shim_proc = shim_proc;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let (mut sock_read, mut sock_write) = stream.into_split();
+        let mut shim_in = shim_stdin;
+        let mut shim_out = shim_stdout;
+        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
+        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
+        let _ = tokio::join!(to_shim, from_shim);
+    });
+
+    (socket_path, temp)
+}
+
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
@@ -101,6 +146,7 @@ async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> 
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -139,6 +185,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn attach_idle_session_does_not_synthesize_stopped() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -170,6 +217,53 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
     assert!(
         stopped.is_none(),
         "watchdog must stay disarmed when in_flight_turn=false; got Stopped reason={stopped:?}"
+    );
+}
+
+/// #1216: once the runner forwards any notification after reattach, the
+/// in-flight turn is observable, so normal mid-turn silence (Task
+/// subagents, slow Bash, reasoning gaps) must NOT trip the watchdog. The
+/// shim emits one unsolicited chunk early, then goes silent well past
+/// the grace; the watchdog must disarm on that first notification rather
+/// than synthesize a spurious `reattach_idle` Stopped.
+#[tokio::test]
+#[serial_test::serial]
+async fn attach_in_flight_disarms_after_first_inbound_notification() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    // Grace 800ms; the shim emits its single chunk at 200ms. Without the
+    // disarm-on-first-event fix the watchdog would fire ~800ms after that
+    // chunk (around t=1s); we drain for 2.5s to catch it. With the fix it
+    // disarms on the chunk and never fires.
+    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "800");
+
+    let session_id = "test-acp-session-id";
+    let (socket_path, _tmp) = spawn_shim_socket_bridge_emitting_unsolicited(session_id, 200).await;
+
+    let mut client = AcpClient::attach(
+        socket_path,
+        std::env::temp_dir(),
+        vec![],
+        session_id.into(),
+        true, // in_flight_turn
+        CockpitSessionId("midturn-disarm".into()),
+        None,
+        "claude".into(),
+        None,
+    )
+    .await
+    .expect("attach in_flight=true");
+
+    let stopped =
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(2500)).await;
+    let _ = client.shutdown().await;
+
+    assert!(
+        stopped.is_none(),
+        "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
     );
 }
 
@@ -208,7 +302,7 @@ async fn socket_transport_round_trips_prompt_via_attach() {
     .expect("attach to bridge");
 
     client
-        .send_prompt("hello over socket")
+        .send_prompt("hello over socket", &[])
         .await
         .expect("send_prompt");
 

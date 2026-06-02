@@ -31,13 +31,14 @@ import {
   useExternalStoreRuntime,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useCockpit } from "../../hooks/useCockpit";
 import type {
   ActivityRow,
   ApprovalDecision,
   CockpitState,
+  PromptAttachmentInput,
   ToolCall,
 } from "../../lib/cockpitTypes";
 
@@ -81,7 +82,18 @@ export interface CockpitContext {
     nonce: string,
     decision: ApprovalDecision,
   ) => Promise<void>;
-  sendPrompt: (text: string) => Promise<void>;
+  sendPrompt: (
+    text: string,
+    attachments?: PromptAttachmentInput[],
+  ) => Promise<void>;
+  /** Attachments the composer has staged for the next send. Owned here
+   *  (above the assistant-ui runtime) so `onNew` can attach them when
+   *  the user submits via Enter / the assistant-ui Send path, and the
+   *  composer can render + clear them. See #1000 / #965. */
+  pendingAttachments: PromptAttachmentInput[];
+  setPendingAttachments: React.Dispatch<
+    React.SetStateAction<PromptAttachmentInput[]>
+  >;
   forceEndTurn: () => Promise<void>;
   lastActivityRef: ReturnType<typeof useCockpit>["lastActivityRef"];
   dismissError: () => void;
@@ -110,6 +122,16 @@ export function CockpitRuntime({
   children,
 }: Props) {
   const cockpit = useCockpit(sessionId, cockpitWorkerState, archivedAt, snoozedUntil);
+  // Staged attachments for the next prompt. A ref mirror keeps `onNew`
+  // (recreated each render by useExternalStoreRuntime) reading the
+  // latest value without going stale. See #1000 / #965.
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PromptAttachmentInput[]
+  >([]);
+  const pendingAttachmentsRef = useRef<PromptAttachmentInput[]>([]);
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the entire activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
@@ -131,19 +153,32 @@ export function CockpitRuntime({
     isRunning: cockpit.state.turnActive,
     convertMessage: (m) => m,
     onNew: async (msg) => {
-      // assistant-ui hands us an AppendMessage with mixed parts. The
-      // cockpit only accepts plain text prompts today, so flatten any
-      // text parts into a single string. Attachments / images are not
-      // supported by ACP yet.
+      // assistant-ui hands us an AppendMessage with mixed parts. Flatten
+      // text parts into one string; the composer stages attachments
+      // separately (assistant-ui's own attachment system is unused), so
+      // pull them from the pending ref and clear it on send. See #1000.
       const text = msg.content
         .map((c) => (c.type === "text" ? c.text : ""))
         .join("")
         .trim();
-      if (!text) return;
-      await cockpit.sendPrompt(text);
+      const attachments = [...pendingAttachmentsRef.current];
+      if (!text && attachments.length === 0) return;
+      // Clear staged attachments only after the send resolves, so a
+      // failed send keeps them staged for retry instead of dropping them.
+      await cockpit.sendPrompt(text, attachments);
+      setPendingAttachments([]);
     },
     onCancel: async () => {
-      await cockpit.cancelPrompt();
+      // First Stop sends a graceful cancel. If a cancel is already in
+      // flight (the agent is ignoring session/cancel on a stuck loop),
+      // a second Stop escalates to a force-stop instead of resending a
+      // no-op notification, so the user's instinct to click again
+      // actually ends the turn. See #1727.
+      if (cockpit.state.cancelling) {
+        await cockpit.forceEndTurn();
+      } else {
+        await cockpit.cancelPrompt();
+      }
     },
   });
 
@@ -160,6 +195,8 @@ export function CockpitRuntime({
         manualReconnect: cockpit.manualReconnect,
         resolveApproval: cockpit.resolveApproval,
         sendPrompt: cockpit.sendPrompt,
+        pendingAttachments,
+        setPendingAttachments,
         forceEndTurn: cockpit.forceEndTurn,
         lastActivityRef: cockpit.lastActivityRef,
         dismissError: cockpit.dismissError,
@@ -238,10 +275,44 @@ export function activityToThreadMessages(
     }
     if (row.kind === "user_prompt") {
       flushAssistant();
+      // `ThreadMessageLike["content"]` is a readonly array, so build the
+      // parts via spreads rather than push. Images become image parts;
+      // audio / embedded resources have no inline player here yet, so
+      // surface them as a labelled chip line.
+      const parts = [
+        ...(row.text ? [{ type: "text" as const, text: row.text }] : []),
+        ...(row.attachments ?? []).map((att) =>
+          att.kind === "image"
+            ? { type: "image" as const, image: att.url }
+            : {
+                type: "text" as const,
+                text: `📎 ${att.name ?? att.kind} (${att.mimeType})`,
+              },
+        ),
+      ];
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: parts.length > 0 ? parts : [{ type: "text", text: "" }],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
+    if (row.kind === "user_diff_comments") {
+      // A typed diff-comments prompt. The assembled markdown is the
+      // user-visible / agent body (and the fallback if the card can't
+      // render); the structured payload rides on the message metadata
+      // so UserText can render the rich DiffCommentsUserCard without
+      // parsing any sentinel. See #1123.
+      flushAssistant();
       messages.push({
         id: row.id,
         role: "user",
         content: [{ type: "text", text: row.text }],
+        metadata: row.diffComments
+          ? { custom: { diffComments: row.diffComments } }
+          : undefined,
         createdAt: parseDate(row.at),
       });
       continue;

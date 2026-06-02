@@ -104,6 +104,13 @@ pub struct SessionResponse {
     /// cockpit view. See #1088.
     #[cfg(feature = "serve")]
     pub cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
+    /// True when this session's agent can run in cockpit: a built-in
+    /// with an ACP adapter, or a custom agent whose profile config
+    /// declares a valid `agent_cockpit_cmd`. The web terminal view reads
+    /// this to decide whether the "switch to cockpit" affordance is
+    /// available, replacing the hardcoded client-side tool list.
+    #[cfg(feature = "serve")]
+    pub acp_capable: bool,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -255,6 +262,19 @@ impl SessionResponse {
             cockpit_mode: inst.cockpit_mode,
             #[cfg(feature = "serve")]
             cockpit_worker_state,
+            // Built-in ACP capability is resolved here from a process-wide
+            // registry (cheap, no IO). Custom agents depend on profile
+            // config; the list and create handlers overlay that without a
+            // per-row config read.
+            #[cfg(feature = "serve")]
+            acp_capable: {
+                let resolved = inst
+                    .cockpit_agent
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str());
+                builtin_acp_registry().get(resolved).is_some()
+            },
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -321,6 +341,28 @@ pub struct SessionsEnvelope {
     pub workspace_ordering: Vec<String>,
 }
 
+/// Process-wide built-in ACP registry, built once. Used to compute
+/// `SessionResponse.acp_capable` for built-in agents without allocating
+/// a registry per response row.
+#[cfg(feature = "serve")]
+fn builtin_acp_registry() -> &'static crate::cockpit::AgentRegistry {
+    static REG: std::sync::OnceLock<crate::cockpit::AgentRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::cockpit::AgentRegistry::with_defaults)
+}
+
+/// True iff this custom agent declares a valid `agent_cockpit_cmd` in the
+/// given profile-resolved map. Built-in capability is handled separately
+/// in the constructor, so this only covers the custom case.
+#[cfg(feature = "serve")]
+fn custom_agent_acp_capable(
+    agent_cockpit_cmd: &std::collections::HashMap<String, String>,
+    tool: &str,
+) -> bool {
+    agent_cockpit_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(tool, cmd).is_ok())
+}
+
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -363,6 +405,32 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             )
         })
         .collect();
+
+    // Overlay custom-agent ACP capability (built-ins were resolved in the
+    // constructor). Cache by (profile, project_path) since repo-local
+    // config can override agent_cockpit_cmd, so each distinct pair is
+    // resolved at most once.
+    #[cfg(feature = "serve")]
+    {
+        use std::collections::HashMap;
+        let mut cockpit_cmd_cache: HashMap<(String, String), HashMap<String, String>> =
+            HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            if resp.acp_capable {
+                continue;
+            }
+            let key = (inst.source_profile.clone(), inst.project_path.clone());
+            let map = cockpit_cmd_cache.entry(key).or_insert_with(|| {
+                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &inst.source_profile,
+                    std::path::Path::new(&inst.project_path),
+                )
+                .session
+                .agent_cockpit_cmd
+            });
+            resp.acp_capable = custom_agent_acp_capable(map, &inst.tool);
+        }
+    }
 
     // Resolve per-profile cleanup defaults with a TTL cache on AppState
     let cache = {
@@ -735,6 +803,74 @@ where
     })
 }
 
+/// Persist a session mutation to its profile store before touching memory.
+///
+/// Opens `Storage` for `profile` and runs `mutate` inside the storage
+/// `update` transaction on a blocking thread, collapsing all three failure
+/// modes (store open, write, join) into `Err(())` after logging with
+/// `label`. Callers MUST treat `Err` as HTTP 500 and leave the in-memory
+/// instance untouched: persisting first is what keeps disk and memory from
+/// diverging when a write fails, and stops the archive/snooze side effects
+/// from firing on a write that never landed. See #1589.
+async fn persist_session_update<F>(
+    profile: String,
+    label: &'static str,
+    mutate: F,
+) -> Result<(), ()>
+where
+    F: FnOnce(&mut Vec<Instance>) + Send + 'static,
+{
+    let storage = match Storage::new(&profile) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Failed to open storage for {label}: {e}"
+            );
+            return Err(());
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        storage.update(|instances, _groups| {
+            mutate(instances);
+            Ok(())
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Failed to persist {label}: {e}"
+            );
+            Err(())
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Persist join failed for {label}: {e}"
+            );
+            Err(())
+        }
+    }
+}
+
+/// 500 response returned whenever `persist_session_update` reports failure.
+/// The body shape (`error` + `message`) matches the other JSON error
+/// responses in this module so the dashboard's `!res.ok` handling reads the
+/// same keys it already does elsewhere.
+fn persist_failed_response() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "persist_failed",
+            "message": "Failed to persist session update"
+        })),
+    )
+        .into_response()
+}
+
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -753,15 +889,6 @@ pub async fn update_session_notifications(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        )
-            .into_response();
-    };
-
     // Apply each field independently. `Unset` leaves the stored value
     // alone; `Clear` sets it to None (inherit default); `Set(v)` writes
     // an explicit override.
@@ -772,44 +899,57 @@ pub async fn update_session_notifications(
             Tristate::Set(v) => *target = Some(v),
         }
     }
-    apply(&mut inst.notify_on_waiting, body.notify_on_waiting);
-    apply(&mut inst.notify_on_idle, body.notify_on_idle);
-    apply(&mut inst.notify_on_error, body.notify_on_error);
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    let waiting = body.notify_on_waiting;
+    let idle = body.notify_on_idle;
+    let error = body.notify_on_error;
+
+    // Persist first; only mutate memory once disk is durable so a write
+    // failure leaves the two in agreement. See #1589.
+    let persist_id = id.clone();
+    if persist_session_update(profile, "notification update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            apply(&mut inst.notify_on_waiting, waiting);
+            apply(&mut inst.notify_on_idle, idle);
+            apply(&mut inst.notify_on_error, error);
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "notification update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    apply(&mut inst.notify_on_waiting, waiting);
+    apply(&mut inst.notify_on_idle, idle);
+    apply(&mut inst.notify_on_error, error);
 
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
-
-    if let Ok(storage) = Storage::new(&profile) {
-        let id_clone = id.clone();
-        let waiting = body.notify_on_waiting;
-        let idle = body.notify_on_idle;
-        let error = body.notify_on_error;
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply(&mut inst.notify_on_waiting, waiting);
-                    apply(&mut inst.notify_on_idle, idle);
-                    apply(&mut inst.notify_on_error, error);
-                }
-                Ok(())
-            })
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(
-                target: "http.api.sessions",
-                "Failed to save after notification update: {e}"
-            ),
-            Err(e) => tracing::error!(
-                target: "http.api.sessions",
-                "Notification persist join failed: {e}"
-            ),
-        }
-    }
-
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -850,57 +990,55 @@ pub async fn update_session_diff_base(
         Err(rej) => return rej.into_response(),
     };
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        )
-            .into_response();
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
     };
 
-    inst.base_branch_override = body
+    let new_override = body
         .base_branch
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
-
-    if let Ok(storage) = Storage::new(&profile) {
-        let id_clone = id.clone();
-        let new_override = body
-            .base_branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string);
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    inst.base_branch_override = new_override;
-                }
-                Ok(())
-            })
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(
-                target: "http.api.sessions",
-                "Failed to save after diff-base update: {e}"
-            ),
-            Err(e) => tracing::error!(
-                target: "http.api.sessions",
-                "Diff-base persist join failed: {e}"
-            ),
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_override = new_override.clone();
+    if persist_session_update(profile, "diff-base update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            inst.base_branch_override = persist_override;
         }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
     }
 
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "diff-base update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    inst.base_branch_override = new_override;
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -969,16 +1107,47 @@ pub async fn update_session_pin(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        )
-            .into_response();
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
     };
 
-    if body.pinned {
+    let pinned = body.pinned;
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    if persist_session_update(profile, "pin update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            if pinned {
+                inst.pin();
+            } else {
+                inst.unpin();
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "pin update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    if pinned {
         inst.pin();
     } else {
         inst.unpin();
@@ -986,38 +1155,6 @@ pub async fn update_session_pin(
 
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    let pinned = body.pinned;
-    drop(instances);
-
-    if let Ok(storage) = Storage::new(&profile) {
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    if pinned {
-                        inst.pin();
-                    } else {
-                        inst.unpin();
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(
-                target: "http.api.sessions",
-                "Failed to save after pin update: {e}"
-            ),
-            Err(e) => tracing::error!(
-                target: "http.api.sessions",
-                "Pin persist join failed: {e}"
-            ),
-        }
-    }
-
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -1044,22 +1181,53 @@ pub async fn update_session_archive(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    // Snapshot what we need for side effects (kill pane / cockpit
-    // shutdown) before we drop the write lock. Clone the instance once
-    // so we can call its `kill()` method outside the lock without
-    // re-borrowing. The outer tuple also carries `kill_pane` so the
-    // tmux branch below can gate the pane teardown without re-reading
-    // the body; cockpit shutdown is unconditional on archive=true.
-    let (was_cockpit_mode, inst_clone, kill_pane) = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+    // Read the profile without mutating memory yet. Persisting first means
+    // a storage failure returns 500 with disk and memory still in
+    // agreement, and the tmux/cockpit teardown below never fires on a write
+    // that did not land. See #1589.
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "message": "Session not found" })),
             )
                 .into_response();
         };
-        if body.archived {
+        inst.source_profile.clone()
+    };
+
+    let archived = body.archived;
+    let persist_id = id.clone();
+    if persist_session_update(profile, "archive update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            if archived {
+                inst.archive();
+            } else {
+                inst.unarchive();
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    // Disk is durable; apply to memory and snapshot what the side effects
+    // need. Clone the instance once so we can call its `kill()` method
+    // outside the lock without re-borrowing.
+    let (was_cockpit_mode, inst_clone, kill_pane) = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "archive update: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        if archived {
             inst.archive();
         } else {
             inst.unarchive();
@@ -1076,40 +1244,7 @@ pub async fn update_session_archive(
             cockpit = false;
         }
         let inst_snap = inst.clone();
-        // Persist now while we hold the per-instance lock; the side
-        // effects below are best-effort and should not block other
-        // mutations on this session.
-        let profile = inst.source_profile.clone();
-        let archived = body.archived;
         drop(instances);
-
-        if let Ok(storage) = Storage::new(&profile) {
-            let id_clone = id.clone();
-            match tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        if archived {
-                            inst.archive();
-                        } else {
-                            inst.unarchive();
-                        }
-                    }
-                    Ok(())
-                })
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!(
-                    target: "http.api.sessions",
-                    "Failed to save after archive update: {e}"
-                ),
-                Err(e) => tracing::error!(
-                    target: "http.api.sessions",
-                    "Archive persist join failed: {e}"
-                ),
-            }
-        }
 
         // Stash the cockpit flag + clone + response and break out to do
         // the side effects below. Return early on the non-archive path
@@ -1117,7 +1252,7 @@ pub async fn update_session_archive(
         // is NOT a short-circuit because cockpit shutdown still has to
         // run for cockpit-mode sessions (kill_pane is a tmux-only
         // switch, per the request-body documentation).
-        if !body.archived {
+        if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
         (cockpit, inst_snap, body.kill_pane)
@@ -1150,7 +1285,9 @@ pub async fn update_session_archive(
         // reconciler does not race to respawn it. The reconciler also
         // skips archived sessions (see cockpit_reconciler.rs), but
         // shutting down here gives an immediate teardown rather than
-        // waiting for the next poll tick.
+        // waiting for the next poll tick. `shutdown` preserves the
+        // agent transcript (no session/delete), so unarchiving resumes
+        // the conversation instead of resetting it (#1710).
         #[cfg(feature = "serve")]
         match state.cockpit_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1221,21 +1358,15 @@ pub async fn update_session_snooze(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let was_cockpit_mode = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+    let (was_cockpit_mode, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "message": "Session not found" })),
             )
                 .into_response();
         };
-
-        match body.minutes {
-            Some(minutes) => inst.snooze(minutes),
-            None => inst.unsnooze(),
-        }
-
         let cockpit;
         #[cfg(feature = "serve")]
         {
@@ -1245,43 +1376,41 @@ pub async fn update_session_snooze(
         {
             cockpit = false;
         }
-        cockpit
+        (cockpit, inst.source_profile.clone())
     };
 
-    let profile = {
-        let instances = state.instances.read().await;
-        instances
-            .iter()
-            .find(|i| i.id == id)
-            .map(|i| i.source_profile.clone())
-            .unwrap_or_default()
-    };
     let minutes = body.minutes;
 
-    if let Ok(storage) = Storage::new(&profile) {
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    match minutes {
-                        Some(m) => inst.snooze(m),
-                        None => inst.unsnooze(),
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(
+    // Persist first; only mutate memory once disk is durable, and only fire
+    // the cockpit teardown below on a write that landed. See #1589.
+    let persist_id = id.clone();
+    if persist_session_update(profile, "snooze update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            match minutes {
+                Some(m) => inst.snooze(m),
+                None => inst.unsnooze(),
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
                 target: "http.api.sessions",
-                "Failed to save after snooze update: {e}"
-            ),
-            Err(e) => tracing::error!(
-                target: "http.api.sessions",
-                "Snooze persist join failed: {e}"
-            ),
+                session = %id,
+                "snooze update: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        match minutes {
+            Some(m) => inst.snooze(m),
+            None => inst.unsnooze(),
         }
     }
 
@@ -1293,6 +1422,9 @@ pub async fn update_session_snooze(
     // worker stays down until the snooze expires; the next reconciler
     // tick after expiry brings it back. Unsnooze just lets the
     // reconciler re-pick the session naturally, no explicit respawn.
+    // `shutdown` preserves the agent transcript (no session/delete), so
+    // that respawn resumes the conversation instead of resetting it
+    // (#1710).
     #[cfg(feature = "serve")]
     if was_cockpit_mode && minutes.is_some() {
         match state.cockpit_supervisor.shutdown(&id).await {
@@ -1392,7 +1524,9 @@ pub async fn delete_session(
     // return UnknownSession, which we ignore.
     #[cfg(feature = "serve")]
     if instance.cockpit_mode {
-        match state.cockpit_supervisor.shutdown(&id).await {
+        // Permanent removal: release the agent's persisted transcript
+        // too, since the session is going away for good. See #1710.
+        match state.cockpit_supervisor.shutdown_and_delete(&id).await {
             Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => {
                 tracing::warn!(
@@ -1877,6 +2011,30 @@ pub async fn create_session(
             instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
             instance.cockpit_agent = body.cockpit_agent;
             instance.cockpit_model = body.cockpit_model;
+            // Don't trust the client's capability decision. Re-resolve
+            // whether this agent can actually run in cockpit; a custom
+            // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
+            // falls back to tmux here rather than erroring at spawn time.
+            if instance.cockpit_mode {
+                let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+                let resolved = instance
+                    .cockpit_agent
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(instance.tool.as_str());
+                let capable = acp_registry.get(resolved).is_some()
+                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
+                        &instance.source_profile,
+                        std::path::Path::new(&instance.project_path),
+                    )
+                    .session
+                    .agent_cockpit_cmd
+                    .get(&instance.tool)
+                    .is_some_and(|cmd| {
+                        crate::cockpit::AgentSpec::from_cockpit_cmd(&instance.tool, cmd).is_ok()
+                    });
+                instance.cockpit_mode = capable;
+            }
         }
 
         // Anything that fails between here and the final `Ok(..)`
@@ -1940,6 +2098,18 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Overlay custom-agent ACP capability so the wizard's redirect
+            // into the new session renders the right substrate immediately.
+            #[cfg(feature = "serve")]
+            if !resp.acp_capable {
+                let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &instance.source_profile,
+                    std::path::Path::new(&instance.project_path),
+                )
+                .session
+                .agent_cockpit_cmd;
+                resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
+            }
             #[cfg(feature = "serve")]
             let cockpit_spawn_target = if instance.cockpit_mode {
                 Some((
@@ -1973,7 +2143,12 @@ pub async fn create_session(
             {
                 let agent = state
                     .cockpit_supervisor
-                    .pick_agent_for_tool(&tool, agent_override.as_deref())
+                    .pick_agent_for_tool(
+                        &tool,
+                        agent_override.as_deref(),
+                        &source_profile,
+                        std::path::Path::new(&project_path),
+                    )
                     .await;
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = state.cockpit_supervisor.clone();
@@ -2005,8 +2180,11 @@ pub async fn create_session(
                             return;
                         }
                     };
-                    let source_profile_for_spawn =
-                        sandbox_info.as_ref().map(|_| source_profile.clone());
+                    // Pass the session profile through regardless of
+                    // sandboxing so the spawn path resolves agent_cockpit_cmd
+                    // and worker env from the right profile for non-sandbox
+                    // sessions too.
+                    let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
                         .spawn(crate::cockpit::supervisor::SpawnRequest {
                             session_id: id.clone(),
@@ -3854,6 +4032,68 @@ mod tests {
         assert_eq!(s.completed, 0);
         assert!(s.current_step_title.is_none());
     }
+
+    // --- persist_session_update (the persist-first contract from #1589) ---
+    //
+    // The five session-mutation PATCH handlers route every write through
+    // this helper and only touch memory after it returns `Ok`, so disk and
+    // memory cannot diverge on a write failure. Full-handler coverage is
+    // impractical (AppState has no test constructor), so these lock the
+    // helper's two guarantees directly: a success durably writes, and every
+    // storage failure surfaces as `Err`.
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_session_update_writes_to_disk() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "persist-success";
+        let storage = Storage::new(profile).unwrap();
+        let seed = make_test_instance();
+        let id = seed.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let persist_id = id.clone();
+        persist_session_update(profile.to_string(), "test", move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.base_branch_override = Some("release/x".to_string());
+            }
+        })
+        .await
+        .expect("persist should succeed");
+
+        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let inst = reloaded.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(
+            inst.base_branch_override.as_deref(),
+            Some("release/x"),
+            "mutation must be durable on disk"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_session_update_surfaces_storage_error() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "persist-failure";
+        // Make `sessions.json` a directory so the store's `read_to_string`
+        // during `update` fails, forcing the write path to error.
+        let dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::create_dir_all(dir.join("sessions.json")).unwrap();
+
+        let result = persist_session_update(profile.to_string(), "test", |_instances| {}).await;
+        assert!(result.is_err(), "a storage failure must surface as Err");
+    }
 }
 
 // ============================================================================
@@ -4286,6 +4526,8 @@ mod workspace_ordering_tests {
             cockpit_mode: false,
             #[cfg(feature = "serve")]
             cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            #[cfg(feature = "serve")]
+            acp_capable: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

@@ -100,6 +100,16 @@ describe("switchCockpitAgent", () => {
     expect(body).toEqual({ target: "codex", model: "opus-4.7" });
   });
 
+  it("includes the reason field only when provided", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      ok({ session_id: "s-1", agent: "claude", before_seq: 0, switch_seq: 1, status: "ok" }),
+    );
+    await switchCockpitAgent("s-1", "claude", null, "manual");
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body).toEqual({ target: "claude", reason: "manual" });
+  });
+
   it("returns null when fetchJson reports a non-2xx", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       new Response("conflict", { status: 409 }),

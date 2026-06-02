@@ -20,6 +20,13 @@ const PAGES_DIR = join(__dirname, "..", "src", "pages");
 const PAGES = [
   // --- Guides (docs/guides/ → pages/guides/) ---
   {
+    source: "docs/guides/shell-completions.md",
+    dest: "guides/shell-completions.md",
+    title: "Shell Completions",
+    description:
+      "Install and refresh tab-completion for the aoe CLI in bash, zsh, fish, PowerShell, and elvish.",
+  },
+  {
     source: "docs/guides/diff-view.md",
     dest: "guides/diff-view.md",
     title: "Diff View",
@@ -62,6 +69,34 @@ const PAGES = [
       "Access your Agent of Empires sessions from your phone via Tailscale Funnel or Cloudflare Tunnel with QR pairing.",
   },
   {
+    source: "docs/guides/web/dashboard.md",
+    dest: "guides/web/dashboard.md",
+    title: "Dashboard & Workspaces",
+    description:
+      "The web dashboard layout: workspace sidebar, status glyphs, the session-creation wizard, command palette, sidebar sort, and triage.",
+  },
+  {
+    source: "docs/guides/web/terminal.md",
+    dest: "guides/web/terminal.md",
+    title: "Terminal View",
+    description:
+      "The browser agent and paired terminals: PTY relay, scrollback, reconnect behavior, WebSocket close codes, and read-only mode.",
+  },
+  {
+    source: "docs/guides/web/diff.md",
+    dest: "guides/web/diff.md",
+    title: "Web Diff View",
+    description:
+      "Review a session's changes from the browser: the flat / tree changed-files list, per-session base override, and inline review comments.",
+  },
+  {
+    source: "docs/guides/web/settings.md",
+    dest: "guides/web/settings.md",
+    title: "Settings & Profiles",
+    description:
+      "The web settings tabs, the profile picker, connected-device tracking, and the step-up elevation gate for persisted config edits.",
+  },
+  {
     source: "docs/guides/worktrees.md",
     dest: "guides/worktrees.md",
     title: "Worktrees Reference",
@@ -95,6 +130,13 @@ const PAGES = [
     title: "Scratch Sessions",
     description:
       "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
+  },
+  {
+    source: "docs/guides/live-mode.md",
+    dest: "guides/live-mode.md",
+    title: "Live Mode",
+    description:
+      "A feels-attached alternative to a full tmux attach: the dashboard stays visible while keystrokes relay to the agent. Covers the Ctrl+B leader menu, the collapsible sidebar, scrolling, and the exit chord.",
   },
 
   // --- Docs pages (docs/ → pages/docs/) ---
@@ -224,6 +266,41 @@ const PAGES = [
       "Per-agent cockpit feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
   },
   {
+    source: "docs/cockpit/setup.md",
+    dest: "docs/cockpit/setup.md",
+    title: "Cockpit Setup",
+    description:
+      "Confirm prerequisites with aoe cockpit doctor, enable cockpit per session or globally, disable it, attach across machines, and drive it from the CLI.",
+  },
+  {
+    source: "docs/cockpit/interface.md",
+    dest: "docs/cockpit/interface.md",
+    title: "Cockpit Interface",
+    description:
+      "The TUI and web cockpit views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
+  },
+  {
+    source: "docs/cockpit/controls.md",
+    dest: "docs/cockpit/controls.md",
+    title: "Cockpit Modes, Approvals & Model Controls",
+    description:
+      "Permission modes, YOLO and bypassPermissions, approval cards and notifications, plus the model and reasoning-effort selectors.",
+  },
+  {
+    source: "docs/cockpit/persistence.md",
+    dest: "docs/cockpit/persistence.md",
+    title: "Cockpit Persistence & Recovery",
+    description:
+      "How cockpit workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
+  },
+  {
+    source: "docs/cockpit/troubleshooting.md",
+    dest: "docs/cockpit/troubleshooting.md",
+    title: "Cockpit Troubleshooting",
+    description:
+      "The cockpit security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
+  },
+  {
     source: "docs/guides/tool-sessions.md",
     dest: "guides/tool-sessions.md",
     title: "Tool Sessions",
@@ -258,19 +335,30 @@ const URL_MAP = {
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/cockpit.md": "/docs/cockpit/",
   "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
+  "docs/cockpit/setup.md": "/docs/cockpit/setup/",
+  "docs/cockpit/interface.md": "/docs/cockpit/interface/",
+  "docs/cockpit/controls.md": "/docs/cockpit/controls/",
+  "docs/cockpit/persistence.md": "/docs/cockpit/persistence/",
+  "docs/cockpit/troubleshooting.md": "/docs/cockpit/troubleshooting/",
   "docs/api.md": "/docs/api/",
   // Guides
+  "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
+  "docs/guides/web/dashboard.md": "/guides/web/dashboard/",
+  "docs/guides/web/terminal.md": "/guides/web/terminal/",
+  "docs/guides/web/diff.md": "/guides/web/diff/",
+  "docs/guides/web/settings.md": "/guides/web/settings/",
   "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
   "docs/guides/worktrees.md": "/guides/worktrees/",
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",
   "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
   "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
+  "docs/guides/live-mode.md": "/guides/live-mode/",
   "docs/guides/tool-sessions.md": "/guides/tool-sessions/",
   "docs/guides/podman.md": "/guides/podman/",
   "docs/guides/apple-containers.md": "/guides/apple-containers/",

@@ -4,9 +4,10 @@ import type { StepDef, StepId } from "../StepIndicator";
 import { getReviewSummary } from "../sessionNames";
 import { useServerDown, OFFLINE_TITLE } from "../../../lib/connectionState";
 import type { AgentInfo } from "../../../lib/types";
+import { isAcpCapable } from "../../../lib/acpCapableTools";
 
-interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; [key: string]: unknown; }
-interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; }
+interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useCockpit: boolean; [key: string]: unknown; }
+interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
@@ -108,7 +109,7 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
   );
 }
 
-export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps }: Props) {
+export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled }: Props) {
   const hasStep = (id: StepId) => steps.some((s) => s.id === id);
   const offline = useServerDown();
   // Scratch sessions intentionally carry no path until the server
@@ -119,6 +120,13 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
   const summary = getReviewSummary(data.title, data.worktreeBranch);
   const selectedAgent = agents.find((agent) => agent.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
+  // Mirror the submit-path computation in SessionWizard.handleSubmit so
+  // the review reflects the substrate the session will actually launch
+  // with, including the per-session opt-out (#1580).
+  const willUseCockpit =
+    cockpitMasterEnabled &&
+    isAcpCapable(data.tool, selectedAgent?.acp_capable) &&
+    data.useCockpit;
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -182,6 +190,9 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
           stepId="agent"
           onJumpTo={onJumpTo}
         />
+        {cockpitMasterEnabled && (
+          <Row label="Interface" value={willUseCockpit ? "Cockpit" : "Terminal"} stepId="agent" onJumpTo={onJumpTo} />
+        )}
         {data.profile && (
           <Row label="Profile" value={data.profileDirty ? `${data.profile} (Custom)` : data.profile} stepId="agent" onJumpTo={onJumpTo} accent />
         )}

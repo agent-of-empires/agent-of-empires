@@ -108,8 +108,35 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             "✓ Updated to v{}. Restart `aoe` to use the new version.",
             info.latest_version
         );
+        println!("{}", completion_refresh_hint());
     } else if matches!(&method, InstallMethod::Homebrew) {
         println!("✓ brew upgrade complete.");
     }
     Ok(())
+}
+
+/// Reminder printed after a successful in-place update. A static completion
+/// file does not refresh itself, so it goes stale once the new binary adds or
+/// renames commands. We deliberately do not rewrite the file: aoe does not
+/// track which paths the user installed completions to, and overwriting files
+/// it does not own (dotfile-managed symlinks, system paths) is unsafe. The
+/// eval-on-startup setup avoids the problem entirely.
+fn completion_refresh_hint() -> &'static str {
+    "  If you use static shell completions, regenerate them so they pick up new\n  \
+     commands, e.g. `aoe completion zsh > ~/.zfunc/_aoe`. Eval-on-startup setups\n  \
+     stay in sync automatically: https://www.agent-of-empires.com/guides/shell-completions/"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completion_refresh_hint;
+
+    #[test]
+    fn hint_points_at_regen_and_eval_alternative() {
+        let hint = completion_refresh_hint();
+        assert!(hint.contains("aoe completion"));
+        assert!(hint.contains("guides/shell-completions"));
+        // Mentions the always-fresh alternative so users can avoid manual refresh.
+        assert!(hint.to_lowercase().contains("eval"));
+    }
 }

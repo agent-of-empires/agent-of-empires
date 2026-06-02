@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ErrorCode;
 use agent_client_protocol::schema::{
-    CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, KillTerminalRequest,
+    AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
+    CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
+    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
@@ -42,13 +43,14 @@ use super::agent_compat::{self, ExpectedAgent};
 use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
+use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
 use super::permissions::build_approval;
 use super::state::{
     AvailableCommand, CockpitSessionId, ConfigOptionCategory, ConfigOptionChoice,
     ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
-    PlanStepStatus, RateLimitInfo, SessionMode, SessionUsage, StartupErrorDetail, ToolCall,
-    UsageCost,
+    PlanStepStatus, PromptAttachmentKind, RateLimitInfo, SessionMode, SessionUsage,
+    StartupErrorDetail, ToolCall, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
 use crate::session::SandboxInfo;
@@ -285,8 +287,14 @@ pub struct SpawnConfig {
 
 /// Commands sent from `AcpClient` methods to the background connection task.
 enum ClientCmd {
-    Prompt(String),
+    /// The fully-built prompt content blocks (text first, then any
+    /// attachments). Built in `send_prompt` so the connection task just
+    /// forwards them to `session/prompt`. See #1000.
+    Prompt(Vec<ContentBlock>),
     Cancel,
+    /// Force-stop now: end the in-flight turn with `user_forced` and let
+    /// the drain task kill the worker process group + respawn. See #1727.
+    ForceStop,
     SetMode(String),
     /// Send `session/set_config_option` for the given (`config_id`,
     /// `value`) pair. The connection task fires the request detached so
@@ -338,13 +346,18 @@ enum ConnectMode {
     },
 }
 
-/// Time without any inbound notification, after a `Resume`-mode attach
-/// with `in_flight_turn = true`, before the watchdog synthesizes a
-/// `Stopped { reason: "reattach_idle" }` event. LLM streams rarely have
-/// intra-turn silence near this duration so the false-positive risk
-/// (UI flips to Idle then back to Streaming on the next chunk) is
-/// bounded.
-const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Time after a `Resume`-mode attach with `in_flight_turn = true`,
+/// during which the runner forwards NO inbound notification, before the
+/// watchdog synthesizes a `Stopped { reason: "reattach_idle" }` event.
+/// The watchdog disarms permanently on the first inbound notification
+/// (see `first_event_after_attach`): once the runner forwards anything,
+/// the turn is observable and later silence is normal mid-turn
+/// reasoning, not an orphan. So this grace only bounds the fully-silent
+/// reattach case (the orphaned `session/prompt` response was lost and
+/// no notification ever arrives). 30s leaves headroom for a slow first
+/// post-attach event (model reasoning before its first chunk) while
+/// still clearing a truly-dead reattach quickly. See #1216.
+const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Grace window between the first `session/cancel` notification (sent
 /// during an in-flight `session/prompt`) and the daemon declaring the
@@ -1125,6 +1138,44 @@ impl AcpClient {
         (client, event_tx)
     }
 
+    /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
+    /// records whether a `session/delete` RPC was issued. The returned
+    /// `AtomicBool` flips to `true` the moment a
+    /// `ClientCmd::DeleteSession` is received, and the consumer answers
+    /// it immediately so the caller's `delete_session` returns without
+    /// waiting on the timeout. Used to assert that reversible teardown
+    /// does NOT delete the agent transcript while permanent removal
+    /// does (#1710).
+    #[cfg(test)]
+    pub fn fake_for_test_recording(
+        session_id: CockpitSessionId,
+    ) -> (
+        Self,
+        mpsc::Sender<Event>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let saw_delete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_delete_task = saw_delete.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let ClientCmd::DeleteSession { respond_to, .. } = cmd {
+                    saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                }
+            }
+        });
+        let client = Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        };
+        (client, event_tx, saw_delete)
+    }
+
     /// Spawn an ACP agent subprocess, run the handshake + create a
     /// session, and start pumping notifications into the inbound channel.
     pub async fn spawn(
@@ -1173,6 +1224,14 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         if let Some(socket_path) = config.socket_path.clone() {
+            // Supersede guard: a fresh spawn overwrites this session's
+            // registry entry, so any runner already registered for it would
+            // be orphaned (its agent's node/SDK children reparent to PID 1
+            // and leak, accumulating across restarts). Reap the prior
+            // runner's whole process group and clear its stale entry/socket
+            // before binding the replacement. No-op when there is no live
+            // prior runner. See #1689.
+            super::worker_registry::terminate(&session_id.0);
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -1453,11 +1512,47 @@ impl AcpClient {
         .await
     }
 
-    /// Send a user message to the agent (ACP `session/prompt`).
-    pub async fn send_prompt(&self, text: &str) -> Result<(), AcpError> {
+    /// Send a user message to the agent (ACP `session/prompt`). The
+    /// `attachments` are mapped to the matching ACP `ContentBlock`
+    /// (`Image` / `Audio` / `Resource`) and appended after the text
+    /// block. Callers are responsible for gating attachment kinds on
+    /// the agent's advertised `prompt_capabilities`; this method does
+    /// not re-check them. See #1000 / #965.
+    pub async fn send_prompt(
+        &self,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), AcpError> {
+        use base64::Engine as _;
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + attachments.len());
+        blocks.push(ContentBlock::Text(TextContent::new(text)));
+        for att in attachments {
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
+            let block = match att.kind {
+                PromptAttachmentKind::Image => {
+                    ContentBlock::Image(ImageContent::new(data_b64, att.mime_type.clone()))
+                }
+                PromptAttachmentKind::Audio => {
+                    ContentBlock::Audio(AudioContent::new(data_b64, att.mime_type.clone()))
+                }
+                PromptAttachmentKind::Resource => {
+                    // Embedded binary resource. ACP requires a uri; the
+                    // bytes never leave the daemon so a synthetic
+                    // `attachment://` uri is enough for the agent to
+                    // refer to it.
+                    let uri = format!("attachment:///{}", att.id);
+                    let blob =
+                        BlobResourceContents::new(data_b64, uri).mime_type(att.mime_type.clone());
+                    ContentBlock::Resource(EmbeddedResource::new(
+                        EmbeddedResourceResource::BlobResourceContents(blob),
+                    ))
+                }
+            };
+            blocks.push(block);
+        }
         cmd_tx
-            .send(ClientCmd::Prompt(text.to_string()))
+            .send(ClientCmd::Prompt(blocks))
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -1469,6 +1564,22 @@ impl AcpClient {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         cmd_tx
             .send(ClientCmd::Cancel)
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Force-stop the in-flight turn immediately, bypassing the 10s
+    /// cancel-escalation grace. If a prompt is in flight the connection
+    /// task ends the turn with `Stopped { reason: "user_forced" }`, which
+    /// the drain task treats like `agent_unresponsive`: it kills the
+    /// worker's process group and respawns with `session/load`. This is
+    /// the only lever that reliably stops a tool the agent runs
+    /// internally (a monitor/until loop) and ignores `session/cancel` on.
+    /// Best-effort: returns Ok even if no turn is in flight. See #1727.
+    pub async fn force_cancel(&self) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ForceStop)
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -2385,6 +2496,7 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ThinkingStarted
             | Event::ThinkingEnded
             | Event::UserPromptSent { .. }
+            | Event::UserDiffCommentsPrompt { .. }
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
@@ -2407,6 +2519,7 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
         Event::UserPromptSent { .. } => "user_prompt_sent",
+        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
@@ -2506,6 +2619,26 @@ fn wakeup_lifecycle_signal_from_update(
         Event::WakeupScheduled { at, .. } => Some(LifecycleSignal::WakeupPending { at }),
         _ => None,
     }
+}
+
+/// Classify a notification for both watchdog lanes. Returns
+/// `(lifecycle_signal, wakeup_signal)`.
+///
+/// During post-load history replay suppression we intentionally surface no
+/// signal, so stale replay frames cannot suppress or disarm watchdogs for a
+/// new prompt epoch.
+fn classify_watchdog_notification_signals(
+    update: &agent_client_protocol::schema::SessionUpdate,
+    profile: &agent_profiles::AgentProfile,
+    suppressing_history_replay: bool,
+) -> (Option<LifecycleSignal>, Option<LifecycleSignal>) {
+    if suppressing_history_replay {
+        return (None, None);
+    }
+    (
+        classify_lifecycle_signal(update),
+        wakeup_lifecycle_signal_from_update(update, profile),
+    )
 }
 
 /// Parse Claude's ExitPlanMode tool input into a structured `Plan`.
@@ -3317,15 +3450,22 @@ async fn run_connection_task<W, R>(
     //     Updated by the notification handler below. Initialized to "now"
     //     so a session that never receives a single notification still
     //     fires Stopped after RESUME_IDLE_GRACE rather than immediately.
+    //   - `first_event_after_attach`: set true on the first inbound
+    //     lifecycle-bearing notification after attach (progress, tool
+    //     lifecycle, terminal usage, wakeup). Ambient updates like mode
+    //     or available-command refreshes do not prove turn progress, so
+    //     they must not disarm the watchdog.
     //   - `prompt_sent_since_attach`: set when the user issues a prompt
     //     after attach; the user's real PromptRequest will own the next
     //     Stopped, so the watchdog must stand down.
     //   - `watchdog_fired`: ensures we synthesize Stopped at most once.
     let now_ms = chrono::Utc::now().timestamp_millis();
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
+    let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
+    let first_event_after_attach_for_notif = first_event_after_attach.clone();
 
     let result = Client
         .builder()
@@ -3336,6 +3476,8 @@ async fn run_connection_task<W, R>(
                 let suppress = suppress_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
+                let first_event_after_attach =
+                    first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 async move {
@@ -3352,31 +3494,24 @@ async fn run_connection_task<W, R>(
                     // started racing it.
                     let envelope_epoch =
                         current_prompt_epoch.load(Ordering::Relaxed);
-                    // Classify before consuming `notification.update` in
-                    // the event mapping below; emit only when we're not
-                    // in the post-load history-replay window so stale
-                    // chunks from a prior turn can't influence the
-                    // current prompt's silent-orphan state machine.
-                    let lifecycle_signal = if suppressing {
-                        None
-                    } else {
-                        classify_lifecycle_signal(&notification.update)
-                    };
-                    // Derive `WakeupPending` directly from the source
-                    // update so it only fires on a successful
-                    // `ToolCallUpdate { status: Completed, title:
-                    // ScheduleWakeup }`. Scanning `mapped_events` for
-                    // `Event::WakeupScheduled` instead would let the
-                    // initial `ToolCall` frame (tool not yet completed)
-                    // and any in-progress / failed completion trip
-                    // suppression for `delay + base_grace`, masking a
-                    // real adapter wedge. See CodeRabbit review on
-                    // PR #1406.
-                    let wakeup_signal = if suppressing {
-                        None
-                    } else {
-                        wakeup_lifecycle_signal_from_update(&notification.update, profile)
-                    };
+                    // Classify watchdog signals before consuming
+                    // `notification.update` in the event mapping below.
+                    // During post-load replay suppression this returns no
+                    // signal so stale chunks from a prior turn cannot
+                    // influence the current prompt's watchdog state.
+                    let (lifecycle_signal, wakeup_signal) =
+                        classify_watchdog_notification_signals(
+                            &notification.update,
+                            profile,
+                            suppressing,
+                        );
+                    // Disarm resume-idle only on lifecycle-bearing
+                    // notifications (progress/tool/terminal/wakeup). Pure
+                    // ambient updates (mode, command list, metadata) are
+                    // not proof of in-flight turn progress.
+                    if lifecycle_signal.is_some() || wakeup_signal.is_some() {
+                        first_event_after_attach.store(true, Ordering::Relaxed);
+                    }
                     let mapped_events = map_update_to_events(notification.update, profile);
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
@@ -3570,6 +3705,21 @@ async fn run_connection_task<W, R>(
             }
 
             let load_session_capable = init.agent_capabilities.load_session;
+            // Surface the agent's prompt capabilities to the cockpit so
+            // the web composer can gate the attachment button on the
+            // current agent, and the server prompt handler can reject
+            // attachments the agent cannot accept. `initialize` runs on
+            // both Fresh and Resume connects, so this re-emits on every
+            // reconnect and replay always carries a current copy. See
+            // #1000 / #965.
+            let prompt_caps = &init.agent_capabilities.prompt_capabilities;
+            let _ = event_tx_for_block
+                .send(Event::PromptCapabilities {
+                    image: prompt_caps.image,
+                    audio: prompt_caps.audio,
+                    embedded_context: prompt_caps.embedded_context,
+                })
+                .await;
             // Snapshot the watchdog-arming flag before `mode` is moved
             // into the match below.
             let arm_resume_watchdog = matches!(
@@ -3787,6 +3937,7 @@ async fn run_connection_task<W, R>(
             if arm_resume_watchdog {
                 let event_tx_for_watchdog = event_tx_for_block.clone();
                 let last_event_at = last_event_at.clone();
+                let first_event_after_attach = first_event_after_attach.clone();
                 let prompt_sent_since_attach = prompt_sent_since_attach.clone();
                 let watchdog_fired = watchdog_fired.clone();
                 let session_label_for_watchdog = session_label.clone();
@@ -3801,6 +3952,24 @@ async fn run_connection_task<W, R>(
                         if prompt_sent_since_attach.load(Ordering::Relaxed) {
                             // User sent a new prompt; its real
                             // PromptRequest will own the next Stopped.
+                            return;
+                        }
+                        if first_event_after_attach.load(Ordering::Relaxed) {
+                            // The runner forwarded at least one notification
+                            // for the in-flight turn, so the turn is
+                            // observable; any further silence is normal
+                            // mid-turn reasoning (Task subagents, slow Bash,
+                            // long reads) rather than an orphaned turn. Disarm
+                            // permanently. The narrow residual (the turn
+                            // completes after attach and its PromptResponse is
+                            // lost, leaving a stale spinner) is rare and
+                            // recoverable via force-end-turn / a new prompt.
+                            // See #1216.
+                            info!(
+                                target: "cockpit.acp",
+                                session = %session_label_for_watchdog,
+                                "resume-idle watchdog: disarming, in-flight turn is observable"
+                            );
                             return;
                         }
                         let last = last_event_at.load(Ordering::Relaxed);
@@ -3827,7 +3996,7 @@ async fn run_connection_task<W, R>(
             loop {
                 let cmd = cmd_rx.recv().await;
                 match cmd {
-                    Some(ClientCmd::Prompt(text)) => {
+                    Some(ClientCmd::Prompt(blocks)) => {
                         // First user prompt after session/load: stop
                         // dropping notifications. The agent's history-
                         // replay window is over; everything from now on
@@ -3844,7 +4013,7 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
-                        info!(target: "cockpit.acp", "sending prompt ({} chars)", text.len());
+                        info!(target: "cockpit.acp", "sending prompt ({} content blocks)", blocks.len());
                         // Drive the prompt request concurrently with the
                         // command channel so out-of-band notifications
                         // (Cancel, SetMode) can be delivered to the agent
@@ -3904,10 +4073,7 @@ async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_fut = connection
-                            .send_request(PromptRequest::new(
-                                acp_session_id.clone(),
-                                vec![ContentBlock::Text(TextContent::new(text))],
-                            ))
+                            .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
                             .block_task();
                         tokio::pin!(prompt_fut);
 
@@ -3973,6 +4139,11 @@ async fn run_connection_task<W, R>(
                         // stop from a clean turn completion.
                         let mut prompt_cancelled = false;
                         let mut cancelling = false;
+                        // Set when the user clicked "Force stop": ends the
+                        // turn with `user_forced` so the drain task kills the
+                        // process group + respawns, instead of waiting out
+                        // the 10s grace. See #1727.
+                        let mut force_stopped = false;
                         let cancel_grace = tokio::time::sleep(CANCEL_ESCALATION_GRACE);
                         tokio::pin!(cancel_grace);
 
@@ -4137,7 +4308,40 @@ async fn run_connection_task<W, R>(
                                                     tokio::time::Instant::now()
                                                         + CANCEL_ESCALATION_GRACE,
                                                 );
+                                                // Tell the UI a cancel is in
+                                                // flight so it can show
+                                                // "Stopping..." with an honest
+                                                // escalation countdown instead
+                                                // of a silent spinner. Once per
+                                                // turn. See #1727.
+                                                let escalates_at = chrono::Utc::now()
+                                                    + chrono::Duration::from_std(
+                                                        CANCEL_ESCALATION_GRACE,
+                                                    )
+                                                    .unwrap_or_else(|_| {
+                                                        chrono::Duration::seconds(10)
+                                                    });
+                                                let _ = event_tx_for_block
+                                                    .send(Event::CancelRequested { escalates_at })
+                                                    .await;
                                             }
+                                        }
+                                        Some(ClientCmd::ForceStop) => {
+                                            warn!(
+                                                target: "cockpit.acp",
+                                                "force-stop requested during in-flight prompt; ending turn and restarting worker"
+                                            );
+                                            // Best-effort cancel notification
+                                            // first (protocol politeness); the
+                                            // real lever is ending the turn so
+                                            // the drain task kills the process
+                                            // group and respawns. See #1727.
+                                            let _ = connection.send_notification(
+                                                CancelNotification::new(acp_session_id.clone()),
+                                            );
+                                            force_stopped = true;
+                                            shutdown = true;
+                                            break;
                                         }
                                         Some(ClientCmd::SetConfigOption { config_id, value }) => {
                                             info!(
@@ -4250,7 +4454,7 @@ async fn run_connection_task<W, R>(
                                                 respond_to,
                                             );
                                         }
-                                        Some(ClientCmd::Prompt(rejected_text)) => {
+                                        Some(ClientCmd::Prompt(rejected_blocks)) => {
                                             // Surface the dropped prompt
                                             // to the UI so the user can
                                             // retry from a Rejected pill
@@ -4262,6 +4466,18 @@ async fn run_connection_task<W, R>(
                                             // server-side gap when a prompt
                                             // does make it to the daemon
                                             // while another is in flight.
+                                            // Recover the text from the
+                                            // first text block; attachments
+                                            // aren't carried back into the
+                                            // retry pill (rare agent-busy
+                                            // edge, text is the retry hook).
+                                            let rejected_text = rejected_blocks
+                                                .iter()
+                                                .find_map(|b| match b {
+                                                    ContentBlock::Text(t) => Some(t.text.clone()),
+                                                    _ => None,
+                                                })
+                                                .unwrap_or_default();
                                             warn!(
                                                 target: "cockpit.acp",
                                                 "received Prompt while one is in flight; rejecting"
@@ -4328,6 +4544,18 @@ async fn run_connection_task<W, R>(
                         //     #1240.
                         let reason = if rate_limited {
                             "rate_limited"
+                        } else if force_stopped {
+                            // Explicit user "Force stop" wins over the
+                            // orphan/unresponsive watchdog reasons: it's the
+                            // proximate cause of THIS turn ending (we broke
+                            // the loop the moment the user clicked), so it
+                            // must not be masked by a prompt_orphaned flag
+                            // that was set earlier. The drain task treats it
+                            // like `agent_unresponsive` (kill process group +
+                            // respawn) but the reason string keeps the
+                            // user-initiated signal distinct in postmortems.
+                            // See #1727.
+                            "user_forced"
                         } else if prompt_orphaned {
                             "prompt_orphaned"
                         } else if agent_unresponsive {
@@ -4358,6 +4586,15 @@ async fn run_connection_task<W, R>(
                         info!(target: "cockpit.acp", "sending session/cancel (no prompt in flight)");
                         connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()))?;
+                    }
+                    Some(ClientCmd::ForceStop) => {
+                        // No prompt in flight: nothing to kill here. The
+                        // supervisor's force_end_turn publishes a synthetic
+                        // `Stopped` to free a wedged UI (#1100); we only send
+                        // a best-effort cancel notification. See #1727.
+                        info!(target: "cockpit.acp", "force-stop requested with no prompt in flight; best-effort cancel only");
+                        let _ = connection
+                            .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         info!(target: "cockpit.acp", "sending session/set_mode mode={mode_id}");
@@ -6144,6 +6381,52 @@ mod tests {
             &agent_profiles::CLAUDE,
         );
         assert!(matches!(sig, Some(LifecycleSignal::WakeupPending { .. })));
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_ignores_ambient_updates() {
+        use agent_client_protocol::schema::{
+            AvailableCommand as AcpAvailableCommand, AvailableCommandsUpdate,
+        };
+        let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AcpAvailableCommand::new("review", "Review changes"),
+        ]));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, false);
+        assert!(
+            lifecycle.is_none() && wakeup.is_none(),
+            "ambient updates must not count as watchdog activity"
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_marks_lifecycle_updates() {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "tc-lifecycle-1",
+            ToolCallUpdateFields::new(),
+        ));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, false);
+        assert!(
+            lifecycle.is_some() && wakeup.is_none(),
+            "tool lifecycle updates must disarm the resume-idle watchdog"
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_suppresses_during_history_replay() {
+        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "tc-suppressed-1",
+            ToolCallUpdateFields::new(),
+        ));
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, true);
+        assert!(
+            lifecycle.is_none() && wakeup.is_none(),
+            "post-load replay suppression must block watchdog signals"
+        );
     }
 
     #[test]

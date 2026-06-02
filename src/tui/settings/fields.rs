@@ -183,6 +183,8 @@ pub enum ListItemValidation {
     CustomAgent,
     /// `name=builtin`, where `builtin` is a known agent.
     DetectAs,
+    /// `name=command`, an ACP launch command split into argv (cockpit).
+    CockpitCmd,
     /// Host/sandbox env entry (`KEY=value` etc).
     EnvEntry,
 }
@@ -233,6 +235,7 @@ impl SettingField {
                     }
                     "custom_agents" => ListItemValidation::CustomAgent,
                     "agent_detect_as" => ListItemValidation::DetectAs,
+                    "agent_cockpit_cmd" => ListItemValidation::CockpitCmd,
                     _ => ListItemValidation::None,
                 }
             }
@@ -330,13 +333,17 @@ fn parse_key_value_object(items: &[String]) -> Value {
     Value::Object(map)
 }
 
-/// The four `session` map fields rendered as `key=value` lists. Their JSON is
+/// The `session` map fields rendered as `key=value` lists. Their JSON is
 /// an object, not an array, so apply must reconstruct the object form.
 fn is_map_list(section: &str, field: &str) -> bool {
     section == "session"
         && matches!(
             field,
-            "agent_extra_args" | "agent_command_override" | "custom_agents" | "agent_detect_as"
+            "agent_extra_args"
+                | "agent_command_override"
+                | "custom_agents"
+                | "agent_detect_as"
+                | "agent_cockpit_cmd"
         )
 }
 

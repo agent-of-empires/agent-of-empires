@@ -5,6 +5,7 @@ pub(crate) mod checkbox;
 mod cycler;
 mod dir_picker;
 mod help;
+pub(crate) mod hover;
 mod list_picker;
 pub(crate) mod preview;
 pub(crate) mod scroll;

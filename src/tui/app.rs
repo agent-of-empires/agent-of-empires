@@ -1249,6 +1249,10 @@ impl App {
             self.update_status = None;
         }
         let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Reset before the render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero capture/parse rather
+        // than leaking the previous frame's durations.
+        self.home.preview_timings = Default::default();
         self.home.render(
             frame,
             frame.area(),
@@ -1256,19 +1260,30 @@ impl App {
             self.update_info.as_ref(),
             status_text,
         );
-        // Sampled / slow-frame only: full-frame trace would dominate the
-        // log at `default_level = trace`. Only emit when a frame breaks the
-        // 16ms budget (60fps), which is the diagnostic case worth tracing.
+        // Sampled trace for frame-budget diagnostics. A full-frame trace on
+        // every paint would dominate the log at `default_level = trace`, so
+        // we only emit for (a) frames that break the 16ms / 60fps budget and
+        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
+        // is the latency we're profiling and individual frames usually stay
+        // under 16ms. `capture_us` / `parse_us` break the frame down into the
+        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
+        // minus those two) is the widget build + ratatui diff.
         let elapsed = start.elapsed();
-        if elapsed.as_millis() > 16
+        let in_live = self.home.live_send.is_some();
+        if (elapsed.as_millis() > 16 || in_live)
             && tracing::enabled!(target: "tui.render", tracing::Level::TRACE)
         {
+            let timings = self.home.preview_timings;
             tracing::trace!(
                 target: "tui.render",
                 frame_ms = elapsed.as_millis() as u64,
+                frame_us = elapsed.as_micros() as u64,
+                capture_us = timings.capture.as_micros() as u64,
+                parse_us = timings.parse.as_micros() as u64,
+                live = in_live,
                 width = frame.area().width,
                 height = frame.area().height,
-                "slow frame",
+                "render frame sample",
             );
         }
     }

@@ -3,8 +3,10 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests",
   // Live-backend specs (spawn real `aoe serve`) live under tests/live/ and
-  // run via playwright.live.config.ts.
-  testIgnore: ["**/live/**"],
+  // run via playwright.live.config.ts. The dev-only screenshot capture spec
+  // under tests/capture/ also spawns a real `aoe serve` and runs via
+  // playwright.capture.config.ts; keep it out of the mocked suite.
+  testIgnore: ["**/live/**", "**/capture/**"],
   timeout: 30000,
   retries: process.env.CI ? 1 : 0,
   // Mocked specs share one `vite preview` server and otherwise touch no

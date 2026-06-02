@@ -8,7 +8,10 @@ import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
 import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
+import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
+import { useSidebarAxis } from "./hooks/useSidebarAxis";
+import { repoGroupToSidebarGroup } from "./lib/sidebarGroups";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
@@ -232,9 +235,30 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [sessionsLoaded, sessions]);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
+  const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
-  const { groups, toggleRepoCollapsed, updateRepoAppearance, reorderRepoGroups } =
-    useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
+  const {
+    groups: repoGroups,
+    toggleRepoCollapsed,
+    updateRepoAppearance,
+    reorderRepoGroups,
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
+  const { groups: sessionGroups, toggleGroupCollapsed } =
+    useSessionGroups(workspaces);
+
+  // The sidebar render path consumes one honest model (SidebarGroup): the
+  // repo axis maps in via an adapter, the user-group axis is already in
+  // that shape. Collapse routing follows the active axis so the two
+  // axes keep independent collapse state. See #1234.
+  const sidebarGroups = useMemo(
+    () =>
+      sidebarAxis === "group"
+        ? sessionGroups
+        : repoGroups.map(repoGroupToSidebarGroup),
+    [sidebarAxis, sessionGroups, repoGroups],
+  );
+  const toggleSidebarGroup =
+    sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -1062,14 +1086,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       <div className="flex flex-1 min-h-0">
         {!showSettings && !showProjects && (
           <WorkspaceSidebar
-            groups={groups}
+            groups={sidebarGroups}
             onReorderWorkspaces={handleReorderWorkspaces}
             onReorderGroups={reorderRepoGroups}
             activeId={activeWorkspace?.id ?? null}
             open={sidebarOpen}
             onToggle={() => setSidebarOpen(false)}
             onSelect={handleSelectWorkspace}
-            onToggleRepo={toggleRepoCollapsed}
+            onToggleGroup={toggleSidebarGroup}
             onUpdateRepoAppearance={updateRepoAppearance}
             onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
             onCreateSession={handleCreateSession}
@@ -1079,6 +1103,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             readOnly={serverAbout?.read_only}
             sortMode={sidebarSortMode}
             onSortModeChange={setSidebarSortMode}
+            axis={sidebarAxis}
+            onAxisChange={setSidebarAxis}
           />
         )}
 

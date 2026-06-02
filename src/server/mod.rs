@@ -1200,7 +1200,21 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/cockpit/prompt",
-            post(api::cockpit_prompt),
+            // Prompt bodies carry inline base64 attachments, which blow
+            // past the global 1 MiB cap. Raise the limit on this route
+            // only; the server-side decoded-size caps in
+            // `validate_attachments` are the real guard. 28 MiB leaves
+            // headroom for the 20 MiB total decoded cap plus base64's
+            // ~33% overhead and JSON framing. See #1000 / #965.
+            post(api::cockpit_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/attachments/{attachment_id}",
+            get(api::cockpit_attachment),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/prompt/diff-comments",
+            post(api::cockpit_prompt_diff_comments),
         )
         .route(
             "/api/sessions/{id}/cockpit/cancel",
@@ -1591,7 +1605,6 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error = prior.last_error;
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-    fresh.last_acquired_existing_sid = prior.last_acquired_existing_sid;
     fresh
 }
 
@@ -1606,6 +1619,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
     #[cfg(feature = "serve")]
     let mut attempted_cockpit_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    #[cfg(feature = "serve")]
+    let mut last_idle_reap: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
 
@@ -1734,8 +1749,12 @@ async fn status_poll_loop(state: Arc<AppState>) {
             }
 
             #[cfg(feature = "serve")]
-            cockpit_reconciler::reconcile_cockpit_workers(&state, &mut attempted_cockpit_spawns)
-                .await;
+            cockpit_reconciler::reconcile_cockpit_workers(
+                &state,
+                &mut attempted_cockpit_spawns,
+                &mut last_idle_reap,
+            )
+            .await;
         }
     }
 }
@@ -2419,19 +2438,6 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
 mod tests {
     use super::*;
 
-    #[test]
-    fn merge_runtime_fields_carries_last_acquired_existing_sid() {
-        let mut prior = crate::session::Instance::new("title", "/tmp/x");
-        prior.last_acquired_existing_sid = true;
-        let fresh = crate::session::Instance::new("title", "/tmp/x");
-        assert!(!fresh.last_acquired_existing_sid);
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert!(
-            merged.last_acquired_existing_sid,
-            "merge_runtime_fields must carry last_acquired_existing_sid across status_poll reloads",
-        );
-    }
     #[cfg(feature = "serve")]
     #[test]
     fn derive_cockpit_status_maps_terminal_events() {
@@ -2449,7 +2455,10 @@ mod tests {
             memory_recall: None,
         };
         assert_eq!(
-            derive_cockpit_status(&Event::UserPromptSent { text: "hi".into() }),
+            derive_cockpit_status(&Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            }),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(

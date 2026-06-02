@@ -35,6 +35,38 @@ class ShimAgent {
     // to elapse.
     this._silentOrphanResolve = null;
     this._installDeleteHandlerIfRequested();
+    this._emitUnsolicitedNotifIfRequested();
+  }
+
+  // SHIM_EMIT_UNSOLICITED_NOTIF reproduces a still-alive runner
+  // forwarding a single mid-turn notification shortly after the daemon
+  // reattaches in Resume mode, with no prompt issued. Used by the #1216
+  // test to confirm the resume-idle watchdog disarms on the first
+  // inbound notification (instead of firing after normal mid-turn
+  // silence). The value is the delay in ms before the emit (default
+  // 150); after this one notification the shim stays silent so the test
+  // can assert no synthetic Stopped follows. Requires
+  // SHIM_PRESEED_SESSION_ID so the notification carries a known session.
+  _emitUnsolicitedNotifIfRequested() {
+    const raw = process.env.SHIM_EMIT_UNSOLICITED_NOTIF;
+    if (raw === undefined) return;
+    const sessionId = process.env.SHIM_PRESEED_SESSION_ID;
+    if (!sessionId) return;
+    const delayMs = Number.parseInt(raw, 10);
+    setTimeout(
+      () => {
+        this.connection
+          .sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "mid-turn chunk after reattach" },
+            },
+          })
+          .catch(() => {});
+      },
+      Number.isFinite(delayMs) ? delayMs : 150,
+    );
   }
 
   async initialize(params) {

@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../../lib/acpCapableTools";
+import { isAcpCapable } from "../../../lib/acpCapableTools";
 
 interface WizardData {
   tool: string;
@@ -18,6 +18,7 @@ interface WizardData {
   customInstruction: string;
   extraArgs: string;
   commandOverride: string;
+  useCockpit: boolean;
   [key: string]: unknown;
 }
 
@@ -35,53 +36,79 @@ interface Props {
   cockpitMasterEnabled: boolean;
 }
 
+/** Read-only callout when the selected tool cannot run in cockpit. This
+ *  includes built-in tools without ACP support and custom agents that do
+ *  not provide `agent_cockpit_cmd`. ACP-capable tools render
+ *  `CockpitSubstrateCard` instead. */
 function SubstrateNotice({
   tool,
-  acpCapable,
   customAgent,
-  sandboxEnabled,
 }: {
   tool: string;
-  acpCapable: boolean;
   customAgent: boolean;
-  sandboxEnabled: boolean;
 }) {
-  const sandboxedCockpit = acpCapable && sandboxEnabled;
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold text-text-primary">
-          {acpCapable ? "Cockpit" : "Terminal"}
-        </span>
-        <span
-          className={`rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide ${
-            acpCapable
-              ? "bg-brand-700/40 text-brand-400"
-              : "bg-surface-700 text-text-dim"
-          }`}
-        >
-          {acpCapable ? "Beta" : "Fallback"}
+        <span className="text-sm font-semibold text-text-primary">Terminal</span>
+        <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
+          Fallback
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {sandboxedCockpit
-          ? "Cockpit + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts."
-          : customAgent
-          ? "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support."
-          : acpCapable
-          ? "Cockpit is enabled, so this session will run in the structured cockpit UI. Switch to terminal substrate from the session view if needed."
+        {customAgent
+          ? "Custom agents run in the terminal unless they define agent_cockpit_cmd in config or TUI settings."
           : `${tool} has no ACP adapter yet, so this session falls back to the tmux terminal. Pick a tool with cockpit support (e.g. claude, opencode, gemini) to use the structured UI.`}
       </p>
     </div>
   );
 }
 
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+/** Interactive substrate picker shown when the cockpit master switch is
+ *  on and the selected tool is ACP-capable. Defaults on (so the master
+ *  switch keeps its current behavior); turning it off launches a tmux
+ *  session even with the master switch enabled (see #1580). */
+function CockpitSubstrateCard({
+  checked,
+  onChange,
+  sandboxEnabled,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  sandboxEnabled: boolean;
+}) {
+  const sandboxedCockpit = checked && sandboxEnabled;
+  return (
+    <div className="mb-5 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-text-primary">Cockpit</span>
+            <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-brand-700/40 text-brand-400">
+              Beta
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-text-dim leading-snug">
+            {sandboxedCockpit
+              ? "Cockpit + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts. Turn off to run this session in the tmux terminal instead."
+              : checked
+              ? "Renders the agent's plan, tool calls, and diffs in the structured cockpit UI. Turn off to run this session in the tmux terminal instead."
+              : "This session will run in the tmux terminal. Turn on to use the structured cockpit UI; you can also switch substrates from the session view later."}
+          </p>
+        </div>
+        <Toggle checked={checked} onChange={onChange} label="Use cockpit" />
+      </div>
+    </div>
+  );
+}
+
+function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => !disabled && onChange(!checked)}
       className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
@@ -103,6 +130,7 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   );
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
+  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
@@ -190,21 +218,22 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         ))}
       </div>
 
-      {/* Substrate notice. Cockpit mode is auto-selected for ACP-capable
-          tools when the master switch is on; non-ACP tools fall back to
-          tmux silently. The notice tells the user which one they'll get
-          without giving them a per-session toggle (the master switch is
-          the opt-in, and the session view has a post-creation switch if
-          they need to flip). When the master switch is off, every new
-          session is tmux and no notice is shown. */}
-      {cockpitMasterEnabled && (
-        <SubstrateNotice
-          tool={data.tool}
-          acpCapable={ACP_CAPABLE_TOOLS.has(data.tool)}
-          customAgent={selectedCustomAgent}
-          sandboxEnabled={data.sandboxEnabled}
-        />
-      )}
+      {/* Substrate picker. When the master switch is on and the tool is
+          ACP-capable, the user gets a per-session cockpit toggle
+          (default on, see #1580) so they can opt down to a tmux session
+          without flipping the global switch. Tools that are not ACP-capable
+          show a read-only fallback notice instead. When the master switch is off, every new
+          session is tmux and nothing is shown. */}
+      {cockpitMasterEnabled &&
+        (acpCapable ? (
+          <CockpitSubstrateCard
+            checked={data.useCockpit}
+            onChange={(v) => onChange("useCockpit", v)}
+            sandboxEnabled={data.sandboxEnabled}
+          />
+        ) : (
+          <SubstrateNotice tool={data.tool} customAgent={selectedCustomAgent} />
+        ))}
 
       {/* Profile selector. We render a card list (rather than a native
           <select>) so each profile can carry a short description beneath

@@ -40,6 +40,18 @@ All settings below can also be edited from the TUI settings screen (press `s` or
 | `AOE_ACP_TRACE` | Add the ACP framework's raw JSON-RPC firehose to `debug.log` (`1` to enable). Very chatty; useful for chasing schema mismatches. |
 | `AOE_TERMINAL_TRACE` | Add per-message byte tracing for the web terminal WebSocket relay to `debug.log` (`1` to enable). Bumps the `terminal` target to `trace`, surfacing every PTY read/write and every WS send/recv. Spammy under load (a busy claude session emits thousands of frames/min); use only when chasing terminal disconnect bugs. |
 
+### Terminal latency instrumentation
+
+The web dashboard can attribute keystroke-to-echo lag (the gap between pressing a key and seeing the character) to network versus server and PTY hops. Append `?debug=terminal-timing` to the dashboard URL. This is a measurement aid only; it changes no behavior and is entirely inert without the flag, so normal sessions pay nothing.
+
+When the flag is set, the terminal:
+
+- Measures **Idle-TTFB**: when you type after a quiet moment, it stamps the keystroke and resolves on the next inbound frame, recording both socket arrival and xterm render completion. It does not match echoed bytes (shells, TUIs, autosuggestions and password prompts make the echo unrelated to what you typed), so the number reflects the real key-to-screen path without parsing the echo.
+- Sends a small control-channel ping every 500ms that the server bounces back without touching the PTY. This is the **WS control RTT**: network plus WebSocket transit with no PTY in the loop. The server includes its own recv-to-send duration so no clock sync is needed.
+- Logs a rolling p50/p95 summary to the browser console every 10s, including the active renderer (`webgl` or `dom`).
+
+Call `window.__aoeTiming.dump()` in the browser console to pull the raw samples as JSON for offline analysis. Interpretation: if WS control RTT is close to Idle-TTFB, the network dominates; if Idle-TTFB is well above WS control RTT, the server, PTY, tmux, or agent echo path dominates; if socket arrival is fast but render is slow, the renderer or main thread dominates.
+
 ## Theme
 
 ```toml
@@ -93,6 +105,7 @@ agent_status_hooks = true
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
+| `agent_cockpit_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in cockpit (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is cockpit-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 
@@ -137,13 +150,30 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 
 - **`custom_agents`**: Maps a display name to the command AoE runs when that agent is selected. Custom-agent names are configured in config files or the TUI settings screen, and they appear alongside built-in agents like `claude`, `opencode`, and `codex`.
 - **`agent_detect_as`** (optional): Maps a custom agent to a built-in agent's status detection. Without this, custom agents default to `Idle` status. Setting `"lenovo-claude" = "claude"` reuses Claude's Running/Waiting/Idle detection heuristics for the remote session.
+- **`agent_cockpit_cmd`** (optional): The ACP launch command that lets a custom agent run in the structured cockpit UI instead of the tmux terminal. See the Cockpit subsection below.
 - **`default_tool`** (optional): Can point at a custom-agent name so new sessions default to that configured agent.
 
 Custom agents are always shown as available in the TUI picker because their command may target a remote host or wrapper script instead of a local binary. From the CLI, use `aoe add --tool <name>` to create a session with a configured custom agent by name. The selected custom agent still uses the command from `custom_agents`; browser or CLI input is not treated as a raw command.
 
-The Web session wizard can select configured custom agents and submit the selected name to the server. For security, the Web UI does not expose custom-agent command strings, does not expose `agent_detect_as` values, and does not edit `custom_agents` or `agent_detect_as`. Edit those fields through config files or the TUI settings screen instead.
+The Web session wizard can select configured custom agents and submit the selected name to the server. For security, the Web UI does not expose custom-agent command strings, does not expose `agent_detect_as` or `agent_cockpit_cmd` values, and does not edit any of these maps. Edit those fields through config files or the TUI settings screen instead.
 
-Both fields are editable from the TUI settings screen and support profile/repo-level overrides.
+All three fields are editable from the TUI settings screen and support profile/repo-level overrides.
+
+#### Running a custom agent in cockpit
+
+By default a custom agent runs in the tmux terminal. To run it in the structured cockpit UI, give it an ACP launch command in `agent_cockpit_cmd`. The agent must speak the [Agent Client Protocol](https://agentclientprotocol.com); the command is what AoE execs to start the ACP server.
+
+```toml
+[session.custom_agents]
+"oc-superpowers" = "ocp run sp"
+
+[session.agent_cockpit_cmd]
+"oc-superpowers" = "ocp run sp acp"
+```
+
+With the cockpit master switch on, selecting `oc-superpowers` in the web wizard now creates a cockpit session, and `aoe add --tool oc-superpowers --cockpit` launches the ACP command. A custom agent with no `agent_cockpit_cmd` keeps running in the terminal, and `aoe add --cockpit` for it now errors instead of silently launching the bundled fallback agent.
+
+Note the difference from `custom_agents`: the `custom_agents` value is a shell command run in a tmux pane, while the `agent_cockpit_cmd` value is split into argv with shell-word rules and executed directly, with no shell. For shell features, wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The agent name must match a `custom_agents` entry so it appears in the picker, and it cannot shadow a built-in agent name.
 
 > **Note:** Profile and repo-level overrides fully replace the global value rather than merging with it. A profile that defines `custom_agents` replaces the entire global set, so you must redeclare any global agents you want to keep in that profile.
 

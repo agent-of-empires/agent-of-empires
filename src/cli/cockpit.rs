@@ -130,6 +130,19 @@ pub enum CockpitCommands {
         /// Cockpit session id.
         session: String,
     },
+    /// Switch a cockpit session to a different ACP agent, keeping the
+    /// transcript. The new agent starts fresh; use `aoe cockpit agents`
+    /// to list valid targets. Handy for returning to claude after a
+    /// rate-limit handoff to codex.
+    SwitchAgent {
+        /// Cockpit session id.
+        session: String,
+        /// Registry key of the target agent (e.g. `claude`, `codex`).
+        target: String,
+        /// Optional model override forwarded to the new agent.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tracing::instrument(target = "cli.cockpit", skip_all)]
@@ -162,6 +175,11 @@ pub async fn run(command: CockpitCommands) -> Result<()> {
         CockpitCommands::Cancel { session } => cancel(&session).await,
         CockpitCommands::Tail { session, since } => tail(&session, since).await,
         CockpitCommands::Attach { session } => attach(&session).await,
+        CockpitCommands::SwitchAgent {
+            session,
+            target,
+            model,
+        } => switch_agent(&session, &target, model.as_deref()).await,
     }
 }
 
@@ -512,12 +530,13 @@ fn kill_now(session: &str) -> Result<()> {
     // on `stop`: the running daemon's drain task uses the registry-gone
     // signal to skip respawn on user-initiated termination.
     worker_registry::delete(session).ok();
-    #[cfg(unix)]
-    if worker_registry::is_pid_alive(record.pid) {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGKILL);
-    }
+    // Group-SIGKILL so the agent's node/SDK grandchildren die with the
+    // runner instead of orphaning under PID 1 (#1689). Unconditional: the
+    // process group can outlive its leader pid, so gating on leader
+    // liveness would skip the killpg and leak surviving descendants.
+    // killpg ignores ESRCH, so signaling an already-empty group is a
+    // harmless no-op.
+    worker_registry::kill_runner_group(record.pid);
     println!(
         "Killed cockpit worker for {} (PID {}).",
         session, record.pid
@@ -530,26 +549,19 @@ async fn signal_and_wait(
     timeout_secs: u64,
 ) {
     use crate::cockpit::worker_registry;
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let pid = Pid::from_raw(record.pid as i32);
+    // Group signals so the whole agent tree (runner + node + SDK child)
+    // goes down together, not just the runner pid. Sent unconditionally:
+    // the group can outlive its leader pid, so gating on leader liveness
+    // would skip the SIGTERM and leak surviving descendants. See #1689.
+    worker_registry::terminate_runner_group(record.pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
         if !worker_registry::is_pid_alive(record.pid) {
             return;
         }
-        let _ = kill(pid, Signal::SIGTERM);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        while std::time::Instant::now() < deadline {
-            if !worker_registry::is_pid_alive(record.pid) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = kill(pid, Signal::SIGKILL);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    #[cfg(not(unix))]
-    let _ = (record, timeout_secs);
+    worker_registry::kill_runner_group(record.pid);
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -624,12 +636,11 @@ fn restart(session: &str) -> Result<()> {
     // Reconnect" affordance.
     worker_registry::mark_restart_pending(session);
     worker_registry::delete(session).ok();
-    #[cfg(unix)]
-    if worker_registry::is_pid_alive(record.pid) {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM);
-    }
+    // Group-SIGTERM so the agent's node/SDK grandchildren die with the
+    // runner rather than orphaning under PID 1 before respawn (#1689).
+    // Unconditional: the group can outlive its leader pid, so gating on
+    // leader liveness would skip the killpg and leak descendants.
+    worker_registry::terminate_runner_group(record.pid);
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid
@@ -657,13 +668,16 @@ fn truncate(s: &str, n: usize) -> String {
 // daemon is the only path to the disk-backed event store; there's no
 // useful read against "no daemon".
 
-use crate::cockpit::client::{require_daemon, HttpClient, HttpError, WsMessage};
+use crate::cockpit::client::{require_daemon, HttpClient, HttpError, WsMessage, REPLAY_PAGE_SIZE};
 use crate::cockpit::protocol::ApprovalDecisionWire;
 
 async fn history(session: &str, since: u64, json: bool) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    let resp = client.replay(session, since).await.map_err(map_http)?;
+    let resp = client
+        .replay_paged(session, since, REPLAY_PAGE_SIZE)
+        .await
+        .map_err(map_http)?;
     if resp.lost {
         eprintln!(
             "warning: retention window evicted events before seq {}; transcript is partial.",
@@ -762,6 +776,17 @@ async fn cancel(session: &str) -> Result<()> {
     Ok(())
 }
 
+async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let resp = client
+        .switch_agent(session, target, model, Some("manual"))
+        .await
+        .map_err(map_http)?;
+    println!("switched cockpit agent for {session} -> {}", resp.agent);
+    Ok(())
+}
+
 async fn attach(session: &str) -> Result<()> {
     crate::tui::cockpit_view::run_standalone(session).await
 }
@@ -827,10 +852,13 @@ fn event_kind(event: &crate::cockpit::Event) -> &'static str {
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
+        Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
+        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
+        Event::PromptCapabilities { .. } => "prompt_capabilities",
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",

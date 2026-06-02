@@ -61,6 +61,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// settings (or hand-editing the line out) restores the new default.
 pub(super) const DEFAULT_EXIT_CHORD: &str = "C-q";
 
+/// Default live-send leader (prefix) chord. `Ctrl+b` matches the tmux
+/// and herdr leader, so multiplexer users already have the muscle
+/// memory, and it's the one chord we steal from the agent (double-tap
+/// `C-b C-b` still delivers a literal `C-b` downstream). Kept in sync
+/// with `default_live_send_leader()` in `session::config`. An empty
+/// configured value disables the leader entirely.
+pub(super) const DEFAULT_LEADER: &str = "C-b";
+
 /// Parse a tmux-style chord spec into a `(KeyCode, KeyModifiers)`
 /// pair. Accepts `C-` / `Ctrl-`, `M-` / `Alt-`, `S-` / `Shift-`
 /// prefixes (any order, separated by `-` or `+`) followed by a key
@@ -275,6 +283,14 @@ pub(in crate::tui) struct LiveSendState {
     /// setting at entry time. Captured per-entry so config edits
     /// don't change behavior mid-session.
     pub exit_chords: Vec<(KeyCode, KeyModifiers)>,
+    /// Leader (prefix) chord parsed from the user's configured leader
+    /// setting at entry time. `None` when the user cleared the setting
+    /// (leader disabled, every key passes through). When `Some`, the
+    /// first press arms the live-send command menu; the next key picks
+    /// a command (or a second leader press passes a literal leader to
+    /// the agent). Snapshotted per-entry for the same reason as
+    /// `exit_chords`.
+    pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
 /// Which paired tmux pane a live-send dispatch targets. The agent
@@ -432,6 +448,106 @@ impl LiveSendWorker {
     /// size (matters when an agent uses cursor-position escapes).
     pub(super) fn resize(&self, cols: u16, rows: u16) {
         let _ = self.tx.send(WorkerMsg::Resize { cols, rows });
+    }
+}
+
+/// How often the off-thread capture worker forks `tmux capture-pane`.
+/// It free-runs at roughly this cadence (a fork is ~3-13ms on macOS, so
+/// the real cycle is interval + fork time), keeping the preview fresh on
+/// a background thread so the render loop never forks capture-pane
+/// itself. Sits just under the 33ms render ticker so a frame almost
+/// always finds content that postdates the last keystroke, while keeping
+/// the steady-state fork rate close to the old render-driven ~30/s (a
+/// tighter value buys little perceived freshness for a lot more idle
+/// forks, since the render only paints every ~33ms anyway).
+const LIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Off-thread preview capture for agent live-send. Spawned alongside
+/// [`LiveSendWorker`] when live-send targets the agent pane, it forks
+/// `tmux capture-pane` on its own thread and publishes fresh pane content
+/// into a single-slot mailbox the render loop drains. The render loop
+/// applies the latest content without forking, which is what moves the
+/// per-frame capture cost (~8.5ms measured on macOS, ~90% of a live-send
+/// frame) off the hot path. Dropping the worker flips `stop` so the
+/// thread exits after its current cycle; like `LiveSendWorker` we don't
+/// join.
+///
+/// Scoped to the agent target on purpose: only the agent preview
+/// force-refreshes every frame in live-send (the terminal/container/tool
+/// previews stay 250ms-throttled), so it's the only path paying the
+/// per-frame fork. Non-agent targets keep the synchronous capture.
+pub(in crate::tui) struct LiveCaptureWorker {
+    /// Lines the render loop wants captured (height + scrollback + buffer).
+    /// `0` means "not set yet"; the worker skips capturing until the first
+    /// render publishes a real value. `capture_lines_for` never yields 0.
+    capture_lines: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Single-slot mailbox holding the newest capture not yet consumed by
+    /// the render loop. A new capture overwrites an unconsumed one (the
+    /// render only ever wants the latest), so this can't grow unbounded if
+    /// the render thread stalls.
+    latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LiveCaptureWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl LiveCaptureWorker {
+    pub(in crate::tui) fn spawn(tmux_name: String) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let capture_lines = Arc::new(AtomicUsize::new(0));
+        let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let lines_cell = capture_lines.clone();
+        let slot = latest.clone();
+        let stop_flag = stop.clone();
+        std::thread::spawn(move || {
+            let session = crate::tmux::Session::from_name(&tmux_name);
+            let mut last_captured: Option<String> = None;
+            while !stop_flag.load(Ordering::Relaxed) {
+                let lines = lines_cell.load(Ordering::Relaxed);
+                if lines > 0 {
+                    if let Ok(content) = session.capture_pane(lines) {
+                        // Skip empties (preserve the last-good preview, the
+                        // #1501 kill switch) and unchanged frames (no point
+                        // waking a re-parse). Only changed, non-empty
+                        // captures reach the render loop.
+                        if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
+                        {
+                            if let Ok(mut guard) = slot.lock() {
+                                *guard = Some(content.clone());
+                            }
+                            last_captured = Some(content);
+                        }
+                    }
+                }
+                std::thread::sleep(LIVE_CAPTURE_INTERVAL);
+            }
+        });
+        Self {
+            capture_lines,
+            latest,
+            stop,
+        }
+    }
+
+    /// Publish the line count the worker should capture. Cheap (one atomic
+    /// store); called each render so resizes and history scroll reach the
+    /// worker promptly.
+    pub(in crate::tui) fn set_capture_lines(&self, lines: usize) {
+        self.capture_lines
+            .store(lines, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the newest capture the worker has produced since the last
+    /// call, if any. Returns `None` when nothing new has arrived (the
+    /// render loop then keeps the current preview).
+    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
+        self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 }
 
@@ -803,6 +919,32 @@ mod tests {
         // hand exit configure one explicitly.
         assert!(!chords.contains(&(KeyCode::Char(']'), KeyModifiers::CONTROL)));
         assert!(!chords.contains(&(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn default_leader_is_ctrl_b() {
+        // Ctrl+B matches the tmux/herdr leader. Kept in sync with
+        // session::config::default_live_send_leader().
+        assert_eq!(
+            parse_chord(DEFAULT_LEADER),
+            Some((KeyCode::Char('b'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn leader_matches_only_its_exact_chord() {
+        let leader = parse_chord(DEFAULT_LEADER).unwrap();
+        // The armed leader: Ctrl+B fires it again (passthrough path).
+        assert!(chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+        // Bare `b` is a menu command, not a second leader press, so it
+        // must NOT match the leader chord.
+        assert!(!chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
@@ -1194,5 +1336,32 @@ mod tests {
         let batches = hex_send_batches(&payload);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].first().map(String::as_str), Some("1b"));
+    }
+
+    #[test]
+    fn live_capture_worker_idle_until_geometry_set() {
+        // With no line count published the worker must not capture at all,
+        // so nothing crosses the channel. (`capture_lines == 0` guard.)
+        let worker = LiveCaptureWorker::spawn("aoe_test_capture_no_geometry".into());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            worker.take_latest().is_none(),
+            "worker should stay idle until set_capture_lines is called",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_skips_empty_captures() {
+        // A worker pointed at a session that doesn't exist captures empty
+        // strings. Forwarding those would blank the preview, defeating the
+        // #1501 kill switch, so the worker must drop them. Deterministic
+        // without a real tmux session: a missing pane always reads empty.
+        let worker = LiveCaptureWorker::spawn("aoe_test_capture_missing_session".into());
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            worker.take_latest().is_none(),
+            "empty captures must never be forwarded",
+        );
     }
 }

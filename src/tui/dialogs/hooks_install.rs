@@ -5,6 +5,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct HooksInstallDialog {
@@ -15,6 +16,9 @@ pub struct HooksInstallDialog {
     scroll_offset: u16,
     accept_button_area: Rect,
     cancel_button_area: Rect,
+    /// Which button the mouse is over, for the hover highlight. Visual
+    /// only; never changes `selected`.
+    hover: HoverState,
 }
 
 impl HooksInstallDialog {
@@ -59,6 +63,7 @@ impl HooksInstallDialog {
             scroll_offset: 0,
             accept_button_area: Rect::default(),
             cancel_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
@@ -73,10 +78,15 @@ impl HooksInstallDialog {
         None
     }
 
-    /// Hover does not change the Accept / Cancel selection. See
-    /// `ConfirmDialog::handle_hover` for the rationale.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the button under the cursor without changing the
+    /// Accept / Cancel selection. See `ConfirmDialog::handle_hover` for
+    /// the rationale. Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(
+            col,
+            row,
+            &[self.accept_button_area, self.cancel_button_area],
+        )
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<bool> {
@@ -259,6 +269,13 @@ impl HooksInstallDialog {
             Paragraph::new(buttons).alignment(Alignment::Center),
             button_area,
         );
+
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.accept_button_area, self.cancel_button_area])
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -355,6 +372,27 @@ mod tests {
         assert!(!dialog.selected);
         dialog.handle_key(key(KeyCode::Tab));
         assert!(dialog.selected);
+    }
+
+    #[test]
+    fn hover_highlights_button_without_changing_selection() {
+        let mut dialog = HooksInstallDialog::new("claude");
+        dialog.accept_button_area = Rect::new(2, 5, 12, 1);
+        dialog.cancel_button_area = Rect::new(20, 5, 14, 1);
+        assert!(dialog.selected);
+
+        // Over Accept: highlight it, selection unchanged.
+        assert!(dialog.handle_hover(3, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.accept_button_area));
+        assert!(dialog.selected, "hover must not flip the selection");
+
+        // Over Cancel.
+        assert!(dialog.handle_hover(21, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
+
+        // Off the buttons clears.
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

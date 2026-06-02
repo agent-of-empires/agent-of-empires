@@ -9,8 +9,11 @@
 //! https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929.
 
 pub mod input;
+pub mod mention;
+pub mod queue;
 pub mod reducer;
 pub mod render;
+pub mod slash;
 pub mod state;
 
 use std::io::Stdout;
@@ -23,10 +26,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::time::Instant;
 
-use self::input::{Focus, Intent};
-use self::state::{CockpitViewState, ToastBanner, ToastKind};
+use self::input::{Focus, InputContext, Intent};
+use self::state::{CockpitViewState, FileIndex, MentionSession, ToastBanner, ToastKind};
 use crate::cockpit::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, ManagerError, WsError, WsMessage,
+    REPLAY_PAGE_SIZE,
 };
 use crate::cockpit::protocol::ApprovalDecisionWire;
 use crate::tui::styles::Theme;
@@ -154,7 +158,7 @@ pub async fn run_for_endpoint(
     // Hydrate the transcript via /replay before opening the WebSocket
     // so the user sees the historical conversation immediately instead
     // of a blank pane until live frames start arriving.
-    let initial = http.replay(session_id, 0).await;
+    let initial = http.replay_paged(session_id, 0, REPLAY_PAGE_SIZE).await;
     let ws_result = ws_connect(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
@@ -166,6 +170,22 @@ pub async fn run_for_endpoint(
     state.focus = Focus::Transcript;
 
     let mut toast_deadline: Option<Instant> = None;
+
+    // Resolve the queue drain mode from the daemon (not local config:
+    // this view can attach to a remote daemon). A failure here is
+    // non-fatal; the queue still works, it just uses the default mode.
+    match state.http.queue_drain_mode().await {
+        Ok(mode) => state.drain_mode = mode,
+        Err(e) => {
+            tracing::warn!(target: "cockpit.tui", "queue drain mode fetch failed: {e}");
+            set_toast(
+                &mut state,
+                &mut toast_deadline,
+                format!("queue drain mode unknown ({e}); using default"),
+                ToastKind::Error,
+            );
+        }
+    }
 
     // Capture both startup-path errors before showing a toast so we
     // can fold them into a single message when both fail (they
@@ -179,6 +199,7 @@ pub async fn run_for_endpoint(
                 state.transcript.apply(frame);
             }
             state.reconcile_selection();
+            state.reconcile_slash_selection();
             None
         }
         Err(e) => {
@@ -227,15 +248,33 @@ pub async fn run_for_endpoint(
             ws_msg = recv_ws(&mut state) => {
                 match ws_msg {
                     Some(Ok(WsMessage::Frame(frame))) => {
+                        let was_active = state.transcript.turn_active;
                         state.transcript.apply(&frame);
                         state.reconcile_selection();
+                        state.reconcile_slash_selection();
+                        let now_active = state.transcript.turn_active;
+                        if !was_active && now_active {
+                            // Turn started (our own prompt echoed back, or
+                            // another client's). The optimistic lock has
+                            // served its purpose; release it.
+                            state.in_flight = false;
+                        } else if was_active && !now_active {
+                            // Turn ended: release the lock and drain the
+                            // next queued batch, if any.
+                            state.in_flight = false;
+                            maybe_drain(&mut state, &mut toast_deadline).await;
+                        }
                         redraw(terminal, theme, &state)?;
                     }
                     Some(Ok(WsMessage::Lagged)) => {
                         // Daemon evicted events we hadn't seen yet. Drop
                         // local reducer state and rehydrate from /replay.
                         state.transcript.reset();
-                        match state.http.replay(&state.session_id, 0).await {
+                        match state
+                            .http
+                            .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
+                            .await
+                        {
                             Ok(replay) => {
                                 if replay.lost {
                                     state.transcript.set_lagged();
@@ -244,6 +283,12 @@ pub async fn run_for_endpoint(
                                     state.transcript.apply(frame);
                                 }
                                 state.reconcile_selection();
+                                state.reconcile_slash_selection();
+                                // Re-derived turn state from the rebuilt
+                                // transcript; the lock no longer reflects
+                                // anything observable. Drain if idle.
+                                state.in_flight = false;
+                                maybe_drain(&mut state, &mut toast_deadline).await;
                             }
                             Err(e) => {
                                 set_toast(&mut state, &mut toast_deadline, format!("replay failed: {e}"), ToastKind::Error);
@@ -261,11 +306,21 @@ pub async fn run_for_endpoint(
                         tracing::warn!(target: "cockpit.tui.ws", "ws disconnect: {e}");
                         set_toast(&mut state, &mut toast_deadline, format!("ws disconnected: {e}; reconnecting…"), ToastKind::Error);
                         state.ws = None;
+                        // Can't observe turn boundaries while the socket
+                        // is down; drop the lock so a stuck send doesn't
+                        // wedge the composer, and queue any new prompts
+                        // (is_busy() is true while ws is None).
+                        state.in_flight = false;
                         let since = state.transcript.last_seq;
                         match reconnect_with_backoff(&state.endpoint, &state.session_id, since).await {
                             Ok(handle) => {
                                 state.ws = Some(handle);
                                 set_toast(&mut state, &mut toast_deadline, "ws reconnected".into(), ToastKind::Info);
+                                // Resumed frames will re-derive turn state
+                                // and drain on the next edge, but if the
+                                // turn already ended before reconnect there
+                                // is no edge to wait for: drain now.
+                                maybe_drain(&mut state, &mut toast_deadline).await;
                             }
                             Err(e) => {
                                 set_toast(&mut state, &mut toast_deadline, format!("ws reconnect failed: {e}"), ToastKind::Error);
@@ -310,7 +365,12 @@ async fn handle_terminal_event(
     }
 
     let has_pending = !state.transcript.pending_approvals.is_empty();
-    let intent = input::dispatch(state.focus, &key, has_pending);
+    let ctx = InputContext {
+        has_pending_approval: has_pending,
+        slash_picker_open: state.slash_picker_open(),
+        mention_picker_open: state.mention.is_some(),
+    };
+    let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
@@ -327,39 +387,101 @@ async fn handle_terminal_event(
         }
         Intent::Compose(k) => {
             // ratatui_textarea consumes raw crossterm KeyEvent through
-            // its `Input` conversion.
+            // its `Input` conversion. Snapshot the slash query first so
+            // we can detect a query-text change (vs. mere cursor motion)
+            // and reset the picker highlight only when the text shifts.
+            let before = state.slash_query();
             state.composer.input(k);
+            if state.slash_query() != before {
+                state.slash_selected = 0;
+            }
+            state.reconcile_slash_selection();
+            // The typed text may have opened, narrowed, or closed an
+            // `@`-mention; recompute and fetch the file list on first open.
+            refresh_mention(state);
+            ensure_files_loaded(state, toast_deadline).await;
+            Ok(false)
+        }
+        Intent::SlashMove(delta) => {
+            state.move_slash_selection(delta);
+            Ok(false)
+        }
+        Intent::SlashAccept => {
+            state.accept_selected_slash();
+            Ok(false)
+        }
+        Intent::SlashDismiss => {
+            state.dismiss_slash();
+            Ok(false)
+        }
+        Intent::MentionNavigate(delta) => {
+            navigate_mention(state, delta);
+            Ok(false)
+        }
+        Intent::MentionAccept => {
+            accept_mention(state);
+            Ok(false)
+        }
+        Intent::MentionClose => {
+            // Remember the dismissed anchor so the picker stays shut while
+            // the user keeps typing in this same token.
+            state.dismissed_mention =
+                mention::active_mention(state.composer.lines(), composer_cursor(state))
+                    .map(|m| (m.row, m.start_col));
+            state.mention = None;
             Ok(false)
         }
         Intent::SubmitPrompt => {
             let text = state.take_composer_text();
             if text.is_empty() {
+                // Empty Enter is a manual flush: if the agent is idle and
+                // prompts are stuck in the queue (e.g. a drain POST failed
+                // earlier), retry the drain. Otherwise just nudge the user.
+                if !state.is_busy() && !state.queue.is_empty() {
+                    maybe_drain(state, toast_deadline).await;
+                } else {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "composer is empty".into(),
+                        ToastKind::Info,
+                    );
+                }
+                return Ok(false);
+            }
+            if state.is_busy() {
+                // A turn is running (or the socket is down): park the
+                // prompt so it drains when the agent next goes idle.
+                state.queue.push(text);
                 set_toast(
                     state,
                     toast_deadline,
-                    "composer is empty".into(),
+                    format!("queued ({} waiting)", state.queue.len()),
                     ToastKind::Info,
                 );
                 return Ok(false);
             }
-            match state.http.prompt(&state.session_id, &text).await {
-                Ok(()) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("prompt sent ({} bytes)", text.len()),
-                        ToastKind::Info,
-                    );
-                }
-                Err(e) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("send failed: {e}"),
-                        ToastKind::Error,
-                    );
-                }
+            if send_prompt_now(state, toast_deadline, &text).await {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("prompt sent ({} bytes)", text.len()),
+                    ToastKind::Info,
+                );
             }
+            Ok(false)
+        }
+        Intent::ClearQueue => {
+            if state.queue.is_empty() {
+                return Ok(false);
+            }
+            state.queue.clear();
+            set_toast(
+                state,
+                toast_deadline,
+                "queue cleared".into(),
+                ToastKind::Info,
+            );
             Ok(false)
         }
         Intent::Scroll(delta) => {
@@ -480,6 +602,120 @@ async fn reconnect_with_backoff(
     Err(last_err.expect("at least one attempt"))
 }
 
+/// The composer cursor as a plain `(row, col)` char-index tuple, the
+/// shape [`mention::active_mention`] expects.
+fn composer_cursor(state: &CockpitViewState) -> (usize, usize) {
+    let c = state.composer.cursor();
+    (c.0, c.1)
+}
+
+/// Recompute the `@`-mention picker from the composer's current text.
+/// Opens the picker when the cursor sits in a fresh `@`-token, keeps it
+/// open while the token narrows, and closes it when the token goes away
+/// or was dismissed with Esc. The query itself is never stored; it is
+/// always derived from the textarea so there is one source of truth.
+fn refresh_mention(state: &mut CockpitViewState) {
+    let active = mention::active_mention(state.composer.lines(), composer_cursor(state));
+    match active {
+        None => {
+            state.mention = None;
+            state.dismissed_mention = None;
+        }
+        Some(m) => {
+            let anchor = (m.row, m.start_col);
+            if state.dismissed_mention == Some(anchor) {
+                // Still inside the token the user dismissed; stay shut.
+                state.mention = None;
+            } else {
+                state.dismissed_mention = None;
+                let selected = state.mention.as_ref().map(|s| s.selected).unwrap_or(0);
+                state.mention = Some(MentionSession { selected });
+            }
+        }
+    }
+}
+
+/// Files currently matching the open mention's query, capped for the
+/// picker. Empty when the picker is closed or the index is not loaded.
+pub(super) fn filtered_mention_files(state: &CockpitViewState) -> Vec<String> {
+    if state.mention.is_none() {
+        return Vec::new();
+    }
+    let FileIndex::Loaded { files, .. } = &state.file_index else {
+        return Vec::new();
+    };
+    let query = mention::active_mention(state.composer.lines(), composer_cursor(state))
+        .map(|m| m.query)
+        .unwrap_or_default();
+    mention::fuzzy_filter(files, &query, mention::PICKER_LIMIT)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fetch the workspace file list the first time the picker opens, then
+/// cache it for the session. No-op once loaded, loading, or failed, and
+/// while the picker is closed.
+async fn ensure_files_loaded(state: &mut CockpitViewState, toast_deadline: &mut Option<Instant>) {
+    if state.mention.is_none() || !matches!(state.file_index, FileIndex::Unloaded) {
+        return;
+    }
+    state.file_index = FileIndex::Loading;
+    match state.http.files(&state.session_id).await {
+        Ok(resp) => {
+            state.file_index = FileIndex::Loaded {
+                files: resp.files,
+                truncated: resp.truncated,
+            };
+        }
+        Err(e) => {
+            tracing::warn!(target: "cockpit.tui", "file list fetch failed: {e}");
+            let msg = e.to_string();
+            state.file_index = FileIndex::Failed(msg.clone());
+            set_toast(
+                state,
+                toast_deadline,
+                format!("file list failed: {msg}"),
+                ToastKind::Error,
+            );
+        }
+    }
+}
+
+/// Move the picker highlight, clamped to the filtered result count.
+fn navigate_mention(state: &mut CockpitViewState, delta: i32) {
+    let len = filtered_mention_files(state).len();
+    let Some(session) = state.mention.as_mut() else {
+        return;
+    };
+    if len == 0 {
+        session.selected = 0;
+        return;
+    }
+    let cur = session.selected.min(len - 1) as i64;
+    let next = (cur + delta as i64).rem_euclid(len as i64);
+    session.selected = next as usize;
+}
+
+/// Insert the highlighted file and close the picker.
+fn accept_mention(state: &mut CockpitViewState) {
+    let files = filtered_mention_files(state);
+    let Some(session) = state.mention.as_ref() else {
+        return;
+    };
+    let Some(path) = files.get(session.selected.min(files.len().saturating_sub(1))) else {
+        // Nothing to insert (empty filter); just close.
+        state.mention = None;
+        return;
+    };
+    let path = path.clone();
+    if let Some(m) = mention::active_mention(state.composer.lines(), composer_cursor(state)) {
+        mention::apply_selection(&mut state.composer, &m, &path);
+    }
+    state.mention = None;
+    state.dismissed_mention = None;
+}
+
 fn apply_scroll(state: &mut CockpitViewState, delta: i32) {
     if delta == i32::MIN {
         state.scroll_offset = 0;
@@ -500,6 +736,55 @@ fn set_toast(
 ) {
     state.toast = Some(ToastBanner { text, kind });
     *deadline = Some(Instant::now() + TOAST_TTL);
+}
+
+/// POST one prompt to the daemon, taking the optimistic in-flight lock
+/// for the round-trip. The lock stays set on success (the WS turn-start
+/// echo clears it) so a rapid second Enter queues instead of double-
+/// firing; it is released on failure since no turn began. Returns whether
+/// the POST succeeded.
+async fn send_prompt_now(
+    state: &mut CockpitViewState,
+    toast_deadline: &mut Option<Instant>,
+    text: &str,
+) -> bool {
+    state.in_flight = true;
+    match state.http.prompt(&state.session_id, text).await {
+        Ok(()) => true,
+        Err(e) => {
+            state.in_flight = false;
+            set_toast(
+                state,
+                toast_deadline,
+                format!("send failed: {e}"),
+                ToastKind::Error,
+            );
+            false
+        }
+    }
+}
+
+/// Drain the next queued batch if the agent is idle. The batch is removed
+/// from the queue only after its POST succeeds, so a failed send leaves
+/// the prompts in place to retry (via the next turn-end edge or an empty-
+/// composer flush) instead of silently dropping them.
+async fn maybe_drain(state: &mut CockpitViewState, toast_deadline: &mut Option<Instant>) {
+    if state.is_busy() || state.queue.is_empty() {
+        return;
+    }
+    let Some((text, count)) = state.queue.next_batch(state.drain_mode) else {
+        return;
+    };
+    if send_prompt_now(state, toast_deadline, &text).await {
+        state.queue.drop_front(count);
+        let remaining = state.queue.len();
+        let msg = if remaining == 0 {
+            "queue drained".to_string()
+        } else {
+            format!("draining queue ({remaining} waiting)")
+        };
+        set_toast(state, toast_deadline, msg, ToastKind::Info);
+    }
 }
 
 fn redraw(

@@ -12,26 +12,42 @@ const DEFAULT_OUTRO = "Please address these comments.";
 const SENTINEL_PREFIX = "<!-- aoe:diff-comments:v1 ";
 const SENTINEL_SUFFIX = " -->";
 
-/** Structured payload embedded as an HTML comment at the top of the
- *  prompt body. The cockpit `UserMessage` parses it back out and
- *  renders a structured card; the agent ignores the HTML comment and
- *  reads the assembled markdown below. Base64-encoded JSON avoids any
- *  `-->` collision with snippet/body content. */
-export interface DiffCommentsSentinelPayload {
+/** Structured fields the cockpit transcript needs to render the rich
+ *  `DiffCommentsUserCard`. Produced two ways: freshly by
+ *  `buildDiffCommentsPrompt` (the typed-event send path), and by
+ *  `parseDiffCommentsSentinel` when decoding legacy prompts that still
+ *  carry the old `<!-- aoe:diff-comments:v1 ... -->` sentinel. */
+export interface DiffCommentsCardPayload {
   intro: string;
   outro: string;
   isMultiRepo: boolean;
   comments: DiffComment[];
 }
 
-function encodeSentinel(payload: DiffCommentsSentinelPayload): string {
-  const json = JSON.stringify(payload);
-  const bytes = new TextEncoder().encode(json);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]!);
-  }
-  return SENTINEL_PREFIX + btoa(bin) + SENTINEL_SUFFIX;
+/** Runtime shape guard for `DiffCommentsCardPayload`. Message metadata
+ *  arrives untyped over the wire, so callers that read it from a cast
+ *  must validate before rendering the card, which assumes `comments` is
+ *  iterable. A malformed payload returns `false` so the caller can fall
+ *  back to plain-text rendering. */
+export function isDiffCommentsCardPayload(
+  value: unknown,
+): value is DiffCommentsCardPayload {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.intro === "string" &&
+    typeof v.outro === "string" &&
+    typeof v.isMultiRepo === "boolean" &&
+    Array.isArray(v.comments)
+  );
+}
+
+/** The single build artifact for the typed diff-comments send path:
+ *  the card payload plus `assembledMarkdown`, the exact text forwarded
+ *  to the agent. Built once and used for the dialog preview, the POST
+ *  body, and the transcript card so the three can never disagree. */
+export interface BuiltDiffCommentsPrompt extends DiffCommentsCardPayload {
+  assembledMarkdown: string;
 }
 
 /** Returns the structured payload when `text` begins with our sentinel,
@@ -39,7 +55,7 @@ function encodeSentinel(payload: DiffCommentsSentinelPayload): string {
  *  falls back to plain-text rendering. */
 export function parseDiffCommentsSentinel(
   text: string,
-): DiffCommentsSentinelPayload | null {
+): DiffCommentsCardPayload | null {
   if (!text.startsWith(SENTINEL_PREFIX)) return null;
   const end = text.indexOf(SENTINEL_SUFFIX, SENTINEL_PREFIX.length);
   if (end < 0) return null;
@@ -97,15 +113,19 @@ export function buildCommentsMarkdown(
   return sections.join("\n\n---\n\n");
 }
 
-/** Assemble the full prompt body: intro + comments preview + outro.
+/** Build the typed diff-comments prompt artifact: intro + comments
+ *  preview + outro assembled into `assembledMarkdown` (the exact text
+ *  the agent receives, no sentinel), alongside the effective
+ *  intro/outro and the structured comments for the transcript card.
  *  `outro` falls back to a default if blank so the agent sees an
- *  actionable nudge. */
-export function buildFullPrompt(
+ *  actionable nudge; the returned `intro`/`outro` are these effective
+ *  values, so the persisted event matches what the agent saw. */
+export function buildDiffCommentsPrompt(
   comments: DiffComment[],
   intro: string,
   outro: string,
   opts: BuildOpts,
-): string {
+): BuiltDiffCommentsPrompt {
   const introText = intro.trim();
   const outroText = (outro.trim() || DEFAULT_OUTRO).trim();
   const sections: string[] = [];
@@ -116,15 +136,14 @@ export function buildFullPrompt(
     sections.push(commentsBlock);
   }
   sections.push(outroText);
-  const body = sections.join("\n\n") + "\n";
-  if (comments.length === 0) return body;
-  const sentinel = encodeSentinel({
+  const assembledMarkdown = sections.join("\n\n") + "\n";
+  return {
     intro: introText,
     outro: outroText,
     isMultiRepo: opts.isMultiRepo,
     comments,
-  });
-  return `${sentinel}\n${body}`;
+    assembledMarkdown,
+  };
 }
 
 function renderComment(c: DiffComment, isMultiRepo: boolean): string {

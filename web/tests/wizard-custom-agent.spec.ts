@@ -140,7 +140,7 @@ test.describe("wizard custom agent picker", () => {
     await page.getByRole("button", { name: /remote-helper/ }).click();
     await expect(
       page.getByText(
-        "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support.",
+        /Custom agents run in the terminal unless they define agent_cockpit_cmd/,
       ),
     ).toBeVisible();
     await expect(page.locator("body")).not.toContainText(hiddenBinary);

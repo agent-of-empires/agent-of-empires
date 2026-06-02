@@ -18,6 +18,7 @@ import {
   normaliseTurnCounters,
   type CockpitFrame,
   type CockpitState,
+  type ToolCall,
 } from "./cockpitTypes";
 
 function frame(seq: number, text: string): CockpitFrame {
@@ -334,6 +335,125 @@ describe("applyEvent / UserPromptSent", () => {
     expect(userPrompts.map((u) => u.text)).toEqual(["hi", "thanks"]);
     expect(messages.map((m) => m.text)).toEqual(["Hello!", "Anytime."]);
     expect(final.lastSeq).toBe(4);
+  });
+});
+
+describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
+  function diffCommentsFrame(seq: number): CockpitFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: {
+        UserDiffCommentsPrompt: {
+          intro: "Take a look:",
+          outro: "Please address these comments.",
+          isMultiRepo: true,
+          comments: [
+            {
+              id: "c-1",
+              repoName: "repoA",
+              filePath: "src/main.rs",
+              side: "new",
+              startLine: 42,
+              endLine: 45,
+              body: "rename this",
+              capturedSnippet: "fn main() {}",
+              language: "rust",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+          assembledMarkdown: "Take a look:\n\n## Diff comments\n\n...\n",
+        },
+      },
+    };
+  }
+
+  it("appends a typed user_diff_comments row carrying the structured payload", () => {
+    const next = applyEvent(emptyCockpitState(), diffCommentsFrame(1));
+    expect(next.activity).toHaveLength(1);
+    const row = next.activity[0]!;
+    expect(row.id).toBe("user-seq-1");
+    expect(row.kind).toBe("user_diff_comments");
+    // text is the assembled markdown (agent-visible body / fallback),
+    // never a base64 sentinel.
+    expect(row.text).toContain("## Diff comments");
+    expect(row.text).not.toContain("aoe:diff-comments");
+    expect(row.diffComments).toEqual({
+      intro: "Take a look:",
+      outro: "Please address these comments.",
+      isMultiRepo: true,
+      comments: [
+        {
+          id: "c-1",
+          repoName: "repoA",
+          filePath: "src/main.rs",
+          side: "new",
+          startLine: 42,
+          endLine: 45,
+          body: "rename this",
+          capturedSnippet: "fn main() {}",
+          language: "rust",
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+    expect(next.lastSeq).toBe(1);
+    expect(next.turnActive).toBe(true);
+  });
+
+  it("applies the same per-turn resets as a plain prompt", () => {
+    const stale: CockpitState = {
+      ...emptyCockpitState(),
+      assistantMessage: "stale partial reply",
+      startupError: "old error",
+      lastError: "old action error",
+      workerStopped: true,
+      workerRestarting: true,
+      agentUnresponsive: true,
+      turnActive: false,
+    };
+    const next = applyEvent(stale, diffCommentsFrame(1));
+    expect(next.assistantMessage).toBe("");
+    expect(next.startupError).toBeNull();
+    expect(next.lastError).toBeNull();
+    expect(next.workerStopped).toBe(false);
+    expect(next.workerRestarting).toBe(false);
+    expect(next.agentUnresponsive).toBe(false);
+    expect(next.turnActive).toBe(true);
+  });
+
+  it("counts as a prior user turn for SessionContextReset (#1123)", () => {
+    // A session whose only turn is a diff-comments prompt must still
+    // surface the context-reset row + arm the primer; otherwise it is
+    // wrongly treated as a 0-message session.
+    let state = applyEvent(emptyCockpitState(), diffCommentsFrame(1));
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { SessionContextReset: { reason: "session/load failed: bad id" } },
+    });
+    expect(state.activity.some((r) => r.kind === "context_reset")).toBe(true);
+    expect(state.contextPrimerAvailable).toEqual({
+      resetSeq: 2,
+      reason: "session/load failed: bad id",
+    });
+  });
+
+  it("reconstructs the diff-comments turn on replay (no optimistic row)", () => {
+    // The send dialog posts directly, so there is never a placeholder to
+    // promote; the server echo simply appends the typed row.
+    const final = [
+      diffCommentsFrame(1),
+      {
+        session_id: "s-1",
+        seq: 2,
+        event: { AgentMessageChunk: { text: "On it." } },
+      } as CockpitFrame,
+    ].reduce((state, f) => applyEvent(state, f), emptyCockpitState());
+    const rows = final.activity.filter((a) => a.kind === "user_diff_comments");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.diffComments?.comments).toHaveLength(1);
+    expect(final.lastSeq).toBe(2);
   });
 });
 
@@ -699,6 +819,51 @@ describe("applyEvent / Stopped restart_pending", () => {
   });
 });
 
+describe("applyEvent / Stopped idle_auto_stop (#1689)", () => {
+  it("sets workerIdleStopped (not workerStopped) on reason=idle_auto_stop", () => {
+    const state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    // Crucially NOT a user stop: no reconnect banner, composer stays open.
+    expect(state.workerStopped).toBe(false);
+    expect(state.workerRestarting).toBe(false);
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("clears workerIdleStopped on the next UserPromptSent (the prompt woke it)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "wake up" } },
+    });
+    expect(state.workerIdleStopped).toBe(false);
+  });
+
+  it("clears workerIdleStopped on AcpSessionAssigned (respawn handshake landed)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "idle_auto_stop" } },
+    });
+    expect(state.workerIdleStopped).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AcpSessionAssigned: { acp_session_id: "fresh-id" } },
+    });
+    expect(state.workerIdleStopped).toBe(false);
+  });
+});
+
 describe("applyEvent / WakeupScheduled lifecycle", () => {
   it("user-typed prompt mid-wait keeps the pending wakeup", () => {
     // Regression for #1091: a user-typed follow-up during the wait
@@ -737,6 +902,82 @@ describe("applyEvent / WakeupScheduled lifecycle", () => {
     });
     expect(state.nextWakeupAt).toBeNull();
     expect(state.nextWakeupReason).toBeNull();
+  });
+});
+
+describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
+  function startedTurn() {
+    // A turn must be active for cancelling to be meaningful.
+    return applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "do a thing" } },
+    });
+  }
+
+  it("CancelRequested sets cancelling + the escalation deadline", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    const state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    expect(state.cancelling).toBe(true);
+    expect(state.cancelEscalatesAt).toBe(at);
+    // Turn is still active: CancelRequested is not a Stopped.
+    expect(state.turnActive).toBe(true);
+  });
+
+  it("any Stopped clears the cancelling state", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    let state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    expect(state.cancelling).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: { reason: "user_forced" } },
+    });
+    expect(state.cancelling).toBe(false);
+    expect(state.cancelEscalatesAt).toBeNull();
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("a fresh user prompt clears a stale cancelling flag", () => {
+    const at = new Date(Date.now() + 10_000).toISOString();
+    let state = applyEvent(startedTurn(), {
+      session_id: "s-1",
+      seq: 2,
+      event: { CancelRequested: { escalates_at: at } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "next turn" } },
+    });
+    expect(state.cancelling).toBe(false);
+    expect(state.cancelEscalatesAt).toBeNull();
+  });
+
+  it("replay reconstructs cancelling from the event stream", () => {
+    // REST replay applies the same ordered events; cancelling must
+    // survive a from-scratch rebuild, not depend on a local timer.
+    const at = new Date(Date.now() + 10_000).toISOString();
+    const frames = [
+      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "go" } } },
+      {
+        session_id: "s-1",
+        seq: 2,
+        event: { CancelRequested: { escalates_at: at } },
+      },
+    ];
+    let state = emptyCockpitState();
+    for (const f of frames) state = applyEvent(state, f);
+    expect(state.cancelling).toBe(true);
+    expect(state.cancelEscalatesAt).toBe(at);
   });
 });
 
@@ -2094,5 +2335,91 @@ describe("applyEvent / ConfigOptions (#1403)", () => {
       event: "SessionCleared",
     });
     expect(state.configOptions).toHaveLength(2);
+  });
+});
+
+describe("applyEvent / thinking-state honesty (#1213)", () => {
+  // claude-agent-acp emits ThinkingStarted once per reasoning block but
+  // often skips ThinkingEnded when it transitions into tool calls or
+  // final text. Without these clears, `thinking` latches true through a
+  // whole turn and the WorkingSpinner shows "thinking" verbs while a
+  // Terminal command is actually running. See #1213.
+
+  function toolCall(id: string, name: string): ToolCall {
+    return {
+      id,
+      name,
+      kind: "execute",
+      args_preview: "{}",
+      started_at: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  it("clears thinking when a tool call starts (no ThinkingEnded from adapter)", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
+    });
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool?.name).toBe("Terminal");
+  });
+
+  it("clears thinking when assistant text starts streaming", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "Here is the answer" } },
+    });
+    expect(state.thinking).toBe(false);
+  });
+
+  it("clears thinking on Stopped so it does not leak across turns", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    expect(state.thinking).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool).toBeNull();
+  });
+
+  it("derives tool over thinking through an interleaved turn (full trace)", () => {
+    // Mirrors the affected session: ThinkingStarted, then a Terminal
+    // tool call with no intervening ThinkingEnded.
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: "ThinkingStarted",
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
+    });
+    // The WorkingSpinner derives state as tool > thinking > working.
+    expect(state.thinking).toBe(false);
+    expect(state.inFlightTool).not.toBeNull();
   });
 });

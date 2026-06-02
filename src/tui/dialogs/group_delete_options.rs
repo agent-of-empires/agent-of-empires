@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 #[derive(Clone, Debug, Default)]
@@ -25,9 +26,11 @@ pub struct GroupDeleteOptionsDialog {
     options: GroupDeleteOptions,
     focused_field: usize,
     /// Captured rect per focusable field, populated by `render`.
-    /// Drives both click (set focus + toggle) and hover (set focus
-    /// only).
+    /// Drives both click (set focus + toggle) and the hover highlight.
     focusable_rects: Vec<(usize, Rect)>,
+    /// Which field row the mouse is over, for the hover highlight.
+    /// Visual only; never moves keyboard `focused_field`.
+    hover: HoverState,
 }
 
 impl GroupDeleteOptionsDialog {
@@ -45,6 +48,7 @@ impl GroupDeleteOptionsDialog {
             options: GroupDeleteOptions::default(),
             focused_field: 0,
             focusable_rects: Vec::new(),
+            hover: HoverState::default(),
         }
     }
 
@@ -60,11 +64,13 @@ impl GroupDeleteOptionsDialog {
         Some(DialogResult::Continue)
     }
 
-    /// Hover does not change focus on the radios / checkboxes. See
-    /// `ConfirmDialog::handle_hover` for the rationale. Click still
-    /// moves focus and toggles state.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the field row under the cursor without moving keyboard
+    /// `focused_field`. See `ConfirmDialog::handle_hover` for the
+    /// rationale; click still moves focus and toggles state. Returns
+    /// `true` when the highlighted row changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let rects: Vec<Rect> = self.focusable_rects.iter().map(|(_, r)| *r).collect();
+        self.hover.update(col, row, &rects)
     }
 
     /// Mirror the Space-key branch's per-field toggle / radio logic so a
@@ -402,6 +408,14 @@ impl GroupDeleteOptionsDialog {
             Span::raw(" cancel"),
         ]);
         frame.render_widget(Paragraph::new(hints), chunks[next_chunk]);
+
+        // Paint the hover highlight last so it sits behind a row that
+        // still exists this frame (the row set shrinks when "Move" is
+        // selected, so a stale rect from a previous layout is dropped).
+        let rows: Vec<Rect> = self.focusable_rects.iter().map(|(_, r)| *r).collect();
+        if let Some(rect) = self.hover.current_in(&rows) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -753,6 +767,23 @@ mod tests {
         assert!(!dialog.options.force_delete_worktrees);
         assert!(!dialog.options.delete_branches);
         assert!(!dialog.options.delete_containers);
+    }
+
+    #[test]
+    fn hover_highlights_row_without_moving_focus() {
+        // Stage focusable rects manually; the real ones come from render().
+        let mut dialog = dialog();
+        dialog.focusable_rects = vec![(0, Rect::new(2, 4, 40, 1)), (1, Rect::new(2, 5, 40, 1))];
+        dialog.focused_field = 0;
+
+        // Over the delete row: highlight it, focus unchanged.
+        assert!(dialog.handle_hover(5, 5));
+        assert_eq!(dialog.hover.current(), Some(Rect::new(2, 5, 40, 1)));
+        assert_eq!(dialog.focused_field, 0, "hover must not move focus");
+
+        // Off all rows clears the highlight.
+        assert!(dialog.handle_hover(99, 99));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

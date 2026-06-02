@@ -13,12 +13,194 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::cockpit::approvals::Nonce;
+use crate::cockpit::event_store::AttachmentBlob;
 use crate::cockpit::protocol::{
-    ContextPrimerQuery, ContextPrimerResponse, PromptRequest, ReplayQuery, ReplayResponse,
-    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
+    ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest, FilesResponse,
+    PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse, ResolveApprovalRequest,
+    SwitchAgentRequest, SwitchAgentResponse,
 };
+use crate::cockpit::state::PromptAttachmentKind;
 use crate::cockpit::supervisor::SupervisorError;
 use crate::server::AppState;
+
+/// Maximum attachments per prompt.
+const MAX_ATTACHMENTS: usize = 8;
+/// Maximum decoded size of a single attachment (10 MiB).
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum decoded size of all attachments on one prompt (20 MiB).
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// MIME types accepted per attachment kind. Conservative on purpose:
+/// `image/svg+xml` is excluded (scriptable XML), and embedded resources
+/// are limited to inert text/document types. The image kind is also
+/// magic-byte sniffed; a declared MIME that the bytes don't back is
+/// rejected. See #1000 / #965 and the design debate.
+fn mime_allowed(kind: PromptAttachmentKind, mime: &str) -> bool {
+    match kind {
+        PromptAttachmentKind::Image => {
+            matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            )
+        }
+        PromptAttachmentKind::Audio => matches!(
+            mime,
+            "audio/mpeg" | "audio/wav" | "audio/x-wav" | "audio/webm" | "audio/ogg" | "audio/mp4"
+        ),
+        PromptAttachmentKind::Resource => matches!(
+            mime,
+            "text/plain" | "text/markdown" | "application/json" | "application/pdf"
+        ),
+    }
+}
+
+/// True if `bytes` start with a magic-number signature for a supported
+/// raster image. Guards against a client mislabeling arbitrary bytes as
+/// `image/png` to smuggle them past the allowlist.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Decode, size-check, MIME-check, magic-byte-sniff and capability-gate
+/// the uploaded attachments. Returns the decoded blobs ready to persist
+/// and forward, or an HTTP `(status, message)` to return verbatim.
+/// Runs entirely before the prompt is published so a rejected prompt
+/// never leaves a half-rendered attachment in the transcript.
+fn validate_attachments(
+    state: &AppState,
+    session_id: &str,
+    uploads: &[PromptAttachmentUpload],
+) -> Result<Vec<AttachmentBlob>, (StatusCode, String)> {
+    use base64::Engine as _;
+    if uploads.is_empty() {
+        return Ok(Vec::new());
+    }
+    if uploads.len() > MAX_ATTACHMENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many attachments (max {MAX_ATTACHMENTS})"),
+        ));
+    }
+    // Capability gate: the agent must advertise the matching prompt
+    // capability. `None` means the handshake hasn't reported caps yet;
+    // reject rather than forward bytes the agent may not accept.
+    let caps = state
+        .cockpit_event_store
+        .latest_prompt_capabilities(session_id);
+    let (image_ok, audio_ok, embedded_ok) = match caps {
+        Some(c) => c,
+        None => {
+            return Err((
+                StatusCode::CONFLICT,
+                "agent capabilities not known yet; cannot accept attachments".to_string(),
+            ))
+        }
+    };
+
+    let mut blobs = Vec::with_capacity(uploads.len());
+    let mut total = 0usize;
+    for up in uploads {
+        let kind_ok = match up.kind {
+            PromptAttachmentKind::Image => image_ok,
+            PromptAttachmentKind::Audio => audio_ok,
+            PromptAttachmentKind::Resource => embedded_ok,
+        };
+        if !kind_ok {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "the current agent does not accept {} attachments",
+                    up.kind.as_str()
+                ),
+            ));
+        }
+        if !mime_allowed(up.kind, &up.mime_type) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unsupported attachment type: {}", up.mime_type),
+            ));
+        }
+        // Reject oversized payloads before allocating the decoded buffer.
+        // base64 expands 4/3, so an encoded string longer than the
+        // encoded-equivalent of MAX_ATTACHMENT_BYTES can never fit the
+        // decoded cap; bailing here stops a client forcing a huge
+        // allocation (memory-pressure DoS). The decoded-size checks below
+        // remain as the second line of defense. The +4 covers base64
+        // rounding/padding so a legitimately max-sized blob is not rejected.
+        let encoded_limit = MAX_ATTACHMENT_BYTES / 3 * 4 + 4;
+        if up.data.len() > encoded_limit {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "attachment exceeds {} MiB limit",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(up.data.as_bytes())
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "attachment is not valid base64".to_string(),
+                )
+            })?;
+        if bytes.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "empty attachment".to_string()));
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "attachment exceeds {} MiB limit",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        if up.kind == PromptAttachmentKind::Image {
+            let Some(sniffed_mime) = sniff_image_mime(&bytes) else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "attachment bytes are not a supported image".to_string(),
+                ));
+            };
+            if sniffed_mime != up.mime_type {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "attachment MIME does not match declared content-type".to_string(),
+                ));
+            }
+        }
+        total += bytes.len();
+        if total > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "attachments exceed {} MiB total limit",
+                    MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        blobs.push(AttachmentBlob {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: up.kind,
+            mime_type: up.mime_type.clone(),
+            name: up.name.clone(),
+            data: bytes,
+        });
+    }
+    Ok(blobs)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnCockpitRequest {
@@ -115,7 +297,12 @@ pub async fn spawn_cockpit(
     let explicit = req.agent.clone().or_else(|| instance.cockpit_agent.clone());
     let agent = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, explicit.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            explicit.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
 
     let cwd = PathBuf::from(&instance.project_path);
@@ -146,9 +333,10 @@ pub async fn spawn_cockpit(
                 .into_response();
         }
     };
-    let source_profile = sandbox_info
-        .as_ref()
-        .map(|_| instance.source_profile.clone());
+    // Pass the session profile through regardless of sandboxing so the
+    // spawn path resolves agent_cockpit_cmd and worker env from the right
+    // profile for non-sandbox sessions too.
+    let source_profile = Some(instance.source_profile.clone());
     let agent_for_response = agent.clone();
     match state
         .cockpit_supervisor
@@ -240,9 +428,11 @@ pub async fn list_cockpit_agents(State(state): State<Arc<AppState>>) -> impl Int
 }
 
 /// Atomically move a cockpit session from one ACP backend to another.
-/// Used by the rate-limit recovery flow (#1282) so the user can
-/// continue a Claude-rate-limited session in `codex` (or another
-/// installed ACP backend) without losing the transcript.
+/// Two callers drive this: the rate-limit recovery flow (#1282), which
+/// hands a Claude-rate-limited session off to `codex` (or another
+/// installed backend), and explicit user-initiated switches from the
+/// composer control or `aoe cockpit switch-agent`. Both keep the
+/// transcript; only the recorded `reason` differs.
 ///
 /// Sequence:
 ///   1. Validate `target` exists in the cockpit registry.
@@ -296,7 +486,12 @@ pub async fn switch_cockpit_agent(
     };
     let from_agent = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.cockpit_agent.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
     if from_agent == target {
         return (
@@ -338,9 +533,10 @@ pub async fn switch_cockpit_agent(
                 .into_response();
         }
     };
-    let source_profile = sandbox_info
-        .as_ref()
-        .map(|_| instance.source_profile.clone());
+    // Pass the session profile through regardless of sandboxing so the
+    // spawn path resolves agent_cockpit_cmd and worker env from the right
+    // profile for non-sandbox sessions too.
+    let source_profile = Some(instance.source_profile.clone());
 
     let model = req.model.clone().or(instance.cockpit_model.clone());
     let spawn_result = state
@@ -415,11 +611,18 @@ pub async fn switch_cockpit_agent(
         }
     }
 
+    let reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("manual")
+        .to_string();
     let switch_seq = state.cockpit_supervisor.publish_agent_switched(
         &id,
         from_agent.clone(),
         target.clone(),
-        "rate_limited".into(),
+        reason,
     );
 
     Json(SwitchAgentResponse {
@@ -427,51 +630,58 @@ pub async fn switch_cockpit_agent(
         agent: target,
         before_seq,
         switch_seq,
-        status: "running",
+        status: "running".to_string(),
     })
     .into_response()
 }
 
-pub async fn cockpit_prompt(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Some(resp) = read_only_block(&state) {
-        return resp;
-    }
-    let Json(req) = match req {
-        Ok(j) => j,
-        Err(rej) => return rej.into_response(),
-    };
-    // Touch the instance before forwarding so an archived or
-    // currently-snoozed session auto-wakes the same way the tmux send
-    // path does (`/api/sessions/{id}/send`). `touch_last_accessed`
-    // clears `archived_at` and `snoozed_until` so the cockpit
-    // reconciler stops skipping the session on its next ~2s tick and
-    // respawns the worker; the frontend's queue drains as soon as the
-    // fresh `AcpSessionAssigned` lands. See #1581.
-    //
-    // The in-memory mutation and the disk persistence are both held
-    // under `state.instance_lock(&id)` so they serialize against
-    // other session-mutating endpoints (archive / snooze / pin /
-    // rename) on the same id. Without this guard, a concurrent
-    // archive PATCH could interleave with the touch and produce a
-    // lost write (archive sets archived_at = Some, touch clears it,
-    // archive's persist lands first, touch's persist lands second
-    // and overwrites the archive).
-    let inst_lock = state.instance_lock(&id).await;
+/// Auto-wake an archived, snoozed, or idle-dormant session before a
+/// prompt is forwarded, matching the tmux send path
+/// (`/api/sessions/{id}/send`). `touch_last_accessed` clears
+/// `archived_at`, `snoozed_until`, and `idle_dormant_since` so the
+/// cockpit reconciler stops skipping the session on its next ~2s tick and
+/// respawns the worker; the frontend's queue drains as soon as the fresh
+/// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
+/// auto-stopped idle workers (#1689); a worker reaped for inactivity
+/// respawns on the next prompt. See #1581.
+///
+/// The in-memory mutation and the disk persistence are both held under
+/// `state.instance_lock(&id)` so they serialize against other
+/// session-mutating endpoints (archive / snooze / pin / rename) on the
+/// same id. Without this guard, a concurrent archive PATCH could
+/// interleave with the touch and produce a lost write (archive sets
+/// archived_at = Some, touch clears it, archive's persist lands first,
+/// touch's persist lands second and overwrites the archive). The lock is
+/// dropped before the caller reaches the supervisor: publish/send take
+/// their own locks downstream and holding ours across the agent forward
+/// would serialize prompts unnecessarily and stall siblings.
+/// Returns whether the wake cleared an idle-dormant marker, so the caller
+/// can synchronously kick a background respawn (the reconciler's ~2s tick
+/// is too slow for the prompt that triggered the wake; see #1748).
+async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
+    let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
-    let triage_changed = {
+    let (triage_changed, woke_idle_dormant) = {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            let was_sunk = inst.is_archived() || inst.is_snoozed();
+            let was_idle_dormant = inst.is_idle_dormant();
+            let was_sunk = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
             if was_sunk {
                 inst.touch_last_accessed();
+                if was_idle_dormant {
+                    // Pairs with the "auto-stopped idle cockpit worker"
+                    // info log in the reconciler's reap pass (#1689) so the
+                    // stop/resume cycle is traceable in the daemon log.
+                    tracing::info!(
+                        target: "cockpit.supervisor",
+                        session = %id,
+                        "waking idle-dormant cockpit session on prompt; spawning a fresh worker"
+                    );
+                }
             }
-            was_sunk
+            (was_sunk, was_idle_dormant)
         } else {
-            false
+            (false, false)
         }
     };
     if triage_changed {
@@ -484,8 +694,8 @@ pub async fn cockpit_prompt(
                 .unwrap_or_default()
         };
         if let Ok(storage) = crate::session::Storage::new(&profile) {
-            let id_clone = id.clone();
-            let session_id_for_log = id.clone();
+            let id_clone = id.to_string();
+            let session_id_for_log = id.to_string();
             match tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
@@ -510,29 +720,222 @@ pub async fn cockpit_prompt(
             }
         }
     }
-    // Drop the per-session lock before reaching out to the
-    // supervisor. publish_user_prompt and send_prompt take their own
-    // locks downstream; holding ours across the agent forward would
-    // serialize prompts unnecessarily and stall siblings.
-    drop(_guard);
+    woke_idle_dormant
+}
+
+pub async fn cockpit_prompt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    // Decode + validate + capability-gate attachments BEFORE publishing
+    // so a rejected prompt never leaves a half-rendered attachment in
+    // the transcript (the publish path is otherwise authoritative). See
+    // #1000 / #965. Validating before the resume trigger below also
+    // avoids respawning a worker for a request we are about to reject.
+    let attachments = match validate_attachments(&state, &id, &req.attachments) {
+        Ok(a) => a,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    // Idle-dormant wake: the worker was auto-stopped for inactivity
+    // (#1689) and the reconciler will not respawn it until its next ~2s
+    // tick. Reserve the resume slot synchronously and drive a fresh spawn
+    // in a detached task NOW, so the `send_prompt` below blocks on
+    // `wait_for_worker` until the worker is live instead of racing ahead
+    // to a 404. The detached task survives this request being cancelled on
+    // client disconnect. See #1748.
+    if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
+        match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                // The session was deleted (or triaged) between the wake and
+                // the resume snapshot. Do not publish into a session that no
+                // longer exists; a 404 is the honest answer, not a retryable
+                // worker_not_ready. See #1748.
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Ok(_) => {}
+            Err(SupervisorError::CapacityFull { current, limit }) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_capacity_full ({current}/{limit})"),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_not_ready: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Publish the user's prompt into the event stream BEFORE forwarding
     // to the agent so the replay buffer / on-disk store captures it
     // even if the agent forward fails. The frontend treats UserPromptSent
     // as authoritative and dedupes against its own optimistic row.
     state
         .cockpit_supervisor
-        .publish_user_prompt(&id, req.text.clone())
+        .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
-    match state.cockpit_supervisor.send_prompt(&id, &req.text).await {
+    match state
+        .cockpit_supervisor
+        .send_prompt(&id, &req.text, &attachments)
+        .await
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            if woke_idle_dormant {
+                // The respawn we kicked above did not finish within
+                // `send_prompt`'s wait window (slow sandbox / spawn). The
+                // worker is still coming; signal a retryable typed status
+                // so the frontend keeps the prompt queued and re-fires on
+                // the next `AcpSessionAssigned`, rather than dropping it
+                // on a 404. See #1748.
+                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            }
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("prompt failed: {e}"),
         )
             .into_response(),
+    }
+}
+
+/// `POST /api/sessions/{id}/cockpit/prompt/diff-comments`: the typed
+/// successor to the diff-comments sentinel hack. The frontend sends the
+/// structured review plus the `assembled_markdown` it previewed; the
+/// server records a typed `Event::UserDiffCommentsPrompt` (so the
+/// transcript re-renders the rich card on replay) and forwards only
+/// `assembled_markdown` to the agent, so the agent never sees the old
+/// base64 sentinel noise. Mirrors `cockpit_prompt`'s auto-wake +
+/// publish-before-forward ordering.
+pub async fn cockpit_prompt_diff_comments(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<DiffCommentsPromptRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    // Idle-dormant wake: respawn synchronously-reserved + detached so the
+    // send_prompt below waits for the worker instead of 404ing. Mirrors
+    // cockpit_prompt. See #1748.
+    if woke_idle_dormant {
+        use crate::server::cockpit_reconciler::ResumeTrigger;
+        match crate::server::cockpit_reconciler::trigger_resume_background(&state, &id).await {
+            Ok(ResumeTrigger::NotFound) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Ok(_) => {}
+            Err(SupervisorError::CapacityFull { current, limit }) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_capacity_full ({current}/{limit})"),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("worker_not_ready: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // Publish the typed event BEFORE forwarding so the replay buffer /
+    // on-disk store captures the user's side even if the forward fails,
+    // matching cockpit_prompt.
+    state
+        .cockpit_supervisor
+        .publish_user_diff_comments_prompt(
+            &id,
+            req.intro,
+            req.outro,
+            req.is_multi_repo,
+            req.comments,
+            req.assembled_markdown.clone(),
+        )
+        .await;
+    match state
+        .cockpit_supervisor
+        .send_prompt(&id, &req.assembled_markdown, &[])
+        .await
+    {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(SupervisorError::UnknownSession(_)) => {
+            if woke_idle_dormant {
+                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("prompt failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Serve one persisted prompt attachment's bytes for transcript replay.
+/// Scoped by session id so a token valid for one session can't read
+/// another's blob by guessing the attachment id. Inherits the global
+/// auth middleware. See #1000 / #965.
+pub async fn cockpit_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((id, attachment_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state
+        .cockpit_event_store
+        .load_attachment(&id, &attachment_id)
+    {
+        Some((mime, bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (
+                    axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                    "nosniff".to_string(),
+                ),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "attachment not found").into_response(),
     }
 }
 
@@ -572,12 +975,6 @@ pub async fn cockpit_force_end_turn(
     StatusCode::ACCEPTED.into_response()
 }
 
-#[derive(Debug, Serialize)]
-pub struct FilesResponse {
-    pub files: Vec<String>,
-    pub truncated: bool,
-}
-
 /// List workspace files for the @-mention picker. Walks the session's
 /// project_path tree, skipping VCS/build dirs and dot-files at the
 /// top level. Capped at 5000 entries.
@@ -607,6 +1004,13 @@ pub async fn cockpit_files(
             .into_response(),
     }
 }
+
+/// Default replay page size when the client omits `limit`. Bounds the
+/// daemon's per-request buffer and response size for a long session.
+const DEFAULT_REPLAY_PAGE: usize = 1000;
+/// Hard cap on a client-requested replay page, so an oversized `limit`
+/// can't reintroduce the unbounded-buffer footprint this paging removes.
+const MAX_REPLAY_PAGE: usize = 2000;
 
 const WORKER_LOG_DEFAULT_TAIL: usize = 200;
 const WORKER_LOG_MAX_TAIL: usize = 2000;
@@ -765,11 +1169,16 @@ fn list_files(root: &std::path::Path, cap: usize) -> std::io::Result<(Vec<String
             truncated = true;
             break;
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
+        // Sort each directory's entries by name before walking them so
+        // the traversal (and therefore which files survive the `cap`) is
+        // deterministic; `read_dir` order is platform/filesystem
+        // dependent and otherwise unspecified.
+        let mut entries: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(e) => e.flatten().collect(),
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with('.') {
@@ -841,15 +1250,30 @@ pub async fn cockpit_enable(
         .into_response();
     }
 
-    // Verify the tool has an ACP-capable registry entry. Otherwise
-    // there's no agent to spawn and the swap would just produce a
-    // dead cockpit. Falls back to "tool not in registry" → 400.
+    // Verify the tool has an ACP-capable agent. Otherwise there's no
+    // agent to spawn and the swap would just produce a dead cockpit.
+    // Built-in tools resolve from the registry; a custom agent is valid
+    // when it declares an `agent_cockpit_cmd` in its profile config.
     let agent_name = state
         .cockpit_supervisor
-        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.cockpit_agent.as_deref(),
+            &profile,
+            std::path::Path::new(&instance.project_path),
+        )
         .await;
     let registry = state.cockpit_supervisor.registry_snapshot().await;
-    if registry.get(&agent_name).is_none() {
+    let resolvable = registry.get(&agent_name).is_some()
+        || state
+            .cockpit_supervisor
+            .custom_agent_has_cockpit_cmd(
+                &agent_name,
+                &profile,
+                std::path::Path::new(&instance.project_path),
+            )
+            .await;
+    if !resolvable {
         return (
             StatusCode::BAD_REQUEST,
             format!("no cockpit agent registered for tool {:?}", instance.tool),
@@ -933,7 +1357,10 @@ pub async fn cockpit_enable(
                 return;
             }
         };
-        let source_profile = sandbox_info.as_ref().map(|_| profile_for_spawn);
+        // Pass the session profile through regardless of sandboxing so the
+        // spawn path resolves agent_cockpit_cmd and worker env from the right
+        // profile for non-sandbox sessions too.
+        let source_profile = Some(profile_for_spawn);
         if let Err(e) = supervisor
             .spawn(crate::cockpit::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
@@ -992,9 +1419,12 @@ pub async fn cockpit_disable(
         .into_response();
     }
 
-    // Tear down the cockpit worker. UnknownSession is fine — the
-    // supervisor may not have a worker if startup never completed.
-    match state.cockpit_supervisor.shutdown(&id).await {
+    // Tear down the cockpit worker. Disabling cockpit mode discards the
+    // conversation (we delete on-disk history and clear the stored ACP
+    // id below), so release the agent's persisted transcript too via
+    // session/delete. UnknownSession is fine, the supervisor may not
+    // have a worker if startup never completed. See #1710.
+    match state.cockpit_supervisor.shutdown_and_delete(&id).await {
         Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
         Err(e) => {
             tracing::warn!(target: "cockpit.switch", session = %id, "shutdown cockpit failed: {e}");
@@ -1238,10 +1668,28 @@ pub async fn cockpit_replay(
     // endpoint backstops that when the in-memory ring is cold (server
     // just restarted) or the client lagged far enough to need older
     // events than the ring holds.
-    let highest_seq = state.cockpit_event_store.highest_seq(&id);
-    let lowest_seq = state.cockpit_event_store.lowest_seq(&id);
-    let entries = state.cockpit_event_store.replay_from(&id, q.since);
-    let frames: Vec<crate::server::CockpitBroadcastFrame> = entries
+    // Bound the page so neither the daemon nor the response scales with
+    // total history. Omitted `limit` falls back to the default rather
+    // than unbounded, so a naive or older client can't make the daemon
+    // buffer an entire long session. All in-repo consumers paginate via
+    // `has_more`/`next_cursor`.
+    let limit = q
+        .limit
+        .map(|l| l as usize)
+        .unwrap_or(DEFAULT_REPLAY_PAGE)
+        .clamp(1, MAX_REPLAY_PAGE);
+    // One store call returns the page and its `highest_seq`/`lowest_seq`
+    // under a single lock, so the response is a consistent snapshot and a
+    // concurrent `record()` can't desync the cap from the page rows.
+    let page = state
+        .cockpit_event_store
+        .replay_page(&id, q.since, Some(limit));
+    let highest_seq = page.highest_seq;
+    let lowest_seq = page.lowest_seq;
+    let next_cursor = page.last_scanned_seq;
+    let has_more = page.has_more;
+    let frames: Vec<crate::server::CockpitBroadcastFrame> = page
+        .events
         .into_iter()
         .map(|(seq, event)| crate::server::CockpitBroadcastFrame {
             session_id: id.clone(),
@@ -1252,7 +1700,9 @@ pub async fn cockpit_replay(
     // `lost = true` when the client's `since` cursor predates the oldest
     // seq still on disk. The retention cap can evict older events, so a
     // client that returns after a long absence may legitimately need a
-    // full reload. With no events on disk yet, nothing is lost.
+    // full reload. With no events on disk yet, nothing is lost. Computed
+    // per request so a mid-loop prune is caught on whatever page first
+    // sees the gap, not only the first.
     let lost = match lowest_seq {
         Some(lo) => q.since < lo.saturating_sub(1),
         None => false,
@@ -1262,6 +1712,8 @@ pub async fn cockpit_replay(
         lost,
         highest_seq,
         lowest_seq,
+        next_cursor,
+        has_more,
     })
     .into_response()
 }
@@ -1359,6 +1811,51 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn mime_allowlist_gates_by_kind() {
+        assert!(mime_allowed(PromptAttachmentKind::Image, "image/png"));
+        assert!(mime_allowed(PromptAttachmentKind::Image, "image/webp"));
+        // SVG is excluded on purpose (scriptable XML).
+        assert!(!mime_allowed(PromptAttachmentKind::Image, "image/svg+xml"));
+        // Cross-kind MIME is rejected.
+        assert!(!mime_allowed(PromptAttachmentKind::Image, "audio/mpeg"));
+        assert!(mime_allowed(PromptAttachmentKind::Audio, "audio/mpeg"));
+        assert!(mime_allowed(
+            PromptAttachmentKind::Resource,
+            "application/pdf"
+        ));
+        assert!(!mime_allowed(PromptAttachmentKind::Resource, "text/html"));
+    }
+
+    #[test]
+    fn image_magic_bytes_sniff() {
+        assert_eq!(
+            sniff_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_mime(b"GIF89a....."), Some("image/gif"));
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(sniff_image_mime(&webp), Some("image/webp"));
+        // A text blob mislabeled as PNG must not pass.
+        assert_eq!(sniff_image_mime(b"<svg>not an image</svg>"), None);
+        assert_eq!(sniff_image_mime(b""), None);
+    }
+
+    #[test]
+    fn image_magic_bytes_predicate() {
+        assert!(sniff_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).is_some());
+        assert!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]).is_some());
+        assert!(sniff_image_mime(b"GIF89a.....").is_some());
+        assert!(sniff_image_mime(b"<svg>not an image</svg>").is_none());
+        assert!(sniff_image_mime(b"").is_none());
+    }
+
+    #[test]
     fn read_log_tail_missing_file_returns_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.log");
@@ -1425,5 +1922,50 @@ mod tests {
         assert!(exists);
         assert_eq!(lines.last().map(String::as_str), Some("real second"));
         assert!(!lines.iter().any(|l| l == &big_line));
+    }
+
+    #[test]
+    fn list_files_returns_sorted_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("c.rs"), "").unwrap();
+
+        let (files, truncated) = list_files(dir.path(), 5000).unwrap();
+        assert_eq!(files, vec!["a.rs", "b.rs", "sub/c.rs"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn list_files_skips_vcs_build_and_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("real.rs"), "").unwrap();
+        // Dotfiles are skipped at every level, not just the top, so a
+        // nested dotfile must be dropped while its sibling is kept.
+        std::fs::write(dir.path().join("sub").join(".env"), "").unwrap();
+        for skip in [".git", "node_modules", "target"] {
+            std::fs::create_dir(dir.path().join(skip)).unwrap();
+            std::fs::write(dir.path().join(skip).join("junk"), "").unwrap();
+        }
+
+        let (files, _) = list_files(dir.path(), 5000).unwrap();
+        assert_eq!(files, vec!["keep.rs", "sub/real.rs"]);
+    }
+
+    #[test]
+    fn list_files_reports_truncation_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "").unwrap();
+        }
+        // Per-directory sorting makes the truncated subset deterministic,
+        // so we can pin the exact files, not just the count.
+        let (files, truncated) = list_files(dir.path(), 3).unwrap();
+        assert!(truncated);
+        assert_eq!(files, vec!["f0.rs", "f1.rs", "f2.rs"]);
     }
 }

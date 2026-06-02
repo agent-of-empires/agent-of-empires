@@ -37,6 +37,7 @@ const builtin: AgentInfo = {
   host_only: false,
   installed: true,
   install_hint: "",
+  acp_capable: true,
 };
 
 const custom: AgentInfo = {
@@ -46,6 +47,19 @@ const custom: AgentInfo = {
   host_only: false,
   installed: true,
   install_hint: "Configured custom agent",
+  acp_capable: false,
+};
+
+// A custom agent with an agent_cockpit_cmd configured: the server marks
+// it acp_capable, so the wizard offers cockpit instead of the terminal.
+const cockpitCustom: AgentInfo = {
+  kind: "custom",
+  name: "oc-superpowers",
+  binary: "oc-superpowers",
+  host_only: false,
+  installed: true,
+  install_hint: "Configured custom agent",
+  acp_capable: true,
 };
 
 const uninstalledBuiltin: AgentInfo = {
@@ -55,6 +69,7 @@ const uninstalledBuiltin: AgentInfo = {
   host_only: false,
   installed: false,
   install_hint: "brew install x",
+  acp_capable: false,
 };
 
 function renderAgentStep(overrides: {
@@ -102,24 +117,35 @@ describe("AgentStep custom-agent selection (#1252)", () => {
     expect(queryByText("No agents installed")).toBeNull();
   });
 
-  it("renders the custom-agent substrate notice when the selected agent is kind=custom", () => {
+  it("renders the terminal-fallback notice for a custom agent with no agent_cockpit_cmd", () => {
     const { getByText } = renderAgentStep({
       tool: "remote-helper",
       agents: [builtin, custom],
     });
-    expect(
-      getByText(
-        "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support.",
-      ),
-    ).toBeTruthy();
+    expect(getByText(/Custom agents run in the terminal unless they define agent_cockpit_cmd/)).toBeTruthy();
   });
 
-  it("renders the ACP substrate notice when the selected agent is a built-in with ACP support", () => {
-    const { getByText } = renderAgentStep({
+  it("renders the cockpit substrate card for a custom agent that is acp_capable", () => {
+    // A custom agent with agent_cockpit_cmd (acp_capable=true) must offer
+    // cockpit, not the terminal fallback.
+    const { getByRole, getByText, queryByText } = renderAgentStep({
+      tool: "oc-superpowers",
+      agents: [builtin, cockpitCustom],
+    });
+    expect(getByRole("switch", { name: "Use cockpit" })).toBeTruthy();
+    expect(getByText(/Renders the agent's plan, tool calls, and diffs/)).toBeTruthy();
+    expect(queryByText(/Custom agents run in the terminal/)).toBeNull();
+  });
+
+  it("renders the interactive cockpit toggle when the selected agent is a built-in with ACP support", () => {
+    const { getByRole, getByText } = renderAgentStep({
       tool: "claude",
       agents: [builtin, custom],
     });
-    expect(getByText(/Cockpit is enabled/)).toBeTruthy();
+    // The ACP-capable case now renders CockpitSubstrateCard (an
+    // interactive switch defaulting on) rather than a read-only notice.
+    expect(getByRole("switch", { name: "Use cockpit" })).toBeTruthy();
+    expect(getByText(/Renders the agent's plan/)).toBeTruthy();
   });
 
   it("clicking an agent button calls onChange with the agent name", () => {
@@ -282,6 +308,7 @@ describe("ReviewStep agent row (#1252)", () => {
         onSubmit={() => {}}
         onJumpTo={() => {}}
         steps={[{ id: "agent", label: "Agent" }] as Parameters<typeof ReviewStep>[0]["steps"]}
+        cockpitMasterEnabled={false}
       />,
     );
   }

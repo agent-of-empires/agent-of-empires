@@ -49,7 +49,7 @@ async fn shim_agent_round_trips_prompt() {
         .expect("spawn shim agent");
 
     client
-        .send_prompt("hello smoke")
+        .send_prompt("hello smoke", &[])
         .await
         .expect("send_prompt");
 
@@ -169,7 +169,7 @@ async fn shim_agent_round_trips_approval_allow() {
         .expect("spawn shim agent");
 
     client
-        .send_prompt("REQUEST_PERMISSION please")
+        .send_prompt("REQUEST_PERMISSION please", &[])
         .await
         .expect("send_prompt");
 
@@ -265,7 +265,7 @@ async fn shim_agent_round_trips_fs() {
         .expect("spawn shim");
 
     client
-        .send_prompt("FS_READ_WRITE please")
+        .send_prompt("FS_READ_WRITE please", &[])
         .await
         .expect("send_prompt");
 
@@ -335,7 +335,7 @@ async fn shim_agent_round_trips_terminal() {
         .expect("spawn shim");
 
     client
-        .send_prompt("TERMINAL_RUN please")
+        .send_prompt("TERMINAL_RUN please", &[])
         .await
         .expect("send_prompt");
 
@@ -483,7 +483,7 @@ async fn shim_agent_emits_rate_limit_event() {
         .expect("spawn shim agent");
 
     client
-        .send_prompt("trigger RATE_LIMIT now")
+        .send_prompt("trigger RATE_LIMIT now", &[])
         .await
         .expect("send_prompt");
 

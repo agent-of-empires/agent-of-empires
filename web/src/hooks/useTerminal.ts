@@ -13,6 +13,8 @@ import type {
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
 import { useWebSettings } from "./useWebSettings";
+import { TerminalTiming } from "../lib/terminalTiming";
+import type { TimingPingMessage, TimingPongMessage } from "../lib/types";
 
 // Client-side terminal WS debug logging is gated behind a runtime flag
 // so production users don't get a console full of lifecycle chatter.
@@ -47,6 +49,26 @@ const twarn = (...args: unknown[]) => {
   console.warn("[terminal.ws]", ...args);
 };
 
+// Keystroke-to-echo latency instrumentation, gated on its own
+// `?debug=terminal-timing` flag (separate from the `?debug=1` logging
+// gate above). When off, none of the timing code runs and no probe
+// traffic is sent, so normal sessions pay nothing. See #1453.
+const TERMINAL_TIMING_ENABLED = (() => {
+  if (typeof window === "undefined") return false;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("debug") === "terminal-timing";
+  } catch {
+    return false;
+  }
+})();
+// Cadence of the WS control-path ping while timing is enabled. 500ms
+// gives ~120 samples/min, enough for p90 over a debug session without
+// looking abusive on metered links.
+const TIMING_PING_INTERVAL_MS = 500;
+// How often the rolling p50/p95 summary is logged to the console.
+const TIMING_SUMMARY_INTERVAL_MS = 10000;
+
 // Fast-start retry schedule: 200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s. Total
 // to exhaustion ~22s vs the old exponential ladder's ~91s. The old 1s/30s
 // curve magnified first-session-open pain when tmux warm-up briefly bounced
@@ -69,6 +91,14 @@ const DEFAULT_FONT_SIZE = 14;
 const MOBILE_BREAKPOINT_PX = 768;
 const WHEEL_ZOOM_SENSITIVITY = 0.05;
 const WHEEL_PERSIST_DEBOUNCE_MS = 400;
+// How long, after a drag-select releases, to wait for tmux's OSC 52
+// clipboard escape to arrive over the WS before giving up. The escape is
+// emitted by tmux's copy-selection on mouse release and round-trips through
+// the PTY relay, so it lands a frame or two after `mouseup`. See #1499.
+const OSC52_CLIPBOARD_TIMEOUT_MS = 500;
+// Pointer travel (px) below which a press/release is treated as a click, not
+// a drag, so a plain focus click doesn't arm a clipboard write.
+const DRAG_COPY_THRESHOLD_PX = 4;
 const RESIZE_DEBOUNCE_MS = 50;
 // First-resize debounce: longer than the steady-state value so the
 // initial layout transition (sidebar mount, splitter snap, font swap)
@@ -223,6 +253,18 @@ export function useTerminal(
     const container = containerRef.current;
     container.innerHTML = "";
 
+    // Latency instrumentation lives for the lifetime of this terminal and
+    // is exposed on `window.__aoeTiming` so an operator can call
+    // `window.__aoeTiming.dump()` to pull raw samples for offline
+    // analysis. Null (and entirely inert) unless the flag is set.
+    const timing = TERMINAL_TIMING_ENABLED ? new TerminalTiming() : null;
+    let timingPingTimer: ReturnType<typeof setInterval> | null = null;
+    let timingSummaryTimer: ReturnType<typeof setInterval> | null = null;
+    if (timing) {
+      (window as Window & { __aoeTiming?: TerminalTiming }).__aoeTiming =
+        timing;
+    }
+
     const isMobileViewport = () => window.innerWidth < MOBILE_BREAKPOINT_PX;
     const readFontSize = () =>
       isMobileViewport() ? settings.mobileFontSize : settings.desktopFontSize;
@@ -261,6 +303,59 @@ export function useTerminal(
     term.loadAddon(new WebLinksAddon());
 
     term.open(termEl);
+
+    // Select-to-copy bridge. tmux owns text selection here: mouse-mode is on
+    // (src/tmux/utils.rs) so a drag drives tmux copy-mode, which is the only
+    // way to select across the scrollback boundary given xterm's
+    // `scrollback: 0`. On copy, tmux (`set-clipboard on`) emits an OSC 52
+    // clipboard escape, but xterm.js has no built-in OSC 52 handler, so the
+    // payload was dropped on the floor and select-to-copy silently failed
+    // after the wterm -> xterm.js swap. We decode it and write it to the
+    // system clipboard. The escape arrives asynchronously over the WS, after
+    // the `mouseup` that triggered the copy, so a bare
+    // `navigator.clipboard.writeText()` is rejected for lacking a user
+    // gesture; `armClipboardCopy()` below pre-arms a gesture-bound
+    // `ClipboardItem` promise that this handler resolves. See #1499.
+    let osc52Resolve: ((text: string) => void) | null = null;
+    // Monotonic arm counter: each drag-arm captures its own seq so a
+    // stale timeout from a prior arm cannot null out a newer arm's
+    // resolver (which would make the next OSC 52 miss the gesture-bound
+    // path). See #1499.
+    let osc52ArmSeq = 0;
+    const writeClipboardText = (text: string) => {
+      navigator.clipboard?.writeText(text).catch((err) => {
+        // Expected on browsers that won't honor an async write without a
+        // live user gesture (notably Firefox, which lacks promise-valued
+        // ClipboardItem). Best-effort; logged, not surfaced.
+        tdbg("clipboard writeText failed", err);
+      });
+    };
+    term.parser.registerOscHandler(52, (data) => {
+      // Payload shape: "<targets>;<base64>" where targets is e.g. "c"
+      // (clipboard), "p" (primary), or "cp". A lone "?" in the data half is
+      // a paste query we don't answer.
+      const sep = data.indexOf(";");
+      if (sep === -1) return true;
+      const encoded = data.slice(sep + 1);
+      if (encoded === "" || encoded === "?") return true;
+      let text: string;
+      try {
+        const bin = atob(encoded);
+        const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+        text = new TextDecoder().decode(bytes);
+      } catch (err) {
+        tdbg("osc52 decode failed", err);
+        return true;
+      }
+      if (osc52Resolve) {
+        osc52Resolve(text);
+        osc52Resolve = null;
+      } else {
+        // Not a user drag (e.g. the agent itself ran a copy); write directly.
+        writeClipboardText(text);
+      }
+      return true;
+    });
 
     // Mobile soft-keyboard Backspace autorepeat arrives as a stream of
     // `beforeinput` events (inputType "deleteContentBackward", with keydown
@@ -320,9 +415,14 @@ export function useTerminal(
     // so the terminal still works there.
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        timing?.setRenderer("dom");
+        webgl.dispose();
+      });
       term.loadAddon(webgl);
+      timing?.setRenderer("webgl");
     } catch (err) {
+      timing?.setRenderer("dom");
       tdbg("webgl addon unavailable, using DOM renderer", err);
     }
 
@@ -603,11 +703,29 @@ export function useTerminal(
           setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
         }
         if (event.data instanceof ArrayBuffer) {
-          term.write(new Uint8Array(event.data));
+          const bytes = new Uint8Array(event.data);
+          const token = timing?.onBinaryFrame(performance.now());
+          if (token) {
+            // This frame resolved an armed keystroke; capture the time
+            // through xterm's render completion as well as socket arrival.
+            term.write(bytes, () => timing!.onRender(token, performance.now()));
+          } else {
+            term.write(bytes);
+          }
         } else if (typeof event.data === "string") {
           // Check for server control messages before writing to terminal
           try {
             const msg = JSON.parse(event.data) as { type?: string };
+            if (msg.type === "timing_pong") {
+              const pong = msg as TimingPongMessage;
+              timing?.onPong(
+                pong.seq,
+                pong.client_t,
+                pong.server_busy_us,
+                performance.now(),
+              );
+              return;
+            }
             if (msg.type === "primary_status") {
               const status = msg as PrimaryStatusMessage;
               setState((prev) => ({ ...prev, isPrimary: status.is_primary }));
@@ -705,6 +823,10 @@ export function useTerminal(
       // Ctrl equivalents (Ctrl+A = 0x01, Ctrl+U = 0x15, etc.).
       term.onData((data: string) => {
         if (ws.readyState !== WebSocket.OPEN) return;
+        // Arm an Idle-TTFB sample for this keystroke. Arming (not the
+        // exact byte) is all the tracker needs; it only records when the
+        // terminal was idle and resolves on the next inbound frame.
+        timing?.onKeystroke(performance.now());
         if (ctrlActiveRef.current && data.length === 1) {
           const code = data.toUpperCase().charCodeAt(0);
           if (code >= 65 && code <= 90) {
@@ -721,6 +843,34 @@ export function useTerminal(
     // Kick off the connection. xterm.js's open() is synchronous so we
     // can dial the WS immediately after construction.
     connect();
+
+    // Drive the control-path ping and the periodic console summary. Both
+    // exist only when timing is enabled. The ping measures pure WS round
+    // trip (never reaches the PTY); the summary logs rolling percentiles
+    // so an operator watching the console sees attribution without
+    // dumping. makePing skips while a keystroke sample is armed so the
+    // probe never contends with the experiential measurement.
+    if (timing) {
+      timingPingTimer = setInterval(() => {
+        const ws = wsRef.current;
+        timing.pruneTimeouts(performance.now());
+        if (ws?.readyState !== WebSocket.OPEN) return;
+        const ping = timing.makePing(performance.now());
+        if (ping) {
+          ws.send(
+            JSON.stringify({
+              type: "timing_ping",
+              seq: ping.seq,
+              client_t: ping.client_t,
+            } as TimingPingMessage),
+          );
+        }
+      }, TIMING_PING_INTERVAL_MS);
+      timingSummaryTimer = setInterval(() => {
+        timing.pruneTimeouts(performance.now());
+        console.info(timing.summaryLine());
+      }, TIMING_SUMMARY_INTERVAL_MS);
+    }
 
     // Touch swipe emits SGR mouse-wheel escape sequences to the PTY
     // so tmux mouse-mode enters copy-mode and scrolls.
@@ -1155,6 +1305,84 @@ export function useTerminal(
     };
     viewport.addEventListener("click", onClickCapture, true);
 
+    // Arm a clipboard write tied to the synchronous `mouseup` that ends a
+    // drag-select, so the OSC 52 escape tmux emits asynchronously over the WS
+    // keeps the browser's user-gesture authorization (see the OSC 52 handler
+    // registered after term.open). A promise-valued ClipboardItem is the
+    // gesture-preserving path (Safari/Chromium); browsers without it
+    // (Firefox) fall back to a best-effort writeText, which may be blocked.
+    // See #1499.
+    const armClipboardCopy = () => {
+      const armSeq = ++osc52ArmSeq;
+      let settled = false;
+      const finish = () => {
+        settled = true;
+        // Only retract the shared resolver if it still belongs to this
+        // arm; a later drag may have already installed its own.
+        if (osc52ArmSeq === armSeq) osc52Resolve = null;
+      };
+      try {
+        if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+          const pending = new Promise<Blob>((resolve, reject) => {
+            osc52Resolve = (text) => {
+              if (settled || osc52ArmSeq !== armSeq) return;
+              finish();
+              resolve(new Blob([text], { type: "text/plain" }));
+            };
+            setTimeout(() => {
+              if (settled || osc52ArmSeq !== armSeq) return;
+              finish();
+              reject(new Error("osc52 clipboard timeout"));
+            }, OSC52_CLIPBOARD_TIMEOUT_MS);
+          });
+          // Attach our own rejection handler so a timeout never surfaces as an
+          // unhandled rejection if the clipboard implementation drops the
+          // promise (the write() consumer below also sees it; both fire).
+          pending.catch(() => {});
+          navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {
+            // Rejected when no OSC 52 arrived within the timeout (drag
+            // selected nothing) or the engine declined the async write.
+            // Harmless.
+          });
+          return;
+        }
+      } catch {
+        // Promise-valued ClipboardItem unsupported (Firefox); fall through to
+        // the best-effort writeText path below.
+      }
+      osc52Resolve = (text) => {
+        if (settled || osc52ArmSeq !== armSeq) return;
+        finish();
+        writeClipboardText(text);
+      };
+      setTimeout(() => {
+        if (!settled && osc52ArmSeq === armSeq) finish();
+      }, OSC52_CLIPBOARD_TIMEOUT_MS);
+    };
+    let mouseDownPoint: { x: number; y: number } | null = null;
+    const onMouseDownCapture = (e: MouseEvent) => {
+      if (e.button === 0) mouseDownPoint = { x: e.clientX, y: e.clientY };
+    };
+    const onWindowMouseUp = (e: MouseEvent) => {
+      const start = mouseDownPoint;
+      mouseDownPoint = null;
+      if (e.button !== 0 || !start) return;
+      // Threshold filters plain focus clicks; only a real drag (which tmux
+      // turns into a copy-mode selection) should arm a clipboard write.
+      if (
+        Math.hypot(e.clientX - start.x, e.clientY - start.y) <
+        DRAG_COPY_THRESHOLD_PX
+      ) {
+        return;
+      }
+      armClipboardCopy();
+    };
+    // mousedown on the viewport so only drags that begin inside the terminal
+    // count; mouseup on the window so a release outside the terminal bounds
+    // (the user dragged past the top edge into scrollback) still arms.
+    viewport.addEventListener("mousedown", onMouseDownCapture, { capture: true });
+    window.addEventListener("mouseup", onWindowMouseUp, { capture: true });
+
     // Mouse wheel: Ctrl+wheel = zoom (trackpad pinch), plain wheel =
     // scroll. tmux manages its own scrollback via mouse-mode escape
     // sequences, so we always synthesize SGR wheel sequences and emit
@@ -1297,6 +1525,10 @@ export function useTerminal(
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);
       viewport.removeEventListener("touchcancel", onTouchEnd, touchOpts);
       viewport.removeEventListener("click", onClickCapture, true);
+      viewport.removeEventListener("mousedown", onMouseDownCapture, {
+        capture: true,
+      });
+      window.removeEventListener("mouseup", onWindowMouseUp, { capture: true });
       viewport.removeEventListener("wheel", onWheelCapture, true);
       xtermTextarea?.removeEventListener("beforeinput", onBeforeInput, {
         capture: true,
@@ -1304,6 +1536,12 @@ export function useTerminal(
       if (wheelPersistTimer) clearTimeout(wheelPersistTimer);
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (fontSizeRaf !== null) cancelAnimationFrame(fontSizeRaf);
+      if (timingPingTimer) clearInterval(timingPingTimer);
+      if (timingSummaryTimer) clearInterval(timingSummaryTimer);
+      if (timing) {
+        const w = window as Window & { __aoeTiming?: TerminalTiming };
+        if (w.__aoeTiming === timing) delete w.__aoeTiming;
+      }
       // Detach handlers BEFORE closing so the soon-to-fire onclose closure
       // can't schedule a retry that races the next session's connect path.
       // Without this, the old onclose runs after cleanup, calls setTimeout

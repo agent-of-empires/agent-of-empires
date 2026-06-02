@@ -153,7 +153,7 @@ async fn silent_orphan_fires_on_cost_then_silence() {
 
     let mut client = client;
     client
-        .send_prompt("SILENT_ORPHAN trigger")
+        .send_prompt("SILENT_ORPHAN trigger", &[])
         .await
         .expect("send prompt");
 
@@ -218,7 +218,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
     // and returns stopReason=end_turn. The watchdog must stay silent
     // and the natural prompt_complete must win.
     client
-        .send_prompt("normal turn")
+        .send_prompt("normal turn", &[])
         .await
         .expect("send prompt");
 
@@ -276,7 +276,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
 
     let mut client = client;
     client
-        .send_prompt("SILENT_ORPHAN trigger")
+        .send_prompt("SILENT_ORPHAN trigger", &[])
         .await
         .expect("send prompt");
 
@@ -334,7 +334,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
 
     let mut client = client;
     client
-        .send_prompt("ASYNC_AGENT_ORPHAN trigger")
+        .send_prompt("ASYNC_AGENT_ORPHAN trigger", &[])
         .await
         .expect("send prompt");
 
@@ -393,7 +393,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
 
     let mut client = client;
     client
-        .send_prompt("BACKGROUND_BASH_ORPHAN trigger")
+        .send_prompt("BACKGROUND_BASH_ORPHAN trigger", &[])
         .await
         .expect("send prompt");
 
@@ -446,7 +446,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
 
     let mut client = client;
     client
-        .send_prompt("WAKEUP_ORPHAN trigger")
+        .send_prompt("WAKEUP_ORPHAN trigger", &[])
         .await
         .expect("send prompt");
 

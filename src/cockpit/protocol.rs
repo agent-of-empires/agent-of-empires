@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::approvals::ApprovalDecision;
-use super::state::Event;
+use super::state::{DiffComment, Event, PromptAttachmentKind};
 
 /// One frame on the per-AppState cockpit broadcast channel: the cockpit
 /// session id plus the typed cockpit Event. Subscribed WebSocket
@@ -64,10 +64,52 @@ impl<'de> Deserialize<'de> for CockpitBroadcastFrame {
     }
 }
 
+/// One attachment as the web composer uploads it: the raw base64 bytes
+/// inline in the prompt POST. This is the untrusted request shape; the
+/// server decodes it, sniffs the magic bytes, enforces size/MIME/count
+/// caps and the agent's capability gate, then maps it to an ACP
+/// `ContentBlock` for the agent and a metadata-only
+/// `PromptAttachmentRef` for replay. Bytes never reach the event log.
+/// See #1000 / #965.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptAttachmentUpload {
+    pub kind: PromptAttachmentKind,
+    pub mime_type: String,
+    /// Standard base64 (no `data:` URL prefix). The client strips the
+    /// prefix before sending.
+    pub data: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// `POST /api/sessions/{id}/cockpit/prompt` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub text: String,
+    /// `#[serde(default)]` so text-only clients (and the TUI cockpit
+    /// verb) keep working unchanged.
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachmentUpload>,
+}
+
+/// `POST /api/sessions/{id}/cockpit/prompt/diff-comments` body.
+///
+/// The "Send diff comments" dialog sends the structured review (so the
+/// transcript can re-render the rich card) alongside `assembled_markdown`,
+/// the exact WYSIWYG prompt the user approved in the preview. The server
+/// forwards `assembled_markdown` to the agent verbatim and records both
+/// in an `Event::UserDiffCommentsPrompt`. The frontend owns markdown
+/// assembly (sort, headings, code-fence sizing, repo prefixes); the
+/// server does not re-derive it, so the card payload and the agent-visible
+/// text can never disagree.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffCommentsPromptRequest {
+    pub intro: String,
+    pub outro: String,
+    pub is_multi_repo: bool,
+    pub comments: Vec<DiffComment>,
+    pub assembled_markdown: String,
 }
 
 /// `POST /api/sessions/{id}/cockpit/approvals/{nonce}` body.
@@ -120,6 +162,12 @@ pub struct ReplayQuery {
     /// strictly newer than this. Defaults to 0 (full replay).
     #[serde(default)]
     pub since: u64,
+    /// Max frames to return in this page. Omitted falls back to the
+    /// server's default page size; the server also clamps to a hard
+    /// max. Clients paginate by passing the previous response's
+    /// `next_cursor` back as `since` while `has_more` is true.
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 /// `GET /api/sessions/{id}/cockpit/replay` response.
@@ -141,6 +189,28 @@ pub struct ReplayResponse {
     /// retention window in status output and detect mid-flight prunes.
     #[serde(default)]
     pub lowest_seq: Option<u64>,
+    /// Cursor to pass back as `since` for the next page: the highest
+    /// seq this page consumed (including rows that failed to
+    /// deserialise, so a corrupt row can't stall a paging loop).
+    /// `None` for an empty page. Only meaningful with `has_more`.
+    #[serde(default)]
+    pub next_cursor: Option<u64>,
+    /// True when more events exist beyond this page within the store.
+    /// Clients keep paging (advancing `since` to `next_cursor`) while
+    /// this is set. Always false for an unbounded (`limit`-less) reply.
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// `GET /api/sessions/{id}/cockpit/files` response. Workspace file
+/// list for the composer's `@`-mention picker, walked from the
+/// session's project root and capped at 5000 entries.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FilesResponse {
+    /// Relative paths (POSIX-style), sorted.
+    pub files: Vec<String>,
+    /// True when the walk hit the 5000-entry cap and stopped early.
+    pub truncated: bool,
 }
 
 /// `GET /api/sessions/{id}/cockpit/context-primer?before_seq=N` query.
@@ -186,6 +256,13 @@ pub struct SwitchAgentRequest {
     /// back to the instance's existing `cockpit_model`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Why the switch happened, recorded verbatim in the `AgentSwitched`
+    /// event and surfaced in the transcript divider. The rate-limit
+    /// recovery flow sends `"rate_limited"`; an explicit user-initiated
+    /// switch (composer control, `aoe cockpit switch-agent`) sends
+    /// `"manual"`. Defaults to `"manual"` when omitted.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/cockpit/switch-agent` response.
@@ -204,12 +281,37 @@ pub struct SwitchAgentResponse {
     /// recovery composer prefill so the divider, state-clear, and
     /// primer prefill all land in order.
     pub switch_seq: u64,
-    pub status: &'static str,
+    /// Owned so the client side can deserialize the response (a
+    /// `&'static str` field is not `DeserializeOwned`).
+    pub status: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_request_defaults_attachments_when_absent() {
+        // Text-only clients (and the CLI/TUI cockpit HTTP client) send
+        // `{"text":"..."}` with no attachments key; it must deserialise.
+        let req: PromptRequest = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
+        assert_eq!(req.text, "hello");
+        assert!(req.attachments.is_empty());
+    }
+
+    #[test]
+    fn prompt_attachment_upload_roundtrips() {
+        let req: PromptRequest = serde_json::from_str(
+            r#"{"text":"see this","attachments":[{"kind":"image","mime_type":"image/png","data":"aGk=","name":"a.png"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.attachments.len(), 1);
+        let att = &req.attachments[0];
+        assert_eq!(att.kind, PromptAttachmentKind::Image);
+        assert_eq!(att.mime_type, "image/png");
+        assert_eq!(att.data, "aGk=");
+        assert_eq!(att.name.as_deref(), Some("a.png"));
+    }
 
     #[test]
     fn broadcast_frame_roundtrips_through_json() {
@@ -238,5 +340,44 @@ mod tests {
         let body = serde_json::json!({ "decision": "Allow" });
         let parsed: ResolveApprovalRequest = serde_json::from_value(body).unwrap();
         assert!(matches!(parsed.decision, ApprovalDecisionWire::Allow));
+    }
+
+    #[test]
+    fn switch_agent_request_optional_fields_default_to_none() {
+        // A bare body (the rate-limit recovery modal's original shape)
+        // still deserializes; model and reason are optional.
+        let body = serde_json::json!({ "target": "codex" });
+        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.target, "codex");
+        assert!(parsed.model.is_none());
+        assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn switch_agent_request_carries_reason() {
+        let body = serde_json::json!({ "target": "claude", "reason": "manual" });
+        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn replay_query_defaults_limit_when_absent() {
+        // A pre-pagination client sends `{"since":N}` with no `limit`;
+        // the `#[serde(default)]` must keep it parsing (None = server
+        // default page).
+        let query: ReplayQuery = serde_json::from_str(r#"{"since":42}"#).unwrap();
+        assert_eq!(query.since, 42);
+        assert_eq!(query.limit, None);
+    }
+
+    #[test]
+    fn replay_response_defaults_paging_fields_when_absent() {
+        // A pre-pagination response body has no `next_cursor`/`has_more`;
+        // newer clients must still deserialize it with sane defaults.
+        let response: ReplayResponse =
+            serde_json::from_str(r#"{"frames":[],"lost":false,"highest_seq":0,"lowest_seq":null}"#)
+                .unwrap();
+        assert_eq!(response.next_cursor, None);
+        assert!(!response.has_more);
     }
 }

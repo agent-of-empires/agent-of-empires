@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../lib/acpCapableTools";
+import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { StepIndicator } from "./StepIndicator";
@@ -190,6 +190,10 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
+    const selectedAgentAcpCapable = isAcpCapable(
+      d.tool,
+      state.agents.find((a) => a.name === d.tool)?.acp_capable,
+    );
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the
@@ -217,12 +221,18 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Cockpit is auto-on for ACP-capable tools when the master
-      // switch is on; non-ACP tools and a disabled master switch
-      // both fall back to tmux. The server re-applies the master
-      // switch (see src/server/api/sessions.rs), so a tampered
-      // client request can't escalate cockpit on.
-      cockpit_mode: cockpitMasterEnabled && ACP_CAPABLE_TOOLS.has(d.tool),
+      // Cockpit runs only when the master switch is on, the agent is
+      // ACP-capable, and the user kept the per-session toggle on
+      // (default). Capability comes from the server's per-agent
+      // `acp_capable` flag (including custom agents with an
+      // `agent_cockpit_cmd`) with hardcoded fallback while loading. The
+      // server re-resolves capability and re-applies the master switch
+      // (see src/server/api/sessions.rs), so a tampered request can't
+      // escalate cockpit on for a non-capable agent.
+      cockpit_mode:
+        cockpitMasterEnabled &&
+        selectedAgentAcpCapable &&
+        d.useCockpit,
       scratch: d.scratch || undefined,
     };
     const result = await createSession(body);
@@ -260,7 +270,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} />;
+        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} />;
       default:
         return null;
     }

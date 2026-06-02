@@ -19,6 +19,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 use crate::update::{get_cached_releases, ReleaseInfo};
 
@@ -26,6 +27,12 @@ pub struct ChangelogDialog {
     scroll_offset: usize,
     display_lines: Vec<DisplayLine>,
     dialog_area: Rect,
+    /// Rect of the `[Got it]` button, captured during `render`. A click
+    /// anywhere dismisses, but the button is the call to action, so it
+    /// picks up the hover highlight to read as clickable.
+    got_it_button_area: Rect,
+    /// Whether the cursor is over `[Got it]`, for the hover highlight.
+    hover: HoverState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +98,8 @@ impl ChangelogDialog {
             scroll_offset: 0,
             display_lines,
             dialog_area: Rect::default(),
+            got_it_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
@@ -107,6 +116,14 @@ impl ChangelogDialog {
         } else {
             None
         }
+    }
+
+    /// Highlight the `[Got it]` button when the cursor is over it. A
+    /// click anywhere still dismisses via `handle_click`; this only
+    /// signals the call to action. Returns `true` when the highlight
+    /// changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(col, row, &[self.got_it_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -196,14 +213,31 @@ impl ChangelogDialog {
             "  j/k scroll".to_string()
         };
 
+        const GOT_IT_WIDTH: u16 = 8; // "[Got it]"
+        let button_area = chunks[1];
+        // The button line is "[Got it]" + scroll_hint, centered as one
+        // unit; mirror that centering to capture just the "[Got it]"
+        // cells for the hover highlight.
+        let line_width = GOT_IT_WIDTH + scroll_hint.chars().count() as u16;
+        self.got_it_button_area = if button_area.width >= line_width {
+            let got_it_x = button_area.x + (button_area.width - line_width) / 2;
+            Rect::new(got_it_x, button_area.y, GOT_IT_WIDTH, 1)
+        } else {
+            Rect::default()
+        };
+
         let button = Line::from(vec![
             Span::styled("[Got it]", Style::default().fg(theme.accent).bold()),
             Span::styled(scroll_hint, Style::default().fg(theme.dimmed)),
         ]);
         frame.render_widget(
             Paragraph::new(button).alignment(Alignment::Center),
-            chunks[1],
+            button_area,
         );
+
+        if let Some(rect) = self.hover.current_in(&[self.got_it_button_area]) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -516,7 +550,23 @@ mod tests {
             scroll_offset: 0,
             display_lines: lines,
             dialog_area: Rect::default(),
+            got_it_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    #[test]
+    fn hover_highlights_got_it_button() {
+        let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
+        dialog.got_it_button_area = Rect::new(10, 20, 8, 1);
+
+        // Over [Got it]: highlight it.
+        assert!(dialog.handle_hover(12, 20));
+        assert_eq!(dialog.hover.current(), Some(dialog.got_it_button_area));
+
+        // Off the button clears the highlight.
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

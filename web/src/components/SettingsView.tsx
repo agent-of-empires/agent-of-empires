@@ -149,6 +149,18 @@ export function SettingsView({
   // clobber it. See #1383 (profile-settings-isolation / settings-
   // tmux-* flakes).
   const [selectedProfile, setSelectedProfile] = useState("");
+  // Bumped only on a user-initiated profile switch (the header picker), never
+  // on the mount-time fetchProfiles resolution that flips selectedProfile from
+  // its "" seed to the default. The content fieldset keys its remount on this
+  // epoch (plus activeTab), so resolving the initial profile no longer remounts
+  // mid-interaction and collapses a just-expanded "Advanced" fold. Genuine
+  // profile switches still remount (reset folds, clear half-typed drafts, break
+  // sibling-tab reconciliation), which is what user story #4 wants.
+  const [profileEpoch, setProfileEpoch] = useState(0);
+  const handleSelectProfile = useCallback((profile: string) => {
+    setSelectedProfile(profile);
+    setProfileEpoch((e) => e + 1);
+  }, []);
   const sidebar = buildSidebar();
   const tabs = sidebar.filter(
     (s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab",
@@ -488,7 +500,7 @@ export function SettingsView({
         saving={saving}
         saveError={saveError}
         selectedProfile={selectedProfile}
-        onSelectProfile={setSelectedProfile}
+        onSelectProfile={handleSelectProfile}
       />
 
       {/* Mobile tabs (horizontal scroll) */}
@@ -552,15 +564,19 @@ export function SettingsView({
                 {OFFLINE_TITLE}: toggles will not save while disconnected.
               </div>
             )}
-            {/* Keying on tab + profile remounts the content subtree on either
-                switch, which resets every component-local <CollapsibleSection>
-                "Advanced" fold back to collapsed (user story #4) and clears any
-                half-typed field draft so it cannot blur-commit into the wrong
-                profile. It also breaks React reconciliation between sibling
-                tabs that share the same root element shape, e.g. sandbox and
-                worktree both rendering <div className="space-y-4">. */}
+            {/* Keying on tab + profileEpoch remounts the content subtree on a
+                tab switch or a user-initiated profile switch, which resets every
+                component-local <CollapsibleSection> "Advanced" fold back to
+                collapsed (user story #4) and clears any half-typed field draft so
+                it cannot blur-commit into the wrong profile. It also breaks React
+                reconciliation between sibling tabs that share the same root
+                element shape, e.g. sandbox and worktree both rendering <div
+                className="space-y-4">. profileEpoch (not selectedProfile) is used
+                so the mount-time fetchProfiles resolution that flips
+                selectedProfile from its "" seed to the default does not remount
+                mid-interaction and collapse a just-expanded fold. */}
             <fieldset
-              key={`${activeTab}-${selectedProfile}`}
+              key={`${activeTab}-${profileEpoch}`}
               disabled={offline}
               className="space-y-5 disabled:opacity-50 border-0 m-0 p-0 min-w-0"
             >
@@ -773,6 +789,17 @@ function CockpitSettings({
           }
           min={0}
           onChange={(v) => onSaveField("cockpit", "silent_orphan_fast_grace_secs", v)}
+        />
+        <NumberField
+          label="Auto-stop idle workers (s)"
+          description="Seconds of inactivity (no cockpit events, no in-flight turn) after which the daemon stops an idle cockpit worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Cockpit workers only. Persists to config.toml as cockpit.auto_stop_idle_secs; cross-device. See #1689."
+          value={
+            typeof cockpit.auto_stop_idle_secs === "number"
+              ? (cockpit.auto_stop_idle_secs as number)
+              : 0
+          }
+          min={0}
+          onChange={(v) => onSaveField("cockpit", "auto_stop_idle_secs", v)}
         />
       </CollapsibleSection>
 

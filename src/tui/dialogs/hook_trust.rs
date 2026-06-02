@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::session::{repo_config, HooksConfig};
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct HookTrustDialog {
@@ -21,6 +22,9 @@ pub struct HookTrustDialog {
     trust_button_area: Rect,
     skip_button_area: Rect,
     cancel_button_area: Rect,
+    /// Which button the mouse is over, for the hover highlight. Visual
+    /// only; never changes `selected`.
+    hover: HoverState,
 }
 
 /// Result from the hook trust dialog.
@@ -52,6 +56,7 @@ impl HookTrustDialog {
             trust_button_area: Rect::default(),
             skip_button_area: Rect::default(),
             cancel_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
@@ -73,10 +78,19 @@ impl HookTrustDialog {
         None
     }
 
-    /// Hover does not change the Trust/Skip selection. See
-    /// `ConfirmDialog::handle_hover` for the rationale.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the button under the cursor without changing the
+    /// Trust/Skip selection. See `ConfirmDialog::handle_hover` for the
+    /// rationale. Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(
+            col,
+            row,
+            &[
+                self.trust_button_area,
+                self.skip_button_area,
+                self.cancel_button_area,
+            ],
+        )
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<HookTrustAction> {
@@ -248,6 +262,14 @@ impl HookTrustDialog {
             Paragraph::new(buttons).alignment(Alignment::Center),
             button_area,
         );
+
+        if let Some(rect) = self.hover.current_in(&[
+            self.trust_button_area,
+            self.skip_button_area,
+            self.cancel_button_area,
+        ]) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -336,6 +358,32 @@ mod tests {
         assert!(dialog.selected);
         dialog.handle_key(key(KeyCode::Tab));
         assert!(!dialog.selected);
+    }
+
+    #[test]
+    fn hover_highlights_button_without_changing_selection() {
+        // Stage button rects manually; the real ones come from render().
+        let mut dialog = test_dialog();
+        dialog.trust_button_area = Rect::new(2, 5, 17, 1);
+        dialog.skip_button_area = Rect::new(23, 5, 10, 1);
+        dialog.cancel_button_area = Rect::new(37, 5, 14, 1);
+        assert!(!dialog.selected);
+
+        // Over Trust: highlight it, selection unchanged.
+        assert!(dialog.handle_hover(3, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.trust_button_area));
+        assert!(
+            !dialog.selected,
+            "hover must not flip the Trust/Skip selection"
+        );
+
+        // Cancel is clickable, so it highlights too.
+        assert!(dialog.handle_hover(38, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
+
+        // Off all buttons clears the highlight.
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

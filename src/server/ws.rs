@@ -885,6 +885,10 @@ async fn handle_terminal_ws(
                     .await;
                 }
                 Message::Text(text) => {
+                    // Stamp arrival before parse so a timing_ping can report
+                    // the server's own parse-to-enqueue cost. Cheap, and text
+                    // control frames are rare (not per-keystroke).
+                    let text_recv = Instant::now();
                     // JSON control messages (resize, activate) are always allowed
                     if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
                         match control {
@@ -999,6 +1003,22 @@ async fn handle_terminal_ws(
                                     &this_ws_paused_for_recv,
                                 )
                                 .await;
+                            }
+                            ControlMessage::TimingPing { seq, client_t } => {
+                                // Bounce straight back over the control
+                                // channel. Never touches the PTY, never
+                                // logs (a sub-second cadence would flood the
+                                // log). server_busy_us captures parse +
+                                // dispatch + serialize on this task.
+                                let pong = TimingPong {
+                                    kind: "timing_pong",
+                                    seq,
+                                    client_t,
+                                    server_busy_us: text_recv.elapsed().as_micros() as u64,
+                                };
+                                if let Ok(text) = serde_json::to_string(&pong) {
+                                    let _ = ctrl_tx_for_recv.send(text).await;
+                                }
                             }
                         }
                     } else if !read_only {
@@ -1360,6 +1380,27 @@ enum ControlMessage {
     /// `pause_output`. SIGCONT to a non-stopped process is a no-op.
     #[serde(rename = "resume_output")]
     ResumeOutput,
+    /// Latency probe from the web terminal under `?debug=terminal-timing`.
+    /// Bounced straight back as a `timing_pong` over the control channel,
+    /// never reaching the PTY. `client_t` is an opaque client timestamp
+    /// echoed unchanged so the browser can compute the round trip. The
+    /// variant is always parseable but only exercised by debug clients, so
+    /// normal sessions pay nothing beyond one extra serde tag. See #1453.
+    #[serde(rename = "timing_ping")]
+    TimingPing { seq: u64, client_t: f64 },
+}
+
+/// Server reply to a [`ControlMessage::TimingPing`]. `server_busy_us` is
+/// this handler's own parse-to-enqueue duration, so the client can
+/// subtract it from the observed round trip to isolate network plus
+/// WebSocket transit without any client/server clock sync. See #1453.
+#[derive(serde::Serialize)]
+struct TimingPong {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u64,
+    client_t: f64,
+    server_busy_us: u64,
 }
 
 #[cfg(test)]
@@ -1464,6 +1505,35 @@ mod tests {
     #[test]
     fn parse_pane_dead_all_dead_is_dead() {
         assert_eq!(parse_pane_dead_output("1\n1\n1\n"), PaneReadiness::Dead);
+    }
+
+    #[test]
+    fn timing_ping_deserializes() {
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"timing_ping","seq":7,"client_t":1234.5}"#).unwrap();
+        match msg {
+            ControlMessage::TimingPing { seq, client_t } => {
+                assert_eq!(seq, 7);
+                assert_eq!(client_t, 1234.5);
+            }
+            _ => panic!("expected TimingPing"),
+        }
+    }
+
+    #[test]
+    fn timing_pong_serializes_with_type_tag() {
+        let pong = TimingPong {
+            kind: "timing_pong",
+            seq: 7,
+            client_t: 1234.5,
+            server_busy_us: 42,
+        };
+        let json = serde_json::to_string(&pong).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "timing_pong");
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["client_t"], 1234.5);
+        assert_eq!(parsed["server_busy_us"], 42);
     }
 
     #[tokio::test]

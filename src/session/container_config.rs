@@ -1219,7 +1219,11 @@ pub(crate) fn build_container_config(
                         let result = if agent.name == "codex" {
                             crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
                         } else {
-                            crate::hooks::install_hooks(&settings_file, hook_cfg.events)
+                            crate::hooks::install_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
                         };
                         if let Err(e) = result {
                             tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);

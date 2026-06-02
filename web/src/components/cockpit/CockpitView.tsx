@@ -41,7 +41,7 @@ import {
 import { Composer } from "./Composer";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
-import { RateLimitRecoveryModal } from "./RateLimitRecoveryModal";
+import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import {
   isQueuedPromptLong,
@@ -56,12 +56,16 @@ import {
   TodoGroupCard,
 } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
-import { parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
+import {
+  isDiffCommentsCardPayload,
+  parseDiffCommentsSentinel,
+} from "../diff/comments/buildPrompt";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
   VERB_INTERVAL_MS,
   chooseVerb,
+  deriveSpinnerState,
 } from "../../lib/cockpitRattle";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
 import {
@@ -166,6 +170,8 @@ function CockpitChrome({
   manualReconnect,
   resolveApproval,
   sendPrompt,
+  pendingAttachments,
+  setPendingAttachments,
   forceEndTurn,
   lastActivityRef,
   dismissError,
@@ -397,6 +403,8 @@ function CockpitChrome({
                 <WorkingSpinner
                   thinking={state.thinking}
                   tool={state.inFlightTool?.name ?? null}
+                  cancelling={state.cancelling}
+                  cancelEscalatesAt={state.cancelEscalatesAt}
                   lastActivityRef={lastActivityRef}
                   onForceEndTurn={forceEndTurn}
                 />
@@ -458,6 +466,7 @@ function CockpitChrome({
 
           <Composer
             sessionId={sessionId}
+            currentAgent={state.agent}
             availableModes={state.availableModes}
             currentModeId={state.currentModeId}
             legacyMode={state.mode}
@@ -470,6 +479,9 @@ function CockpitChrome({
             turnActive={state.turnActive}
             queuedCount={state.queuedPrompts.length}
             enqueuePrompt={sendPrompt}
+            promptCapabilities={state.promptCapabilities}
+            pendingAttachments={pendingAttachments}
+            setPendingAttachments={setPendingAttachments}
             primerPrefill={primerPrefill}
           />
         </div>
@@ -492,11 +504,22 @@ function UserMessage() {
   );
 }
 
-/** Text-part renderer for user messages. Detects the diff-comments
- *  sentinel header (prepended by `buildFullPrompt`) and swaps in the
- *  structured `DiffCommentsUserCard`; falls back to the classic chat
- *  bubble otherwise. */
+/** Text-part renderer for user messages. Renders the structured
+ *  `DiffCommentsUserCard` for diff-comments prompts: from the typed
+ *  event payload carried on the message metadata (see #1123) for new
+ *  prompts, or from the decoded base64 sentinel for legacy persisted
+ *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
+  const typedPayload = useMessage(
+    (m) =>
+      (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments,
+  );
+  if (isDiffCommentsCardPayload(typedPayload)) {
+    return <DiffCommentsUserCard payload={typedPayload} />;
+  }
+  // Legacy fallback: older prompts carry the structured data in a
+  // base64 sentinel at the top of the text body. Decode + render the
+  // same card. Kept until those persisted events age out of the log.
   const payload = parseDiffCommentsSentinel(text);
   if (payload) {
     return <DiffCommentsUserCard payload={payload} />;
@@ -951,11 +974,15 @@ function formatElapsed(seconds: number): string {
 export function WorkingSpinner({
   thinking,
   tool,
+  cancelling,
+  cancelEscalatesAt,
   lastActivityRef,
   onForceEndTurn,
 }: {
   thinking: boolean;
   tool: string | null;
+  cancelling: boolean;
+  cancelEscalatesAt: string | null;
   lastActivityRef: React.RefObject<number>;
   onForceEndTurn: () => Promise<void>;
 }) {
@@ -999,11 +1026,28 @@ export function WorkingSpinner({
     return () => window.clearInterval(t);
   }, [lastActivityRef]);
 
-  const state: "thinking" | "tool" | "working" = thinking
-    ? "thinking"
-    : tool
-      ? "tool"
-      : "working";
+  // Live countdown to the cancel-escalation deadline while cancelling, so
+  // "Stopping…" shows when the worker will be force-restarted. Computed in
+  // an effect (not render) to keep the render pure. See #1727.
+  const [escalatesInSecs, setEscalatesInSecs] = useState<number | null>(null);
+  useEffect(() => {
+    if (!cancelEscalatesAt) {
+      setEscalatesInSecs(null);
+      return;
+    }
+    const target = new Date(cancelEscalatesAt).getTime();
+    if (Number.isNaN(target)) {
+      setEscalatesInSecs(null);
+      return;
+    }
+    const tick = () =>
+      setEscalatesInSecs(Math.max(0, Math.ceil((target - Date.now()) / 1000)));
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => window.clearInterval(t);
+  }, [cancelEscalatesAt]);
+
+  const state = deriveSpinnerState(thinking, tool);
   // Swap the rattle verb for an explicit "waiting on model" badge
   // with a live elapsed counter once the inactivity gap is clearly
   // longer than normal TTFT. The user can then distinguish "model
@@ -1013,12 +1057,21 @@ export function WorkingSpinner({
   // #1112.
   const showStalled = stalledSecs >= forceEndTurnThresholdSecs;
   const toolInFlight = tool != null;
-  const label = showStalled
-    ? toolInFlight
-      ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
-      : `Waiting on model… ${formatElapsed(stalledSecs)}`
-    : chooseVerb(state, seed, tool);
-  const showForceEnd = showStalled && !toolInFlight;
+  const label = cancelling
+    ? escalatesInSecs != null && escalatesInSecs > 0
+      ? `Stopping… (force in ${escalatesInSecs}s)`
+      : "Stopping…"
+    : showStalled
+      ? toolInFlight
+        ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
+        : `Waiting on model… ${formatElapsed(stalledSecs)}`
+      : chooseVerb(state, seed, tool);
+  // A cancel is in flight: show the escape hatch even with a tool in
+  // flight (the runaway loop IS a tool in flight). The legacy
+  // force-end-turn button stays scoped to !toolInFlight so #1176's
+  // anti-flicker rule for normal Task-subagent gaps is untouched.
+  const showForceStop = cancelling;
+  const showForceEnd = !cancelling && showStalled && !toolInFlight;
 
   return (
     <div className="flex flex-col gap-2 text-sm italic text-text-muted">
@@ -1031,13 +1084,24 @@ export function WorkingSpinner({
         </span>
         <span>{label}</span>
       </div>
-      {showForceEnd ? (
+      {showForceStop ? (
         <button
           type="button"
           onClick={() => {
             void onForceEndTurn();
           }}
-          className="self-start text-xs not-italic px-2 py-1 rounded-md border border-surface-700 bg-surface-800 text-text-secondary hover:bg-surface-700 hover:text-text-primary cursor-pointer"
+          className="self-start h-8 text-xs not-italic px-2 py-1 rounded-md border border-surface-700 bg-surface-800 text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
+          title="The agent is ignoring the stop request. Force stop restarts the agent now (it resumes from the saved transcript; partial in-flight tool output is lost)."
+        >
+          Force stop
+        </button>
+      ) : showForceEnd ? (
+        <button
+          type="button"
+          onClick={() => {
+            void onForceEndTurn();
+          }}
+          className="self-start h-8 text-xs not-italic px-2 py-1 rounded-md border border-surface-700 bg-surface-800 text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
           title={`No streaming activity for ${stalledSecs}s. Clears the spinner and sends a best-effort cancel to the agent.`}
         >
           Force end turn
@@ -1185,12 +1249,13 @@ export function RateLimitRecoverySection({
   return (
     <>
       {children({ onSwitchAgent: () => setOpen(true) })}
-      <RateLimitRecoveryModal
+      <SwitchAgentModal
         open={open}
         sessionId={sessionId}
         currentAgent={currentAgent}
         onClose={() => setOpen(false)}
         onPrefill={onPrefill}
+        trigger="rate_limit"
       />
     </>
   );

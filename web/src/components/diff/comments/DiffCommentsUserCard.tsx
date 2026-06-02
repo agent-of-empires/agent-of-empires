@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
-import type { DiffCommentsSentinelPayload } from "./buildPrompt";
+import type { DiffCommentsCardPayload } from "./buildPrompt";
 import type { DiffComment } from "./types";
 import {
   ensureThemeLoaded,
@@ -11,13 +11,14 @@ import {
 import { useShikiTheme } from "../../../hooks/useShikiTheme";
 
 interface Props {
-  payload: DiffCommentsSentinelPayload;
+  payload: DiffCommentsCardPayload;
 }
 
 /** Rich rendering of a diff-comments prompt in the cockpit user-message
- *  slot. Built from the sentinel payload that `buildFullPrompt`
- *  prepends to the prompt body. Falls back to the raw text rendering
- *  upstream when the sentinel is missing or malformed. */
+ *  slot. Built from the typed `UserDiffCommentsPrompt` event (carried on
+ *  the assistant-ui message metadata) or, for legacy prompts, from the
+ *  decoded sentinel payload. Falls back to raw text rendering upstream
+ *  when neither is present. */
 export function DiffCommentsUserCard({ payload }: Props) {
   const { intro, outro, isMultiRepo, comments } = payload;
   const sorted = [...comments].sort(compareComments);

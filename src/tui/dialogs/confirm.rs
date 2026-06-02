@@ -7,6 +7,7 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::components::buttons::render_yes_no;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
+use crate::tui::components::hover::HoverState;
 use crate::tui::styles::Theme;
 
 /// The dialog's emphasis color. Destructive confirmations (delete, stop,
@@ -31,6 +32,9 @@ pub struct ConfirmDialog {
     dont_ask_again: Option<bool>,
     yes_button_area: Rect,
     no_button_area: Rect,
+    /// Which Yes/No button the mouse is over, for the hover highlight.
+    /// Visual only; never changes `selected`.
+    hover: HoverState,
 }
 
 impl ConfirmDialog {
@@ -44,6 +48,7 @@ impl ConfirmDialog {
             dont_ask_again: None,
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
     }
 
@@ -82,12 +87,15 @@ impl ConfirmDialog {
         None
     }
 
-    /// Hover does not change the Yes/No selection. Otherwise the mouse
-    /// drifting over the opposite button between the user reading the
-    /// prompt and pressing Enter would silently flip which action
-    /// fires. Click commits explicitly via `handle_click`.
-    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
-        false
+    /// Highlight the Yes/No button under the cursor. Hover does not
+    /// change `selected`: otherwise the mouse drifting over the opposite
+    /// button between the user reading the prompt and pressing Enter
+    /// would silently flip which action fires. Click commits explicitly
+    /// via `handle_click`. Returns `true` when the highlighted button
+    /// changed so the caller can redraw.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.yes_button_area, self.no_button_area])
     }
 
     pub fn action(&self) -> &str {
@@ -176,7 +184,8 @@ impl ConfirmDialog {
                 CheckboxStyle::confirm(theme),
             );
             frame.render_widget(Paragraph::new(line), chunks[2]);
-            let (yes, no) = render_yes_no(frame, chunks[4], theme, self.selected);
+            let (yes, no) =
+                render_yes_no(frame, chunks[4], theme, self.selected, self.hover.current());
             self.yes_button_area = yes;
             self.no_button_area = no;
         } else {
@@ -187,7 +196,8 @@ impl ConfirmDialog {
                 .split(inner);
 
             self.render_message(frame, chunks[0], theme);
-            let (yes, no) = render_yes_no(frame, chunks[1], theme, self.selected);
+            let (yes, no) =
+                render_yes_no(frame, chunks[1], theme, self.selected, self.hover.current());
             self.yes_button_area = yes;
             self.no_button_area = no;
         }

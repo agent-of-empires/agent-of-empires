@@ -77,6 +77,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe cockpit cancel`↴](#aoe-cockpit-cancel)
 * [`aoe cockpit tail`↴](#aoe-cockpit-tail)
 * [`aoe cockpit attach`↴](#aoe-cockpit-attach)
+* [`aoe cockpit switch-agent`↴](#aoe-cockpit-switch-agent)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
 * [`aoe completion`↴](#aoe-completion)
@@ -983,6 +984,7 @@ Cockpit (ACP-based native agent rendering) management
 * `cancel` — Cancel the in-flight prompt for a cockpit session
 * `tail` — Stream the cockpit broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
+* `switch-agent` — Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
 
 
 
@@ -1180,6 +1182,23 @@ Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAE
 ###### **Arguments:**
 
 * `<SESSION>` — Cockpit session id
+
+
+
+## `aoe cockpit switch-agent`
+
+Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+
+**Usage:** `aoe cockpit switch-agent [OPTIONS] <SESSION> <TARGET>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Cockpit session id
+* `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
+
+###### **Options:**
+
+* `--model <MODEL>` — Optional model override forwarded to the new agent
 
 
 
