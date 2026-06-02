@@ -188,3 +188,58 @@ describe("cockpit cache eviction (#1345)", () => {
     expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-a`)).toBe("draft");
   });
 });
+
+describe("persistState strips attachment-bearing queued rows (#1833)", () => {
+  it("drops queued rows that carry attachments and writes no base64 bytes", () => {
+    const state = {
+      ...emptyCockpitState(),
+      queuedPrompts: [
+        { id: "q1", text: "plain text", queuedAt: "2026-01-01T00:00:00.000Z" },
+        {
+          id: "q2",
+          text: "with image",
+          queuedAt: "2026-01-01T00:00:01.000Z",
+          attachments: [
+            {
+              kind: "image" as const,
+              mimeType: "image/png",
+              dataB64: "QUJDREVG",
+              name: "shot.png",
+            },
+          ],
+        },
+      ],
+    };
+
+    persistState("sess-strip", state);
+
+    const raw = window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-strip`);
+    expect(raw).not.toBeNull();
+    // The base64 payload must never reach localStorage (quota invariant).
+    expect(raw).not.toContain("QUJDREVG");
+
+    const parsed = JSON.parse(raw!) as {
+      state: { queuedPrompts: Array<{ id: string; attachments?: unknown }> };
+    };
+    // Only the text-only row survives persistence; the attachment row is
+    // dropped entirely so reload never drains a degraded prompt.
+    expect(parsed.state.queuedPrompts).toHaveLength(1);
+    expect(parsed.state.queuedPrompts[0]?.id).toBe("q1");
+  });
+
+  it("leaves a fully text-only queue untouched (no needless clone)", () => {
+    const state = {
+      ...emptyCockpitState(),
+      queuedPrompts: [
+        { id: "q1", text: "a", queuedAt: "2026-01-01T00:00:00.000Z" },
+      ],
+    };
+    persistState("sess-textonly", state);
+    const raw = window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-textonly`);
+    const parsed = JSON.parse(raw!) as {
+      state: { queuedPrompts: Array<{ id: string }> };
+    };
+    expect(parsed.state.queuedPrompts).toHaveLength(1);
+    expect(parsed.state.queuedPrompts[0]?.id).toBe("q1");
+  });
+});

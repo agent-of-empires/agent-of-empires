@@ -46,6 +46,32 @@ describe("cockpitHookReducer / queue actions", () => {
     }
   });
 
+  it("enqueue_prompt carries attachments onto the queued row (#1833)", () => {
+    const s1 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "with image",
+      attachments: [
+        { kind: "image", mimeType: "image/png", dataB64: "aA==", name: "x.png" },
+      ],
+    });
+    expect(s1.queuedPrompts[0]?.attachments).toHaveLength(1);
+    expect(s1.queuedPrompts[0]?.attachments?.[0]?.name).toBe("x.png");
+  });
+
+  it("enqueue_prompt omits the attachments key for a text-only send", () => {
+    const s1 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "text only",
+    });
+    expect(s1.queuedPrompts[0]?.attachments).toBeUndefined();
+    const s2 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "empty list",
+      attachments: [],
+    });
+    expect(s2.queuedPrompts[0]?.attachments).toBeUndefined();
+  });
+
   it("dequeue_prompt removes the matching entry by id", () => {
     const s1 = cockpitHookReducer(emptyCockpitState(), {
       kind: "enqueue_prompt",
@@ -201,6 +227,13 @@ describe("combineQueuedPrompts (combined drain mode)", () => {
 
   it("returns a single entry unchanged for a one-item queue", () => {
     expect(combineQueuedPrompts([mk("a", "only one")])).toBe("only one");
+  });
+
+  it("skips empty (attachment-only) entries so no stray blank lines appear (#1833)", () => {
+    expect(combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")])).toBe(
+      "before\n\nafter",
+    );
+    expect(combineQueuedPrompts([mk("a", ""), mk("b", "")])).toBe("");
   });
 });
 
@@ -559,10 +592,11 @@ describe("useCockpit drain race (#1144)", () => {
     );
   });
 
-  it("keeps the error banner on a worker_not_ready 503 for an attachment send (#1748)", async () => {
-    // Attachments cannot be re-queued (the local queue is text-only), so a
-    // worker_not_ready 503 for an attachment send has no retry path. The
-    // banner must show rather than being suppressed as transient.
+  it("re-queues an attachment send without an error banner on a worker_not_ready 503 (#1833)", async () => {
+    // The local queue now carries attachments in memory, so a
+    // worker_not_ready 503 for an attachment send has a retry path: park
+    // it (image included) and suppress the banner, exactly like a
+    // text-only send. The drain re-fires it once the worker comes online.
     const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
     await flushAsync();
     const ws = sockets[0]!;
@@ -597,9 +631,139 @@ describe("useCockpit drain race (#1144)", () => {
     });
     await flushAsync();
 
-    expect(result.current.state.lastError ?? "").toContain(
-      "Could not send prompt (503)",
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
     );
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
+    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.attachments?.[0]?.name).toBe(
+      "shot.png",
+    );
+  });
+
+  it("queues an attachment send mid-turn instead of dropping it (#1833)", async () => {
+    // The bug: sending an image while the agent is still producing the
+    // previous turn surfaced an error and the composer cleared the image,
+    // losing it. It must queue like text and drain on Stopped.
+    const { result } = renderHook(() => useCockpit("sess-attach-midturn"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // Kick a turn so turnActive flips on.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-midturn",
+          seq: 1,
+          event: { UserPromptSent: { text: "kicker" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.turnActive).toBe(true);
+
+    // Send an image while the turn is active.
+    await act(async () => {
+      await result.current.sendPrompt("look at this", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "shot.png",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    // No POST yet, no error banner, and the image is parked on the queue.
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
+    );
+    expect(result.current.state.lastError ?? "").not.toContain("Attachments");
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
+
+    // End the turn: the drain fires and the POST carries the attachment.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-midturn",
+          seq: 2,
+          event: { Stopped: { reason: "prompt_complete" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    const sent = JSON.parse(promptPostBodies[0]!) as {
+      text: string;
+      attachments: Array<{ name?: string; data: string }>;
+    };
+    expect(sent.text).toBe("look at this");
+    expect(sent.attachments).toHaveLength(1);
+    expect(sent.attachments[0]?.name).toBe("shot.png");
+    expect(sent.attachments[0]?.data).toBe("aA==");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("combined-mode drain merges attachments from every queued row into one POST (#1833)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-attach-combined"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-combined",
+          seq: 1,
+          event: { UserPromptSent: { text: "kicker" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    act(() => {
+      void result.current.sendPrompt("first", [
+        { kind: "image", mimeType: "image/png", dataB64: "aA==", name: "a.png" },
+      ]);
+    });
+    act(() => {
+      void result.current.sendPrompt("second", [
+        { kind: "image", mimeType: "image/png", dataB64: "bB==", name: "b.png" },
+      ]);
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(2);
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-combined",
+          seq: 2,
+          event: { Stopped: { reason: "prompt_complete" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    const sent = JSON.parse(promptPostBodies[0]!) as {
+      text: string;
+      attachments: Array<{ name?: string }>;
+    };
+    expect(sent.text).toBe("first\n\nsecond");
+    expect(sent.attachments.map((a) => a.name)).toEqual(["a.png", "b.png"]);
     expect(result.current.state.queuedPrompts).toEqual([]);
   });
 

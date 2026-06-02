@@ -108,6 +108,7 @@ import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
+import { Tooltip } from "./Tooltip";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1937,17 +1938,6 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   );
 });
 
-function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
-  return (
-    <span className="relative group/tip inline-flex">
-      {children}
-      <span className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-full mt-1.5 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary whitespace-nowrap opacity-0 scale-95 transition-all duration-100 group-hover/tip:opacity-100 group-hover/tip:scale-100 z-50">
-        {text}
-      </span>
-    </span>
-  );
-}
-
 function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   return (
     ws.displayName.toLowerCase().includes(q) ||
@@ -2385,7 +2375,7 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           open ? "translate-x-0" : "-translate-x-full md:hidden"
         }`}
       >
@@ -2501,7 +2491,7 @@ export function WorkspaceSidebar({
           />
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
@@ -2808,6 +2798,40 @@ export function WorkspaceSidebar({
               <p className="text-sm text-text-muted">
                 No matches for &ldquo;{filterQuery}&rdquo;
               </p>
+            </div>
+          )}
+
+          {!hasResults && !filterQuery && (
+            <div
+              className="px-4 py-10 text-center"
+              data-testid="sidebar-empty-state"
+            >
+              <p className="text-sm font-medium text-text-secondary">
+                No sessions yet
+              </p>
+              <p className="mt-1 text-[13px] text-text-muted">
+                Create a session to start working in a repo.
+              </p>
+              <button
+                onClick={onNew}
+                disabled={offline}
+                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                New session
+              </button>
             </div>
           )}
         </div>

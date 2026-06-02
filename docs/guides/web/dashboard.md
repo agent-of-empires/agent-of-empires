@@ -12,7 +12,8 @@ auth, see the [Web Dashboard overview](../web-dashboard.md).
 
 - **Workspace sidebar** (left) lists every session grouped by repo, with
   a live status glyph per row. On phones it collapses behind a toggle in
-  the top bar.
+  the top bar. With no sessions yet, the sidebar shows a short hint and a
+  **New session** button that opens the wizard.
 - **Main pane** shows the selected session: the agent terminal (or
   cockpit view), with the diff and paired terminal reachable from the
   top bar.
@@ -57,9 +58,11 @@ open settings, start a new session, toggle the right panel. It is the
 fastest path to anything the dashboard can do without reaching for the
 mouse.
 
-## First-run tutorial
+## First-run onboarding
 
-The first time you open the dashboard in a browser, an interactive walkthrough launches automatically and highlights the major regions: the command bar, the workspace sidebar, how to start a session, settings, and (inside a session) the diff panel and composer. Each step lists the keyboard shortcuts that apply to it, and every step has a **Skip** button so you can dismiss the whole tour in one click.
+The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else, so you can set the look of the dashboard and TUI right away. Picking a theme applies it live and saves it to your default profile; you can switch between themes as many times as you like, then click **Continue**. You can always change the theme later from Settings, under Appearance. The card is skipped in read-only mode (where it cannot save) and for anyone who already finished the tutorial in an earlier version. Dismissing it records a per-browser `aoe-welcome-seen` flag in `localStorage` so it does not show again.
+
+After the theme card, an interactive walkthrough launches automatically and highlights the major regions: the command bar, the workspace sidebar, how to start a session, settings, and (inside a session) the diff panel and composer. Each step lists the keyboard shortcuts that apply to it, and every step has a **Skip** button so you can dismiss the whole tour in one click.
 
 Completing or skipping the tour records that you have seen it on the server (the `app_state.has_seen_web_tour` flag in your config), so it does not launch again on reload, and it does not re-launch when you open the dashboard in a different browser or on another device pointed at the same server. (If you upgraded from an older build that tracked this per browser, your existing local flag is migrated to the server on first load, so you are not shown the tour again.) Debug builds on port 8081 and release builds on port 8080 use separate config, so they still track it separately.
 

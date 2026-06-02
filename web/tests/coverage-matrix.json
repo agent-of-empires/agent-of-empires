@@ -490,6 +490,17 @@
       ]
     },
     {
+      "id": "wizard.cockpit-mode-creation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/wizard-cockpit-create-session.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+      ]
+    },
+    {
       "id": "wizard.scratch-delete-cleans-tempdir",
       "kind": "live-playwright",
       "risk": "high",
@@ -598,6 +609,17 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useRepoGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.empty-state",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/sidebar-empty-state.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
       ]
     },
     {
@@ -766,7 +788,8 @@
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx"
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/Tooltip.tsx"
       ]
     },
     {
@@ -943,6 +966,19 @@
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
         "web/src/components/cockpit/CockpitRuntime.tsx",
         "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.storage-cleanup",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/comments/storage.test.ts",
+        "src/components/diff/comments/storage.sweep.test.ts",
+        "src/hooks/useDiffComments.rtl.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/comments/storage.ts"
       ]
     },
     {
@@ -2846,6 +2882,29 @@
         "web/src/components/Dashboard.tsx",
         "web/src/lib/tourSteps.ts",
         "web/src/hooks/useTour.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.theme-welcome",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/theme-onboarding.spec.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.theme-welcome-unit",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
+        "src/lib/__tests__/onboarding.test.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
       ]
     },
     {

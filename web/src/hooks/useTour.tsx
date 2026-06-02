@@ -21,6 +21,7 @@ import {
   type TourScope,
   type TourStep,
 } from "../lib/tourSteps";
+import { isAutomatedSession } from "../lib/onboarding";
 
 const TourRunner = lazy(() => import("../components/tour/TourRunner"));
 
@@ -70,10 +71,6 @@ export function shouldAutoLaunch(args: {
     !args.seen &&
     !args.automated
   );
-}
-
-function isAutomatedSession(): boolean {
-  return typeof navigator !== "undefined" && navigator.webdriver === true;
 }
 
 export interface UseTourResult {

@@ -18,6 +18,10 @@ import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import {
+  clearStoredComments,
+  sweepOrphanComments,
+} from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -72,6 +76,8 @@ import { SettingsView } from "./components/SettingsView";
 import { ProjectsView } from "./components/ProjectsView";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
+import { useWelcomePhase } from "./hooks/useWelcomePhase";
+import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
@@ -238,6 +244,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     if (!sessionsLoaded) return;
     sweptDraftsRef.current = true;
     sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
+  // deleted sessions and retroactively removes empty keys written before the
+  // empty-removal fix. Mirrors the draft sweep above.
+  const sweptCommentsRef = useRef(false);
+  useEffect(() => {
+    if (sweptCommentsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptCommentsRef.current = true;
+    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
   }, [sessionsLoaded, sessions]);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
@@ -547,6 +564,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // localStorage key doesn't linger (#1358). Cross-tab / cross-device
     // deletes go through the startup sweep instead.
     clearDraft(sessionId);
+    // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
+    // cross-device deletes still fall to the startup sweep.
+    clearStoredComments(sessionId);
 
     // Server returns `messages` from `perform_deletion` when there's something
     // user-facing to report (e.g. "Scratch directory kept at: <path>" when
@@ -1123,11 +1143,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !showHelp &&
     !showAbout &&
     !showPalette;
+  // First-run theme choice is phase one of onboarding. It decides on the same
+  // settled-dashboard gate as the tour, then the tour follows once the modal
+  // resolves so the two never overlap on first load.
+  const welcome = useWelcomePhase({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    autoLaunchReady: tourAutoLaunchReady,
+    tourSeen,
+    tourSeenKnown,
+  });
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
     isDesktop: !isCoarse,
-    autoLaunchReady: tourAutoLaunchReady,
+    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
@@ -1209,6 +1239,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
         />
       )}
+
+      {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
 
       {tour.tourElement}
 

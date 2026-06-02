@@ -209,12 +209,15 @@ pruned in lockstep with it (and dropped when the session is deleted), so
 the event log stays lean. Replayed images are fetched lazily from
 `GET /api/sessions/{id}/cockpit/attachments/{attachment_id}`.
 
-Attachments require an idle, connected agent. Unlike text, they are not
-held in the offline prompt queue (which is stored locally in the
-browser); sending an attachment while the agent is mid-turn or
-disconnected surfaces an error rather than silently dropping it. Audio
-and embedded resources are sent and stored, but render as a labelled
-chip rather than an inline player or preview for now.
+Attachments queue alongside the prompt text. Sending one while the
+agent is mid-turn, disconnected, or restarting parks the message in the
+queue (the queued row shows a thumbnail / chip for each attachment) and
+the drain fires it once the session resumes, the same as a text-only
+follow-up. The bytes ride the queued row in memory only: they are kept
+out of the per-origin localStorage snapshot, so a full page reload drops
+any queued attachment row (you reattach and resend). Audio and embedded
+resources are sent and stored, but render as a labelled chip rather than
+an inline player or preview for now.
 
 ## Queued prompts (mid-turn + inactive session)
 
@@ -253,8 +256,12 @@ can't accept them yet. Two cases:
 Queued entries persist in the per-origin localStorage snapshot at
 `aoe:cockpit-state:v1:<sid>`, so a page reload (and closing then
 reopening the tab on the same origin) keeps them across the reconnect
-window. Server-side durability is not currently implemented; clearing
-site data wipes the queue.
+window. The one exception is queued rows that carry attachments: their
+base64 bytes are never written to the snapshot (they would blow the
+storage quota), and the whole row is dropped on reload rather than
+draining a text-only prompt with the image silently missing. Server-side
+durability is not currently implemented; clearing site data wipes the
+queue.
 
 **TUI cockpit.** The TUI cockpit view has the same client-side queue.
 Pressing `Enter` while a turn is active (or while the WebSocket is
