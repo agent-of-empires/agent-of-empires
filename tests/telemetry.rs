@@ -115,6 +115,31 @@ fn snapshot_buckets_are_sanitized() {
     assert_eq!(snapshot.session_total, 2);
 }
 
+/// The CLI `process_start` is throttled to once per install per day so a user
+/// scripting `aoe` in a loop can't flood the endpoint: the first claim in a
+/// window succeeds, the next is denied.
+#[test]
+#[serial]
+fn cli_process_start_throttled_to_once_per_window() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    assert!(
+        telemetry::claim_cli_process_start_slot(day),
+        "first claim in the window should be granted"
+    );
+    assert!(
+        !telemetry::claim_cli_process_start_slot(day),
+        "second claim within the window should be denied"
+    );
+    // A zero-length window always re-grants (the stamp is always older).
+    assert!(telemetry::claim_cli_process_start_slot(
+        std::time::Duration::ZERO
+    ));
+}
+
 /// An unreachable / slow endpoint must never block the CLI: `flush_process_start`
 /// is bounded and returns well within the timeout even when the endpoint
 /// black-holes the connection.

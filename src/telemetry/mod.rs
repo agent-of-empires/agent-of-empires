@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use events::{ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
-pub use state::{install_id, reset_install_id};
+pub use state::{claim_cli_process_start_slot, install_id, reset_install_id};
 
 use crate::session::Instance;
 
@@ -33,6 +33,12 @@ use crate::session::Instance;
 /// the outer flush bound use it, so a dead or slow endpoint can never delay
 /// the CLI's exit or a daemon tick beyond this.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// CLI `process_start` is the only unbounded event source (one per `aoe`
+/// invocation), so it is throttled to at most once per install per day. That
+/// still answers "did this install run the CLI today" without a POST per
+/// command.
+const CLI_PROCESS_START_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// True when `DO_NOT_TRACK` is set to an affirmative value. This is the
 /// absolute override: it wins over `config.telemetry.enabled`.
@@ -220,13 +226,23 @@ pub fn spawn_process_start(surface: Surface) {
     }
 }
 
-/// Emit a `process_start` for a short-lived CLI invocation, awaiting delivery
-/// with a hard timeout so the event has a chance to flush before the process
-/// exits. Bounded by [`SEND_TIMEOUT`], so a dead endpoint can never hang the
-/// CLI; a no-op for the common default-off / no-endpoint case.
+/// Emit a `process_start`, awaiting delivery with a hard timeout so the event
+/// has a chance to flush before the process exits. Bounded by [`SEND_TIMEOUT`],
+/// so a dead endpoint can never hang the caller; a no-op for the common
+/// default-off / no-endpoint case.
 pub async fn flush_process_start(surface: Surface) {
     if let Some(event) = build_process_start(surface) {
         let _ = tokio::time::timeout(SEND_TIMEOUT, post(&event)).await;
+    }
+}
+
+/// CLI entrypoint for `process_start`: same as [`flush_process_start`] for the
+/// `cli` surface, but throttled to at most once per install per day so a user
+/// scripting `aoe` in a loop can't flood the endpoint. The throttle stamp is
+/// only claimed when opted in, so default-off users never touch disk.
+pub async fn flush_cli_process_start() {
+    if is_opted_in() && state::claim_cli_process_start_slot(CLI_PROCESS_START_MIN_GAP) {
+        flush_process_start(Surface::Cli).await;
     }
 }
 

@@ -6,8 +6,10 @@
 //! counts. The file is created only on opt-in and deleted on opt-out.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::session::get_app_dir;
 
@@ -15,6 +17,11 @@ use crate::session::get_app_dir;
 struct TelemetryState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     install_id: Option<String>,
+    /// Last time a CLI `process_start` was emitted, used to throttle the one
+    /// unbounded event source to at most once per install per day. Long-lived
+    /// surfaces (TUI / serve) emit once per launch and need no throttle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_cli_process_start: Option<DateTime<Utc>>,
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -86,4 +93,30 @@ pub fn delete_install_id() -> Result<()> {
 pub fn reset_install_id() -> Option<String> {
     let _ = delete_install_id();
     ensure_install_id()
+}
+
+/// Claim the once-per-`min_gap` CLI `process_start` slot. Returns `true` and
+/// stamps "now" when the last emission is older than `min_gap` (or never),
+/// `false` otherwise. This bounds the only unbounded telemetry source: a user
+/// scripting `aoe` in a loop emits at most one CLI `process_start` per window
+/// instead of one per invocation. Caller is responsible for the opt-in gate.
+pub fn claim_cli_process_start_slot(min_gap: Duration) -> bool {
+    let mut state = load_state();
+    let now = Utc::now();
+    if let Some(last) = state.last_cli_process_start {
+        // A positive elapsed shorter than the window means "too soon". A
+        // negative elapsed (clock skew) falls through and is allowed.
+        if let Ok(elapsed) = (now - last).to_std() {
+            if elapsed < min_gap {
+                return false;
+            }
+        }
+    }
+    state.last_cli_process_start = Some(now);
+    if let Err(e) = save_state(&state) {
+        // Persisting the stamp failed; allow this send rather than dropping it,
+        // and try again to persist next time.
+        tracing::debug!(target: "telemetry", "failed to persist cli throttle stamp: {e}");
+    }
+    true
 }

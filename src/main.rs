@@ -318,12 +318,11 @@ async fn main() -> Result<()> {
     };
 
     // Emit `process_start` for a short-lived CLI command AFTER it runs, so the
-    // command's own output isn't delayed. Awaited with a hard timeout so a
-    // dead endpoint can't hang exit; a no-op unless the user opted in and an
-    // endpoint is configured, so default-off users pay nothing.
+    // command's own output isn't delayed. Throttled to once per install per
+    // day and awaited with a hard timeout so a dead endpoint can't hang exit;
+    // a no-op unless the user opted in, so default-off users pay nothing.
     if cli_oneshot {
-        agent_of_empires::telemetry::flush_process_start(agent_of_empires::telemetry::Surface::Cli)
-            .await;
+        agent_of_empires::telemetry::flush_cli_process_start().await;
     }
 
     result

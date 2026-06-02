@@ -572,7 +572,7 @@ impl App {
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
         // send an initial snapshot, then refresh it periodically and once more
         // on graceful exit. All sends are detached and swallow errors.
-        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
         crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
         self.emit_telemetry_snapshot();
         let mut last_telemetry_snapshot = std::time::Instant::now();

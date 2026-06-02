@@ -12,11 +12,16 @@ Only when you opt in, and only aggregate counts. Two event kinds, both with a
 closed, versioned schema (see `src/telemetry/events.rs`):
 
 - **`process_start`** on boot: surface (`cli` / `tui` / `serve`), aoe version,
-  OS, and CPU arch.
-- **`usage_snapshot`** from the TUI and `aoe serve`, on start and roughly
-  hourly: counts of sessions by status, how many are sandboxed / cockpit /
+  OS, and CPU arch. The `cli` surface is throttled to at most once per install
+  per day, so scripting `aoe` in a loop never floods the endpoint.
+- **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
+  ~12 hours: counts of sessions by status, how many are sandboxed / cockpit /
   yolo, counts bucketed by agent and by model family, and whether the web
   dashboard / cockpit was opened.
+
+In practice that is a handful of small (well under 1 KB) requests per active
+install per day, with no retries and no offline buffering, so a flaky network
+drops events rather than building a backlog.
 
 Every agent and model string passes through a sanitizer
 (`src/telemetry/sanitize.rs`) that coerces it to a fixed allowlist: a custom

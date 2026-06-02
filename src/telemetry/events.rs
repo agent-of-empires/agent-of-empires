@@ -50,8 +50,8 @@ pub struct ProcessStart {
     pub arch: String,
 }
 
-/// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then
-/// periodically, and best-effort on graceful shutdown. Carries current
+/// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
+/// ~12 hours, and best-effort on graceful shutdown. Carries current
 /// aggregate state, never a per-action stream. Every string-valued bucket
 /// has already passed through [`super::sanitize`].
 #[derive(Debug, Clone, Serialize)]

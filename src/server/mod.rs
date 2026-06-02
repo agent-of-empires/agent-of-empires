@@ -1627,14 +1627,14 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 }
 
 /// Background task: emit an opt-in telemetry `process_start` for the serve
-/// surface, then a `usage_snapshot` immediately and every hour, plus a final
-/// one on graceful shutdown. All sends are best-effort and swallow errors;
-/// nothing leaves the box unless the user opted in and an endpoint is
+/// surface, then a `usage_snapshot` immediately and every 12 hours, plus a
+/// final one on graceful shutdown. All sends are best-effort and swallow
+/// errors; nothing leaves the box unless the user opted in and an endpoint is
 /// configured.
 fn spawn_telemetry_loop(state: Arc<AppState>) {
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
