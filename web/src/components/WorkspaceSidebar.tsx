@@ -14,11 +14,9 @@ import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowLeftRight,
-  Clock,
   GripVertical,
   Hourglass,
   Layers,
-  ListOrdered,
   Moon,
   Pencil,
   Pin,
@@ -109,6 +107,7 @@ export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
+import { SidebarSortPicker } from "./SidebarSortPicker";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -2416,40 +2415,10 @@ export function WorkspaceSidebar({
               <Layers className="h-3.5 w-3.5" />
             </button>
           </Tooltip>
-          <Tooltip
-            text={
-              sortMode === "lastActivity"
-                ? "Sort: last activity, drag disabled"
-                : "Sort: manual, drag enabled"
-            }
-          >
-            <button
-              onClick={() =>
-                onSortModeChange(
-                  sortMode === "manual" ? "lastActivity" : "manual",
-                )
-              }
-              aria-pressed={sortMode === "lastActivity"}
-              aria-label={
-                sortMode === "lastActivity"
-                  ? "Sort by last activity, currently pressed"
-                  : "Sort by manual order"
-              }
-              data-testid="sidebar-sort-toggle"
-              data-sort-mode={sortMode}
-              className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                sortMode === "lastActivity"
-                  ? "text-brand-500"
-                  : "text-text-dim hover:text-text-secondary"
-              }`}
-            >
-              {sortMode === "lastActivity" ? (
-                <Clock className="h-3.5 w-3.5" />
-              ) : (
-                <ListOrdered className="h-3.5 w-3.5" />
-              )}
-            </button>
-          </Tooltip>
+          <SidebarSortPicker
+            sortMode={sortMode}
+            onSortModeChange={onSortModeChange}
+          />
           <Tooltip text="Filter">
             <button
               onClick={toggleFilter}

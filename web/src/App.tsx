@@ -254,13 +254,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     reorderRepoGroups,
   } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
   const { groups: sessionGroups, toggleGroupCollapsed } =
-    useSessionGroups(workspaces);
+    useSessionGroups(workspaces, sidebarSortMode);
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
   const { groups: nestedGroups, toggleSubgroupCollapsed } =
-    useNestedSidebarGroups(repoGroups);
+    useNestedSidebarGroups(repoGroups, sidebarSortMode);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
