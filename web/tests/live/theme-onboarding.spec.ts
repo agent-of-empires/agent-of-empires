@@ -23,6 +23,10 @@ base("theme onboarding: pick, persist, hand off to tour", async ({ page }, testI
 
     // The welcome modal appears first, with the available themes as options.
     await expect(page.getByText("Choose your theme")).toBeVisible({ timeout: 10_000 });
+    // Desktop viewport (>= lg): the composer and diff preview panels flank the
+    // picker so the user sees the chosen theme on representative surfaces.
+    await expect(page.getByText("Composer")).toBeVisible();
+    await expect(page.getByText("Diff viewer")).toBeVisible();
     const options = page.getByRole("option");
     await expect(options.first()).toBeVisible();
 
