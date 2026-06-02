@@ -22,6 +22,7 @@ vi.mock("../../lib/highlighter", () => ({
     codeToHtml: (code: string) => `<pre>${code}</pre>`,
   }),
   langKeyForExt: (s: string) => s,
+  langImportForPath: () => null,
   loadLanguage: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -96,6 +97,39 @@ describe("ToolCards dispatch", () => {
     );
     expect(container.textContent).toContain("write");
     expect(container.textContent).toContain("/tmp/new.rs");
+  });
+
+  it("renders a Codex structured-diff edit with its path and a diff body (not '(unknown file)')", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard tool={fixtures.codexEdit} result={undefined} />
+      </Wrap>,
+    );
+    // Path shows in the (collapsed) header.
+    expect(container.textContent).toContain("edit");
+    expect(container.textContent).toContain("src/codex.rs");
+    expect(container.textContent).not.toContain("(unknown file)");
+    // Expand to reveal the diff body.
+    fireEvent.click(container.querySelector("button")!);
+    expect(
+      container.querySelector('[data-testid="string-diff"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders every touched file path for a multi-file Codex patch", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard tool={fixtures.codexEditMultiFile} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("src/alpha.rs");
+    expect(container.textContent).not.toContain("(unknown file)");
+    // The second file's path lives in the expanded body.
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.textContent).toContain("src/beta.rs");
+    expect(
+      container.querySelectorAll('[data-testid="string-diff"]').length,
+    ).toBe(2);
   });
 
   it("renders delete kind with a 'delete' label", () => {
