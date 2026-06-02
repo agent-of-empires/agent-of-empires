@@ -64,7 +64,7 @@ The first time you open the dashboard in a browser, a **Choose your theme** card
 
 After the theme card, an interactive walkthrough launches automatically and highlights the major regions: the command bar, the workspace sidebar, how to start a session, settings, and (inside a session) the diff panel and composer. Each step lists the keyboard shortcuts that apply to it, and every step has a **Skip** button so you can dismiss the whole tour in one click.
 
-Completing or skipping the tour records that you have seen it (a per-browser `aoe-tour-seen` flag in `localStorage`), so it does not launch again on reload. Because the flag is per origin, a debug build on port 8081 and a release build on port 8080 each track it separately.
+Completing or skipping the tour records that you have seen it on the server (the `app_state.has_seen_web_tour` flag in your config), so it does not launch again on reload, and it does not re-launch when you open the dashboard in a different browser or on another device pointed at the same server. (If you upgraded from an older build that tracked this per browser, your existing local flag is migrated to the server on first load, so you are not shown the tour again.) Debug builds on port 8081 and release builds on port 8080 use separate config, so they still track it separately.
 
 To replay it at any time, open the overflow menu (the three-dot **More options** button in the top bar) and choose **Show tutorial**. Re-triggering it adapts to where you are: on the dashboard it covers the dashboard regions; inside a session it also covers the composer, agent mode picker, and send/queue controls. The tutorial does not auto-launch on touch devices, where it is available only from the menu.
 

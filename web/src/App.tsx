@@ -5,7 +5,7 @@ import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
 import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
 import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
-import { safeGetItem, safeSetItem } from "./lib/safeStorage";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
@@ -39,6 +39,7 @@ import {
   setTelemetryConsent,
   reportTelemetrySeen,
   isDebugBuild,
+  markWebTourSeen,
   updateWorkspaceOrdering,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
@@ -101,6 +102,9 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
+// Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
+// already dismissed the tour to the backend; no longer written.
+const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
   // Apply the user-selected theme as CSS custom properties on the root
@@ -1173,6 +1177,43 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       : activeSession.cockpit_mode
         ? "cockpit"
         : "session";
+  // First-run tour "seen" state, sourced from the backend (app_state) so it
+  // follows the user across browsers and devices. `tourSeenKnown` stays false
+  // until settings resolve, so the tour never flashes on a `false` default
+  // while the request is in flight (and never auto-launches when the fetch
+  // fails). Fetched here in AppContent (post-auth) so the request runs as the
+  // authenticated user. `LEGACY_TOUR_SEEN_KEY` is the pre-#1832 per-browser
+  // flag, read once to migrate existing users so they are not re-shown the tour.
+  const [tourSeen, setTourSeen] = useState(false);
+  const [tourSeenKnown, setTourSeenKnown] = useState(false);
+
+  useEffect(() => {
+    fetchSettings().then((settings) => {
+      // Fetch failed: leave the seen state unknown so the tour does not
+      // auto-launch over an error/recovery screen. The menu trigger still works.
+      if (!settings) return;
+      const backendSeen = settings.app_state?.has_seen_web_tour === true;
+      const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
+      // Treat the legacy local flag as a suppression hint while the migration
+      // POST is in flight, so the tour cannot flash before the backend agrees.
+      setTourSeen(backendSeen || legacySeen);
+      setTourSeenKnown(true);
+      if (legacySeen && !backendSeen) {
+        void markWebTourSeen().then((ok) => {
+          if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
+        });
+      }
+    });
+  }, []);
+
+  // Persist the seen flag when the user finishes or skips the tour. Optimistic:
+  // flip local state immediately so a failed POST (e.g. read-only 403) cannot
+  // re-auto-launch the tour for the rest of this page's lifetime.
+  const handleTourSeen = useCallback(() => {
+    setTourSeen(true);
+    void markWebTourSeen();
+  }, []);
+
   // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
   // an in-flight session route defers it (the flag stays unset until then).
   const tourAutoLaunchReady =
@@ -1193,12 +1234,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
     autoLaunchReady: tourAutoLaunchReady,
+    tourSeen,
+    tourSeenKnown,
   });
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
+    seen: tourSeen,
+    seenKnown: tourSeenKnown,
+    onSeen: handleTourSeen,
   });
 
   return (
