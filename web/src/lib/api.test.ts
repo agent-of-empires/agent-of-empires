@@ -24,6 +24,7 @@ import {
   setSessionSnooze,
   updateProfileSettings,
   PROFILE_WRITABLE_SECTIONS,
+  updateSessionGroup,
   type ServerAbout,
 } from "./api";
 
@@ -244,6 +245,41 @@ describe("updateProfileSettings write guard", () => {
     expect(JSON.parse(init!.body as string)).toEqual({
       description: "my profile",
     });
+  });
+});
+
+describe("updateSessionGroup", () => {
+  it("PATCHes /api/sessions/{id}/group with the group path", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1" }));
+    await updateSessionGroup("sess-1", "team/alpha");
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-1/group");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ group: "team/alpha" });
+  });
+
+  it("sends an empty string to ungroup (no null on the wire)", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1" }));
+    await updateSessionGroup("sess-1", "");
+    expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({
+      group: "",
+    });
+  });
+
+  it("encodes the session id in the path", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "a/b" }));
+    await updateSessionGroup("a/b", "g");
+    expect(fetchSpy.mock.calls[0]![0]).toBe("/api/sessions/a%2Fb/group");
+  });
+
+  it("returns false on non-2xx", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    expect(await updateSessionGroup("sess-1", "g")).toBe(false);
+  });
+
+  it("returns false on network failure", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await updateSessionGroup("sess-1", "g")).toBe(false);
   });
 });
 

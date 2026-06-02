@@ -71,6 +71,7 @@ import {
   setSessionPin,
   setSessionSnooze,
   setWorktreeName,
+  updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
@@ -91,6 +92,7 @@ import {
 } from "../lib/sidebarSort";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
+import { SessionGroupModal } from "./SessionGroupModal";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -799,6 +801,8 @@ export const SessionRow = memo(function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
+  const sessionGroup = firstSession?.group_path ?? "";
+  const [editingGroup, setEditingGroup] = useState(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
   const touchOpenedAt = useRef(0);
@@ -908,6 +912,16 @@ export const SessionRow = memo(function SessionRow({
   const openWorkdirModal = () => {
     setContextMenu(null);
     setWorkdirModalOpen(true);
+  };
+
+  const startGroupEdit = () => {
+    setContextMenu(null);
+    setEditingGroup(true);
+  };
+
+  const saveGroup = async (group: string): Promise<boolean> => {
+    if (!sessionId) return false;
+    return updateSessionGroup(sessionId, group);
   };
 
   const handleDelete = () => {
@@ -1147,6 +1161,15 @@ export const SessionRow = memo(function SessionRow({
               Edit workdir name
             </button>
           )}
+          {!readOnly && (
+            <button
+              onClick={startGroupEdit}
+              data-testid="sidebar-context-menu-edit-group"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Edit group
+            </button>
+          )}
           {!readOnly && cockpitSession && (
             <button
               onClick={handleSwitchAgent}
@@ -1303,6 +1326,16 @@ export const SessionRow = memo(function SessionRow({
               if (res.ok) setWorkdirModalOpen(false);
               return res;
             }}
+          />,
+          document.body,
+        )}
+      {editingGroup &&
+        createPortal(
+          <SessionGroupModal
+            sessionTitle={sessionTitle || label}
+            currentGroup={sessionGroup}
+            onSave={saveGroup}
+            onClose={() => setEditingGroup(false)}
           />,
           document.body,
         )}
