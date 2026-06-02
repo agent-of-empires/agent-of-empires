@@ -12,7 +12,8 @@ auth, see the [Web Dashboard overview](../web-dashboard.md).
 
 - **Workspace sidebar** (left) lists every session grouped by repo, with
   a live status glyph per row. On phones it collapses behind a toggle in
-  the top bar.
+  the top bar. With no sessions yet, the sidebar shows a short hint and a
+  **New session** button that opens the wizard.
 - **Main pane** shows the selected session: the agent terminal (or
   cockpit view), with the diff and paired terminal reachable from the
   top bar.
