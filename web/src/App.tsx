@@ -9,6 +9,7 @@ import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup } from "./lib/sidebarGroups";
@@ -253,6 +254,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
   const { groups: sessionGroups, toggleGroupCollapsed } =
     useSessionGroups(workspaces);
+  // The nested `repo+group` axis reuses the already-built repo groups for
+  // its top level (so repo collapse, appearance, and ordering are shared
+  // with the repo axis) and splits each repo by `group_path` underneath.
+  // See #1720.
+  const { groups: nestedGroups, toggleSubgroupCollapsed } =
+    useNestedSidebarGroups(repoGroups);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -1171,6 +1178,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {!showSettings && !showProjects && (
           <WorkspaceSidebar
             groups={sidebarGroups}
+            nestedGroups={nestedGroups}
+            onToggleSubgroup={toggleSubgroupCollapsed}
             onReorderWorkspaces={handleReorderWorkspaces}
             onReorderGroups={reorderRepoGroups}
             activeId={activeWorkspace?.id ?? null}

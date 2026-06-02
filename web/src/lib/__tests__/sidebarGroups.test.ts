@@ -11,7 +11,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildNestedSidebarGroups,
   buildSessionGroups,
+  nestedSidebarGroupHasLiveWorkspace,
   repoGroupToSidebarGroup,
   sidebarGroupHasLiveWorkspace,
   UNGROUPED_GROUP_ID,
@@ -218,6 +220,157 @@ describe("repoGroupToSidebarGroup", () => {
     );
     expect(sg.capabilities.create).toBe("generic");
     expect(sg.capabilities.appearance).toBe(true);
+  });
+});
+
+describe("buildNestedSidebarGroups", () => {
+  function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
+    return {
+      id: "/repo-a",
+      repoPath: "/repo-a",
+      displayName: "repo-a",
+      defaultDisplayName: "repo-a",
+      alias: null,
+      color: null,
+      remoteOwner: null,
+      workspaces: [],
+      status: "idle",
+      collapsed: false,
+      ...over,
+    };
+  }
+
+  const buildNested = (
+    repoGroups: RepoGroup[],
+    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () =>
+      false,
+  ) =>
+    buildNestedSidebarGroups(repoGroups, {
+      idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
+      isSubgroupCollapsed,
+    });
+
+  it("keeps the repo header and nests its user groups underneath", () => {
+    const nested = buildNested([
+      repoGroup({
+        workspaces: [
+          workspace("w1", [session({ id: "a", group_path: "feature" })]),
+          workspace("w2", [session({ id: "b", group_path: "fix" })]),
+        ],
+      }),
+    ]);
+    expect(nested).toHaveLength(1);
+    expect(nested[0]!.repo.kind).toBe("repo");
+    expect(nested[0]!.repo.repoPath).toBe("/repo-a");
+    expect(nested[0]!.subgroups.map((sg) => sg.id)).toEqual(["feature", "fix"]);
+    expect(nested[0]!.subgroups.every((sg) => sg.kind === "sessionGroup")).toBe(
+      true,
+    );
+  });
+
+  it("drops manual reorder on the repo header (nested axis has no order)", () => {
+    const nested = buildNested([
+      repoGroup({
+        workspaces: [workspace("w1", [session({ id: "a", group_path: "x" })])],
+      }),
+    ]);
+    expect(nested[0]!.repo.capabilities.reorder).toBe(false);
+    // Other repo affordances stay intact.
+    expect(nested[0]!.repo.capabilities.appearance).toBe(true);
+    expect(nested[0]!.repo.capabilities.create).toBe("repo");
+  });
+
+  it("puts ungrouped sessions in an Ungrouped subgroup within the repo", () => {
+    const nested = buildNested([
+      repoGroup({
+        workspaces: [
+          workspace("w1", [session({ id: "a", group_path: "feature" })]),
+          workspace("w2", [session({ id: "b", group_path: "" })]),
+        ],
+      }),
+    ]);
+    const ids = nested[0]!.subgroups.map((sg) => sg.id);
+    expect(ids).toEqual(["feature", UNGROUPED_GROUP_ID]);
+    const ungrouped = nested[0]!.subgroups.find(
+      (sg) => sg.id === UNGROUPED_GROUP_ID,
+    )!;
+    expect(ungrouped.groupPath).toBe("");
+  });
+
+  it("slices a split workspace per subgroup with the real id preserved", () => {
+    const nested = buildNested([
+      repoGroup({
+        workspaces: [
+          workspace("w1", [
+            session({ id: "a", group_path: "feature" }),
+            session({ id: "b", group_path: "fix" }),
+          ]),
+        ],
+      }),
+    ]);
+    const [feature, fix] = nested[0]!.subgroups;
+    expect(feature!.workspaces[0]!.workspace.id).toBe("w1");
+    expect(fix!.workspaces[0]!.workspace.id).toBe("w1");
+    expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
+    expect(
+      feature!.workspaces[0]!.workspace.sessions.map((s) => s.id),
+    ).toEqual(["a"]);
+    expect(fix!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual([
+      "b",
+    ]);
+  });
+
+  it("keys subgroup collapse on (repoId, groupPath), not group id alone", () => {
+    const nested = buildNested(
+      [
+        repoGroup({
+          id: "/repo-a",
+          repoPath: "/repo-a",
+          workspaces: [
+            workspace("w1", [session({ id: "a", group_path: "feature" })]),
+          ],
+        }),
+        repoGroup({
+          id: "/repo-b",
+          repoPath: "/repo-b",
+          workspaces: [
+            workspace("w2", [session({ id: "b", group_path: "feature" })], {
+              projectPath: "/repo-b",
+            }),
+          ],
+        }),
+      ],
+      (repoId, groupPath) => repoId === "/repo-a" && groupPath === "feature",
+    );
+    // Same group path in two repos collapses independently.
+    expect(nested[0]!.subgroups[0]!.collapsed).toBe(true);
+    expect(nested[1]!.subgroups[0]!.collapsed).toBe(false);
+  });
+
+  it("reports liveness from any live subgroup row", () => {
+    const allSunk = buildNested([
+      repoGroup({
+        workspaces: [
+          workspace("w1", [
+            session({
+              id: "a",
+              group_path: "feature",
+              archived_at: "2025-01-02T00:00:00Z",
+            }),
+          ]),
+        ],
+      }),
+    ]);
+    expect(nestedSidebarGroupHasLiveWorkspace(allSunk[0]!)).toBe(false);
+
+    const live = buildNested([
+      repoGroup({
+        workspaces: [
+          workspace("w1", [session({ id: "a", group_path: "feature" })]),
+        ],
+      }),
+    ]);
+    expect(nestedSidebarGroupHasLiveWorkspace(live[0]!)).toBe(true);
   });
 });
 

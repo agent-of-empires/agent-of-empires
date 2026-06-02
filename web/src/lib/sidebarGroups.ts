@@ -119,7 +119,11 @@ export function buildSessionGroups(
   workspaces: Workspace[],
   opts: {
     idleDecayWindowMs: number;
-    isCollapsed: (groupId: string) => boolean;
+    // `groupPath` is the normalized path ("" for Ungrouped), passed
+    // alongside the synthetic id so nested callers can key collapse state
+    // on the path and dodge the `UNGROUPED_GROUP_ID` sentinel. Flat callers
+    // ignore it. See #1720.
+    isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
@@ -171,7 +175,7 @@ export function buildSessionGroups(
       remoteOwner: null,
       workspaces: views,
       status: hasActive ? "active" : "idle",
-      collapsed: opts.isCollapsed(id),
+      collapsed: opts.isCollapsed(id, gp),
       capabilities: { appearance: false, reorder: false, create: "generic" },
       groupPath: gp,
     });
@@ -191,4 +195,55 @@ export function buildSessionGroups(
 // footer, so an all-sunk group's header is not rendered empty.
 export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {
   return group.workspaces.some((v) => !workspaceIsSunk(v.workspace));
+}
+
+// The nested `repo+group` axis (#1720). A repository header keeps its full
+// repo-axis identity (`repo`), and inside it the same `group_path` buckets
+// the user-group axis already computes show up as `subgroups`. This is a
+// composition of the two existing builders, not a third bucketing pass:
+// `repo` comes from `repoGroupToSidebarGroup`, `subgroups` from
+// `buildSessionGroups` over that repo's own workspaces.
+export interface NestedSidebarGroup {
+  repo: SidebarGroup;
+  subgroups: SidebarGroup[];
+}
+
+// Build the nested axis from the already-built repo-axis groups. Top-level
+// ordering, appearance, synthetic Multi-repo / Scratch buckets, and per-repo
+// collapse are inherited verbatim from the repo axis; only manual drag
+// reorder is dropped (the nested axis has no manual order, like the group
+// axis). Each repo's subgroups are the user-group split of just that repo's
+// workspaces, so a workspace whose sessions span groups is sliced per
+// subgroup exactly as the flat group axis does.
+export function buildNestedSidebarGroups(
+  repoGroups: RepoGroup[],
+  opts: {
+    idleDecayWindowMs: number;
+    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
+  },
+): NestedSidebarGroup[] {
+  return repoGroups.map((repoGroup) => {
+    const repo = repoGroupToSidebarGroup(repoGroup);
+    const subgroups = buildSessionGroups(repoGroup.workspaces, {
+      idleDecayWindowMs: opts.idleDecayWindowMs,
+      isCollapsed: (_groupId, groupPath) =>
+        opts.isSubgroupCollapsed(repo.id, groupPath),
+    });
+    return {
+      repo: {
+        ...repo,
+        capabilities: { ...repo.capabilities, reorder: false },
+      },
+      subgroups,
+    };
+  });
+}
+
+// Nested-axis equivalent of `sidebarGroupHasLiveWorkspace`: true while any
+// subgroup still has a live row, so an all-sunk repository block is not
+// rendered as an empty header.
+export function nestedSidebarGroupHasLiveWorkspace(
+  group: NestedSidebarGroup,
+): boolean {
+  return group.subgroups.some(sidebarGroupHasLiveWorkspace);
 }

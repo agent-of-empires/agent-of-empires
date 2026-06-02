@@ -899,6 +899,30 @@
       ]
     },
     {
+      "id": "sidebar.nested-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sidebarGroups.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.nested-axis-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/sidebar-nested-axis.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useNestedSidebarGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
