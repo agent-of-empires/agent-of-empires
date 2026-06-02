@@ -883,14 +883,16 @@ export function applyEvent(
     if (existing >= 0) {
       const prev = next.activity[existing];
       if (prev) {
+        // Merge rather than replace so a sparse permission start (#1713)
+        // never clobbers richer args/kind from a real start frame.
+        const merged = prev.tool ? mergeToolStart(prev.tool, tc) : tc;
         const copy = next.activity.slice();
-        // Keep diffs from the earlier frame if this duplicate start lacks
-        // them, so a re-delivered tool_start can't blank the edit card.
-        const mergedTool: ToolCall =
-          tc.diffs && tc.diffs.length > 0
-            ? tc
-            : { ...tc, diffs: prev.tool?.diffs };
-        copy[existing] = { ...prev, tool: mergedTool, text: tc.name };
+        copy[existing] = {
+          ...prev,
+          tool: merged,
+          text: merged.name,
+          at: merged.started_at,
+        };
         next.activity = copy;
       }
       return next;
@@ -909,6 +911,19 @@ export function applyEvent(
   if ("ToolCallCompleted" in event) {
     const { tool_call_id, is_error, content, completed_at } =
       event.ToolCallCompleted;
+    // #1713: a completion with no preceding start frame would render no
+    // card (the render layer only attaches results to an existing
+    // tool-call part). Synthesize a minimal start row first so the card
+    // appears.
+    if (!hasToolStart(next.activity, tool_call_id)) {
+      next.activity = pushActivity(
+        next.activity,
+        synthToolStartRow(tool_call_id, { started_at: completed_at }),
+      );
+      // A synthesized tool call is real turn output; without this the
+      // turn-end logic would append "Command produced no output."
+      next.turnHasOutput = true;
+    }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = null;
     }
@@ -954,6 +969,20 @@ export function applyEvent(
     // the card's diffs; null/empty leaves an earlier frame's diffs intact
     // so a text-only update can't blank the edit card. See #1721.
     const incomingDiffs = diffs && diffs.length > 0 ? diffs : null;
+    // #1713: an update with no preceding start frame would be dropped
+    // (the patch loop below only touches an existing tool_start row).
+    // Synthesize one so the update lands and a card renders.
+    if (!hasToolStart(next.activity, tool_call_id)) {
+      next.activity = pushActivity(
+        next.activity,
+        synthToolStartRow(tool_call_id, {
+          name: title ?? undefined,
+          args_preview: args_preview ?? undefined,
+          started_at: started_at ?? undefined,
+        }),
+      );
+      next.turnHasOutput = true;
+    }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = {
         ...next.inFlightTool,
@@ -1568,6 +1597,73 @@ export function applyEvent(
   // no state mutation. The activity feed shows the raw text where
   // useful via the catch-all branch in the UI.
   return next;
+}
+
+/** True when `rows` already carries a `tool_start` row for this id. */
+function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
+  return rows.some(
+    (r) => r.kind === "tool_start" && r.toolCallId === toolCallId,
+  );
+}
+
+/** Build a minimal `tool_start` row for a tool call we never saw start.
+ *  Some agents (Gemini's permission flow) emit updates/completions with
+ *  no preceding start frame; synthesizing one keeps the card visible.
+ *  See #1713. */
+function synthToolStartRow(
+  toolCallId: string,
+  opts: { name?: string; args_preview?: string; started_at?: string },
+): ActivityRow {
+  const startedAt = opts.started_at ?? new Date().toISOString();
+  const tool: ToolCall = {
+    id: toolCallId,
+    name: opts.name && opts.name.length > 0 ? opts.name : "tool call",
+    kind: "other",
+    args_preview: opts.args_preview ?? "",
+    started_at: startedAt,
+  };
+  return {
+    id: `start-${toolCallId}`,
+    kind: "tool_start",
+    text: tool.name,
+    toolCallId,
+    tool,
+    at: startedAt,
+  };
+}
+
+/** Merge a duplicate `ToolCallStarted` into the existing row's payload
+ *  without clobbering richer data with a sparser frame. A permission
+ *  start (#1713) carries empty args and `kind: "other"`; a later real
+ *  start frame for the same id must win, but a real start that arrives
+ *  first must not be overwritten by the sparse permission start. */
+function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
+  const startedAt =
+    !prev.started_at ||
+    (incoming.started_at.length > 0 &&
+      Date.parse(incoming.started_at) > Date.parse(prev.started_at))
+      ? incoming.started_at
+      : prev.started_at;
+
+  return {
+    ...prev,
+    ...incoming,
+    name: incoming.name.length > 0 ? incoming.name : prev.name,
+    kind:
+      incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
+    args_preview:
+      incoming.args_preview.trim().length > 0
+        ? incoming.args_preview
+        : prev.args_preview,
+    started_at: startedAt,
+    diffs:
+      incoming.diffs && incoming.diffs.length > 0
+        ? incoming.diffs
+        : prev.diffs,
+    parent_tool_call_id:
+      incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
+    memory_recall: incoming.memory_recall ?? prev.memory_recall,
+  };
 }
 
 function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
