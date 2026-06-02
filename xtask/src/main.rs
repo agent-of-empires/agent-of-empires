@@ -58,7 +58,7 @@ fn run_dev(args: DevArgs) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -85,13 +85,19 @@ fn run_dev(args: DevArgs) {
             .expect("failed to install Ctrl-C handler");
     }
 
+    // Detach stdin from both children: each runs in its own (background)
+    // process group, so a TTY-driven raw-mode setup (Vite installs keypress
+    // shortcuts when stdin is a TTY) would raise SIGTTOU and suspend the
+    // child. Shutdown is driven by signals here, not per-server keystrokes,
+    // so neither child needs the terminal.
     let mut serve = Command::new(&bin)
         .args(["serve", "--no-auth", "--port", &args.serve_port.to_string()])
+        .stdin(Stdio::null())
         .process_group(0)
         .spawn()
         .expect("failed to spawn `aoe serve`");
 
-    let mut vite = Command::new("npm")
+    let mut vite = match Command::new("npm")
         .args([
             "--prefix",
             "web",
@@ -105,9 +111,20 @@ fn run_dev(args: DevArgs) {
             "VITE_PROXY",
             format!("http://127.0.0.1:{}", args.serve_port),
         )
+        .stdin(Stdio::null())
         .process_group(0)
         .spawn()
-        .expect("failed to spawn `npm run dev`");
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // serve is already up; tear its group down before bailing so we
+            // don't orphan a backend on the serve port.
+            eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
+            let _ = killpg(Pid::from_raw(serve.id() as i32), Signal::SIGTERM);
+            let _ = serve.wait();
+            std::process::exit(1);
+        }
+    };
 
     eprintln!(
         "[xtask dev] aoe serve on :{} | open http://localhost:{}",

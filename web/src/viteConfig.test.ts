@@ -11,10 +11,8 @@ async function loadProxy(
   env: Record<string, string | undefined>,
 ): Promise<Record<string, ProxyEntry> | undefined> {
   vi.resetModules();
-  const prev = { ...process.env };
   for (const [k, v] of Object.entries(env)) {
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
+    vi.stubEnv(k, v as string | undefined);
   }
   try {
     const mod = await import("../vite.config");
@@ -25,13 +23,14 @@ async function loadProxy(
     const cfg = await factory({ command: "serve", mode: "development" });
     return cfg.server.proxy;
   } finally {
-    process.env = prev;
+    vi.unstubAllEnvs();
   }
 }
 
 describe("vite dev server proxy", () => {
   afterEach(() => {
     vi.resetModules();
+    vi.unstubAllEnvs();
   });
 
   it("has no proxy when VITE_PROXY is unset", async () => {
