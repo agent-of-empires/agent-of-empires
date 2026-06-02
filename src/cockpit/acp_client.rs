@@ -2889,7 +2889,16 @@ fn map_update_to_events(
                 let diffs = extract_diffs_from_content(blocks);
                 (!diffs.is_empty()).then_some(diffs)
             });
-            let new_args_preview = update.fields.raw_input.as_ref().map(preview_args);
+            // Drop an explicit JSON null so a late-arriving update never
+            // patches the card's args with the literal "null"; leaving it
+            // None means the reducer keeps whatever args it already has.
+            // See #1713.
+            let new_args_preview = update
+                .fields
+                .raw_input
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(preview_args);
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
             if new_title.is_some()
@@ -5394,6 +5403,16 @@ async fn handle_permission_request(
             }
         }
         Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => {
+            // Cancellation (explicit cancel_permission, or the resolver
+            // dropped on teardown) emits no agent completion, so close the
+            // start frame and clear the approval here too. See #1713.
+            let _ = event_tx
+                .send(Event::ApprovalResolved {
+                    nonce: nonce.clone(),
+                    decision: ApprovalDecision::Cancelled,
+                })
+                .await;
+            emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
             (RequestPermissionOutcome::Cancelled, "cancelled")
         }
     };

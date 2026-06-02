@@ -920,6 +920,9 @@ export function applyEvent(
         next.activity,
         synthToolStartRow(tool_call_id, { started_at: completed_at }),
       );
+      // A synthesized tool call is real turn output; without this the
+      // turn-end logic would append "Command produced no output."
+      next.turnHasOutput = true;
     }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = null;
@@ -978,6 +981,7 @@ export function applyEvent(
           started_at: started_at ?? undefined,
         }),
       );
+      next.turnHasOutput = true;
     }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = {

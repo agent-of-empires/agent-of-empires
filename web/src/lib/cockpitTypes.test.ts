@@ -2527,6 +2527,9 @@ describe("applyEvent / start-less tool flows (#1713)", () => {
       (r) => r.kind === "tool_complete" && r.toolCallId === "orphan-1",
     );
     expect(done?.text).toBe("done output");
+    // A synthesized card counts as turn output, so the turn-end logic
+    // must not append "Command produced no output."
+    expect(state.turnHasOutput).toBe(true);
   });
 
   it("synthesizes a tool_start row when an update arrives with no start", () => {
