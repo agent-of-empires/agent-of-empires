@@ -1210,10 +1210,15 @@ impl App {
             // support. Skip ticker-driven refreshes inside the
             // cool-down window unless this refresh was specifically
             // requested by something else (status update, post-key
-            // wake, etc).
+            // wake, or the capture-worker wake). Preview wakes carry
+            // genuinely new pane content (the worker dedups and only
+            // fires on change), so they're a real frame to paint, not a
+            // redundant repaint, and must bypass the cool-down like the
+            // post-key wake does or live-send echo stalls to the ticker.
             if refresh_needed
                 && self.home.live_send.is_some()
                 && !woke_via_post_key
+                && !woke_via_preview
                 && !needs_full_refresh
                 && last_refresh_at
                     .map(|t| t.elapsed() < REFRESH_COOLDOWN)

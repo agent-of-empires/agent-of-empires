@@ -1392,7 +1392,14 @@ impl HomeView {
             }
             self.preview_capture_target = desired;
         }
-        let live = self.live_send.is_some();
+        // Fast cadence only when the displayed pane IS the live-send target.
+        // Viewing the agent while live-send points at a terminal (or vice
+        // versa) leaves this preview a background view, so it stays on the
+        // idle interval instead of forking every 25ms.
+        let live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| self.preview_capture_target.as_deref() == Some(s.tmux_name.as_str()));
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
         }
@@ -1414,7 +1421,8 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return false;
         };
-        let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
+        let scroll_offset = self.preview_scroll_offset;
+        let capture_lines = capture_lines_for(height, scroll_offset);
         let Some(worker) = self.preview_capture_worker.as_ref() else {
             return false;
         };
@@ -1423,11 +1431,17 @@ impl HomeView {
             return false;
         };
         let captured_lines = select(self).store_capture(content, id, (width, height));
-        self.preview_scroll_offset = clamp_scroll_to_capture(
-            self.preview_scroll_offset,
-            captured_lines,
-            self.preview_visible_rows,
-        );
+        // `set_capture_lines` is async, so this frame may carry a capture
+        // produced under a smaller line budget (the user just scrolled back
+        // or the pane grew). If it doesn't cover the requested window, fall
+        // through so `refresh_preview_cache_core` does a one-off synchronous
+        // catch-up instead of clamping the offset against an undersized
+        // capture and snapping the preview toward the live edge.
+        if scroll_exceeds_cache(captured_lines, height, scroll_offset) {
+            return false;
+        }
+        self.preview_scroll_offset =
+            clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
         true
     }
 

@@ -503,28 +503,38 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
     /// otherwise. Read by the worker thread each cycle.
     interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Interrupts the worker's inter-capture wait so a cadence or target
+    /// change takes effect immediately instead of after the current (up to
+    /// 250ms idle) sleep. Without this, entering live-send mid-idle-sleep
+    /// would lag the first fast capture by ~250ms.
+    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake the worker so it sees `stop` and exits now rather than after
+        // its current inter-capture sleep.
+        self.nudge();
     }
 }
 
 impl LiveCaptureWorker {
     pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Condvar, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
         let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
+        let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
         let interval_cell = interval_ms.clone();
+        let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
@@ -572,8 +582,16 @@ impl LiveCaptureWorker {
                         }
                     }
                 }
+                // Interruptible wait: `set_live` / `set_target` notify the
+                // condvar so a cadence or target change is picked up at once
+                // rather than after the current sleep. Spurious wakeups just
+                // run an extra capture cycle, which the dedup makes harmless.
                 let ms = interval_cell.load(Ordering::Relaxed);
-                std::thread::sleep(std::time::Duration::from_millis(ms));
+                if let Ok(guard) = nudge_thread.0.lock() {
+                    let _ = nudge_thread
+                        .1
+                        .wait_timeout(guard, std::time::Duration::from_millis(ms));
+                }
             }
         });
         Self {
@@ -581,7 +599,16 @@ impl LiveCaptureWorker {
             target,
             latest,
             interval_ms,
+            nudge,
             stop,
+        }
+    }
+
+    /// Wake the worker out of its inter-capture wait so a just-changed
+    /// cadence or target applies immediately.
+    fn nudge(&self) {
+        if let Ok(_guard) = self.nudge.0.lock() {
+            self.nudge.1.notify_one();
         }
     }
 
@@ -591,13 +618,22 @@ impl LiveCaptureWorker {
     /// the new view. Never blocks on a `capture-pane` fork, so the render
     /// reconcile can call it freely.
     pub(in crate::tui) fn set_target(&self, name: String) {
-        if let Ok(mut guard) = self.target.lock() {
+        let changed = if let Ok(mut guard) = self.target.lock() {
             if *guard != name {
                 *guard = name;
                 if let Ok(mut latest) = self.latest.lock() {
                     *latest = None;
                 }
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if changed {
+            // Capture the new pane now instead of after the current sleep.
+            self.nudge();
         }
     }
 
@@ -611,8 +647,15 @@ impl LiveCaptureWorker {
         } else {
             LIVE_CAPTURE_INTERVAL_IDLE_MS
         };
-        self.interval_ms
-            .store(ms, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .interval_ms
+            .swap(ms, std::sync::atomic::Ordering::Relaxed);
+        if prev != ms {
+            // Apply the new cadence now: a mid-idle-sleep worker would
+            // otherwise keep the old (up to 250ms) interval for one cycle,
+            // lagging the first live capture on live-send entry.
+            self.nudge();
+        }
     }
 
     /// Publish the line count the worker should capture. Cheap (one atomic
@@ -1439,8 +1482,14 @@ mod tests {
         // without a real tmux session: a missing pane always reads empty.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_target("aoe_test_capture_missing_session".into());
+        // Fast cadence so the worker actually captures (and drops the empty
+        // frame) within the wait, instead of still being in its first idle
+        // sleep when we assert.
+        worker.set_live(true);
         worker.set_capture_lines(40);
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        std::thread::sleep(std::time::Duration::from_millis(
+            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
+        ));
         assert!(
             worker.take_latest().is_none(),
             "empty captures must never be forwarded",

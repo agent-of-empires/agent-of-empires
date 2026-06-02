@@ -2961,13 +2961,18 @@ impl HomeView {
             // against the old session before we reset its sizing.
             self.live_send_worker = None;
             // The capture worker is retargeted by the render reconcile, not
-            // here; but drop the previous session's cached preview so the
+            // here; but drop the previous session's cached previews so the
             // first frames after the switch don't paint session A's content
             // under session B's header while B's capture worker spins up.
             // (The synchronous path got this for free via its cross-session
             // kill-switch branch; the worker path applies content lazily,
-            // so clear it explicitly here.)
+            // so clear it explicitly here.) All targets are cleared because
+            // a live-send switch can retarget to Terminal / ContainerTerminal
+            // too, and the view can be flipped to any of them right after.
             self.preview_cache = PreviewCache::default();
+            self.terminal_preview_cache = PreviewCache::default();
+            self.container_terminal_preview_cache = PreviewCache::default();
+            self.tool_preview_cache = PreviewCache::default();
             if let Some(name) = &prev_tmux_name {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
