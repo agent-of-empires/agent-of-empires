@@ -81,6 +81,7 @@ pub async fn reconcile_cockpit_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
     last_idle_reap: &mut Option<std::time::Instant>,
+    last_rate_limit_reap: &mut Option<std::time::Instant>,
 ) {
     // Honor `cockpit.enabled = false` from config.toml — the persistent
     // master switch. Mirrored as an atomic; `PATCH /api/cockpit/master`
@@ -125,6 +126,18 @@ pub async fn reconcile_cockpit_workers(
     if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
         reap_idle_workers(state).await;
         *last_idle_reap = Some(std::time::Instant::now());
+    }
+
+    // Rate-limit auto-resume (#1722). Cadence-gated like the idle reaper:
+    // reset windows are long, so probing every 2s tick is wasteful. Runs
+    // BEFORE the resume snapshot so a session whose reset just elapsed is
+    // un-parked (breadcrumb published + cleared from `attempted`) in time
+    // for this same tick's spawn pass to bring its worker back. The pass is
+    // a no-op for the default-off case: profiles that did not opt in are
+    // dropped before any event-store probe.
+    if last_rate_limit_reap.is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL) {
+        reap_rate_limit_resumes(state, attempted).await;
+        *last_rate_limit_reap = Some(std::time::Instant::now());
     }
 
     // Snapshot per-target resume inputs under the instances read lock.
@@ -599,6 +612,188 @@ fn adopt_decision(live: bool, build_current: bool, in_flight_turn: bool) -> Adop
     }
 }
 
+/// How often the rate-limit auto-resume pass runs. Reset windows are
+/// minutes to hours, so the 2s reconciler tick would re-probe far more
+/// often than needed; this gates it to a coarse cadence. See #1722.
+const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Hardcoded floor on the park window, measured from when the `RateLimit`
+/// event was recorded. A misbehaving adapter could report a `resets_at`
+/// already in the past (or with `grace_secs == 0`); without this floor the
+/// reconciler would respawn the worker on the very next pass and could
+/// thrash if the adapter keeps emitting past resets. 30s preserves the
+/// spirit of the #1281 "no eager restart loop" fix. See #1722.
+const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
+
+/// Opt-in rate-limit auto-resume pass (#1722). For cockpit sessions parked
+/// on `Stopped { reason: "rate_limited" }` whose profile enabled
+/// `cockpit.rate_limit_auto_resume`, respawn the worker once the
+/// adapter-reported `resets_at` (plus the configured grace, floored by
+/// `RATE_LIMIT_MIN_PARK_SECS` from when the limit was recorded) has passed.
+///
+/// Mechanism: publish a `RateLimitAutoResumed` breadcrumb (which supersedes
+/// the terminal `Stopped{rate_limited}` in `latest_status_event`) and clear
+/// the id from `attempted`. The main resume loop on the same tick then sees
+/// a non-park latest status and a clear `attempted` slot, so it fresh-spawns
+/// the worker through the existing path. Both the in-process park (id was
+/// inserted into `attempted` while the worker ran) and the daemon-restart
+/// park (the main loop parks it on the first tick) are covered because the
+/// candidate set is exactly `attempted` minus running workers.
+///
+/// Durable across daemon restart: `resets_at` is read from the persisted
+/// event store, never from memory. A re-rate-limit writes a fresh
+/// `RateLimit` event with a new `resets_at`, so the next auto-resume waits
+/// for the new window rather than looping.
+/// Wall-clock instant at which a rate-limit-parked session becomes
+/// eligible for auto-resume: the later of the adapter-reported reset
+/// (plus the configured grace) and a hardcoded minimum park measured from
+/// when the `RateLimit` event was recorded. The floor keeps a buggy
+/// adapter that reports a past `resets_at` (or a zero grace) from driving
+/// a tight respawn loop. See #1722.
+fn rate_limit_resume_at(
+    resets_at: chrono::DateTime<chrono::Utc>,
+    recorded_at_ms: i64,
+    grace_secs: u32,
+) -> chrono::DateTime<chrono::Utc> {
+    let resets_plus_grace = resets_at + chrono::Duration::seconds(i64::from(grace_secs));
+    match chrono::DateTime::from_timestamp_millis(recorded_at_ms)
+        .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
+    {
+        Some(floor) if floor > resets_plus_grace => floor,
+        _ => resets_plus_grace,
+    }
+}
+
+async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
+    // Candidates: cockpit sessions currently parked (recorded in
+    // `attempted`, no live worker). Snapshot (id, profile) under the read
+    // lock so we don't hold it across awaits. Archived/snoozed/dormant
+    // sessions are excluded for the same reasons as the resume snapshot.
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.cockpit_mode
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_idle_dormant()
+                    && attempted.contains(&i.id)
+            })
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Only sessions without a live worker are parked; a running worker in
+    // `attempted` is the steady-state perf entry, not a park.
+    let mut parked: Vec<(String, String)> = Vec::new();
+    for (id, profile) in candidates {
+        if !state.cockpit_supervisor.is_running(&id).await {
+            parked.push((id, profile));
+        }
+    }
+    if parked.is_empty() {
+        return;
+    }
+    // Resolve the auto-resume config per distinct profile off-thread (it
+    // touches disk). Sessions on a profile that did not opt in are dropped
+    // before any per-session event-store probe, so the feature is free for
+    // the default-off case.
+    let distinct_profiles: Vec<String> = {
+        let mut seen = HashSet::new();
+        parked
+            .iter()
+            .map(|(_, p)| p.clone())
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    };
+    let cfg_by_profile: std::collections::HashMap<String, (bool, u32)> =
+        tokio::task::spawn_blocking(move || {
+            distinct_profiles
+                .into_iter()
+                .map(|p| {
+                    let cockpit =
+                        crate::session::profile_config::resolve_config_or_warn(&p).cockpit;
+                    (
+                        p,
+                        (
+                            cockpit.rate_limit_auto_resume,
+                            cockpit.rate_limit_auto_resume_grace_secs,
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    for (id, profile) in parked {
+        let (enabled, grace_secs) = cfg_by_profile.get(&profile).copied().unwrap_or((false, 0));
+        if !enabled {
+            continue;
+        }
+        // Confirm the session is actually parked on a rate-limit stop (not
+        // some other terminal state that happens to sit in `attempted`) and
+        // read the reset time, both off-thread.
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_probe = id.clone();
+        let (is_rate_limit_parked, rate_limit) = match tokio::task::spawn_blocking(move || {
+            let parked = matches!(
+                store.latest_status_event(&id_probe),
+                Some(crate::cockpit::Event::Stopped { reason }) if reason == "rate_limited"
+            );
+            (parked, store.latest_rate_limit_event(&id_probe))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    error = %e,
+                    "rate-limit auto-resume probe failed"
+                );
+                continue;
+            }
+        };
+        if !is_rate_limit_parked {
+            continue;
+        }
+        let Some((info, recorded_at_ms)) = rate_limit else {
+            continue;
+        };
+        if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
+            continue;
+        }
+        // Re-check liveness right before publishing: several awaits sit
+        // between the candidate snapshot and here, so a manual
+        // `/cockpit/spawn` could have brought the worker back in the gap.
+        // Without this guard we would emit a spurious auto-resume
+        // breadcrumb (and clear `attempted`) for an already-running
+        // session. Let the manual resume win. See #1722.
+        if state.cockpit_supervisor.is_running(&id).await {
+            continue;
+        }
+        // Eligible: publish the breadcrumb (supersedes Stopped{rate_limited})
+        // and free the `attempted` slot so the main resume loop spawns a
+        // fresh worker this tick.
+        state
+            .cockpit_supervisor
+            .publish_rate_limit_auto_resumed(&id, info.resets_at);
+        attempted.remove(&id);
+        tracing::info!(
+            target: "cockpit.supervisor",
+            session = %id,
+            resets_at = %info.resets_at,
+            "rate-limit auto-resume: reset window elapsed; respawning worker"
+        );
+    }
+}
+
 async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
     let ResumeTarget {
         id,
@@ -996,7 +1191,11 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adopt_decision, should_auto_stop, AdoptDecision};
+    use super::{
+        adopt_decision, rate_limit_resume_at, should_auto_stop, AdoptDecision,
+        RATE_LIMIT_MIN_PARK_SECS,
+    };
+    use chrono::{Duration, TimeZone, Utc};
 
     const HOUR_MS: i64 = 3_600_000;
 
@@ -1041,6 +1240,38 @@ mod tests {
             AdoptDecision::FreshSpawn
         );
         assert_eq!(adopt_decision(false, true, true), AdoptDecision::FreshSpawn);
+    }
+
+    #[test]
+    fn resume_at_is_reset_plus_grace_when_far_in_future() {
+        // A reset an hour out dominates the 30s recorded-at floor, so the
+        // resume instant is exactly resets_at + grace.
+        let recorded_at = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let resets_at = recorded_at + Duration::hours(1);
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 15);
+        assert_eq!(got, resets_at + Duration::seconds(15));
+    }
+
+    #[test]
+    fn resume_at_floors_on_recorded_at_for_past_reset() {
+        // Adapter reported a reset in the past with zero grace; without the
+        // floor this would resume immediately. The floor pins it to
+        // recorded_at + MIN_PARK so there is no tight respawn loop.
+        let recorded_at = Utc.timestamp_opt(2_000_000, 0).unwrap();
+        let resets_at = recorded_at - Duration::seconds(5); // already elapsed
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 0);
+        assert_eq!(
+            got,
+            recorded_at + Duration::seconds(RATE_LIMIT_MIN_PARK_SECS)
+        );
+    }
+
+    #[test]
+    fn resume_at_grace_wins_when_above_floor() {
+        // resets_at == recorded_at, grace 120s > 30s floor: grace wins.
+        let recorded_at = Utc.timestamp_opt(3_000_000, 0).unwrap();
+        let got = rate_limit_resume_at(recorded_at, recorded_at.timestamp_millis(), 120);
+        assert_eq!(got, recorded_at + Duration::seconds(120));
     }
 
     #[test]

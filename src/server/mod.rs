@@ -1764,6 +1764,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut last_idle_reap: Option<std::time::Instant> = None;
     #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
+    #[cfg(feature = "serve")]
+    let mut last_rate_limit_reap: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
 
@@ -1896,6 +1898,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 &state,
                 &mut attempted_cockpit_spawns,
                 &mut last_idle_reap,
+                &mut last_rate_limit_reap,
             )
             .await;
 
@@ -2711,6 +2714,10 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
         // Running/Waiting turn (a respawn during an active turn
         // would otherwise stop the spinner mid-stream).
         Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
+        // Auto-resume after a rate-limit park: the worker is coming back.
+        // Heal any sticky error so the sidebar dot recovers; the imminent
+        // fresh spawn emits AcpSessionAssigned and live events right after.
+        Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
         _ => None,
     }
 }
@@ -2809,6 +2816,15 @@ mod tests {
         assert_eq!(
             derive_cockpit_status(&Event::AcpSessionAssigned {
                 acp_session_id: "uuid".into()
+            }),
+            Some(StatusIntent::HealError)
+        );
+        // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
+        // the worker is coming back, so clear a sticky error without
+        // clobbering an in-progress turn. See #1722.
+        assert_eq!(
+            derive_cockpit_status(&Event::RateLimitAutoResumed {
+                resets_at: chrono::Utc::now()
             }),
             Some(StatusIntent::HealError)
         );

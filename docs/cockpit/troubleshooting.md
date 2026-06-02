@@ -136,8 +136,25 @@ Stopping the agent while a tool call is mid-execution settles that tool's card t
 When the active ACP backend reports `errorKind: "rate_limit"` on `session/prompt` (Claude's adapter does this when the Anthropic account is over its limit), aoe treats this as a non-crash terminal state rather than as a worker crash:
 
 - The connection task emits a typed `RateLimit` event (which the dashboard banner reads to show the reset time) and a `Stopped { reason: "rate_limited" }` lifecycle event, then exits cleanly.
-- The supervisor drops the worker handle and does NOT respawn. Earlier behaviour respawned the runner inside the restart budget, then immediately hit the same limit on the next `session/prompt` and burned the budget. The session now sits parked until the user explicitly retries or hands off.
-- `aoe serve` restart while a session is parked respects the `Stopped { reason: "rate_limited" }` signal in the on-disk event log and does NOT auto-resume the worker; otherwise daemon restart at minute 30 of a 90-minute window would undo the fix.
+- The supervisor drops the worker handle and does NOT respawn. Earlier behaviour respawned the runner inside the restart budget, then immediately hit the same limit on the next `session/prompt` and burned the budget. By default the session now sits parked until the user explicitly retries or hands off.
+- `aoe serve` restart while a session is parked respects the `Stopped { reason: "rate_limited" }` signal in the on-disk event log and does NOT auto-resume the worker by default; otherwise daemon restart at minute 30 of a 90-minute window would undo the fix.
+
+#### Optional auto-resume after reset
+
+If you would rather stay on the same backend and have AoE pick the session back up automatically once the limit clears, enable the opt-in setting (off by default):
+
+```toml
+[cockpit]
+rate_limit_auto_resume = true
+rate_limit_auto_resume_grace_secs = 15   # cushion added to the reported reset time
+```
+
+Both knobs are editable in the cockpit settings (TUI and web dashboard, under "Advanced") and can be overridden per profile. When enabled, the reconciler watches a parked session and, once the adapter-reported `resets_at` (plus the grace) has passed, publishes a `RateLimitAutoResumed` breadcrumb and respawns the same worker through the normal resume path. Any prompt you queued during the wait is dispatched once the worker is back. Notes:
+
+- The reset time is read from the persisted `RateLimit` event, so the timer survives an `aoe serve` restart: a daemon that comes up after the window has elapsed resumes on its next reconciler pass, and one that comes up mid-window keeps waiting.
+- It is vendor-agnostic. Any ACP backend that reports `errorKind: "rate_limit"` is eligible, not just Claude.
+- It does not reintroduce a restart loop. If the resumed worker hits the limit again, the adapter reports a fresh `resets_at` and auto-resume waits for that new window. A hardcoded minimum park window also applies, so a misbehaving adapter that reports a reset in the past (or a zero grace) still cannot drive a tight respawn.
+- The manual "Continue in another agent" and reconnect paths below stay available regardless of the setting.
 
 The rate-limit banner offers a primary "Continue in another agent" CTA. Clicking it opens a modal that lists the cockpit ACP registry (claude / codex / opencode / gemini / vibe / pi / aoe-agent by default, plus anything you've added via the settings TUI) and preselects `codex` when installed. Picking a target calls `POST /api/sessions/{id}/cockpit/switch-agent`, which:
 

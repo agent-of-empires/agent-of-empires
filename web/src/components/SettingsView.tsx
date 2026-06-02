@@ -789,6 +789,15 @@ function CockpitSettings({
         </button>
       </div>
 
+      <div className="border-t border-surface-800 pt-3">
+        <ToggleField
+          label="Auto-resume after rate limit"
+          description="When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as cockpit.rate_limit_auto_resume; cross-device. See #1722."
+          checked={(cockpit.rate_limit_auto_resume as boolean) ?? false}
+          onChange={(v) => onSaveField("cockpit", "rate_limit_auto_resume", v)}
+        />
+      </div>
+
       <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
         <div>
           <div className="text-sm text-text-bright">Queue drain mode</div>
@@ -889,6 +898,19 @@ function CockpitSettings({
           }
           min={0}
           onChange={(v) => onSaveField("cockpit", "auto_stop_idle_secs", v)}
+        />
+        <NumberField
+          label="Auto-resume grace (s)"
+          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as cockpit.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
+          value={
+            typeof cockpit.rate_limit_auto_resume_grace_secs === "number"
+              ? (cockpit.rate_limit_auto_resume_grace_secs as number)
+              : 15
+          }
+          min={0}
+          onChange={(v) =>
+            onSaveField("cockpit", "rate_limit_auto_resume_grace_secs", v)
+          }
         />
       </CollapsibleSection>
 

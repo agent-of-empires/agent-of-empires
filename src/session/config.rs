@@ -409,6 +409,41 @@ pub struct CockpitConfig {
         advanced
     )]
     pub auto_stop_idle_secs: u32,
+    /// Opt-in auto-resume after a provider usage/rate-limit reset. When a
+    /// cockpit worker stops with `Stopped { reason: "rate_limited" }`, the
+    /// session is parked and (by default) waits for explicit user
+    /// recovery via `/cockpit/spawn` or agent handoff (the #1281
+    /// behavior). With this enabled, the reconciler instead respawns the
+    /// same worker automatically once the adapter-reported reset time
+    /// (plus `rate_limit_auto_resume_grace_secs`) has passed, publishing a
+    /// `RateLimitAutoResumed` breadcrumb for timeline clarity. Resume
+    /// timing is read from the persisted `RateLimit` event, so it survives
+    /// a daemon restart; a re-rate-limit writes a fresh reset time, so
+    /// there is no tight restart loop. Vendor-agnostic: any ACP backend
+    /// that reports `kind == "rate_limit"` is eligible. Default false,
+    /// preserving the manual-first behavior. See #1722.
+    #[serde(default)]
+    #[setting(label = "Auto-resume after rate limit", widget = "toggle")]
+    pub rate_limit_auto_resume: bool,
+    /// Seconds added to the adapter-reported `resets_at` before
+    /// auto-resume fires, to absorb clock skew and adapter jitter. Only
+    /// meaningful when `rate_limit_auto_resume` is true. Default 15. The
+    /// reconciler also enforces a hardcoded minimum park window from the
+    /// moment the rate limit was recorded, so a buggy adapter reporting a
+    /// past `resets_at` with grace 0 still cannot cause a tight respawn
+    /// loop. See #1722.
+    #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
+    #[setting(
+        label = "Auto-resume grace (s)",
+        widget = "number",
+        min = 0,
+        advanced
+    )]
+    pub rate_limit_auto_resume_grace_secs: u32,
+}
+
+fn default_rate_limit_auto_resume_grace_secs() -> u32 {
+    15
 }
 
 fn default_auto_stop_idle_secs() -> u32 {
@@ -481,6 +516,8 @@ impl Default for CockpitConfig {
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
+            rate_limit_auto_resume: false,
+            rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
         }
     }
 }

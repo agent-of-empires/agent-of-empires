@@ -702,6 +702,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         seq
     }
 
+    /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
+    /// reconciler is about to auto-respawn after a rate-limit park. The
+    /// `resets_at` is the adapter-reported reset time that gated the
+    /// resume. This event doubles as the supersede marker: it becomes the
+    /// session's latest status event (see `latest_status_event`'s filter),
+    /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
+    /// and falls through to a fresh spawn instead of re-parking. The web
+    /// reducer also keys off it to clear the rate-limit banner and drain a
+    /// queued prompt. See #1722.
+    pub fn publish_rate_limit_auto_resumed(
+        &self,
+        session_id: &str,
+        resets_at: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink
+            .publish(session_id, seq, &Event::RateLimitAutoResumed { resets_at });
+        seq
+    }
+
     /// Like `shutdown` but waits for the runner process to actually exit
     /// before returning, so a subsequent `spawn` for the same session id
     /// doesn't race the SIGTERM and collide on the worker socket file.
@@ -3798,6 +3818,32 @@ mod tests {
             .find_map(|(sid, seq, _)| if sid == "s-1" { Some(*seq) } else { None });
         assert_eq!(startup_seq, Some(1));
         assert_eq!(drained_seq, 2, "drain seq must follow startup-error seq");
+    }
+
+    /// `publish_rate_limit_auto_resumed` must emit a `RateLimitAutoResumed`
+    /// carrying the exact `resets_at` and allocate monotonic per-session
+    /// seqs, so the reconciler breadcrumb supersedes `Stopped{rate_limited}`
+    /// in the replay/store ordering. See #1722.
+    #[tokio::test]
+    async fn publish_rate_limit_auto_resumed_emits_event_with_monotonic_seq() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let resets_at = chrono::Utc::now();
+
+        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2, "seq must be monotonic per session");
+
+        let frames = sink.frames.lock().unwrap();
+        let first = frames
+            .iter()
+            .find(|(sid, seq, _)| sid == "s-rl" && *seq == 1)
+            .expect("first breadcrumb frame published");
+        assert!(matches!(
+            &first.2,
+            Event::RateLimitAutoResumed { resets_at: ts } if *ts == resets_at
+        ));
     }
 
     /// `with_capacity` enforces the configured cap. Past the cap,

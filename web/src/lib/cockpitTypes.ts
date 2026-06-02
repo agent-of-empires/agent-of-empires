@@ -258,6 +258,7 @@ export type CockpitEvent =
   | "ThinkingStarted"
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
+  | { RateLimitAutoResumed: { resets_at: string } }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -986,6 +987,15 @@ export function applyEvent(
   }
   if ("RateLimit" in event) {
     next.rateLimit = event.RateLimit.info;
+    return next;
+  }
+  if ("RateLimitAutoResumed" in event) {
+    // The reconciler crossed the reset deadline and is respawning the
+    // worker (opt-in cockpit.rate_limit_auto_resume). Clear the parked
+    // banner so the composer unlocks; the imminent AcpSessionAssigned and
+    // the running worker let the drain effect dispatch any prompt the
+    // user queued during the wait. See #1722.
+    next.rateLimit = null;
     return next;
   }
   if ("UsageUpdated" in event) {
