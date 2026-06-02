@@ -55,7 +55,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, trace, warn};
 
 use super::approvals::Nonce;
-use super::state::{Event, Plan};
+use super::state::{Event, Plan, RateLimitInfo};
 
 /// Externally-tagged JSON discriminants for non-substantive cockpit
 /// events: lifecycle and metadata snapshots the agent emits once per
@@ -541,6 +541,40 @@ impl EventStore {
         }
     }
 
+    /// Return the most recent `Event::RateLimit` stored for `session_id`
+    /// together with the wall-clock millis it was recorded (the
+    /// `created_at` row column). The reconciler's rate-limit auto-resume
+    /// pass reads this to decide whether `resets_at + grace` has elapsed,
+    /// using `created_at` as the floor for a minimum park window so a
+    /// buggy adapter reporting a past `resets_at` cannot trigger a tight
+    /// respawn loop. Latest event wins (a re-rate-limit supersedes the
+    /// prior reset time). See #1722.
+    pub fn latest_rate_limit_event(&self, session_id: &str) -> Option<(RateLimitInfo, i64)> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT event_json, created_at FROM cockpit_events
+                 WHERE session_id = ?1
+                   AND event_json LIKE '{\"RateLimit\":%'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (json, created_at) = row?;
+        let event: Event = serde_json::from_str(&json).ok()?;
+        if let Event::RateLimit { info } = event {
+            Some((info, created_at))
+        } else {
+            None
+        }
+    }
+
     /// Return the most recent unfired `WakeupScheduled` for `session_id`.
     /// "Pending" means the latest scheduled `at` is still in the future;
     /// the previous heuristic (any `UserPromptSent` with a higher seq
@@ -838,6 +872,14 @@ impl EventStore {
     /// cockpit events don't survive restart, so without this scan a
     /// session that was mid-turn when the previous daemon died would
     /// render Idle until the next lifecycle event arrived. See #1103.
+    ///
+    /// `RateLimitAutoResumed` is included deliberately: the rate-limit
+    /// auto-resume reconciler pass publishes it to supersede the terminal
+    /// `Stopped{rate_limited}`, so this query stops reporting the park and
+    /// the main resume loop falls through to a fresh spawn instead of
+    /// re-parking. A new status event added here also participates in
+    /// park supersession; keep that in mind before extending the set. See
+    /// #1722.
     pub fn latest_status_event(&self, session_id: &str) -> Option<Event> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
@@ -851,6 +893,7 @@ impl EventStore {
                      OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
                      OR json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                      OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
                  ORDER BY seq DESC
                  LIMIT 1",
@@ -1222,6 +1265,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
         Event::RateLimit { .. } => "rate_limit",
+        Event::RateLimitAutoResumed { .. } => "rate_limit_auto_resumed",
         Event::UsageUpdated { .. } => "usage_updated",
         Event::ModeChanged { .. } => "mode_changed",
         Event::ModesAvailable { .. } => "modes_available",
@@ -2433,5 +2477,74 @@ mod tests {
 
         // Unrelated session must not bleed into the query.
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
+    }
+
+    fn rate_limit_event(secs_until_reset: i64) -> Event {
+        Event::RateLimit {
+            info: RateLimitInfo {
+                status: "usage limit reached".into(),
+                resets_at: Utc::now() + chrono::Duration::seconds(secs_until_reset),
+                kind: "rate_limit".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn latest_rate_limit_event_returns_most_recent_with_recorded_at() {
+        let (_tmp, store) = open_store(1000);
+        let before = Utc::now().timestamp_millis();
+        store.record("s-1", 1, &rate_limit_event(3600)).unwrap();
+        // A second, later rate limit supersedes the first (new resets_at).
+        let second = rate_limit_event(7200);
+        let Event::RateLimit { info: ref expected } = second else {
+            unreachable!()
+        };
+        let expected_resets = expected.resets_at;
+        store.record("s-1", 2, &second).unwrap();
+        let after = Utc::now().timestamp_millis();
+
+        let (info, recorded_at) = store
+            .latest_rate_limit_event("s-1")
+            .expect("a rate-limit event is stored");
+        assert_eq!(info.resets_at, expected_resets, "latest event wins");
+        assert!(
+            recorded_at >= before && recorded_at <= after,
+            "recorded_at ({recorded_at}) is the row's created_at within [{before}, {after}]"
+        );
+        // A session with no rate-limit event returns None.
+        assert!(store.latest_rate_limit_event("s-2").is_none());
+    }
+
+    #[test]
+    fn rate_limit_auto_resumed_supersedes_stopped_in_latest_status() {
+        let (_tmp, store) = open_store(1000);
+        store.record("s-1", 1, &rate_limit_event(60)).unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        // While parked, the latest status is the rate-limit Stopped.
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::Stopped { reason }) if reason == "rate_limited"
+        ));
+        // The auto-resume breadcrumb must become the latest status event so
+        // the reconciler's resume loop stops seeing the park. See #1722.
+        let resets_at = Utc::now();
+        store
+            .record("s-1", 3, &Event::RateLimitAutoResumed { resets_at })
+            .unwrap();
+        assert!(
+            matches!(
+                store.latest_status_event("s-1"),
+                Some(Event::RateLimitAutoResumed { .. })
+            ),
+            "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
+        );
     }
 }

@@ -2423,3 +2423,29 @@ describe("applyEvent / thinking-state honesty (#1213)", () => {
     expect(state.inFlightTool).not.toBeNull();
   });
 });
+
+describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
+  it("clears the rate-limit banner so the composer unlocks", () => {
+    let state: CockpitState = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        RateLimit: {
+          info: {
+            status: "usage limit reached",
+            resets_at: "2026-06-01T12:10:00Z",
+            kind: "rate_limit",
+          },
+        },
+      },
+    });
+    expect(state.rateLimit).not.toBeNull();
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
+    });
+    expect(state.rateLimit).toBeNull();
+  });
+});

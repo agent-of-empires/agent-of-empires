@@ -426,6 +426,17 @@ impl CockpitTranscript {
                 // renderer is followup work (see the no-op group below).
                 self.turn_active = false;
             }
+            Event::RateLimitAutoResumed { resets_at } => {
+                // Timeline breadcrumb: the reconciler auto-resumed the
+                // worker after the rate-limit reset elapsed. Surface it so
+                // the transcript explains why the agent came back on its
+                // own. See #1722.
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Info,
+                    text: format!("auto-resumed after rate-limit reset ({resets_at})"),
+                });
+            }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
             | Event::UsageUpdated { .. }

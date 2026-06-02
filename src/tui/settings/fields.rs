@@ -169,6 +169,8 @@ pub enum FieldKey {
     CockpitSilentOrphanGraceSecs,
     CockpitSilentOrphanFastGraceSecs,
     CockpitAutoStopIdleSecs,
+    CockpitRateLimitAutoResume,
+    CockpitRateLimitAutoResumeGraceSecs,
     // Diff
     DiffSplitView,
     // Logging
@@ -688,6 +690,16 @@ fn build_cockpit_fields(
         global.cockpit.auto_stop_idle_secs,
         p.and_then(|c| c.auto_stop_idle_secs),
     );
+    let (rate_limit_auto_resume, rlar_override) = resolve_value(
+        scope,
+        global.cockpit.rate_limit_auto_resume,
+        p.and_then(|c| c.rate_limit_auto_resume),
+    );
+    let (rate_limit_auto_resume_grace_secs, rlargs_override) = resolve_value(
+        scope,
+        global.cockpit.rate_limit_auto_resume_grace_secs,
+        p.and_then(|c| c.rate_limit_auto_resume_grace_secs),
+    );
 
     vec![
         SettingField {
@@ -742,6 +754,15 @@ fn build_cockpit_fields(
             value: FieldValue::Bool(show_tool_durations),
             category: SettingsCategory::Cockpit,
             has_override: std_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitRateLimitAutoResume,
+            label: "Auto-resume after rate limit",
+            description: "When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Default off, which keeps the parked-until-you-act behavior. Vendor-agnostic: any ACP backend reporting a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. See #1722.",
+            value: FieldValue::Bool(rate_limit_auto_resume),
+            category: SettingsCategory::Cockpit,
+            has_override: rlar_override,
             inherited_display: None,
         },
         SettingField {
@@ -829,6 +850,15 @@ fn build_cockpit_fields(
             value: FieldValue::Number(u64::from(auto_stop_idle_secs)),
             category: SettingsCategory::Cockpit,
             has_override: asis_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitRateLimitAutoResumeGraceSecs,
+            label: "Auto-resume grace (s)",
+            description: "Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when \"Auto-resume after rate limit\" is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. See #1722.",
+            value: FieldValue::Number(u64::from(rate_limit_auto_resume_grace_secs)),
+            category: SettingsCategory::Cockpit,
+            has_override: rlargs_override,
             inherited_display: None,
         },
     ]
@@ -3008,6 +3038,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::CockpitAutoStopIdleSecs, FieldValue::Number(v)) => {
             config.cockpit.auto_stop_idle_secs = (*v).min(u32::MAX as u64) as u32;
         }
+        (FieldKey::CockpitRateLimitAutoResume, FieldValue::Bool(v)) => {
+            config.cockpit.rate_limit_auto_resume = *v
+        }
+        (FieldKey::CockpitRateLimitAutoResumeGraceSecs, FieldValue::Number(v)) => {
+            config.cockpit.rate_limit_auto_resume_grace_secs = (*v).min(u32::MAX as u64) as u32;
+        }
         // Logging
         (FieldKey::LoggingDefaultLevel, FieldValue::Select { selected, options }) => {
             if let Some(level) = options.get(*selected) {
@@ -3573,6 +3609,17 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 s.auto_stop_idle_secs = val
             });
         }
+        (FieldKey::CockpitRateLimitAutoResume, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.cockpit, |s, val| {
+                s.rate_limit_auto_resume = val
+            });
+        }
+        (FieldKey::CockpitRateLimitAutoResumeGraceSecs, FieldValue::Number(v)) => {
+            let clamped = (*v).min(u32::MAX as u64) as u32;
+            set_profile_override(clamped, &mut config.cockpit, |s, val| {
+                s.rate_limit_auto_resume_grace_secs = val
+            });
+        }
         (FieldKey::HostEnvironment, FieldValue::List(v)) => {
             // Empty list clears the override (no env entries); otherwise store
             // the list as the profile-scope replacement of the global list.
@@ -4003,6 +4050,7 @@ mod tests {
             FieldKey::CockpitReplayEvents,
             FieldKey::CockpitNodePath,
             FieldKey::CockpitShowToolDurations,
+            FieldKey::CockpitRateLimitAutoResume,
         ];
         for k in common_keys {
             let pos = fields.iter().position(|f| f.key == k).unwrap();
@@ -4024,6 +4072,7 @@ mod tests {
             FieldKey::CockpitSilentOrphanGraceSecs,
             FieldKey::CockpitSilentOrphanFastGraceSecs,
             FieldKey::CockpitAutoStopIdleSecs,
+            FieldKey::CockpitRateLimitAutoResumeGraceSecs,
         ];
         for k in advanced_keys {
             let pos = fields.iter().position(|f| f.key == k).unwrap();
