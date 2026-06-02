@@ -80,6 +80,33 @@ aoe add . --cockpit --agent aoe-agent --model llama3.3:ollama
 aoe add . --cockpit --agent gemini
 ```
 
+### Launch command and session name
+
+`--cmd <tool>` resolves through `session.agent_command_override` for
+cockpit sessions, the same as for tmux sessions. With
+
+```toml
+[session.agent_command_override]
+opencode = "opencode-plannotator"
+```
+
+`aoe add . --cmd opencode --cockpit` launches `opencode-plannotator`,
+not the bare `opencode` binary; the override's binary replaces the
+registry command and the agent's required ACP args are preserved (so
+`opencode acp` becomes `opencode-plannotator acp`). The override is
+applied only to a built-in agent whose registry binary matches the
+tool's own binary; adapter-backed agents such as Claude keep using
+`session.agent_cockpit_cmd` for a full command swap.
+
+The web new-session wizard shows the resolved launch command read-only
+so you can confirm it before the session starts.
+
+Session naming differs by entry point. `aoe add` is non-interactive: it
+uses `--title` when given, otherwise the worktree branch name, otherwise
+a generated name; it never prompts. The TUI `n` flow and the web
+new-session wizard prompt for a name interactively. To name a session
+created from the CLI, pass `--title "<name>"`.
+
 ### Globally
 
 The settings live in `config.toml` under `[cockpit]`:
