@@ -950,14 +950,6 @@ export const SessionRow = memo(function SessionRow({
 
   return (
     <>
-      {editingGroup && (
-        <SessionGroupModal
-          sessionTitle={sessionTitle || label}
-          currentGroup={sessionGroup}
-          onSave={saveGroup}
-          onClose={() => setEditingGroup(false)}
-        />
-      )}
       <a
         href={sessionPath}
         tabIndex={isDeleting ? -1 : undefined}
@@ -1333,6 +1325,16 @@ export const SessionRow = memo(function SessionRow({
               if (res.ok) setWorkdirModalOpen(false);
               return res;
             }}
+          />,
+          document.body,
+        )}
+      {editingGroup &&
+        createPortal(
+          <SessionGroupModal
+            sessionTitle={sessionTitle || label}
+            currentGroup={sessionGroup}
+            onSave={saveGroup}
+            onClose={() => setEditingGroup(false)}
           />,
           document.body,
         )}
