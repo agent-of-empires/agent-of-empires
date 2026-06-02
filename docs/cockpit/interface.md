@@ -296,3 +296,12 @@ TodoWrite sandwiched between real tool work (Read, Edit) stays inline as
 its own card rather than being hidden inside a group, so a status update
 between actions is never buried. Two-in-a-row stays inline as well; the
 fold threshold is three.
+
+Automatic grouping needs an unbroken run, so a phase where the agent
+narrates between each action (common right after a plan is approved)
+produces a long stream of individual cards instead. The **Compact
+tools** toggle at the top of the transcript collapses every tool card to
+its header for scanning, and new cards arrive collapsed while it stays
+on; the agent's narration stays visible and errored cards stay open so a
+failure is never hidden. It is a per-browser preference saved locally,
+and you can still expand any single card while compact mode is on.

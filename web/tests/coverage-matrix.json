@@ -1363,6 +1363,17 @@
       ]
     },
     {
+      "id": "cockpit.tool-density",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/ToolDisplayMode.test.tsx"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolDisplayMode.tsx"
+      ]
+    },
+    {
       "id": "cockpit.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
