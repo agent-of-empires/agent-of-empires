@@ -68,6 +68,7 @@ import {
   setSessionNotifications,
   setSessionPin,
   setSessionSnooze,
+  setWorktreeName,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
@@ -675,6 +676,9 @@ export const SessionRow = memo(function SessionRow({
   // independent of the context menu's lifecycle so the parent-menu
   // dismissal listener cannot close the picker out from under us.
   const [snoozeModalOpen, setSnoozeModalOpen] = useState(false);
+  // Edit-workdir-name picker, also in its own portal-rendered modal so the
+  // context-menu dismissal listener does not close it. See #1723.
+  const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
   useEffect(() => {
     if (optimisticPinned !== null && optimisticPinned === isPinned) {
       setOptimisticPinned(null);
@@ -887,6 +891,17 @@ export const SessionRow = memo(function SessionRow({
     // the prefilled value should still set the title.
     if (!trimmed || trimmed === sessionTitle || !sessionId) return;
     await renameSession(sessionId, trimmed);
+  };
+
+  // Editing the workdir name moves the worktree directory, so it is only
+  // offered for an aoe-managed worktree session that is not running. See
+  // #1723.
+  const canEditWorkdir =
+    !!firstSession?.has_managed_worktree && !runningSession && !!sessionId;
+
+  const openWorkdirModal = () => {
+    setContextMenu(null);
+    setWorkdirModalOpen(true);
   };
 
   const handleDelete = () => {
@@ -1117,6 +1132,15 @@ export const SessionRow = memo(function SessionRow({
           >
             Rename
           </button>
+          {!readOnly && canEditWorkdir && (
+            <button
+              onClick={openWorkdirModal}
+              data-testid="sidebar-context-menu-edit-workdir"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Edit workdir name
+            </button>
+          )}
           {!readOnly && cockpitSession && (
             <button
               onClick={handleSwitchAgent}
@@ -1261,9 +1285,160 @@ export const SessionRow = memo(function SessionRow({
           />,
           document.body,
         )}
+      {workdirModalOpen &&
+        sessionId &&
+        createPortal(
+          <WorkdirNameModal
+            title={label}
+            currentBranch={branchLabel}
+            onCancel={() => setWorkdirModalOpen(false)}
+            onSubmit={async (name, renameBranch) => {
+              const res = await setWorktreeName(sessionId, name, renameBranch);
+              if (res.ok) setWorkdirModalOpen(false);
+              return res;
+            }}
+          />,
+          document.body,
+        )}
     </>
   );
 });
+
+/** Edit-workdir-name modal. Renamed the worktree directory and, when the
+ *  user opts in, the git branch. Rendered as its own portal so it is
+ *  independent of the row's context menu. See #1723. */
+export function WorkdirNameModal({
+  title,
+  currentBranch,
+  onCancel,
+  onSubmit,
+}: {
+  title: string;
+  currentBranch: string | null;
+  onCancel: () => void;
+  onSubmit: (
+    name: string,
+    renameBranch: boolean,
+  ) => Promise<{ ok: boolean; message?: string }>;
+}) {
+  const [name, setName] = useState("");
+  const [renameBranch, setRenameBranch] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const submit = async () => {
+    if (busy) return;
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError("Enter a new workdir name.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const res = await onSubmit(trimmed, renameBranch);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.message ?? "Failed to edit the workdir name.");
+    }
+  };
+
+  return (
+    <div
+      data-testid="workdir-modal-backdrop"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Edit workdir name"
+    >
+      <div
+        data-testid="workdir-modal"
+        className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
+      >
+        <div className="px-4 py-3 border-b border-surface-700/40">
+          <div
+            className="text-sm font-mono text-text-primary truncate"
+            title={title}
+          >
+            Edit workdir name
+            <span className="text-text-muted"> · {title}</span>
+          </div>
+          {currentBranch && (
+            <div className="mt-1 text-[11px] text-text-dim font-mono">
+              Current branch: {currentBranch}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 flex flex-col gap-3">
+          <input
+            type="text"
+            autoFocus
+            aria-label="New workdir name"
+            disabled={busy}
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submit();
+              }
+            }}
+            placeholder="new-workdir-name"
+            data-testid="workdir-modal-name"
+            className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none focus:border-brand-600 disabled:opacity-50"
+          />
+          <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={renameBranch}
+              onChange={(e) => setRenameBranch(e.target.checked)}
+              data-testid="workdir-modal-rename-branch"
+            />
+            Also rename git branch
+          </label>
+          {error && (
+            <div
+              data-testid="workdir-modal-error"
+              className="text-[11px] text-status-error"
+            >
+              {error}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1 text-sm text-text-secondary hover:bg-surface-700/50 rounded cursor-pointer transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => void submit()}
+            disabled={busy}
+            data-testid="workdir-modal-save"
+            className="px-3 py-1 text-sm text-text-primary bg-brand-600 hover:bg-brand-500 rounded cursor-pointer transition-colors disabled:opacity-50"
+          >
+            {busy ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /** Bounds for `validate_snooze_duration` on the server. Mirrored
  *  client-side so the modal can pre-validate and disable the submit

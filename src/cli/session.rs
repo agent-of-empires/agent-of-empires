@@ -34,6 +34,11 @@ pub enum SessionCommands {
     /// Rename a session
     Rename(RenameArgs),
 
+    /// Edit a managed worktree session's workdir directory name (and,
+    /// optionally, its git branch). Moves the worktree directory in place;
+    /// the session must not be running. See #1723.
+    SetWorktreeName(SetWorktreeNameArgs),
+
     /// Capture tmux pane output
     Capture(CaptureArgs),
 
@@ -139,6 +144,20 @@ pub struct RenameArgs {
 }
 
 #[derive(Args)]
+pub struct SetWorktreeNameArgs {
+    /// Session ID or title (optional, auto-detects in tmux)
+    identifier: Option<String>,
+
+    /// New workdir (worktree directory) name
+    #[arg(long)]
+    name: String,
+
+    /// Also rename the underlying git branch to match the new name
+    #[arg(long)]
+    rename_branch: bool,
+}
+
+#[derive(Args)]
 pub struct ShowArgs {
     /// Session ID or title (optional, auto-detects in tmux)
     identifier: Option<String>,
@@ -235,6 +254,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Show(args) => show_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
+        SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
         SessionCommands::SetBase(args) => set_base(profile, args).await,
@@ -1040,6 +1060,83 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         println!("✓ Updated session: {}", effective_title);
     }
 
+    Ok(())
+}
+
+async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
+    let storage = Storage::new(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let inst = if let Some(id) = &args.identifier {
+        super::resolve_session(id, &instances)?
+    } else {
+        let current_session = std::env::var("TMUX_PANE")
+            .ok()
+            .and_then(|_| crate::tmux::get_current_session_name());
+        if let Some(session_name) = current_session {
+            instances
+                .iter()
+                .find(|i| {
+                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                    tmux_name == session_name
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                })?
+        } else {
+            bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
+        }
+    };
+
+    let id = inst.id.clone();
+    let current_path = inst.project_path.clone();
+    let Some(worktree_info) = inst.worktree_info.clone() else {
+        bail!("Session does not use a worktree");
+    };
+    // Persisted status can lag the real tmux pane, and moving the worktree of
+    // a still-running session is unsafe. Recompute from live tmux state before
+    // enforcing the guard.
+    let mut live = inst.clone();
+    crate::tmux::refresh_session_cache();
+    live.update_status();
+    if live.status.blocks_worktree_edit() {
+        bail!("Cannot edit the workdir name while the session is active; stop it first");
+    }
+
+    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+        crate::session::worktree_edit::WorktreeEditRequest {
+            worktree_info: &worktree_info,
+            current_path: std::path::Path::new(&current_path),
+            new_name: args.name.trim(),
+            rename_branch: args.rename_branch,
+        },
+    )?;
+    let new_path = outcome.new_path.to_string_lossy().to_string();
+    let new_branch = outcome.new_branch.clone();
+
+    storage
+        .update(|instances, _groups| {
+            let inst = instances
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+            inst.project_path = new_path.clone();
+            if let Some(branch) = &new_branch {
+                if let Some(wt) = inst.worktree_info.as_mut() {
+                    wt.branch = branch.clone();
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
+            )
+        })?;
+
+    println!("✓ Worktree moved to: {}", new_path);
+    if let Some(branch) = &new_branch {
+        println!("  Branch renamed to: {}", branch);
+    }
     Ok(())
 }
 
