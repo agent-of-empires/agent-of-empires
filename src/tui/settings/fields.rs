@@ -38,6 +38,7 @@ use super::SettingsScope;
 pub enum SettingsCategory {
     Theme,
     Updates,
+    Telemetry,
     Worktree,
     Sandbox,
     Tmux,
@@ -58,6 +59,7 @@ impl SettingsCategory {
         match self {
             Self::Theme => "Theme",
             Self::Updates => "Updates",
+            Self::Telemetry => "Telemetry",
             Self::Worktree => "Worktree",
             Self::Sandbox => "Sandbox",
             Self::Tmux => "Tmux",
@@ -93,6 +95,7 @@ impl SettingsCategory {
             Self::Web => "Web",
             Self::Cockpit => "Cockpit",
             Self::Diff => "Diff",
+            Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
         }
     }

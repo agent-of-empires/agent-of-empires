@@ -30,6 +30,9 @@ import {
   deleteSession,
   fetchAbout,
   fetchSettings,
+  fetchTelemetryStatus,
+  setTelemetryConsent,
+  reportTelemetrySeen,
   isDebugBuild,
   updateWorkspaceOrdering,
 } from "./lib/api";
@@ -83,6 +86,7 @@ import {
   resetTokenExpired,
 } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
+import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -317,6 +321,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [showHelp, setShowHelp] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(
     () => window.innerWidth >= 768,
   );
@@ -500,6 +505,33 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   useEffect(() => {
     refreshServerAbout();
   }, [refreshServerAbout]);
+
+  // Telemetry: once authenticated and on a writable server, report that the
+  // web dashboard was opened (folded into the daemon's next opt-in snapshot)
+  // and, if the user has not yet answered the opt-in prompt, show the consent
+  // modal. The browser never posts to the telemetry backend; it only talks to
+  // the local daemon. Read-only servers can't persist a choice, so skip.
+  useEffect(() => {
+    // AppContent only renders past the login gate, so reaching here means the
+    // session is usable. Read-only servers can't persist a choice, so skip.
+    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    reportTelemetrySeen("web");
+    let active = true;
+    void fetchTelemetryStatus().then((status) => {
+      if (!active || !status) return;
+      if (!status.responded && !status.do_not_track) {
+        setTelemetryConsentNeeded(true);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [serverAboutLoaded, serverAbout?.read_only]);
+
+  const handleTelemetryConsent = useCallback((enabled: boolean) => {
+    setTelemetryConsentNeeded(false);
+    void setTelemetryConsent(enabled);
+  }, []);
 
   const deletingWorkspace = deletingWorkspaceId
     ? workspaces.find((w) => w.id === deletingWorkspaceId)
@@ -1176,6 +1208,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
       {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+      {telemetryConsentNeeded && (
+        <TelemetryConsentModal onChoose={handleTelemetryConsent} />
+      )}
 
       {deletingSession && (
         <DeleteSessionDialog

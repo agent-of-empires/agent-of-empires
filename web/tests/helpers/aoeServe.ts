@@ -515,6 +515,15 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // under contention and triggering an optimistic-update revert).
     // Override via process env if a future investigation needs it.
     AOE_LOG_LEVEL: process.env.AOE_LOG_LEVEL ?? "info",
+    // Suppress the first-load telemetry consent modal. Every live spec boots
+    // a fresh HOME where `has_responded_to_telemetry` is false, so the modal
+    // (`telemetry-modal-title`, a z-50 full-screen backdrop) would otherwise
+    // intercept pointer events and time out every `click`. `DO_NOT_TRACK`
+    // makes `/api/telemetry/status` report `do_not_track: true`, which App.tsx
+    // treats as "never auto-show the modal". The consent flow itself is
+    // covered by the Vitest + RTL contract tests, not the live suite. A future
+    // live spec that exercises the modal can unset this in its own env.
+    DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
   };
 
   if (authMode === "token") {

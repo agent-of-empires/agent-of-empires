@@ -232,6 +232,15 @@ impl App {
             home.show_changelog(config.app_state.last_seen_version.clone());
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
+        } else if !config.app_state.has_responded_to_telemetry {
+            // Existing users who finished the walkthrough before telemetry
+            // existed get a one-time opt-in popup. Gated behind the changelog
+            // branch above (mutually exclusive in this if/else chain), so it
+            // never co-renders with the changelog; and because it is a modal
+            // dialog, the version update modal (opened only by an explicit
+            // keypress) can't open on top of it while it is up. No save here:
+            // the dialog's response handler persists the answer.
+            home.show_telemetry_consent();
         }
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
@@ -427,6 +436,7 @@ impl App {
         // before the intro walkthrough.
         self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
+        self.home.telemetry_consent_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
         self.home.info_dialog =
             Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
@@ -565,6 +575,14 @@ impl App {
         crate::session::write_tui_heartbeat();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
 
+        // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
+        // send an initial snapshot, then refresh it periodically and once more
+        // on graceful exit. All sends are detached and swallow errors.
+        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+        crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
+        self.emit_telemetry_snapshot();
+        let mut last_telemetry_snapshot = std::time::Instant::now();
+
         loop {
             // Force full redraw if needed (e.g., after returning from tmux).
             // with_raw_mode_disabled drops and recreates the EventStream, so
@@ -701,6 +719,12 @@ impl App {
                                                             // Click consumed by the context menu
                                                             // (item dispatched, kept open, or
                                                             // dismissed on outside-click).
+                                                        } else if self.home.handle_dialog_click(mouse.column, mouse.row) {
+                                                            // A modal (e.g. the telemetry consent
+                                                            // popup) swallowed the click. Mirrors the
+                                                            // non-burst path so dialog buttons are
+                                                            // clickable even when a mouse event lands
+                                                            // right after a paste/dictation burst.
                                                         } else if hit_list {
                                                             let action = self.home.handle_click(mouse.column, mouse.row);
                                                             if action.is_none() {
@@ -1157,6 +1181,11 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
+            if last_telemetry_snapshot.elapsed() >= TELEMETRY_SNAPSHOT_INTERVAL {
+                last_telemetry_snapshot = std::time::Instant::now();
+                self.emit_telemetry_snapshot();
+            }
+
             if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
                 last_presence_refresh = std::time::Instant::now();
                 let count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
@@ -1273,7 +1302,34 @@ impl App {
             tracing::error!(target: "tui.input", "Failed to save on quit: {}", e);
         }
 
+        // Best-effort final snapshot on graceful exit, bounded so a dead
+        // endpoint can't delay quit.
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::flush_snapshot(snapshot).await;
+        }
+
         Ok(())
+    }
+
+    /// Build a `usage_snapshot` from the current session list, or `None` when
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so
+    /// `web_seen` / `cockpit_seen` are false and the create-trend counter is
+    /// left at 0 (the `aoe serve` daemon is the surface that tracks those).
+    fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+        crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Tui,
+            self.home.instances(),
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Build and send a snapshot, detached. No-op when not opted in.
+    fn emit_telemetry_snapshot(&self) {
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::spawn_snapshot(snapshot);
+        }
     }
 
     fn render(&mut self, frame: &mut Frame) {

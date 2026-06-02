@@ -24,6 +24,7 @@ mod send_message;
 mod serve;
 mod snooze_duration;
 mod sort_picker;
+mod telemetry_consent;
 mod tool_picker;
 mod update_confirm;
 
@@ -54,6 +55,7 @@ pub use send_message::SendMessageDialog;
 pub use serve::{ServeAction, ServeView};
 pub use snooze_duration::SnoozeDurationDialog;
 pub use sort_picker::SortPickerDialog;
+pub use telemetry_consent::TelemetryConsentDialog;
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
 

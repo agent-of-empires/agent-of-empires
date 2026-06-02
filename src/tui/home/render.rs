@@ -601,6 +601,7 @@ impl HomeView {
             intro_dialog,
             no_agents_dialog,
             changelog_dialog,
+            telemetry_consent_dialog,
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,
@@ -833,6 +834,7 @@ impl HomeView {
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
+            || self.telemetry_consent_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()

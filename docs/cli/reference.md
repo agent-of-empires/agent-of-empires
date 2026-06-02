@@ -60,6 +60,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme list`↴](#aoe-theme-list)
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
+* [`aoe telemetry`↴](#aoe-telemetry)
+* [`aoe telemetry status`↴](#aoe-telemetry-status)
+* [`aoe telemetry enable`↴](#aoe-telemetry-enable)
+* [`aoe telemetry disable`↴](#aoe-telemetry-disable)
+* [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe cockpit`↴](#aoe-cockpit)
@@ -109,6 +114,7 @@ Run without arguments to launch the TUI dashboard.
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
+* `telemetry` — Manage anonymous opt-in usage telemetry
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
 * `cockpit` — Cockpit (ACP-based native agent rendering) management
@@ -913,6 +919,53 @@ Export a built-in theme as a TOML file for customization
 Show the custom themes directory path
 
 **Usage:** `aoe theme dir`
+
+
+
+## `aoe telemetry`
+
+Manage anonymous opt-in usage telemetry
+
+**Usage:** `aoe telemetry <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show the current telemetry opt-in state and install id
+* `enable` — Opt in to anonymous usage telemetry
+* `disable` — Opt out of telemetry (deletes the local install id)
+* `reset-id` — Generate a fresh anonymous install id (only while opted in)
+
+
+
+## `aoe telemetry status`
+
+Show the current telemetry opt-in state and install id
+
+**Usage:** `aoe telemetry status`
+
+
+
+## `aoe telemetry enable`
+
+Opt in to anonymous usage telemetry
+
+**Usage:** `aoe telemetry enable`
+
+
+
+## `aoe telemetry disable`
+
+Opt out of telemetry (deletes the local install id)
+
+**Usage:** `aoe telemetry disable`
+
+
+
+## `aoe telemetry reset-id`
+
+Generate a fresh anonymous install id (only while opted in)
+
+**Usage:** `aoe telemetry reset-id`
 
 
 

@@ -28,6 +28,7 @@ Only a small set of sub-targets is enumerated in the settings dropdown (see `KNO
 | `serve` | `aoe serve` daemonize/foreground startup, PID/URL file IO, tunnel up/down, signal-driven shutdown. |
 | `hooks` | Agent hook integration (Claude/Settl/Hermes/Kiro) install/uninstall, hook status file lifecycle, user-configured status hook command failures, and attached status hook watcher failures. |
 | `sound` | Notification sound asset download/install and per-event playback. |
+| `telemetry` | Anonymous opt-in usage telemetry: install-id persistence, opt-in/opt-out transitions, and send outcomes (all at `debug`). The `aoe serve` consent route emits under `http.api.telemetry`. |
 | `log.runtime` | Filter swaps (REST + runner file-watch). |
 
 ## Levels

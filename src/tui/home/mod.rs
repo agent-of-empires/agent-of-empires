@@ -432,6 +432,10 @@ pub struct HomeView {
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
+    /// One-time opt-in popup for users who finished the walkthrough before
+    /// telemetry existed. Startup gating keeps it from rendering over the
+    /// changelog or the version update modal.
+    pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
@@ -874,6 +878,7 @@ impl HomeView {
             #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
+            telemetry_consent_dialog: None,
             send_message_dialog: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
@@ -2371,6 +2376,7 @@ impl HomeView {
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
+            || self.telemetry_consent_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -2406,6 +2412,7 @@ impl HomeView {
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
+            || self.telemetry_consent_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -2536,6 +2543,11 @@ impl HomeView {
             "opening",
         );
         self.changelog_dialog = Some(ChangelogDialog::new(from_version));
+    }
+
+    pub fn show_telemetry_consent(&mut self) {
+        tracing::info!(target: "tui.dialog", dialog = "telemetry_consent", "opening");
+        self.telemetry_consent_dialog = Some(super::dialogs::TelemetryConsentDialog::new());
     }
 
     pub fn instances(&self) -> &[Instance] {

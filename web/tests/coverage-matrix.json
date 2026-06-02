@@ -150,6 +150,19 @@
       ]
     },
     {
+      "id": "settings.telemetry-consent",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/TelemetrySettings.test.tsx",
+        "src/components/__tests__/TelemetryConsentModal.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/TelemetrySettings.tsx",
+        "web/src/components/TelemetryConsentModal.tsx"
+      ]
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",

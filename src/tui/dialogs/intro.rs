@@ -27,11 +27,17 @@ use crate::tui::styles::{available_themes, Theme};
 pub struct IntroOutcome {
     pub final_theme: Option<String>,
     pub final_attach_mode: Option<NewSessionAttachMode>,
+    /// `Some(true)` if the user opted in to telemetry on the Telemetry page,
+    /// `Some(false)` if they declined, `None` if they skipped before reaching
+    /// it. The caller writes `config.telemetry.enabled` and marks the opt-in
+    /// prompt answered only when this is `Some`.
+    pub telemetry_opt_in: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Welcome,
+    Telemetry,
     FirstSession,
     AttachMode,
     ThemePicker,
@@ -51,6 +57,7 @@ impl Page {
     fn all() -> &'static [Page] {
         &[
             Page::Welcome,
+            Page::Telemetry,
             Page::FirstSession,
             Page::AttachMode,
             Page::ThemePicker,
@@ -107,6 +114,18 @@ pub struct IntroDialog {
     /// Index into `attach_mode_areas` (0 = LiveSend, 1 = Tmux) for the
     /// option the mouse is currently hovering on the AttachMode page.
     hovered_attach_idx: Option<usize>,
+
+    /// True when the user has chosen to opt in to telemetry on the Telemetry
+    /// page. Defaults to `false`: telemetry is off unless explicitly enabled.
+    telemetry_opt_in: bool,
+    /// True once the user has visited the Telemetry page; the choice is only
+    /// persisted (and the opt-in prompt only marked answered) when they did.
+    telemetry_visited: bool,
+    /// Hit-test rects for the two Telemetry options (0 = enable, 1 = decline).
+    telemetry_option_areas: [Rect; 2],
+    /// Index into `telemetry_option_areas` for the option under the mouse on
+    /// the Telemetry page.
+    hovered_telemetry_idx: Option<usize>,
 }
 
 impl IntroDialog {
@@ -134,6 +153,10 @@ impl IntroDialog {
             hovered_button: None,
             hovered_theme_row: None,
             hovered_attach_idx: None,
+            telemetry_opt_in: false,
+            telemetry_visited: false,
+            telemetry_option_areas: [Rect::default(), Rect::default()],
+            hovered_telemetry_idx: None,
         }
     }
 
@@ -175,6 +198,9 @@ impl IntroDialog {
             }
             Page::AttachMode => {
                 self.attach_mode_visited = true;
+            }
+            Page::Telemetry => {
+                self.telemetry_visited = true;
             }
             _ => {}
         }
@@ -218,6 +244,11 @@ impl IntroDialog {
             } else {
                 None
             },
+            telemetry_opt_in: if self.telemetry_visited {
+                Some(self.telemetry_opt_in)
+            } else {
+                None
+            },
         }
     }
 
@@ -232,6 +263,17 @@ impl IntroDialog {
             NewSessionAttachMode::LiveSend => NewSessionAttachMode::Tmux,
             NewSessionAttachMode::Tmux => NewSessionAttachMode::LiveSend,
         };
+    }
+
+    /// Flip the telemetry opt-in choice. A no-op when `DO_NOT_TRACK` forces
+    /// telemetry off, so the displayed choice can't drift from what will
+    /// actually happen.
+    fn toggle_telemetry(&mut self) {
+        if crate::telemetry::do_not_track() {
+            self.telemetry_opt_in = false;
+            return;
+        }
+        self.telemetry_opt_in = !self.telemetry_opt_in;
     }
 
     fn move_theme_cursor(&mut self, delta: isize) {
@@ -267,6 +309,18 @@ impl IntroDialog {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                     self.toggle_attach_mode();
+                    return DialogResult::Continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Telemetry page captures up/down/j/k to flip the opt-in choice,
+        // mirroring the attach-mode page.
+        if self.current_page() == Page::Telemetry {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                    self.toggle_telemetry();
                     return DialogResult::Continue;
                 }
                 _ => {}
@@ -316,12 +370,21 @@ impl IntroDialog {
         } else {
             None
         };
+        let new_telemetry = if self.current_page() == Page::Telemetry {
+            self.telemetry_option_areas
+                .iter()
+                .position(|a| a.contains(pos))
+        } else {
+            None
+        };
         let changed = self.hovered_button != new_button
             || self.hovered_theme_row != new_theme
-            || self.hovered_attach_idx != new_attach;
+            || self.hovered_attach_idx != new_attach
+            || self.hovered_telemetry_idx != new_telemetry;
         self.hovered_button = new_button;
         self.hovered_theme_row = new_theme;
         self.hovered_attach_idx = new_attach;
+        self.hovered_telemetry_idx = new_telemetry;
         changed
     }
 
@@ -332,6 +395,7 @@ impl IntroDialog {
     fn clear_page_hover(&mut self) {
         self.hovered_theme_row = None;
         self.hovered_attach_idx = None;
+        self.hovered_telemetry_idx = None;
     }
 
     /// Route a left-click. Returns `Some(result)` when the click hit a known
@@ -369,6 +433,15 @@ impl IntroDialog {
                 }
             }
         }
+        if self.current_page() == Page::Telemetry {
+            for (idx, area) in self.telemetry_option_areas.iter().enumerate() {
+                if area.contains(pos) {
+                    // Index 0 = enable, 1 = decline. DO_NOT_TRACK forces off.
+                    self.telemetry_opt_in = idx == 0 && !crate::telemetry::do_not_track();
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
         None
     }
 
@@ -399,6 +472,7 @@ impl IntroDialog {
 
         match self.current_page() {
             Page::Welcome => self.render_welcome(frame, chunks[0], theme),
+            Page::Telemetry => self.render_telemetry(frame, chunks[0], theme),
             Page::FirstSession => self.render_first_session(frame, chunks[0], theme),
             Page::AttachMode => self.render_attach_mode(frame, chunks[0], theme),
             Page::ThemePicker => self.render_theme_picker(frame, chunks[0], theme),
@@ -470,6 +544,112 @@ impl IntroDialog {
         ];
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+    }
+
+    fn render_telemetry(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let dnt = crate::telemetry::do_not_track();
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let intro = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Help improve aoe with anonymous usage telemetry?",
+                Style::default().fg(theme.title).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "It shows us how aoe is actually used, so we can prioritize the",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(Span::styled(
+                "features that matter most. Off by default; when on, aoe sends",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(Span::styled(
+                "anonymous counts only: sessions, agents/models, version, and OS.",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(Span::styled(
+                "Never prompts, paths, names, branches, or commands.",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(Span::styled(
+                "Change it any time under Settings, or with `aoe telemetry`.",
+                Style::default().fg(theme.dimmed),
+            )),
+        ])
+        .wrap(Wrap { trim: false });
+        frame.render_widget(intro, layout[0]);
+
+        if dnt {
+            // DO_NOT_TRACK is an absolute override; make the suppressed state
+            // explicit rather than silently ignoring the toggle.
+            self.telemetry_option_areas = [Rect::default(), Rect::default()];
+            let note = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "DO_NOT_TRACK is set in your environment.",
+                    Style::default().fg(theme.accent).bold(),
+                )),
+                Line::from(Span::styled(
+                    "Telemetry stays off and no install id is generated, whatever you pick.",
+                    Style::default().fg(theme.text),
+                )),
+            ])
+            .wrap(Wrap { trim: false });
+            frame.render_widget(note, layout[1]);
+            let hint = Paragraph::new(Span::styled(
+                "Enter to continue",
+                Style::default().fg(theme.hint).italic(),
+            ));
+            frame.render_widget(hint, layout[4]);
+            return;
+        }
+
+        let options = [
+            (true, "Enable anonymous telemetry"),
+            (false, "No thanks  (default)"),
+        ];
+        for (slot_idx, slot) in [layout[1], layout[2]].iter().enumerate() {
+            let (value, label) = options[slot_idx];
+            let is_selected = self.telemetry_opt_in == value;
+            let is_hovered = self.hovered_telemetry_idx == Some(slot_idx);
+            self.telemetry_option_areas[slot_idx] = *slot;
+            let marker = if is_selected { "▶ " } else { "  " };
+            let mut style = if is_selected {
+                Style::default().fg(theme.accent).bold()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            if is_hovered {
+                style = style.bg(theme.selection);
+            }
+            let line = Line::from(vec![
+                Span::styled(marker.to_string(), style),
+                Span::styled(label.to_string(), style),
+            ]);
+            let para = Paragraph::new(line);
+            let para = if is_hovered {
+                para.style(Style::default().bg(theme.selection))
+            } else {
+                para
+            };
+            frame.render_widget(para, *slot);
+        }
+
+        let hint = Paragraph::new(Span::styled(
+            "↑/↓ to choose  •  Enter to confirm",
+            Style::default().fg(theme.hint).italic(),
+        ));
+        frame.render_widget(hint, layout[4]);
     }
 
     fn render_first_session(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -877,7 +1057,14 @@ mod tests {
     #[test]
     fn enter_advances_through_pages_to_finish() {
         let mut dialog = IntroDialog::new("default");
-        // Welcome -> FirstSession
+        // Welcome -> Telemetry (marks telemetry_visited)
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Continue
+        ));
+        assert_eq!(dialog.current_page(), Page::Telemetry);
+        assert!(dialog.telemetry_visited);
+        // Telemetry -> FirstSession
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
             DialogResult::Continue
@@ -929,7 +1116,9 @@ mod tests {
     #[test]
     fn esc_reverts_preview_when_theme_was_visited() {
         let mut dialog = IntroDialog::new("default");
-        // Walk to theme page (Welcome -> FirstSession -> AttachMode -> Theme).
+        // Walk to theme page (Welcome -> Telemetry -> FirstSession ->
+        // AttachMode -> Theme).
+        dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
@@ -952,6 +1141,8 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.current_page(), Page::ThemePicker);
         // Entering the theme page itself queues a preview of the cursor's
         // current theme; drain it so we can isolate the arrow-key effect.
         let _ = dialog.take_pending_preview();
@@ -966,10 +1157,13 @@ mod tests {
     #[test]
     fn submit_outcome_carries_final_theme_when_user_picks_a_new_one() {
         let mut dialog = IntroDialog::new("default");
-        // Walk through Welcome -> FirstSession -> AttachMode -> ThemePicker.
+        // Walk to ThemePicker (Welcome -> Telemetry -> FirstSession ->
+        // AttachMode -> ThemePicker).
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.current_page(), Page::ThemePicker);
         // Move the cursor so the pick differs from the original "default";
         // outcome() suppresses identity picks to avoid an unnecessary
         // SetTheme dispatch + screen clear on close.
@@ -995,7 +1189,7 @@ mod tests {
         // Walk through all pages without touching the cursor: it stays on
         // "default", which equals the original; outcome() should report
         // None so the close path skips a needless SetTheme dispatch.
-        for _ in 0..5 {
+        for _ in 0..6 {
             let _ = dialog.handle_key(key(KeyCode::Enter));
         }
         let outcome = dialog.outcome();
@@ -1017,6 +1211,7 @@ mod tests {
         let mut dialog = IntroDialog::new("default");
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::AttachMode);
         assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::LiveSend);
         dialog.handle_key(key(KeyCode::Down));
@@ -1033,7 +1228,7 @@ mod tests {
         // who flips this for "clickable buttons" should make a
         // conscious choice rather than regressing the copy flow.
         let mut dialog = IntroDialog::new("default");
-        for _ in 0..5 {
+        for _ in 0..6 {
             assert!(dialog.wants_text_selection());
             dialog.handle_key(key(KeyCode::Right));
         }
@@ -1050,6 +1245,7 @@ mod tests {
             width: 10,
             height: 4,
         };
+        dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::AttachMode);
@@ -1085,6 +1281,7 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::ThemePicker);
         assert!(dialog.handle_hover(5, 0));
         assert_eq!(dialog.hovered_theme_row, Some(0));
@@ -1106,6 +1303,8 @@ mod tests {
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.current_page(), Page::ThemePicker);
         let _ = dialog.handle_hover(5, 0);
         assert!(dialog.hovered_theme_row.is_some());
         // Advancing to Done clears the per-page hover; if it leaked, the
@@ -1121,6 +1320,7 @@ mod tests {
         // Walk to AttachMode, toggle to Tmux, then walk to the end.
         dialog.handle_key(key(KeyCode::Enter));
         dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.current_page(), Page::AttachMode);
         dialog.handle_key(key(KeyCode::Down));
         assert_eq!(dialog.attach_mode_cursor, NewSessionAttachMode::Tmux);
@@ -1129,6 +1329,52 @@ mod tests {
         }
         let outcome = dialog.outcome();
         assert_eq!(outcome.final_attach_mode, Some(NewSessionAttachMode::Tmux));
+    }
+
+    #[test]
+    fn telemetry_toggle_switches_choice() {
+        let mut dialog = IntroDialog::new("default");
+        // Welcome -> Telemetry.
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.current_page(), Page::Telemetry);
+        // Default is opt-out; toggle on, then back off.
+        assert!(!dialog.telemetry_opt_in);
+        dialog.handle_key(key(KeyCode::Down));
+        assert!(dialog.telemetry_opt_in);
+        dialog.handle_key(key(KeyCode::Up));
+        assert!(!dialog.telemetry_opt_in);
+    }
+
+    #[test]
+    fn outcome_carries_telemetry_opt_in_when_user_enables_it() {
+        let mut dialog = IntroDialog::new("default");
+        dialog.handle_key(key(KeyCode::Enter)); // -> Telemetry
+        dialog.handle_key(key(KeyCode::Down)); // opt in
+        for _ in 0..5 {
+            let _ = dialog.handle_key(key(KeyCode::Enter));
+        }
+        let outcome = dialog.outcome();
+        assert_eq!(outcome.telemetry_opt_in, Some(true));
+    }
+
+    #[test]
+    fn outcome_carries_telemetry_decline_when_left_default() {
+        let mut dialog = IntroDialog::new("default");
+        // Walk the whole wizard without touching the telemetry choice.
+        for _ in 0..6 {
+            let _ = dialog.handle_key(key(KeyCode::Enter));
+        }
+        let outcome = dialog.outcome();
+        // Visited the page but left it on the default: an explicit decline.
+        assert_eq!(outcome.telemetry_opt_in, Some(false));
+    }
+
+    #[test]
+    fn outcome_omits_telemetry_when_skipped_before_the_page() {
+        let mut dialog = IntroDialog::new("default");
+        // Skip on the Welcome page, before reaching Telemetry.
+        let _ = dialog.handle_key(key(KeyCode::Esc));
+        assert_eq!(dialog.outcome().telemetry_opt_in, None);
     }
 
     #[test]

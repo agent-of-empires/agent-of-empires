@@ -37,7 +37,7 @@ fn intro_walkthrough_appears_on_first_run() {
 
     // Title bar uses the literal string from IntroDialog::render.
     h.wait_for("Welcome to Agent of Empires");
-    h.assert_screen_contains("(1/5)");
+    h.assert_screen_contains("(1/6)");
     h.assert_screen_contains("[Skip]");
     h.assert_screen_contains("[Next");
 }
@@ -51,24 +51,27 @@ fn intro_advances_through_pages_with_enter() {
     force_first_run(&h);
     h.spawn_tui();
 
-    h.wait_for("(1/5)");
+    h.wait_for("(1/6)");
     h.send_keys("Enter");
-    h.wait_for("(2/5)");
+    h.wait_for("(2/6)");
+    h.assert_screen_contains("Help improve aoe with anonymous usage telemetry?");
+    h.send_keys("Enter");
+    h.wait_for("(3/6)");
     h.assert_screen_contains("Start your first session");
     h.send_keys("Enter");
-    h.wait_for("(3/5)");
+    h.wait_for("(4/6)");
     h.assert_screen_contains("How do you want to drive your sessions?");
     h.send_keys("Enter");
-    h.wait_for("(4/5)");
+    h.wait_for("(5/6)");
     h.assert_screen_contains("Pick a theme");
     h.send_keys("Enter");
-    h.wait_for("(5/5)");
+    h.wait_for("(6/6)");
     h.assert_screen_contains("You're all set");
     h.send_keys("Enter");
     // Intro dismissed: list view marker should appear and the dialog title
     // should be gone.
     h.wait_for("No sessions yet");
-    h.wait_for_absent("(5/5)", Duration::from_secs(3));
+    h.wait_for_absent("(6/6)", Duration::from_secs(3));
 }
 
 #[test]
@@ -80,7 +83,7 @@ fn intro_esc_skips_without_changing_theme() {
     force_first_run(&h);
     h.spawn_tui();
 
-    h.wait_for("(1/5)");
+    h.wait_for("(1/6)");
     h.send_keys("Escape");
     h.wait_for("No sessions yet");
 
@@ -111,18 +114,20 @@ fn intro_theme_pick_persists_to_config() {
     force_first_run(&h);
     h.spawn_tui();
 
-    h.wait_for("(1/5)");
-    h.send_keys("Enter"); // -> page 2 (first session)
-    h.wait_for("(2/5)");
-    h.send_keys("Enter"); // -> page 3 (attach mode, pre-selects LiveSend)
-    h.wait_for("(3/5)");
-    h.send_keys("Enter"); // -> page 4 (theme picker)
-    h.wait_for("(4/5)");
+    h.wait_for("(1/6)");
+    h.send_keys("Enter"); // -> page 2 (telemetry)
+    h.wait_for("(2/6)");
+    h.send_keys("Enter"); // -> page 3 (first session)
+    h.wait_for("(3/6)");
+    h.send_keys("Enter"); // -> page 4 (attach mode, pre-selects LiveSend)
+    h.wait_for("(4/6)");
+    h.send_keys("Enter"); // -> page 5 (theme picker)
+    h.wait_for("(5/6)");
     // BUILTIN_THEMES (src/tui/styles/mod.rs) is ordered `default, empire, ...`
     // so a single Down from the default-seeded cursor lands on `empire`.
     h.send_keys("Down");
-    h.send_keys("Enter"); // -> page 5 (done)
-    h.wait_for("(5/5)");
+    h.send_keys("Enter"); // -> page 6 (done)
+    h.wait_for("(6/6)");
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
@@ -153,17 +158,19 @@ fn intro_lets_user_choose_tmux_attach() {
     force_first_run(&h);
     h.spawn_tui();
 
-    h.wait_for("(1/5)");
+    h.wait_for("(1/6)");
+    h.send_keys("Enter"); // -> telemetry
+    h.wait_for("(2/6)");
     h.send_keys("Enter"); // -> first session
-    h.wait_for("(2/5)");
+    h.wait_for("(3/6)");
     h.send_keys("Enter"); // -> attach mode
-    h.wait_for("(3/5)");
+    h.wait_for("(4/6)");
     // Pre-selected LiveSend; flip to Tmux.
     h.send_keys("Down");
     h.send_keys("Enter"); // -> theme
-    h.wait_for("(4/5)");
+    h.wait_for("(5/6)");
     h.send_keys("Enter"); // -> done
-    h.wait_for("(5/5)");
+    h.wait_for("(6/6)");
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");

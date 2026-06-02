@@ -224,6 +224,7 @@ async fn main() -> Result<()> {
                 ThemeCommands::Dir => cli::theme::run_dir(),
             };
         }
+        Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         _ => {}
@@ -265,7 +266,19 @@ async fn main() -> Result<()> {
         migrations::run_migrations()?;
     }
 
-    match cli.command {
+    // Whether this invocation is a short-lived CLI command. The long-running
+    // surfaces (TUI, serve) emit their own `process_start` with the correct
+    // surface and run their own snapshot loop, so they're excluded here.
+    #[cfg(feature = "serve")]
+    let cli_oneshot = cli.command.is_some()
+        && !matches!(
+            cli.command,
+            Some(Commands::Serve(_)) | Some(Commands::CockpitRunner(_))
+        );
+    #[cfg(not(feature = "serve"))]
+    let cli_oneshot = cli.command.is_some();
+
+    let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
@@ -302,5 +315,15 @@ async fn main() -> Result<()> {
             tui::run(&profile, combined).await
         }
         _ => unreachable!(),
+    };
+
+    // Emit `process_start` for a short-lived CLI command AFTER it runs, so the
+    // command's own output isn't delayed. Throttled to once per install per
+    // day and awaited with a hard timeout so a dead endpoint can't hang exit;
+    // a no-op unless the user opted in, so default-off users pay nothing.
+    if cli_oneshot {
+        agent_of_empires::telemetry::flush_cli_process_start().await;
     }
+
+    result
 }

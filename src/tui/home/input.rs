@@ -36,7 +36,10 @@ const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_mi
 /// logged and swallowed: the intro should never block startup on a config
 /// write hiccup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
-    if outcome.final_theme.is_none() && outcome.final_attach_mode.is_none() {
+    if outcome.final_theme.is_none()
+        && outcome.final_attach_mode.is_none()
+        && outcome.telemetry_opt_in.is_none()
+    {
         return;
     }
     let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
@@ -50,9 +53,34 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
         config.session.new_session_attach_mode = mode;
         config.session.default_attach_mode = mode;
     }
+    if let Some(opt_in) = outcome.telemetry_opt_in {
+        config.telemetry.enabled = opt_in;
+        config.app_state.has_responded_to_telemetry = true;
+    }
     if let Err(e) = save_config(&config) {
         tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
     }
+    // Sync the install id with the saved opt-in choice (no-op under
+    // DO_NOT_TRACK). Done after save so telemetry.json matches config.
+    if let Some(opt_in) = outcome.telemetry_opt_in {
+        crate::telemetry::apply_opt_in_change(opt_in);
+    }
+}
+
+/// Persist the user's answer to the standalone telemetry consent popup.
+/// Sets the opt-in flag, marks the prompt answered so it never re-appears,
+/// and reconciles the install id (no-op under `DO_NOT_TRACK`).
+fn persist_telemetry_consent(opt_in: bool) {
+    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
+        tracing::warn!(target: "tui.input", "telemetry consent: load_config failed; not persisting");
+        return;
+    };
+    config.telemetry.enabled = opt_in;
+    config.app_state.has_responded_to_telemetry = true;
+    if let Err(e) = save_config(&config) {
+        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
+    }
+    crate::telemetry::apply_opt_in_change(opt_in);
 }
 
 /// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
@@ -790,6 +818,20 @@ impl HomeView {
             }
             return true;
         }
+        if let Some(dialog) = &self.telemetry_consent_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let opt_in = match result {
+                    DialogResult::Submit(opt_in) => Some(opt_in),
+                    DialogResult::Cancel => Some(false),
+                    DialogResult::Continue => None,
+                };
+                if let Some(opt_in) = opt_in {
+                    self.telemetry_consent_dialog = None;
+                    persist_telemetry_consent(opt_in);
+                }
+            }
+            return true;
+        }
         if let Some(dialog) = &self.snooze_duration_dialog {
             if let Some(DialogResult::Submit(minutes)) = dialog.handle_click(col, row) {
                 self.snooze_duration_dialog = None;
@@ -1215,6 +1257,23 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel | DialogResult::Submit(_) => {
                     self.changelog_dialog = None;
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.telemetry_consent_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Submit(opt_in) => {
+                    self.telemetry_consent_dialog = None;
+                    persist_telemetry_consent(opt_in);
+                }
+                // Cancel can't be produced by this dialog (Esc maps to a
+                // decline), but treat it as a decline for completeness.
+                DialogResult::Cancel => {
+                    self.telemetry_consent_dialog = None;
+                    persist_telemetry_consent(false);
                 }
             }
             return None;
@@ -3293,6 +3352,9 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.update_confirm_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some(dialog) = &mut self.telemetry_consent_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.snooze_duration_dialog {

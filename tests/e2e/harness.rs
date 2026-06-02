@@ -240,6 +240,10 @@ impl TuiTestHarness {
         }
 
         // Pre-seed config.toml to skip the welcome dialog and update checks.
+        // `has_responded_to_telemetry` is set so the one-time telemetry consent
+        // popup (gated on that flag alone in `App::new`) never renders over the
+        // TUI and swallows input in the general e2e tests; the telemetry consent
+        // surfaces are covered directly by their own unit and integration tests.
         // On Linux the app uses $XDG_CONFIG_HOME/agent-of-empires[-dev]/ (set
         // below), on macOS it uses $HOME/.agent-of-empires[-dev]/. The `-dev`
         // suffix kicks in on debug builds, which is what `cargo test` produces.
@@ -251,6 +255,7 @@ update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
+has_responded_to_telemetry = true
 last_seen_version = "{}"
 "#,
             env!("CARGO_PKG_VERSION")
