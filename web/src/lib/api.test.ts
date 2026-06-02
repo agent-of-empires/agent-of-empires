@@ -22,6 +22,8 @@ import {
   setSessionArchive,
   setSessionPin,
   setSessionSnooze,
+  updateProfileSettings,
+  PROFILE_WRITABLE_SECTIONS,
   type ServerAbout,
 } from "./api";
 
@@ -184,6 +186,64 @@ describe("setSessionSnooze", () => {
   it("returns null on 400 (server rejected an out-of-range duration)", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 400 }));
     expect(await setSessionSnooze("sess-1", 0)).toBeNull();
+  });
+});
+
+describe("updateProfileSettings write guard", () => {
+  // PROFILE_WRITABLE_SECTIONS mirrors the server's
+  // ALLOWED_PROFILE_SETTINGS_SECTIONS (src/server/api/mod.rs). This literal
+  // pin fails CI if the client list drifts; keep it in sync with the Rust
+  // constant and its pinned regression test by hand.
+  it("pins the allowlist to the server's writable sections", () => {
+    expect([...PROFILE_WRITABLE_SECTIONS]).toEqual([
+      "theme",
+      "session",
+      "tmux",
+      "updates",
+      "sound",
+      "sandbox",
+      "worktree",
+      "web",
+      "logging",
+      "cockpit",
+      "description",
+    ]);
+  });
+
+  it("refuses to send a body containing the blocked `hooks` section", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const ok = await updateProfileSettings("work", {
+      hooks: { on_create: ["rm -rf /"] },
+    });
+    expect(ok).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("refuses any unknown/blocked key even alongside an allowed one", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const ok = await updateProfileSettings("work", {
+      theme: { name: "empire" },
+      custom_agents: { evil: "ssh host claude" },
+    });
+    expect(ok).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("PATCHes an allowed section through to the server", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
+    const ok = await updateProfileSettings("work", {
+      description: "my profile",
+    });
+    expect(ok).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/profiles/work/settings");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({
+      description: "my profile",
+    });
   });
 });
 

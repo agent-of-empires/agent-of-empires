@@ -262,6 +262,18 @@
       ]
     },
     {
+      "id": "settings.session-auto-stop-idle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.session.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/FormFields.tsx"
+      ]
+    },
+    {
       "id": "settings.advanced-fold-persistence",
       "kind": "live-playwright",
       "risk": "medium",
@@ -358,6 +370,41 @@
       ],
       "components": [
         "web/src/components/settings/ProfileSelector.tsx"
+      ]
+    },
+    {
+      "id": "profiles.page",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/profiles-page.spec.ts"
+      ],
+      "components": [
+        "web/src/components/profiles/ProfilesPage.tsx"
+      ]
+    },
+    {
+      "id": "profiles.hooks-readonly",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/profiles/__tests__/HooksReadOnlyPanel.test.tsx",
+        "src/lib/profileHooks.test.ts"
+      ],
+      "components": [
+        "web/src/components/profiles/HooksReadOnlyPanel.tsx"
+      ]
+    },
+    {
+      "id": "profiles.write-guard",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/components/profiles/__tests__/ProfilesPage.test.tsx"
+      ],
+      "components": [
+        "web/src/components/profiles/ProfilesPage.tsx"
       ]
     },
     {
@@ -864,6 +911,20 @@
         "web/src/lib/safeStorage.ts",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/ContentSplit.tsx"
+      ]
+    },
+    {
+      "id": "right-panel.diff-copy-path",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/diff/__tests__/CopyPathContextMenu.test.tsx",
+        "src/components/diff/__tests__/DiffFileList.copyPath.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/CopyPathContextMenu.tsx",
+        "web/src/components/diff/DiffFileList.tsx",
+        "web/src/lib/clipboard.ts"
       ]
     },
     {

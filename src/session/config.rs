@@ -624,6 +624,19 @@ pub struct SessionConfig {
     #[serde(default = "default_snooze_duration_minutes")]
     pub snooze_duration_minutes: u32,
 
+    /// Seconds of inactivity after which a plain TUI/tmux session that has
+    /// been `Idle` this long is auto-stopped (its tmux session and any
+    /// sandbox container are killed and the row becomes a restartable
+    /// `Stopped` row). `0` disables (default); no session is ever auto-stopped
+    /// for inactivity. Idle age is anchored on the later of the last
+    /// transition into `Idle` and the last user interaction, and a session
+    /// with a currently attached tmux client is never stopped, so a session
+    /// the user is reading is spared. Checked about once a minute, so the stop
+    /// can lag the threshold by up to a minute. Cockpit workers use the
+    /// separate `cockpit.auto_stop_idle_secs` knob; see #1689 and #1690.
+    #[serde(default = "default_auto_stop_idle_secs")]
+    pub auto_stop_idle_secs: u32,
+
     /// Text sent to the agent after a successful `aoe session restart` /
     /// `e`-keybind restart, once the post-restart readiness probe says the
     /// pane is alive. Restart re-execs the agent at a blank prompt; this
@@ -784,6 +797,7 @@ impl Default for SessionConfig {
             agent_cockpit_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
@@ -829,6 +843,17 @@ pub fn validate_snooze_duration(minutes: u64) -> Result<(), String> {
         return Err(format!(
             "Snooze duration must be between 1 and {} minutes (got {})",
             SNOOZE_MAX_MINUTES, minutes
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_auto_stop_idle_secs(secs: u64) -> Result<(), String> {
+    if secs > u32::MAX as u64 {
+        return Err(format!(
+            "Auto-stop idle seconds must be at most {} (got {})",
+            u32::MAX,
+            secs
         ));
     }
     Ok(())
@@ -2351,6 +2376,18 @@ mod tests {
     fn test_validate_snooze_duration_rejects_out_of_range() {
         assert!(validate_snooze_duration(0).is_err());
         assert!(validate_snooze_duration(SNOOZE_MAX_MINUTES + 1).is_err());
+    }
+
+    #[test]
+    fn test_validate_auto_stop_idle_secs_accepts_u32_range() {
+        assert!(validate_auto_stop_idle_secs(0).is_ok());
+        assert!(validate_auto_stop_idle_secs(3600).is_ok());
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auto_stop_idle_secs_rejects_above_u32() {
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
     }
 
     #[test]

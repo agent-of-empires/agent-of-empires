@@ -4,6 +4,7 @@ import type {
   RichFileDiffResponse,
   AgentInfo,
   ProfileInfo,
+  ProfileSettingsResponse,
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
@@ -210,16 +211,53 @@ export async function setDefaultProfile(name: string): Promise<boolean> {
 
 export function getProfileSettings(
   name: string,
-): Promise<Record<string, unknown> | null> {
-  return fetchJson<Record<string, unknown>>(
+): Promise<ProfileSettingsResponse | null> {
+  return fetchJson<ProfileSettingsResponse>(
     `/api/profiles/${encodeURIComponent(name)}/settings`,
   );
 }
+
+/** Profile-settings sections the dashboard is allowed to PATCH. Mirror of
+ *  the server's `ALLOWED_PROFILE_SETTINGS_SECTIONS` (src/server/api/mod.rs).
+ *  Sections NOT listed here, notably `hooks` plus the agent-command and
+ *  env fields, are remote-code-execution surfaces blocked server-side with
+ *  a pinned regression test (mod.rs tests module). We reject them client
+ *  side too as defense in depth. Keep this in sync with the Rust constant
+ *  by hand: there is no automated cross-language pin. */
+export const PROFILE_WRITABLE_SECTIONS = [
+  "theme",
+  "session",
+  "tmux",
+  "updates",
+  "sound",
+  "sandbox",
+  "worktree",
+  "web",
+  "logging",
+  "cockpit",
+  "description",
+] as const;
+
+const PROFILE_WRITABLE_SECTION_SET: ReadonlySet<string> = new Set(
+  PROFILE_WRITABLE_SECTIONS,
+);
 
 export async function updateProfileSettings(
   name: string,
   updates: Record<string, unknown>,
 ): Promise<boolean> {
+  for (const key of Object.keys(updates)) {
+    if (!PROFILE_WRITABLE_SECTION_SET.has(key)) {
+      // Refuse loudly rather than silently dropping the key. A blocked
+      // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
+      // server would 400 it anyway. Failing here keeps a buggy caller
+      // from reporting a partial save as success.
+      console.error(
+        `updateProfileSettings: refusing to send blocked profile section "${key}"`,
+      );
+      return false;
+    }
+  }
   try {
     const res = await fetch(
       `/api/profiles/${encodeURIComponent(name)}/settings`,

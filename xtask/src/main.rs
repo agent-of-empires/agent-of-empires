@@ -198,45 +198,121 @@ fn collect_subcommand_paths(cmd: &clap::Command, prefix: &str, out: &mut BTreeSe
     }
 }
 
+/// How the skill's published version is sourced, which determines whether a
+/// top-level `version:` field is allowed in the frontmatter.
+enum VersionRule {
+    /// clawhub manages the version via `_meta.json` and the release workflow's
+    /// `--version` flag, so a static `version:` field would go stale: forbid it.
+    Forbidden,
+    /// The Hermes Skills Hub requires a top-level `version:` field: require it.
+    Required,
+}
+
 fn check_skill() {
-    let skill_path = Path::new("contrib/openclaw-skill/SKILL.md");
-    if !skill_path.exists() {
-        eprintln!("Skill file not found: {}", skill_path.display());
-        std::process::exit(1);
-    }
+    let skills = [
+        ("contrib/openclaw-skill/SKILL.md", VersionRule::Forbidden),
+        ("contrib/hermes-skill/SKILL.md", VersionRule::Required),
+    ];
 
-    let content = fs::read_to_string(skill_path).expect("Failed to read SKILL.md");
-
-    let mut has_error = false;
-
-    // The skill's published version is managed by clawhub via _meta.json and
-    // the release workflow's `--version` flag. A static `version:` in the
-    // frontmatter goes stale on every release, so disallow it.
-    if let Some((frontmatter, _)) = content
-        .strip_prefix("---\n")
-        .and_then(|s| s.split_once("\n---"))
-    {
-        for line in frontmatter.lines() {
-            if line.starts_with("version:") {
-                eprintln!(
-                    "ERROR: SKILL.md frontmatter must not contain a top-level `version:` field; \
-                     clawhub's _meta.json is the source of truth"
-                );
-                has_error = true;
-                break;
-            }
-        }
-    }
-
-    // Build the clap command tree
+    // Build the clap command tree once; shared across every skill file.
     let cli_cmd = agent_of_empires::cli::Cli::command();
     let mut cli_commands: BTreeSet<String> = BTreeSet::new();
     collect_subcommand_paths(&cli_cmd, "", &mut cli_commands);
 
+    let mut has_error = false;
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+
+    for (path_str, version_rule) in &skills {
+        let skill_path = Path::new(path_str);
+        if !skill_path.exists() {
+            eprintln!("Skill file not found: {}", skill_path.display());
+            has_error = true;
+            continue;
+        }
+
+        let content = fs::read_to_string(skill_path).expect("Failed to read SKILL.md");
+
+        if check_skill_file(
+            path_str,
+            &content,
+            version_rule,
+            &cli_commands,
+            &mut referenced,
+        ) {
+            has_error = true;
+        }
+    }
+
+    // Advisory: CLI commands not referenced in any skill file.
+    let mut missing_from_skill = Vec::new();
+    for cli_cmd in &cli_commands {
+        let mentioned = referenced.iter().any(|s| {
+            s == cli_cmd
+                || cli_cmd.starts_with(&format!("{} ", s))
+                || s.starts_with(&format!("{} ", cli_cmd))
+        });
+        if !mentioned {
+            missing_from_skill.push(cli_cmd.clone());
+        }
+    }
+
+    if !missing_from_skill.is_empty() {
+        println!("Advisory: CLI commands not referenced in any skill file:");
+        for cmd in &missing_from_skill {
+            println!("  aoe {}", cmd);
+        }
+    }
+
+    if has_error {
+        std::process::exit(1);
+    }
+
+    println!("Skill check passed.");
+}
+
+/// Validate one skill file's frontmatter version rule and command references.
+/// Referenced commands are accumulated into `referenced` for the shared
+/// advisory. Returns `true` if an error was found.
+fn check_skill_file(
+    path_str: &str,
+    content: &str,
+    version_rule: &VersionRule,
+    cli_commands: &BTreeSet<String>,
+    referenced: &mut BTreeSet<String>,
+) -> bool {
+    let mut has_error = false;
+
+    let has_version = content
+        .strip_prefix("---\n")
+        .and_then(|s| s.split_once("\n---"))
+        .is_some_and(|(frontmatter, _)| {
+            frontmatter.lines().any(|line| line.starts_with("version:"))
+        });
+
+    match version_rule {
+        VersionRule::Forbidden if has_version => {
+            eprintln!(
+                "ERROR: {} frontmatter must not contain a top-level `version:` field; \
+                 clawhub's _meta.json is the source of truth",
+                path_str
+            );
+            has_error = true;
+        }
+        VersionRule::Required if !has_version => {
+            eprintln!(
+                "ERROR: {} frontmatter must contain a top-level `version:` field; \
+                 the Hermes Skills Hub requires it",
+                path_str
+            );
+            has_error = true;
+        }
+        _ => {}
+    }
+
     // Extract `aoe <words>` patterns and match longest valid subcommand path
     let re = regex::Regex::new(r"aoe\s+([a-z][a-z0-9 -]*)").unwrap();
     let mut skill_commands: BTreeSet<String> = BTreeSet::new();
-    for cap in re.captures_iter(&content) {
+    for cap in re.captures_iter(content) {
         let raw = cap[1].trim();
         let words: Vec<&str> = raw
             .split_whitespace()
@@ -281,37 +357,14 @@ fn check_skill() {
                 .any(|c| c.starts_with(&format!("{} ", skill_cmd)));
             if !is_prefix {
                 eprintln!(
-                    "ERROR: Skill references command 'aoe {}' which does not exist in CLI",
-                    skill_cmd
+                    "ERROR: {} references command 'aoe {}' which does not exist in CLI",
+                    path_str, skill_cmd
                 );
                 has_error = true;
             }
         }
     }
 
-    // Advisory: CLI commands not mentioned in skill
-    let mut missing_from_skill = Vec::new();
-    for cli_cmd in &cli_commands {
-        let mentioned = skill_commands.iter().any(|s| {
-            s == cli_cmd
-                || cli_cmd.starts_with(&format!("{} ", s))
-                || s.starts_with(&format!("{} ", cli_cmd))
-        });
-        if !mentioned {
-            missing_from_skill.push(cli_cmd.clone());
-        }
-    }
-
-    if !missing_from_skill.is_empty() {
-        println!("Advisory: CLI commands not referenced in skill file:");
-        for cmd in &missing_from_skill {
-            println!("  aoe {}", cmd);
-        }
-    }
-
-    if has_error {
-        std::process::exit(1);
-    }
-
-    println!("Skill check passed.");
+    referenced.extend(skill_commands);
+    has_error
 }

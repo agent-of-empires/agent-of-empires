@@ -106,6 +106,7 @@ pub enum FieldKey {
     StrictHotkeys,
     ConfirmBeforeQuit,
     SnoozeDurationMinutes,
+    SessionAutoStopIdleSecs,
     RestartWakeMessage,
     RowTag,
     AgentExtraArgs,
@@ -341,6 +342,10 @@ impl SettingField {
             }
             (FieldKey::SnoozeDurationMinutes, FieldValue::Number(n)) => {
                 validate_snooze_duration(*n)?;
+                Ok(())
+            }
+            (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(n)) => {
+                crate::session::config::validate_auto_stop_idle_secs(*n)?;
                 Ok(())
             }
             (FieldKey::MemoryLimit, FieldValue::OptionalText(Some(v))) => {
@@ -1707,6 +1712,14 @@ fn build_session_fields(
             .map(|v| v as u64),
     );
 
+    let (auto_stop_idle_secs, auto_stop_idle_secs_override) = resolve_value(
+        scope,
+        global.session.auto_stop_idle_secs as u64,
+        session
+            .and_then(|s| s.auto_stop_idle_secs)
+            .map(|v| v as u64),
+    );
+
     let (restart_wake_message, restart_wake_message_override) = resolve_value(
         scope,
         global.session.restart_wake_message.clone(),
@@ -1761,6 +1774,18 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 snooze_duration_override,
                 FieldValue::Number(global.session.snooze_duration_minutes as u64),
+            ),
+        },
+        SettingField {
+            key: FieldKey::SessionAutoStopIdleSecs,
+            label: "Auto-stop Idle Sessions (seconds)",
+            description: "Stop a plain tmux session after it sits idle this long (0 disables; attached or recently-used sessions are spared)",
+            value: FieldValue::Number(auto_stop_idle_secs),
+            category: SettingsCategory::Session,
+            has_override: auto_stop_idle_secs_override,
+            inherited_display: inherited_if(
+                auto_stop_idle_secs_override,
+                FieldValue::Number(global.session.auto_stop_idle_secs as u64),
             ),
         },
         SettingField {
@@ -2743,6 +2768,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::SnoozeDurationMinutes, FieldValue::Number(v)) => {
             config.session.snooze_duration_minutes = *v as u32;
         }
+        (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
+            config.session.auto_stop_idle_secs = (*v).min(u32::MAX as u64) as u32;
+        }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             config.session.restart_wake_message = v.clone();
         }
@@ -3259,6 +3287,13 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             set_profile_override(*v as u32, &mut config.session, |s, val| {
                 s.snooze_duration_minutes = val
             });
+        }
+        (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
+            set_profile_override(
+                (*v).min(u32::MAX as u64) as u32,
+                &mut config.session,
+                |s, val| s.auto_stop_idle_secs = val,
+            );
         }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.session, |s, val| {

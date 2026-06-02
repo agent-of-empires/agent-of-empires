@@ -183,6 +183,21 @@ impl DiffView {
         self.files.get(self.selected_file)
     }
 
+    /// Repo-relative path of the selected file as a string, if any.
+    pub(crate) fn selected_path_string(&self) -> Option<String> {
+        self.selected_file()
+            .map(|f| f.path.to_string_lossy().to_string())
+    }
+
+    /// Copy the selected file's repo-relative path to the system clipboard and
+    /// surface a confirmation in the footer.
+    pub(crate) fn copy_selected_path(&mut self) {
+        if let Some(path) = self.selected_path_string() {
+            crate::tui::clipboard::copy_to_clipboard(&path);
+            self.success_message = Some(format!("Copied {path}"));
+        }
+    }
+
     /// Get or compute the diff for the selected file
     pub fn get_current_diff(&mut self) -> Option<&FileDiff> {
         let file = self.files.get(self.selected_file)?;
