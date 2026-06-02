@@ -55,6 +55,7 @@ mod tests {
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         let a = build_approval(tc);
         assert!(a.destructive);
@@ -72,6 +73,7 @@ mod tests {
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         let mut a = build_approval(tc);
         resolve(&mut a, ApprovalDecision::Allow, None);

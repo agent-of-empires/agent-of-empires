@@ -55,6 +55,13 @@ export interface ToolCall {
    *  paths the SDK loaded into the agent's context; `synthesize`
    *  mode carries the synthesised memory text. */
   memory_recall?: MemoryRecall | null;
+  /** Structured file diffs the agent attached via ACP
+   *  `ToolCallContent::Diff`. Codex routes `apply_patch` edits through
+   *  this channel (one entry per touched file) rather than the legacy
+   *  `old_string`/`new_string` args, so the edit card reads the path and
+   *  +/- preview from here when present and falls back to the args shape
+   *  otherwise. See #1721. */
+  diffs?: DiffPreview[] | null;
 }
 
 export interface MemoryRecall {
@@ -248,6 +255,11 @@ export type CockpitEvent =
          *  rather than adapter scheduling time. Null for non-status
          *  updates. */
         started_at?: string | null;
+        /** Diffs carried on a late `ToolCallUpdate.fields.content` frame
+         *  (Codex emits apply_patch diffs on the in-progress and
+         *  completion updates). A non-empty list REPLACES the card's
+         *  diffs; null/absent leaves earlier diffs untouched. See #1721. */
+        diffs?: DiffPreview[] | null;
       };
     }
   | { ApprovalRequested: { approval: Approval } }
@@ -872,7 +884,13 @@ export function applyEvent(
       const prev = next.activity[existing];
       if (prev) {
         const copy = next.activity.slice();
-        copy[existing] = { ...prev, tool: tc, text: tc.name };
+        // Keep diffs from the earlier frame if this duplicate start lacks
+        // them, so a re-delivered tool_start can't blank the edit card.
+        const mergedTool: ToolCall =
+          tc.diffs && tc.diffs.length > 0
+            ? tc
+            : { ...tc, diffs: prev.tool?.diffs };
+        copy[existing] = { ...prev, tool: mergedTool, text: tc.name };
         next.activity = copy;
       }
       return next;
@@ -930,14 +948,19 @@ export function applyEvent(
     return next;
   }
   if ("ToolCallUpdated" in event) {
-    const { tool_call_id, title, args_preview, started_at } =
+    const { tool_call_id, title, args_preview, started_at, diffs } =
       event.ToolCallUpdated;
+    // Per ACP, content is a replacement: a non-empty diff list overwrites
+    // the card's diffs; null/empty leaves an earlier frame's diffs intact
+    // so a text-only update can't blank the edit card. See #1721.
+    const incomingDiffs = diffs && diffs.length > 0 ? diffs : null;
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = {
         ...next.inFlightTool,
         name: title ?? next.inFlightTool.name,
         args_preview: args_preview ?? next.inFlightTool.args_preview,
         started_at: started_at ?? next.inFlightTool.started_at,
+        diffs: incomingDiffs ?? next.inFlightTool.diffs,
       };
     }
     // Walk activity backwards to find the matching tool_start row and
@@ -961,6 +984,7 @@ export function applyEvent(
             name: title ?? row.tool.name,
             args_preview: args_preview ?? row.tool.args_preview,
             started_at: started_at ?? row.tool.started_at,
+            diffs: incomingDiffs ?? row.tool.diffs,
           },
         };
       }
