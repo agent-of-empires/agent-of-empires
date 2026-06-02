@@ -1,11 +1,9 @@
 // @vitest-environment jsdom
 //
 // Behavioral coverage for the Session tab's "Auto-stop idle sessions" number
-// field (#1690): committing a value persists `session.auto_stop_idle_secs`
-// through the normal profile-settings path, the same wiring the TUI uses.
-//
-// The end-to-end persist-through-reload path lives in live Playwright at
-// web/tests/live/settings-persistence-session.spec.ts.
+// field (#1690): a persisted value renders into the field, and committing a
+// value persists `session.auto_stop_idle_secs` through the normal
+// profile-settings path, the same wiring the TUI uses.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -54,6 +52,40 @@ function commit(input: HTMLInputElement, value: string) {
 describe("Session tab auto-stop idle field", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks resets call history but not implementations, so restore
+    // the empty-settings default here to isolate tests that override it.
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      session: {},
+      cockpit: {},
+      sandbox: {},
+      worktree: {},
+    } as never);
+  });
+
+  it("renders the persisted auto_stop_idle_secs value into the field", async () => {
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      session: { auto_stop_idle_secs: 1800 },
+      cockpit: {},
+      sandbox: {},
+      worktree: {},
+    } as never);
+
+    const { container } = render(
+      <SettingsView
+        onClose={() => {}}
+        tab="session"
+        onSelectTab={() => {}}
+        serverAbout={SERVER_ABOUT as never}
+        onServerAboutRefresh={() => {}}
+      />,
+    );
+    await screen.findByText("Auto-stop idle sessions (s)");
+
+    await waitFor(() =>
+      expect(
+        numberInputByLabel(container, "Auto-stop idle sessions (s)").value,
+      ).toBe("1800"),
+    );
   });
 
   it("persists session.auto_stop_idle_secs through the profile path", async () => {
