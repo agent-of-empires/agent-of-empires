@@ -2780,7 +2780,10 @@ fn map_update_to_events(
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
-            let args_preview = preview_args(&raw_args);
+            // Empty (not the literal "null") when the agent ships no
+            // raw_input, so argless tool cards render a clean empty-state.
+            // See #1713.
+            let args_preview = preview_optional_args(tc.raw_input.as_ref());
             let parent_tool_call_id = profile.parent_tool_use_id_from_meta(&tc.meta);
             if let Some(parent) = parent_tool_call_id.as_deref() {
                 // Breadcrumb so AOE_ACP_TRACE=1 sessions can verify the
@@ -2886,7 +2889,16 @@ fn map_update_to_events(
                 let diffs = extract_diffs_from_content(blocks);
                 (!diffs.is_empty()).then_some(diffs)
             });
-            let new_args_preview = update.fields.raw_input.as_ref().map(preview_args);
+            // Drop an explicit JSON null so a late-arriving update never
+            // patches the card's args with the literal "null"; leaving it
+            // None means the reducer keeps whatever args it already has.
+            // See #1713.
+            let new_args_preview = update
+                .fields
+                .raw_input
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(preview_args);
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
             if new_title.is_some()
@@ -3237,6 +3249,34 @@ fn preview_args(raw: &serde_json::Value) -> String {
         out.push(c);
     }
     out
+}
+
+/// Preview for an optional ACP `raw_input`. Treats both a missing field
+/// (`None`) and an explicit JSON `null` as "no args provided", returning
+/// an empty string. The empty string lets the UI render a dedicated
+/// empty-state instead of the literal text "null" that
+/// `preview_args(&Value::Null)` would otherwise produce. Gemini's
+/// permission flow ships argless tool calls this way. See #1713.
+fn preview_optional_args(raw: Option<&serde_json::Value>) -> String {
+    match raw {
+        Some(value) if !value.is_null() => preview_args(value),
+        _ => String::new(),
+    }
+}
+
+/// Close a permission-request tool card with a terminal error row when
+/// the user denies (or no compatible option exists). Pairs the start
+/// frame emitted in `handle_permission_request`; without it a denied tool
+/// hangs on "running" until the turn ends. See #1713.
+async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &str, content: &str) {
+    let _ = event_tx
+        .send(Event::ToolCallCompleted {
+            tool_call_id: tool_call_id.to_string(),
+            is_error: true,
+            content: content.to_string(),
+            completed_at: chrono::Utc::now(),
+        })
+        .await;
 }
 
 /// Concat the textual portion of a tool call's `content` array. Drops
@@ -5243,13 +5283,10 @@ async fn handle_permission_request(
         .title
         .clone()
         .unwrap_or_else(|| "tool call".into());
-    let raw_args = request
-        .tool_call
-        .fields
-        .raw_input
-        .clone()
-        .unwrap_or(serde_json::Value::Null);
-    let args_preview = preview_args(&raw_args);
+    // Empty (not the literal "null") when the permission request ships no
+    // raw_input, which Gemini's confirm-required tools routinely do. The
+    // approval card then renders a clean empty-state. See #1713.
+    let args_preview = preview_optional_args(request.tool_call.fields.raw_input.as_ref());
     let tool_call = ToolCall {
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
@@ -5266,6 +5303,18 @@ async fn handle_permission_request(
         memory_recall: None,
         diffs: Vec::new(),
     };
+    // Gemini's confirm-required tools never send a standalone `tool_call`
+    // start frame (only requestPermission, then a completion update), so
+    // without this the approved tool would have no transcript card and
+    // its later completion would render nothing. Emit a start frame from
+    // the ToolCall we just built; the reducer dedupes tool_start by id,
+    // so a later real start frame merges in place rather than doubling
+    // the card. See #1713.
+    let _ = event_tx
+        .send(Event::ToolCallStarted {
+            tool_call: tool_call.clone(),
+        })
+        .await;
     let approval = build_approval(tool_call);
     let nonce = approval.nonce.clone();
 
@@ -5324,6 +5373,13 @@ async fn handle_permission_request(
                         decision,
                     })
                     .await;
+                // A denied tool will not run, so the start frame emitted
+                // above would otherwise hang on "running" until the turn
+                // ends. Close it immediately with a terminal error row.
+                // See #1713.
+                if matches!(decision, ApprovalDecision::Deny) {
+                    emit_permission_denied(&event_tx, &tool_call_id, "permission denied").await;
+                }
                 (
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
                     "selected",
@@ -5333,10 +5389,30 @@ async fn handle_permission_request(
                     target: "cockpit.acp",
                     "agent did not offer a {decision:?}-compatible option; cancelling"
                 );
+                // No compatible option: the agent gets Cancelled, but the
+                // user still acted, so clear the approval card and close
+                // the hanging start frame. See #1713.
+                let _ = event_tx
+                    .send(Event::ApprovalResolved {
+                        nonce: nonce.clone(),
+                        decision: ApprovalDecision::Cancelled,
+                    })
+                    .await;
+                emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
                 (RequestPermissionOutcome::Cancelled, "cancelled")
             }
         }
         Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => {
+            // Cancellation (explicit cancel_permission, or the resolver
+            // dropped on teardown) emits no agent completion, so close the
+            // start frame and clear the approval here too. See #1713.
+            let _ = event_tx
+                .send(Event::ApprovalResolved {
+                    nonce: nonce.clone(),
+                    decision: ApprovalDecision::Cancelled,
+                })
+                .await;
+            emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
             (RequestPermissionOutcome::Cancelled, "cancelled")
         }
     };
@@ -6273,6 +6349,17 @@ mod tests {
         // AllowAlways. Falls back gracefully.
         let id = pick_option_id(&options, ApprovalDecision::Allow).unwrap();
         assert_eq!(id.0.as_ref(), "always");
+    }
+
+    #[test]
+    fn preview_optional_args_empty_for_missing_or_null() {
+        // #1713: a missing or explicitly-null raw_input must preview as
+        // empty (so the UI shows a clean empty-state) rather than the
+        // literal "null" that preview_args(&Value::Null) would produce.
+        assert_eq!(preview_optional_args(None), "");
+        assert_eq!(preview_optional_args(Some(&serde_json::Value::Null)), "");
+        let obj = serde_json::json!({ "command": "ls" });
+        assert_eq!(preview_optional_args(Some(&obj)), r#"{"command":"ls"}"#);
     }
 
     #[test]
