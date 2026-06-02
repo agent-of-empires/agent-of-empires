@@ -15,7 +15,7 @@ interface BulkActionBarProps {
 }
 
 const BTN =
-  "inline-flex items-center gap-1 rounded border border-surface-700/50 bg-surface-800/60 px-2 py-1 text-[11px] font-mono text-text-secondary hover:bg-surface-700/60 hover:text-text-primary cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-default";
+  "inline-flex h-8 items-center gap-1 rounded-md border border-surface-700/50 bg-surface-800/60 px-2 text-[11px] font-mono text-text-secondary hover:bg-surface-700/60 hover:text-text-primary cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-default";
 
 /** Bulk triage bar shown while one or more sidebar rows are multi-selected.
  *  Actions split by eligibility so a mixed selection shows count-labelled
@@ -35,7 +35,7 @@ export function BulkActionBar({
   return (
     <div
       data-testid="sidebar-bulk-bar"
-      className="flex flex-wrap items-center gap-1.5 border-b border-surface-700/40 bg-surface-850 px-3 py-2"
+      className="flex flex-wrap items-center gap-2 border-b border-surface-700/40 bg-surface-850 px-3 py-2"
     >
       <span className="mr-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
         {selectedCount} selected
