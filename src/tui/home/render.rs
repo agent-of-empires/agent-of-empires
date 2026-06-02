@@ -1369,19 +1369,27 @@ impl HomeView {
     }
 
     /// Point the off-thread capture worker at `desired` (the displayed
-    /// pane's tmux session), respawning on change and tearing down on
-    /// `None`, then retune its cadence to live-send vs. idle. Cheap and
+    /// pane's tmux session), then retune its cadence to live-send vs. idle.
+    /// One long-lived worker is spawned lazily on first use and retargeted
+    /// in place (no per-switch respawn); an empty target idles it. Cheap and
     /// idempotent when the target is unchanged, so render calls it every
     /// frame. This is what keeps the worker tracking whatever the user is
     /// looking at instead of only the agent during live-send.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        // Don't spawn the worker until there's actually something to show.
+        if desired.is_none() && self.preview_capture_worker.is_none() {
+            self.preview_capture_target = None;
+            return;
+        }
+        if self.preview_capture_worker.is_none() {
+            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
+                self.preview_wake.clone(),
+            ));
+        }
         if self.preview_capture_target != desired {
-            // Dropping the old worker flips its `stop` flag; spawn the new
-            // one against the wake the event loop selects on.
-            self.preview_capture_worker = None;
-            self.preview_capture_worker = desired.as_ref().map(|name| {
-                live_send::LiveCaptureWorker::spawn(name.clone(), self.preview_wake.clone())
-            });
+            if let Some(worker) = self.preview_capture_worker.as_ref() {
+                worker.set_target(desired.clone().unwrap_or_default());
+            }
             self.preview_capture_target = desired;
         }
         let live = self.live_send.is_some();

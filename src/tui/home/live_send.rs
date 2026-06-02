@@ -468,22 +468,21 @@ const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
 const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 
-/// Off-thread preview capture for agent live-send. Spawned alongside
-/// [`LiveSendWorker`] when live-send targets the agent pane, it forks
-/// `tmux capture-pane` on its own thread and publishes fresh pane content
-/// into a single-slot mailbox the render loop drains. The render loop
-/// applies the latest content without forking, which is what moves the
-/// per-frame capture cost (~8.5ms measured on macOS, ~90% of a live-send
-/// frame) off the hot path. Dropping the worker flips `stop` so the
-/// thread exits after its current cycle; like `LiveSendWorker` we don't
-/// join.
+/// Off-thread preview capture. One long-lived thread forks `tmux
+/// capture-pane` and publishes fresh pane content into a single-slot
+/// mailbox the render loop drains, so the render loop applies the latest
+/// content without forking. That moves the per-frame capture cost (~8.5ms
+/// measured on macOS, ~90% of a live-send frame) off the hot path.
+/// Dropping the worker flips `stop` so the thread exits after its current
+/// cycle; like `LiveSendWorker` we don't join.
 ///
 /// Tracks whichever pane the preview is currently displaying (agent,
 /// terminal, container shell, or tool), not just the agent: the home view
-/// retargets the worker via `sync_preview_capture_worker` whenever the
-/// selected session or view mode changes, so every preview path reads
-/// fresh content without ever forking on the render thread. The capture
-/// cadence adapts (`set_interval_ms`): tight while live-send is attached,
+/// points it via `set_target` (from `sync_preview_capture_worker`) whenever
+/// the selected session or view mode changes, so every preview path reads
+/// fresh content without ever forking on the render thread, and a switch
+/// swaps the target in place instead of spawning a new thread. The capture
+/// cadence adapts (`set_live`): tight while live-send is attached,
 /// `PREVIEW_REFRESH_MS`-matched otherwise so the background preview costs
 /// no more idle forks than the old render-driven throttle did.
 pub(in crate::tui) struct LiveCaptureWorker {
@@ -491,6 +490,11 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// `0` means "not set yet"; the worker skips capturing until the first
     /// render publishes a real value. `capture_lines_for` never yields 0.
     capture_lines: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// tmux session name the worker is currently capturing. Swapped in
+    /// place by `set_target` when the displayed pane changes, so one
+    /// long-lived thread serves every view without per-switch respawns.
+    /// Empty string means "idle, capture nothing" (no selection).
+    target: std::sync::Arc<std::sync::Mutex<String>>,
     /// Single-slot mailbox holding the newest capture not yet consumed by
     /// the render loop. A new capture overwrites an unconsumed one (the
     /// render only ever wants the latest), so this can't grow unbounded if
@@ -509,26 +513,40 @@ impl Drop for LiveCaptureWorker {
 }
 
 impl LiveCaptureWorker {
-    pub(in crate::tui) fn spawn(
-        tmux_name: String,
-        wake: std::sync::Arc<tokio::sync::Notify>,
-    ) -> Self {
+    pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
+        let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
         let stop = Arc::new(AtomicBool::new(false));
         let lines_cell = capture_lines.clone();
+        let target_cell = target.clone();
         let slot = latest.clone();
         let interval_cell = interval_ms.clone();
         let stop_flag = stop.clone();
         std::thread::spawn(move || {
-            let session = crate::tmux::Session::from_name(&tmux_name);
+            let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
-                if lines > 0 {
+                // Read the target without holding the lock across the fork:
+                // `set_target` must never wait on a `capture-pane`.
+                let name = target_cell
+                    .lock()
+                    .ok()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                // A retarget resets the dedup so the new pane's first frame
+                // always publishes, even if its bytes happen to match the
+                // previous pane's last capture.
+                if name != last_target {
+                    last_target = name.clone();
+                    last_captured = None;
+                }
+                if lines > 0 && !name.is_empty() {
+                    let session = crate::tmux::Session::from_name(&name);
                     if let Ok(content) = session.capture_pane(lines) {
                         // Skip empties (preserve the last-good preview, the
                         // #1501 kill switch) and unchanged frames (no point
@@ -537,11 +555,20 @@ impl LiveCaptureWorker {
                         // wake it: an idle pane never repaints.
                         if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
                         {
-                            if let Ok(mut guard) = slot.lock() {
-                                *guard = Some(content.clone());
+                            // Publish only if the target hasn't changed during
+                            // the fork. Otherwise these are the *old* pane's
+                            // bytes and would flash under the new view's header
+                            // (`set_target` also clears the mailbox, but the
+                            // fork may have started before that switch).
+                            let still_current =
+                                target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
+                            if still_current {
+                                if let Ok(mut guard) = slot.lock() {
+                                    *guard = Some(content.clone());
+                                }
+                                last_captured = Some(content);
+                                wake.notify_one();
                             }
-                            last_captured = Some(content);
-                            wake.notify_one();
                         }
                     }
                 }
@@ -551,9 +578,26 @@ impl LiveCaptureWorker {
         });
         Self {
             capture_lines,
+            target,
             latest,
             interval_ms,
             stop,
+        }
+    }
+
+    /// Point the worker at a different pane (its tmux session name; empty to
+    /// idle). Cheap: just swaps the shared name and drops any capture queued
+    /// from the previous pane so the render never applies stale bytes under
+    /// the new view. Never blocks on a `capture-pane` fork, so the render
+    /// reconcile can call it freely.
+    pub(in crate::tui) fn set_target(&self, name: String) {
+        if let Ok(mut guard) = self.target.lock() {
+            if *guard != name {
+                *guard = name;
+                if let Ok(mut latest) = self.latest.lock() {
+                    *latest = None;
+                }
+            }
         }
     }
 
@@ -1378,10 +1422,8 @@ mod tests {
     fn live_capture_worker_idle_until_geometry_set() {
         // With no line count published the worker must not capture at all,
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
-        let worker = LiveCaptureWorker::spawn(
-            "aoe_test_capture_no_geometry".into(),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
-        );
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_no_geometry".into());
         std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
             worker.take_latest().is_none(),
@@ -1395,15 +1437,29 @@ mod tests {
         // strings. Forwarding those would blank the preview, defeating the
         // #1501 kill switch, so the worker must drop them. Deterministic
         // without a real tmux session: a missing pane always reads empty.
-        let worker = LiveCaptureWorker::spawn(
-            "aoe_test_capture_missing_session".into(),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
-        );
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_missing_session".into());
         worker.set_capture_lines(40);
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(
             worker.take_latest().is_none(),
             "empty captures must never be forwarded",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_retarget_drops_previous_capture() {
+        // Swapping the target must clear any queued capture so the render
+        // never applies the previous pane's bytes under the new view.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_capture_lines(40);
+        if let Ok(mut latest) = worker.latest.lock() {
+            *latest = Some("stale previous-pane content".to_string());
+        }
+        worker.set_target("aoe_test_capture_new_target".into());
+        assert!(
+            worker.take_latest().is_none(),
+            "retarget must drop the previous pane's queued capture",
         );
     }
 }

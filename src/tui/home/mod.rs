@@ -465,12 +465,14 @@ pub struct HomeView {
     /// (agent, terminal, container shell, or tool). Forks `tmux
     /// capture-pane` on its own thread so no preview path ever forks on the
     /// render thread (the per-frame capture was ~90% of a frame on macOS).
-    /// Retargeted by `sync_preview_capture_worker` when the displayed pane
-    /// changes; `None` only when nothing is selected.
+    /// One long-lived worker: spawned lazily on first use by
+    /// `sync_preview_capture_worker` and retargeted in place via
+    /// `set_target` as the displayed pane changes; stays `None` until the
+    /// first session is previewed.
     pub(super) preview_capture_worker: Option<live_send::LiveCaptureWorker>,
-    /// The tmux session name `preview_capture_worker` is currently
-    /// capturing, so the reconcile can tell when the displayed pane changed
-    /// and respawn. `None` mirrors a `None` worker.
+    /// The tmux session name `preview_capture_worker` is currently pointed
+    /// at, so the reconcile can tell when the displayed pane changed and
+    /// retarget. `None` before the first preview or when nothing is selected.
     pub(super) preview_capture_target: Option<String>,
     /// Notified by the capture worker thread when it has fresh, changed
     /// content. The event loop selects on this to repaint without
