@@ -60,7 +60,9 @@ interface RecentProject {
   sessionCount: number;
 }
 
-function collectRecentProjects(sessions: SessionResponse[]): RecentProject[] {
+export function collectRecentProjects(
+  sessions: SessionResponse[],
+): RecentProject[] {
   const map = new Map<string, RecentProject>();
   for (const s of sessions) {
     // Scratch sessions live in transient `<app_dir>/scratch/<id>/`
@@ -73,8 +75,15 @@ function collectRecentProjects(sessions: SessionResponse[]): RecentProject[] {
     // silently drop the other repos. The project step cannot reconstruct a
     // workspace from one path, so keep them out of the list entirely.
     if (s.workspace_repos.length > 0) continue;
-    const path = s.main_repo_path || s.project_path;
-    if (!path) continue;
+    // Normalize the trailing slash before keying, mirroring the backend's
+    // dedup convention (`src/cli/add.rs` is_duplicate_session and
+    // `src/server/api/sessions.rs` workspace_id_for_session both
+    // `trim_end_matches('/')`). Without this, `/foo/bar` and `/foo/bar/`
+    // become two separate entries with split session counts. The `|| "/"`
+    // keeps the filesystem root from collapsing to an empty string.
+    const raw = s.main_repo_path || s.project_path;
+    if (!raw) continue;
+    const path = raw.replace(/\/+$/, "") || "/";
     const existing = map.get(path);
     const ts = s.last_accessed_at ?? s.created_at ?? null;
     if (existing) {
