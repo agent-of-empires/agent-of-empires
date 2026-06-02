@@ -44,6 +44,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const [expanded, setExpanded] = useState(approval.destructive);
   const preview = useMemo(() => previewFromArgs(raw), [raw]);
   const canExpand = useMemo(() => hasArgsBody(raw), [raw]);
+  const showEmptyArgsState = raw.trim() === "";
   const Header = canExpand ? "button" : "div";
 
   useEffect(() => {
@@ -152,7 +153,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         )}
       </Header>
 
-      {expanded && <ArgsView raw={raw} />}
+      {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
         <p className="px-3 pt-2 text-rose-400 text-xs">
