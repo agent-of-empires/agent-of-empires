@@ -77,6 +77,14 @@ export function saveComments(
   safeSetItem(storageKey(sessionId), JSON.stringify(state));
 }
 
+// Drop the persisted diff-comments for a single session id. Convenience
+// over saveComments(id, EMPTY_STORAGE); intended for session-delete paths
+// (mirrors clearDraft for cockpit composer drafts). Cross-tab / cross-device
+// deletes still fall to sweepOrphanComments on the next mount.
+export function clearStoredComments(sessionId: string): void {
+  safeRemoveItem(storageKey(sessionId));
+}
+
 // Remove every `aoe:diff-comments:v1:<id>` key whose session id is not in
 // the given active set. Run once on app mount to catch keys left behind by
 // session deletions in another tab or on another device, and to retroactively

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  clearStoredComments,
   EMPTY_STORAGE,
   isEmptyState,
   loadComments,
@@ -206,6 +207,23 @@ describe("storage", () => {
       saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
       expect(data.has(storageKey("sess-1"))).toBe(true);
       expect(loadComments("sess-1").comments).toHaveLength(1);
+    });
+  });
+
+  describe("clearStoredComments", () => {
+    it("removes the key for a single session", () => {
+      const data = installFakeLocalStorage();
+      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
+      saveComments("sess-2", { ...EMPTY_STORAGE, comments: [mkComment({})] });
+      clearStoredComments("sess-1");
+      expect(data.has(storageKey("sess-1"))).toBe(false);
+      expect(data.has(storageKey("sess-2"))).toBe(true);
+    });
+
+    it("is a no-op for a session with no stored comments", () => {
+      const data = installFakeLocalStorage();
+      expect(() => clearStoredComments("absent")).not.toThrow();
+      expect(data.has(storageKey("absent"))).toBe(false);
     });
   });
 });

@@ -18,7 +18,10 @@ import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
-import { sweepOrphanComments } from "./components/diff/comments/storage";
+import {
+  clearStoredComments,
+  sweepOrphanComments,
+} from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -555,6 +558,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // localStorage key doesn't linger (#1358). Cross-tab / cross-device
     // deletes go through the startup sweep instead.
     clearDraft(sessionId);
+    // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
+    // cross-device deletes still fall to the startup sweep.
+    clearStoredComments(sessionId);
 
     // Server returns `messages` from `perform_deletion` when there's something
     // user-facing to report (e.g. "Scratch directory kept at: <path>" when
