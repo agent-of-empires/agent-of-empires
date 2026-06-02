@@ -146,6 +146,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "serve",
     "hooks",
     "sound",
+    "telemetry",
 ];
 
 /// Sub-targets users can tune individually from the settings UI.

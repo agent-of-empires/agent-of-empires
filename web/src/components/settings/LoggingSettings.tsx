@@ -38,6 +38,8 @@ const KNOWN_TARGETS: { value: string; group: string }[] = [
   { value: "containers.runtime", group: "Containers" },
   { value: "git.command", group: "Git" },
   { value: "web.client", group: "Web" },
+  { value: "telemetry", group: "Telemetry" },
+  { value: "http.api.telemetry", group: "Telemetry" },
   { value: "log.runtime", group: "Meta" },
 ];
 

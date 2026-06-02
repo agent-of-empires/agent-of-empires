@@ -38,6 +38,7 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "devices", label: "Devices" },
       { kind: "divider", label: "System" },
       { kind: "tab", id: "updates", label: "Updates" },
+      { kind: "tab", id: "telemetry", label: "Telemetry" },
       { kind: "tab", id: "logging", label: "Logging" },
     ]);
   });
