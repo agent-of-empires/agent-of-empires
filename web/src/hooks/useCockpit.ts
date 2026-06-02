@@ -53,7 +53,11 @@ export type Action =
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: CockpitState }
-  | { kind: "enqueue_prompt"; text: string }
+  | {
+      kind: "enqueue_prompt";
+      text: string;
+      attachments?: PromptAttachmentInput[];
+    }
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "dequeue_prompts_by_id"; ids: string[] }
   | { kind: "edit_queued_prompt"; id: string; text: string }
@@ -147,9 +151,27 @@ function evictOldestPersistedCockpitState(currentKey: string): boolean {
   }
 }
 
+/** Project the in-memory reducer state into the shape written to
+ *  localStorage. Queued prompts that carry attachments are dropped
+ *  entirely: their base64 bytes would blow the per-origin quota, and
+ *  persisting the text alone would silently drain a degraded prompt on
+ *  reload (e.g. "fix this screenshot:" with no screenshot). The full
+ *  row stays in the in-memory `stateCache`, so it survives a component
+ *  remount but not a hard page reload. See #1833 / #1000. */
+function toPersistedState(state: CockpitState): CockpitState {
+  if (!state.queuedPrompts.some((q) => q.attachments?.length)) return state;
+  return {
+    ...state,
+    queuedPrompts: state.queuedPrompts.filter((q) => !q.attachments?.length),
+  };
+}
+
 function persistState(sessionId: string, state: CockpitState): void {
   const key = storageKey(sessionId);
-  const body = JSON.stringify({ savedAt: Date.now(), state } satisfies PersistedEntry);
+  const body = JSON.stringify({
+    savedAt: Date.now(),
+    state: toPersistedState(state),
+  } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
     setRateLimit(sessionId, state.rateLimit);
@@ -350,7 +372,12 @@ export function cockpitHookReducer(
 export function combineQueuedPrompts(
   queue: ReadonlyArray<QueuedPrompt>,
 ): string {
-  return queue.map((q) => q.text).join("\n\n");
+  // Skip empty entries: an attachment-only queued prompt carries no
+  // text, and gluing its "" in would leave stray blank-line separators.
+  return queue
+    .map((q) => q.text)
+    .filter((t) => t.length > 0)
+    .join("\n\n");
 }
 
 function reducer(state: CockpitState, action: Action): CockpitState {
@@ -432,6 +459,9 @@ function reducer(state: CockpitState, action: Action): CockpitState {
       id: `q-${Date.now()}-${state.queuedPrompts.length}`,
       text: action.text,
       queuedAt: new Date().toISOString(),
+      ...(action.attachments && action.attachments.length > 0
+        ? { attachments: action.attachments }
+        : {}),
     };
     return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
   }
@@ -1131,14 +1161,11 @@ export function useCockpit(
           // is NOT this case: it needs operator action, so it keeps its
           // banner. See #1748.
           //
-          // Only suppress for text-only sends: the local queue does not
-          // carry attachments, so an attachment send that hits this 503 has
-          // no retry path. Keep its banner so the user knows to resend
-          // rather than seeing a silent optimistic bubble. See #1748.
+          // Attachments are now re-queued on this transient (the queue
+          // carries them in memory; see sendPrompt + the drain effect), so
+          // suppress the banner for attachment sends too. See #1833.
           const workerNotReady =
-            res.status === 503 &&
-            detail.startsWith("worker_not_ready") &&
-            (!attachments || attachments.length === 0);
+            res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
           }
@@ -1221,36 +1248,23 @@ export function useCockpit(
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
       if (shouldEnqueue) {
-        // The local prompt queue is text-only (persisted to
-        // localStorage, where megabytes of base64 would blow the
-        // quota). Attachments must go through the immediate POST, so
-        // surface why rather than silently dropping them. The composer
-        // keeps the text + attachments so the user can resend once the
-        // agent is idle. See #1000 / #965.
-        if (attachments && attachments.length > 0) {
-          dispatch({
-            kind: "error",
-            message:
-              "Attachments can only be sent while the agent is idle and connected. Your message was not sent; try again in a moment.",
-          });
-          return;
-        }
-        dispatch({ kind: "enqueue_prompt", text });
+        // Park the prompt (with any attachments) so the drain effect
+        // fires it once the agent is idle and connected, instead of
+        // dropping the image. The attachment bytes ride the queued row
+        // in memory only; `persistState` keeps them out of localStorage
+        // (and drops the whole row on reload) so the quota invariant
+        // holds. See #1833 / #1000.
+        dispatch({ kind: "enqueue_prompt", text, attachments });
         return;
       }
       const result = await dispatchPromptNow(text, attachments);
       // Idle-dormant direct send: the worker was respawning and did not
       // come online within send_prompt's wait window, so the POST returned
-      // a retryable typed 503. Park the prompt instead of dropping it; the
-      // drain effect re-fires it once AcpSessionAssigned brings the worker
-      // online (text-only, since the queue does not carry attachments).
-      // See #1748.
-      if (
-        result === "retryable_failure" &&
-        state.workerIdleStopped &&
-        (!attachments || attachments.length === 0)
-      ) {
-        dispatch({ kind: "enqueue_prompt", text });
+      // a retryable typed 503. Park the prompt (with its attachments)
+      // instead of dropping it; the drain effect re-fires it once
+      // AcpSessionAssigned brings the worker online. See #1748 / #1833.
+      if (result === "retryable_failure" && state.workerIdleStopped) {
+        dispatch({ kind: "enqueue_prompt", text, attachments });
       }
     },
     [
@@ -1337,8 +1351,16 @@ export function useCockpit(
       }
       const snapshot = queue.slice(0, batchEnd);
       const combined = combineQueuedPrompts(snapshot);
+      // Merge every attachment in the sub-batch into the one combined
+      // POST. If that overflows the server's per-prompt cap the POST
+      // 4xx-rejects and the batch retires via the non-retryable path
+      // below, same as any other rejected combined send. See #1833.
+      const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
       const sentIds = snapshot.map((q) => q.id);
-      void dispatchPromptNow(combined)
+      void dispatchPromptNow(
+        combined,
+        combinedAttachments.length > 0 ? combinedAttachments : undefined,
+      )
         .then((result) => {
           // Retire on success and on non-retryable rejection; only a
           // transient failure keeps the batch queued for the next retry.
@@ -1352,7 +1374,7 @@ export function useCockpit(
     } else {
       const head = state.queuedPrompts[0]!;
       const headId = head.id;
-      void dispatchPromptNow(head.text)
+      void dispatchPromptNow(head.text, head.attachments)
         .then((result) => {
           if (result !== "retryable_failure") {
             dispatch({ kind: "dequeue_prompt", id: headId });
