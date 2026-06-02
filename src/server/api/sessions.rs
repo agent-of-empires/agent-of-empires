@@ -996,6 +996,110 @@ fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Opt
     }
 }
 
+// --- Update session group ---
+
+#[derive(Deserialize)]
+pub struct UpdateGroupBody {
+    /// Destination group path. Empty string means "ungrouped". A
+    /// non-empty path auto-creates the group: `/api/groups` and the
+    /// `GroupTree` render model both derive groups from instance
+    /// `group_path` values, so no separate groups.json write is needed
+    /// (this mirrors `create_session`, which never touches the groups
+    /// Vec either).
+    pub group: String,
+}
+
+fn apply_session_group(inst: &mut Instance, group: String) {
+    inst.group_path = group;
+}
+
+/// `PATCH /api/sessions/:id/group`. Moves an existing session to another
+/// group, creates a new group by assigning its path, or clears the group
+/// (empty string). Web parity with the TUI rename dialog and `aoe session
+/// rename --group`, which already support post-create group edits.
+///
+/// Persist-first like the other per-field PATCH sub-routes (`/pin`,
+/// `/archive`, `/snooze`): disk is made durable before memory is touched,
+/// so a failed write returns 500 without leaving memory and disk diverged.
+/// See #1589.
+pub async fn update_session_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let group = body.group;
+    // Match `create_session`'s group handling exactly: shell-injection
+    // check on a non-empty path, no trimming or slash normalization. The
+    // empty string is the ungroup sentinel and skips validation.
+    if !group.is_empty() {
+        if let Err(msg) = validate_no_shell_injection(&group, "group") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": msg })),
+            )
+                .into_response();
+        }
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_group = group.clone();
+    if persist_session_update(profile, "group update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            apply_session_group(inst, persist_group);
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "group update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    apply_session_group(inst, group);
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
 // --- Update session notification preferences ---
 
 /// Body for `PATCH /api/sessions/:id/notifications`. Each field is an
@@ -4368,6 +4472,63 @@ mod tests {
 
         let result = persist_session_update(profile.to_string(), "test", |_instances| {}).await;
         assert!(result.is_err(), "a storage failure must surface as Err");
+    }
+
+    // Group edit (#1726): the persisted instance's group_path is the only
+    // thing that changes; the groups Vec is left alone (the group list is
+    // derived from instance group_path, exactly like create_session). Set
+    // and clear both round-trip to disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn group_edit_set_and_clear_round_trip_to_disk() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "group-edit";
+        let storage = Storage::new(profile).unwrap();
+        let seed = make_test_instance(); // seeded in "work/projects"
+        let id = seed.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // Move to a brand-new group.
+        let set_id = id.clone();
+        persist_session_update(profile.to_string(), "group update", move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
+                apply_session_group(inst, "team/alpha".to_string());
+            }
+        })
+        .await
+        .expect("set should succeed");
+
+        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        assert_eq!(
+            reloaded.iter().find(|i| i.id == id).unwrap().group_path,
+            "team/alpha",
+            "group must move to the new path on disk"
+        );
+
+        // Clear to ungrouped via the empty-string sentinel.
+        let clear_id = id.clone();
+        persist_session_update(profile.to_string(), "group update", move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
+                apply_session_group(inst, String::new());
+            }
+        })
+        .await
+        .expect("clear should succeed");
+
+        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        assert_eq!(
+            reloaded.iter().find(|i| i.id == id).unwrap().group_path,
+            "",
+            "empty string must clear the group on disk"
+        );
     }
 }
 
