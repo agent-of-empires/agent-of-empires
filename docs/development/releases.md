@@ -66,6 +66,20 @@ gh workflow run prepare-release.yml -f version=1.7.2
 
 This bypasses the staging PR. `prepare-release.yml` regenerates `CHANGELOG.md` from git-cliff and folds it into the same `chore: bump version` commit; `release.yml` builds the binaries and creates the GitHub Release with the per-version body that git-cliff emits via `--current --strip header`.
 
+## Skill hubs
+
+`aoe` ships a coding-agent management skill to two skill hubs. The skill sources live in `contrib/`, and `cargo xtask check-skill` (run in CI) validates that both reference real CLI commands and follow each hub's frontmatter rules.
+
+- **ClawHub** (`contrib/openclaw-skill/`): published automatically by the `publish-clawhub` job in `release.yml` on every release, using `CLAWHUB_TOKEN`. ClawHub is a registry, so each release idempotently pushes the new version. The frontmatter must not carry a top-level `version:` field; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
+
+- **Hermes Agent Skills Hub** (`contrib/hermes-skill/`): published manually. Unlike ClawHub, the Hermes hub is GitHub-PR-based: `hermes skills publish` forks the hub repo, commits the skill snapshot, and opens a PR for a maintainer to merge. There is no auto-sync, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. The frontmatter must carry a top-level `version:` field. To publish (or push an update), bump the `version:` in `contrib/hermes-skill/SKILL.md`, then run:
+
+  ```bash
+  hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent
+  ```
+
+  This requires the `hermes` CLI and a GitHub token with fork permissions (`GITHUB_TOKEN` in `~/.hermes/.env` or `gh auth login`). Re-run it whenever the skill changes meaningfully; cadence is "on change," not "every release."
+
 ## Versioning
 
 We follow semver, but the autopick is patch. Maintainer adjusts when:
