@@ -60,6 +60,7 @@ vi.mock("@assistant-ui/react-markdown", () => ({
 }));
 
 import { Markdown } from "./Markdown";
+import { CockpitFileRefContext } from "./CockpitFileRefContext";
 
 beforeEach(() => {
   primitiveCalls.length = 0;
@@ -205,6 +206,69 @@ describe("anchor override", () => {
     expect(a?.getAttribute("href")).toBe("https://example.com/path");
     expect(a?.getAttribute("title")).toBe("t");
     expect(a?.textContent).toBe("link text");
+  });
+});
+
+// #1718: a local file reference (Codex `path:line` markdown link) is
+// intercepted and routed to the in-app file viewer instead of opening a
+// dead new tab. External links keep the #1714 new-tab behavior.
+describe("anchor file-ref interception", () => {
+  function getAnchor(): React.ComponentType<
+    React.ComponentPropsWithoutRef<"a">
+  > {
+    render(<Markdown text="x" />);
+    return primitiveCalls.at(-1)!.components.a as React.ComponentType<
+      React.ComponentPropsWithoutRef<"a">
+    >;
+  }
+
+  it("intercepts a local file link and calls the file-ref handler", () => {
+    const Anchor = getAnchor();
+    const onOpenFileRef = vi.fn();
+    const { container } = render(
+      <CockpitFileRefContext.Provider value={{ onOpenFileRef }}>
+        <Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>
+      </CockpitFileRefContext.Provider>,
+    );
+    const a = container.querySelector("a")!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(a, event);
+    expect(onOpenFileRef).toHaveBeenCalledWith({
+      path: "/Users/me/repo/src/app.ts",
+      line: 42,
+    });
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("does not intercept an external link even with a handler present", () => {
+    const Anchor = getAnchor();
+    const onOpenFileRef = vi.fn();
+    const { container } = render(
+      <CockpitFileRefContext.Provider value={{ onOpenFileRef }}>
+        <Anchor href="https://example.com">docs</Anchor>
+      </CockpitFileRefContext.Provider>,
+    );
+    const a = container.querySelector("a")!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(a, event);
+    expect(onOpenFileRef).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+    expect(a.getAttribute("target")).toBe("_blank");
+    expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("leaves links untouched when no handler is provided", () => {
+    const Anchor = getAnchor();
+    const { container } = render(
+      <Anchor href="/Users/me/repo/src/app.ts:42">app.ts</Anchor>,
+    );
+    const a = container.querySelector("a")!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(a, event);
+    // No handler in context, so the file link falls through to the
+    // default new-tab anchor without preventing navigation.
+    expect(event.defaultPrevented).toBe(false);
+    expect(a.getAttribute("target")).toBe("_blank");
   });
 });
 
