@@ -142,8 +142,12 @@ base.describe("sidebar user-group axis (#1234)", () => {
         featureHeader.locator("button[aria-expanded]"),
       ).toHaveAttribute("aria-expanded", "false");
 
-      // Switching back to the repo axis shows an independent collapse map:
-      // the repo group is not collapsed just because a user group was.
+      // Cycling back to the repo axis shows an independent collapse map:
+      // the repo group is not collapsed just because a user group was. The
+      // toggle now cycles repo -> group -> repo+group -> repo (#1720), so
+      // returning to repo from group takes two clicks.
+      await axisToggle.click();
+      await expect(axisToggle).toHaveAttribute("data-axis", "repo+group");
       await axisToggle.click();
       await expect(axisToggle).toHaveAttribute("data-axis", "repo");
       await expect(

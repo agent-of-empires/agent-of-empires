@@ -75,14 +75,15 @@ A sort toggle next to the filter button in the sidebar header switches to **Rece
 
 The toggle's state is per-browser (localStorage), not synced across devices and not tied to your profile. Toggling back to manual restores the stored manual order and re-enables drag. The Multi-repo group defaults to the bottom; in manual mode you can drag it anywhere and it holds that spot, while in Recent activity mode group drag is disabled and it stays at the bottom.
 
-## Sidebar grouping: by repo or by group
+## Sidebar grouping: by repo, by group, or both
 
-A grouping toggle (the layers icon) next to the sort toggle switches the axis the sidebar organises sessions by:
+A grouping toggle (the layers icon) next to the sort toggle cycles the axis the sidebar organises sessions by. Each click advances through the three modes, **By repo** to **By group** to **By repo and group** and back:
 
 - **By repo** (default) groups workspaces by their git repository, the original behavior.
 - **By group** groups sessions by the user-defined group you assigned in the TUI rename dialog or with `aoe group move`, mirroring the TUI's group headers. Sessions with no group fall into an **Ungrouped** bucket pinned to the bottom. A session whose worktree hosts agents in different groups shows up under each of those groups.
+- **By repo and group** keeps the repository headers and nests the user groups inside each one, so a single repo block shows its `feature`, `fix`, and **Ungrouped** subgroups with the matching sessions under each. This is the mode to use when you want repo-level focus and group-level structure at the same time. A session split across groups appears once per subgroup, sliced to that group's sessions.
 
-The choice is per-browser (localStorage). Collapse state is tracked separately for each axis, so collapsing a group in **By group** does not collapse a repo in **By repo**. The group axis is read-only in v1: group rename, color, and drag-reorder live on the repo axis only, and groups themselves are not yet reorderable.
+The choice is per-browser (localStorage). Collapse state is tracked separately for each axis, so collapsing a group in **By group** does not collapse a repo in **By repo**. In **By repo and group**, the repository headers share their collapse state with **By repo**, while each nested subgroup collapses independently and is keyed per repository, so collapsing `feature` in one repo leaves `feature` in another repo expanded. The group and nested axes are read-only: group rename, color, and drag-reorder live on the repo axis only, and groups themselves are not reorderable.
 
 ## Triage: pin, archive, snooze
 
