@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EMPTY_STORAGE, loadComments, saveComments, storageKey } from "./storage";
+import {
+  EMPTY_STORAGE,
+  isEmptyState,
+  loadComments,
+  saveComments,
+  storageKey,
+} from "./storage";
 import type { DiffComment, DiffCommentsStorageV1 } from "./types";
 
 // Vitest default env is node; install a minimal in-memory localStorage
@@ -139,12 +145,67 @@ describe("storage", () => {
     const spy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
       throw new Error("QuotaExceeded");
     });
-    // Should not throw despite the failing setItem.
-    expect(() => saveComments("sess-1", EMPTY_STORAGE)).not.toThrow();
+    // Non-empty state still routes through setItem; should not throw despite
+    // the failing write.
+    expect(() =>
+      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] }),
+    ).not.toThrow();
     expect(spy).toHaveBeenCalled();
   });
 
   it("uses a deterministic, versioned key", () => {
     expect(storageKey("abc")).toBe("aoe:diff-comments:v1:abc");
+  });
+
+  describe("isEmptyState", () => {
+    it("is true for the empty envelope", () => {
+      expect(isEmptyState(EMPTY_STORAGE)).toBe(true);
+    });
+
+    it("ignores a non-default clearAfterSend toggle", () => {
+      expect(isEmptyState({ ...EMPTY_STORAGE, clearAfterSend: false })).toBe(
+        true,
+      );
+    });
+
+    it("is false with a comment", () => {
+      expect(
+        isEmptyState({ ...EMPTY_STORAGE, comments: [mkComment({})] }),
+      ).toBe(false);
+    });
+
+    it("is false with draft text", () => {
+      expect(isEmptyState({ ...EMPTY_STORAGE, introDraft: "hi" })).toBe(false);
+      expect(isEmptyState({ ...EMPTY_STORAGE, outroDraft: "bye" })).toBe(false);
+    });
+  });
+
+  describe("saveComments empty-removal", () => {
+    it("removes the key instead of writing an empty record", () => {
+      const data = installFakeLocalStorage();
+      saveComments("sess-1", EMPTY_STORAGE);
+      expect(data.has(storageKey("sess-1"))).toBe(false);
+    });
+
+    it("removes an existing key when state goes back to empty", () => {
+      const data = installFakeLocalStorage();
+      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
+      expect(data.has(storageKey("sess-1"))).toBe(true);
+      saveComments("sess-1", EMPTY_STORAGE);
+      expect(data.has(storageKey("sess-1"))).toBe(false);
+    });
+
+    it("treats a lone clearAfterSend toggle as empty and removes the key", () => {
+      const data = installFakeLocalStorage();
+      saveComments("sess-1", { ...EMPTY_STORAGE, clearAfterSend: false });
+      expect(data.has(storageKey("sess-1"))).toBe(false);
+    });
+
+    it("still persists non-empty state", () => {
+      const data = installFakeLocalStorage();
+      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
+      expect(data.has(storageKey("sess-1"))).toBe(true);
+      expect(loadComments("sess-1").comments).toHaveLength(1);
+    });
   });
 });
