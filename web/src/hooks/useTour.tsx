@@ -18,11 +18,7 @@ import {
   type TourScope,
   type TourStep,
 } from "../lib/tourSteps";
-import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-
-// Per-origin localStorage already isolates dev (port 8081) from release (8080),
-// so a flat key needs no app-dir namespace.
-const TOUR_SEEN_KEY = "aoe-tour-seen";
+import { hasSeenTour, isAutomatedSession, markTourSeen } from "../lib/onboarding";
 
 const TourRunner = lazy(() => import("../components/tour/TourRunner"));
 
@@ -59,10 +55,6 @@ export function shouldAutoLaunch(args: {
     !args.seen &&
     !args.automated
   );
-}
-
-function isAutomatedSession(): boolean {
-  return typeof navigator !== "undefined" && navigator.webdriver === true;
 }
 
 export interface UseTourResult {
@@ -121,7 +113,7 @@ export function useTour({
   // is painted yet does not permanently suppress the auto-launch.
   useEffect(() => {
     if (autoStartedRef.current) return;
-    const seen = safeGetItem(TOUR_SEEN_KEY) === "1";
+    const seen = hasSeenTour();
     const automated = isAutomatedSession();
     if (!shouldAutoLaunch({ autoLaunchReady, scope, isDesktop, seen, automated }))
       return;
@@ -142,7 +134,7 @@ export function useTour({
 
   const handleFinish = useCallback((markSeen: boolean) => {
     setRun(false);
-    if (markSeen) safeSetItem(TOUR_SEEN_KEY, "1");
+    if (markSeen) markTourSeen();
   }, []);
 
   const tourElement = run ? (

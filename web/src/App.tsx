@@ -71,6 +71,8 @@ import { SettingsView } from "./components/SettingsView";
 import { ProjectsView } from "./components/ProjectsView";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
+import { useWelcomePhase } from "./hooks/useWelcomePhase";
+import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
@@ -1082,11 +1084,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !showHelp &&
     !showAbout &&
     !showPalette;
+  // First-run theme choice is phase one of onboarding. It decides on the same
+  // settled-dashboard gate as the tour, then the tour follows once the modal
+  // resolves so the two never overlap on first load.
+  const welcome = useWelcomePhase({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    autoLaunchReady: tourAutoLaunchReady,
+  });
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
     isDesktop: !isCoarse,
-    autoLaunchReady: tourAutoLaunchReady,
+    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
   });
 
   return (
@@ -1165,6 +1175,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
         />
       )}
+
+      {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
 
       {tour.tourElement}
 
