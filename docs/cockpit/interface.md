@@ -103,7 +103,12 @@ uses text attributes only (bold, italic, dim) so it tracks your theme
 colors. Code-block syntax highlighting is deferred; press `o` to open
 the web dashboard for full-fidelity rendering. In the web dashboard,
 links inside transcript messages open in a new browser tab so following
-a docs, CI, or repo link keeps your cockpit session open.
+a docs, CI, or repo link keeps your cockpit session open. Local file
+references (the `path:line` links agents like Codex emit when citing
+source) are an exception: clicking one opens that file in the in-app
+diff/file viewer and keeps you on the current session, instead of
+navigating away. A file that is not inside the session's repo shows a
+brief notice and leaves the view unchanged.
 
 **Tool cards.** Tool calls in the transcript render per kind rather than
 as a single generic line. An edit or write shows the file path and a
