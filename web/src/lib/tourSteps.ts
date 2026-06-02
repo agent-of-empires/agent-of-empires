@@ -7,6 +7,8 @@
 // convention: every anchor must be referenced through `TOUR_ANCHORS.<key>`, never
 // as a raw `data-tour="..."` literal, so a renamed or deleted anchor fails fast.
 
+import type { ShortcutId } from "./shortcuts";
+
 /**
  * Every UI region the tour can point at. The string value is the literal that
  * lands in the DOM as `data-tour="<value>"`. Keep these on stable region
@@ -34,6 +36,16 @@ export type TourAnchorId = (typeof TOUR_ANCHORS)[keyof typeof TOUR_ANCHORS];
  */
 export type TourScope = "dashboard" | "session" | "cockpit";
 
+/**
+ * A tour shortcut hint references a registered shortcut by id (so the rendered
+ * key chord cannot drift from the actual binding) plus a step-local verb phrase.
+ * TourRunner renders it as `${formatTourShortcut(chord)} ${verb}`.
+ */
+export interface TourShortcutHint {
+  id: ShortcutId;
+  verb: string;
+}
+
 export interface TourStep {
   /** Stable id, also used as the react-joyride step id. */
   id: string;
@@ -41,8 +53,8 @@ export interface TourStep {
   scopes: readonly TourScope[];
   title: string;
   body: string;
-  /** Human-readable shortcut hints rendered under the body, e.g. "⌘K / Ctrl+K". */
-  shortcuts?: readonly string[];
+  /** Shortcut hints rendered under the body, resolved from the SHORTCUTS registry. */
+  shortcutHints?: readonly TourShortcutHint[];
   /** Drop the step when the dashboard is in read-only mode (mutation UI absent). */
   writableOnly?: boolean;
   /** Drop the step on coarse-pointer / non-desktop layouts (region not shown). */
@@ -70,7 +82,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard", "session", "cockpit"],
     title: "Command bar",
     body: "Jump anywhere from the command palette: switch sessions, open settings, toggle panels.",
-    shortcuts: ["⌘K / Ctrl+K opens the palette"],
+    shortcutHints: [{ id: "palette", verb: "opens the palette" }],
   },
   {
     id: "sidebar",
@@ -78,7 +90,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard", "session", "cockpit"],
     title: "Workspaces and sessions",
     body: "Your sessions are grouped by workspace here. Pick one to open its terminal or cockpit.",
-    shortcuts: ["⌘B / Ctrl+B toggles the sidebar"],
+    shortcutHints: [{ id: "sidebar", verb: "toggles the sidebar" }],
   },
   {
     id: "new-session",
@@ -86,7 +98,10 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard"],
     title: "Start a session",
     body: "Launch a new agent session: pick a project, choose an agent, and go.",
-    shortcuts: ["n opens the wizard", "⌘⇧N / Ctrl+Shift+N starts a scratch session"],
+    shortcutHints: [
+      { id: "new", verb: "opens the wizard" },
+      { id: "newScratch", verb: "starts a scratch session" },
+    ],
     writableOnly: true,
   },
   {
@@ -95,7 +110,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard", "session", "cockpit"],
     title: "Settings and profiles",
     body: "Tune sandboxing, worktrees, sounds, devices, and per-profile overrides here.",
-    shortcuts: ["s opens settings"],
+    shortcutHints: [{ id: "settings", verb: "opens settings" }],
   },
   {
     id: "right-panel",
@@ -103,7 +118,10 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["session", "cockpit"],
     title: "Diff and review",
     body: "Review the agent's file changes and send comments back without leaving the session.",
-    shortcuts: ["D toggles the diff", "⌘⌥B / Ctrl+Alt+B toggles the panel"],
+    shortcutHints: [
+      { id: "diff", verb: "toggles the diff" },
+      { id: "rightPanel", verb: "toggles the panel" },
+    ],
     desktopOnly: true,
   },
   {
