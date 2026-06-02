@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Clock, ListOrdered, Siren } from "lucide-react";
 import type { SidebarSortMode } from "../lib/sidebarSort";
+import { Tooltip } from "./Tooltip";
 
 // Sidebar sort picker (#1640). Replaces the former two-state Clock /
 // ListOrdered toggle now that there are three modes; a cycle button gets
@@ -58,22 +59,23 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
 
   return (
     <div ref={ref} className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        title={TRIGGER_TOOLTIP[sortMode]}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-label={`Sort sessions, current: ${active.label}`}
-        data-testid="sidebar-sort-toggle"
-        data-sort-mode={sortMode}
-        className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-          sortMode !== "manual"
-            ? "text-brand-500"
-            : "text-text-dim hover:text-text-secondary"
-        }`}
-      >
-        <ActiveIcon className="h-3.5 w-3.5" />
-      </button>
+      <Tooltip text={TRIGGER_TOOLTIP[sortMode]}>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-label={`Sort sessions, current: ${active.label}`}
+          data-testid="sidebar-sort-toggle"
+          data-sort-mode={sortMode}
+          className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+            sortMode !== "manual"
+              ? "text-brand-500"
+              : "text-text-dim hover:text-text-secondary"
+          }`}
+        >
+          <ActiveIcon className="h-3.5 w-3.5" />
+        </button>
+      </Tooltip>
 
       {open && (
         <div

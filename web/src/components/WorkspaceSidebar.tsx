@@ -108,6 +108,7 @@ import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
+import { Tooltip } from "./Tooltip";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1936,17 +1937,6 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
     </>
   );
 });
-
-function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
-  return (
-    <span className="relative group/tip inline-flex">
-      {children}
-      <span className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-full mt-1.5 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary whitespace-nowrap opacity-0 scale-95 transition-all duration-100 group-hover/tip:opacity-100 group-hover/tip:scale-100 z-50">
-        {text}
-      </span>
-    </span>
-  );
-}
 
 function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   return (
