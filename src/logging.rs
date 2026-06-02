@@ -917,41 +917,49 @@ pub fn persist_runtime_filter(directive: &str, app_dir: &std::path::Path) {
 /// to this process's `FilterController`. Used by the cockpit runner so
 /// the daemon's `aoe log-level` propagates to runners without restart.
 ///
-/// notify watches the parent directory (the file may not exist yet);
-/// the task filters events to those touching our target file.
-pub async fn watch_runtime_filter(app_dir: std::path::PathBuf) {
-    use notify::{RecursiveMode, Watcher};
-    use std::sync::mpsc;
+/// Subscribes via the shared [`crate::file_watch::FileWatchService`] (one
+/// `notify::RecommendedWatcher` per process). The function holds the
+/// returned `SubscriptionHandle` for its entire lifetime; dropping the
+/// future deregisters the subscription and unwatches the directory if no
+/// other consumer needs it.
+pub async fn watch_runtime_filter(
+    svc: std::sync::Arc<crate::file_watch::FileWatchService>,
+    app_dir: std::path::PathBuf,
+) {
+    use crate::file_watch::{FileMatcher, WatchSpec};
 
     let target = runtime_filter_path(&app_dir);
-
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    }) {
-        Ok(w) => w,
+    let result = svc.subscribe_channel(
+        WatchSpec {
+            dir: app_dir.clone(),
+            matcher: FileMatcher::Exact(target.clone()),
+            // `apply_filter_file` is idempotent; no debounce needed.
+            debounce: None,
+        },
+        // Capacity 4: low-rate source.
+        4,
+    );
+    let (mut rx, _handle) = match result {
+        Ok(pair) => pair,
         Err(e) => {
-            tracing::warn!(target: "log.runtime", error = %e, "notify init failed; live propagation disabled");
+            tracing::warn!(
+                target: "log.runtime",
+                error = %e,
+                dir = %app_dir.display(),
+                "notify watch failed; live propagation disabled"
+            );
             return;
         }
     };
-    if let Err(e) = watcher.watch(&app_dir, RecursiveMode::NonRecursive) {
-        tracing::warn!(target: "log.runtime", error = %e, dir = %app_dir.display(), "notify watch failed");
-        return;
-    }
 
-    // Apply once at startup if the file is already there.
+    // Apply once at startup if the file is already there. This matches the
+    // pre-migration ordering: priming runs only AFTER subscribe succeeds.
     apply_filter_file(&target);
 
-    loop {
-        let evt = match tokio::task::block_in_place(|| rx.recv()) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let Ok(evt) = evt else { continue };
-        if evt.paths.iter().any(|p| p == &target) {
-            apply_filter_file(&target);
-        }
+    // Drain the channel for the lifetime of the task. `_handle` keeps the
+    // subscription alive; dropping it on function exit unsubscribes.
+    while rx.recv().await.is_some() {
+        apply_filter_file(&target);
     }
 }
 

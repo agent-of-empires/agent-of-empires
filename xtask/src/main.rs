@@ -1,6 +1,6 @@
 //! xtask - Development tasks for agent-of-empires
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -19,6 +19,18 @@ enum Commands {
     GenDocs,
     /// Check that contrib skill files reference valid CLI commands
     CheckSkill,
+    /// Run the web dashboard backend and Vite dev server together (Ctrl-C stops both)
+    Dev(DevArgs),
+}
+
+#[derive(Args)]
+struct DevArgs {
+    /// Port for the `aoe serve` backend (matches the debug-build default)
+    #[arg(long, default_value_t = 8081)]
+    serve_port: u16,
+    /// Port for the Vite dev server
+    #[arg(long, default_value_t = 5173)]
+    web_port: u16,
 }
 
 fn main() {
@@ -26,7 +38,137 @@ fn main() {
     match args.command {
         Commands::GenDocs => generate_cli_docs(),
         Commands::CheckSkill => check_skill(),
+        Commands::Dev(dev) => run_dev(dev),
     }
+}
+
+#[cfg(not(unix))]
+fn run_dev(_args: DevArgs) {
+    eprintln!("`cargo xtask dev` is unix-only (it relies on POSIX process groups).");
+    std::process::exit(1);
+}
+
+/// Build the serve-enabled binary, then run it alongside the Vite dev server.
+/// Vite proxies `/api` and the `/sessions/*/ws` relays to the backend via the
+/// `VITE_PROXY` env var it already honors. Each child runs in its own process
+/// group so a single Ctrl-C tears the whole tree down (npm spawns vite, vite
+/// may spawn esbuild) with no orphans.
+#[cfg(unix)]
+fn run_dev(args: DevArgs) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // Build up front so build output doesn't interleave with Vite's startup
+    // and a broken build fails fast before either server comes up.
+    eprintln!("[xtask dev] building aoe (--features serve)...");
+    let built = Command::new("cargo")
+        .args(["build", "--features", "serve"])
+        .status()
+        .expect("failed to run cargo build");
+    if !built.success() {
+        std::process::exit(built.code().unwrap_or(1));
+    }
+
+    // Honor CARGO_TARGET_DIR; cargo wrote the debug binary under it.
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+    let bin = Path::new(&target_dir).join("debug").join("aoe");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        ctrlc::set_handler(move || shutdown.store(true, Ordering::SeqCst))
+            .expect("failed to install Ctrl-C handler");
+    }
+
+    // Detach stdin from both children: each runs in its own (background)
+    // process group, so a TTY-driven raw-mode setup (Vite installs keypress
+    // shortcuts when stdin is a TTY) would raise SIGTTOU and suspend the
+    // child. Shutdown is driven by signals here, not per-server keystrokes,
+    // so neither child needs the terminal.
+    let mut serve = Command::new(&bin)
+        .args(["serve", "--no-auth", "--port", &args.serve_port.to_string()])
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn `aoe serve`");
+
+    let mut vite = match Command::new("npm")
+        .args([
+            "--prefix",
+            "web",
+            "run",
+            "dev",
+            "--",
+            "--port",
+            &args.web_port.to_string(),
+        ])
+        .env(
+            "VITE_PROXY",
+            format!("http://127.0.0.1:{}", args.serve_port),
+        )
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // serve is already up; tear its group down before bailing so we
+            // don't orphan a backend on the serve port.
+            eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
+            let _ = killpg(Pid::from_raw(serve.id() as i32), Signal::SIGTERM);
+            let _ = serve.wait();
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "[xtask dev] aoe serve on :{} | open http://localhost:{}",
+        args.serve_port, args.web_port
+    );
+
+    let exited = |child: &mut Child| matches!(child.try_wait(), Ok(Some(_)));
+
+    // Supervise: stop when Ctrl-C arrives or either child dies on its own.
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if exited(&mut serve) {
+            eprintln!("[xtask dev] `aoe serve` exited; stopping vite");
+            break;
+        }
+        if exited(&mut vite) {
+            eprintln!("[xtask dev] vite exited; stopping `aoe serve`");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Signal each process group: SIGTERM, brief grace, then SIGKILL so the
+    // ports are always freed even if a child ignores the term.
+    let groups = [serve.id() as i32, vite.id() as i32];
+    for pid in groups {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if exited(&mut serve) && exited(&mut vite) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !(exited(&mut serve) && exited(&mut vite)) {
+        for pid in groups {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+    let _ = serve.wait();
+    let _ = vite.wait();
 }
 
 fn generate_cli_docs() {

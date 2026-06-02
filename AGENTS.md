@@ -42,7 +42,7 @@
 - Stack: React 19, TypeScript, Vite, Tailwind v4, xterm.js v6. Installable as a PWA ("Install Agent of Empires" in Chrome; "Add to Home Screen" on iOS).
 - Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
-- Frontend dev: `cd web && npm run dev` for Vite HMR; the Rust server must also be running for API/WebSocket requests.
+- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
 - TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
 
 ## Settings & Configuration

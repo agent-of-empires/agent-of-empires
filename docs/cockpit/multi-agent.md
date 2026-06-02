@@ -71,6 +71,15 @@ different MCP naming scheme, file an issue or PR adjusting the profile's
   adapter advertises the matching channels (`available_modes`,
   `available_commands_update`, `usage_update`). When the adapter doesn't
   emit them, the UI simply stays empty rather than showing stale state.
+- **Mode picker sources, in order**: a `category:"mode"` config option
+  (OpenCode, and claude-agent-acp v0.37.0+), then the ACP
+  SessionModeState `available_modes` channel (older claude), then, for
+  claude-family agents only, claude's built-in Default / Plan / Accept
+  edits / Yolo taxonomy. A non-claude agent that advertises no modes
+  shows no picker rather than a vocabulary it would reject. OpenCode has
+  no "default" mode: it operates in modes such as `build` and `plan`,
+  so the picker surfaces those real names and switches through the
+  config-option channel.
 
 ## How the Profile Works
 

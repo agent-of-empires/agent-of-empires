@@ -24,6 +24,7 @@ import {
   ToggleField,
 } from "./settings/FormFields";
 import { ThemeSettings } from "./settings/ThemeSettings";
+import { DiffSettings } from "./settings/DiffSettings";
 import { SoundSettings } from "./settings/SoundSettings";
 import { UpdateSettings } from "./settings/UpdateSettings";
 import { TmuxSettings } from "./settings/TmuxSettings";
@@ -35,6 +36,7 @@ type TabId =
   | "sandbox"
   | "worktree"
   | "theme"
+  | "diff"
   | "sound"
   | "tmux"
   | "updates"
@@ -62,6 +64,7 @@ export function buildSidebar(): SidebarItem[] {
   return [
     { kind: "divider", label: "Appearance" },
     { kind: "tab", id: "theme", label: "Theme" },
+    { kind: "tab", id: "diff", label: "Diff" },
     { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
     { kind: "tab", id: "cockpit", label: "Cockpit" },
@@ -95,6 +98,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "sandbox",
   "worktree",
   "theme",
+  "diff",
   "sound",
   "tmux",
   "updates",
@@ -455,6 +459,8 @@ export function SettingsView({
 
       case "theme":
         return <ThemeSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "diff":
+        return <DiffSettings />;
       case "sound":
         return <SoundSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
       case "tmux":

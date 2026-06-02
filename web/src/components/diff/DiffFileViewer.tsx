@@ -1,9 +1,11 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileDiff } from "../../hooks/useFileDiff";
 import {
   useHighlightedLines,
   type SyntaxToken,
 } from "../../hooks/useHighlightedLines";
+import { useWebSettings } from "../../hooks/useWebSettings";
+import { SplitHunkView } from "./SplitHunkView";
 import type { RichDiffHunk, RichDiffLine } from "../../lib/types";
 import { DiffLine } from "./DiffLine";
 import type { UseDiffCommentsResult } from "../../hooks/useDiffComments";
@@ -233,6 +235,28 @@ export function DiffFileViewer({
     diff?.file.path ?? filePath,
   );
 
+  const { settings, update } = useWebSettings();
+  const [isWide, setIsWide] = useState(true);
+  const widthObserverRef = useRef<ResizeObserver | null>(null);
+
+  // Callback ref: the scroll container is rendered only after the loading /
+  // error / empty guards below, so it may mount well after first paint. A
+  // callback ref attaches the observer the moment the node mounts (and tears it
+  // down on unmount), unlike a one-shot mount effect that would miss the late
+  // mount and never measure width.
+  const measureRef = useCallback((el: HTMLDivElement | null) => {
+    widthObserverRef.current?.disconnect();
+    widthObserverRef.current = null;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      setIsWide((entries[0]?.contentRect.width ?? 0) >= 640);
+    });
+    ro.observe(el);
+    widthObserverRef.current = ro;
+  }, []);
+
+  const splitActive = settings.diffViewLayout === "split" && isWide;
+
   const [rangeStart, setRangeStart] = useState<RangeStart | null>(null);
   const [draft, setDraft] = useState<DraftRange | null>(null);
 
@@ -429,10 +453,44 @@ export function DiffFileViewer({
             <span className="text-status-error">-{diff.file.deletions}</span>
           )}
         </span>
+        <div className="ml-auto flex items-center rounded border border-surface-700/40 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => update({ diffViewLayout: "unified" })}
+            aria-pressed={settings.diffViewLayout === "unified"}
+            title="Unified diff"
+            className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+              settings.diffViewLayout === "unified"
+                ? "bg-brand-600 text-white"
+                : "text-text-dim hover:text-text-secondary"
+            }`}
+          >
+            Unified
+          </button>
+          <button
+            type="button"
+            onClick={() => update({ diffViewLayout: "split" })}
+            aria-pressed={settings.diffViewLayout === "split"}
+            title={
+              settings.diffViewLayout === "split" && !isWide
+                ? "Split selected, but this pane is too narrow; showing unified"
+                : "Side-by-side diff"
+            }
+            className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${
+              settings.diffViewLayout === "split"
+                ? splitActive
+                  ? "bg-brand-600 text-white"
+                  : "bg-brand-600/40 text-white/80"
+                : "text-text-dim hover:text-text-secondary"
+            }`}
+          >
+            Split
+          </button>
+        </div>
       </div>
 
       {/* Diff content */}
-      <div className="flex-1 overflow-auto">
+      <div ref={measureRef} className="flex-1 overflow-auto">
         {diff.is_binary ? (
           <div className="flex items-center justify-center h-full text-text-dim">
             <span className="text-sm">Binary file changed</span>
@@ -474,26 +532,51 @@ export function DiffFileViewer({
                 No changes in this file
               </div>
             )}
-            {diff.hunks.map((hunk, hi) => (
-              <HunkView
-                key={`${hunk.old_start}-${hunk.new_start}`}
-                hunk={hunk}
-                hunkIndex={hi}
-                lineTokens={tokenGrid?.[hi]}
-                rangeStart={rangeStart}
-                draft={draft?.hunkIndex === hi ? draft : null}
-                cardsByEndRow={cardsByHunkRow.get(hi) ?? EMPTY_MAP}
-                formRowIndex={
-                  draft?.hunkIndex === hi ? draft.endRowIndex : null
-                }
-                commentsEnabled={commentsEnabled && !!commentsStore}
-                onPlusClick={handlePlusClick}
-                onCommentSave={handleCommentSave}
-                onCommentDelete={handleCommentDelete}
-                onDraftSave={handleDraftSave}
-                onDraftCancel={handleDraftCancel}
-              />
-            ))}
+            {diff.hunks.map((hunk, hi) =>
+              splitActive ? (
+                <SplitHunkView
+                  key={`${hunk.old_start}-${hunk.new_start}`}
+                  hunk={hunk}
+                  hunkIndex={hi}
+                  lineTokens={tokenGrid?.[hi]}
+                  commentsEnabled={commentsEnabled && !!commentsStore}
+                  cardsByEndRow={cardsByHunkRow.get(hi) ?? EMPTY_MAP}
+                  formRowIndex={draft?.hunkIndex === hi ? draft.endRowIndex : null}
+                  draftSide={draft?.hunkIndex === hi ? draft.side : null}
+                  draftStartLine={draft?.hunkIndex === hi ? draft.startLine : null}
+                  draftEndLine={draft?.hunkIndex === hi ? draft.endLine : null}
+                  rangeStart={
+                    rangeStart?.hunkIndex === hi
+                      ? { side: rangeStart.side, line: rangeStart.line }
+                      : null
+                  }
+                  onPlusClick={handlePlusClick}
+                  onCommentSave={handleCommentSave}
+                  onCommentDelete={handleCommentDelete}
+                  onDraftSave={handleDraftSave}
+                  onDraftCancel={handleDraftCancel}
+                />
+              ) : (
+                <HunkView
+                  key={`${hunk.old_start}-${hunk.new_start}`}
+                  hunk={hunk}
+                  hunkIndex={hi}
+                  lineTokens={tokenGrid?.[hi]}
+                  rangeStart={rangeStart}
+                  draft={draft?.hunkIndex === hi ? draft : null}
+                  cardsByEndRow={cardsByHunkRow.get(hi) ?? EMPTY_MAP}
+                  formRowIndex={
+                    draft?.hunkIndex === hi ? draft.endRowIndex : null
+                  }
+                  commentsEnabled={commentsEnabled && !!commentsStore}
+                  onPlusClick={handlePlusClick}
+                  onCommentSave={handleCommentSave}
+                  onCommentDelete={handleCommentDelete}
+                  onDraftSave={handleDraftSave}
+                  onDraftCancel={handleDraftCancel}
+                />
+              ),
+            )}
           </div>
         )}
       </div>

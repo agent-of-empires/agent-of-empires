@@ -1081,16 +1081,24 @@ impl SessionConfig {
 }
 
 /// Diff view configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "diff", category = "Diff")]
 pub struct DiffConfig {
     /// Default branch to compare against (e.g., "main", "master")
     /// If not set, will try to auto-detect from the repository
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "Default Branch", widget = "optional_text")]
     pub default_branch: Option<String>,
 
     /// Number of context lines to show around changes
     #[serde(default = "default_context_lines")]
+    #[setting(label = "Context Lines", widget = "number", min = 0)]
     pub context_lines: usize,
+
+    /// Render diffs side-by-side (split) instead of unified.
+    #[serde(default)]
+    #[setting(label = "Side-by-side diff", widget = "toggle")]
+    pub split_view: bool,
 }
 
 impl Default for DiffConfig {
@@ -1098,6 +1106,7 @@ impl Default for DiffConfig {
         Self {
             default_branch: None,
             context_lines: 3,
+            split_view: false,
         }
     }
 }
@@ -2501,6 +2510,16 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.diff.default_branch, Some("main".to_string()));
         assert_eq!(config.diff.context_lines, 10);
+    }
+
+    #[test]
+    fn diff_config_split_view_roundtrips() {
+        let mut cfg = DiffConfig::default();
+        assert!(!cfg.split_view);
+        cfg.split_view = true;
+        let toml = toml::to_string(&cfg).unwrap();
+        let back: DiffConfig = toml::from_str(&toml).unwrap();
+        assert!(back.split_view);
     }
 
     #[test]

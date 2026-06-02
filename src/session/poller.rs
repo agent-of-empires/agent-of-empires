@@ -296,6 +296,13 @@ impl SessionPoller {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_test_update(&self, instance_id: &str, session_id: &str) {
+        self.result_tx
+            .send((instance_id.to_string(), session_id.to_string()))
+            .expect("inject_test_update: result channel disconnected");
+    }
+
     /// Stop the poller thread and wait for it to finish
     pub fn stop(&mut self) {
         let _ = self.cmd_tx.send(PollCommand::Stop);

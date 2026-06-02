@@ -21,6 +21,7 @@ describe("buildSidebar", () => {
     expect(buildSidebar()).toEqual([
       { kind: "divider", label: "Appearance" },
       { kind: "tab", id: "theme", label: "Theme" },
+      { kind: "tab", id: "diff", label: "Diff" },
       { kind: "divider", label: "Sessions" },
       { kind: "tab", id: "session", label: "Session" },
       { kind: "tab", id: "cockpit", label: "Cockpit" },

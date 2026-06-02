@@ -966,6 +966,31 @@
       ]
     },
     {
+      "id": "right-panel.diff-split-toggle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/__tests__/DiffFileViewer.split.test.tsx",
+        "src/components/diff/__tests__/SplitHunkView.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/SplitHunkView.tsx"
+      ]
+    },
+    {
+      "id": "settings.diff-section",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/settings/__tests__/DiffSettings.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/DiffSettings.tsx",
+        "web/src/components/SettingsView.tsx"
+      ]
+    },
+    {
       "id": "devices",
       "kind": "live-playwright",
       "risk": "low",
@@ -2370,6 +2395,18 @@
       "components": [
         "web/src/components/diff/StringDiff.tsx",
         "web/src/components/cockpit/ToolCards.tsx"
+      ]
+    },
+    {
+      "id": "cockpit.edit-card-diff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/cockpit-edit-card-diff.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolCards.tsx",
+        "web/src/components/diff/StringDiff.tsx"
       ]
     },
     {

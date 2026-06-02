@@ -15,6 +15,7 @@ export interface WebSettings {
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
   diffViewMode: "flat" | "tree";
+  diffViewLayout: "unified" | "split";
   collapsedDiffDirs: string[];
 }
 
@@ -26,6 +27,7 @@ function getDefaults(): WebSettings {
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
+    diffViewLayout: "unified",
     collapsedDiffDirs: [],
   };
 }

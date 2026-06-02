@@ -2,6 +2,7 @@
 
 mod input;
 mod render;
+mod split;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,7 +12,7 @@ use crate::git::diff::{
     list_branches, DiffFile, FileDiff,
 };
 use crate::session::config::{load_config, save_config};
-use crate::session::Config;
+use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
 use crate::tui::dialogs::InfoDialog;
 
 pub use input::DiffAction;
@@ -70,6 +71,9 @@ pub struct DiffView {
     /// Context lines for diff
     pub(crate) context_lines: usize,
 
+    /// Render the selected file's diff side-by-side instead of unified.
+    pub(crate) split_view: bool,
+
     /// Show help overlay
     pub(crate) show_help: bool,
 
@@ -112,7 +116,14 @@ impl DiffView {
         profile: String,
         base_override: Option<String>,
     ) -> anyhow::Result<Self> {
-        let config = Config::load_or_warn();
+        // Use the profile-merged config so a per-profile Diff override (e.g.
+        // split_view) is honored on open. The session-agnostic path (empty
+        // profile) falls back to the global config.
+        let config = if profile.is_empty() {
+            Config::load_or_warn()
+        } else {
+            resolve_config_or_warn(&profile)
+        };
 
         let base_branch = base_override
             .as_deref()
@@ -124,6 +135,7 @@ impl DiffView {
             .unwrap_or_else(|| "main".to_string());
 
         let context_lines = config.diff.context_lines;
+        let split_view = config.diff.split_view;
 
         let warning_dialog = check_merge_base_status(&repo_path, &base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
@@ -143,6 +155,7 @@ impl DiffView {
             error_message: None,
             success_message: None,
             context_lines,
+            split_view,
             show_help: false,
             file_list_width: config.app_state.diff_file_list_width.unwrap_or(35),
             warning_dialog,
@@ -321,6 +334,44 @@ impl DiffView {
         }
     }
 
+    /// Persist the current `split_view` choice so it survives restarts and
+    /// stays in sync with the settings TUI. A profile-scoped session writes the
+    /// choice to that profile's override; a session-agnostic view writes the
+    /// global default.
+    pub(crate) fn persist_split_view(&self) {
+        if self.profile.is_empty() {
+            if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+                config.diff.split_view = self.split_view;
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!("failed to persist diff split_view: {e}");
+                }
+            }
+            return;
+        }
+        match load_profile_config(&self.profile) {
+            Ok(mut profile_config) => {
+                // Overrides are sparse JSON (#1692): set diff.split_view in the
+                // generic override map rather than a typed DiffConfigOverride.
+                let diff = profile_config
+                    .overrides
+                    .entry("diff".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = diff.as_object_mut() {
+                    obj.insert("split_view".to_string(), serde_json::json!(self.split_view));
+                }
+                if let Err(e) = save_profile_config(&self.profile, &profile_config) {
+                    tracing::warn!(
+                        "failed to persist diff split_view for profile {}: {e}",
+                        self.profile
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to load profile config {}: {e}", self.profile);
+            }
+        }
+    }
+
     /// Minimal DiffView for unit tests. Centralised so new fields only need
     /// a default value in one place.
     #[cfg(test)]
@@ -340,6 +391,7 @@ impl DiffView {
             error_message: None,
             success_message: None,
             context_lines: 3,
+            split_view: false,
             show_help: false,
             file_list_width: 35,
             warning_dialog: None,

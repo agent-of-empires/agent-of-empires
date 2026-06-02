@@ -286,6 +286,7 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Session);
         push_tab(&mut rows, SettingsCategory::Agents);
         push_tab(&mut rows, SettingsCategory::Interaction);
+        push_tab(&mut rows, SettingsCategory::Diff);
         push_tab(&mut rows, SettingsCategory::Cockpit);
 
         push_section(&mut rows, "Hooks");

@@ -49,6 +49,7 @@ pub enum SettingsCategory {
     Hooks,
     Web,
     Cockpit,
+    Diff,
     Logging,
 }
 
@@ -68,6 +69,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Cockpit => "Cockpit",
+            Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
     }
@@ -90,6 +92,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Cockpit => "Cockpit",
+            Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
     }

@@ -1,9 +1,10 @@
 // Convert an `(old_string, new_string)` pair into a `RichDiffHunk`
 // plus add/del counts, so the cockpit Edit/Write card can drive its
-// body and its `+N −N` chip off a single line-diff pass. Same
-// `diff` engine used elsewhere in the tree. See #1073 / #1074.
+// body and its `+N −N` chip off a single line-diff pass. Uses
+// `@pierre/diffs` `parseDiffFromFile`, the same diff engine the diff
+// surfaces render with. See #1073 / #1074.
 
-import { diffLines } from "diff";
+import { parseDiffFromFile } from "@pierre/diffs";
 import type { RichDiffHunk, RichDiffLine } from "./types";
 
 export interface DiffPairResult {
@@ -12,13 +13,19 @@ export interface DiffPairResult {
   dels: number;
 }
 
-/** Force a single trailing newline so diffLines doesn't treat
+/** Force a single trailing newline so the line diff doesn't treat
  *  "last line without `\n`" as a distinct token from "same line with
  *  `\n`". Without this, `"a\nb\nc"` vs `"a\nb\nc\nd"` registers as
  *  remove("c") + add("c\nd\n") instead of add("d\n"). */
 function withTrailingNewline(s: string): string {
   if (s === "") return s;
   return s.endsWith("\n") ? s : s + "\n";
+}
+
+/** `parseDiffFromFile` keeps the trailing newline on every line but
+ *  the file's last; drop it so `content` is the bare line text. */
+function stripNewline(s: string): string {
+  return s.endsWith("\n") ? s.slice(0, -1) : s;
 }
 
 /** Run a line-level diff over the pair and emit a `RichDiffHunk`
@@ -39,10 +46,8 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
     };
   }
 
-  const parts = diffLines(
-    withTrailingNewline(oldText),
-    withTrailingNewline(newText),
-  );
+  const oldNormalized = withTrailingNewline(oldText);
+  const newNormalized = withTrailingNewline(newText);
 
   const lines: RichDiffLine[] = [];
   let oldNum = 1;
@@ -50,35 +55,70 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
   let adds = 0;
   let dels = 0;
 
-  for (const part of parts) {
-    const trimmed = part.value.endsWith("\n")
-      ? part.value.slice(0, -1)
-      : part.value;
-    if (trimmed === "") continue;
-    for (const content of trimmed.split("\n")) {
-      if (part.added) {
-        lines.push({
-          type: "add",
-          old_line_num: null,
-          new_line_num: newNum++,
-          content,
-        });
-        adds += 1;
-      } else if (part.removed) {
-        lines.push({
-          type: "delete",
-          old_line_num: oldNum++,
-          new_line_num: null,
-          content,
-        });
-        dels += 1;
-      } else {
-        lines.push({
-          type: "equal",
-          old_line_num: oldNum++,
-          new_line_num: newNum++,
-          content,
-        });
+  if (oldNormalized === newNormalized) {
+    // Identical content yields no hunks; surface every line as `equal`
+    // so the renderer still shows the snippet.
+    for (const content of stripNewline(oldNormalized).split("\n")) {
+      lines.push({
+        type: "equal",
+        old_line_num: oldNum++,
+        new_line_num: newNum++,
+        content,
+      });
+    }
+  } else {
+    // A context window this wide keeps every unchanged line in the hunk
+    // (no `@@`-collapsing), so the snippet renders in full and line
+    // numbers stay contiguous on both sides.
+    const meta = parseDiffFromFile(
+      { name: "f", contents: oldNormalized },
+      { name: "f", contents: newNormalized },
+      { context: Number.MAX_SAFE_INTEGER },
+    );
+
+    for (const hunk of meta.hunks) {
+      for (const segment of hunk.hunkContent) {
+        if (segment.type === "context") {
+          const idx = segment.additionLineIndex;
+          for (const raw of meta.additionLines.slice(
+            idx,
+            idx + segment.lines,
+          )) {
+            lines.push({
+              type: "equal",
+              old_line_num: oldNum++,
+              new_line_num: newNum++,
+              content: stripNewline(raw),
+            });
+          }
+        } else {
+          const delIdx = segment.deletionLineIndex;
+          for (const raw of meta.deletionLines.slice(
+            delIdx,
+            delIdx + segment.deletions,
+          )) {
+            lines.push({
+              type: "delete",
+              old_line_num: oldNum++,
+              new_line_num: null,
+              content: stripNewline(raw),
+            });
+            dels += 1;
+          }
+          const addIdx = segment.additionLineIndex;
+          for (const raw of meta.additionLines.slice(
+            addIdx,
+            addIdx + segment.additions,
+          )) {
+            lines.push({
+              type: "add",
+              old_line_num: null,
+              new_line_num: newNum++,
+              content: stripNewline(raw),
+            });
+            adds += 1;
+          }
+        }
       }
     }
   }
