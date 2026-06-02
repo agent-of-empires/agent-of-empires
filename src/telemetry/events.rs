@@ -78,6 +78,11 @@ pub struct UsageSnapshot {
     pub sessions_by_agent: BTreeMap<String, u32>,
     /// Coarse model family bucket -> session count.
     pub sessions_by_model_bucket: BTreeMap<String, u32>,
+    /// Install-level feature adoption: allowlisted feature name -> active.
+    /// Keyed by the fixed registry in [`super::features`]; lets new gated
+    /// features be tracked by registering the flag, not by extending the
+    /// schema. See `telemetry::features`.
+    pub features: BTreeMap<String, bool>,
 
     /// The web dashboard was opened at least once since the last snapshot.
     pub web_seen: bool,

@@ -15,9 +15,13 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   OS, and CPU arch. The `cli` surface is throttled to at most once per install
   per day, so scripting `aoe` in a loop never floods the endpoint.
 - **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
-  ~12 hours: counts of sessions by status, how many are sandboxed / cockpit /
-  yolo, counts bucketed by agent and by model family, and whether the web
-  dashboard / cockpit was opened.
+  ~12 hours. It is a point-in-time summary of the current install, never a
+  stream of actions:
+  - how many sessions exist and how many are running / idle / errored,
+  - how many use a sandbox, the cockpit, or yolo mode,
+  - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
+  - which opt-in features are turned on (see "Feature flags" below),
+  - whether the web dashboard / cockpit was opened since the last snapshot.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day, with no retries and no offline buffering, so a flaky network
@@ -28,6 +32,15 @@ Every agent and model string passes through a sanitizer
 agent command becomes `custom`, an unrecognized model becomes `other`. **Raw
 commands, file paths, titles, branch names, group paths, and prompts are never
 sent.**
+
+### Feature flags
+
+The snapshot includes a small `features` map (allowlisted feature name ->
+on/off) so we can see which opt-in features installs actually turn on. It is
+driven by a registry in `src/telemetry/features.rs`: tracking a newly gated
+feature is one entry there (name + how to read it from config), not a schema
+change. The key set is fixed and the values are booleans, so a flag can never
+carry a path or name, and the gateway forwards only this allowlisted shape.
 
 ## What is never sent
 

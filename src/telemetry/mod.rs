@@ -19,6 +19,7 @@
 //!   names, and prompts are never emitted.
 
 pub mod events;
+pub mod features;
 pub mod sanitize;
 mod state;
 
@@ -139,6 +140,7 @@ pub fn build_usage_snapshot(
         return None;
     }
     let install_id = state::ensure_install_id()?;
+    let features = features::active_features(&crate::session::Config::load_or_warn());
 
     let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
     let mut sessions_by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
@@ -207,6 +209,7 @@ pub fn build_usage_snapshot(
         session_yolo: yolo,
         sessions_by_agent,
         sessions_by_model_bucket,
+        features,
         web_seen,
         cockpit_seen,
         session_creates_since_last_snapshot,
