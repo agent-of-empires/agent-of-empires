@@ -1337,27 +1337,103 @@ impl HomeView {
         );
     }
 
+    /// tmux session name backing the pane the preview currently shows, as a
+    /// function of the selected session and view mode (and, for Terminal,
+    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// `sync_preview_capture_worker`.
+    pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        let id = self.selected_session.as_ref()?;
+        let inst = self.get_instance(id)?;
+        let name = match &self.view_mode {
+            ViewMode::Agent => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Terminal => {
+                let mode = if inst.is_sandboxed() {
+                    self.get_terminal_mode(id)
+                } else {
+                    TerminalMode::Host
+                };
+                match mode {
+                    TerminalMode::Host => {
+                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                    TerminalMode::Container => {
+                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                }
+            }
+            ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
+                .session_name()
+                .to_string(),
+        };
+        Some(name)
+    }
+
+    /// Point the off-thread capture worker at `desired` (the displayed
+    /// pane's tmux session), respawning on change and tearing down on
+    /// `None`, then retune its cadence to live-send vs. idle. Cheap and
+    /// idempotent when the target is unchanged, so render calls it every
+    /// frame. This is what keeps the worker tracking whatever the user is
+    /// looking at instead of only the agent during live-send.
+    pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        if self.preview_capture_target != desired {
+            // Dropping the old worker flips its `stop` flag; spawn the new
+            // one against the wake the event loop selects on.
+            self.preview_capture_worker = None;
+            self.preview_capture_worker = desired.as_ref().map(|name| {
+                live_send::LiveCaptureWorker::spawn(name.clone(), self.preview_wake.clone())
+            });
+            self.preview_capture_target = desired;
+        }
+        let live = self.live_send.is_some();
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_live(live);
+        }
+    }
+
+    /// If the capture worker has fresh content, store it into `select`'s
+    /// cache and report `true` so the caller skips the synchronous fork.
+    /// Returns `false` when the worker has nothing new (cold start, or an
+    /// idle/unchanged pane), leaving the caller's `refresh_preview_cache_core`
+    /// to populate the cache once via the fork gate. Steady state across
+    /// every view goes through here, so `tmux capture-pane` stays off the
+    /// render thread.
+    fn apply_worker_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) -> bool {
+        let Some(id) = self.selected_session.clone() else {
+            return false;
+        };
+        let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            return false;
+        };
+        worker.set_capture_lines(capture_lines);
+        let Some(content) = worker.take_latest() else {
+            return false;
+        };
+        let captured_lines = select(self).store_capture(content, id, (width, height));
+        self.preview_scroll_offset = clamp_scroll_to_capture(
+            self.preview_scroll_offset,
+            captured_lines,
+            self.preview_visible_rows,
+        );
+        true
+    }
+
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        // Outside live-send, captures fork a fresh `tmux capture-pane` so we
-        // throttle to 250ms (4 Hz). Inside agent live-send the fork moves off
-        // the render thread entirely: `LiveCaptureWorker` keeps the cache
-        // fresh on its own thread and the block below just applies the newest
-        // content (the core's `force` flag and the synchronous fork remain
-        // for non-agent live-send targets and the throttled non-live path).
-        // This replaced the old per-frame on-thread fork, which the
-        // `tui.render` trace measured at ~8.5ms on macOS (~90% of a frame).
-        // Control-mode capture was removed with the rest of the `tmux -C`
-        // path (#1485 revert); there is no socket round-trip and no
-        // `%output` wake. Profile the result via `capture_us` on the trace.
+        // The off-thread `LiveCaptureWorker` (retargeted to this pane by
+        // `sync_preview_capture_worker` in `render_preview`) keeps fresh
+        // content flowing on its own thread; `apply_worker_capture` below
+        // just applies the newest it has produced. The synchronous fork via
+        // `refresh_preview_cache_core` remains only as the cold-start /
+        // worker-empty fallback (its 250ms gate still applies there). This
+        // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
+        // frame; the `tui.render` `capture_us` trace measures it) off the
+        // render thread for every view, not just agent live-send.
         let in_live = self.live_send.is_some();
-        // The agent preview can render (ViewMode::Agent) while live-send is
-        // pointed at a non-agent pane. Only agent live-send should bypass the
-        // throttle / use the capture worker; otherwise this preview is a
-        // background view and must stay 250ms-throttled like any other.
-        let agent_live = self
-            .live_send
-            .as_ref()
-            .is_some_and(|s| s.target == live_send::LiveSendTarget::Agent);
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
@@ -1396,46 +1472,18 @@ impl HomeView {
             }
         }
 
-        // Agent live-send reads from the off-thread capture worker instead
-        // of forking `capture-pane` on the render thread. The worker keeps
-        // fresh pane content flowing on its own thread (see
-        // `LiveCaptureWorker`); here we just publish the current geometry and
-        // apply the newest content it has produced. This is what moves the
-        // ~8.5ms (macOS) per-frame capture cost off the hot path: the
-        // measured `capture_us` drops from thousands to tens. The worker
-        // already skips empty captures, so the #1501 kill switch (don't flash
-        // blank when a capture comes back empty) is preserved by simply not
-        // overwriting the cache when there's no new content.
-        if agent_live {
-            if let Some(id) = self.selected_session.clone() {
-                let capture_lines = capture_lines_for(height, self.preview_scroll_offset);
-                let latest = self.live_capture_worker.as_ref().map(|worker| {
-                    worker.set_capture_lines(capture_lines);
-                    worker.take_latest()
-                });
-                // `Some(None)` = worker present, nothing new this frame (keep
-                // the cache). `None` = no worker; fall through to the
-                // synchronous path below.
-                if let Some(latest) = latest {
-                    if let Some(content) = latest {
-                        let captured_lines =
-                            self.preview_cache
-                                .store_capture(content, id, (width, height));
-                        self.preview_scroll_offset = clamp_scroll_to_capture(
-                            self.preview_scroll_offset,
-                            captured_lines,
-                            self.preview_visible_rows,
-                        );
-                    }
-                    return;
-                }
-            }
+        // Apply the worker's latest capture if it has fresh content; that's
+        // the steady-state path and never forks. Only a cold start (worker
+        // just retargeted) or an idle/unchanged pane falls through to the
+        // synchronous fork below.
+        if self.apply_worker_capture(width, height, |s| &mut s.preview_cache) {
+            return;
         }
 
-        // Captures otherwise go through the fork-based path
-        // (`Session::capture_pane_with_size` via the instance helper); the
-        // synchronous path runs outside live-send (250ms-throttled) and for
-        // non-agent live-send targets, which don't force-refresh per frame.
+        // Cold-start / fallback capture via the fork-based path
+        // (`Session::capture_pane_with_size` via the instance helper). The
+        // 250ms gate in `refresh_preview_cache_core` keeps this from forking
+        // every frame; in steady state the worker above satisfies the render.
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
         // capture (which is what `Session::capture_pane_with_size` returns when
@@ -1450,7 +1498,7 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            agent_live,
+            false,
             |s| &mut s.preview_cache,
             |s, id, capture_lines| {
                 let in_live = s
@@ -1489,6 +1537,12 @@ impl HomeView {
         // the visible output area so a window resize or info-header toggle
         // reflows the shell instead of waiting for a live-mode re-enter.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
+        // Worker (retargeted to this pane in `render_preview`) drives the
+        // steady-state refresh fork-free; the core below is the cold-start /
+        // empty-worker fallback.
+        if self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache) {
+            return;
+        }
         self.refresh_preview_cache_core(
             width,
             height,
@@ -1515,6 +1569,9 @@ impl HomeView {
             width,
             height,
         );
+        if self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache) {
+            return;
+        }
         self.refresh_preview_cache_core(
             width,
             height,
@@ -1531,6 +1588,9 @@ impl HomeView {
     }
 
     fn refresh_tool_preview_cache_if_needed(&mut self, width: u16, height: u16, tool_name: &str) {
+        if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
+            return;
+        }
         self.refresh_preview_cache_core(
             width,
             height,
@@ -1719,6 +1779,13 @@ impl HomeView {
         // the no-output paths (creating / no selection).
         self.preview_visible_rows = inner.height as usize;
         frame.render_widget(block, area);
+
+        // Keep the off-thread capture worker pointed at whatever pane this
+        // view shows (and tuned to live-send vs. idle cadence) before any
+        // refresh reads from it. Done once here, not per-branch, so the
+        // creating / no-selection paths also retarget or tear it down.
+        let desired = self.displayed_pane_tmux_name();
+        self.sync_preview_capture_worker(desired);
 
         match self.view_mode {
             ViewMode::Agent => {

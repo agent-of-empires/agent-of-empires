@@ -573,6 +573,12 @@ impl App {
             // `None` here becomes `pending` inside the arm.
             let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
             let mut woke_via_post_key = false;
+            // The capture worker notifies this when it has fresh, changed
+            // pane content; the arm below wakes the loop so the new preview
+            // paints without busy-polling. Cloned per iteration so the
+            // select! arm doesn't borrow `self`.
+            let preview_wake = self.home.preview_wake.clone();
+            let mut woke_via_preview = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -987,6 +993,12 @@ impl App {
                     }
                 }
                 _ = refresh_interval.tick() => {}
+                _ = preview_wake.notified() => {
+                    // The capture worker produced fresh content. Repaint so
+                    // it shows; an idle pane never fires this, so the home
+                    // view stays as quiet as before when nothing changes.
+                    woke_via_preview = true;
+                }
                 _ = async {
                     match post_key_deadline {
                         Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -1182,8 +1194,10 @@ impl App {
             // but on a deterministic ~15ms delay after each keystroke
             // so typing-echo latency doesn't have to wait for ticker
             // phase. Outside live-send, only the periodic checks
-            // above trigger refresh.
-            if self.home.live_send.is_some() || woke_via_post_key {
+            // above and the capture-worker wake (`woke_via_preview`,
+            // fired only when pane content actually changed) trigger a
+            // refresh.
+            if self.home.live_send.is_some() || woke_via_post_key || woke_via_preview {
                 refresh_needed = true;
             }
 

@@ -3684,7 +3684,9 @@ impl HomeView {
         session.reset_size_to_latest_client();
         self.live_send = None;
         self.live_send_worker = None;
-        self.live_capture_worker = None;
+        // Leave the capture worker running: the same pane is still
+        // previewed after exit, just at the idle cadence. The render
+        // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
         // The leader menu and sidebar collapse are live-mode-only: drop
         // any half-entered leader chord and re-reveal the session list so

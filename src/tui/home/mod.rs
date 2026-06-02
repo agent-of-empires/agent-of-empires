@@ -461,12 +461,21 @@ pub struct HomeView {
     /// latency. Dropping (set to None when live mode exits) closes the
     /// channel and the worker thread exits cleanly on its own.
     pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
-    /// Background capture worker for agent live-send. Forks `tmux
-    /// capture-pane` on its own thread so the render loop applies fresh
-    /// preview content without forking (the per-frame capture was ~90% of
-    /// a live-send frame). `Some` only while live-send targets the agent
-    /// pane; `None` otherwise, where the synchronous capture path runs.
-    pub(super) live_capture_worker: Option<live_send::LiveCaptureWorker>,
+    /// Background capture worker for whichever pane the preview is showing
+    /// (agent, terminal, container shell, or tool). Forks `tmux
+    /// capture-pane` on its own thread so no preview path ever forks on the
+    /// render thread (the per-frame capture was ~90% of a frame on macOS).
+    /// Retargeted by `sync_preview_capture_worker` when the displayed pane
+    /// changes; `None` only when nothing is selected.
+    pub(super) preview_capture_worker: Option<live_send::LiveCaptureWorker>,
+    /// The tmux session name `preview_capture_worker` is currently
+    /// capturing, so the reconcile can tell when the displayed pane changed
+    /// and respawn. `None` mirrors a `None` worker.
+    pub(super) preview_capture_target: Option<String>,
+    /// Notified by the capture worker thread when it has fresh, changed
+    /// content. The event loop selects on this to repaint without
+    /// busy-polling; an idle pane (no new content) never wakes it.
+    pub(super) preview_wake: std::sync::Arc<tokio::sync::Notify>,
     /// Last (cols, rows) we asked the worker to resize the pane to in
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
@@ -869,7 +878,9 @@ impl HomeView {
             pending_live_send_target: live_send::LiveSendTarget::Agent,
             live_send: None,
             live_send_worker: None,
-            live_capture_worker: None,
+            preview_capture_worker: None,
+            preview_capture_target: None,
+            preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
             sidebar_collapsed: false,
@@ -2947,11 +2958,9 @@ impl HomeView {
             // Drop worker first so its queued resizes (if any) drain
             // against the old session before we reset its sizing.
             self.live_send_worker = None;
-            // Stop the old session's capture worker too; a fresh one
-            // (if the new target is the agent) is spawned below.
-            self.live_capture_worker = None;
-            // Drop the previous session's cached preview so the first
-            // frames after the switch don't paint session A's content
+            // The capture worker is retargeted by the render reconcile, not
+            // here; but drop the previous session's cached preview so the
+            // first frames after the switch don't paint session A's content
             // under session B's header while B's capture worker spins up.
             // (The synchronous path got this for free via its cross-session
             // kill-switch branch; the worker path applies content lazily,
@@ -3001,19 +3010,11 @@ impl HomeView {
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name.clone()));
-        // Spawn the off-thread preview capture only for the agent target:
-        // it's the one preview that force-refreshes every frame in
-        // live-send, so it's the only path paying the per-frame
-        // capture-pane fork. `tmux_name` is the agent session here.
-        self.live_capture_worker = match target {
-            live_send::LiveSendTarget::Agent => {
-                Some(live_send::LiveCaptureWorker::spawn(tmux_name))
-            }
-            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
-                None
-            }
-        };
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name));
+        // The preview capture worker is not spawned here: it follows the
+        // displayed pane for every view (not just agent live-send) and is
+        // (re)targeted by `sync_preview_capture_worker` on the next render,
+        // which also retunes its cadence to the now-live pane.
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

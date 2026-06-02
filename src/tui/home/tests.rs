@@ -1207,6 +1207,43 @@ fn test_t_toggles_view_mode() {
 
 #[test]
 #[serial]
+fn switching_view_retargets_capture_worker_pane() {
+    // The preview's off-thread capture worker follows the displayed pane:
+    // switching agent <-> terminal must resolve to different tmux sessions
+    // so `sync_preview_capture_worker` respawns the worker against the new
+    // pane (instead of the old agent-only behavior). Regression guard for
+    // the responsiveness fix that moved every preview's `tmux capture-pane`
+    // off the render thread.
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+
+    let agent_pane = view.displayed_pane_tmux_name();
+    assert!(
+        agent_pane.is_some(),
+        "a selected session must resolve a pane"
+    );
+
+    view.handle_key(key(KeyCode::Char('t')), None);
+    assert_eq!(view.view_mode, ViewMode::Terminal);
+    let terminal_pane = view.displayed_pane_tmux_name();
+    assert!(terminal_pane.is_some());
+    assert_ne!(
+        agent_pane, terminal_pane,
+        "agent and terminal panes must differ so the worker retargets on switch",
+    );
+
+    // The reconcile tracks the active target and is idempotent: a changed
+    // pane updates it, the same pane leaves it in place.
+    view.sync_preview_capture_worker(terminal_pane.clone());
+    assert_eq!(view.preview_capture_target, terminal_pane);
+    view.sync_preview_capture_worker(terminal_pane.clone());
+    assert_eq!(view.preview_capture_target, terminal_pane);
+    view.sync_preview_capture_worker(agent_pane.clone());
+    assert_eq!(view.preview_capture_target, agent_pane);
+}
+
+#[test]
+#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
