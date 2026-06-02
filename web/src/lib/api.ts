@@ -234,6 +234,7 @@ export const PROFILE_WRITABLE_SECTIONS = [
   "worktree",
   "web",
   "logging",
+  "cockpit",
   "description",
 ] as const;
 

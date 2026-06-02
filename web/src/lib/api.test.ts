@@ -205,6 +205,7 @@ describe("updateProfileSettings write guard", () => {
       "worktree",
       "web",
       "logging",
+      "cockpit",
       "description",
     ]);
   });
