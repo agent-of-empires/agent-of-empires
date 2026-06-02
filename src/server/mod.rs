@@ -2775,6 +2775,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         assert_eq!(
             derive_cockpit_status(&Event::UserPromptSent {

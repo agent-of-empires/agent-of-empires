@@ -81,6 +81,16 @@ pub struct ToolCall {
     /// generic read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_recall: Option<MemoryRecall>,
+    /// Structured file diffs the agent attached to this tool call via ACP
+    /// `ToolCallContent::Diff`. Codex routes `apply_patch` edits through
+    /// this channel (one entry per touched file) instead of the legacy
+    /// `old_string`/`new_string` raw_input keys, so the cockpit edit card
+    /// reads the path and +/- preview from here when present and falls
+    /// back to the args-preview shape otherwise. Text on each side is
+    /// capped at ingest (see `acp_client`) so a large patch can't bloat the
+    /// event store or WS frame. See #1721.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diffs: Vec<DiffPreview>,
 }
 
 /// Structured payload for a `memory_recall` tool call. `mode` mirrors
@@ -516,6 +526,15 @@ pub enum Event {
         /// time on completion.
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
+        /// Structured diffs carried on a late `ToolCallUpdate.fields.content`
+        /// frame (Codex emits `apply_patch` diffs on the in-progress and
+        /// completion updates, not only the initial `tool_call`). `Some`
+        /// REPLACES the tool's diff list wholesale (per ACP, content is a
+        /// replacement, not an append); `None` leaves any diffs from the
+        /// initial frame untouched so a text-only update can't erase them.
+        /// See #1721.
+        #[serde(default)]
+        diffs: Option<Vec<DiffPreview>>,
     },
     ApprovalRequested {
         approval: Approval,
@@ -802,6 +821,7 @@ impl CockpitState {
                 title,
                 args_preview,
                 started_at,
+                diffs,
             } => {
                 if let Some(tool) = self.in_flight_tool.as_mut() {
                     if tool.id == tool_call_id {
@@ -813,6 +833,9 @@ impl CockpitState {
                         }
                         if let Some(t) = started_at {
                             tool.started_at = t;
+                        }
+                        if let Some(d) = diffs {
+                            tool.diffs = d;
                         }
                     }
                 }
@@ -1071,6 +1094,7 @@ mod tests {
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         s.apply_event(Event::ToolCallStarted {
             tool_call: tc.clone(),
@@ -1085,6 +1109,57 @@ mod tests {
         })
         .unwrap();
         assert!(s.in_flight_tool.is_none());
+    }
+
+    #[test]
+    fn tool_call_updated_replaces_diffs_on_some_and_preserves_on_none() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "tc-1".into(),
+                name: "Edit".into(),
+                kind: "edit".into(),
+                args_preview: "{}".into(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        })
+        .unwrap();
+        // A later update carrying diff content populates the card.
+        s.apply_event(Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: None,
+            args_preview: None,
+            started_at: None,
+            diffs: Some(vec![DiffPreview {
+                path: "src/foo.rs".into(),
+                old_text: Some("old".into()),
+                new_text: Some("new".into()),
+                created_at: Utc::now(),
+            }]),
+        })
+        .unwrap();
+        assert_eq!(s.in_flight_tool.as_ref().unwrap().diffs.len(), 1);
+        assert_eq!(
+            s.in_flight_tool.as_ref().unwrap().diffs[0].path,
+            "src/foo.rs"
+        );
+        // A subsequent text-only update (diffs None) must not erase them.
+        s.apply_event(Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: Some("Edit src/foo.rs".into()),
+            args_preview: None,
+            started_at: None,
+            diffs: None,
+        })
+        .unwrap();
+        assert_eq!(
+            s.in_flight_tool.as_ref().unwrap().diffs.len(),
+            1,
+            "text-only update must preserve existing diffs"
+        );
     }
 
     #[test]

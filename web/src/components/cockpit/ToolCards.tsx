@@ -769,18 +769,40 @@ function EditToolCard({ tool, result }: Props) {
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
-  const oldText = pickStr(args, "old_string", "oldString", "old_str") ?? "";
-  const newText =
+  // Codex (and any ACP agent) attaches structured per-file diffs via
+  // ToolCallContent::Diff; prefer those for path + body and fall back to
+  // the legacy old_string/new_string args shape otherwise. See #1721.
+  const structuredDiffs = tool.diffs ?? [];
+  const hasStructuredDiffs = structuredDiffs.length > 0;
+  const legacyOld = pickStr(args, "old_string", "oldString", "old_str") ?? "";
+  const legacyNew =
     pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
+  const hasLegacyDiff = legacyOld !== "" || legacyNew !== "";
+  const path =
+    pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ??
+    "(unknown file)";
   const [open, setOpen] = useToolCardExpansion(status);
-  const hasDiff = oldText !== "" || newText !== "";
-  const verb = oldText ? "edit" : "write";
+  const hasDiff = hasStructuredDiffs || hasLegacyDiff;
+  // "edit" when a prior version existed, "write" for a fresh file.
+  const isEdit = hasStructuredDiffs
+    ? structuredDiffs.some((d) => (d.old_text ?? "") !== "")
+    : legacyOld !== "";
+  const verb = isEdit ? "edit" : "write";
+  const multiFile = structuredDiffs.length > 1;
 
-  const { adds, dels } = useMemo(
-    () => diffPair(oldText, newText),
-    [oldText, newText],
-  );
+  const { adds, dels } = useMemo(() => {
+    const ds = tool.diffs ?? [];
+    if (ds.length > 0) {
+      return ds.reduce(
+        (acc, d) => {
+          const p = diffPair(d.old_text ?? "", d.new_text ?? "");
+          return { adds: acc.adds + p.adds, dels: acc.dels + p.dels };
+        },
+        { adds: 0, dels: 0 },
+      );
+    }
+    return diffPair(legacyOld, legacyNew);
+  }, [tool.diffs, legacyOld, legacyNew]);
   const meta = hasDiff && (adds > 0 || dels > 0) && (
     <span className="hidden md:inline text-[11px]">
       <span className="text-emerald-400">+{adds}</span>{" "}
@@ -799,7 +821,7 @@ function EditToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Pencil className="h-3.5 w-3.5" />}
       label={verb}
-      primary={path}
+      primary={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
       meta={errorChip ? undefined : meta}
       expanded={open}
       onToggle={
@@ -807,14 +829,33 @@ function EditToolCard({ tool, result }: Props) {
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {hasDiff && (
+          {hasStructuredDiffs ? (
             <div className="border-t border-surface-800 bg-surface-950">
-              <StringDiff
-                oldText={oldText}
-                newText={newText}
-                filePath={path}
-              />
+              {structuredDiffs.map((d, i) => (
+                <div key={`${d.path}-${i}`}>
+                  {multiFile && (
+                    <div className="px-2 py-1 text-[11px] text-text-dim">
+                      {d.path}
+                    </div>
+                  )}
+                  <StringDiff
+                    oldText={d.old_text ?? ""}
+                    newText={d.new_text ?? ""}
+                    filePath={d.path}
+                  />
+                </div>
+              ))}
             </div>
+          ) : (
+            hasLegacyDiff && (
+              <div className="border-t border-surface-800 bg-surface-950">
+                <StringDiff
+                  oldText={legacyOld}
+                  newText={legacyNew}
+                  filePath={path}
+                />
+              </div>
+            )
           )}
         </ToolErrorBody>
       }
