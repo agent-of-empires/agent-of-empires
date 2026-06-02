@@ -1,7 +1,8 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { resolveLaunchCommand } from "../../../lib/launchCommand";
 
 interface WizardData {
   tool: string;
@@ -134,6 +135,49 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
+
+  // Command-override maps from the profile-resolved config, used to
+  // preview the exact launch command (#1766). Read-only; mirrors the
+  // backend `resolve_tool_command` precedence.
+  const [commandMaps, setCommandMaps] = useState<{
+    agentCommandOverride: Record<string, string>;
+    customAgents: Record<string, string>;
+  }>({ agentCommandOverride: {}, customAgents: {} });
+
+  useEffect(() => {
+    let cancelled = false;
+    // Clear immediately so a profile switch never shows the previous
+    // profile's override while the new fetch is in flight.
+    setCommandMaps({ agentCommandOverride: {}, customAgents: {} });
+    void (async () => {
+      const settings = await fetchSettings(data.profile || undefined);
+      if (cancelled || !settings) return;
+      const session = settings.session as Record<string, unknown> | undefined;
+      const asMap = (v: unknown): Record<string, string> =>
+        v && typeof v === "object"
+          ? Object.fromEntries(
+              Object.entries(v as Record<string, unknown>).filter(
+                ([, val]) => typeof val === "string",
+              ) as [string, string][],
+            )
+          : {};
+      setCommandMaps({
+        agentCommandOverride: asMap(session?.agent_command_override),
+        customAgents: asMap(session?.custom_agents),
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [data.profile]);
+
+  const resolvedCommand = resolveLaunchCommand({
+    tool: data.tool,
+    binary: selectedAgent?.binary,
+    manualOverride: data.commandOverride,
+    agentCommandOverride: commandMaps.agentCommandOverride,
+    customAgents: commandMaps.customAgents,
+  });
 
   const handleProfileChange = useCallback(async (profileName: string) => {
     // If user had manual edits, confirm before overwriting
@@ -424,6 +468,17 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="Override the agent launch command"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {resolvedCommand && (
+              <p
+                className="mt-1.5 text-xs text-text-dim"
+                data-testid="resolved-launch-command"
+              >
+                Resolved launch command:{" "}
+                <code className="font-mono text-text-secondary">
+                  {resolvedCommand}
+                </code>
+              </p>
+            )}
           </div>
         </div>
       )}

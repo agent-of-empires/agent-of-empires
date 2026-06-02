@@ -61,6 +61,10 @@ struct ResumeTarget {
     source_profile: String,
     in_flight_turn: bool,
     yolo_mode: bool,
+    /// `Instance.command`: the resolved launch command (from
+    /// `session.agent_command_override` / `--cmd-override`). Threaded
+    /// into `SpawnRequest` so cockpit honors it like tmux. See #1766.
+    command: String,
 }
 
 /// Tuple shape used by the instance-list snapshot. Aliased to dodge
@@ -75,6 +79,7 @@ type RawTargetTuple = (
     Option<String>,
     String,
     bool,
+    String,
 );
 
 pub async fn reconcile_cockpit_workers(
@@ -168,6 +173,7 @@ pub async fn reconcile_cockpit_workers(
                     i.cockpit_acp_session_id.clone(),
                     i.source_profile.clone(),
                     i.yolo_mode,
+                    i.command.clone(),
                 )
             })
             .collect()
@@ -200,6 +206,7 @@ pub async fn reconcile_cockpit_workers(
         stored_acp_session_id,
         source_profile,
         yolo_mode,
+        command,
     ) in raw_targets
     {
         if attempted.contains(&id) {
@@ -272,6 +279,7 @@ pub async fn reconcile_cockpit_workers(
             source_profile,
             in_flight_turn,
             yolo_mode,
+            command,
         });
     }
 
@@ -805,6 +813,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         source_profile,
         in_flight_turn,
         yolo_mode,
+        command,
     } = target;
 
     // Reattach path: if a previous daemon detached a runner for this
@@ -944,6 +953,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         source_profile,
         in_flight_turn,
         yolo_mode,
+        command,
     };
     let req = match build_spawn_request(&state, &resume_target).await {
         Ok(req) => req,
@@ -1037,6 +1047,26 @@ async fn build_spawn_request(
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
+        agent_command_override: command_override_for_spawn(&target.tool, &target.command),
+    })
+}
+
+/// Build a cockpit command override from the instance's persisted
+/// launch command. Returns `None` for an empty command so the spawn
+/// keeps the registry default. Applicability gating (registry-backed,
+/// matching binary) lives in the supervisor where the resolved
+/// `AgentSpec` is available. See #1766.
+pub(crate) fn command_override_for_spawn(
+    tool: &str,
+    command: &str,
+) -> Option<crate::cockpit::supervisor::AgentCommandOverride> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(crate::cockpit::supervisor::AgentCommandOverride {
+        logical_tool: tool.to_string(),
+        command: command.to_string(),
     })
 }
 
@@ -1065,6 +1095,7 @@ async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<Re
         source_profile: inst.source_profile.clone(),
         in_flight_turn: false,
         yolo_mode: inst.yolo_mode,
+        command: inst.command.clone(),
     })
 }
 

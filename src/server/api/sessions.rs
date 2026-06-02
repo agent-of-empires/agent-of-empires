@@ -2470,6 +2470,7 @@ pub async fn create_session(
                     instance.cockpit_acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
+                    instance.command.clone(),
                 ))
             } else {
                 None
@@ -2495,6 +2496,7 @@ pub async fn create_session(
                 stored_acp_session_id,
                 source_profile,
                 yolo_mode,
+                command,
             )) = cockpit_spawn_target
             {
                 let agent = state
@@ -2506,6 +2508,8 @@ pub async fn create_session(
                         std::path::Path::new(&project_path),
                     )
                     .await;
+                let command_override =
+                    crate::server::cockpit_reconciler::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = state.cockpit_supervisor.clone();
                 let state_for_check = state.clone();
@@ -2553,6 +2557,7 @@ pub async fn create_session(
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
+                            agent_command_override: command_override,
                         })
                         .await
                     {
