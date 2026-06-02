@@ -64,6 +64,22 @@ impl Status {
             Status::Creating => "creating",
         }
     }
+
+    /// Whether this status blocks an in-place worktree edit (move dir /
+    /// rename branch). The worktree's checkout must be quiescent: an
+    /// actively running agent, a session mid-start, or one being
+    /// created/deleted can hold the directory or race the metadata write.
+    /// Idle/Stopped/Error/Unknown sessions are safe to edit.
+    pub fn blocks_worktree_edit(self) -> bool {
+        matches!(
+            self,
+            Status::Running
+                | Status::Waiting
+                | Status::Starting
+                | Status::Creating
+                | Status::Deleting
+        )
+    }
 }
 
 /// Outcome of a `start_with_resume_fallback` cascade.
@@ -196,7 +212,7 @@ impl std::fmt::Display for EnsureReadyError {
 
 impl std::error::Error for EnsureReadyError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeInfo {
     pub branch: String,
     pub main_repo_path: String,
@@ -953,6 +969,15 @@ impl Instance {
         }
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
+        }
+        // Worktree workdir edit (move dir / rename branch) mutates these two;
+        // both the TUI and the CLI can write them, so they go through the
+        // same conditional-diff path as the triage fields. See #1723.
+        if pre.project_path != post.project_path {
+            self.project_path = post.project_path.clone();
+        }
+        if pre.worktree_info != post.worktree_info {
+            self.worktree_info = post.worktree_info.clone();
         }
         if pre.status != post.status {
             self.status = post.status;

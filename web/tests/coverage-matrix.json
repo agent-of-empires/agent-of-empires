@@ -2801,6 +2801,18 @@
       ]
     },
     {
+      "id": "sidebar.edit-workdir-name",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/WorkdirNameEdit.test.tsx"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "sidebar.context-menu-clamp",
       "kind": "vitest",
       "risk": "medium",

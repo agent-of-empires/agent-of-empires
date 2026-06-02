@@ -925,6 +925,37 @@ export async function renameSession(
   }
 }
 
+/**
+ * Edit a managed worktree session's workdir name: move the worktree
+ * directory and, optionally, rename its git branch. The session must not be
+ * running. Returns the server's validation message on failure so the caller
+ * can surface it. See #1723.
+ */
+export async function setWorktreeName(
+  id: string,
+  name: string,
+  renameBranch: boolean,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/worktree-name`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, rename_branch: renameBranch }),
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /** Three-preset helper for the sidebar context menu:
  *  - "off":     set all three overrides to false (silence this session)
  *  - "default": clear all three overrides (inherit server defaults)

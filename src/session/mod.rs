@@ -20,6 +20,7 @@ pub(crate) mod serde_helpers;
 pub mod settings_schema;
 pub mod stop;
 mod storage;
+pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
