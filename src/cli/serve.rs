@@ -142,9 +142,9 @@ pub struct ServeArgs {
 
     /// Restart a running `aoe serve` daemon, replaying the host, port,
     /// mode, and auth it was launched with (read from `serve.launch`).
-    /// The passphrase is recalled from `AOE_SERVE_PASSPHRASE` or the
-    /// running daemon's `serve.passphrase` before the old daemon is
-    /// stopped, so a passphrase-protected daemon is never left down.
+    /// The passphrase is recalled from `serve.passphrase` or
+    /// `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a
+    /// passphrase-protected daemon is never left down.
     /// Incompatible with the flags that would change the daemon's bind
     /// config: that config comes from the persisted launch state.
     #[arg(
@@ -365,23 +365,25 @@ fn read_serve_launch() -> Result<ServeLaunch> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Recall the daemon passphrase for a restart: the env override first,
-/// then the plaintext `serve.passphrase` file the server writes while
-/// running. Returns None when neither yields a non-empty value.
+/// Recall the daemon passphrase for a restart: the plaintext
+/// `serve.passphrase` file the server writes while running first,
+/// then the `AOE_SERVE_PASSPHRASE` env override. Returns None when
+/// neither yields a non-empty value.
 fn recall_serve_passphrase() -> Option<String> {
+    if let Ok(dir) = crate::session::get_app_dir() {
+        if let Ok(raw) = std::fs::read_to_string(dir.join("serve.passphrase")) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
     if let Ok(p) = std::env::var("AOE_SERVE_PASSPHRASE") {
         if !p.is_empty() {
             return Some(p);
         }
     }
-    let dir = crate::session::get_app_dir().ok()?;
-    let raw = std::fs::read_to_string(dir.join("serve.passphrase")).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    None
 }
 
 /// One URL we can show in the Active state. Tunnel mode has exactly one.
@@ -541,9 +543,10 @@ pub fn daemon_pid() -> Option<u32> {
             // Stale PID file; the ESRCH case is handled the same as any
             // other error — the process is not reachable.
             let _ = std::fs::remove_file(&path);
-            // Drop the launch state too so `serve_launch_exists()` does
-            // not keep reporting a self-managed daemon that has died.
             if let Ok(dir) = crate::session::get_app_dir() {
+                let _ = std::fs::remove_file(dir.join("serve.url"));
+                let _ = std::fs::remove_file(dir.join("serve.mode"));
+                let _ = std::fs::remove_file(dir.join("serve.passphrase"));
                 let _ = std::fs::remove_file(dir.join("serve.launch"));
             }
             None
