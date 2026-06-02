@@ -936,6 +936,20 @@
       ]
     },
     {
+      "id": "session.group-edit",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/session-group-edit.spec.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SessionGroupModal.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "session.delete-dialog-keyboard",
       "kind": "vitest",
       "risk": "low",

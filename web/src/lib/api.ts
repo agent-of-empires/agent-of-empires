@@ -956,6 +956,26 @@ export async function setWorktreeName(
   }
 }
 
+/** Move an existing session to another group, create a new group by
+ *  passing a path that does not exist yet, or clear the group with an
+ *  empty string (the ungroup sentinel, matching session creation and the
+ *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
+export async function updateSessionGroup(
+  id: string,
+  group: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Three-preset helper for the sidebar context menu:
  *  - "off":     set all three overrides to false (silence this session)
  *  - "default": clear all three overrides (inherit server defaults)
