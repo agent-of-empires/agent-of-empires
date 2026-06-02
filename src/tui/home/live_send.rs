@@ -476,6 +476,12 @@ impl LiveCaptureWake {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum EmptyCapturePolicy {
+    PreserveLastGood,
+    ForwardEmpty,
+}
+
 /// Off-thread preview capture for live-send. Spawned alongside
 /// [`LiveSendWorker`] for the targeted tmux pane, it forks
 /// `tmux capture-pane` on its own thread and publishes fresh pane
@@ -506,7 +512,7 @@ impl Drop for LiveCaptureWorker {
 }
 
 impl LiveCaptureWorker {
-    pub(in crate::tui) fn spawn(tmux_name: String) -> Self {
+    pub(in crate::tui) fn spawn(tmux_name: String, empty_policy: EmptyCapturePolicy) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
@@ -522,13 +528,17 @@ impl LiveCaptureWorker {
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 if lines > 0 {
-                    if let Ok(content) = session.capture_pane(lines) {
-                        // Skip empties (preserve the last-good preview, the
-                        // #1501 kill switch) and unchanged frames (no point
-                        // waking a re-parse). Only changed, non-empty
-                        // captures reach the render loop.
-                        if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
-                        {
+                    let capture = match session.capture_pane(lines) {
+                        Ok(content) => Some(content),
+                        Err(_) if empty_policy == EmptyCapturePolicy::ForwardEmpty => {
+                            Some(String::new())
+                        }
+                        Err(_) => None,
+                    };
+                    if let Some(content) = capture {
+                        let allow_empty = empty_policy == EmptyCapturePolicy::ForwardEmpty;
+                        let changed = last_captured.as_deref() != Some(content.as_str());
+                        if (allow_empty || !content.is_empty()) && changed {
                             if let Ok(mut guard) = slot.lock() {
                                 *guard = Some(content.clone());
                             }
@@ -1364,7 +1374,10 @@ mod tests {
     fn live_capture_worker_idle_until_geometry_set() {
         // With no line count published the worker must not capture at all,
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
-        let worker = LiveCaptureWorker::spawn("aoe_test_capture_no_geometry".into());
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_no_geometry".into(),
+            EmptyCapturePolicy::PreserveLastGood,
+        );
         std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
             worker.take_latest().is_none(),
@@ -1378,12 +1391,32 @@ mod tests {
         // strings. Forwarding those would blank the preview, defeating the
         // #1501 kill switch, so the worker must drop them. Deterministic
         // without a real tmux session: a missing pane always reads empty.
-        let worker = LiveCaptureWorker::spawn("aoe_test_capture_missing_session".into());
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_missing_session".into(),
+            EmptyCapturePolicy::PreserveLastGood,
+        );
         worker.set_capture_lines(40);
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(
             worker.take_latest().is_none(),
             "empty captures must never be forwarded",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_can_forward_empty_captures() {
+        // Terminal previews treat empty output as meaningful: a missing or
+        // blank pane should clear stale terminal text instead of preserving it.
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_forward_empty".into(),
+            EmptyCapturePolicy::ForwardEmpty,
+        );
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            worker.take_latest(),
+            Some(String::new()),
+            "forward-empty policy must surface empty captures",
         );
     }
 }

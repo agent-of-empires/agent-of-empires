@@ -3001,7 +3001,16 @@ impl HomeView {
         // Spawn the off-thread preview capture first so the send worker can
         // wake it after each dispatched batch. That keeps echo latency tied
         // to actual input rather than the background capture phase.
-        self.live_capture_worker = Some(live_send::LiveCaptureWorker::spawn(tmux_name.clone()));
+        let empty_policy = match target {
+            live_send::LiveSendTarget::Agent => live_send::EmptyCapturePolicy::PreserveLastGood,
+            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
+                live_send::EmptyCapturePolicy::ForwardEmpty
+            }
+        };
+        self.live_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
+            tmux_name.clone(),
+            empty_policy,
+        ));
         let capture_wake = self
             .live_capture_worker
             .as_ref()

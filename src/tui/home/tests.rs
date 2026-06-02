@@ -8016,6 +8016,54 @@ mod live_send_mode {
         assert_eq!(env.view.terminal_preview_cache.session_id, Some(id));
     }
 
+    #[test]
+    #[serial]
+    fn refresh_terminal_live_cache_overwrites_on_empty_worker_capture() {
+        // Same invariant as `refresh_terminal_cache_overwrites_on_empty_capture`,
+        // but through the live worker path added for terminal live mode.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.selected_session = Some(id.clone());
+        env.view.terminal_preview_cache.content = "stale terminal output".to_string();
+        env.view.terminal_preview_cache.captured_lines = 1;
+        env.view.terminal_preview_cache.dimensions = (10, 10);
+        env.view.terminal_preview_cache.session_id = Some(id.clone());
+
+        let tmux_name = "aoe_test_terminal_live_forward_empty";
+        let worker = crate::tui::home::live_send::LiveCaptureWorker::spawn(
+            tmux_name.to_string(),
+            crate::tui::home::live_send::EmptyCapturePolicy::ForwardEmpty,
+        );
+        worker.set_capture_lines(44);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        env.view.live_capture_worker = Some(worker);
+        env.view.live_send = Some(LiveSendState {
+            session_id: id.clone(),
+            title: "session0".to_string(),
+            tmux_name: tmux_name.to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Terminal,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        env.view.refresh_terminal_preview_cache_if_needed(80, 24);
+
+        assert_eq!(
+            env.view.terminal_preview_cache.content, "",
+            "terminal live worker must clear stale output on empty capture"
+        );
+        assert_eq!(env.view.terminal_preview_cache.dimensions, (80, 24));
+        assert_eq!(env.view.terminal_preview_cache.session_id, Some(id));
+    }
+
     mod paste_splitting {
         //! `split_paste_for_live_send` decomposes a pasted string into
         //! tmux operations the live-send worker can actually deliver.
