@@ -685,6 +685,17 @@
       ]
     },
     {
+      "id": "sidebar.empty-state",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/sidebar-empty-state.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
       "id": "sidebar.reorder-stationary-click",
       "kind": "mocked-playwright",
       "risk": "medium",

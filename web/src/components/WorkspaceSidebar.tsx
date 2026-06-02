@@ -2812,6 +2812,40 @@ export function WorkspaceSidebar({
               </p>
             </div>
           )}
+
+          {!hasResults && !filterQuery && (
+            <div
+              className="px-4 py-10 text-center"
+              data-testid="sidebar-empty-state"
+            >
+              <p className="text-sm font-medium text-text-secondary">
+                No sessions yet
+              </p>
+              <p className="mt-1 text-[13px] text-text-muted">
+                Create a session to start working in a repo.
+              </p>
+              <button
+                onClick={onNew}
+                disabled={offline}
+                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                New session
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="border-t border-surface-700/20 p-2 flex items-center gap-1">
