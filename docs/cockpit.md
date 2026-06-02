@@ -69,21 +69,30 @@ For the full per-agent feature matrix, see [Multi-agent support](cockpit/multi-a
 
 ## Quickstart
 
-```bash
-# 1. Confirm prerequisites: aoe, Node.js >= 20, claude login.
-aoe cockpit doctor
+The web new-session wizard is the primary way to start a cockpit session.
+You do not need the CLI.
 
-# 2. Create a Claude Code session in cockpit mode.
-aoe add . --cmd claude --cockpit
-
-# 3. Open the dashboard, pick the session, and you should see the
-#    structured plan + tool-call cards instead of a terminal.
-aoe serve
-```
+1. Enable cockpit once: the **Cockpit** tab in dashboard settings, or set
+   `[cockpit] enabled = true` in `config.toml`.
+2. Run `aoe serve` and open the dashboard.
+3. Click **New session**, pick your project, and choose an agent. Leave
+   the **Use cockpit** toggle on (it defaults on for supported agents).
+4. Create and open the session: you see the structured plan and tool-call
+   cards instead of a terminal.
 
 A first-time mobile user pointed at a remote `aoe serve` will install
 the PWA, tap the session, and see the plan panel render the moment the
 agent emits its first plan event.
+
+The CLI is the optional path for scripting or headless launches:
+
+```bash
+# Confirm prerequisites: aoe, Node.js >= 20, claude login.
+aoe cockpit doctor
+
+# Create a Claude Code session in cockpit mode (optional, CLI path).
+aoe add . --cmd claude --cockpit
+```
 
 Full setup detail, including the prerequisites check and how to enable
 cockpit per session or globally, lives in [Setup](cockpit/setup.md).

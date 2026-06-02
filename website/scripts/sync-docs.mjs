@@ -196,6 +196,13 @@ const PAGES = [
       "Weekly release cadence, automated staging PR, post-merge tagger, and emergency-release path for Agent of Empires maintainers.",
   },
   {
+    source: "docs/development/web-dashboard.md",
+    dest: "docs/development/web-dashboard.md",
+    title: "Web Dashboard Development",
+    description:
+      "Build the web dashboard from source, run the frontend dev workflow (cargo xtask dev and manual Vite + VITE_PROXY), and the server architecture.",
+  },
+  {
     source: "docs/sounds.md",
     dest: "docs/sounds.md",
     title: "Sound Effects",
@@ -338,6 +345,7 @@ const URL_MAP = {
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
   "docs/development/releases.md": "/docs/development/releases/",
+  "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/cockpit.md": "/docs/cockpit/",

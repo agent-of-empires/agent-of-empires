@@ -574,6 +574,17 @@
       ]
     },
     {
+      "id": "wizard.cockpit-mode-creation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/wizard-cockpit-create-session.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+      ]
+    },
+    {
       "id": "wizard.scratch-delete-cleans-tempdir",
       "kind": "live-playwright",
       "risk": "high",
