@@ -65,7 +65,7 @@ export function SessionGroupModal({
       aria-labelledby="session-group-modal-title"
       data-testid="session-group-modal"
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
-      onClick={onClose}
+      onClick={() => !saving && onClose()}
     >
       <div
         className="bg-surface-800 border border-surface-700/50 rounded-lg w-[420px] max-w-[90vw] shadow-2xl animate-slide-up"
@@ -85,7 +85,7 @@ export function SessionGroupModal({
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
             Move{" "}
-            <span className="font-mono text-text-primary">{sessionTitle}</span>{" "}
+            <span className="text-text-primary">{sessionTitle}</span>{" "}
             to a group.
           </p>
           <input
@@ -101,7 +101,7 @@ export function SessionGroupModal({
                 e.preventDefault();
                 if (!saving) void handleSave();
               }
-              if (e.key === "Escape") onClose();
+              if (e.key === "Escape" && !saving) onClose();
             }}
             placeholder="Group (blank to ungroup)"
             data-testid="session-group-modal-input"
