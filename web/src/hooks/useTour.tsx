@@ -1,5 +1,8 @@
 // First-run tutorial controller. Owns the tour's run state, the resolved step
-// snapshot, auto-launch policy, and `aoe-tour-seen` persistence. It is
+// snapshot, and auto-launch policy. The "seen" flag is now persisted
+// server-side (config.toml `app_state.has_seen_web_tour`) so a returning user
+// on a new browser or device is not re-shown the tour; App owns the fetch and
+// the write and feeds them in as `seen` / `seenKnown` / `onSeen`. The hook is
 // engine-agnostic: the react-joyride coupling lives entirely in the lazy
 // TourRunner, which is only mounted (and only downloaded) while a tour runs, so
 // returning users never pay for the engine. App is the single consumer, so this
@@ -18,7 +21,7 @@ import {
   type TourScope,
   type TourStep,
 } from "../lib/tourSteps";
-import { hasSeenTour, isAutomatedSession, markTourSeen } from "../lib/onboarding";
+import { isAutomatedSession } from "../lib/onboarding";
 
 const TourRunner = lazy(() => import("../components/tour/TourRunner"));
 
@@ -31,18 +34,30 @@ export interface UseTourOptions {
   /** True once it is safe to auto-launch: server/about and sessions loaded, the
    *  dashboard is painted, and no blocking overlay is open. */
   autoLaunchReady: boolean;
+  /** Whether the user has already seen the tour (from backend app_state, with a
+   *  legacy-localStorage fallback during migration). */
+  seen: boolean;
+  /** True once the seen state is resolved (settings fetched). Auto-launch stays
+   *  suppressed until then so a `seen=false` default cannot flash the tour while
+   *  the settings request is still in flight. */
+  seenKnown: boolean;
+  /** Called when the user finishes or skips the tour, so App can persist the
+   *  seen flag to the backend. */
+  onSeen: () => void;
 }
 
 /**
  * Pure auto-launch decision, extracted so the truth table is unit-testable
  * without driving rAF / Suspense / the lazy engine. The tour auto-launches only
- * on a settled dashboard, with a fine pointer, when the user has not yet seen
- * it, and never inside an automated browser session (a synthetic monitor, a
- * scraper, or our own Playwright suites): the spotlight overlay would otherwise
- * intercept clicks in unrelated flows. The menu re-trigger stays available.
+ * on a settled dashboard, once the seen state is known, with a fine pointer,
+ * when the user has not yet seen it, and never inside an automated browser
+ * session (a synthetic monitor, a scraper, or our own Playwright suites): the
+ * spotlight overlay would otherwise intercept clicks in unrelated flows. The
+ * menu re-trigger stays available.
  */
 export function shouldAutoLaunch(args: {
   autoLaunchReady: boolean;
+  seenKnown: boolean;
   scope: TourScope;
   isDesktop: boolean;
   seen: boolean;
@@ -50,6 +65,7 @@ export function shouldAutoLaunch(args: {
 }): boolean {
   return (
     args.autoLaunchReady &&
+    args.seenKnown &&
     args.scope === "dashboard" &&
     args.isDesktop &&
     !args.seen &&
@@ -70,6 +86,9 @@ export function useTour({
   readOnly,
   isDesktop,
   autoLaunchReady,
+  seen,
+  seenKnown,
+  onSeen,
 }: UseTourOptions): UseTourResult {
   const [run, setRun] = useState(false);
   const [steps, setSteps] = useState<TourStep[]>([]);
@@ -108,20 +127,29 @@ export function useTour({
     begin();
   }, [begin]);
 
-  // Auto-launch: once per mount, dashboard scope, fine pointer, flag unset.
-  // The latch is set inside begin()'s success path so a frame where no anchor
-  // is painted yet does not permanently suppress the auto-launch.
+  // Auto-launch: once per mount, dashboard scope, fine pointer, seen state
+  // known and unset. The latch is set inside begin()'s success path so a frame
+  // where no anchor is painted yet does not permanently suppress the
+  // auto-launch.
   useEffect(() => {
     if (autoStartedRef.current) return;
-    const seen = hasSeenTour();
     const automated = isAutomatedSession();
-    if (!shouldAutoLaunch({ autoLaunchReady, scope, isDesktop, seen, automated }))
+    if (
+      !shouldAutoLaunch({
+        autoLaunchReady,
+        seenKnown,
+        scope,
+        isDesktop,
+        seen,
+        automated,
+      })
+    )
       return;
     const id = begin(() => {
       autoStartedRef.current = true;
     });
     return () => cancelAnimationFrame(id);
-  }, [autoLaunchReady, scope, isDesktop, begin]);
+  }, [autoLaunchReady, seenKnown, seen, scope, isDesktop, begin]);
 
   // Navigating to a different surface mid-tour cancels it without marking seen,
   // so a returning user can still get the cockpit steps on a later re-trigger.
@@ -132,10 +160,13 @@ export function useTour({
     }
   }, [scope]);
 
-  const handleFinish = useCallback((markSeen: boolean) => {
-    setRun(false);
-    if (markSeen) markTourSeen();
-  }, []);
+  const handleFinish = useCallback(
+    (markSeen: boolean) => {
+      setRun(false);
+      if (markSeen) onSeen();
+    },
+    [onSeen],
+  );
 
   const tourElement = run ? (
     <Suspense fallback={null}>

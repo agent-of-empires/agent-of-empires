@@ -8,6 +8,7 @@ import { shouldAutoLaunch } from "../useTour";
 
 const base = {
   autoLaunchReady: true,
+  seenKnown: true,
   scope: "dashboard" as const,
   isDesktop: true,
   seen: false,
@@ -17,6 +18,10 @@ const base = {
 describe("shouldAutoLaunch", () => {
   it("launches on a settled dashboard, fine pointer, unseen", () => {
     expect(shouldAutoLaunch(base)).toBe(true);
+  });
+
+  it("does not launch before the seen state is known", () => {
+    expect(shouldAutoLaunch({ ...base, seenKnown: false })).toBe(false);
   });
 
   it("does not launch before the dashboard is ready", () => {

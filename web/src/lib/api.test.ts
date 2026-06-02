@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   fetchAbout,
   isDebugBuild,
+  markWebTourSeen,
   setSessionArchive,
   setSessionPin,
   setSessionSnooze,
@@ -280,6 +281,30 @@ describe("updateSessionGroup", () => {
   it("returns false on network failure", async () => {
     fetchSpy.mockRejectedValueOnce(new Error("offline"));
     expect(await updateSessionGroup("sess-1", "g")).toBe(false);
+  });
+});
+
+describe("markWebTourSeen", () => {
+  it("POSTs /api/app-state/web-tour-seen with no body", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ has_seen_web_tour: true }),
+    );
+    const ok = await markWebTourSeen();
+    expect(ok).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/app-state/web-tour-seen");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
+  });
+
+  it("returns false on a read-only 403 (nonfatal)", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    expect(await markWebTourSeen()).toBe(false);
+  });
+
+  it("returns false on network failure", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await markWebTourSeen()).toBe(false);
   });
 });
 
