@@ -2109,14 +2109,22 @@ export function WorkspaceSidebar({
     [groups, onReorderWorkspaces, onReorderGroups],
   );
 
-  // All workspaces flattened across groups, used to reconcile the optimistic
-  // triage overlay against server truth on each refresh. A workspace can
-  // appear under multiple groups (group axis); reconcileOptimistic keys by
-  // workspace id so duplicates are harmless.
-  const allWorkspaces = useMemo(
-    () => groups.flatMap((g) => g.workspaces.map((v) => v.workspace)),
-    [groups],
-  );
+  // All workspaces flattened across groups, deduped by id. A workspace can
+  // appear under more than one group (group axis), so without the dedupe the
+  // same id would surface twice in `selectedWorkspaces` and bulk actions
+  // would fan out to the same session more than once. First occurrence wins.
+  const allWorkspaces = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Workspace[] = [];
+    for (const g of groups) {
+      for (const v of g.workspaces) {
+        if (seen.has(v.workspace.id)) continue;
+        seen.add(v.workspace.id);
+        out.push(v.workspace);
+      }
+    }
+    return out;
+  }, [groups]);
 
   // Optimistic triage overlay + single-id PATCH wiring, lifted out of
   // SessionRow so single-row and (in #1724) bulk actions share one source of
@@ -2178,18 +2186,27 @@ export function WorkspaceSidebar({
   // must mirror the render below; both walk filteredGroups the same way.
   const flatRenderedOrder = useMemo(() => {
     const ids: string[] = [];
+    const seen = new Set<string>();
+    // A workspace that renders under more than one group still resolves to a
+    // single selectable id, so the range order keeps only its first
+    // occurrence; pushing it twice would make Shift+range math ambiguous.
+    const push = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    };
     for (const g of filteredGroups) {
       if (!sidebarGroupHasLiveWorkspace(g)) continue;
       const expanded = q ? true : !g.collapsed;
       if (!expanded) continue;
       for (const v of g.workspaces) {
-        if (!workspaceIsSunk(v.workspace)) ids.push(v.workspace.id);
+        if (!workspaceIsSunk(v.workspace)) push(v.workspace.id);
       }
     }
     if (sunkExpanded) {
       for (const g of filteredGroups) {
         for (const v of g.workspaces) {
-          if (workspaceIsSunk(v.workspace)) ids.push(v.workspace.id);
+          if (workspaceIsSunk(v.workspace)) push(v.workspace.id);
         }
       }
     }
