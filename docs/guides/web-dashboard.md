@@ -250,7 +250,22 @@ The terminal disconnect banner surfaces a WebSocket close code when it can't rea
 
 ## Frontend development
 
-The React frontend lives in `web/`:
+The React frontend lives in `web/`. One command from the repo root builds the
+serve-enabled binary, then runs the backend and the Vite dev server together:
+
+```bash
+cargo xtask dev
+```
+
+This starts `aoe serve --no-auth` on port 8081 and the Vite dev server on
+[http://localhost:5173](http://localhost:5173), pointing Vite at the backend via
+`VITE_PROXY`. Open the `:5173` URL (not `:8081`): Vite serves the app with hot
+module reload and proxies `/api` and the `/sessions/*/ws` relays to the backend,
+so edits to `.tsx` files reload instantly while API and terminal traffic keep
+working. One Ctrl-C stops both processes. Override ports with `--serve-port` /
+`--web-port`. Unix only.
+
+To run the two halves by hand instead:
 
 ```bash
 cd web
