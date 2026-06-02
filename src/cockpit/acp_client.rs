@@ -378,7 +378,7 @@ const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from
 /// against the adapter ignoring the signal, not against socket /
 /// stdout / process-level wedges that prevent the PromptResponse from
 /// reaching the daemon at all. See #1196.
-const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Vendor-agnostic silent-orphan grace fallback used when no config
 /// value is available. Mirrors `CockpitConfig::silent_orphan_grace_secs`
