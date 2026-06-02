@@ -31,9 +31,10 @@ files. `aoe cockpit ps` lists running workers.
 
 Practical implications:
 
-- `aoe update` followed by `aoe serve --stop` + `aoe serve` keeps
-  every cockpit agent's in-flight turn alive; a worker left on the old
-  build then respawns on the new binary once its turn finishes (see
+- `aoe update` followed by a daemon restart (`aoe serve --restart`, or
+  the restart prompt `aoe update` now shows) keeps every cockpit agent's
+  in-flight turn alive; a worker left on the old build then respawns on
+  the new binary once its turn finishes (see
   [Build-version upgrade after `aoe update`](#build-version-upgrade-after-aoe-update)).
 - Closing the laptop or restarting the host with `aoe serve` running:
   the daemon dies on suspend, but the runner continues. On wake the
@@ -104,13 +105,22 @@ compares it against its own on every reattach:
 `aoe cockpit ps` tags any such not-yet-respawned worker `(stale)` in its
 `BUILD` column so a mixed-version state is visible rather than silent.
 
-Note that the new binary takes effect only once the daemon itself
-restarts: `aoe update` swaps the binary on disk but does not restart a
-running `aoe serve`, so you must `aoe serve --stop` and start it again
-for the reconciler pass above to run. A worker's build identity pairs the
-package version with a git commit hash, so local rebuilds across commits
-are detected, not just shipped release upgrades. See
-[#1754](https://github.com/agent-of-empires/agent-of-empires/issues/1754).
+The new binary takes effect only once the daemon itself restarts.
+`aoe update` closes this loop: after an in-place (tarball) update it
+detects a running self-managed daemon and offers to restart it
+(prompting by default, automatic with `aoe update -y`) so the reconciler
+pass above runs against the new binary. You can also bounce a running
+daemon at any time with `aoe serve --restart`, which replays the host,
+port, mode, and auth it was launched with; the passphrase is recalled
+from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon
+is stopped, so a passphrase-protected daemon is never left down. A daemon
+run in the foreground or under a service supervisor (systemd, launchd) is
+left to its manager: restart only touches daemons started by
+`aoe serve --daemon`. A worker's build identity pairs the package version
+with a git commit hash, so local rebuilds across commits are detected,
+not just shipped release upgrades. See
+[#1754](https://github.com/agent-of-empires/agent-of-empires/issues/1754)
+and [#1794](https://github.com/agent-of-empires/agent-of-empires/issues/1794).
 
 ## Session deletion
 
