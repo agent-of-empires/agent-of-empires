@@ -5,6 +5,7 @@ import {
   buildNestedSidebarGroups,
   type NestedSidebarGroup,
 } from "../lib/sidebarGroups";
+import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
 // Distinct from both the repo prefix (`aoe-repo-collapsed-`) and the flat
@@ -25,7 +26,10 @@ function loadCollapsed(key: string): boolean {
   return safeGetItem(`${COLLAPSED_KEY_PREFIX}${key}`) === "1";
 }
 
-export function useNestedSidebarGroups(repoGroups: RepoGroup[]): {
+export function useNestedSidebarGroups(
+  repoGroups: RepoGroup[],
+  sortMode: SidebarSortMode,
+): {
   groups: NestedSidebarGroup[];
   toggleSubgroupCollapsed: (repoId: string, groupPath: string) => void;
 } {
@@ -36,12 +40,13 @@ export function useNestedSidebarGroups(repoGroups: RepoGroup[]): {
     () =>
       buildNestedSidebarGroups(repoGroups, {
         idleDecayWindowMs,
+        sortMode,
         isSubgroupCollapsed: (repoId, groupPath) => {
           const key = subgroupKey(repoId, groupPath);
           return collapsedMap[key] ?? loadCollapsed(key);
         },
       }),
-    [repoGroups, idleDecayWindowMs, collapsedMap],
+    [repoGroups, idleDecayWindowMs, sortMode, collapsedMap],
   );
 
   // The updater stays pure and persistence runs in an effect, for the same

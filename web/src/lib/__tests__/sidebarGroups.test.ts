@@ -19,6 +19,7 @@ import {
   UNGROUPED_GROUP_ID,
 } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID } from "../../hooks/useRepoGroups";
+import type { SidebarSortMode } from "../sidebarSort";
 import { IDLE_DECAY_WINDOW_MS } from "../session";
 import type { RepoGroup, SessionResponse, Workspace } from "../types";
 
@@ -79,13 +80,39 @@ function workspace(
 const build = (
   workspaces: Workspace[],
   isCollapsed: (id: string) => boolean = () => false,
+  sortMode: SidebarSortMode = "lastActivity",
 ) =>
   buildSessionGroups(workspaces, {
     idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
+    sortMode,
     isCollapsed,
   });
 
 describe("buildSessionGroups", () => {
+  it("orders within-group rows by attention when sortMode is attention (#1640)", () => {
+    const groups = build(
+      [
+        workspace("w-running", [
+          session({ id: "r", group_path: "feature", status: "Running" }),
+        ]),
+        workspace("w-waiting", [
+          session({ id: "w", group_path: "feature", status: "Waiting" }),
+        ]),
+        workspace("w-idle", [
+          session({ id: "i", group_path: "feature", status: "Idle" }),
+        ]),
+      ],
+      () => false,
+      "attention",
+    );
+    const feature = groups.find((g) => g.id === "feature")!;
+    expect(feature.workspaces.map((v) => v.workspace.id)).toEqual([
+      "w-waiting",
+      "w-idle",
+      "w-running",
+    ]);
+  });
+
   it("buckets workspaces by group_path, named groups alphabetical", () => {
     const groups = build([
       workspace("w1", [session({ id: "s1", group_path: "refactor" })]),
@@ -244,9 +271,11 @@ describe("buildNestedSidebarGroups", () => {
     repoGroups: RepoGroup[],
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () =>
       false,
+    sortMode: SidebarSortMode = "lastActivity",
   ) =>
     buildNestedSidebarGroups(repoGroups, {
       idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
+      sortMode,
       isSubgroupCollapsed,
     });
 

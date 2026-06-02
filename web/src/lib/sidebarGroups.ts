@@ -7,7 +7,8 @@ import type {
 } from "./types";
 import { isSessionActive } from "./session";
 import {
-  compareWorkspacesByLastActivityDesc,
+  compareWorkspacesForComputedSortMode,
+  type SidebarSortMode,
   workspaceIsSunk,
 } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
@@ -112,13 +113,17 @@ function groupDisplayName(path: string): string {
 // so a workspace whose sessions span groups is split into one view per
 // group, each carrying only that group's sessions. Sessions with an empty
 // `group_path` collect into the Ungrouped bucket. Within a group, rows
-// sort by the shared last-activity comparator (the group axis has no
-// manual order in v1); named groups sort alphabetically with Ungrouped
-// pinned to the bottom.
+// sort by the selected sort mode (the group axis has no manual order in
+// v1, so `manual` falls back to last-activity); named groups sort
+// alphabetically with Ungrouped pinned to the bottom regardless of mode.
 export function buildSessionGroups(
   workspaces: Workspace[],
   opts: {
     idleDecayWindowMs: number;
+    // Drives the within-group row comparator. `manual` falls back to
+    // last-activity here (this axis has no manual drag order), while
+    // `lastActivity` and `attention` are honored. See #1640.
+    sortMode: SidebarSortMode;
     // `groupPath` is the normalized path ("" for Ungrouped), passed
     // alongside the synthetic id so nested callers can key collapse state
     // on the path and dodge the `UNGROUPED_GROUP_ID` sentinel. Flat callers
@@ -126,6 +131,7 @@ export function buildSessionGroups(
     isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
+  const compareWorkspace = compareWorkspacesForComputedSortMode(opts.sortMode);
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -160,9 +166,7 @@ export function buildSessionGroups(
   const groups: SidebarGroup[] = [];
   for (const gp of order) {
     const views = byGroup.get(gp)!;
-    views.sort((a, b) =>
-      compareWorkspacesByLastActivityDesc(a.workspace, b.workspace),
-    );
+    views.sort((a, b) => compareWorkspace(a.workspace, b.workspace));
     const id = gp === "" ? UNGROUPED_GROUP_ID : gp;
     const hasActive = views.some((v) => v.workspace.status === "active");
     groups.push({
@@ -219,6 +223,10 @@ export function buildNestedSidebarGroups(
   repoGroups: RepoGroup[],
   opts: {
     idleDecayWindowMs: number;
+    // Forwarded to the per-repo subgroup builder so subgroup rows honor the
+    // selected sort mode. Top-level repo order is inherited from the repo
+    // axis (already sorted by `useRepoGroups`), so it is not re-sorted here.
+    sortMode: SidebarSortMode;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
   },
 ): NestedSidebarGroup[] {
@@ -226,6 +234,7 @@ export function buildNestedSidebarGroups(
     const repo = repoGroupToSidebarGroup(repoGroup);
     const subgroups = buildSessionGroups(repoGroup.workspaces, {
       idleDecayWindowMs: opts.idleDecayWindowMs,
+      sortMode: opts.sortMode,
       isCollapsed: (_groupId, groupPath) =>
         opts.isSubgroupCollapsed(repo.id, groupPath),
     });

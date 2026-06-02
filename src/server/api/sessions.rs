@@ -57,6 +57,14 @@ pub struct SessionResponse {
     /// favorited rows and render the `*` marker without re-implementing
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
+    /// True when the agent has flagged this session as urgent via the
+    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
+    /// urgent rows above all non-urgent ones within their triage tier,
+    /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
+    /// returns false for archived/snoozed sessions, so a sunk row never
+    /// claws back to the top. See #1640.
+    pub urgent: bool,
     /// RFC3339 timestamp at which the session was web-pinned, or omitted
     /// when not pinned. Distinct from `favorited`: favorite is the TUI
     /// within-tier attention-sort signal, while pin is the hard
@@ -229,6 +237,7 @@ impl SessionResponse {
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
             // Surface `snoozed_until` only when the snooze is still
@@ -3550,6 +3559,32 @@ mod tests {
     }
 
     #[test]
+    fn from_instance_surfaces_hook_urgent_flag() {
+        // #1640: the web Attention sort needs `Instance::is_urgent()` on the
+        // wire. Write the hook-side attention.json the agent would emit and
+        // confirm it round-trips onto the response, then confirm a session
+        // with no hook file reports urgent: false.
+        let inst = make_test_instance();
+        let dir = crate::hooks::hook_status_dir(&inst.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attention.json"),
+            r#"{"urgent":true,"urgent_reason":"needs input"}"#,
+        )
+        .unwrap();
+
+        let urgent_resp = SessionResponse::from_instance(&inst, false);
+        assert!(urgent_resp.urgent, "hook-flagged session must be urgent");
+
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+        let plain_resp = SessionResponse::from_instance(&inst, false);
+        assert!(
+            !plain_resp.urgent,
+            "session with no hook file must not be urgent"
+        );
+    }
+
+    #[test]
     fn public_create_session_error_forwards_whitelisted_git_errors() {
         let dup: anyhow::Error =
             GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
@@ -4971,6 +5006,7 @@ mod workspace_ordering_tests {
             next_wakeup_at: None,
             next_wakeup_reason: None,
             favorited: false,
+            urgent: false,
             pinned_at: None,
             archived_at: None,
             snoozed_until: None,
