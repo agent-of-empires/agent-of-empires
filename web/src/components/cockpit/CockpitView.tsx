@@ -34,6 +34,11 @@ import { ApprovalCard } from "./ApprovalCard";
 import { CockpitFileRefContext } from "./CockpitFileRefContext";
 import type { FileRef } from "../../lib/fileRef";
 import {
+  ToolDensityToggle,
+  ToolDisplayModeProvider,
+  useToolDensityPref,
+} from "./ToolDisplayMode";
+import {
   CockpitRuntime,
   SUBAGENT_TASK_NAME,
   TODO_GROUP_NAME,
@@ -137,28 +142,35 @@ export function CockpitView({
   // the view (not the reducer) because it's a UI preference, not
   // event-log state. See #1101.
   const [showClearedTurns, setShowClearedTurns] = useState(false);
+  // Tool-card density is a client-side view preference (localStorage),
+  // not reducer state and not a daemon config field. See #1767.
+  const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <CockpitFileRefContext.Provider value={{ onOpenFileRef }}>
       <AgentProfileProvider toolKey={tool}>
-        <CockpitRuntime
-          sessionId={sessionId}
-          cockpitWorkerState={cockpitWorkerState}
-          archivedAt={archivedAt}
-          snoozedUntil={snoozedUntil}
-          showClearedTurns={showClearedTurns}
-        >
-          {(ctx) => (
-            <CockpitChrome
-              sessionId={sessionId}
-              cockpitWorkerState={cockpitWorkerState}
-              showClearedTurns={showClearedTurns}
-              onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-              archivedAt={archivedAt}
-              snoozedUntil={snoozedUntil}
-              {...ctx}
-            />
-          )}
-        </CockpitRuntime>
+        <ToolDisplayModeProvider density={toolDensity}>
+          <CockpitRuntime
+            sessionId={sessionId}
+            cockpitWorkerState={cockpitWorkerState}
+            archivedAt={archivedAt}
+            snoozedUntil={snoozedUntil}
+            showClearedTurns={showClearedTurns}
+          >
+            {(ctx) => (
+              <CockpitChrome
+                sessionId={sessionId}
+                cockpitWorkerState={cockpitWorkerState}
+                showClearedTurns={showClearedTurns}
+                onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                toolDensity={toolDensity}
+                onToggleToolDensity={toggleToolDensity}
+                archivedAt={archivedAt}
+                snoozedUntil={snoozedUntil}
+                {...ctx}
+              />
+            )}
+          </CockpitRuntime>
+        </ToolDisplayModeProvider>
       </AgentProfileProvider>
     </CockpitFileRefContext.Provider>
   );
@@ -169,6 +181,8 @@ function CockpitChrome({
   cockpitWorkerState,
   showClearedTurns,
   onToggleClearedTurns,
+  toolDensity,
+  onToggleToolDensity,
   archivedAt,
   snoozedUntil,
   state,
@@ -199,6 +213,8 @@ function CockpitChrome({
   cockpitWorkerState: "absent" | "resuming" | "running";
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
+  toolDensity: "detailed" | "compact";
+  onToggleToolDensity: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
 }) {
@@ -393,6 +409,15 @@ function CockpitChrome({
             <ThreadPrimitive.Empty>
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
+
+            {state.activity.length > 0 && (
+              <div className="mb-2 flex">
+                <ToolDensityToggle
+                  density={toolDensity}
+                  onToggle={onToggleToolDensity}
+                />
+              </div>
+            )}
 
             {clearedSummary && clearedSummary.hiddenCount > 0 && (
               <ClearedTurnsBanner

@@ -11,10 +11,14 @@
 // the approval from CockpitState.pendingApprovals.
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Shield, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision } from "../../lib/cockpitTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
-import { parseJsonObject } from "../../lib/cockpitArgs";
+import {
+  hasArgsBody,
+  parseJsonObject,
+  previewFromArgs,
+} from "../../lib/cockpitArgs";
 
 interface Props {
   approval: Approval;
@@ -31,6 +35,16 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const [progress, setProgress] = useState(0);
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const raw = approval.tool_call.args_preview;
+  // Benign approvals collapse to a one-line preview so the queue stays
+  // scannable; destructive ones default expanded so the full command is
+  // in view before a hold-to-allow. Either way the toggle stays under
+  // user control and nothing re-expands it on plan approval. See #1767.
+  const [expanded, setExpanded] = useState(approval.destructive);
+  const preview = useMemo(() => previewFromArgs(raw), [raw]);
+  const canExpand = useMemo(() => hasArgsBody(raw), [raw]);
+  const Header = canExpand ? "button" : "div";
 
   useEffect(() => {
     return () => {
@@ -98,26 +112,47 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       role="alertdialog"
       aria-label={`Approval needed: ${approval.tool_call.name}`}
     >
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-800/60">
+      <Header
+        type={canExpand ? "button" : undefined}
+        onClick={canExpand ? () => setExpanded((v) => !v) : undefined}
+        aria-expanded={canExpand ? expanded : undefined}
+        className={[
+          "flex w-full items-center gap-2 px-3 py-2 text-left border-b border-surface-800/60",
+          canExpand ? "cursor-pointer hover:bg-surface-800/40" : "",
+        ].join(" ")}
+      >
         {approval.destructive ? (
-          <AlertTriangle className="h-3.5 w-3.5 text-rose-400" />
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
         ) : (
-          <Shield className="h-3.5 w-3.5 text-brand-500" />
+          <Shield className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         )}
         <span
           className={[
-            "text-[11px] uppercase tracking-wider",
+            "shrink-0 text-[11px] uppercase tracking-wider",
             approval.destructive ? "text-rose-400" : "text-brand-500",
           ].join(" ")}
         >
           {approval.destructive ? "Destructive action" : "Approval needed"}
         </span>
-        <span className="truncate font-mono text-xs text-text-secondary">
+        <span className="shrink-0 font-mono text-xs text-text-secondary">
           {approval.tool_call.name}
         </span>
-      </div>
+        {preview && (
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-dim">
+            {preview}
+          </span>
+        )}
+        {canExpand && (
+          <ChevronDown
+            className={[
+              "ml-auto h-3.5 w-3.5 shrink-0 text-text-dim transition-transform",
+              expanded ? "rotate-180" : "",
+            ].join(" ")}
+          />
+        )}
+      </Header>
 
-      <ArgsView raw={approval.tool_call.args_preview} />
+      {expanded && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
         <p className="px-3 pt-2 text-rose-400 text-xs">

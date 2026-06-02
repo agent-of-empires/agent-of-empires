@@ -62,6 +62,7 @@ import {
 } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 
 interface Props {
@@ -243,24 +244,42 @@ function statusFor(result?: ActivityRow): Status {
 
 // Per-card expand state for tool cards. Failed cards auto-open so the
 // user sees the error immediately, but the chevron must still fold them
-// once read. We model the user's choice as a nullable override: while
-// it is null we derive openness from the current props
-// (`status === "err" || defaultOpen`), so both a replayed already-failed
+// once read. We model the user's choice as an override scoped to the
+// active tool density: while no override matches the current density we
+// derive openness from the baseline, so both a replayed already-failed
 // card (mounts as err) and a live card that fails mid-stream
 // (running -> err) open during render with no effect and no one-frame
-// collapse flash. The first user toggle pins `userOpen` and is respected
-// from then on, even if the card later re-enters err. See #1467.
+// collapse flash. The first user toggle pins the override and is
+// respected from then on, even if the card later re-enters err. See
+// #1467.
+//
+// The baseline folds in the transcript density (#1767): "compact" makes
+// every card default collapsed, "detailed" keeps the caller's
+// `defaultOpen`. Errored cards always auto-open regardless of density so
+// compact mode never hides a failure. Scoping the override to the
+// density means flipping the global toggle re-applies the baseline for
+// every untouched card without a useEffect.
 function useToolCardExpansion(status: Status, defaultOpen = false) {
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = userOpen ?? (status === "err" || defaultOpen);
+  const density = useToolDisplayMode();
+  const baseline =
+    status === "err" ? true : density === "compact" ? false : defaultOpen;
+  const [override, setOverride] = useState<{
+    density: ToolDensity;
+    open: boolean;
+  } | null>(null);
+  const active =
+    override && override.density === density ? override.open : null;
+  const open = active ?? baseline;
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
-      setUserOpen((prev) => {
-        const current = prev ?? (status === "err" || defaultOpen);
-        return typeof action === "function" ? action(current) : action;
+      setOverride((prev) => {
+        const current =
+          prev && prev.density === density ? prev.open : baseline;
+        const next = typeof action === "function" ? action(current) : action;
+        return { density, open: next };
       });
     },
-    [status, defaultOpen],
+    [density, baseline],
   );
   return [open, setOpen] as const;
 }
@@ -1318,9 +1337,6 @@ interface ToolGroupItem {
  *  matching how the Claude Code CLI condenses silent investigation
  *  phases. See #1057. */
 export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
-  const [open, setOpen] = useState(false);
-  if (items.length === 0) return null;
-
   const runningCount = items.filter((i) => !i.result).length;
   const errorCount = items.filter(
     (i) => i.result && i.result.kind === "tool_error",
@@ -1329,6 +1345,11 @@ export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
   // 11-step investigation doesn't make the whole investigation
   // failed; per-child status stays on the inner cards. See #1102.
   const status: Status = runningCount > 0 ? "running" : "ok";
+  // Route through the shared hook (not a bare useState) so the group
+  // folds with the transcript density toggle too. Called before the
+  // empty-items guard to keep hook order stable. See #1767.
+  const [open, setOpen] = useToolCardExpansion(status, false);
+  if (items.length === 0) return null;
 
   const breakdown = summariseKinds(items, errorCount);
 
