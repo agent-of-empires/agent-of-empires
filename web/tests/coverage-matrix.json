@@ -1067,6 +1067,19 @@
       ]
     },
     {
+      "id": "diff-comments.storage-cleanup",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/comments/storage.test.ts",
+        "src/components/diff/comments/storage.sweep.test.ts",
+        "src/hooks/useDiffComments.rtl.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/comments/storage.ts"
+      ]
+    },
+    {
       "id": "right-panel.mobile-picker",
       "kind": "mocked-playwright",
       "risk": "high",
