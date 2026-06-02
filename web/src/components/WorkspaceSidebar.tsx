@@ -108,6 +108,7 @@ import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
+import { Tooltip } from "./Tooltip";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1938,17 +1939,6 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   );
 });
 
-function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
-  return (
-    <span className="relative group/tip inline-flex">
-      {children}
-      <span className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-full mt-1.5 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary whitespace-nowrap opacity-0 scale-95 transition-all duration-100 group-hover/tip:opacity-100 group-hover/tip:scale-100 z-50">
-        {text}
-      </span>
-    </span>
-  );
-}
-
 function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   return (
     ws.displayName.toLowerCase().includes(q) ||
@@ -2387,7 +2377,7 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           open ? "translate-x-0" : "-translate-x-full md:hidden"
         }`}
       >
@@ -2503,7 +2493,7 @@ export function WorkspaceSidebar({
           />
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
