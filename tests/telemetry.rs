@@ -28,6 +28,12 @@ fn set_enabled(enabled: bool) {
     save_config(&config).expect("save config");
 }
 
+/// An empty per-form-factor map, for the snapshot builders that take no web
+/// client classes (TUI, or a serve snapshot with no classified opens).
+fn empty() -> std::collections::BTreeMap<String, bool> {
+    std::collections::BTreeMap::new()
+}
+
 /// Default-off must hold: a fresh install reports no opt-in, no install id,
 /// and builds no events.
 #[test]
@@ -37,7 +43,10 @@ fn default_off_emits_nothing() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-    assert!(telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0).is_none());
+    assert!(
+        telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, empty(), empty(), 0)
+            .is_none()
+    );
 }
 
 /// Opting in generates an install id and lets events build; opting back out
@@ -100,9 +109,16 @@ fn snapshot_buckets_are_sanitized() {
     custom.detect_as = String::new();
     let claude = Instance::new("c", "/p");
 
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Tui, &[custom, claude], false, false, 0)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[custom, claude],
+        false,
+        false,
+        empty(),
+        empty(),
+        0,
+    )
+    .expect("snapshot built when opted in");
 
     let serialized = serde_json::to_string(&snapshot).expect("serialize");
     // The raw custom command / project path must never appear in the payload.
@@ -124,6 +140,44 @@ fn snapshot_buckets_are_sanitized() {
     }
 }
 
+/// User story (#1883): the snapshot carries the per-class client form-factor
+/// map. A desktop browser and a mobile PWA against the same daemon both appear
+/// as distinct was-seen classes, not one undifferentiated `web_seen`, while the
+/// coarse `web_seen` flag still summarises "the dashboard was opened".
+#[test]
+#[serial]
+fn snapshot_carries_per_class_web_clients() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let mut web_clients = std::collections::BTreeMap::new();
+    web_clients.insert("desktop".to_string(), true);
+    web_clients.insert("mobile_pwa".to_string(), true);
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], true, false, web_clients, empty(), 0)
+            .expect("snapshot built when opted in");
+
+    assert!(
+        snapshot.web_seen,
+        "coarse web_seen still summarises the open"
+    );
+    assert_eq!(snapshot.web_clients_seen.get("desktop"), Some(&true));
+    assert_eq!(snapshot.web_clients_seen.get("mobile_pwa"), Some(&true));
+    // Classes that were never seen are absent, not `false`: the map is a
+    // presence set, so it stays small and the gateway forwards only real opens.
+    assert_eq!(snapshot.web_clients_seen.get("mobile"), None);
+
+    // An empty form-factor map is omitted from the wire entirely (the TUI and
+    // any surface with no classified opens), never serialized as `{}`.
+    let serialized = serde_json::to_string(&snapshot).expect("serialize");
+    assert!(
+        !serialized.contains("cockpit_clients_seen"),
+        "empty cockpit_clients_seen must be skipped, not emitted as {{}}"
+    );
+}
+
 /// User story (#1874): the create-trend counter carries a real value. When N
 /// sessions were created during the window, the snapshot reports
 /// `session_creates_since_last_snapshot == N`; with none created it reports 0.
@@ -134,12 +188,14 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
-        .expect("snapshot built when opted in");
+    let none =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, empty(), empty(), 0)
+            .expect("snapshot built when opted in");
     assert_eq!(none.session_creates_since_last_snapshot, 0);
 
-    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
-        .expect("snapshot built when opted in");
+    let some =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, empty(), empty(), 7)
+            .expect("snapshot built when opted in");
     assert_eq!(some.session_creates_since_last_snapshot, 7);
 }
 

@@ -10,7 +10,11 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Payload schema version. Bump on any breaking change to the field set.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (#1883): the `usage_snapshot` gained the `web_clients_seen` /
+/// `cockpit_clients_seen` per-form-factor maps alongside the coarse
+/// `web_seen` / `cockpit_seen` flags.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -88,6 +92,18 @@ pub struct UsageSnapshot {
     pub web_seen: bool,
     /// The cockpit web UI was opened at least once since the last snapshot.
     pub cockpit_seen: bool,
+
+    /// Coarse client form-factor classes that opened the web dashboard since
+    /// the last snapshot: allowlisted class key (`desktop` / `desktop_pwa` /
+    /// `mobile` / `mobile_pwa`) -> was-seen. A boolean, not a count, on the
+    /// wire: it answers "which client classes used the dashboard" without
+    /// leaking open frequency. Empty (and so omitted) on surfaces that host no
+    /// web client, e.g. the TUI. See `telemetry::form_factor`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub web_clients_seen: BTreeMap<String, bool>,
+    /// Same per-class was-seen map for the cockpit web UI.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cockpit_clients_seen: BTreeMap<String, bool>,
 
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).

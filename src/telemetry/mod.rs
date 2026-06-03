@@ -20,6 +20,7 @@
 
 pub mod events;
 pub mod features;
+pub mod form_factor;
 pub mod sanitize;
 mod state;
 
@@ -27,6 +28,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use events::{ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
+pub use form_factor::WebClientFormFactor;
 pub use state::{cli_process_start_due, install_id, record_cli_process_start, reset_install_id};
 
 use crate::session::Instance;
@@ -139,6 +141,8 @@ pub fn build_usage_snapshot(
     instances: &[Instance],
     web_seen: bool,
     cockpit_seen: bool,
+    web_clients_seen: BTreeMap<String, bool>,
+    cockpit_clients_seen: BTreeMap<String, bool>,
     session_creates_since_last_snapshot: u32,
 ) -> Option<UsageSnapshot> {
     if !is_opted_in() {
@@ -219,6 +223,8 @@ pub fn build_usage_snapshot(
         features,
         web_seen,
         cockpit_seen,
+        web_clients_seen,
+        cockpit_clients_seen,
         session_creates_since_last_snapshot,
     })
 }
@@ -471,6 +477,8 @@ mod tests {
             features: BTreeMap::new(),
             web_seen: false,
             cockpit_seen: false,
+            web_clients_seen: BTreeMap::new(),
+            cockpit_clients_seen: BTreeMap::new(),
             session_creates_since_last_snapshot: 0,
         }
     }
