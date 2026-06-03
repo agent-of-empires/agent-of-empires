@@ -21,14 +21,15 @@ use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
+    KillTerminalResponse, LoadSessionRequest, ModelId, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    SessionConfigId, SessionConfigValueId, SessionId, SessionModelState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
+    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
@@ -3116,21 +3117,220 @@ fn map_update_to_events(
     }
 }
 
-/// Map a snapshot of ACP `SessionConfigOption`s (typically pulled
-/// from `NewSessionResponse.config_options` or
-/// `LoadSessionResponse.config_options`) into one
-/// `Event::ConfigOptionsUpdated`. Returns `None` only when the
-/// snapshot itself is absent (the adapter did not include the field).
-/// A present-but-empty snapshot is still a real full replacement and
-/// must be propagated, otherwise stale cached selectors never clear
-/// when an adapter intentionally drops them. See #1403.
-fn config_options_event(
-    options: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+/// Reserved id for the synthetic model selector AoE injects when an
+/// agent advertises its model via the ACP `unstable_session_model`
+/// capability (`SessionModelState`) instead of a generic
+/// `config_option` with `category: Model`. The set path recognizes
+/// this id and routes to `session/set_model` rather than
+/// `session/set_config_option`. See #1820.
+const ACP_SESSION_MODEL_CONFIG_ID: &str = "__aoe_acp_session_model__";
+
+/// Per-connection cache of the two ACP channels that can carry a model
+/// selector: the generic `config_option` list and the unstable
+/// `SessionModelState`. The cockpit exposes a single model dropdown, so
+/// these are normalized into one `ConfigOptionsUpdated` snapshot before
+/// reaching the UI. Held behind a `std::sync::Mutex` shared between the
+/// notification handler and the command loop; never locked across an
+/// `.await`. See #1820.
+#[derive(Default)]
+struct ModelChannelCache {
+    raw_config_options: Vec<ConfigOptionDescriptor>,
+    session_model: Option<SessionModelState>,
+}
+
+impl ModelChannelCache {
+    /// Build the config-option list the UI sees: the agent's raw options
+    /// plus a synthetic model selector derived from `session_model`, but
+    /// only when the agent did not already expose a real
+    /// `category: Model` option. The generic config_option wins because
+    /// it has a push/echo path (`set_config_option` returns the updated
+    /// snapshot); `unstable_session_model` is silent and only acked, so
+    /// surfacing both would risk two dropdowns and divergent state.
+    fn normalized(&self) -> Vec<ConfigOptionDescriptor> {
+        let mut out = self.raw_config_options.clone();
+        let has_real_model = out
+            .iter()
+            .any(|o| o.category == ConfigOptionCategory::Model);
+        if !has_real_model {
+            if let Some(model) = &self.session_model {
+                out.push(session_model_to_config_option(model));
+            }
+        }
+        out
+    }
+}
+
+/// Map an ACP `SessionModelState` into the synthetic model
+/// `ConfigOptionDescriptor` the cockpit dropdown renders. See #1820.
+fn session_model_to_config_option(model: &SessionModelState) -> ConfigOptionDescriptor {
+    ConfigOptionDescriptor {
+        id: ACP_SESSION_MODEL_CONFIG_ID.to_string(),
+        name: "Model".to_string(),
+        description: None,
+        category: ConfigOptionCategory::Model,
+        current_value: model.current_model_id.0.to_string(),
+        options: model
+            .available_models
+            .iter()
+            .map(|m| ConfigOptionChoice {
+                value: m.model_id.0.to_string(),
+                name: m.name.clone(),
+                description: m.description.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Fold a session response's `config_options` and `models` into the
+/// cache and return the normalized `ConfigOptionsUpdated` event, or
+/// `None` when the response carried neither (so cached selectors
+/// persist). A present-but-empty `config_options` is a real full
+/// replacement and must propagate, otherwise stale selectors never
+/// clear when an adapter intentionally drops them (see #1403). This is
+/// the single entry point that merges the two model channels at the
+/// boundary. See #1820.
+fn fold_session_options(
+    cache: &std::sync::Mutex<ModelChannelCache>,
+    raw: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+    models: Option<SessionModelState>,
 ) -> Option<Event> {
-    let raw = options?;
-    let mapped: Vec<ConfigOptionDescriptor> =
-        raw.into_iter().filter_map(map_acp_config_option).collect();
-    Some(Event::ConfigOptionsUpdated { options: mapped })
+    if raw.is_none() && models.is_none() {
+        return None;
+    }
+    let mut cache = cache.lock().expect("model channel cache poisoned");
+    if let Some(raw) = raw {
+        cache.raw_config_options = raw.into_iter().filter_map(map_acp_config_option).collect();
+    }
+    if let Some(models) = models {
+        cache.session_model = Some(models);
+    }
+    Some(Event::ConfigOptionsUpdated {
+        options: cache.normalized(),
+    })
+}
+
+/// Re-normalize any `ConfigOptionsUpdated` event produced by
+/// `map_update_to_events` so a `config_option_update` notification that
+/// omits the model (e.g. a `thought_level`-only refresh) cannot wipe
+/// the synthetic model selector out of the UI's full-replacement
+/// snapshot. The notification carries the fresh raw option list; the
+/// cached `session_model` is merged back in. See #1820.
+fn renormalize_model_events(
+    events: Vec<Event>,
+    cache: &std::sync::Mutex<ModelChannelCache>,
+) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|event| match event {
+            Event::ConfigOptionsUpdated { options } => {
+                let mut cache = cache.lock().expect("model channel cache poisoned");
+                cache.raw_config_options = options;
+                Event::ConfigOptionsUpdated {
+                    options: cache.normalized(),
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Route a `SetConfigOption` command to the right ACP request and emit
+/// the resulting UI update. The synthetic model selector
+/// (`ACP_SESSION_MODEL_CONFIG_ID`) goes to `session/set_model`; every
+/// other id goes to `session/set_config_option`. Because ACP has no
+/// agent-push model-change notification (only an ack), the success path
+/// for `set_model` mutates the cached `current_model_id` and re-emits a
+/// normalized snapshot so the dropdown reflects the new model. The
+/// round-trip is spawned detached, mirroring the existing config-option
+/// set path, so the command loop never blocks on it. See #1820.
+fn dispatch_set_config_option(
+    connection: &ConnectionTo<Agent>,
+    acp_session_id: &SessionId,
+    config_id: String,
+    value: String,
+    event_tx: mpsc::Sender<Event>,
+    model_cache: Arc<std::sync::Mutex<ModelChannelCache>>,
+) {
+    if config_id == ACP_SESSION_MODEL_CONFIG_ID {
+        info!(target: "cockpit.acp", "sending session/set_model model={value}");
+        let sent = connection.send_request(SetSessionModelRequest::new(
+            acp_session_id.clone(),
+            value.clone(),
+        ));
+        tokio::spawn(async move {
+            match sent.block_task().await {
+                Ok(_) => {
+                    // No state echo from set_model; synthesize the
+                    // confirmation by updating the cached current model
+                    // and re-normalizing.
+                    let event = {
+                        let mut cache = model_cache.lock().expect("model channel cache poisoned");
+                        if let Some(model) = cache.session_model.as_mut() {
+                            model.current_model_id = ModelId::from(value.clone());
+                        }
+                        Event::ConfigOptionsUpdated {
+                            options: cache.normalized(),
+                        }
+                    };
+                    let _ = event_tx.send(event).await;
+                }
+                Err(e) => {
+                    let reason = format!("{e}");
+                    warn!(target: "cockpit.acp", "session/set_model failed: {reason}");
+                    let _ = event_tx
+                        .send(Event::ConfigOptionSwitchFailed {
+                            config_id,
+                            value,
+                            reason,
+                        })
+                        .await;
+                }
+            }
+        });
+        return;
+    }
+
+    info!(
+        target: "cockpit.acp",
+        "sending session/set_config_option {config_id}={value}"
+    );
+    let sent = connection.send_request(SetSessionConfigOptionRequest::new(
+        acp_session_id.clone(),
+        SessionConfigId::new(config_id.clone()),
+        SessionConfigValueId::new(value.clone()),
+    ));
+    tokio::spawn(async move {
+        match sent.block_task().await {
+            Ok(resp) => {
+                // claude-agent-acp's setSessionConfigOption returns the
+                // full updated config_options list in the response but
+                // does NOT emit a follow-up `config_option_update`
+                // notification (see acp-agent.js:1003-1057). Fold the
+                // response back through the cache so the synthetic model
+                // selector (if any) survives and the frontend reducer
+                // clears pending state. See #1403, #1820.
+                if let Some(event) =
+                    fold_session_options(&model_cache, Some(resp.config_options), None)
+                {
+                    let _ = event_tx.send(event).await;
+                }
+            }
+            Err(e) => {
+                let reason = format!("{e}");
+                warn!(
+                    target: "cockpit.acp",
+                    "session/set_config_option failed: {reason}"
+                );
+                let _ = event_tx
+                    .send(Event::ConfigOptionSwitchFailed {
+                        config_id,
+                        value,
+                        reason,
+                    })
+                    .await;
+            }
+        }
+    });
 }
 
 fn thought_level_config_id(
@@ -3567,6 +3767,12 @@ async fn run_connection_task<W, R>(
     let event_tx_for_notif = event_tx.clone();
     let event_tx_for_perm = event_tx.clone();
     let event_tx_for_block = event_tx.clone();
+    // Shared model-selector cache: the notification handler and the
+    // command loop both fold their model channels through it so the UI
+    // sees a single normalized model dropdown. See #1820.
+    let model_cache = Arc::new(std::sync::Mutex::new(ModelChannelCache::default()));
+    let model_cache_for_notif = model_cache.clone();
+    let model_cache_for_block = model_cache.clone();
     let pending_for_perm = pending_responders.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
@@ -3653,6 +3859,7 @@ async fn run_connection_task<W, R>(
                     first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
+                let model_cache = model_cache_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -3685,7 +3892,13 @@ async fn run_connection_task<W, R>(
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
                     }
-                    let mapped_events = map_update_to_events(notification.update, profile);
+                    // Merge any config_option_update through the shared
+                    // model cache so a model-less refresh cannot wipe the
+                    // synthetic model selector. See #1820.
+                    let mapped_events = renormalize_model_events(
+                        map_update_to_events(notification.update, profile),
+                        &model_cache,
+                    );
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
                     // ToolStarted / ToolCompleted / WakeupPending /
@@ -4038,12 +4251,17 @@ async fn run_connection_task<W, R>(
                                         })
                                         .await;
                                     // Per ACP schema 0.12, LoadSessionResponse
-                                    // carries config_options. Surface them so
-                                    // the structured view picker hydrates on resume
+                                    // carries config_options and (with
+                                    // unstable_session_model) a models field.
+                                    // Fold both through the cache so the
+                                    // structured view picker hydrates on resume
                                     // without waiting for a notification. See
-                                    // #1403.
-                                    if let Some(event) = config_options_event(resp.config_options)
-                                    {
+                                    // #1403, #1820.
+                                    if let Some(event) = fold_session_options(
+                                        &model_cache_for_block,
+                                        resp.config_options,
+                                        resp.models,
+                                    ) {
                                         let _ = event_tx_for_block.send(event).await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
@@ -4140,10 +4358,16 @@ async fn run_connection_task<W, R>(
                         // Per ACP schema 0.12, NewSessionResponse carries
                         // config_options (claude-agent-acp v0.37.0 emits the
                         // initial model + effort + mode set here, not as a
-                        // subsequent notification). Surface them so the
-                        // structured view pickers render immediately. See #1403.
+                        // subsequent notification) and, with
+                        // unstable_session_model, a models field. Fold both
+                        // so the structured view pickers render immediately.
+                        // See #1403, #1820.
                         let config_options = new_session.config_options.clone();
-                        if let Some(event) = config_options_event(config_options.clone()) {
+                        if let Some(event) = fold_session_options(
+                            &model_cache_for_block,
+                            config_options.clone(),
+                            new_session.models.clone(),
+                        ) {
                             let _ = event_tx_for_block.send(event).await;
                         }
 
@@ -4623,52 +4847,14 @@ async fn run_connection_task<W, R>(
                                             break;
                                         }
                                         Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                                            info!(
-                                                target: "acp.protocol",
-                                                "sending session/set_config_option {config_id}={value} during in-flight prompt"
+                                            dispatch_set_config_option(
+                                                &connection,
+                                                &acp_session_id,
+                                                config_id,
+                                                value,
+                                                event_tx_for_block.clone(),
+                                                model_cache_for_block.clone(),
                                             );
-                                            let sent = connection.send_request(
-                                                SetSessionConfigOptionRequest::new(
-                                                    acp_session_id.clone(),
-                                                    SessionConfigId::new(config_id.clone()),
-                                                    SessionConfigValueId::new(value.clone()),
-                                                ),
-                                            );
-                                            let tx = event_tx_for_block.clone();
-                                            tokio::spawn(async move {
-                                                match sent.block_task().await {
-                                                    Ok(resp) => {
-                                                        // claude-agent-acp's setSessionConfigOption
-                                                        // returns the full updated config_options
-                                                        // list in the response but does NOT emit a
-                                                        // follow-up `config_option_update`
-                                                        // notification (see acp-agent.js:1003-1057).
-                                                        // Synthesize ConfigOptionsUpdated from the
-                                                        // response so the frontend reducer clears
-                                                        // pending state and shows the new current
-                                                        // value. See #1403.
-                                                        if let Some(event) =
-                                                            config_options_event(Some(resp.config_options))
-                                                        {
-                                                            let _ = tx.send(event).await;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        let reason = format!("{e}");
-                                                        warn!(
-                                                            target: "acp.protocol",
-                                                            "session/set_config_option failed mid-turn: {reason}"
-                                                        );
-                                                        let _ = tx
-                                                            .send(Event::ConfigOptionSwitchFailed {
-                                                                config_id,
-                                                                value,
-                                                                reason,
-                                                            })
-                                                            .await;
-                                                    }
-                                                }
-                                            });
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
                                             // Skip when the agent has not
@@ -4937,48 +5123,14 @@ async fn run_connection_task<W, R>(
                         handle_delete_session_cmd(&connection, target_id, respond_to);
                     }
                     Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                        info!(
-                            target: "acp.protocol",
-                            "sending session/set_config_option {config_id}={value}"
+                        dispatch_set_config_option(
+                            &connection,
+                            &acp_session_id,
+                            config_id,
+                            value,
+                            event_tx_for_block.clone(),
+                            model_cache_for_block.clone(),
                         );
-                        let sent = connection.send_request(SetSessionConfigOptionRequest::new(
-                            acp_session_id.clone(),
-                            SessionConfigId::new(config_id.clone()),
-                            SessionConfigValueId::new(value.clone()),
-                        ));
-                        let tx = event_tx_for_block.clone();
-                        tokio::spawn(async move {
-                            match sent.block_task().await {
-                                Ok(resp) => {
-                                    // claude-agent-acp's setSessionConfigOption returns the
-                                    // full updated config_options list in the response but
-                                    // does NOT emit a follow-up `config_option_update`
-                                    // notification (see acp-agent.js:1003-1057). Synthesize
-                                    // ConfigOptionsUpdated from the response so the frontend
-                                    // reducer clears pending state and shows the new
-                                    // current value. See #1403.
-                                    if let Some(event) =
-                                        config_options_event(Some(resp.config_options))
-                                    {
-                                        let _ = tx.send(event).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    let reason = format!("{e}");
-                                    warn!(
-                                        target: "acp.protocol",
-                                        "session/set_config_option failed: {reason}"
-                                    );
-                                    let _ = tx
-                                        .send(Event::ConfigOptionSwitchFailed {
-                                            config_id,
-                                            value,
-                                            reason,
-                                        })
-                                        .await;
-                                }
-                            }
-                        });
                     }
                     Some(ClientCmd::Shutdown) | None => {
                         info!(target: "acp.protocol", "shutdown received, exiting connection loop");
@@ -7568,22 +7720,130 @@ mod tests {
     }
 
     #[test]
-    fn config_options_event_propagates_empty_snapshot() {
-        // A present-but-empty snapshot from the adapter is a real
-        // full replacement and must clear stale cached selectors, so
-        // `config_options_event(Some(vec![]))` returns
-        // `Some(ConfigOptionsUpdated { options: [] })` (not `None`).
-        let event =
-            config_options_event(Some(Vec::new())).expect("Some(vec![]) should produce an event");
+    fn fold_session_options_propagates_empty_snapshot() {
+        let cache = std::sync::Mutex::new(ModelChannelCache::default());
+        // A present-but-empty config_options snapshot from the adapter is
+        // a real full replacement and must clear stale cached selectors,
+        // so it returns `Some(ConfigOptionsUpdated { options: [] })`
+        // (not `None`). See #1403.
+        let event = fold_session_options(&cache, Some(Vec::new()), None)
+            .expect("Some(vec![]) should produce an event");
         match event {
             Event::ConfigOptionsUpdated { options } => {
                 assert!(options.is_empty());
             }
             other => panic!("expected empty ConfigOptionsUpdated, got {other:?}"),
         }
-        // Absent snapshot (the adapter omitted the field) still
-        // returns None so callers skip the emit.
-        assert!(config_options_event(None).is_none());
+        // Neither channel present (the adapter omitted both fields) still
+        // returns None so callers skip the emit and cached selectors
+        // persist.
+        assert!(fold_session_options(&cache, None, None).is_none());
+    }
+
+    fn sample_session_model() -> SessionModelState {
+        SessionModelState::new(
+            "sonnet",
+            vec![
+                agent_client_protocol::schema::ModelInfo::new("sonnet", "Claude Sonnet"),
+                agent_client_protocol::schema::ModelInfo::new("opus", "Claude Opus"),
+            ],
+        )
+    }
+
+    fn model_config_option(current: &str) -> ConfigOptionDescriptor {
+        ConfigOptionDescriptor {
+            id: "real-model".to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: ConfigOptionCategory::Model,
+            current_value: current.to_string(),
+            options: vec![ConfigOptionChoice {
+                value: current.to_string(),
+                name: current.to_string(),
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn normalize_synthesizes_model_selector_from_unstable_state() {
+        let cache = ModelChannelCache {
+            raw_config_options: Vec::new(),
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1);
+        let model = &out[0];
+        assert_eq!(model.id, ACP_SESSION_MODEL_CONFIG_ID);
+        assert_eq!(model.category, ConfigOptionCategory::Model);
+        assert_eq!(model.current_value, "sonnet");
+        assert_eq!(model.options.len(), 2);
+        assert_eq!(model.options[1].value, "opus");
+        assert_eq!(model.options[1].name, "Claude Opus");
+    }
+
+    #[test]
+    fn normalize_prefers_real_config_option_over_unstable_state() {
+        // When the agent exposes BOTH a real config_option model and the
+        // unstable session_model, the config_option wins and the
+        // synthetic selector is dropped so the UI shows one dropdown.
+        let cache = ModelChannelCache {
+            raw_config_options: vec![model_config_option("real-current")],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real-model");
+        assert!(out.iter().all(|o| o.id != ACP_SESSION_MODEL_CONFIG_ID));
+    }
+
+    #[test]
+    fn normalize_appends_model_to_non_model_options() {
+        let cache = ModelChannelCache {
+            raw_config_options: vec![ConfigOptionDescriptor {
+                id: "effort".to_string(),
+                name: "Reasoning".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "medium".to_string(),
+                options: Vec::new(),
+            }],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "effort");
+        assert_eq!(out[1].id, ACP_SESSION_MODEL_CONFIG_ID);
+    }
+
+    #[test]
+    fn renormalize_keeps_model_when_update_omits_it() {
+        // Regression: a config_option_update that carries only an
+        // unrelated option must NOT wipe the synthetic model selector,
+        // because the UI treats ConfigOptionsUpdated as a full
+        // replacement. See #1820.
+        let cache = std::sync::Mutex::new(ModelChannelCache {
+            raw_config_options: Vec::new(),
+            session_model: Some(sample_session_model()),
+        });
+        let update = vec![Event::ConfigOptionsUpdated {
+            options: vec![ConfigOptionDescriptor {
+                id: "effort".to_string(),
+                name: "Reasoning".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "high".to_string(),
+                options: Vec::new(),
+            }],
+        }];
+        let out = renormalize_model_events(update, &cache);
+        match &out[0] {
+            Event::ConfigOptionsUpdated { options } => {
+                assert!(options.iter().any(|o| o.id == ACP_SESSION_MODEL_CONFIG_ID));
+                assert!(options.iter().any(|o| o.id == "effort"));
+            }
+            other => panic!("expected ConfigOptionsUpdated, got {other:?}"),
+        }
     }
 
     #[test]

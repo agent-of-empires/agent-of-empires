@@ -148,7 +148,7 @@ jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # Agent Client Protocol — drives the structured view surface bundled with `serve`.
-agent-client-protocol = { version = "0.11", optional = true, features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "0.11", optional = true, features = ["unstable_session_usage", "unstable_session_model"] }
 agent-client-protocol-tokio = { version = "0.11", optional = true }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
