@@ -131,8 +131,12 @@ mod tests {
         counters.record("web");
         let snap = counters.snapshot();
         // Exactly the allowlist, no more, no less; untouched signals are zero.
+        // `snap` is a BTreeMap, so its keys come out sorted; compare against the
+        // registry sorted the same way rather than relying on its source order.
         let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
-        assert_eq!(keys, USAGE_SIGNALS);
+        let mut expected: Vec<&str> = USAGE_SIGNALS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
         assert_eq!(snap.get("web"), Some(&2));
         assert_eq!(snap.get("cockpit"), Some(&0));
         // zeroed() (the TUI shape) matches the same key set.

@@ -204,8 +204,12 @@ fn usage_seen_keys_are_only_allowlisted_short_names() {
     let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], usage_signals::zeroed(), 0)
         .expect("snapshot built when opted in");
 
+    // `usage_seen` is a BTreeMap, so its keys come out sorted; compare against
+    // the registry sorted the same way rather than relying on its source order.
     let keys: Vec<&str> = snapshot.usage_seen.keys().map(String::as_str).collect();
-    assert_eq!(keys, USAGE_SIGNALS);
+    let mut expected: Vec<&str> = USAGE_SIGNALS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
     for key in snapshot.usage_seen.keys() {
         assert!(
             key.chars()
