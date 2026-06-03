@@ -53,15 +53,17 @@ fn cockpit_command_fields(
     spec: Option<&crate::cockpit::AgentSpec>,
     data_dir: Option<&std::path::Path>,
 ) -> (Option<String>, Vec<String>) {
+    let substitute = |value: &str| match data_dir {
+        Some(dir) if value.contains("${aoe_data_dir}") => {
+            value.replace("${aoe_data_dir}", &dir.to_string_lossy())
+        }
+        _ => value.to_string(),
+    };
     match spec {
         Some(spec) => {
-            let mut command = spec.command.clone();
-            if command.contains("${aoe_data_dir}") {
-                if let Some(dir) = data_dir {
-                    command = command.replace("${aoe_data_dir}", &dir.to_string_lossy());
-                }
-            }
-            (Some(command), spec.args.clone())
+            let command = substitute(&spec.command);
+            let args = spec.args.iter().map(|arg| substitute(arg)).collect();
+            (Some(command), args)
         }
         None => (None, Vec::new()),
     }
