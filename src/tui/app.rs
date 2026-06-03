@@ -193,19 +193,19 @@ impl App {
     /// dictation that punctuates with a return) lands as a single
     /// burst `[h, i, Enter]` whose string is `"hi\n"`. The current
     /// code forwards that whole string through `handle_paste`, which
-    /// inserts `\n` as a literal newline in the textarea — the
+    /// inserts `\n` as a literal newline in the textarea, so the
     /// `Enter` never reaches the dialog's Submit branch and the
     /// message never sends.
     ///
     /// The fix preserves embedded `\n` (mid-burst sentence breaks from
-    /// Mosh-stripped voice paste — the original reason Enter was added
+    /// Mosh-stripped voice paste; the original reason Enter was added
     /// to `is_burst_candidate`) and only peels the trailing Enter,
     /// which is intent-to-submit, not data.
     ///
     /// Returns `(paste_text, trailing_enter)`:
-    ///   * `paste_text` — the string to forward to `handle_paste` with
+    ///   * `paste_text`: the string to forward to `handle_paste` with
     ///     any trailing `\n` removed.
-    ///   * `trailing_enter` — `Some(KeyEvent)` to replay via
+    ///   * `trailing_enter`: `Some(KeyEvent)` to replay via
     ///     `handle_key` after `handle_paste` runs, so the dialog's
     ///     plain-Enter Submit branch fires; `None` if the burst did
     ///     not end on Enter.
