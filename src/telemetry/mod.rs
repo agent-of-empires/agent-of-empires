@@ -26,8 +26,10 @@ mod state;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub use events::{ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
-pub use state::{cli_process_start_due, install_id, record_cli_process_start, reset_install_id};
+pub use events::{CliUsage, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
+pub use state::{
+    cli_usage_due, install_id, record_cli_command, record_cli_usage_flush, reset_install_id,
+};
 
 use crate::session::Instance;
 
@@ -52,16 +54,17 @@ const DEFAULT_ENDPOINT: &str = "https://telemetry.agent-of-empires.com/v1/ingest
 /// gateway must be configured to require this exact value.
 const TELEMETRY_KEY: &str = "7bc5a4e45ce861662b9690a7105da988";
 
-/// CLI `process_start` is the only unbounded event source (one per `aoe`
-/// invocation), so it is throttled to at most once per install per day. That
-/// still answers "did this install run the CLI today" without a POST per
-/// command.
-const CLI_PROCESS_START_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
+/// CLI `cli_usage` is the only unbounded event source (one per `aoe`
+/// invocation could accumulate counts), so its flush is throttled to at most
+/// once per install per day. Per-command counts accumulate on disk between
+/// flushes, so a single daily POST still answers "which commands did this
+/// install run" without a POST per command.
+const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Retry backoff after a *failed* CLI `process_start` send. While the daily slot
+/// Retry backoff after a *failed* CLI `cli_usage` send. While the daily slot
 /// stays open (a failed send never claims it), this bounds re-attempts to once
 /// per hour so a down endpoint can't make every `aoe` invocation re-send.
-const CLI_PROCESS_START_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
+const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// True when `DO_NOT_TRACK` is set to an affirmative value. This is the
 /// absolute override: it wins over `config.telemetry.enabled`.
@@ -274,38 +277,70 @@ pub fn spawn_process_start(surface: Surface) {
     }
 }
 
-/// Emit a `process_start`, awaiting delivery with a hard timeout so the event
-/// has a chance to flush before the process exits. Returns whether delivery was
-/// *confirmed* (a 2xx), so a throttled caller can defer claiming its slot until
-/// the send actually succeeds. Bounded by the connect and send timeouts, so a
-/// dead endpoint can never hang the caller; a no-op (returns `false`) for the
-/// common default-off (not opted in) case.
-pub async fn flush_process_start(surface: Surface) -> bool {
-    let Some(event) = build_process_start(surface) else {
-        return false;
-    };
-    matches!(
-        tokio::time::timeout(SEND_TIMEOUT, post(&event)).await,
-        Ok(true)
-    )
+/// Build a `cli_usage` event from the accumulated per-command counts, or `None`
+/// when not opted in or there is nothing to report. Every key is filtered
+/// against the closed [`crate::cli::CLI_COMMAND_NAMES`] allowlist, so a
+/// hand-edited or corrupt `telemetry.json` can never smuggle an arbitrary
+/// string onto the wire: the in-process recorder only ever writes allowlisted
+/// names, and this is the defense-in-depth re-check before sending.
+pub fn build_cli_usage() -> Option<CliUsage> {
+    if !is_opted_in() {
+        return None;
+    }
+    let (counts, window_start) = state::cli_usage_window();
+    let command_counts: BTreeMap<String, u32> = counts
+        .into_iter()
+        .filter(|(name, _)| crate::cli::CLI_COMMAND_NAMES.contains(&name.as_str()))
+        .collect();
+    if command_counts.is_empty() {
+        return None;
+    }
+    let install_id = state::ensure_install_id()?;
+    let window_start = window_start
+        .map(|w| w.to_rfc3339())
+        .unwrap_or_else(now_rfc3339);
+    Some(CliUsage {
+        schema: SCHEMA_VERSION,
+        event: "cli_usage",
+        install_id,
+        sent_at: now_rfc3339(),
+        surface: Surface::Cli,
+        aoe_version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        window_start,
+        command_counts,
+    })
 }
 
-/// CLI entrypoint for `process_start`: same as [`flush_process_start`] for the
-/// `cli` surface, but throttled to at most once per install per day so a user
-/// scripting `aoe` in a loop can't flood the endpoint. The daily slot is claimed
-/// only after the send is *confirmed*, so a failed send leaves it open for the
-/// next invocation to retry (bounded by [`CLI_PROCESS_START_RETRY_GAP`] so a down
-/// endpoint can't make every invocation re-send). Nothing touches disk unless
-/// opted in and a send is actually due.
-pub async fn flush_cli_process_start() {
-    if !is_opted_in() {
+/// Record one CLI subcommand invocation and flush the accumulated `cli_usage`
+/// event if a send is due. Called once per `aoe <subcommand>` run.
+///
+/// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
+/// is a non-creating check, so app-data-free commands (`aoe completion`,
+/// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
+/// keep working in read-only / sandboxed environments. The daily slot is claimed
+/// only after a *confirmed* send, so a failed send leaves the counts and the slot
+/// intact for the next invocation to retry (bounded by [`CLI_USAGE_RETRY_GAP`]).
+/// Awaited with a hard timeout so a dead endpoint can never hang the CLI's exit.
+pub async fn track_cli_command(name: &str) {
+    // Cheap non-creating gate first: opt-in creates the app dir, so its absence
+    // means the install cannot be opted in, and we must not create it here.
+    if !crate::session::app_dir_exists() || !is_opted_in() {
         return;
     }
-    if !cli_process_start_due(CLI_PROCESS_START_MIN_GAP, CLI_PROCESS_START_RETRY_GAP) {
+    state::record_cli_command(name);
+    if !cli_usage_due(CLI_USAGE_MIN_GAP, CLI_USAGE_RETRY_GAP) {
         return;
     }
-    let confirmed = flush_process_start(Surface::Cli).await;
-    record_cli_process_start(confirmed);
+    let Some(event) = build_cli_usage() else {
+        return;
+    };
+    let confirmed = matches!(
+        tokio::time::timeout(SEND_TIMEOUT, post(&event)).await,
+        Ok(true)
+    );
+    record_cli_usage_flush(confirmed);
 }
 
 /// Fingerprint of the last `usage_snapshot` whose send we initiated this
