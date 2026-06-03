@@ -119,6 +119,8 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
         return None;
     }
     let install_id = state::ensure_install_id()?;
+    let (update_status, update_releases_behind) =
+        crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
     Some(ProcessStart {
         schema: SCHEMA_VERSION,
         event: "process_start",
@@ -128,6 +130,9 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        data_schema_version: crate::migrations::current_schema_version(),
+        update_status,
+        update_releases_behind,
     })
 }
 
@@ -198,6 +203,8 @@ pub fn build_usage_snapshot(
             .or_insert(0) += 1;
     }
 
+    let (update_status, update_releases_behind) =
+        crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
     Some(UsageSnapshot {
         schema: SCHEMA_VERSION,
         event: "usage_snapshot",
@@ -207,6 +214,9 @@ pub fn build_usage_snapshot(
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        data_schema_version: crate::migrations::current_schema_version(),
+        update_status,
+        update_releases_behind,
         session_total: instances.len() as u32,
         session_running: running,
         session_idle: idle,
@@ -459,6 +469,9 @@ mod tests {
             aoe_version: "0.0.0".to_string(),
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
+            data_schema_version: 11,
+            update_status: crate::update::UpdateStatus::Current,
+            update_releases_behind: crate::update::ReleasesBehind::Current,
             session_total: 7,
             session_running: 1,
             session_idle: 6,

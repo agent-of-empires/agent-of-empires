@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Payload schema version. Bump on any breaking change to the field set.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: added version-health fields (`data_schema_version`, `update_status`,
+/// `update_releases_behind`) to both events. See issue #1887.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,6 +51,14 @@ pub struct ProcessStart {
     pub aoe_version: String,
     pub os: String,
     pub arch: String,
+
+    /// On-disk data-schema version this build targets (`migrations::CURRENT_VERSION`).
+    /// A small integer, never a version string.
+    pub data_schema_version: u32,
+    /// Coarse update-staleness by semver distance, from the cached update check.
+    pub update_status: crate::update::UpdateStatus,
+    /// Coarse "how many releases behind", counted from the cached release list.
+    pub update_releases_behind: crate::update::ReleasesBehind,
 }
 
 /// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
@@ -65,6 +76,14 @@ pub struct UsageSnapshot {
     pub aoe_version: String,
     pub os: String,
     pub arch: String,
+
+    /// On-disk data-schema version this build targets (`migrations::CURRENT_VERSION`).
+    /// A small integer, never a version string.
+    pub data_schema_version: u32,
+    /// Coarse update-staleness by semver distance, from the cached update check.
+    pub update_status: crate::update::UpdateStatus,
+    /// Coarse "how many releases behind", counted from the cached release list.
+    pub update_releases_behind: crate::update::ReleasesBehind,
 
     pub session_total: u32,
     pub session_running: u32,
