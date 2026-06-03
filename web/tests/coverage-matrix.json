@@ -1577,6 +1577,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": [
+        "src/components/cockpit/CockpitRuntime.test.ts",
         "src/components/cockpit/ToolCards.render.test.tsx",
         "src/lib/agentProfiles.test.ts",
         "src/lib/cockpitTypes.test.ts"
