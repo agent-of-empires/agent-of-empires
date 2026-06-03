@@ -182,6 +182,72 @@ describe("applyEvent / UserPromptSent", () => {
     expect(state.inFlightTool).toBeNull();
   });
 
+  it("carries structured media output from ToolCallCompleted.output", () => {
+    // #1818: a completion can ship images/audio/resources that the text
+    // concat drops. The reducer must attach the structured blocks to the
+    // tool_complete row so the card renders them.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-img",
+            name: "screenshot",
+            kind: "other",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallCompleted: {
+          tool_call_id: "tc-img",
+          is_error: false,
+          content: "",
+          output: [
+            { kind: "image", mime_type: "image/png", data: "BASE64" },
+            {
+              kind: "resource_link",
+              uri: "file:///report.pdf",
+              name: "report.pdf",
+            },
+          ],
+        },
+      },
+    });
+    const done = state.activity.find((a) => a.id === "done-tc-img");
+    expect(done).toBeDefined();
+    expect(done!.output).toHaveLength(2);
+    expect(done!.output![0]).toMatchObject({
+      kind: "image",
+      mime_type: "image/png",
+    });
+    // Text fallback still applies for the collapsed label.
+    expect(done!.text).toBe("completed");
+  });
+
+  it("omits output on a text-only completion", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallCompleted: {
+          tool_call_id: "tc-plain",
+          is_error: false,
+          content: "done",
+        },
+      },
+    });
+    const done = state.activity.find((a) => a.id === "done-tc-plain");
+    expect(done).toBeDefined();
+    expect(done!.output).toBeUndefined();
+  });
+
   it("falls back to streamed ToolCallContent when completion has empty content", () => {
     // Some agents stream stdout via interim ToolCallUpdate notifications
     // (status=in_progress with content) and emit a final completion

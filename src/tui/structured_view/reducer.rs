@@ -21,7 +21,32 @@
 
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::protocol::AcpBroadcastFrame;
-use crate::acp::state::{AvailableCommand, Event, PlanStepStatus};
+use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, ToolOutputBlock};
+
+/// Render the structured completion payload as a single text block for the
+/// native TUI, which can't display images/audio inline. Media variants
+/// become a `[kind mime]` placeholder; text + text-resources show their
+/// text; links/blobs show their uri. See #1818.
+fn summarize_output_blocks(blocks: &[ToolOutputBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ToolOutputBlock::Text { text } => text.clone(),
+            ToolOutputBlock::Image { mime_type, .. } => format!("[image {mime_type}]"),
+            ToolOutputBlock::Audio { mime_type, .. } => format!("[audio {mime_type}]"),
+            ToolOutputBlock::ResourceLink { name, uri, .. } => format!("[link {name}: {uri}]"),
+            ToolOutputBlock::Resource {
+                uri,
+                text: Some(text),
+                ..
+            } => format!("{text}\n[resource {uri}]"),
+            ToolOutputBlock::Resource {
+                uri, text: None, ..
+            } => format!("[resource {uri}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Debug, Clone)]
 pub struct AcpTranscript {
@@ -289,14 +314,23 @@ impl AcpTranscript {
                 tool_call_id,
                 is_error,
                 content,
+                output,
                 ..
             } => {
                 self.flush_pending_chunk();
                 if let Some(&idx) = self.tool_idx.get(tool_call_id) {
                     if let Some(ActivityRow::ToolCall(row)) = self.rows.get_mut(idx) {
+                        // The terminal can't render images/audio inline, so a
+                        // media completion shows a textual placeholder instead
+                        // of collapsing to the status word. See #1818.
+                        let text = if output.is_empty() {
+                            content.clone()
+                        } else {
+                            summarize_output_blocks(output)
+                        };
                         row.completed = Some(ToolCompletion {
                             ok: !is_error,
-                            content: content.clone(),
+                            content: text,
                         });
                     }
                 }
@@ -614,6 +648,7 @@ mod tests {
                 tool_call_id: "t-1".into(),
                 is_error: false,
                 content: "ok".into(),
+                output: Vec::new(),
                 completed_at: Utc::now(),
             },
         ));

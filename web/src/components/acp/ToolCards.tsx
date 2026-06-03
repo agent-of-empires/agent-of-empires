@@ -24,10 +24,14 @@ import {
   ChevronDown,
   Clock,
   Copy as CopyIcon,
+  FileDown,
   FileText,
   Globe,
+  Image as ImageIcon,
   Layers,
+  Link as LinkIcon,
   ListChecks,
+  Music,
   Pencil,
   Plug,
   Search,
@@ -51,7 +55,11 @@ import {
   todoItemsFromArgs,
 } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import type {
+  ActivityRow,
+  ToolCall,
+  ToolOutputBlock,
+} from "../../lib/acpTypes";
 import { diffPair } from "../../lib/diffPair";
 import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
@@ -105,10 +113,140 @@ interface ToolCardProps extends Props {
 export function ToolCard({ tool, result, nested }: ToolCardProps) {
   const profile = useAgentProfile();
   const card = renderToolCard(tool, result, profile);
+  // Structured media/resources the agent shipped at completion render
+  // below the per-kind card, regardless of tool kind. See #1818.
+  const media = result?.output?.length ? (
+    <ToolOutputMedia blocks={result.output} />
+  ) : null;
+  const content = media ? (
+    <>
+      {card}
+      {media}
+    </>
+  ) : (
+    card
+  );
   if (!nested && hasSubagentParent(tool)) {
-    return <SubagentChildWrap>{card}</SubagentChildWrap>;
+    return <SubagentChildWrap>{content}</SubagentChildWrap>;
   }
-  return card;
+  return content;
+}
+
+/** Render a tool call's structured completion payload (#1818). Images and
+ *  audio render inline (preferring an embedded base64 payload, falling back
+ *  to a `uri`); resource links and binary resources become download links;
+ *  text and text-resources render as plain blocks. A media block with no
+ *  inline data and no uri degrades to a labelled placeholder so the output
+ *  is never silently dropped. */
+function ToolOutputMedia({ blocks }: { blocks: ToolOutputBlock[] }) {
+  return (
+    <div className="my-1 space-y-2 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 p-3 text-sm">
+      {blocks.map((block, i) => (
+        <ToolOutputBlockView key={i} block={block} />
+      ))}
+    </div>
+  );
+}
+
+function dataUri(mimeType: string, data: string): string {
+  return `data:${mimeType};base64,${data}`;
+}
+
+function MediaPlaceholder({
+  icon,
+  label,
+}: {
+  icon: ReactNode;
+  label: string;
+}) {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-text-dim italic">
+      <span className="text-text-dim">{icon}</span>
+      {label}
+    </div>
+  );
+}
+
+function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
+  switch (block.kind) {
+    case "text":
+      return (
+        <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
+          {block.text}
+        </pre>
+      );
+    case "image": {
+      const src = block.data
+        ? dataUri(block.mime_type, block.data)
+        : (block.uri ?? null);
+      if (!src) {
+        return (
+          <MediaPlaceholder
+            icon={<ImageIcon className="h-3.5 w-3.5" />}
+            label={`image (${block.mime_type})`}
+          />
+        );
+      }
+      return (
+        <img
+          src={src}
+          alt={`tool output image (${block.mime_type})`}
+          className="max-h-80 max-w-full rounded border border-surface-700 object-contain"
+        />
+      );
+    }
+    case "audio": {
+      if (!block.data) {
+        return (
+          <MediaPlaceholder
+            icon={<Music className="h-3.5 w-3.5" />}
+            label={`audio (${block.mime_type})`}
+          />
+        );
+      }
+      return (
+        <audio
+          controls
+          src={dataUri(block.mime_type, block.data)}
+          className="w-full"
+        />
+      );
+    }
+    case "resource_link":
+      return (
+        <a
+          href={block.uri}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+        >
+          <LinkIcon className="h-3.5 w-3.5" />
+          {block.name}
+        </a>
+      );
+    case "resource": {
+      if (block.text != null) {
+        return (
+          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
+            {block.text}
+          </pre>
+        );
+      }
+      return (
+        <a
+          href={block.uri}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+        >
+          <FileDown className="h-3.5 w-3.5" />
+          {block.uri}
+        </a>
+      );
+    }
+    default:
+      return null;
+  }
 }
 
 function renderToolCard(

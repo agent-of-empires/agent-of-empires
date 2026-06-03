@@ -82,6 +82,23 @@ export interface DiffPreview {
   created_at: string;
 }
 
+/** One renderable block of a tool call's completion payload, bridged from
+ *  an ACP `ToolCallContent` block (mirrors the Rust `ToolOutputBlock`).
+ *  Carries the structured media shape so the card renders images / audio /
+ *  resources that arrive only at completion instead of collapsing them to
+ *  the status word. See #1818. */
+export type ToolOutputBlock =
+  | { kind: "text"; text: string }
+  | { kind: "image"; mime_type: string; data?: string | null; uri?: string | null }
+  | { kind: "audio"; mime_type: string; data?: string | null }
+  | { kind: "resource_link"; uri: string; name: string; mime_type?: string | null }
+  | {
+      kind: "resource";
+      uri: string;
+      mime_type?: string | null;
+      text?: string | null;
+    };
+
 export interface RateLimitInfo {
   status: string;
   resets_at: string;
@@ -221,6 +238,10 @@ export type AcpEvent =
          *  ACP `ToolCallUpdate.fields.content`. Empty when the agent
          *  emitted no content blocks on completion. */
         content: string;
+        /** Structured completion payload (images / audio / resources +
+         *  text) bridged from the ACP content blocks. Empty/absent for
+         *  text-only completions, which render from `content`. See #1818. */
+        output?: ToolOutputBlock[];
         /** Server-side ISO-8601 wall clock at which the completion
          *  was minted. Used to stamp the activity row's `at` so the
          *  duration label survives page reload; without it, the
@@ -660,6 +681,11 @@ export interface ActivityRow {
    *  Set from the optimistic local preview on send, or from the
    *  server `UserPromptSent` refs on replay. See #1000 / #965. */
   attachments?: AcpAttachment[];
+  /** Structured completion payload on `tool_complete` / `tool_error`
+   *  rows: media/resource blocks the card renders richly when the agent
+   *  ships them only at completion. Absent for text-only completions
+   *  (those render from `text`). See #1818. */
+  output?: ToolOutputBlock[];
   at: string; // ISO-8601
 }
 
@@ -915,7 +941,7 @@ export function applyEvent(
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, completed_at } =
+    const { tool_call_id, is_error, content, output, completed_at } =
       event.ToolCallCompleted;
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
@@ -959,6 +985,7 @@ export function applyEvent(
       kind: is_error ? "tool_error" : "tool_complete",
       text,
       toolCallId: tool_call_id,
+      output: output && output.length > 0 ? output : undefined,
       at: completed_at ?? new Date().toISOString(),
     });
     return next;

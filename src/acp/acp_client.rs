@@ -51,7 +51,7 @@ use super::state::{
     AcpSessionId, AvailableCommand, ConfigOptionCategory, ConfigOptionChoice,
     ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
     PlanStepStatus, PromptAttachmentKind, RateLimitInfo, SessionMode, SessionUsage,
-    StartupErrorDetail, ToolCall, UsageCost,
+    StartupErrorDetail, ToolCall, ToolOutputBlock, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
 use crate::session::SandboxInfo;
@@ -2924,6 +2924,19 @@ fn map_update_to_events(
                 .as_ref()
                 .filter(|value| !value.is_null())
                 .map(preview_args);
+            // Structured completion payload: media/resource blocks that the
+            // text concat above drops. Only extracted on the terminal frame
+            // (the card renders it once on completion). See #1818.
+            let output_blocks = if completed {
+                update
+                    .fields
+                    .content
+                    .as_ref()
+                    .map(|blocks| extract_tool_output_blocks(blocks))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
             if new_title.is_some()
@@ -2948,6 +2961,7 @@ fn map_update_to_events(
                     tool_call_id: id,
                     is_error,
                     content: content_text,
+                    output: output_blocks,
                     completed_at: chrono::Utc::now(),
                 });
             } else if !content_text.is_empty() {
@@ -3045,6 +3059,7 @@ fn map_update_to_events(
                     tool_call_id: tool_id,
                     is_error: false,
                     content: String::new(),
+                    output: Vec::new(),
                     completed_at: now,
                 },
             ]
@@ -3525,6 +3540,7 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
             tool_call_id: tool_call_id.to_string(),
             is_error: true,
             content: content.to_string(),
+            output: Vec::new(),
             completed_at: chrono::Utc::now(),
         })
         .await;
@@ -3548,6 +3564,99 @@ fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallCo
         }
     }
     out
+}
+
+/// Max base64 length kept for an inline image/audio payload. Media this
+/// large is persisted in the event store and reshipped on every WS replay,
+/// so an oversized blob would bloat both; past the cap the inline data is
+/// dropped (a placeholder/uri is surfaced instead). ~4 MiB of base64 is
+/// ~3 MiB of bytes, comfortably above a typical screenshot.
+const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
+
+/// Bridge an ACP `ToolCallContent` array into the cockpit's renderable
+/// `ToolOutputBlock` list, preserving non-text completion payloads (images,
+/// audio, resource links/contents) that `extract_tool_content_text` drops.
+/// Diff blocks are bridged separately (`extract_diffs_from_content`) and are
+/// skipped here; an embedded terminal surfaces as a text placeholder since
+/// cockpit does not own ACP terminals. Returns an EMPTY vec when every block
+/// is plain text (or diff): the existing `content` text path renders those,
+/// so the structured list only carries weight when real media is present.
+/// See #1818.
+fn extract_tool_output_blocks(
+    blocks: &[agent_client_protocol::schema::ToolCallContent],
+) -> Vec<ToolOutputBlock> {
+    use agent_client_protocol::schema::{EmbeddedResourceResource, ToolCallContent};
+    let mut out: Vec<ToolOutputBlock> = Vec::new();
+    let mut has_media = false;
+    let cap =
+        |data: String| -> Option<String> { (data.len() <= MAX_INLINE_MEDIA_B64).then_some(data) };
+    for block in blocks {
+        match block {
+            ToolCallContent::Content(c) => match &c.content {
+                ContentBlock::Text(t) => out.push(ToolOutputBlock::Text {
+                    text: t.text.clone(),
+                }),
+                ContentBlock::Image(img) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::Image {
+                        mime_type: img.mime_type.clone(),
+                        data: cap(img.data.clone()),
+                        uri: img.uri.clone(),
+                    });
+                }
+                ContentBlock::Audio(audio) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::Audio {
+                        mime_type: audio.mime_type.clone(),
+                        data: cap(audio.data.clone()),
+                    });
+                }
+                ContentBlock::ResourceLink(link) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::ResourceLink {
+                        uri: link.uri.clone(),
+                        name: link.name.clone(),
+                        mime_type: link.mime_type.clone(),
+                    });
+                }
+                ContentBlock::Resource(res) => {
+                    has_media = true;
+                    let block = match &res.resource {
+                        EmbeddedResourceResource::TextResourceContents(t) => {
+                            ToolOutputBlock::Resource {
+                                uri: t.uri.clone(),
+                                mime_type: t.mime_type.clone(),
+                                text: Some(t.text.clone()),
+                            }
+                        }
+                        EmbeddedResourceResource::BlobResourceContents(b) => {
+                            ToolOutputBlock::Resource {
+                                uri: b.uri.clone(),
+                                mime_type: b.mime_type.clone(),
+                                text: None,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    out.push(block);
+                }
+                _ => {}
+            },
+            ToolCallContent::Terminal(term) => {
+                has_media = true;
+                out.push(ToolOutputBlock::Text {
+                    text: format!("[terminal {}]", term.terminal_id.0),
+                });
+            }
+            ToolCallContent::Diff(_) => {}
+            _ => {}
+        }
+    }
+    if has_media {
+        out
+    } else {
+        Vec::new()
+    }
 }
 
 /// Inspect a `tool_call` payload for the `memory_recall` shape
@@ -7289,6 +7398,7 @@ mod tests {
                 is_error,
                 content,
                 completed_at: _,
+                ..
             } => {
                 assert_eq!(tool_call_id, "tc-1");
                 assert!(!*is_error);
@@ -7497,6 +7607,87 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("[truncated]"));
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_empty_for_text_only() {
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        // Pure text completion: the `content` string path renders it, so the
+        // structured list stays empty and the existing path is untouched.
+        let blocks = vec![ToolCallContent::Content(Content::new("just text"))];
+        assert!(extract_tool_output_blocks(&blocks).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_preserves_media_and_resources() {
+        use agent_client_protocol::schema::{
+            AudioContent, Content, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
+            ImageContent, ResourceLink, TextResourceContents, ToolCallContent,
+        };
+        let blocks =
+            vec![
+                ToolCallContent::Content(Content::new("a caption")),
+                ToolCallContent::Content(Content::new(ContentBlock::Image(
+                    ImageContent::new("BASE64IMG", "image/png").uri("file:///shot.png".to_string()),
+                ))),
+                ToolCallContent::Content(Content::new(ContentBlock::Audio(AudioContent::new(
+                    "BASE64AUDIO",
+                    "audio/wav",
+                )))),
+                ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
+                    ResourceLink::new("report.pdf", "file:///report.pdf"),
+                ))),
+                ToolCallContent::Content(Content::new(ContentBlock::Resource(
+                    EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+                        TextResourceContents::new("inline body", "file:///note.txt"),
+                    )),
+                ))),
+            ];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 5, "all blocks preserved in order: {out:?}");
+        assert!(matches!(&out[0], ToolOutputBlock::Text { text } if text == "a caption"));
+        match &out[1] {
+            ToolOutputBlock::Image {
+                mime_type,
+                data,
+                uri,
+            } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data.as_deref(), Some("BASE64IMG"));
+                assert_eq!(uri.as_deref(), Some("file:///shot.png"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        assert!(
+            matches!(&out[2], ToolOutputBlock::Audio { mime_type, .. } if mime_type == "audio/wav")
+        );
+        assert!(
+            matches!(&out[3], ToolOutputBlock::ResourceLink { name, uri, .. } if name == "report.pdf" && uri == "file:///report.pdf")
+        );
+        assert!(
+            matches!(&out[4], ToolOutputBlock::Resource { text: Some(t), .. } if t == "inline body")
+        );
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_drops_oversized_inline_media() {
+        use agent_client_protocol::schema::{Content, ContentBlock, ImageContent, ToolCallContent};
+        let huge = "A".repeat(MAX_INLINE_MEDIA_B64 + 1);
+        let blocks = vec![ToolCallContent::Content(Content::new(ContentBlock::Image(
+            ImageContent::new(huge, "image/png"),
+        )))];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 1);
+        // Oversized inline data is dropped (no uri to fall back on) but the
+        // block survives so the card still shows the media placeholder.
+        assert!(matches!(
+            &out[0],
+            ToolOutputBlock::Image {
+                data: None,
+                uri: None,
+                ..
+            }
+        ));
     }
 
     #[test]

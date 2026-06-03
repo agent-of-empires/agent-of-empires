@@ -1368,6 +1368,19 @@
       ]
     },
     {
+      "id": "acp.tool-output-media",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
       "id": "acp.rate-limit-recovery",
       "kind": "vitest",
       "risk": "high",
