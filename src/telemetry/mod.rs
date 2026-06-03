@@ -523,7 +523,7 @@ mod tests {
             session_yolo: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
-            sessions_by_substrate: BTreeMap::new(),
+            sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
             features: BTreeMap::new(),
             web_seen: false,
             cockpit_seen: false,
