@@ -95,10 +95,43 @@ impl Drop for StateFlock {
 
 /// Acquire the exclusive advisory flock on `<app_dir>/.telemetry.lock`, polling
 /// `try_lock_exclusive` until granted or [`LOCK_ACQUIRE_BUDGET`] elapses. Bounded
-/// (unlike the storage flock's indefinite wait) because telemetry must never
-/// block the caller. Open semantics mirror the storage / logging locks
-/// (read+write, create, no truncate, `0o600` on Unix).
+/// (unlike the storage flock's indefinite wait) because fire-and-forget telemetry
+/// must never block the caller. User-initiated mutations use
+/// [`acquire_state_flock_blocking`] instead.
 fn acquire_state_flock() -> Result<StateFlock> {
+    let file = open_state_lock_file()?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(StateFlock { file }),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= LOCK_ACQUIRE_BUDGET {
+                    anyhow::bail!("telemetry state lock contended beyond budget");
+                }
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Acquire the exclusive flock with a *blocking* wait, for user-initiated
+/// mutations (opt-out / `reset-id`) whose documented contract is that the file
+/// is actually deleted. Unlike [`acquire_state_flock`], it does not give up on
+/// contention: the bounded skip is right for fire-and-forget telemetry, but an
+/// explicit opt-out must not silently leave `telemetry.json` behind. The kernel
+/// releases the lock on fd close / process exit, so a crashed peer can't wedge
+/// this forever.
+fn acquire_state_flock_blocking() -> Result<StateFlock> {
+    let file = open_state_lock_file()?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(StateFlock { file })
+}
+
+/// Open (creating if needed) the sidecar lock file. Shared by the bounded and
+/// blocking acquire paths. Open semantics mirror the storage / logging locks
+/// (read+write, create, no truncate, `0o600` on Unix).
+fn open_state_lock_file() -> Result<std::fs::File> {
     let path = get_app_dir()?.join(STATE_LOCK_FILENAME);
     #[cfg(unix)]
     let file = {
@@ -118,20 +151,7 @@ fn acquire_state_flock() -> Result<StateFlock> {
         .create(true)
         .truncate(false)
         .open(&path)?;
-
-    let started = Instant::now();
-    loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(StateFlock { file }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if started.elapsed() >= LOCK_ACQUIRE_BUDGET {
-                    anyhow::bail!("telemetry state lock contended beyond budget");
-                }
-                std::thread::sleep(LOCK_POLL_INTERVAL);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    Ok(file)
 }
 
 /// Run a `telemetry.json` read-modify-write under both the process-local mutex
@@ -212,7 +232,9 @@ pub fn delete_install_id() -> Result<()> {
     let _guard = STATE_RMW_MUTEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _flock = acquire_state_flock()?;
+    // Blocking acquire, not the fire-and-forget bounded one: an explicit opt-out
+    // must delete the file even under contention, per the documented contract.
+    let _flock = acquire_state_flock_blocking()?;
     let path = state_path()?;
     if path.exists() {
         std::fs::remove_file(&path)?;
