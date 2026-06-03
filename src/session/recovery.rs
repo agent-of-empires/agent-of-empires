@@ -265,6 +265,7 @@ pub const RECOVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lower bound on `AOE_RECOVERY_HOOK_TIMEOUT_MS` so a misconfigured test
 /// cannot race fork+exec and trip the timeout before the child spawns.
+#[cfg(debug_assertions)]
 const RECOVERY_HOOK_TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 
 /// Resolve the recovery hook timeout. Release builds always return
