@@ -143,6 +143,56 @@ fn snapshot_carries_session_create_count() {
     assert_eq!(some.session_creates_since_last_snapshot, 7);
 }
 
+/// User stories (#1873): every built event carries a non-empty per-event
+/// `uuid`, distinct from `install_id` and `sent_at`, and two events built in the
+/// same process get different uuids. This is the idempotency key the gateway
+/// forwards as the PostHog event `uuid` for native redelivery dedup.
+#[test]
+#[serial]
+fn events_carry_distinct_idempotency_uuid() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snap = telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    assert!(!snap.uuid.is_empty(), "snapshot uuid must be non-empty");
+    assert_ne!(
+        snap.uuid, snap.install_id,
+        "uuid must differ from install_id"
+    );
+    assert_ne!(snap.uuid, snap.sent_at, "uuid must differ from sent_at");
+    // It must serialize onto the wire so the gateway can read it.
+    let serialized = serde_json::to_string(&snap).expect("serialize");
+    assert!(
+        serialized.contains(&format!("\"uuid\":\"{}\"", snap.uuid)),
+        "uuid must be present in the serialized payload"
+    );
+
+    // Two events built in the same process must not collide.
+    let proc = telemetry::build_process_start(Surface::Cli).expect("process_start built");
+    let snap2 = telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0)
+        .expect("second snapshot built");
+    assert_ne!(
+        snap.uuid, snap2.uuid,
+        "two snapshots must get distinct uuids"
+    );
+    assert_ne!(
+        proc.uuid, snap.uuid,
+        "process_start and snapshot must get distinct uuids"
+    );
+}
+
+/// Opted out (the default): no event, and therefore no `uuid`, is ever built.
+#[test]
+#[serial]
+fn opted_out_builds_no_uuid() {
+    let _tmp = isolate();
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_process_start(Surface::Cli).is_none());
+    assert!(telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0).is_none());
+}
+
 /// The CLI `process_start` is throttled to once per install per day so a user
 /// scripting `aoe` in a loop can't flood the endpoint: a send is due first, then
 /// not due once a confirmed send claims the daily slot.

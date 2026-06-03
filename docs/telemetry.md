@@ -128,3 +128,12 @@ the install id and does all sending.
 booleans, or short identifier-like strings (and the two allowlisted bucket
 maps); the gateway drops free text, paths, branch-name-like strings, and any
 nested object, so anything richer than a count or flag will not survive ingest.
+
+**Idempotency key.** Every event carries a per-event `uuid`, a random v4 UUID
+minted once when the event is built. It is distinct from the install id (stable
+per install) and `sent_at` (a per-emit timestamp), and is stable across any
+redelivery of the same logical event. The gateway forwards it as the PostHog
+event `uuid`, so a retried or redelivered POST is recognized as the same event
+and deduped downstream rather than double-counted. It is excluded from the
+in-process snapshot dedup fingerprint, so two snapshots with identical content
+still compare equal.

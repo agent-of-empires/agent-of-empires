@@ -122,6 +122,7 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     Some(ProcessStart {
         schema: SCHEMA_VERSION,
         event: "process_start",
+        uuid: uuid::Uuid::new_v4().to_string(),
         install_id,
         sent_at: now_rfc3339(),
         surface,
@@ -201,6 +202,7 @@ pub fn build_usage_snapshot(
     Some(UsageSnapshot {
         schema: SCHEMA_VERSION,
         event: "usage_snapshot",
+        uuid: uuid::Uuid::new_v4().to_string(),
         install_id,
         sent_at: now_rfc3339(),
         surface,
@@ -317,14 +319,17 @@ pub async fn flush_cli_process_start() {
 /// re-sending back to back.
 static LAST_SNAPSHOT_FP: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
-/// Content fingerprint of a snapshot, excluding the volatile `sent_at` stamp.
-/// Everything else is included: `install_id` is stable per install, so two
-/// snapshots with the same counts hash equal. Used only for in-process dedup,
-/// never sent anywhere.
+/// Content fingerprint of a snapshot, excluding the volatile `sent_at` stamp
+/// and the per-emit random `uuid`. Everything else is included: `install_id` is
+/// stable per install, so two snapshots with the same counts hash equal. The
+/// `uuid` is freshly minted per build, so leaving it in would make every
+/// snapshot hash unique and defeat the exit-snapshot dedup entirely. Used only
+/// for in-process dedup, never sent anywhere.
 fn snapshot_fingerprint(snapshot: &UsageSnapshot) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut probe = snapshot.clone();
     probe.sent_at = String::new();
+    probe.uuid = String::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_string(&probe)
         .unwrap_or_default()
@@ -453,6 +458,7 @@ mod tests {
         UsageSnapshot {
             schema: SCHEMA_VERSION,
             event: "usage_snapshot",
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             install_id: "00000000-0000-0000-0000-000000000000".to_string(),
             sent_at: "2026-06-02T19:00:45Z".to_string(),
             surface: Surface::Tui,
@@ -489,14 +495,16 @@ mod tests {
         let boot = sample_snapshot();
         record_snapshot_fp(&boot);
 
-        // Quit right after, sessions unchanged: same content, newer stamp.
-        // The only difference is `sent_at`, which the fingerprint excludes, so
-        // the exit snapshot is recognised as a duplicate and not re-sent.
+        // Quit right after, sessions unchanged: same content, newer stamp and
+        // a freshly minted uuid. Both `sent_at` and `uuid` are per-emit and
+        // excluded from the fingerprint, so the exit snapshot is still
+        // recognised as a duplicate and not re-sent.
         let mut exit = sample_snapshot();
         exit.sent_at = "2026-06-02T19:00:47Z".to_string();
+        exit.uuid = "22222222-2222-4222-8222-222222222222".to_string();
         assert!(
             snapshot_matches_last(&exit),
-            "an unchanged exit snapshot must dedupe against the boot snapshot"
+            "an unchanged exit snapshot must dedupe against the boot snapshot despite a new uuid"
         );
 
         // A snapshot whose counts actually changed is not a duplicate, so it
