@@ -136,15 +136,17 @@ back to the generic one-liner (name, arguments, output snapshot).
 
 **Structured completion payloads.** When a tool reports its result as
 structured content at completion (rather than streamed text), the web
-card renders it below the card: images and audio show inline (an embedded
-payload is preferred, falling back to a referenced `uri`), resource links
-and binary resources become download links, and text resources render as
-text. A media block with neither inline data nor a uri degrades to a
-labelled placeholder so the output is never silently dropped. The native
-TUI, which cannot draw images, shows a textual placeholder (for example
-`[image image/png]`) for the non-text blocks. Inline image/audio payloads
-larger than 4 MiB of base64 are dropped from the event (the placeholder
-remains) to keep the replay stream small.
+card renders it below the card: images show inline (an embedded payload is
+preferred, falling back to a referenced `uri`), audio plays inline from
+its embedded payload, resource links and binary resources become download
+links, and text resources render as text. A block whose payload can't be
+shown (an image with neither inline data nor a uri, or audio with no
+embedded data) degrades to a labelled placeholder so the output is never
+silently dropped. The native TUI, which cannot draw images, shows a
+textual placeholder (for example `[image image/png]`) for the non-text
+blocks. Inline image/audio payloads larger than 4 MiB of base64 are
+dropped from the event (the placeholder remains) to keep the replay
+stream small.
 
 **File-mention picker.** Typing `@` in the composer opens a picker
 listing the session's workspace files, fetched once per session from
