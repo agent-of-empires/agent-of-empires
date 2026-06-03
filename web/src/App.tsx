@@ -533,8 +533,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // both the desktop and mobile cockpit mounts, so this single effect covers
   // both layouts. Same guard as the `"web"` ping above: skip until
   // `serverAbout` loads, skip read-only servers (which can't persist). The
-  // backend flag is an idempotent AtomicBool, so re-fires on session switch
-  // are harmless. See #1882.
+  // backend folds repeated pings into a monotonic open-count (reported as the
+  // boolean `cockpit_seen` and decremented by exactly what each snapshot
+  // reported), so re-fires on session switch are harmless. See #1882.
   useEffect(() => {
     if (!serverAboutLoaded || serverAbout?.read_only) return;
     if (!activeSession?.cockpit_mode) return;
