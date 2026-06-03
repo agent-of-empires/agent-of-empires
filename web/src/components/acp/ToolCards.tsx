@@ -152,6 +152,21 @@ function dataUri(mimeType: string, data: string): string {
   return `data:${mimeType};base64,${data}`;
 }
 
+/** Schemes safe to render in an `href` / `img src`. Tool output uris are
+ *  agent-controlled, so a `javascript:` uri must never reach the DOM where
+ *  a click could execute it. Returns the uri when its scheme is allowlisted
+ *  (resolved against the current origin so relative paths keep working) and
+ *  null otherwise. See #1818 review. */
+const SAFE_URI_SCHEMES = new Set(["http:", "https:", "file:", "mailto:"]);
+function safeUri(uri: string): string | null {
+  try {
+    const parsed = new URL(uri, window.location.href);
+    return SAFE_URI_SCHEMES.has(parsed.protocol) ? uri : null;
+  } catch {
+    return null;
+  }
+}
+
 function MediaPlaceholder({
   icon,
   label,
@@ -178,7 +193,9 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
     case "image": {
       const src = block.data
         ? dataUri(block.mime_type, block.data)
-        : (block.uri ?? null);
+        : block.uri
+          ? safeUri(block.uri)
+          : null;
       if (!src) {
         return (
           <MediaPlaceholder
@@ -212,10 +229,19 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
         />
       );
     }
-    case "resource_link":
+    case "resource_link": {
+      const href = safeUri(block.uri);
+      if (!href) {
+        return (
+          <MediaPlaceholder
+            icon={<LinkIcon className="h-3.5 w-3.5" />}
+            label={`${block.name} (${block.uri})`}
+          />
+        );
+      }
       return (
         <a
-          href={block.uri}
+          href={href}
           target="_blank"
           rel="noreferrer"
           className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
@@ -224,6 +250,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
           {block.name}
         </a>
       );
+    }
     case "resource": {
       if (block.text != null) {
         return (
@@ -232,9 +259,33 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
           </pre>
         );
       }
+      // A binary (blob) resource ships its bytes inline; offer them as a
+      // download even when the uri isn't fetchable. See #1818.
+      if (block.data) {
+        const filename = block.uri.split("/").pop() || "resource";
+        return (
+          <a
+            href={dataUri(block.mime_type ?? "application/octet-stream", block.data)}
+            download={filename}
+            className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            {filename}
+          </a>
+        );
+      }
+      const href = safeUri(block.uri);
+      if (!href) {
+        return (
+          <MediaPlaceholder
+            icon={<FileDown className="h-3.5 w-3.5" />}
+            label={block.uri}
+          />
+        );
+      }
       return (
         <a
-          href={block.uri}
+          href={href}
           target="_blank"
           rel="noreferrer"
           className="flex items-center gap-2 text-xs text-accent-500 hover:underline"

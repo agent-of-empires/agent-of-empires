@@ -688,6 +688,57 @@ describe("ToolCards failed-card folding (#1467)", () => {
     expect(container.textContent).toContain("image (image/png)");
   });
 
+  it("refuses a javascript: resource link and shows a placeholder", () => {
+    // #1818 review: agent-controlled uris must not reach href; a
+    // javascript: scheme degrades to a non-clickable placeholder.
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              {
+                kind: "resource_link",
+                uri: "javascript:alert(1)",
+                name: "evil.html",
+              },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toContain("evil.html");
+  });
+
+  it("offers a blob resource as a download from inline data", () => {
+    // #1818 review: a blob resource keeps its bytes, so it downloads even
+    // without a fetchable uri.
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              {
+                kind: "resource",
+                uri: "file:///out.bin",
+                mime_type: "application/octet-stream",
+                data: "QkxPQg==",
+              },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    const link = container.querySelector("a[download]");
+    expect(link).not.toBeNull();
+    expect(link!.getAttribute("href")).toBe(
+      "data:application/octet-stream;base64,QkxPQg==",
+    );
+    expect(link!.getAttribute("download")).toBe("out.bin");
+  });
+
   it("renders a successful completion body when the card is expanded", () => {
     // Criterion 3: the success-path body wiring (result.text) renders once
     // the user opens the card, not just the error path.

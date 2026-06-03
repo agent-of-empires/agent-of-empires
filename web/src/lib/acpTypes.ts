@@ -97,6 +97,9 @@ export type ToolOutputBlock =
       uri: string;
       mime_type?: string | null;
       text?: string | null;
+      /** Base64 bytes for a binary (blob) resource, offered as a download
+       *  when present. Absent for text resources or oversized blobs. */
+      data?: string | null;
     };
 
 export interface RateLimitInfo {
