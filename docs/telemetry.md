@@ -24,7 +24,8 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
-  - whether the web dashboard / cockpit was opened since the last snapshot.
+  - which surfaces were opened since the last snapshot, as a `usage_seen` map
+    of allowlisted signal name to open-count (see "Usage signals" below).
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events
@@ -50,6 +51,18 @@ The values reflect the **global** config (the install default), not any single
 profile's effective config. It is an install-level default-adoption signal;
 since sessions can run under arbitrary profiles whose overrides are not folded
 in here, per-session usage is reported separately by the session counts above.
+
+### Usage signals
+
+The snapshot also includes a `usage_seen` map (allowlisted signal name ->
+open-count) so we can see which surfaces installs actually use within a window,
+for example `{web: 3, cockpit: 1}`. It is driven by a registry in
+`src/telemetry/usage_signals.rs`: instrumenting a new surface is one entry there
+(its short name), not a schema change. The key set is fixed and the values are
+counts, so a signal can never carry a path or free text, and the gateway
+forwards only this allowlisted shape. The web dashboard reports an open by
+pinging `POST /api/telemetry/seen`; an unregistered name is rejected. The TUI
+never hosts the web surfaces, so it reports the map zeroed.
 
 ## What is never sent
 
@@ -101,9 +114,10 @@ until delivery is confirmed, so a failed send does not silently drop them:
 - the CLI `process_start` daily slot is claimed only on a confirmed send, so a
   failed send leaves it open for the next invocation to retry (bounded to once
   per hour so a down endpoint cannot make every `aoe` invocation re-send);
-- the serve `web_seen` / `cockpit_seen` flags and the session-create counter are
-  cleared only after a confirmed snapshot send, so a failed snapshot keeps them
-  for the next one instead of losing that window's signal.
+- the serve `usage_seen` open counts and the session-create counter are cleared
+  only after a confirmed snapshot send, decremented by exactly what was reported,
+  so a failed snapshot keeps them for the next one instead of losing that
+  window's signal.
 
 This is coarse, last-write retry, not a durable queue: periodic snapshots are
 still point-in-time, and a snapshot identical to the last confirmed one is

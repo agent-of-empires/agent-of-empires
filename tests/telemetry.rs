@@ -6,6 +6,7 @@
 //! user state is touched.
 
 use agent_of_empires::session::{save_config, Config, Instance};
+use agent_of_empires::telemetry::usage_signals::{self, UsageSeenCounters, USAGE_SIGNALS};
 use agent_of_empires::telemetry::{self, Surface};
 use serial_test::serial;
 
@@ -37,7 +38,9 @@ fn default_off_emits_nothing() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-    assert!(telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0).is_none());
+    assert!(
+        telemetry::build_usage_snapshot(Surface::Tui, &[], usage_signals::zeroed(), 0).is_none()
+    );
 }
 
 /// Opting in generates an install id and lets events build; opting back out
@@ -100,9 +103,13 @@ fn snapshot_buckets_are_sanitized() {
     custom.detect_as = String::new();
     let claude = Instance::new("c", "/p");
 
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Tui, &[custom, claude], false, false, 0)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[custom, claude],
+        usage_signals::zeroed(),
+        0,
+    )
+    .expect("snapshot built when opted in");
 
     let serialized = serde_json::to_string(&snapshot).expect("serialize");
     // The raw custom command / project path must never appear in the payload.
@@ -134,13 +141,78 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], usage_signals::zeroed(), 0)
         .expect("snapshot built when opted in");
     assert_eq!(none.session_creates_since_last_snapshot, 0);
 
-    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
+    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], usage_signals::zeroed(), 7)
         .expect("snapshot built when opted in");
     assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
+/// User story (#1880): a usage signal registered in the allowlist flows through
+/// the daemon aggregate (`UsageSeenCounters`) into the snapshot's `usage_seen`
+/// map with no other code changes. The map carries the recorded counts verbatim.
+#[test]
+#[serial]
+fn snapshot_carries_registered_usage_signals() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // The daemon folds browser pings into these counters.
+    let counters = UsageSeenCounters::new();
+    assert!(counters.record("web"));
+    assert!(counters.record("web"));
+    assert!(counters.record("cockpit"));
+
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0)
+        .expect("snapshot built when opted in");
+    assert_eq!(snapshot.usage_seen.get("web"), Some(&2));
+    assert_eq!(snapshot.usage_seen.get("cockpit"), Some(&1));
+}
+
+/// User story (#1880): an unregistered signal name is rejected by the registry
+/// (`record` returns false, which the endpoint turns into a 400) and never
+/// reaches the snapshot's `usage_seen` map.
+#[test]
+#[serial]
+fn unregistered_usage_signal_is_rejected_and_never_reported() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let counters = UsageSeenCounters::new();
+    // The endpoint would return 400 on this false.
+    assert!(!counters.record("web_terminal"));
+
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0)
+        .expect("snapshot built when opted in");
+    assert!(!snapshot.usage_seen.contains_key("web_terminal"));
+}
+
+/// User story (#1880): the `usage_seen` map only ever carries allowlisted short
+/// names, never free-form input. Its key set is exactly the fixed registry and
+/// every key is a short identifier.
+#[test]
+#[serial]
+fn usage_seen_keys_are_only_allowlisted_short_names() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], usage_signals::zeroed(), 0)
+        .expect("snapshot built when opted in");
+
+    let keys: Vec<&str> = snapshot.usage_seen.keys().map(String::as_str).collect();
+    assert_eq!(keys, USAGE_SIGNALS);
+    for key in snapshot.usage_seen.keys() {
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "usage_seen key `{key}` is not a short allowlisted identifier"
+        );
+    }
 }
 
 /// The CLI `process_start` is throttled to once per install per day so a user
