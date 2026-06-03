@@ -210,8 +210,10 @@ describe("SessionWizard cockpit_mode payload (#1580)", () => {
       },
       sandbox: {},
     } as never);
-    const { getByText } = renderWizardWithoutToolPrefill(true);
-    await waitFor(() => expect(getByText("opencode")).toBeTruthy());
+    const { getAllByText, getByText } = renderWizardWithoutToolPrefill(true);
+    // "opencode" now renders in both the Agent row and the resolved
+    // Launch command row (#1911), so match either occurrence.
+    await waitFor(() => expect(getAllByText(/opencode/).length).toBeGreaterThan(0));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(

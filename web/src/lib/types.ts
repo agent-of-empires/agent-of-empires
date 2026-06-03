@@ -302,6 +302,14 @@ export interface AgentInfo {
    *  The wizard reads this to decide whether a new session runs in
    *  cockpit or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** The ACP command a built-in agent launches in cockpit (e.g.
+   *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
+   *  substitution. Can differ from `binary`. Absent for custom agents,
+   *  whose command values are never serialized by the backend. */
+  cockpit_command?: string;
+  /** Registry args appended to `cockpit_command` (e.g. `["acp"]` for
+   *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
+  cockpit_args?: string[];
 }
 
 /** Profile info returned by /api/profiles */

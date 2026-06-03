@@ -510,6 +510,18 @@
       ]
     },
     {
+      "id": "wizard.resolved-launch-command",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/wizard-resolved-launch-command.spec.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+      ]
+    },
+    {
       "id": "cockpit.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",

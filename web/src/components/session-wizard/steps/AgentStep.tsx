@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
   tool: string;
@@ -36,7 +37,12 @@ interface Props {
     extraEnv: string[];
     cockpitModel?: string;
     cockpitEffort?: string;
+    commandMaps?: CommandMaps;
   }) => void;
+  /** Profile-resolved override / custom-agent maps, used to preview the
+   *  exact launch command. Sourced from the settings the wizard already
+   *  fetched, so this step issues no extra request. See #1911. */
+  commandMaps?: CommandMaps;
   /** Live value of the cockpit master switch. When true, sessions
    *  the user creates here run in cockpit mode automatically (for
    *  tools with an ACP adapter); when false, every session is tmux.
@@ -132,7 +138,7 @@ function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onCh
   );
 }
 
-export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled }: Props) {
+export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectableAgents = agents.filter(
     (agent) => agent.kind === "custom" || agent.installed,
   );
@@ -143,48 +149,21 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
 
-  // Command-override maps from the profile-resolved config, used to
-  // preview the exact launch command (#1766). Read-only; mirrors the
-  // backend `resolve_tool_command` precedence.
-  const [commandMaps, setCommandMaps] = useState<{
-    agentCommandOverride: Record<string, string>;
-    customAgents: Record<string, string>;
-  }>({ agentCommandOverride: {}, customAgents: {} });
-
-  useEffect(() => {
-    let cancelled = false;
-    // Clear immediately so a profile switch never shows the previous
-    // profile's override while the new fetch is in flight.
-    setCommandMaps({ agentCommandOverride: {}, customAgents: {} });
-    void (async () => {
-      const settings = await fetchSettings(data.profile || undefined);
-      if (cancelled || !settings) return;
-      const session = settings.session as Record<string, unknown> | undefined;
-      const asMap = (v: unknown): Record<string, string> =>
-        v && typeof v === "object"
-          ? Object.fromEntries(
-              Object.entries(v as Record<string, unknown>).filter(
-                ([, val]) => typeof val === "string",
-              ) as [string, string][],
-            )
-          : {};
-      setCommandMaps({
-        agentCommandOverride: asMap(session?.agent_command_override),
-        customAgents: asMap(session?.custom_agents),
-      });
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [data.profile]);
-
+  // Mirror SessionWizard.handleSubmit / ReviewStep so the preview shows
+  // the substrate the session will actually launch with (#1580).
+  const willUseCockpit = cockpitMasterEnabled && acpCapable && data.useCockpit;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
+    useCockpit: willUseCockpit,
     binary: selectedAgent?.binary,
+    cockpitCommand: selectedAgent?.cockpit_command,
+    cockpitArgs: selectedAgent?.cockpit_args,
+    extraArgs: data.extraArgs,
     manualOverride: data.commandOverride,
     agentCommandOverride: commandMaps.agentCommandOverride,
     customAgents: commandMaps.customAgents,
-  });
+  }).full;
+  const extraArgsIgnored = willUseCockpit && data.extraArgs.trim().length > 0;
 
   const handleProfileChange = useCallback(async (profileName: string) => {
     // If user had manual edits, confirm before overwriting
@@ -219,6 +198,7 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
           extraEnv: env,
           cockpitModel: typeof cockpitDefault?.model === "string" ? cockpitDefault.model : "",
           cockpitEffort: typeof cockpitDefault?.effort === "string" ? cockpitDefault.effort : "",
+          commandMaps: commandMapsFromSettings(settings),
         });
       }
     } catch {
@@ -468,6 +448,12 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="e.g. --port 8080"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {extraArgsIgnored && (
+              <p className="mt-1.5 text-xs text-status-warning" data-testid="extra-args-ignored">
+                Extra args are ignored for cockpit sessions; use the command
+                override to change the launch command.
+              </p>
+            )}
           </div>
 
           {/* Command override */}

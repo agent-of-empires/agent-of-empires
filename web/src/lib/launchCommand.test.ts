@@ -1,66 +1,136 @@
 import { describe, expect, it } from "vitest";
 import { resolveLaunchCommand } from "./launchCommand";
 
-describe("resolveLaunchCommand", () => {
-  it("uses session.agent_command_override when no manual override (the #1766 case)", () => {
+describe("resolveLaunchCommand (cockpit)", () => {
+  const base = { tool: "opencode", useCockpit: true, binary: "opencode" };
+
+  it("appends the registry args to the cockpit command (the #1911 case)", () => {
     expect(
       resolveLaunchCommand({
-        tool: "opencode",
-        binary: "opencode",
-        agentCommandOverride: { opencode: "opencode-plannotator" },
+        ...base,
+        cockpitCommand: "opencode",
+        cockpitArgs: ["acp"],
       }),
-    ).toBe("opencode-plannotator");
+    ).toEqual({ prefix: "opencode", suffix: "acp", full: "opencode acp" });
   });
 
-  it("manual override wins over the config override", () => {
+  it("prefers cockpit_command over binary (claude -> claude-agent-acp)", () => {
     expect(
       resolveLaunchCommand({
-        tool: "opencode",
-        binary: "opencode",
+        tool: "claude",
+        useCockpit: true,
+        binary: "claude",
+        cockpitCommand: "claude-agent-acp",
+        cockpitArgs: [],
+      }),
+    ).toEqual({
+      prefix: "claude-agent-acp",
+      suffix: "",
+      full: "claude-agent-acp",
+    });
+  });
+
+  it("retains the registry args when a config override applies, without duplicating them", () => {
+    const r = resolveLaunchCommand({
+      ...base,
+      cockpitCommand: "opencode",
+      cockpitArgs: ["acp"],
+      agentCommandOverride: { opencode: "opencode-plannotator" },
+    });
+    expect(r.full).toBe("opencode-plannotator acp");
+    expect(r.prefix).toBe("opencode-plannotator");
+    expect(r.suffix).toBe("acp");
+  });
+
+  it("manual override wins over the config override, args still retained", () => {
+    expect(
+      resolveLaunchCommand({
+        ...base,
+        cockpitCommand: "opencode",
+        cockpitArgs: ["acp"],
         manualOverride: "opencode --foo",
         agentCommandOverride: { opencode: "opencode-plannotator" },
       }),
-    ).toBe("opencode --foo");
+    ).toEqual({
+      prefix: "opencode --foo",
+      suffix: "acp",
+      full: "opencode --foo acp",
+    });
   });
 
-  it("falls back to custom_agents when no manual or agent override", () => {
-    expect(
-      resolveLaunchCommand({
-        tool: "my-agent",
-        binary: "my-agent",
-        customAgents: { "my-agent": "my-agent-wrapper run" },
-      }),
-    ).toBe("my-agent-wrapper run");
+  it("editing the prefix back into the override does not double-append registry args", () => {
+    // Simulate the wizard writing the edited prefix into commandOverride.
+    const edited = "opencode-plannotator";
+    const r = resolveLaunchCommand({
+      ...base,
+      cockpitCommand: "opencode",
+      cockpitArgs: ["acp"],
+      manualOverride: edited,
+    });
+    expect(r.full).toBe("opencode-plannotator acp");
+    expect(r.full.match(/acp/g)?.length).toBe(1);
   });
 
-  it("falls back to the agent binary when nothing is overridden", () => {
-    expect(resolveLaunchCommand({ tool: "claude", binary: "claude-agent-acp" })).toBe(
-      "claude-agent-acp",
+  it("strips a duplicated registry-arg suffix from an override (no double-append)", () => {
+    const r = resolveLaunchCommand({
+      ...base,
+      cockpitCommand: "opencode",
+      cockpitArgs: ["acp"],
+      manualOverride: "opencode acp",
+    });
+    expect(r).toEqual({ prefix: "opencode", suffix: "acp", full: "opencode acp" });
+  });
+
+  it("falls back to the tool name when no command is known", () => {
+    expect(resolveLaunchCommand({ tool: "opencode", useCockpit: true })).toEqual(
+      { prefix: "opencode", suffix: "", full: "opencode" },
     );
-  });
-
-  it("falls back to the tool name when no binary is known", () => {
-    expect(resolveLaunchCommand({ tool: "opencode" })).toBe("opencode");
   });
 
   it("ignores a whitespace-only manual override", () => {
     expect(
       resolveLaunchCommand({
-        tool: "opencode",
-        binary: "opencode",
+        ...base,
+        cockpitCommand: "opencode",
+        cockpitArgs: ["acp"],
         manualOverride: "   ",
         agentCommandOverride: { opencode: "opencode-plannotator" },
+      }).full,
+    ).toBe("opencode-plannotator acp");
+  });
+});
+
+describe("resolveLaunchCommand (tmux)", () => {
+  it("uses the binary plus the session extra args", () => {
+    expect(
+      resolveLaunchCommand({
+        tool: "claude",
+        useCockpit: false,
+        binary: "claude",
+        extraArgs: "--model opus",
       }),
-    ).toBe("opencode-plannotator");
+    ).toEqual({ prefix: "claude", suffix: "--model opus", full: "claude --model opus" });
   });
 
-  it("ignores an empty-string config override entry", () => {
+  it("ignores cockpit_args when not in cockpit", () => {
     expect(
       resolveLaunchCommand({
         tool: "opencode",
+        useCockpit: false,
         binary: "opencode",
-        agentCommandOverride: { opencode: "" },
+        cockpitArgs: ["acp"],
       }),
-    ).toBe("opencode");
+    ).toEqual({ prefix: "opencode", suffix: "", full: "opencode" });
+  });
+
+  it("falls back to custom_agents when no manual or config override", () => {
+    expect(
+      resolveLaunchCommand({
+        tool: "my-agent",
+        useCockpit: false,
+        binary: "my-agent",
+        customAgents: { "my-agent": "my-agent-wrapper run" },
+      }).prefix,
+    ).toBe("my-agent-wrapper run");
   });
 });
