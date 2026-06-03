@@ -439,8 +439,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.tool = selection.name().to_string();
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
-        // Verify the agent binary is actually on PATH before creating the session
-        if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+        // Verify the binary that will actually launch is on PATH before
+        // creating the session. A configured session.agent_command_override
+        // (or custom_agents) entry replaces the built-in binary, so check the
+        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // falsely bails when only the override binary (e.g.
+        // opencode-plannotator) is installed. See #1910.
+        let resolved_override = config.session.resolve_tool_command(&tool_name);
+        if !resolved_override.is_empty() {
+            let bin = resolved_override.split_whitespace().next().unwrap_or("");
+            if !bin.is_empty() && !crate::cli::cockpit::command_present(bin) {
+                bail!(
+                    "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                     See all supported agents: aoe agents",
+                    bin
+                );
+            }
+        } else if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
             if !crate::tmux::is_agent_available(agent_def) {
                 bail!(
                     "'{}' is not installed or not on $PATH.\n\
@@ -597,17 +612,36 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             // agent's configured ACP command, then verify the binary is on
             // PATH. A missing adapter is a hard error at add-time rather
             // than a silent 404 on the first prompt.
-            let spec = match registry.get(&agent_name) {
-                Some(spec) => spec.clone(),
+            let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
+                Some(spec) => (spec.clone(), true),
                 None => match config.session.agent_cockpit_cmd.get(&agent_name) {
-                    Some(cmd) => crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                    Some(cmd) => (
+                        crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        false,
+                    ),
                     None => bail!(
                         "cockpit agent `{agent_name}` is not in the registry.\n\
                          Run `aoe cockpit doctor` to see configured agents."
                     ),
                 },
             };
+            // Overlay session.agent_command_override the same way the cockpit
+            // spawn path does, so the precondition checks the binary that will
+            // actually launch (e.g. opencode-plannotator), not the bare
+            // registry binary. Without this, a user who installed only the
+            // override binary gets a false "not installed" bail. See #1910.
+            if let Some(ovr) = crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ) {
+                crate::cockpit::supervisor::apply_agent_command_override(
+                    &agent_name,
+                    spec_from_registry,
+                    &ovr,
+                    &mut spec,
+                )?;
+            }
             if !crate::cli::cockpit::command_present(&spec.command) {
                 let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
                     .unwrap_or("install via your package manager and re-run");
