@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Payload schema version. Bump on any breaking change to the field set.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 replaced the bespoke `web_seen` / `cockpit_seen` booleans with the
+/// allowlisted `usage_seen` count map (issue #1880).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -84,10 +87,12 @@ pub struct UsageSnapshot {
     /// schema. See `telemetry::features`.
     pub features: BTreeMap<String, bool>,
 
-    /// The web dashboard was opened at least once since the last snapshot.
-    pub web_seen: bool,
-    /// The cockpit web UI was opened at least once since the last snapshot.
-    pub cockpit_seen: bool,
+    /// Window-scoped usage activity: allowlisted signal name -> times the
+    /// surface was opened since the last snapshot. Keyed by the fixed registry
+    /// in [`super::usage_signals`]; instrumenting a new surface is one registry
+    /// entry, not a schema field. Zero-valued keys stay present so the wire key
+    /// set is stable. See `telemetry::usage_signals`.
+    pub usage_seen: BTreeMap<String, u32>,
 
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).

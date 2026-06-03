@@ -22,6 +22,7 @@ pub mod events;
 pub mod features;
 pub mod sanitize;
 mod state;
+pub mod usage_signals;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -137,8 +138,7 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
 pub fn build_usage_snapshot(
     surface: Surface,
     instances: &[Instance],
-    web_seen: bool,
-    cockpit_seen: bool,
+    usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
 ) -> Option<UsageSnapshot> {
     if !is_opted_in() {
@@ -217,8 +217,7 @@ pub fn build_usage_snapshot(
         sessions_by_agent,
         sessions_by_model_bucket,
         features,
-        web_seen,
-        cockpit_seen,
+        usage_seen,
         session_creates_since_last_snapshot,
     })
 }
@@ -469,8 +468,7 @@ mod tests {
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
-            web_seen: false,
-            cockpit_seen: false,
+            usage_seen: usage_signals::zeroed(),
             session_creates_since_last_snapshot: 0,
         }
     }
