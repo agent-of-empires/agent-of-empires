@@ -41,6 +41,12 @@ Finally, an agent command override can also be used via the CLI using the `aoe a
 aoe add --cmd-override <CMD_OVERRIDE>
 ```
 
+A configured override also applies to plain `aoe add --cmd <agent>` (without `--cmd-override`): the agent name
+resolves through `agent_command_override` just as it does in the TUI. This means the override is honored consistently
+whether the session is started from the TUI, a tmux CLI session, or a `--cockpit` session. The on-PATH check that
+`aoe add` runs before creating the session verifies the resolved override binary, so a session works even when only the
+wrapper (for example `opencode-plannotator`) is installed and the bare agent binary (`opencode`) is not.
+
 ## Priority order
 
 As mentioned in the [Configuration Guide](configuration.md), `aoe` uses a layered configuration system. As such,
