@@ -579,11 +579,13 @@ mod tests {
     // and carry no session id, name, path, or timestamp (issue #1892, story 3).
     #[test]
     fn triage_counts_are_plain_integers() {
-        fn assert_u32(_: u32) {}
-        let snap = sample_snapshot();
-        assert_u32(snap.session_pinned);
-        assert_u32(snap.session_snoozed);
-        assert_u32(snap.session_archived);
+        // Assert the wire format, not just the Rust type: a future serde
+        // attribute or wrapper that serialized these as strings or null would
+        // regress the telemetry contract while a `u32`-only check still passed.
+        let json = serde_json::to_value(sample_snapshot()).unwrap();
+        assert!(json["session_pinned"].is_u64());
+        assert!(json["session_snoozed"].is_u64());
+        assert!(json["session_archived"].is_u64());
     }
 
     // An opted-out install records nothing: `build_usage_snapshot` returns
