@@ -251,6 +251,15 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub devices: RwLock<Vec<DeviceInfo>>,
     pub behind_tunnel: bool,
+    /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` /
+    /// `"none"`). `/api/about` and the opt-in telemetry snapshot both read this
+    /// single value rather than re-deriving it; immutable for the daemon's
+    /// lifetime. Never the token or passphrase itself, only the mode.
+    pub auth_mode: &'static str,
+    /// Coarse exposure mode resolved once at launch from the active transport
+    /// (`"tunnel"` / `"tailscale"` / `"local"`), fed to the telemetry snapshot.
+    /// Never a tunnel name, hostname, or `.ts.net` URL, only the mode.
+    pub serve_mode: &'static str,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
@@ -463,6 +472,22 @@ pub struct ServerConfig<'a> {
     pub open_browser: bool,
 }
 
+/// Resolve the coarse auth-mode label the same way `/api/about` reports it, so
+/// the value is derived once from a single place. Token auth wins over a
+/// passphrase second factor when both are configured.
+pub(crate) async fn resolve_auth_mode(
+    token_manager: &TokenManager,
+    login_manager: &login::LoginManager,
+) -> &'static str {
+    if !token_manager.is_no_auth().await {
+        "token"
+    } else if login_manager.is_enabled() {
+        "passphrase"
+    } else {
+        "none"
+    }
+}
+
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
         profile,
@@ -592,59 +617,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor
     };
 
-    let state = Arc::new(AppState {
-        profile: profile.to_string(),
-        read_only,
-        instances: RwLock::new(instances),
-        token_manager: Arc::clone(&token_manager),
-        login_manager: Arc::clone(&login_manager),
-        rate_limiter: Arc::clone(&rate_limiter),
-        devices: RwLock::new(Vec::new()),
-        behind_tunnel: remote || behind_proxy,
-        instance_locks: RwLock::new(std::collections::HashMap::new()),
-        recently_restarted: crate::session::recovery::new_recently_restarted(),
-        cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
-            // Seed with an already-stale timestamp so the first request
-            // forces a fresh resolve instead of handing out an empty map.
-            refreshed_at: std::time::Instant::now() - CLEANUP_DEFAULTS_TTL,
-            entries: std::collections::HashMap::new(),
-        }),
-        remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
-        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
-        #[cfg(feature = "serve")]
-        cockpit_events_tx: cockpit_events_tx.clone(),
-        #[cfg(feature = "serve")]
-        cockpit_event_store: cockpit_event_store.clone(),
-        #[cfg(feature = "serve")]
-        cockpit_master_enabled,
-        #[cfg(feature = "serve")]
-        cockpit_supervisor: cockpit_supervisor.clone(),
-        push: push_state,
-        push_enabled,
-        web_config: config.web.clone(),
-        last_web_activity: std::sync::atomic::AtomicI64::new(0),
-        telemetry_web_seen: std::sync::atomic::AtomicU32::new(0),
-        telemetry_cockpit_seen: std::sync::atomic::AtomicU32::new(0),
-        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
-        telemetry_last_reported: std::sync::Mutex::new(None),
-        shutdown: CancellationToken::new(),
-    });
+    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
+    // The boot announcement fires here, before transport setup, so a launch
+    // attempt is still recorded even if a remote tunnel later fails to come up.
+    // The periodic `usage_snapshot` loop is spawned only after the transport is
+    // resolved (below), so its first tick can report the real `serve_mode`.
+    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
 
-    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot
-    // and refresh an aggregate snapshot periodically. Detached; errors are
-    // swallowed.
-    spawn_telemetry_loop(state.clone());
-
-    let app = build_router(state.clone());
-
-    // Cockpit workers for persisted sessions get auto-spawned by the
-    // reconciler in `status_poll_loop`. The poll interval's first tick
-    // fires immediately, so on cold startup this is equivalent to the
-    // old in-place loop here, while also covering sessions added via
-    // `aoe add --cockpit` while serve is already running. The
-    // reconciler short-circuits when `cockpit.enabled = false`.
+    // Resolve the coarse auth mode once at launch; `/api/about` and the
+    // telemetry snapshot both read this single value.
+    let auth_mode = resolve_auth_mode(&token_manager, &login_manager).await;
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -823,6 +805,67 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     };
 
+    // Coarse exposure label for telemetry, read straight from the resolved
+    // transport so it cannot drift from what was actually spawned: the tunnel
+    // handle reports "tunnel" (Cloudflare quick or named) or "tailscale", and a
+    // local-only daemon has no handle. Named-tunnel names never leak; only the
+    // coarse mode is taken.
+    let serve_mode: &'static str = tunnel_handle
+        .as_ref()
+        .map(|h| h.mode_label())
+        .unwrap_or("local");
+
+    let state = Arc::new(AppState {
+        profile: profile.to_string(),
+        read_only,
+        instances: RwLock::new(instances),
+        token_manager: Arc::clone(&token_manager),
+        login_manager: Arc::clone(&login_manager),
+        rate_limiter: Arc::clone(&rate_limiter),
+        devices: RwLock::new(Vec::new()),
+        behind_tunnel: remote || behind_proxy,
+        auth_mode,
+        serve_mode,
+        instance_locks: RwLock::new(std::collections::HashMap::new()),
+        recently_restarted: crate::session::recovery::new_recently_restarted(),
+        cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
+            // Seed with an already-stale timestamp so the first request
+            // forces a fresh resolve instead of handing out an empty map.
+            refreshed_at: std::time::Instant::now() - CLEANUP_DEFAULTS_TTL,
+            entries: std::collections::HashMap::new(),
+        }),
+        remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        #[cfg(feature = "serve")]
+        cockpit_events_tx: cockpit_events_tx.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_event_store: cockpit_event_store.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_master_enabled,
+        #[cfg(feature = "serve")]
+        cockpit_supervisor: cockpit_supervisor.clone(),
+        push: push_state,
+        push_enabled,
+        web_config: config.web.clone(),
+        last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        telemetry_web_seen: std::sync::atomic::AtomicU32::new(0),
+        telemetry_cockpit_seen: std::sync::atomic::AtomicU32::new(0),
+        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_last_reported: std::sync::Mutex::new(None),
+        shutdown: CancellationToken::new(),
+    });
+
+    let app = build_router(state.clone());
+
+    // Cockpit workers for persisted sessions get auto-spawned by the
+    // reconciler in `status_poll_loop`. The poll interval's first tick
+    // fires immediately, so on cold startup this is equivalent to the
+    // old in-place loop here, while also covering sessions added via
+    // `aoe add --cockpit` while serve is already running. The
+    // reconciler short-circuits when `cockpit.enabled = false`.
+
     // Seed cockpit sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
     // `state.instances` and the cockpit_event_listener only sees
@@ -839,6 +882,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+
+    // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
+    // resolved (so the first, immediate tick reports the real `serve_mode` and a
+    // daemon whose tunnel failed to start emits nothing) and after cockpit
+    // status seeding plus the synchronous recovery marking (so that first tick's
+    // session counts reflect the restored state rather than a half-loaded one).
+    spawn_serve_snapshot_loop(state.clone());
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
@@ -1652,13 +1702,12 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh
 }
 
-/// Background task: emit an opt-in telemetry `process_start` for the serve
-/// surface, then a `usage_snapshot` immediately and every ~12 hours (jittered),
-/// plus a final one on graceful shutdown. All sends are best-effort and swallow
-/// errors; nothing leaves the box unless the user opted in and an endpoint is
-/// configured.
-fn spawn_telemetry_loop(state: Arc<AppState>) {
-    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
+/// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
+/// every ~12 hours (jittered), plus a final one on graceful shutdown. The boot
+/// `process_start` is emitted separately by the caller before transport setup.
+/// All sends are best-effort and swallow errors; nothing leaves the box unless
+/// the user opted in and an endpoint is configured.
+fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Jittered period (12h + up to 30m) so installs that boot together don't
         // snapshot in lockstep; the first tick is still immediate (boot
@@ -1722,6 +1771,8 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
         web_seen > 0,
         cockpit_seen > 0,
         session_creates,
+        Some(state.auth_mode),
+        Some(state.serve_mode),
     )?;
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
         web_seen,
@@ -3015,6 +3066,25 @@ mod tests {
             entries: std::collections::HashMap::new(),
         };
         assert!(cache.stale());
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_mode_matches_about_precedence() {
+        let token = TokenManager::new(Some("abc123".to_string()), Duration::from_secs(3600));
+        let no_token = TokenManager::new(None, Duration::from_secs(3600));
+        let passphrase = login::LoginManager::new(Some("hunter2"));
+        let no_passphrase = login::LoginManager::new(None);
+
+        // A token wins over a passphrase second factor when both are set.
+        assert_eq!(resolve_auth_mode(&token, &passphrase).await, "token");
+        assert_eq!(resolve_auth_mode(&token, &no_passphrase).await, "token");
+        // No token but a passphrase reports passphrase auth.
+        assert_eq!(
+            resolve_auth_mode(&no_token, &passphrase).await,
+            "passphrase"
+        );
+        // Neither configured is the security-relevant fully-open mode.
+        assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
     }
 
     #[tokio::test]

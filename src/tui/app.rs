@@ -1327,6 +1327,9 @@ impl App {
             false,
             false,
             0,
+            // The TUI hosts no server, so it has no auth or exposure mode.
+            None,
+            None,
         )
     }
 

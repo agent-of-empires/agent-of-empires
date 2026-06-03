@@ -181,6 +181,8 @@ pub fn build_usage_snapshot(
     web_seen: bool,
     cockpit_seen: bool,
     session_creates_since_last_snapshot: u32,
+    auth_mode: Option<&str>,
+    serve_mode: Option<&str>,
 ) -> Option<UsageSnapshot> {
     // Load the global, pre-profile-merge config exactly once and reuse it for
     // both the opt-in gate and `active_features`, instead of parsing
@@ -191,8 +193,20 @@ pub fn build_usage_snapshot(
     if !opted_in_with(&config) {
         return None;
     }
+    // auth_mode / serve_mode are serve-only deployment metadata. Normalize here
+    // rather than trusting every caller to pass None, so a future non-serve call
+    // site can never leak them onto a TUI / CLI payload.
+    debug_assert!(
+        matches!(surface, Surface::Serve) || (auth_mode.is_none() && serve_mode.is_none()),
+        "auth_mode and serve_mode are serve-only fields"
+    );
+    let (auth_mode, serve_mode) = if matches!(surface, Surface::Serve) {
+        (auth_mode, serve_mode)
+    } else {
+        (None, None)
+    };
     let install_id = state::ensure_install_id()?;
-    Some(assemble_usage_snapshot(
+    let mut snapshot = assemble_usage_snapshot(
         surface,
         install_id,
         &config,
@@ -200,7 +214,12 @@ pub fn build_usage_snapshot(
         web_seen,
         cockpit_seen,
         session_creates_since_last_snapshot,
-    ))
+    );
+    // Layer the serve-only deployment metadata on top of the pure snapshot, so
+    // `assemble_usage_snapshot` stays focused on session/feature bucketing.
+    snapshot.auth_mode = auth_mode.map(str::to_string);
+    snapshot.serve_mode = serve_mode.map(str::to_string);
+    Some(snapshot)
 }
 
 /// Pure assembly of a `usage_snapshot` from an already-resolved install id and
@@ -289,6 +308,10 @@ fn assemble_usage_snapshot(
         web_seen,
         cockpit_seen,
         session_creates_since_last_snapshot,
+        // Set by `build_usage_snapshot` for the serve surface; the pure
+        // assembler leaves them unset.
+        auth_mode: None,
+        serve_mode: None,
     }
 }
 
@@ -556,7 +579,34 @@ mod tests {
             web_seen: false,
             cockpit_seen: false,
             session_creates_since_last_snapshot: 0,
+            auth_mode: None,
+            serve_mode: None,
         }
+    }
+
+    // The serve deployment-mode fields are part of the content fingerprint, so a
+    // daemon that switches exposure or auth mode between snapshots is not deduped
+    // away as an unchanged repeat (#1885).
+    #[test]
+    #[serial]
+    fn serve_mode_fields_change_the_fingerprint() {
+        let base = sample_snapshot();
+        let mut serve = sample_snapshot();
+        serve.auth_mode = Some("passphrase".to_string());
+        serve.serve_mode = Some("tailscale".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&base),
+            snapshot_fingerprint(&serve),
+            "adding auth_mode / serve_mode must change the fingerprint"
+        );
+
+        let mut other = serve.clone();
+        other.serve_mode = Some("tunnel".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&serve),
+            snapshot_fingerprint(&other),
+            "a different serve_mode must change the fingerprint"
+        );
     }
 
     // Regression for the duplicate `usage_snapshot` seen in dogfooding: the TUI
