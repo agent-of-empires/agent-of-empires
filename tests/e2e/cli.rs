@@ -258,6 +258,62 @@ agent_command_override = {{ claude = "my-custom-claude" }}
 
 #[test]
 #[serial]
+fn test_cli_add_cmd_respects_command_override_for_availability() {
+    // `qwen` is a built-in agent whose binary is not installed in CI. The
+    // override remaps it to a wrapper that we shim on PATH. Pre-fix, the
+    // `--cmd` availability check ran `which qwen` and bailed because the
+    // bare binary was absent; post-fix it verifies the override binary
+    // (`qwen-plannotator`) that will actually launch. See #1910.
+    let mut h = TuiTestHarness::new("cli_add_cmd_override_avail");
+    h.install_path_command("qwen-plannotator");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+agent_command_override = {{ qwen = "qwen-plannotator" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "QwenOverride",
+        "--cmd",
+        "qwen",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --cmd qwen should succeed when the override binary is on PATH: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session = &sessions[0];
+    assert_eq!(
+        session["tool"].as_str().unwrap_or(""),
+        "qwen",
+        "tool should resolve to the built-in qwen"
+    );
+    assert_eq!(
+        session["command"].as_str().unwrap_or(""),
+        "qwen-plannotator",
+        "command should resolve through session.agent_command_override"
+    );
+}
+
+#[test]
+#[serial]
 fn test_cli_add_cli_flags_override_config() {
     let h = TuiTestHarness::new("cli_add_flags_override");
     let project = h.project_path();
