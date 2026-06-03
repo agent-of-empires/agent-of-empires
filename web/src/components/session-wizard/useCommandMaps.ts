@@ -31,13 +31,19 @@ export function useCommandMaps(profile: string | undefined): CommandMaps {
     let cancelled = false;
     setMaps(EMPTY);
     void (async () => {
-      const settings = await fetchSettings(profile || undefined);
-      if (cancelled || !settings) return;
-      const session = settings.session as Record<string, unknown> | undefined;
-      setMaps({
-        agentCommandOverride: asMap(session?.agent_command_override),
-        customAgents: asMap(session?.custom_agents),
-      });
+      try {
+        const settings = await fetchSettings(profile || undefined);
+        if (cancelled || !settings) return;
+        const session = settings.session as Record<string, unknown> | undefined;
+        setMaps({
+          agentCommandOverride: asMap(session?.agent_command_override),
+          customAgents: asMap(session?.custom_agents),
+        });
+      } catch {
+        // A flaky settings fetch must not surface a wrong launch command;
+        // fall back to empty maps (binary + registry args only).
+        if (!cancelled) setMaps(EMPTY);
+      }
     })();
     return () => {
       cancelled = true;
