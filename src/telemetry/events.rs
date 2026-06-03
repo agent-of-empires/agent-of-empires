@@ -9,8 +9,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-/// Payload schema version. Bump on any breaking change to the field set.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Payload schema version. Bump whenever the wire payload shape changes
+/// (a new field, a removed field, a renamed field, or a type change); this is
+/// a closed, auditable schema, so the version identifies the exact shape.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -73,6 +75,16 @@ pub struct UsageSnapshot {
     pub session_cockpit: u32,
     pub session_sandboxed: u32,
     pub session_yolo: u32,
+
+    /// Sessions currently pinned, snoozed (future `snoozed_until`), or
+    /// archived at snapshot time. Point-in-time state prevalence, not action
+    /// counts; the three are mutually exclusive per the session triage
+    /// invariant, so they sum to at most `session_total`. Set through a shared
+    /// mutator layer, so this census covers both the web and TUI surfaces with
+    /// no per-surface wiring.
+    pub session_pinned: u32,
+    pub session_snoozed: u32,
+    pub session_archived: u32,
 
     /// Allowlisted agent bucket -> session count.
     pub sessions_by_agent: BTreeMap<String, u32>,
