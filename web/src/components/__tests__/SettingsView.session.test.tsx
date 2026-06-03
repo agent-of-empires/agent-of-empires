@@ -49,6 +49,20 @@ function commit(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
+function textareaByLabel(container: HTMLElement, label: string): HTMLTextAreaElement {
+  const labels = Array.from(container.querySelectorAll("label"));
+  const match = labels.find((l) => l.textContent === label);
+  const textarea = match?.parentElement?.querySelector("textarea");
+  expect(textarea).toBeTruthy();
+  return textarea as HTMLTextAreaElement;
+}
+
+function commitTextarea(input: HTMLTextAreaElement, value: string) {
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value } });
+  fireEvent.blur(input);
+}
+
 describe("Session tab auto-stop idle field", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -105,6 +119,34 @@ describe("Session tab auto-stop idle field", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: { auto_stop_idle_secs: 7200 },
+      }),
+    );
+  });
+
+  it("persists session.cockpit_defaults through the profile path", async () => {
+    const { container } = render(
+      <SettingsView
+        onClose={() => {}}
+        tab="session"
+        onSelectTab={() => {}}
+        serverAbout={SERVER_ABOUT as never}
+        onServerAboutRefresh={() => {}}
+      />,
+    );
+    await screen.findByText("Cockpit defaults");
+
+    commitTextarea(
+      textareaByLabel(container, "Cockpit defaults"),
+      '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}',
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: {
+          cockpit_defaults: {
+            opencode: { model: "openai/gpt-5.5", effort: "high" },
+          },
+        },
       }),
     );
   });

@@ -2074,6 +2074,9 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub cockpit_model: Option<String>,
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub cockpit_effort: Option<String>,
     /// Scratch session: server provisions a fresh directory under
     /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
     /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
@@ -2376,10 +2379,30 @@ pub async fn create_session(
         // silently downgraded to tmux when the master switch is off
         // (`cockpit.enabled = false` in config.toml).
         #[cfg(feature = "serve")]
-        {
+        let cockpit_effort = {
             instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
             instance.cockpit_agent = body.cockpit_agent;
-            instance.cockpit_model = body.cockpit_model;
+            let cockpit_agent_key = instance
+                .cockpit_agent
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(instance.tool.as_str())
+                .to_string();
+            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &instance.source_profile,
+                std::path::Path::new(&instance.project_path),
+            );
+            let defaults = resolved_config
+                .session
+                .cockpit_defaults_for(&cockpit_agent_key);
+            instance.cockpit_model = body
+                .cockpit_model
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| defaults.and_then(|d| d.model.clone()));
+            let mut cockpit_effort = body
+                .cockpit_effort
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| defaults.and_then(|d| d.effort.clone()));
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in cockpit; a custom
             // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
@@ -2404,7 +2427,13 @@ pub async fn create_session(
                     });
                 instance.cockpit_mode = capable;
             }
-        }
+
+            if !instance.cockpit_mode {
+                cockpit_effort = None;
+            }
+
+            cockpit_effort
+        };
 
         // Anything that fails between here and the final `Ok(..)`
         // would otherwise orphan the scratch directory `build_instance`
@@ -2456,20 +2485,26 @@ pub async fn create_session(
             return Err(e);
         }
 
+        #[cfg(feature = "serve")]
+        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+            instance,
+            build_warnings,
+            cockpit_effort,
+        ));
+
+        #[cfg(not(feature = "serve"))]
         Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings))) => {
+        #[cfg(feature = "serve")]
+        Ok(Ok((instance, warnings, cockpit_effort))) => {
             let mut resp = SessionResponse::from_instance(
                 &instance,
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
-            // Overlay custom-agent ACP capability so the wizard's redirect
-            // into the new session renders the right substrate immediately.
-            #[cfg(feature = "serve")]
             if !resp.acp_capable {
                 let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
@@ -2479,13 +2514,13 @@ pub async fn create_session(
                 .agent_cockpit_cmd;
                 resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
             }
-            #[cfg(feature = "serve")]
             let cockpit_spawn_target = if instance.cockpit_mode {
                 Some((
                     instance.id.clone(),
                     instance.tool.clone(),
                     instance.cockpit_agent.clone(),
                     instance.cockpit_model.clone(),
+                    cockpit_effort,
                     instance.project_path.clone(),
                     instance.cockpit_acp_session_id.clone(),
                     instance.source_profile.clone(),
@@ -2506,12 +2541,12 @@ pub async fn create_session(
                 .telemetry_session_creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            #[cfg(feature = "serve")]
             if let Some((
                 id,
                 tool,
                 agent_override,
                 model,
+                effort,
                 project_path,
                 stored_acp_session_id,
                 source_profile,
@@ -2534,11 +2569,6 @@ pub async fn create_session(
                 let supervisor = state.cockpit_supervisor.clone();
                 let state_for_check = state.clone();
                 tokio::spawn(async move {
-                    // Initial session creation: run on_launch hooks
-                    // once here so cockpit-mode parity with the tmux
-                    // path is preserved (tmux fires on_launch from
-                    // `instance.start()` at creation, then never
-                    // again).
                     let inst_lock = state_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
                         &state_for_check.instances,
@@ -2560,10 +2590,6 @@ pub async fn create_session(
                             return;
                         }
                     };
-                    // Pass the session profile through regardless of
-                    // sandboxing so the spawn path resolves agent_cockpit_cmd
-                    // and worker env from the right profile for non-sandbox
-                    // sessions too.
                     let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
                         .spawn(crate::cockpit::supervisor::SpawnRequest {
@@ -2573,6 +2599,7 @@ pub async fn create_session(
                             additional_dirs: vec![],
                             provider_env: vec![],
                             model,
+                            effort,
                             stored_acp_session_id,
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
@@ -2581,11 +2608,6 @@ pub async fn create_session(
                         })
                         .await
                     {
-                        // If the session was deleted during the 2-3s
-                        // ACP handshake, the spawn error is for a
-                        // vanished session; demote to debug instead
-                        // of publishing AgentStartupError to a UI
-                        // that no longer exists.
                         let still_present = state_for_check
                             .instances
                             .read()
@@ -2610,6 +2632,19 @@ pub async fn create_session(
                     }
                 });
             }
+
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        #[cfg(not(feature = "serve"))]
+        Ok(Ok((instance, warnings))) => {
+            let mut resp = SessionResponse::from_instance(
+                &instance,
+                crate::claude_settings::read_tui_fullscreen(),
+            );
+            resp.warnings = warnings;
+            let mut instances = state.instances.write().await;
+            instances.push(instance);
+            drop(instances);
 
             (StatusCode::CREATED, Json(resp)).into_response()
         }

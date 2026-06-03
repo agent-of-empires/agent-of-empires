@@ -33,6 +33,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         cwd: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: env,
+        default_effort: None,
         socket_path: None,
         stored_acp_session_id: None,
         sandbox_info: None,

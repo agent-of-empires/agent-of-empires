@@ -265,6 +265,9 @@ pub struct SessionConfigOverride {
     pub agent_cockpit_cmd: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cockpit_defaults: Option<HashMap<String, super::config::CockpitAgentDefaults>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_hotkeys: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -530,6 +533,9 @@ pub fn apply_session_overrides(
     }
     if let Some(ref cockpit_cmd) = source.agent_cockpit_cmd {
         target.agent_cockpit_cmd = cockpit_cmd.clone();
+    }
+    if let Some(ref cockpit_defaults) = source.cockpit_defaults {
+        target.cockpit_defaults = cockpit_defaults.clone();
     }
     if let Some(strict_hotkeys) = source.strict_hotkeys {
         target.strict_hotkeys = strict_hotkeys;

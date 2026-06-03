@@ -839,6 +839,11 @@ impl SettingsView {
                     s.agent_cockpit_cmd = None;
                 }
             }
+            FieldKey::CockpitDefaults => {
+                if let Some(ref mut s) = config.session {
+                    s.cockpit_defaults = None;
+                }
+            }
             FieldKey::AgentStatusHooks => {
                 if let Some(ref mut s) = config.session {
                     s.agent_status_hooks = None;

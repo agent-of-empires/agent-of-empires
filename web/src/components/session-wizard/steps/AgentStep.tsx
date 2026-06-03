@@ -29,7 +29,14 @@ interface Props {
   agents: AgentInfo[];
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
-  onApplyProfileDefaults: (defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => void;
+  onApplyProfileDefaults: (defaults: {
+    yoloMode: boolean;
+    sandboxEnabled: boolean;
+    tool: string;
+    extraEnv: string[];
+    cockpitModel?: string;
+    cockpitEffort?: string;
+  }) => void;
   /** Live value of the cockpit master switch. When true, sessions
    *  the user creates here run in cockpit mode automatically (for
    *  tools with an ACP adapter); when false, every session is tmux.
@@ -202,11 +209,16 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         const env = Array.isArray(sandbox?.environment)
           ? (sandbox.environment as unknown[]).filter((v): v is string => typeof v === "string")
           : [];
+        const defaultTool = (session?.default_tool as string) || data.tool;
+        const cockpitDefaults = session?.cockpit_defaults as Record<string, unknown> | undefined;
+        const cockpitDefault = cockpitDefaults?.[defaultTool] as Record<string, unknown> | undefined;
         onApplyProfileDefaults({
           yoloMode: (session?.yolo_mode_default as boolean) ?? false,
           sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
-          tool: (session?.default_tool as string) || data.tool,
+          tool: defaultTool,
           extraEnv: env,
+          cockpitModel: typeof cockpitDefault?.model === "string" ? cockpitDefault.model : "",
+          cockpitEffort: typeof cockpitDefault?.effort === "string" ? cockpitDefault.effort : "",
         });
       }
     } catch {

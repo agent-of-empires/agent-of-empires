@@ -115,6 +115,7 @@ pub enum FieldKey {
     CustomAgents,
     AgentDetectAs,
     AgentCockpitCmd,
+    CockpitDefaults,
     HostEnvironment,
     SessionIdPollerMaxThreads,
     LiveSendExitChord,
@@ -290,6 +291,54 @@ fn parse_key_value_list(items: &[String]) -> std::collections::HashMap<String, S
             Some((k.to_string(), v.to_string()))
         })
         .collect()
+}
+
+fn parse_cockpit_defaults_list(
+    items: &[String],
+) -> std::collections::HashMap<String, crate::session::config::CockpitAgentDefaults> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let (agent, value) = item.split_once('=')?;
+            let agent = agent.trim();
+            if agent.is_empty() {
+                return None;
+            }
+            let mut parts = value.splitn(2, ',').map(str::trim);
+            let model = parts
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            let effort = parts
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            if model.is_none() && effort.is_none() {
+                return None;
+            }
+            Some((
+                agent.to_string(),
+                crate::session::config::CockpitAgentDefaults { model, effort },
+            ))
+        })
+        .collect()
+}
+
+fn cockpit_defaults_list(
+    map: &std::collections::HashMap<String, crate::session::config::CockpitAgentDefaults>,
+) -> Vec<String> {
+    let mut items: Vec<_> = map
+        .iter()
+        .map(|(agent, defaults)| {
+            let model = defaults.model.as_deref().unwrap_or_default();
+            match defaults.effort.as_deref() {
+                Some(effort) if !effort.is_empty() => format!("{agent}={model},{effort}"),
+                _ => format!("{agent}={model}"),
+            }
+        })
+        .collect();
+    items.sort();
+    items
 }
 
 /// Value types for settings fields
@@ -2043,6 +2092,14 @@ fn build_agents_fields(
         items
     };
 
+    let (cockpit_defaults_map, cockpit_defaults_override) = resolve_value(
+        scope,
+        global.session.cockpit_defaults.clone(),
+        session.and_then(|s| s.cockpit_defaults.clone()),
+    );
+    let cockpit_defaults_items = cockpit_defaults_list(&cockpit_defaults_map);
+    let global_cockpit_defaults_items = cockpit_defaults_list(&global.session.cockpit_defaults);
+
     vec![
         SettingField {
             key: FieldKey::DefaultTool,
@@ -2123,6 +2180,19 @@ fn build_agents_fields(
             inherited_display: inherited_if(
                 cockpit_cmd_override,
                 FieldValue::List(global_cockpit_cmd_list),
+            ),
+        },
+        SettingField {
+            key: FieldKey::CockpitDefaults,
+            label: "Cockpit Defaults",
+            description:
+                "Per-agent cockpit defaults: agent=model[,effort] (e.g. opencode=openai/gpt-5.5,high)",
+            value: FieldValue::List(cockpit_defaults_items),
+            category: SettingsCategory::Agents,
+            has_override: cockpit_defaults_override,
+            inherited_display: inherited_if(
+                cockpit_defaults_override,
+                FieldValue::List(global_cockpit_defaults_items),
             ),
         },
         SettingField {
@@ -2906,6 +2976,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::AgentCockpitCmd, FieldValue::List(v)) => {
             config.session.agent_cockpit_cmd = parse_key_value_list(v);
         }
+        (FieldKey::CockpitDefaults, FieldValue::List(v)) => {
+            config.session.cockpit_defaults = parse_cockpit_defaults_list(v);
+        }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => config.sound.enabled = *v,
         (FieldKey::SoundMode, FieldValue::Select { selected, .. }) => {
@@ -3423,6 +3496,14 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 .session
                 .get_or_insert_with(SessionConfigOverride::default);
             s.agent_cockpit_cmd = Some(map);
+        }
+        (FieldKey::CockpitDefaults, FieldValue::List(v)) => {
+            let map = parse_cockpit_defaults_list(v);
+            use crate::session::SessionConfigOverride;
+            let s = config
+                .session
+                .get_or_insert_with(SessionConfigOverride::default);
+            s.cockpit_defaults = Some(map);
         }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => {
