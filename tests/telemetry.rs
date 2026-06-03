@@ -326,8 +326,10 @@ fn version_health_never_leaks_version_string() {
             !serialized.contains(secret_latest),
             "raw cached latest version leaked into payload: {serialized}"
         );
+        // A dotted fragment, so it can never collide with the dashless hex
+        // install-id UUID (nor with any bucket string).
         assert!(
-            !serialized.contains("1234"),
+            !serialized.contains("1234.5678"),
             "a fragment of the cached version leaked: {serialized}"
         );
         // Only the coarse bucket leaves the client.
