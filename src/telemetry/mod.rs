@@ -28,7 +28,9 @@ pub mod usage_signals;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub use events::{CliUsage, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
+pub use events::{
+    CliUsage, CockpitInteractionCounts, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION,
+};
 pub use form_factor::WebClientFormFactor;
 pub use state::{
     cli_usage_due, ensure_install_id, install_id, record_cli_command, record_cli_usage_flush,
@@ -353,6 +355,7 @@ pub fn build_usage_snapshot(
     session_creates_since_last_snapshot: u32,
     auth_mode: Option<&str>,
     serve_mode: Option<&str>,
+    cockpit_counts: &CockpitInteractionCounts,
 ) -> Option<UsageSnapshot> {
     // Load the global, pre-profile-merge config exactly once and reuse it for
     // both the opt-in gate and `active_features`, instead of parsing
@@ -383,6 +386,7 @@ pub fn build_usage_snapshot(
         instances,
         usage_seen,
         session_creates_since_last_snapshot,
+        cockpit_counts,
     );
     // Layer the serve-only deployment metadata on top of the pure snapshot, so
     // `assemble_usage_snapshot` stays focused on session/feature bucketing.
@@ -410,6 +414,7 @@ fn assemble_usage_snapshot(
     instances: &[Instance],
     usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
+    cockpit_counts: &CockpitInteractionCounts,
 ) -> UsageSnapshot {
     let features = features::active_features(config);
 
@@ -456,6 +461,12 @@ fn assemble_usage_snapshot(
         // assembler leaves them unset.
         auth_mode: None,
         serve_mode: None,
+        approvals_resolved: cockpit_counts.approvals_resolved(),
+        approvals_by_decision: cockpit_counts.approvals_by_decision(),
+        agent_switches: cockpit_counts.agent_switches,
+        substrate_toggles: cockpit_counts.substrate_toggles,
+        plan_mode_seen: cockpit_counts.plan_mode_seen,
+        prompts_queued: cockpit_counts.prompts_queued,
     }
 }
 
@@ -761,6 +772,12 @@ mod tests {
             session_creates_since_last_snapshot: 0,
             auth_mode: None,
             serve_mode: None,
+            approvals_resolved: 0,
+            approvals_by_decision: BTreeMap::new(),
+            agent_switches: 0,
+            substrate_toggles: 0,
+            plan_mode_seen: false,
+            prompts_queued: 0,
         }
     }
 

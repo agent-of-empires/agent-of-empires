@@ -26,7 +26,10 @@ use serde::Serialize;
 /// and `usage_snapshot`.
 /// v9 (#1883): added the `web_clients_seen` / `cockpit_clients_seen`
 /// per-form-factor maps alongside the `usage_seen` open counts.
-pub const SCHEMA_VERSION: u32 = 9;
+/// v10 (#1888): added the cockpit-interaction aggregates (`approvals_resolved`,
+/// `approvals_by_decision`, `agent_switches`, `substrate_toggles`,
+/// `plan_mode_seen`, `prompts_queued`).
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -223,4 +226,104 @@ pub struct UsageSnapshot {
     /// a tunnel name, hostname, or `.ts.net` URL, only the coarse mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_mode: Option<String>,
+
+    /// Cockpit approvals the user resolved since the last snapshot. The sum of
+    /// [`Self::approvals_by_decision`]; the synthetic daemon-restart
+    /// `Cancelled` decision is never counted (it is not a user choice).
+    pub approvals_resolved: u32,
+    /// Decision mix for resolved approvals: allowlisted decision key
+    /// (`allow` / `allow_always` / `deny`) -> count. Zero-count keys are
+    /// omitted, like [`Self::sessions_by_agent`]. Shows whether people lean on
+    /// `allow_always` (trust) vs `deny` (friction).
+    pub approvals_by_decision: BTreeMap<String, u32>,
+    /// Mid-session agent switches since the last snapshot.
+    pub agent_switches: u32,
+    /// Cockpit/terminal substrate toggles since the last snapshot. Only real
+    /// transitions count; an enable on an already-cockpit session (or a disable
+    /// on an already-terminal session) is a no-op and is not counted.
+    pub substrate_toggles: u32,
+    /// A session entered plan mode at least once since the last snapshot.
+    pub plan_mode_seen: bool,
+    /// Prompts the web cockpit queued (parked because the agent was busy)
+    /// since the last snapshot. Reported by the browser, the only surface that
+    /// owns the prompt queue; the daemon never sees the queue directly.
+    pub prompts_queued: u32,
+}
+
+/// Resolved cockpit-interaction counts for one snapshot window, the input the
+/// daemon folds into a [`UsageSnapshot`]. Surfaces without a cockpit (the TUI)
+/// pass [`Default`] (all zero). Counts only, plus a closed decision key set, so
+/// nothing here can carry free-form content past [`super::sanitize`].
+#[derive(Debug, Clone, Default)]
+pub struct CockpitInteractionCounts {
+    pub approvals_allow: u32,
+    pub approvals_allow_always: u32,
+    pub approvals_deny: u32,
+    pub agent_switches: u32,
+    pub substrate_toggles: u32,
+    pub plan_mode_seen: bool,
+    pub prompts_queued: u32,
+}
+
+impl CockpitInteractionCounts {
+    /// Total user-resolved approvals (the three real decisions; `Cancelled`
+    /// is never accumulated here).
+    pub fn approvals_resolved(&self) -> u32 {
+        self.approvals_allow + self.approvals_allow_always + self.approvals_deny
+    }
+
+    /// Decision mix as an allowlisted-key map, omitting zero counts to match
+    /// the `sessions_by_agent` convention.
+    pub fn approvals_by_decision(&self) -> BTreeMap<String, u32> {
+        let mut map = BTreeMap::new();
+        for (key, count) in [
+            ("allow", self.approvals_allow),
+            ("allow_always", self.approvals_allow_always),
+            ("deny", self.approvals_deny),
+        ] {
+            if count > 0 {
+                map.insert(key.to_string(), count);
+            }
+        }
+        map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approvals_resolved_sums_the_three_real_decisions() {
+        let counts = CockpitInteractionCounts {
+            approvals_allow: 2,
+            approvals_allow_always: 1,
+            approvals_deny: 1,
+            ..Default::default()
+        };
+        // Issue #1888 story: 2 allow + 1 deny (+ 1 allow_always here) all count.
+        assert_eq!(counts.approvals_resolved(), 4);
+    }
+
+    #[test]
+    fn approvals_by_decision_omits_zero_keys() {
+        let counts = CockpitInteractionCounts {
+            approvals_allow: 2,
+            approvals_deny: 1,
+            ..Default::default()
+        };
+        let map = counts.approvals_by_decision();
+        // Matches the sessions_by_agent convention: absent key == zero.
+        assert_eq!(map.get("allow"), Some(&2));
+        assert_eq!(map.get("deny"), Some(&1));
+        assert!(!map.contains_key("allow_always"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn empty_counts_produce_an_empty_decision_map() {
+        let counts = CockpitInteractionCounts::default();
+        assert_eq!(counts.approvals_resolved(), 0);
+        assert!(counts.approvals_by_decision().is_empty());
+    }
 }
