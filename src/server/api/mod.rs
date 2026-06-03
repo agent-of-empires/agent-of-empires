@@ -345,6 +345,15 @@ mod tests {
                 ],
             ),
             (
+                "api/telemetry.rs",
+                include_str!("telemetry.rs"),
+                &[
+                    "set_telemetry_consent",
+                    "post_telemetry_seen",
+                    "post_telemetry_cockpit_interaction",
+                ],
+            ),
+            (
                 "server/push.rs",
                 include_str!("../push.rs"),
                 &["subscribe", "unsubscribe", "test"],
