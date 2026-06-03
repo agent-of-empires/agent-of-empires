@@ -161,6 +161,10 @@ pub struct NewSessionDialog {
     /// Extra environment entries (session-specific).
     /// `KEY` = pass through, `KEY=VALUE` = set explicitly.
     pub(super) extra_env: Vec<String>,
+    /// True after the user edits the sandbox env list in this dialog.
+    /// Inherited config is shown for review, but is not submitted as a
+    /// per-session override unless this flips.
+    pub(super) extra_env_overridden: bool,
     /// Whether the env list is expanded (editing mode)
     pub(super) env_list_expanded: bool,
     /// Currently selected index in the env list
@@ -464,6 +468,7 @@ impl NewSessionDialog {
             yolo_mode,
             yolo_mode_default: yolo_mode,
             extra_env,
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -496,6 +501,9 @@ impl NewSessionDialog {
     /// Pre-fill the path field (e.g. from a selected session).
     pub fn set_path(&mut self, path: String) {
         self.path = Input::new(path);
+        if !self.extra_env_overridden {
+            self.reload_config_defaults();
+        }
     }
 
     /// Pre-fill the group field (e.g. from a selected session or group).
@@ -587,6 +595,27 @@ impl NewSessionDialog {
         self.available_profiles.len() > 1
     }
 
+    fn resolve_config_for_path(&self, profile: &str) -> crate::session::Config {
+        let path = self.path.value().trim();
+        if path.is_empty() {
+            resolve_config_or_warn(profile)
+        } else {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(path),
+            )
+        }
+    }
+
+    fn refresh_inherited_sandbox_settings(&mut self) {
+        if !self.sandbox_enabled || self.extra_env_overridden {
+            return;
+        }
+        let config = self.resolve_config_for_path(&self.profile);
+        self.extra_env = config.sandbox.environment.clone();
+        self.inherited_settings = build_inherited_settings(&config.sandbox);
+    }
+
     /// Whether the currently selected tool is always in YOLO mode (no opt-in needed).
     fn selected_tool_always_yolo(&self) -> bool {
         let tool_name = &self.available_tools[self.tool_index];
@@ -628,7 +657,7 @@ impl NewSessionDialog {
     fn reload_config_defaults(&mut self) {
         let profile = self.selected_profile().to_string();
         self.profile = profile.clone();
-        let config = resolve_config_or_warn(&profile);
+        let config = self.resolve_config_for_path(&profile);
 
         // Reset tool index
         self.tool_index = if let Some(ref default_tool) = config.session.default_tool {
@@ -659,6 +688,7 @@ impl NewSessionDialog {
             self.extra_env.clear();
             self.inherited_settings.clear();
         }
+        self.extra_env_overridden = false;
 
         // Reset extra args and command override for new default tool
         let selected_tool = self
@@ -735,6 +765,7 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             extra_env: Vec::new(),
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -804,6 +835,7 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             extra_env: Vec::new(),
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -1076,11 +1108,13 @@ impl NewSessionDialog {
         } else if self.focused_field == sandbox_field {
             self.sandbox_enabled = !self.sandbox_enabled;
             if self.sandbox_enabled {
-                let config = resolve_config_or_warn(&self.profile);
+                let config = self.resolve_config_for_path(&self.profile);
                 self.extra_env = config.sandbox.environment.clone();
                 self.inherited_settings = build_inherited_settings(&config.sandbox);
+                self.extra_env_overridden = false;
             } else {
                 self.extra_env.clear();
+                self.extra_env_overridden = false;
                 self.env_list_expanded = false;
                 self.env_editing_input = None;
                 self.inherited_settings.clear();
@@ -1252,6 +1286,7 @@ impl NewSessionDialog {
                 return DialogResult::Continue;
             }
             if self.focused_field == sandbox_field && self.sandbox_enabled {
+                self.refresh_inherited_sandbox_settings();
                 self.sandbox_config_mode = true;
                 self.sandbox_focused_field = 0;
                 return DialogResult::Continue;
@@ -1395,11 +1430,13 @@ impl NewSessionDialog {
             {
                 self.sandbox_enabled = !self.sandbox_enabled;
                 if self.sandbox_enabled {
-                    let config = resolve_config_or_warn(&self.profile);
+                    let config = self.resolve_config_for_path(&self.profile);
                     self.extra_env = config.sandbox.environment.clone();
                     self.inherited_settings = build_inherited_settings(&config.sandbox);
+                    self.extra_env_overridden = false;
                 } else {
                     self.extra_env.clear();
+                    self.extra_env_overridden = false;
                     self.env_list_expanded = false;
                     self.env_editing_input = None;
                     self.inherited_settings.clear();
@@ -1716,6 +1753,7 @@ impl NewSessionDialog {
 
         // Validate the current entry if the list changed
         if self.extra_env != snapshot {
+            self.extra_env_overridden = true;
             self.error_message = self
                 .extra_env
                 .get(self.env_selected_index)
@@ -1960,7 +1998,7 @@ impl NewSessionDialog {
             sandbox: self.sandbox_enabled,
             sandbox_image: self.sandbox_image.value().trim().to_string(),
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
-            extra_env: if self.sandbox_enabled {
+            extra_env: if self.sandbox_enabled && self.extra_env_overridden {
                 self.extra_env.clone()
             } else {
                 Vec::new()

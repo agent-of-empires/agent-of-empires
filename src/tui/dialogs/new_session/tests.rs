@@ -1154,6 +1154,243 @@ fn test_profile_included_in_submit() {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn test_profile_switch_reloads_sandbox_env_without_session_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", temp_home.path());
+    #[cfg(target_os = "linux")]
+    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+    std::env::set_var("OLD_THING", "1");
+    std::env::set_var("NEW_THING", "2");
+
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
+    fs::create_dir_all(profiles_dir.join("aoe")).expect("aoe profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        r#"
+default_profile = "default"
+
+[sandbox]
+enabled_by_default = true
+environment = ["THING=$OLD_THING"]
+"#,
+    )
+    .expect("global config");
+    fs::write(
+        profiles_dir.join("aoe").join("config.toml"),
+        r#"
+[sandbox]
+environment = ["THING=$NEW_THING"]
+"#,
+    )
+    .expect("profile config");
+
+    let mut dialog = single_tool_dialog();
+    dialog.available_profiles = vec!["default".to_string(), "aoe".to_string()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.profile_index = 0;
+    dialog.docker_available = true;
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
+
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_profile(), "aoe");
+    assert!(dialog.sandbox_enabled);
+    assert_eq!(dialog.extra_env, vec!["THING=$NEW_THING".to_string()]);
+    assert!(!dialog.extra_env_overridden);
+
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.profile, "aoe");
+            assert!(
+                data.extra_env.is_empty(),
+                "inherited sandbox env must not become a session override"
+            );
+        }
+        _ => panic!("Expected Submit"),
+    }
+
+    std::env::remove_var("OLD_THING");
+    std::env::remove_var("NEW_THING");
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn test_set_path_reloads_repo_sandbox_env_without_session_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", temp_home.path());
+    #[cfg(target_os = "linux")]
+    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        r#"
+default_profile = "default"
+
+[sandbox]
+enabled_by_default = true
+environment = ["THING=$OLD_THING"]
+"#,
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("repo dir");
+    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::write(
+        repo.path().join(".agent-of-empires/config.toml"),
+        r#"
+[sandbox]
+environment = ["THING=$REPO_THING"]
+"#,
+    )
+    .expect("repo config");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
+
+    dialog.set_path(repo.path().to_string_lossy().to_string());
+
+    assert_eq!(dialog.extra_env, vec!["THING=$REPO_THING".to_string()]);
+    assert!(!dialog.extra_env_overridden);
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert!(
+                data.extra_env.is_empty(),
+                "repo-inherited sandbox env must not become a session override"
+            );
+        }
+        _ => panic!("Expected Submit"),
+    }
+
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn test_sandbox_config_refreshes_typed_path_repo_env_without_session_override() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", temp_home.path());
+    #[cfg(target_os = "linux")]
+    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        r#"
+default_profile = "default"
+
+[sandbox]
+enabled_by_default = true
+environment = ["THING=$OLD_THING"]
+"#,
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("repo dir");
+    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::write(
+        repo.path().join(".agent-of-empires/config.toml"),
+        r#"
+[sandbox]
+environment = ["THING=$REPO_THING"]
+"#,
+    )
+    .expect("repo config");
+
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.extra_env, vec!["THING=$OLD_THING".to_string()]);
+
+    dialog.path = Input::new(repo.path().to_string_lossy().to_string());
+    dialog.focused_field = 4;
+    let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+
+    assert!(matches!(result, DialogResult::Continue));
+    assert!(dialog.sandbox_config_mode);
+    assert_eq!(dialog.extra_env, vec!["THING=$REPO_THING".to_string()]);
+    assert!(!dialog.extra_env_overridden);
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert!(
+                data.extra_env.is_empty(),
+                "repo-inherited sandbox env must not become a session override"
+            );
+        }
+        _ => panic!("Expected Submit"),
+    }
+
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+#[test]
+fn test_env_list_edit_submits_session_override() {
+    let mut dialog = single_tool_dialog();
+    dialog.docker_available = true;
+    dialog.sandbox_enabled = true;
+    dialog.extra_env = vec!["THING=$NEW_THING".to_string()];
+    dialog.env_list_expanded = true;
+    dialog.sandbox_config_mode = true;
+    dialog.sandbox_focused_field = 1;
+
+    dialog.handle_env_list_key(key(KeyCode::Char('a')));
+    for ch in "EXTRA=1".chars() {
+        dialog.handle_env_list_key(key(KeyCode::Char(ch)));
+    }
+    dialog.handle_env_list_key(key(KeyCode::Enter));
+
+    assert!(dialog.extra_env_overridden);
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert_eq!(
+                data.extra_env,
+                vec!["THING=$NEW_THING".to_string(), "EXTRA=1".to_string()]
+            );
+        }
+        _ => panic!("Expected Submit"),
+    }
+}
+
 // --- Sandbox config mode tests ---
 
 #[test]
