@@ -3174,12 +3174,27 @@ impl ModelChannelCache {
         let has_real_model = out
             .iter()
             .any(|o| o.category == ConfigOptionCategory::Model);
-        if !has_real_model {
+        // A real option already wins if it occupies the reserved id; adding
+        // the synthetic selector under the same id would shadow it and the
+        // dispatch path would misroute its set to session/set_model. See
+        // #1820 review.
+        let reserved_taken = self.reserved_id_is_real();
+        if !has_real_model && !reserved_taken {
             if let Some(model) = &self.session_model {
                 out.push(session_model_to_config_option(model));
             }
         }
         out
+    }
+
+    /// True when the agent's raw config options already include one whose id
+    /// equals the reserved synthetic-model id. In that (pathological) case
+    /// the real option owns the id and the session_model channel must not be
+    /// synthesized or routed to `session/set_model`.
+    fn reserved_id_is_real(&self) -> bool {
+        self.raw_config_options
+            .iter()
+            .any(|o| o.id == ACP_SESSION_MODEL_CONFIG_ID)
     }
 }
 
@@ -3274,7 +3289,14 @@ fn dispatch_set_config_option(
     event_tx: mpsc::Sender<Event>,
     model_cache: Arc<std::sync::Mutex<ModelChannelCache>>,
 ) {
-    if config_id == ACP_SESSION_MODEL_CONFIG_ID {
+    // Route to session/set_model only for the SYNTHETIC selector. If a real
+    // ACP option happens to occupy the reserved id, it wins and goes through
+    // the generic set_config_option path below. See #1820 review.
+    let is_synthetic_model = config_id == ACP_SESSION_MODEL_CONFIG_ID && {
+        let cache = model_cache.lock().expect("model channel cache poisoned");
+        !cache.reserved_id_is_real()
+    };
+    if is_synthetic_model {
         info!(target: "cockpit.acp", "sending session/set_model model={value}");
         let sent = connection.send_request(SetSessionModelRequest::new(
             acp_session_id.clone(),
@@ -3627,13 +3649,19 @@ fn extract_tool_output_blocks(
                                 uri: t.uri.clone(),
                                 mime_type: t.mime_type.clone(),
                                 text: Some(t.text.clone()),
+                                data: None,
                             }
                         }
                         EmbeddedResourceResource::BlobResourceContents(b) => {
+                            // Keep the inline bytes (capped) so a blob without
+                            // a fetchable uri is still recoverable as a
+                            // download instead of an empty placeholder. See
+                            // #1818 review.
                             ToolOutputBlock::Resource {
                                 uri: b.uri.clone(),
                                 mime_type: b.mime_type.clone(),
                                 text: None,
+                                data: cap(b.blob.clone()),
                             }
                         }
                         _ => continue,
@@ -7670,6 +7698,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_output_blocks_keeps_blob_resource_payload() {
+        // #1818 review: a binary (blob) embedded resource must keep its
+        // inline bytes so it stays recoverable as a download.
+        use agent_client_protocol::schema::{
+            BlobResourceContents, Content, ContentBlock, EmbeddedResource,
+            EmbeddedResourceResource, ToolCallContent,
+        };
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new("QkxPQg==", "file:///out.bin")
+                        .mime_type(Some("application/octet-stream".to_string())),
+                ),
+            )),
+        ))];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ToolOutputBlock::Resource {
+                uri,
+                data,
+                text,
+                mime_type,
+            } => {
+                assert_eq!(uri, "file:///out.bin");
+                assert_eq!(data.as_deref(), Some("QkxPQg=="));
+                assert!(text.is_none());
+                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+            }
+            other => panic!("expected Resource, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn extract_tool_output_blocks_drops_oversized_inline_media() {
         use agent_client_protocol::schema::{Content, ContentBlock, ImageContent, ToolCallContent};
         let huge = "A".repeat(MAX_INLINE_MEDIA_B64 + 1);
@@ -8080,6 +8142,29 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "real-model");
         assert!(out.iter().all(|o| o.id != ACP_SESSION_MODEL_CONFIG_ID));
+    }
+
+    #[test]
+    fn normalize_yields_to_real_option_on_reserved_id_collision() {
+        // Pathological: a real ACP option occupies the reserved synthetic id.
+        // The real option wins; the synthetic selector is not added (which
+        // would otherwise shadow it and misroute its set). See #1820 review.
+        let reserved_real = ConfigOptionDescriptor {
+            id: ACP_SESSION_MODEL_CONFIG_ID.to_string(),
+            name: "Not really the model".to_string(),
+            description: None,
+            category: ConfigOptionCategory::Other("misc".to_string()),
+            current_value: "x".to_string(),
+            options: Vec::new(),
+        };
+        let cache = ModelChannelCache {
+            raw_config_options: vec![reserved_real],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1, "no synthetic selector appended: {out:?}");
+        assert_eq!(out[0].current_value, "x");
+        assert!(cache.reserved_id_is_real());
     }
 
     #[test]

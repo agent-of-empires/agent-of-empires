@@ -156,9 +156,15 @@ pub enum ToolOutputBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
         /// Inline text for a text resource. Absent for a binary (blob)
-        /// resource, which surfaces as a download link instead.
+        /// resource, which carries `data` instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// Base64-encoded bytes for a binary (blob) resource, so the card
+        /// can offer the payload as a download even without a fetchable uri.
+        /// Absent for a text resource, or when the blob exceeded the size
+        /// cap (the uri remains as a fallback).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
 }
 
