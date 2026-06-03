@@ -338,6 +338,17 @@ pub struct AppState {
     /// /api/telemetry/seen`), which folds the flag into its own snapshot.
     pub telemetry_web_seen: std::sync::atomic::AtomicBool,
     pub telemetry_cockpit_seen: std::sync::atomic::AtomicBool,
+    /// Sessions created since the last opt-in telemetry snapshot. Feeds the
+    /// `session_creates_since_last_snapshot` trend counter so short-lived sessions
+    /// that start and end between two snapshots are still counted. Decremented (by
+    /// the value reported) only after a confirmed send, so a failed send retains
+    /// the count for the next snapshot instead of silently dropping it.
+    pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    /// What the most recent serve snapshot reported, held until its send is
+    /// confirmed so the originating signals (`web_seen` / `cockpit_seen` / the
+    /// create counter) are cleared only on success. The telemetry loop is the
+    /// sole reader/writer, so it never overlaps an in-flight build.
+    telemetry_last_reported: std::sync::Mutex<Option<ReportedServeSignals>>,
     /// Resolved when the daemon receives SIGINT/SIGTERM/SIGHUP. Long-lived
     /// handlers (cockpit WS, terminal WS) clone this and `select!` on
     /// `cancelled()` so they exit promptly instead of holding axum's
@@ -613,6 +624,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
         telemetry_web_seen: std::sync::atomic::AtomicBool::new(false),
         telemetry_cockpit_seen: std::sync::atomic::AtomicBool::new(false),
+        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
     });
 
@@ -1642,13 +1655,23 @@ fn spawn_telemetry_loop(state: Arc<AppState>) {
                     // 12h ticks would otherwise emit the initial first-tick
                     // snapshot and an identical shutdown snapshot seconds apart.
                     if let Some(snapshot) = build_serve_snapshot(&state).await {
-                        crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+                        let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+                        clear_reported_serve_signals(&state, outcome);
                     }
                     break;
                 }
                 _ = interval.tick() => {
                     if let Some(snapshot) = build_serve_snapshot(&state).await {
-                        crate::telemetry::spawn_snapshot(snapshot);
+                        // Awaited (not detached) so the reported signals are
+                        // cleared only after a confirmed send. A failed send
+                        // retains web_seen / cockpit_seen / the create counter
+                        // for the next snapshot instead of dropping them.
+                        let outcome = if crate::telemetry::send_snapshot(snapshot).await {
+                            crate::telemetry::SendOutcome::Sent
+                        } else {
+                            crate::telemetry::SendOutcome::Failed
+                        };
+                        clear_reported_serve_signals(&state, outcome);
                     }
                 }
             }
@@ -1656,22 +1679,73 @@ fn spawn_telemetry_loop(state: Arc<AppState>) {
     });
 }
 
-/// Build a serve `usage_snapshot` from the live session list, folding in (and
-/// resetting) the `web_seen` / `cockpit_seen` flags reported by browsers. The
-/// session-create trend counter is left at 0 for v1. Returns `None` when
-/// telemetry is not opted in.
+/// What a serve snapshot reported, so the originating signals can be cleared
+/// only after the send is confirmed. The clear is deferred (rather than reset at
+/// build time) so a failed send retains the signals for the next snapshot.
+struct ReportedServeSignals {
+    web_seen: bool,
+    cockpit_seen: bool,
+    session_creates: u32,
+}
+
+/// Build a serve `usage_snapshot` from the live session list, folding in the
+/// `web_seen` / `cockpit_seen` flags and the session-create trend counter
+/// *without resetting them*. The reported values are stashed in `AppState` so
+/// [`clear_reported_serve_signals`] can clear them once the send is confirmed.
+/// Returns `None` when telemetry is not opted in.
 async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::UsageSnapshot> {
     use std::sync::atomic::Ordering;
-    let web_seen = state.telemetry_web_seen.swap(false, Ordering::Relaxed);
-    let cockpit_seen = state.telemetry_cockpit_seen.swap(false, Ordering::Relaxed);
+    let web_seen = state.telemetry_web_seen.load(Ordering::Relaxed);
+    let cockpit_seen = state.telemetry_cockpit_seen.load(Ordering::Relaxed);
+    let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
     let instances = state.instances.read().await.clone();
-    crate::telemetry::build_usage_snapshot(
+    let snapshot = crate::telemetry::build_usage_snapshot(
         crate::telemetry::Surface::Serve,
         &instances,
         web_seen,
         cockpit_seen,
-        0,
-    )
+        session_creates,
+    )?;
+    *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
+        web_seen,
+        cockpit_seen,
+        session_creates,
+    });
+    Some(snapshot)
+}
+
+/// Clear the signals a serve snapshot reported, but only when the send was
+/// confirmed (`SendOutcome::Sent`). On `Deduped` the prior confirmed send
+/// already cleared them; on `Failed` they are retained so the next snapshot
+/// re-reports them. The create counter is decremented by exactly the reported
+/// value (not reset to 0) so creates that arrived during the in-flight send are
+/// preserved; the `seen` flags are reset to false, with any open that landed
+/// during the send re-arming the flag on the next snapshot.
+fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::SendOutcome) {
+    use std::sync::atomic::Ordering;
+    let Some(reported) = state.telemetry_last_reported.lock().unwrap().take() else {
+        return;
+    };
+    if outcome != crate::telemetry::SendOutcome::Sent {
+        return;
+    }
+    if reported.web_seen {
+        state.telemetry_web_seen.store(false, Ordering::Relaxed);
+    }
+    if reported.cockpit_seen {
+        state.telemetry_cockpit_seen.store(false, Ordering::Relaxed);
+    }
+    decrement_reported_creates(&state.telemetry_session_creates, reported.session_creates);
+}
+
+/// Decrement the create counter by exactly `reported`, never by more. Using
+/// `fetch_sub(reported)` rather than `swap(0)` preserves any creates that landed
+/// between the snapshot build and the confirmed send, so they roll into the next
+/// snapshot instead of being dropped. A no-op when nothing was reported.
+fn decrement_reported_creates(counter: &std::sync::atomic::AtomicU32, reported: u32) {
+    if reported > 0 {
+        counter.fetch_sub(reported, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -2643,6 +2717,34 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1874: a confirmed snapshot clears the create counter by exactly the value
+    // it reported, so creates that arrive during the in-flight send survive into
+    // the next snapshot instead of being reset away.
+    #[test]
+    fn create_counter_decrement_preserves_concurrent_creates() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(5);
+        // The snapshot reported the 5 creates seen at build time.
+        let reported = counter.load(Ordering::Relaxed);
+        // A create lands while the snapshot is in flight.
+        counter.fetch_add(1, Ordering::Relaxed);
+        // The confirmed send clears only what it reported.
+        decrement_reported_creates(&counter, reported);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "the create that arrived during the send must be retained"
+        );
+    }
+
+    #[test]
+    fn create_counter_decrement_is_noop_for_zero() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(3);
+        decrement_reported_creates(&counter, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
 
     #[cfg(feature = "serve")]
     #[test]

@@ -124,6 +124,25 @@ fn snapshot_buckets_are_sanitized() {
     }
 }
 
+/// User story (#1874): the create-trend counter carries a real value. When N
+/// sessions were created during the window, the snapshot reports
+/// `session_creates_since_last_snapshot == N`; with none created it reports 0.
+#[test]
+#[serial]
+fn snapshot_carries_session_create_count() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    assert_eq!(none.session_creates_since_last_snapshot, 0);
+
+    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
+        .expect("snapshot built when opted in");
+    assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
 /// The CLI `process_start` is throttled to once per install per day so a user
 /// scripting `aoe` in a loop can't flood the endpoint: a send is due first, then
 /// not due once a confirmed send claims the daily slot.

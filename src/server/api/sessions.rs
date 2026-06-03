@@ -2129,6 +2129,13 @@ pub async fn create_session(
             instances.push(instance);
             drop(instances);
 
+            // Count the create for the opt-in telemetry trend counter. Bounded
+            // accumulator, read-and-decremented by the snapshot loop; no-op for
+            // opted-out installs (the snapshot is never built / sent).
+            state
+                .telemetry_session_creates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             #[cfg(feature = "serve")]
             if let Some((
                 id,
