@@ -31,6 +31,30 @@ pub fn agent_bucket(agent: &str) -> String {
     "custom".to_string()
 }
 
+/// How a family needle is matched against a model string.
+#[derive(Clone, Copy)]
+enum Needle {
+    /// Plain substring. Safe for distinctive needles long enough not to collide
+    /// (`claude`, `gpt`, `gemini`, ...).
+    Substr(&'static str),
+    /// Whole-token match: the needle must equal a token of the model string when
+    /// split on non-alphanumeric boundaries. Required for the 2-char OpenAI
+    /// tokens (`o1` / `o3` / `o4`) so `o3-mini` buckets as openai but `kilo3` or
+    /// `macro1` do not. `o3` is a token of `o3-mini` but not of `kilo3`.
+    Token(&'static str),
+}
+
+impl Needle {
+    fn matches(self, lower: &str) -> bool {
+        match self {
+            Needle::Substr(n) => lower.contains(n),
+            Needle::Token(n) => lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| tok == n),
+        }
+    }
+}
+
 /// Coarse family bucket for a model string. Never emits the raw value; maps
 /// to a small fixed vocabulary so an internal/custom model name can't leak.
 ///
@@ -40,18 +64,37 @@ pub fn model_bucket(model: Option<&str>) -> &'static str {
         return "unset";
     };
     let lower = model.to_ascii_lowercase();
-    const FAMILIES: &[(&str, &[&str])] = &[
-        ("claude", &["claude", "sonnet", "opus", "haiku"]),
-        ("openai", &["gpt", "openai", "codex", "o1", "o3", "o4"]),
-        ("gemini", &["gemini"]),
-        ("qwen", &["qwen"]),
-        ("grok", &["grok"]),
-        ("llama", &["llama"]),
-        ("mistral", &["mistral", "mixtral"]),
-        ("deepseek", &["deepseek"]),
+    use Needle::{Substr, Token};
+    const FAMILIES: &[(&str, &[Needle])] = &[
+        (
+            "claude",
+            &[
+                Substr("claude"),
+                Substr("sonnet"),
+                Substr("opus"),
+                Substr("haiku"),
+            ],
+        ),
+        (
+            "openai",
+            &[
+                Substr("gpt"),
+                Substr("openai"),
+                Substr("codex"),
+                Token("o1"),
+                Token("o3"),
+                Token("o4"),
+            ],
+        ),
+        ("gemini", &[Substr("gemini")]),
+        ("qwen", &[Substr("qwen")]),
+        ("grok", &[Substr("grok")]),
+        ("llama", &[Substr("llama")]),
+        ("mistral", &[Substr("mistral"), Substr("mixtral")]),
+        ("deepseek", &[Substr("deepseek")]),
     ];
     for (family, needles) in FAMILIES {
-        if needles.iter().any(|n| lower.contains(n)) {
+        if needles.iter().any(|n| n.matches(&lower)) {
             return family;
         }
     }
@@ -96,5 +139,46 @@ mod tests {
         assert_eq!(model_bucket(Some("   ")), "unset");
         // An internal/unknown model name must collapse to "other", not leak.
         assert_eq!(model_bucket(Some("acme-internal-v2")), "other");
+    }
+
+    // #1876: the short OpenAI tokens o1/o3/o4 are matched on a boundary, not as a
+    // bare substring, so a name that merely contains those two chars adjacent
+    // does not over-count as openai.
+    #[test]
+    fn short_openai_tokens_do_not_false_positive() {
+        for name in [
+            "kilo3",
+            "macro1-7b",
+            "kilo3-experimental",
+            "halo4",
+            "mono1x",
+        ] {
+            assert_eq!(
+                model_bucket(Some(name)),
+                "other",
+                "`{name}` must not bucket as openai"
+            );
+        }
+    }
+
+    #[test]
+    fn real_openai_models_still_bucket() {
+        for name in [
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5",
+            "gpt-4o",
+            "codex",
+        ] {
+            assert_eq!(
+                model_bucket(Some(name)),
+                "openai",
+                "`{name}` must bucket as openai"
+            );
+        }
     }
 }

@@ -145,6 +145,8 @@ pub fn build_usage_snapshot(
         return None;
     }
     let install_id = state::ensure_install_id()?;
+    // Global, pre-profile-merge config on purpose: `features` is an install-level
+    // default-adoption signal, not per-session usage. See `features::active_features`.
     let features = features::active_features(&crate::session::Config::load_or_warn());
 
     let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
