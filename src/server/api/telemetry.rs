@@ -82,6 +82,12 @@ pub async fn set_telemetry_consent(
 pub struct SeenRequest {
     /// `"web"` or `"cockpit"`.
     surface: String,
+    /// Optional coarse client form-factor (`"desktop"` / `"desktop_pwa"` /
+    /// `"mobile"` / `"mobile_pwa"`). Absent on older clients; any value outside
+    /// the closed allowlist is rejected, never stored. See
+    /// `telemetry::form_factor` and #1883.
+    #[serde(default)]
+    form_factor: Option<String>,
 }
 
 /// Record that the web dashboard / cockpit web UI was opened. Folded into the
@@ -104,13 +110,14 @@ pub async fn post_telemetry_seen(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    match req.surface.as_str() {
-        "web" => {
-            state.telemetry_web_seen.fetch_add(1, Ordering::Relaxed);
-        }
-        "cockpit" => {
-            state.telemetry_cockpit_seen.fetch_add(1, Ordering::Relaxed);
-        }
+    // Resolve the surface to its coarse counter and its per-form-factor
+    // counters in one place so both web and cockpit share the form-factor path.
+    let (coarse, clients) = match req.surface.as_str() {
+        "web" => (&state.telemetry_web_seen, &state.telemetry_web_clients),
+        "cockpit" => (
+            &state.telemetry_cockpit_seen,
+            &state.telemetry_cockpit_clients,
+        ),
         other => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -118,6 +125,31 @@ pub async fn post_telemetry_seen(
             )
                 .into_response();
         }
+    };
+
+    // Reject an unknown form-factor before recording anything, the way an
+    // unknown surface is rejected: a non-allowlisted value (a user-agent
+    // string, a screen size, a typo) must never be stored or coerced.
+    let form_factor = match req.form_factor.as_deref() {
+        Some(value) => match crate::telemetry::form_factor::parse(value) {
+            Some(ff) => Some(ff),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "bad_form_factor", "message": format!("unknown form_factor '{value}'")})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    // The coarse `*_seen` counter always increments so an unclassified open
+    // (older frontend, no form_factor) still registers; a classified open also
+    // bumps its specific class.
+    coarse.fetch_add(1, Ordering::Relaxed);
+    if let Some(ff) = form_factor {
+        clients.increment(ff);
     }
     StatusCode::NO_CONTENT.into_response()
 }
