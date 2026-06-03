@@ -37,7 +37,9 @@ fn default_off_emits_nothing() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-    assert!(telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0).is_none());
+    assert!(
+        telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0, None, None).is_none()
+    );
 }
 
 /// Opting in generates an install id and lets events build; opting back out
@@ -100,15 +102,27 @@ fn snapshot_buckets_are_sanitized() {
     custom.detect_as = String::new();
     let claude = Instance::new("c", "/p");
 
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Tui, &[custom, claude], false, false, 0)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[custom, claude],
+        false,
+        false,
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
 
     let serialized = serde_json::to_string(&snapshot).expect("serialize");
     // The raw custom command / project path must never appear in the payload.
     assert!(!serialized.contains("my-internal-agent"));
     assert!(!serialized.contains("secret-project"));
     assert!(!serialized.contains("secret-session"));
+    // The TUI surface has no serve deployment mode, so the fields are omitted.
+    assert!(snapshot.auth_mode.is_none());
+    assert!(snapshot.serve_mode.is_none());
+    assert!(!serialized.contains("auth_mode"));
+    assert!(!serialized.contains("serve_mode"));
 
     assert_eq!(snapshot.sessions_by_agent.get("custom"), Some(&1));
     assert_eq!(snapshot.sessions_by_agent.get("claude"), Some(&1));
@@ -134,13 +148,77 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0, None, None)
         .expect("snapshot built when opted in");
     assert_eq!(none.session_creates_since_last_snapshot, 0);
 
-    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
+    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7, None, None)
         .expect("snapshot built when opted in");
     assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
+/// User stories (#1885): the serve snapshot carries the coarse deployment mode.
+/// A passphrase-auth daemon behind a Tailscale Funnel reports
+/// `auth_mode = "passphrase"` and `serve_mode = "tailscale"`; the token-gated
+/// local-only default reports `auth_mode = "token"` and `serve_mode = "local"`.
+/// Both fields are always from the closed allowlist and never carry a tunnel
+/// name, hostname, token, or passphrase.
+#[test]
+#[serial]
+fn serve_snapshot_carries_coarse_deployment_mode() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let tailscale = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        false,
+        false,
+        0,
+        Some("passphrase"),
+        Some("tailscale"),
+    )
+    .expect("snapshot built when opted in");
+    assert_eq!(tailscale.auth_mode.as_deref(), Some("passphrase"));
+    assert_eq!(tailscale.serve_mode.as_deref(), Some("tailscale"));
+
+    let local = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        false,
+        false,
+        0,
+        Some("token"),
+        Some("local"),
+    )
+    .expect("snapshot built when opted in");
+    assert_eq!(local.auth_mode.as_deref(), Some("token"));
+    assert_eq!(local.serve_mode.as_deref(), Some("local"));
+
+    // Both fields are constrained to their closed sets on the wire.
+    let serialized = serde_json::to_string(&tailscale).expect("serialize");
+    assert!(serialized.contains("\"auth_mode\":\"passphrase\""));
+    assert!(serialized.contains("\"serve_mode\":\"tailscale\""));
+}
+
+/// As an opted-out user, serve in any auth/exposure mode records nothing: the
+/// snapshot is not even built, regardless of the deployment-mode arguments.
+#[test]
+#[serial]
+fn opted_out_serve_builds_no_snapshot_with_deployment_mode() {
+    let _tmp = isolate();
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        false,
+        false,
+        0,
+        Some("none"),
+        Some("tunnel"),
+    )
+    .is_none());
 }
 
 /// The CLI `process_start` is throttled to once per install per day so a user

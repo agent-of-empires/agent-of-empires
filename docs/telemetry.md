@@ -24,7 +24,12 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
-  - whether the web dashboard / cockpit was opened since the last snapshot.
+  - whether the web dashboard / cockpit was opened since the last snapshot,
+  - for `aoe serve` only, how the daemon is deployed, decided once at launch:
+    its auth mode (`token`, `passphrase`, or `none`) and its exposure mode
+    (`tunnel` for a Cloudflare quick or named tunnel, `tailscale` for a
+    Tailscale Funnel, or `local`). These are coarse enums only; the TUI reports
+    neither, since it hosts no server.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events
@@ -55,8 +60,11 @@ in here, per-session usage is reported separately by the session counts above.
 
 Prompts, file or project paths, session titles, branch names, group paths,
 custom command lines, model strings, hostnames, usernames, or anything derived
-from them. The install id is a random UUID generated locally on opt-in; it is
-never derived from hostname, username, MAC, or filesystem.
+from them. For `aoe serve`, the deployment-mode signals carry only the coarse
+auth and exposure enums above: never a tunnel name, named-tunnel hostname,
+`.ts.net` URL, auth token, or passphrase. The install id is a random UUID
+generated locally on opt-in; it is never derived from hostname, username, MAC,
+or filesystem.
 
 ## Anonymous install id
 
