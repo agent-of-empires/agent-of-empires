@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::containers::{self, ContainerRuntimeInterface};
@@ -18,6 +19,12 @@ pub struct AddArgs {
     /// Session title (defaults to folder name)
     #[arg(short = 't', long)]
     title: Option<String>,
+
+    /// Prompt for the session name, mirroring the TUI `n` flow. Shows the
+    /// generated default; press Enter to accept it. Ignored when --title
+    /// is given. Requires an interactive terminal.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     /// Group path (defaults to parent folder)
     #[arg(short = 'g', long)]
@@ -138,6 +145,13 @@ pub struct AddArgs {
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
+    // Fail fast before any filesystem side effects: --interactive must
+    // have a real terminal to read the name from, otherwise the prompt
+    // would block on EOF or a PTY harness would hang.
+    if args.interactive && !std::io::stdin().is_terminal() {
+        bail!("--interactive requires a terminal; pass --title for non-interactive naming");
+    }
+
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
     // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
@@ -346,7 +360,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // Generate title: use provided title, or branch name for worktree sessions, or random civ
+    // Generate title: use provided title, or branch name for worktree sessions, or random civ.
+    // With --interactive (and no --title), prompt for the name TUI-style,
+    // prefilling the generated default. The chosen title, whatever its
+    // source, runs through the same duplicate (title + path) check.
     let final_title = if let Some(title) = &args.title {
         let trimmed_title = title.trim();
         if is_duplicate_session(&instances, trimmed_title, path.to_str().unwrap_or("")) {
@@ -364,12 +381,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Ok(());
         }
         trimmed_title.to_string()
-    } else if let Some(ref branch) = args.worktree_branch {
-        let branch_title = branch.trim().to_string();
-        if is_duplicate_session(&instances, &branch_title, path.to_str().unwrap_or("")) {
+    } else {
+        let default_title = if let Some(ref branch) = args.worktree_branch {
+            branch.trim().to_string()
+        } else {
+            let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+            civilizations::generate_random_title(&existing_titles)
+        };
+        let chosen_title = if args.interactive {
+            prompt_session_title(&default_title)?
+        } else {
+            default_title
+        };
+        if is_duplicate_session(&instances, &chosen_title, path.to_str().unwrap_or("")) {
             println!(
                 "Session already exists with same title and path: {}",
-                branch_title
+                chosen_title
             );
             cleanup_partial_session(
                 &path,
@@ -380,10 +407,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
             return Ok(());
         }
-        branch_title
-    } else {
-        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-        civilizations::generate_random_title(&existing_titles)
+        chosen_title
     };
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
@@ -890,6 +914,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prompt for a session title on stderr, mirroring the TUI `n` flow's
+/// "auto-generates if empty" field. Empty input or EOF keeps
+/// `default_title`; a non-empty line is trimmed and used. Only reached in
+/// `--interactive` mode, which already verified stdin is a terminal.
+fn prompt_session_title(default_title: &str) -> Result<String> {
+    use std::io::Write;
+
+    eprint!("Session name [{}]: ", default_title);
+    std::io::stderr().flush()?;
+
+    let mut input = String::new();
+    let read = std::io::stdin().read_line(&mut input)?;
+    if read == 0 {
+        return Ok(default_title.to_string());
+    }
+
+    let trimmed = input.trim();
+    Ok(if trimmed.is_empty() {
+        default_title.to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 fn cleanup_partial_session(
