@@ -1323,6 +1323,7 @@
       "specs": [
         "tests/live/acp-config-pickers.spec.ts",
         "tests/live/acp-config-pickers-ui.spec.ts",
+        "tests/live/acp-session-model.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
         "src/hooks/useAcpSession.configOption.test.ts"
       ],
