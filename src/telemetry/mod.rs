@@ -183,14 +183,27 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
         // exclusive per the triage invariant enforced in the session apply /
         // merge path (see `Instance::archive`/`snooze`/`pin` and the merge
         // reconciliation), so independent checks never double-count a
-        // well-formed session.
-        if inst.is_pinned() {
+        // well-formed session. The debug assert makes a future mutator or
+        // merge regression fail fast instead of silently skewing the census
+        // (sum of the three counts exceeding `session_total`).
+        let is_pinned = inst.is_pinned();
+        let is_snoozed = inst.is_snoozed();
+        let is_archived = inst.is_archived();
+        debug_assert!(
+            [is_pinned, is_snoozed, is_archived]
+                .into_iter()
+                .filter(|state| *state)
+                .count()
+                <= 1,
+            "session triage states must be mutually exclusive"
+        );
+        if is_pinned {
             pinned += 1;
         }
-        if inst.is_snoozed() {
+        if is_snoozed {
             snoozed += 1;
         }
-        if inst.is_archived() {
+        if is_archived {
             archived += 1;
         }
 
