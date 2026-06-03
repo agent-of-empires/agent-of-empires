@@ -9,11 +9,13 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-/// Payload schema version. Bump on any breaking change to the field set.
+/// Payload schema version. Bump on any change to the wire shape, including
+/// additive optional fields, so a reader can tell which fields to expect.
 ///
-/// v2 (#1886): added `sessions_by_substrate`, a mutually-exclusive
+/// v2 (#1941): added serve-only `auth_mode` / `serve_mode`.
+/// v3 (#1886): added `sessions_by_substrate`, a mutually-exclusive
 /// per-substrate census of live sessions.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -110,4 +112,18 @@ pub struct UsageSnapshot {
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).
     pub session_creates_since_last_snapshot: u32,
+
+    /// Serve-only: how the daemon authenticates clients, decided once at
+    /// launch. One of `"token"`, `"passphrase"`, `"none"`. `None` for the
+    /// TUI / CLI surfaces, which host no server. Never carries the token or
+    /// passphrase value, only the coarse mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+
+    /// Serve-only: how the daemon is exposed, decided once at launch. One of
+    /// `"tunnel"` (Cloudflare quick or named), `"tailscale"` (Tailscale
+    /// Funnel), or `"local"`. `None` for the TUI / CLI surfaces. Never carries
+    /// a tunnel name, hostname, or `.ts.net` URL, only the coarse mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve_mode: Option<String>,
 }

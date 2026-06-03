@@ -2118,11 +2118,18 @@ impl HomeView {
                 &current_profile,
                 profiles,
             );
+            let has_prefilled_path = prefill_path.is_some();
             if let Some(path) = prefill_path {
                 dialog.set_path(path);
             }
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
+            }
+            // Only skip to the title when the path was inherited from a
+            // session. In the group-only fallback the path is still the
+            // default cwd, so leaving focus there lets the user confirm it.
+            if has_prefilled_path {
+                dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
         }
