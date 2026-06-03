@@ -105,8 +105,12 @@ pub async fn post_telemetry_seen(
         Err(rej) => return rej.into_response(),
     };
     match req.surface.as_str() {
-        "web" => state.telemetry_web_seen.store(true, Ordering::Relaxed),
-        "cockpit" => state.telemetry_cockpit_seen.store(true, Ordering::Relaxed),
+        "web" => {
+            state.telemetry_web_seen.fetch_add(1, Ordering::Relaxed);
+        }
+        "cockpit" => {
+            state.telemetry_cockpit_seen.fetch_add(1, Ordering::Relaxed);
+        }
         other => {
             return (
                 StatusCode::BAD_REQUEST,
