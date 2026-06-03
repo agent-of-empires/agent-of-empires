@@ -146,6 +146,18 @@ pub fn build_usage_snapshot(
     if !is_opted_in() {
         return None;
     }
+    // auth_mode / serve_mode are serve-only deployment metadata. Normalize here
+    // rather than trusting every caller to pass None, so a future non-serve call
+    // site can never leak them onto a TUI / CLI payload.
+    debug_assert!(
+        matches!(surface, Surface::Serve) || (auth_mode.is_none() && serve_mode.is_none()),
+        "auth_mode and serve_mode are serve-only fields"
+    );
+    let (auth_mode, serve_mode) = if matches!(surface, Surface::Serve) {
+        (auth_mode, serve_mode)
+    } else {
+        (None, None)
+    };
     let install_id = state::ensure_install_id()?;
     // Global, pre-profile-merge config on purpose: `features` is an install-level
     // default-adoption signal, not per-session usage. See `features::active_features`.
