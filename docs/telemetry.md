@@ -12,8 +12,9 @@ Only when you opt in, and only aggregate counts. Two event kinds, both with a
 closed, versioned schema (see `src/telemetry/events.rs`):
 
 - **`process_start`** on boot: surface (`cli` / `tui` / `serve`), aoe version,
-  OS, and CPU arch. The `cli` surface is throttled to at most once per install
-  per day, so scripting `aoe` in a loop never floods the endpoint.
+  OS, CPU arch, and the version-health signals (see "Version health" below). The
+  `cli` surface is throttled to at most once per install per day, so scripting
+  `aoe` in a loop never floods the endpoint.
 - **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
   ~12 hours. It is a point-in-time summary of the current install, never a
   stream of actions:
@@ -24,7 +25,29 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
-  - whether the web dashboard / cockpit was opened since the last snapshot.
+  - whether the web dashboard / cockpit was opened since the last snapshot,
+  - the same version-health signals carried on `process_start` (see below).
+
+### Version health
+
+Both events carry three coarse version-health fields so the maintainers can see
+whether the install base is on recent, patched versions and how large the
+backward-compat support burden is. None of them is a version string:
+
+- `data_schema_version`: a small integer, the data-schema version this build
+  targets (`migrations::CURRENT_VERSION`). Successful installs converge to it on
+  startup, since a failed migration aborts boot.
+- `update_status`: a coarse semver-distance bucket from the local update check,
+  one of `unknown` / `current` / `patch_behind` / `minor_behind` / `major_behind`.
+  `unknown` means no update check has been cached yet; it is never reported as
+  `current`.
+- `update_releases_behind`: how many cached releases are newer than the running
+  build, one of `unknown` / `current` / `one_behind` / `several_behind`. Counted
+  from the cached release list, so a fallback cache that only knows the latest
+  release reports the conservative `one_behind`.
+
+Both update fields are read from the local update-check cache; they never trigger
+a network call and never include the latest version number, only the coarse gap.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events
