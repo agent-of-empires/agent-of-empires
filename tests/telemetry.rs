@@ -5,9 +5,15 @@
 //! `#[serial]`. Each test points the app dir at a fresh `TempDir`, so no real
 //! user state is touched.
 
-use agent_of_empires::session::{save_config, Config, Instance};
+use agent_of_empires::session::{
+    save_config, Config, Instance, SandboxInfo, WorkspaceInfo, WorktreeInfo,
+};
+use agent_of_empires::telemetry::usage_signals::{self, UsageSeenCounters, USAGE_SIGNALS};
 use agent_of_empires::telemetry::{self, Surface};
+use chrono::Utc;
 use serial_test::serial;
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 /// Redirect the app dir at a temp location and clear the telemetry-related env
 /// vars. Returns the guard; keep it alive for the test's duration.
@@ -37,7 +43,15 @@ fn default_off_emits_nothing() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-    assert!(telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0).is_none());
+    assert!(telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None
+    )
+    .is_none());
 }
 
 /// Opting in generates an install id and lets events build; opting back out
@@ -100,15 +114,26 @@ fn snapshot_buckets_are_sanitized() {
     custom.detect_as = String::new();
     let claude = Instance::new("c", "/p");
 
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Tui, &[custom, claude], false, false, 0)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[custom, claude],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
 
     let serialized = serde_json::to_string(&snapshot).expect("serialize");
     // The raw custom command / project path must never appear in the payload.
     assert!(!serialized.contains("my-internal-agent"));
     assert!(!serialized.contains("secret-project"));
     assert!(!serialized.contains("secret-session"));
+    // The TUI surface has no serve deployment mode, so the fields are omitted.
+    assert!(snapshot.auth_mode.is_none());
+    assert!(snapshot.serve_mode.is_none());
+    assert!(!serialized.contains("auth_mode"));
+    assert!(!serialized.contains("serve_mode"));
 
     assert_eq!(snapshot.sessions_by_agent.get("custom"), Some(&1));
     assert_eq!(snapshot.sessions_by_agent.get("claude"), Some(&1));
@@ -124,6 +149,163 @@ fn snapshot_buckets_are_sanitized() {
     }
 }
 
+/// The fixed, closed substrate vocabulary (#1886). The snapshot must never
+/// emit a key outside this set.
+const SUBSTRATE_VOCAB: [&str; 5] = ["local", "worktree", "workspace", "sandbox", "scratch"];
+
+fn with_worktree(mut inst: Instance) -> Instance {
+    inst.worktree_info = Some(WorktreeInfo {
+        branch: "feature/x".to_string(),
+        main_repo_path: "/repo".to_string(),
+        managed_by_aoe: true,
+        created_at: Utc::now(),
+        base_branch: None,
+    });
+    inst
+}
+
+fn with_workspace(mut inst: Instance) -> Instance {
+    inst.workspace_info = Some(WorkspaceInfo {
+        branch: "feature/x".to_string(),
+        workspace_dir: "/ws".to_string(),
+        repos: Vec::new(),
+        created_at: Utc::now(),
+        cleanup_on_delete: true,
+    });
+    inst
+}
+
+fn with_sandbox(mut inst: Instance, enabled: bool) -> Instance {
+    inst.sandbox_info = Some(SandboxInfo {
+        enabled,
+        container_id: None,
+        image: "secret-internal-image:latest".to_string(),
+        container_name: "aoe_secret_container".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+    });
+    inst
+}
+
+/// User story (#1886): a maintainer with one local, one worktree, and one
+/// sandboxed session sees one count in each of the matching substrate buckets.
+#[test]
+#[serial]
+fn substrate_census_counts_each_bucket() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let local = Instance::new("a", "/p");
+    let worktree = with_worktree(Instance::new("b", "/p"));
+    let sandbox = with_sandbox(Instance::new("c", "/p"), true);
+
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[local, worktree, sandbox],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
+
+    assert_eq!(snapshot.sessions_by_substrate.get("local"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("worktree"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("sandbox"), Some(&1));
+    // Untouched buckets are still present (pre-seeded) and zero.
+    assert_eq!(snapshot.sessions_by_substrate.get("workspace"), Some(&0));
+    assert_eq!(snapshot.sessions_by_substrate.get("scratch"), Some(&0));
+}
+
+/// User story (#1886): a session that is both scratch and (somehow) carries
+/// worktree info is classified into exactly one bucket by the documented
+/// precedence (scratch wins), never double-counted. The substrate buckets
+/// always partition `session_total`, so they sum to it.
+#[test]
+#[serial]
+fn substrate_buckets_are_mutually_exclusive_and_sum_to_total() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // Impossible-but-defensive combo: scratch AND worktree set. Precedence puts
+    // it in `scratch`, and it is counted exactly once.
+    let mut conflicted = with_worktree(Instance::new("a", "/p"));
+    conflicted.scratch = true;
+    // A sandboxed worktree buckets as `worktree` (sandbox sits below worktree),
+    // yet still increments the orthogonal `session_sandboxed` count.
+    let sandboxed_worktree = with_sandbox(with_worktree(Instance::new("b", "/p")), true);
+    let workspace = with_workspace(Instance::new("c", "/p"));
+    let local = Instance::new("d", "/p");
+
+    let instances = [conflicted, sandboxed_worktree, workspace, local];
+    let total = instances.len() as u32;
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &instances,
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
+
+    let sum: u32 = snapshot.sessions_by_substrate.values().sum();
+    assert_eq!(
+        sum, total,
+        "substrate buckets must partition session_total exactly once each"
+    );
+    assert_eq!(snapshot.session_total, total);
+    assert_eq!(snapshot.sessions_by_substrate.get("scratch"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("worktree"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("workspace"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("local"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("sandbox"), Some(&0));
+    // The substrate map is orthogonal to the sandbox count: the sandboxed
+    // worktree is bucketed as worktree but still tallied as sandboxed.
+    assert_eq!(snapshot.session_sandboxed, 1);
+}
+
+/// Privacy: the substrate map keys are only the allowlisted closed vocabulary,
+/// never a path, repo name, branch, or sandbox image string (#1886).
+#[test]
+#[serial]
+fn substrate_keys_are_only_allowlisted_vocab() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let instances = [
+        with_sandbox(
+            with_worktree(Instance::new("a", "/home/me/secret-project")),
+            true,
+        ),
+        with_workspace(Instance::new("b", "/home/me/secret-workspace")),
+    ];
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &instances,
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
+
+    for key in snapshot.sessions_by_substrate.keys() {
+        assert!(
+            SUBSTRATE_VOCAB.contains(&key.as_str()),
+            "substrate key `{key}` is outside the closed vocabulary"
+        );
+    }
+    // And the raw image/path strings must not leak into the serialized payload.
+    let serialized = serde_json::to_string(&snapshot).expect("serialize");
+    assert!(!serialized.contains("secret-project"));
+    assert!(!serialized.contains("secret-workspace"));
+    assert!(!serialized.contains("secret-internal-image"));
+}
+
 /// User story (#1874): the create-trend counter carries a real value. When N
 /// sessions were created during the window, the snapshot reports
 /// `session_creates_since_last_snapshot == N`; with none created it reports 0.
@@ -134,13 +316,166 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
-        .expect("snapshot built when opted in");
+    let none = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
     assert_eq!(none.session_creates_since_last_snapshot, 0);
 
-    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
-        .expect("snapshot built when opted in");
+    let some = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        7,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
     assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
+/// User story (#1880): a usage signal registered in the allowlist flows through
+/// the daemon aggregate (`UsageSeenCounters`) into the snapshot's `usage_seen`
+/// map with no other code changes. The map carries the recorded counts verbatim.
+#[test]
+#[serial]
+fn snapshot_carries_registered_usage_signals() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // The daemon folds browser pings into these counters.
+    let counters = UsageSeenCounters::new();
+    assert!(counters.record("web"));
+    assert!(counters.record("web"));
+    assert!(counters.record("cockpit"));
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0, None, None)
+            .expect("snapshot built when opted in");
+    assert_eq!(snapshot.usage_seen.get("web"), Some(&2));
+    assert_eq!(snapshot.usage_seen.get("cockpit"), Some(&1));
+}
+
+/// User story (#1880): an unregistered signal name is rejected by the registry
+/// (`record` returns false, which the endpoint turns into a 400) and never
+/// reaches the snapshot's `usage_seen` map.
+#[test]
+#[serial]
+fn unregistered_usage_signal_is_rejected_and_never_reported() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let counters = UsageSeenCounters::new();
+    // The endpoint would return 400 on this false.
+    assert!(!counters.record("web_terminal"));
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0, None, None)
+            .expect("snapshot built when opted in");
+    assert!(!snapshot.usage_seen.contains_key("web_terminal"));
+}
+
+/// User story (#1880): the `usage_seen` map only ever carries allowlisted short
+/// names, never free-form input. Its key set is exactly the fixed registry and
+/// every key is a short identifier.
+#[test]
+#[serial]
+fn usage_seen_keys_are_only_allowlisted_short_names() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
+
+    // `usage_seen` is a BTreeMap, so its keys come out sorted; compare against
+    // the registry sorted the same way rather than relying on its source order.
+    let keys: Vec<&str> = snapshot.usage_seen.keys().map(String::as_str).collect();
+    let mut expected: Vec<&str> = USAGE_SIGNALS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    for key in snapshot.usage_seen.keys() {
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "usage_seen key `{key}` is not a short allowlisted identifier"
+        );
+    }
+}
+
+/// User stories (#1885): the serve snapshot carries the coarse deployment mode.
+/// A passphrase-auth daemon behind a Tailscale Funnel reports
+/// `auth_mode = "passphrase"` and `serve_mode = "tailscale"`; the token-gated
+/// local-only default reports `auth_mode = "token"` and `serve_mode = "local"`.
+/// Both fields are always from the closed allowlist and never carry a tunnel
+/// name, hostname, token, or passphrase.
+#[test]
+#[serial]
+fn serve_snapshot_carries_coarse_deployment_mode() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let tailscale = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        Some("passphrase"),
+        Some("tailscale"),
+    )
+    .expect("snapshot built when opted in");
+    assert_eq!(tailscale.auth_mode.as_deref(), Some("passphrase"));
+    assert_eq!(tailscale.serve_mode.as_deref(), Some("tailscale"));
+
+    let local = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        Some("token"),
+        Some("local"),
+    )
+    .expect("snapshot built when opted in");
+    assert_eq!(local.auth_mode.as_deref(), Some("token"));
+    assert_eq!(local.serve_mode.as_deref(), Some("local"));
+
+    // Both fields are constrained to their closed sets on the wire.
+    let serialized = serde_json::to_string(&tailscale).expect("serialize");
+    assert!(serialized.contains("\"auth_mode\":\"passphrase\""));
+    assert!(serialized.contains("\"serve_mode\":\"tailscale\""));
+}
+
+/// As an opted-out user, serve in any auth/exposure mode records nothing: the
+/// snapshot is not even built, regardless of the deployment-mode arguments.
+#[test]
+#[serial]
+fn opted_out_serve_builds_no_snapshot_with_deployment_mode() {
+    let _tmp = isolate();
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        Some("none"),
+        Some("tunnel"),
+    )
+    .is_none());
 }
 
 /// The CLI `cli_usage` flush is throttled to once per install per day so a user
@@ -183,8 +518,8 @@ fn failed_cli_usage_flush_leaves_daily_slot_open() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
-    let hour = std::time::Duration::from_secs(60 * 60);
+    let day = Duration::from_secs(24 * 60 * 60);
+    let hour = Duration::from_secs(60 * 60);
 
     // Simulate a failed send: it stamps the attempt but never claims the slot.
     telemetry::record_cli_usage_flush(false);
@@ -270,22 +605,60 @@ fn cli_usage_drops_non_allowlisted_keys() {
 #[serial]
 fn cli_usage_default_off_records_nothing() {
     let _tmp = isolate();
-    assert!(!telemetry::is_opted_in());
-    assert!(
-        telemetry::build_cli_usage().is_none(),
-        "no event when not opted in"
-    );
 
     // The per-command tracker is a true no-op for a not-opted-in install: it must
     // not create the app dir (so app-data-free commands stay pure) and must not
-    // record or send anything.
+    // record or send anything. Checked first, before any opt-in / config read,
+    // since reading the config itself materializes the dir; this isolates the
+    // tracker's own (non-creating) behavior, which the `app_dir_exists` gate in
+    // `track_cli_command` guarantees by short-circuiting before any config load.
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(telemetry::track_cli_command("add"));
     assert!(
         !agent_of_empires::session::app_dir_exists(),
         "tracking must not create the app dir when not opted in"
     );
-    assert!(telemetry::build_cli_usage().is_none());
+
+    // And nothing is opted in, so no event ever builds.
+    assert!(!telemetry::is_opted_in());
+    assert!(
+        telemetry::build_cli_usage().is_none(),
+        "no event when not opted in"
+    );
+}
+
+/// Item A (#1877): the `telemetry.json` read-modify-write is serialized across
+/// threads/processes, so a concurrent id-generation race can't lose an update.
+/// Without the lock, barrier-synced threads each load an empty state, generate
+/// distinct UUIDs, and return different ids (last-writer-wins); with it, the
+/// first writer wins and every caller observes the same id.
+#[test]
+#[serial]
+fn concurrent_ensure_install_id_yields_single_id() {
+    let _tmp = isolate();
+
+    const N: usize = 32;
+    let barrier = Arc::new(Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                telemetry::ensure_install_id()
+            })
+        })
+        .collect();
+
+    let ids: Vec<Option<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let first = ids[0].clone().expect("an id is generated");
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(
+            id.as_deref(),
+            Some(first.as_str()),
+            "thread {i} returned a different id; a concurrent RMW lost an update"
+        );
+    }
+    assert_eq!(telemetry::install_id(), Some(first));
 }
 
 /// An unreachable / slow endpoint must never block the CLI: `track_cli_command`

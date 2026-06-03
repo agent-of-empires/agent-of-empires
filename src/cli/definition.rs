@@ -293,7 +293,7 @@ mod tests {
             (&["aoe", "agents"], "agents"),
             (&["aoe", "ls"], "list"), // alias collapses to canonical
             (&["aoe", "rm", "demo"], "remove"),
-            (&["aoe", "session", "list"], "session"),
+            (&["aoe", "session", "current"], "session"),
             (&["aoe", "telemetry", "status"], "telemetry"),
             (&["aoe", "update"], "update"),
             (&["aoe", "completion", "bash"], "completion"),
