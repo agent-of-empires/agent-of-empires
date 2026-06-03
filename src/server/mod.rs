@@ -1710,6 +1710,10 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
+        // Skip, not burst, missed ticks: a daemon that was paused (laptop sleep)
+        // must not fire several back-to-back snapshots on resume; the 12h cadence
+        // is what matters, not catching up.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
