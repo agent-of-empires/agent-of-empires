@@ -1314,15 +1314,15 @@ impl App {
     }
 
     /// Build a `usage_snapshot` from the current session list, or `None` when
-    /// telemetry is not opted in. The TUI never hosts the web dashboard, so
-    /// `web_seen` / `cockpit_seen` are false and the create-trend counter is
-    /// left at 0 (the `aoe serve` daemon is the surface that tracks those).
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
+    /// `usage_seen` map is reported zeroed (a stable full key set) and the
+    /// create-trend counter is left at 0 (the `aoe serve` daemon is the surface
+    /// that tracks those).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
             self.home.instances(),
-            false,
-            false,
+            crate::telemetry::usage_signals::zeroed(),
             0,
         )
     }

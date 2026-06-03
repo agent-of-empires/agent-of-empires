@@ -353,7 +353,7 @@ fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
 }
 
 /// Outcome of a snapshot flush, so a caller can decide whether to consume the
-/// state the snapshot reported (e.g. reset `web_seen` / a create counter).
+/// state the snapshot reported (e.g. the `usage_seen` counts / a create counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     /// Delivery was confirmed (a 2xx). Safe to consume the reported state.
