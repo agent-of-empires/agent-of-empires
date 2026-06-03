@@ -320,4 +320,29 @@ mod tests {
         let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
         assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
     }
+
+    /// The compiler forces a `command_name` arm per `Commands` variant, but
+    /// nothing forces a matching `CLI_COMMAND_NAMES` entry. Without this guard a
+    /// contributor could add a counted command and silently drop it from the
+    /// `cli_usage` payload (`build_cli_usage` filters unknown keys). Assert every
+    /// visible clap subcommand is in the allowlist (subset direction: the
+    /// allowlist may carry extra `serve`-only names in a TUI-only build, which is
+    /// a harmless never-matched filter key). `log-level` maps to `log_level`.
+    #[test]
+    fn allowlist_covers_every_visible_subcommand() {
+        use clap::CommandFactory;
+        let visible: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name().replace('-', "_"))
+            .collect();
+        assert!(!visible.is_empty(), "expected visible subcommands");
+        for name in &visible {
+            assert!(
+                CLI_COMMAND_NAMES.contains(&name.as_str()),
+                "visible subcommand `{name}` is missing from CLI_COMMAND_NAMES; \
+                 it would be silently dropped from cli_usage telemetry"
+            );
+        }
+    }
 }
