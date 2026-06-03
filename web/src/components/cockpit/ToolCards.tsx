@@ -44,7 +44,12 @@ import {
 } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
-import { parseJsonObject, pickFirst, pickStr } from "../../lib/cockpitArgs";
+import {
+  parseJsonObject,
+  pickFirst,
+  pickStr,
+  todoItemsFromArgs,
+} from "../../lib/cockpitArgs";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
 import type { ActivityRow, ToolCall } from "../../lib/cockpitTypes";
 import { diffPair } from "../../lib/diffPair";
@@ -1026,37 +1031,22 @@ interface TodoItem {
   status: TodoStatus;
 }
 
-/** Heuristic for Claude's TodoWrite tool. The adapter ships it as a
- *  `kind: "think"` tool call with the joined todo list crammed into the
- *  title (`"Update TODOs: a, b, c"`) and the structured `{todos: [...]}`
- *  payload in raw_input. We detect via the title prefix and parse the
- *  args payload to render a proper checklist. See #1064. Profile-keyed
- *  so coincidental matches on other agents return early. */
+/** Heuristic for agent todo tools. Claude and OpenCode both carry the
+ *  current list in `args_preview.todos`, but their titles differ. The
+ *  profile opt-in is the safety gate; the structured todo payload is the
+ *  shared discriminator so grouping and rendering agree. See #1905. */
 function classifyTodoWrite(
   tool: ToolCall,
   profile: AgentProfile,
 ): { isTodoWrite: true; todos: TodoItem[] } | { isTodoWrite: false } {
-  const title = tool.name?.trim() ?? "";
-  const prefixes = profile.specialTitles.todoPrefixes;
-  const looksLikeTodo =
-    title === "TodoWrite" || prefixes.some((p) => title.startsWith(p));
-  if (!looksLikeTodo) return { isTodoWrite: false };
+  if (!profile.capabilities.todos) return { isTodoWrite: false };
   const args = parseJsonObject(tool.args_preview);
-  if (!args) return { isTodoWrite: false };
-  const raw = args.todos;
-  if (!Array.isArray(raw)) return { isTodoWrite: false };
-  const todos: TodoItem[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const obj = entry as Record<string, unknown>;
-    const content = typeof obj.content === "string" ? obj.content : "";
-    if (!content) continue;
-    todos.push({
-      content,
-      status: normaliseTodoStatus(obj.status),
-    });
-  }
-  if (todos.length === 0) return { isTodoWrite: false };
+  const payload = todoItemsFromArgs(args);
+  if (payload.length === 0) return { isTodoWrite: false };
+  const todos = payload.map((entry) => ({
+    content: entry.content,
+    status: normaliseTodoStatus(entry.status),
+  }));
   return { isTodoWrite: true, todos };
 }
 

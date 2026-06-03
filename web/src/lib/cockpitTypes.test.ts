@@ -351,6 +351,52 @@ describe("applyEvent / UserPromptSent", () => {
     expect(rowAfter?.tool?.diffs?.length).toBe(1);
   });
 
+  it("patches OpenCode todowrite args when ToolCallUpdated supplies todos later", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-todos",
+            name: "todowrite",
+            kind: "other",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    const todos = JSON.stringify({
+      todos: [
+        {
+          content: "Render OpenCode todos",
+          priority: "high",
+          status: "in_progress",
+        },
+      ],
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-todos",
+          title: "1 todos",
+          args_preview: todos,
+        },
+      },
+    });
+
+    const startRow = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-todos",
+    );
+    expect(startRow?.tool?.name).toBe("1 todos");
+    expect(startRow?.tool?.args_preview).toBe(todos);
+    expect(state.inFlightTool?.name).toBe("1 todos");
+    expect(state.inFlightTool?.args_preview).toBe(todos);
+  });
+
   it("uses 'tool failed' when error event has no content", () => {
     const state = applyEvent(emptyCockpitState(), {
       session_id: "s-1",

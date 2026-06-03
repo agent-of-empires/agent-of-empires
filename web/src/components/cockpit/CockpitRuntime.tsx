@@ -41,6 +41,7 @@ import type {
   PromptAttachmentInput,
   ToolCall,
 } from "../../lib/cockpitTypes";
+import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/cockpitArgs";
 
 interface Props {
   sessionId: string;
@@ -527,20 +528,14 @@ class AssistantBuilder {
 }
 
 function isTodoWriteArgsText(argsText: string): boolean {
-  try {
-    const parsed = JSON.parse(argsText);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const title = (parsed as Record<string, unknown>)._aoe_title;
-      if (typeof title === "string" && title.startsWith("Update TODOs")) {
-        return true;
-      }
-      const todos = (parsed as Record<string, unknown>).todos;
-      if (Array.isArray(todos)) return true;
+  const parsed = parseJsonObject(argsText);
+  if (parsed) {
+    const title = parsed._aoe_title;
+    if (typeof title === "string" && title.startsWith("Update TODOs")) {
+      return true;
     }
-  } catch {
-    // ignore
   }
-  return false;
+  return hasTodoItemsArgsText(argsText);
 }
 
 /** Synthetic toolName for a Claude sub-agent (Task) and its child tool

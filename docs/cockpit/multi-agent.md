@@ -36,11 +36,11 @@ agent's profile opts in, or is currently claude-only.
 | Usage / context-window display | ✓ | depends | ✓ | ✓ | depends |
 | MCP tool grouping | ✓ | claimed* | claimed* | claimed* | claimed* |
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
-| TodoWrite card | ✓ | — | — | — | — |
-| Skill card | ✓ | — | — | — | — |
-| ExitPlanMode synthesis | ✓ | — | — | — | — |
-| ScheduleWakeup (`/loop`) | ✓ | — | — | — | — |
-| Subagent indentation | ✓ | — | unverified | — | — |
+| TodoWrite card | ✓ | no | ✓ | no | no |
+| Skill card | ✓ | no | no | no | no |
+| ExitPlanMode synthesis | ✓ | no | no | no | no |
+| ScheduleWakeup (`/loop`) | ✓ | no | no | no | no |
+| Subagent indentation | ✓ | no | unverified | no | no |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
 \* All profiles default to the `mcp__` prefix. If your agent uses a
@@ -49,10 +49,12 @@ different MCP naming scheme, file an issue or PR adjusting the profile's
 
 ### Notes on the matrix
 
-- **TodoWrite / Skill / ExitPlanMode / ScheduleWakeup** are claude-only
-  tools today, so the cards stay quiet on other agents. The cockpit
-  doesn't fire those cards based on coincidental tool names; gating
-  happens in the agent profile.
+- **TodoWrite cards** are enabled for agents whose profile has verified a
+  structured todo payload. Claude emits TodoWrite-compatible payloads;
+  OpenCode emits `todowrite` tool updates with `rawInput.todos`, which the
+  cockpit renders through the same card. Skill / ExitPlanMode /
+  ScheduleWakeup remain Claude-only today, so those cards stay quiet on
+  other agents.
 - **`/clear`** is detected server-side by matching the user's prompt
   against the profile's `clearAliases`. Claude uses `/clear`; codex and
   opencode use `/new`. Gemini has no slash command verified as a
