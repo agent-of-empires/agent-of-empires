@@ -393,15 +393,22 @@ export type ApprovalResolveOutcome =
   | { kind: "error"; message: string };
 
 /** Classify an approval-resolve response. A 204 (ok) or a 404 whose body
- *  names the missing nonce both mean "this card is done" and clear it; any
- *  other failure (including a session-gone 404) surfaces an error. */
+ *  names *this* nonce both mean "this card is done" and clear it; any other
+ *  failure (a session-gone 404, or a 404 that doesn't name the nonce)
+ *  surfaces an error. Matching the nonce keeps a generic 404 from silently
+ *  clearing the clicked card. See #1821. */
 export function classifyApprovalResolveResponse(
   ok: boolean,
   status: number,
   detail: string,
+  nonce: string,
 ): ApprovalResolveOutcome {
   if (ok) return { kind: "resolved" };
-  if (status === 404 && /no pending approval/i.test(detail)) {
+  if (
+    status === 404 &&
+    /no pending approval/i.test(detail) &&
+    detail.includes(nonce)
+  ) {
     return { kind: "resolved" };
   }
   return {
@@ -434,12 +441,16 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // the decision (204) or reports the nonce already gone (404), instead
     // of waiting on the ApprovalResolved broadcast, which the seq dedupe
     // can swallow and leave the card stuck. See #1821.
+    const pendingApprovals = state.pendingApprovals.filter(
+      (a) => a.nonce !== action.nonce,
+    );
+    // Only clear the error banner when a card was actually removed, so a
+    // duplicate or stale action can't quietly hide an unrelated error.
+    const removed = pendingApprovals.length !== state.pendingApprovals.length;
     return {
       ...state,
-      lastError: null,
-      pendingApprovals: state.pendingApprovals.filter(
-        (a) => a.nonce !== action.nonce,
-      ),
+      lastError: removed ? null : state.lastError,
+      pendingApprovals,
     };
   }
   if (action.kind === "hydrate") {
@@ -1088,6 +1099,7 @@ export function useAcpSession(
           res.ok,
           res.status,
           detail,
+          nonce,
         );
         if (outcome.kind === "resolved") {
           // 204, or a 404 that names the missing nonce: the decision was

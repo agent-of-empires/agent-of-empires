@@ -271,8 +271,12 @@ impl HttpClient {
         );
         let body = ResolveApprovalRequest { decision };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = res.text().await.unwrap_or_default();
+        Err(classify_resolve_error(status, &text, nonce, session_id))
     }
 
     /// `GET /api/sessions`. Returns the daemon's session list as
@@ -339,15 +343,32 @@ fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError
         StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
             HttpError::ReadOnly
         }
-        // A nonce-level 404 (the daemon names the missing approval) is
-        // distinct from a session-level 404 so the approval flow can clear
-        // the card instead of toasting an error. See #1821.
-        StatusCode::NOT_FOUND if body.contains("no pending approval") => HttpError::ApprovalGone,
         StatusCode::NOT_FOUND => HttpError::SessionNotFound(session_id.to_string()),
         _ => HttpError::Server {
             status,
             body: body.to_string(),
         },
+    }
+}
+
+/// Classify the response of an approval-resolve POST. Scoped to that
+/// endpoint (not the shared `check_status`, which replay/prompt/cancel use
+/// too) so only this path can mint `ApprovalGone`. A 404 whose body names
+/// *this* nonce means the approval already resolved server-side; anything
+/// else folds back into the generic classifier. See #1821.
+fn classify_resolve_error(
+    status: StatusCode,
+    body: &str,
+    nonce: &str,
+    session_id: &str,
+) -> HttpError {
+    if status == StatusCode::NOT_FOUND
+        && body.contains("no pending approval")
+        && body.contains(nonce)
+    {
+        HttpError::ApprovalGone
+    } else {
+        classify_error(status, body, session_id)
     }
 }
 
@@ -386,20 +407,45 @@ mod tests {
     // and `--auth=none` daemons that never had a token. Pin the new
     // wording so the env-var hint can't regress back in.
     #[test]
-    fn classify_error_distinguishes_nonce_404_from_session_404() {
-        // #1821: a 404 naming the missing approval nonce maps to
-        // ApprovalGone so the card clears; a session-level 404 stays
-        // SessionNotFound (a real failure).
+    fn classify_resolve_error_clears_only_on_matching_nonce() {
+        // #1821: ApprovalGone is minted only by the resolve path, only for a
+        // 404 that names *this* nonce. A session-gone 404, or a 404 naming a
+        // different nonce, stays a real error.
         assert!(matches!(
-            classify_error(
+            classify_resolve_error(
                 StatusCode::NOT_FOUND,
-                "no pending approval with that nonce",
+                "no pending approval with nonce abc-123",
+                "abc-123",
                 "s-1"
             ),
             HttpError::ApprovalGone
         ));
         assert!(matches!(
-            classify_error(StatusCode::NOT_FOUND, "session has no running cockpit", "s-1"),
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "no pending approval with nonce other-999",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "session has no running cockpit",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+    }
+
+    #[test]
+    fn classify_error_never_mints_approval_gone() {
+        // The shared classifier (used by replay/prompt/cancel/session-list)
+        // must not produce ApprovalGone; a bare 404 is a session miss.
+        assert!(matches!(
+            classify_error(StatusCode::NOT_FOUND, "no pending approval with that nonce", "s-1"),
             HttpError::SessionNotFound(s) if s == "s-1"
         ));
     }

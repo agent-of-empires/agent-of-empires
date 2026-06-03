@@ -1657,7 +1657,7 @@ pub async fn resolve_approval(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let nonce = Nonce(nonce_str);
+    let nonce = Nonce(nonce_str.clone());
     let decision = req.decision;
     match state
         .acp_supervisor
@@ -1672,7 +1672,14 @@ pub async fn resolve_approval(
             (StatusCode::NOT_FOUND, "session has no running acp").into_response()
         }
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => {
-            (StatusCode::NOT_FOUND, "no pending approval with that nonce").into_response()
+            // Echo the nonce so clients (web + native TUI) can confirm the
+            // 404 refers to the card they resolved, not a generic miss. See
+            // #1821.
+            (
+                StatusCode::NOT_FOUND,
+                format!("no pending approval with nonce {nonce_str}"),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -514,6 +514,9 @@ async fn handle_terminal_event(
                     state
                         .transcript
                         .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    // The selected/last approval may have just disappeared;
+                    // re-anchor focus like the replay/live-frame paths do.
+                    state.reconcile_selection();
                     set_toast(
                         state,
                         toast_deadline,
@@ -529,6 +532,7 @@ async fn handle_terminal_event(
                     state
                         .transcript
                         .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    state.reconcile_selection();
                     set_toast(
                         state,
                         toast_deadline,
