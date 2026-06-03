@@ -116,6 +116,20 @@ current model reports `supportsEffort=true`. Older adapters that
 emit no `config_option_update` show neither picker; this is by
 design so non-Claude backends don't grow empty UI chrome.
 
+### Model via the unstable `session_model` channel
+
+Some adapters advertise the model not as a `config_option` but through
+the ACP `unstable_session_model` capability: a `SessionModelState`
+(current model plus available models) on the `session/new` and
+`session/load` response, switched with `session/set_model`. Cockpit
+reads that channel too and normalizes it into the same model dropdown,
+so it looks and behaves identically regardless of which channel the
+agent uses. If an agent exposes the model on both channels, the
+`config_option` one wins (it has a push/echo path; `session/set_model`
+only acks), so the UI never shows two model dropdowns. Because
+`session/set_model` returns no model-state echo, cockpit synthesizes
+the confirming update itself after the switch is acknowledged.
+
 ### Setting a value
 
 Clicking an option fires `POST /api/sessions/{id}/acp/config-option`
