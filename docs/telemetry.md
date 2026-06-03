@@ -19,6 +19,9 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
+  - how many sessions are currently pinned, snoozed, or archived (a
+    point-in-time count of the session-organization states, not how often
+    those actions were taken),
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
   - how many sessions were created since the last snapshot, a trend counter so
     short-lived sessions that start and end between two snapshots are still
