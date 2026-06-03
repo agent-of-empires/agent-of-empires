@@ -64,6 +64,12 @@ impl ProjectScope {
 pub struct Project {
     pub name: String,
     pub path: String,
+    /// Default base branch for new worktree branches created against this
+    /// project's repo in a multi-repo workspace. When `None`, resolution falls
+    /// back to the global/profile `worktree.default_base_branch`, then the
+    /// repo's detected default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_base_branch: Option<String>,
     /// Populated by the loader; not persisted.
     #[serde(skip, default = "default_scope")]
     pub scope: ProjectScope,
@@ -78,8 +84,16 @@ impl Project {
         Self {
             name: name.into(),
             path: path.into(),
+            default_base_branch: None,
             scope,
         }
+    }
+
+    /// Set the project's default base branch, treating an empty/whitespace
+    /// string as "unset".
+    pub fn with_base_branch(mut self, base: Option<String>) -> Self {
+        self.default_base_branch = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        self
     }
 }
 
@@ -152,7 +166,7 @@ pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
     Ok(merged)
 }
 
-fn canonical_key(path: &str) -> String {
+pub(crate) fn canonical_key(path: &str) -> String {
     PathBuf::from(path)
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
@@ -310,6 +324,45 @@ mod tests {
         std::env::set_var("HOME", temp);
         #[cfg(target_os = "linux")]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    #[test]
+    fn with_base_branch_trims_and_treats_empty_as_unset() {
+        let p = Project::new("r", "/tmp/r", ProjectScope::Global);
+        assert_eq!(p.clone().with_base_branch(None).default_base_branch, None);
+        assert_eq!(
+            p.clone()
+                .with_base_branch(Some("  ".to_string()))
+                .default_base_branch,
+            None
+        );
+        assert_eq!(
+            p.with_base_branch(Some("  develop ".to_string()))
+                .default_base_branch,
+            Some("develop".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_base_branch_persists_through_add_and_load() -> Result<()> {
+        let temp = tempdir()?;
+        setup(temp.path());
+        let repo = temp.path().join("repoBase");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("repoBase", repo.to_string_lossy(), ProjectScope::Global)
+                .with_base_branch(Some("develop".to_string())),
+            false,
+        )?;
+
+        let loaded = load_global()?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].default_base_branch.as_deref(), Some("develop"));
+        Ok(())
     }
 
     #[test]

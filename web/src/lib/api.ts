@@ -621,6 +621,7 @@ export async function createProject(body: {
   name?: string;
   scope?: "global" | "profile";
   allow_override?: boolean;
+  default_base_branch?: string;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {

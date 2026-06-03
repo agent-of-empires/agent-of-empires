@@ -22,6 +22,8 @@ pub struct ProjectResponse {
     pub name: String,
     pub path: String,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_base_branch: Option<String>,
 }
 
 impl From<Project> for ProjectResponse {
@@ -30,6 +32,7 @@ impl From<Project> for ProjectResponse {
             name: p.name,
             path: p.path,
             scope: p.scope.as_str().to_string(),
+            default_base_branch: p.default_base_branch,
         }
     }
 }
@@ -97,6 +100,10 @@ pub struct CreateProjectBody {
     /// otherwise return 409.
     #[serde(default)]
     pub allow_override: bool,
+    /// Default base branch for new worktree branches created against this
+    /// project in a multi-repo workspace. Empty/whitespace is treated as unset.
+    #[serde(default)]
+    pub default_base_branch: Option<String>,
 }
 
 #[tracing::instrument(
@@ -168,7 +175,8 @@ pub async fn create_project(
             .unwrap_or_else(|| "project".to_string())
     });
 
-    let project = Project::new(name, canonical.to_string_lossy(), scope);
+    let project = Project::new(name, canonical.to_string_lossy(), scope)
+        .with_base_branch(body.default_base_branch);
     match projects::add(&state.profile, scope, project, body.allow_override) {
         Ok(saved) => {
             tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
