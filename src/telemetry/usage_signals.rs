@@ -32,6 +32,12 @@ pub struct UsageSeenCounters {
     counts: BTreeMap<&'static str, AtomicU32>,
 }
 
+impl Default for UsageSeenCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UsageSeenCounters {
     pub fn new() -> Self {
         Self {
