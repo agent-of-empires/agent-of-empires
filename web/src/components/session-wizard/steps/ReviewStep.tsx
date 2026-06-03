@@ -152,6 +152,7 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
           <input
             ref={inputRef}
             type="text"
+            data-testid="launch-command-input"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commit}
