@@ -60,6 +60,16 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     like a desktop client. Only the coarse class is derived (from display-mode,
     pointer type, and viewport width); no user-agent string, screen size, or
     device model is read or sent,
+  - coarse cockpit-interaction counts since the last snapshot, so we can tell
+    "opened" from "actually used" (populated by `aoe serve`; the TUI reports
+    zero). All are counts or a closed decision-key map, never content:
+    - how many approvals were resolved and the decision mix (`allow`,
+      `allow_always`, `deny`; the synthetic daemon-restart cancellation is not
+      counted),
+    - how many mid-session agent switches and cockpit/terminal toggles happened
+      (only real toggles, not no-op re-applies),
+    - whether any session entered plan mode,
+    - how many prompts were queued (parked because the agent was busy),
   - for `aoe serve` only, how the daemon is deployed, decided once at launch:
     its auth mode (`token`, `passphrase`, or `none`) and its exposure mode
     (`tunnel` for a Cloudflare quick or named tunnel, `tailscale` for a
@@ -200,10 +210,11 @@ until delivery is confirmed, so a failed send does not silently drop them:
   both the slot and the counts intact for the next invocation to retry (bounded
   to once per hour so a down endpoint cannot make every `aoe` invocation
   re-send), and a transient failure never drops a window of commands;
-- the serve `usage_seen` open counts, the per-form-factor client maps, and the
-  session-create counter are cleared only after a confirmed snapshot send,
-  decremented by exactly what was reported, so a failed snapshot keeps them for
-  the next one instead of losing that window's signal.
+- the serve `usage_seen` open counts, the per-form-factor client maps, the
+  session-create counter, and the cockpit-interaction counts are cleared only
+  after a confirmed snapshot send, each decremented by exactly the reported
+  amount (so an interaction that lands mid-send rolls into the next snapshot),
+  so a failed snapshot keeps that window's signal instead of losing it.
 
 This is coarse, last-write retry, not a durable queue: periodic snapshots are
 still point-in-time, and a snapshot identical to the last confirmed one is
