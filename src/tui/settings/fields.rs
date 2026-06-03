@@ -1126,7 +1126,7 @@ mod tests {
         );
         assert!(matches!(
             field(&fields, "status_hooks.debounce_ms").value,
-            FieldValue::Number(n) if n == default_debounce as u64
+            FieldValue::Number(n) if n == default_debounce
         ));
 
         let profile = profile_from(json!({"status_hooks": {"debounce_ms": 500}}));
