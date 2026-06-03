@@ -5,8 +5,11 @@
 //! `#[serial]`. Each test points the app dir at a fresh `TempDir`, so no real
 //! user state is touched.
 
-use agent_of_empires::session::{save_config, Config, Instance};
+use agent_of_empires::session::{
+    save_config, Config, Instance, SandboxInfo, WorkspaceInfo, WorktreeInfo,
+};
 use agent_of_empires::telemetry::{self, Surface};
+use chrono::Utc;
 use serial_test::serial;
 
 /// Redirect the app dir at a temp location and clear the telemetry-related env
@@ -122,6 +125,143 @@ fn snapshot_buckets_are_sanitized() {
             "features map missing allowlisted key `{key}`"
         );
     }
+}
+
+/// The fixed, closed substrate vocabulary (#1886). The snapshot must never
+/// emit a key outside this set.
+const SUBSTRATE_VOCAB: [&str; 5] = ["local", "worktree", "workspace", "sandbox", "scratch"];
+
+fn with_worktree(mut inst: Instance) -> Instance {
+    inst.worktree_info = Some(WorktreeInfo {
+        branch: "feature/x".to_string(),
+        main_repo_path: "/repo".to_string(),
+        managed_by_aoe: true,
+        created_at: Utc::now(),
+        base_branch: None,
+    });
+    inst
+}
+
+fn with_workspace(mut inst: Instance) -> Instance {
+    inst.workspace_info = Some(WorkspaceInfo {
+        branch: "feature/x".to_string(),
+        workspace_dir: "/ws".to_string(),
+        repos: Vec::new(),
+        created_at: Utc::now(),
+        cleanup_on_delete: true,
+    });
+    inst
+}
+
+fn with_sandbox(mut inst: Instance, enabled: bool) -> Instance {
+    inst.sandbox_info = Some(SandboxInfo {
+        enabled,
+        container_id: None,
+        image: "secret-internal-image:latest".to_string(),
+        container_name: "aoe_secret_container".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+    });
+    inst
+}
+
+/// User story (#1886): a maintainer with one local, one worktree, and one
+/// sandboxed session sees one count in each of the matching substrate buckets.
+#[test]
+#[serial]
+fn substrate_census_counts_each_bucket() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let local = Instance::new("a", "/p");
+    let worktree = with_worktree(Instance::new("b", "/p"));
+    let sandbox = with_sandbox(Instance::new("c", "/p"), true);
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Tui, &[local, worktree, sandbox], false, false, 0)
+            .expect("snapshot built when opted in");
+
+    assert_eq!(snapshot.sessions_by_substrate.get("local"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("worktree"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("sandbox"), Some(&1));
+    // Untouched buckets are still present (pre-seeded) and zero.
+    assert_eq!(snapshot.sessions_by_substrate.get("workspace"), Some(&0));
+    assert_eq!(snapshot.sessions_by_substrate.get("scratch"), Some(&0));
+}
+
+/// User story (#1886): a session that is both scratch and (somehow) carries
+/// worktree info is classified into exactly one bucket by the documented
+/// precedence (scratch wins), never double-counted. The substrate buckets
+/// always partition `session_total`, so they sum to it.
+#[test]
+#[serial]
+fn substrate_buckets_are_mutually_exclusive_and_sum_to_total() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // Impossible-but-defensive combo: scratch AND worktree set. Precedence puts
+    // it in `scratch`, and it is counted exactly once.
+    let mut conflicted = with_worktree(Instance::new("a", "/p"));
+    conflicted.scratch = true;
+    // A sandboxed worktree buckets as `worktree` (sandbox sits below worktree),
+    // yet still increments the orthogonal `session_sandboxed` count.
+    let sandboxed_worktree = with_sandbox(with_worktree(Instance::new("b", "/p")), true);
+    let workspace = with_workspace(Instance::new("c", "/p"));
+    let local = Instance::new("d", "/p");
+
+    let instances = [conflicted, sandboxed_worktree, workspace, local];
+    let total = instances.len() as u32;
+    let snapshot = telemetry::build_usage_snapshot(Surface::Tui, &instances, false, false, 0)
+        .expect("snapshot built when opted in");
+
+    let sum: u32 = snapshot.sessions_by_substrate.values().sum();
+    assert_eq!(
+        sum, total,
+        "substrate buckets must partition session_total exactly once each"
+    );
+    assert_eq!(snapshot.session_total, total);
+    assert_eq!(snapshot.sessions_by_substrate.get("scratch"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("worktree"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("workspace"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("local"), Some(&1));
+    assert_eq!(snapshot.sessions_by_substrate.get("sandbox"), Some(&0));
+    // The substrate map is orthogonal to the sandbox count: the sandboxed
+    // worktree is bucketed as worktree but still tallied as sandboxed.
+    assert_eq!(snapshot.session_sandboxed, 1);
+}
+
+/// Privacy: the substrate map keys are only the allowlisted closed vocabulary,
+/// never a path, repo name, branch, or sandbox image string (#1886).
+#[test]
+#[serial]
+fn substrate_keys_are_only_allowlisted_vocab() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let instances = [
+        with_sandbox(
+            with_worktree(Instance::new("a", "/home/me/secret-project")),
+            true,
+        ),
+        with_workspace(Instance::new("b", "/home/me/secret-workspace")),
+    ];
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &instances, false, false, 0)
+        .expect("snapshot built when opted in");
+
+    for key in snapshot.sessions_by_substrate.keys() {
+        assert!(
+            SUBSTRATE_VOCAB.contains(&key.as_str()),
+            "substrate key `{key}` is outside the closed vocabulary"
+        );
+    }
+    // And the raw image/path strings must not leak into the serialized payload.
+    let serialized = serde_json::to_string(&snapshot).expect("serialize");
+    assert!(!serialized.contains("secret-project"));
+    assert!(!serialized.contains("secret-workspace"));
+    assert!(!serialized.contains("secret-internal-image"));
 }
 
 /// User story (#1874): the create-trend counter carries a real value. When N

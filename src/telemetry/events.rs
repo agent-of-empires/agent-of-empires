@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Payload schema version. Bump on any breaking change to the field set.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (#1886): added `sessions_by_substrate`, a mutually-exclusive
+/// per-substrate census of live sessions.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +81,21 @@ pub struct UsageSnapshot {
     pub sessions_by_agent: BTreeMap<String, u32>,
     /// Coarse model family bucket -> session count.
     pub sessions_by_model_bucket: BTreeMap<String, u32>,
+    /// Primary, mutually-exclusive substrate bucket -> session count. Every
+    /// session lands in exactly one of a fixed, closed vocabulary
+    /// (`local` / `worktree` / `workspace` / `sandbox` / `scratch`), so the
+    /// values partition `session_total` and always sum to it. All five keys
+    /// are always present (pre-seeded to 0), so a dashboard never has to treat
+    /// a missing key as zero. Keys are hardcoded, never derived from a path,
+    /// repo name, or image string.
+    ///
+    /// This is orthogonal to `session_sandboxed`, which may overlap: a
+    /// sandboxed worktree counts as `worktree` here (the substrate precedence
+    /// puts worktree above sandbox) yet still increments `session_sandboxed`.
+    /// So the `sandbox` bucket means "sandboxed and not also scratch /
+    /// workspace / worktree", NOT "all sandboxed sessions"; use
+    /// `session_sandboxed` for the latter.
+    pub sessions_by_substrate: BTreeMap<String, u32>,
     /// Install-level feature adoption: allowlisted feature name -> active.
     /// Keyed by the fixed registry in [`super::features`]; lets new gated
     /// features be tracked by registering the flag, not by extending the

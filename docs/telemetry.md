@@ -19,6 +19,14 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
+  - a per-substrate census: each session is classified into exactly one of
+    `local` / `worktree` / `workspace` / `sandbox` / `scratch` (a closed
+    five-way vocabulary), so the counts partition the session total and answer
+    "of N sessions, how many are worktree vs local vs sandbox vs ...". All five
+    keys are always present. This is orthogonal to the sandbox count above: a
+    sandboxed worktree counts as `worktree` here yet still in the sandbox count,
+    so the `sandbox` bucket means "sandboxed and not also one of the others",
+    not "all sandboxed sessions",
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
   - how many sessions were created since the last snapshot, a trend counter so
     short-lived sessions that start and end between two snapshots are still
@@ -125,6 +133,7 @@ the install id and does all sending.
 
 **Schema contract.** The wire format is the flat, closed schema in
 `src/telemetry/events.rs`, mirrored by the gateway. New fields must be counts,
-booleans, or short identifier-like strings (and the two allowlisted bucket
-maps); the gateway drops free text, paths, branch-name-like strings, and any
-nested object, so anything richer than a count or flag will not survive ingest.
+booleans, or short identifier-like strings (and the allowlisted bucket maps:
+per-agent, per-model-family, and per-substrate); the gateway drops free text,
+paths, branch-name-like strings, and any nested object, so anything richer than
+a count or flag will not survive ingest.

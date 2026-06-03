@@ -112,6 +112,46 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The fixed, closed substrate vocabulary, in precedence order. A session is
+/// classified into exactly one of these by [`substrate_bucket`]; the snapshot
+/// pre-seeds all five so the census is always complete.
+const SUBSTRATES: [&str; 5] = ["scratch", "workspace", "worktree", "sandbox", "local"];
+
+/// Classify a session into its single primary substrate bucket.
+///
+/// Mutually exclusive by fixed precedence: `scratch` > `workspace` >
+/// `worktree` > `sandbox` > `local`. `scratch` is invariant-exclusive with
+/// worktree/workspace, so a session carrying both is an upstream state bug; we
+/// log it at `debug` and bucket by precedence rather than panic, because
+/// telemetry must never crash the tool. A sandbox can legitimately co-occur
+/// with a worktree, so it sits below worktree and the orthogonal
+/// `session_sandboxed` count carries the "has sandbox at all" signal.
+fn substrate_bucket(inst: &Instance) -> &'static str {
+    let has_worktree = inst.worktree_info.is_some();
+    let has_workspace = inst.workspace_info.is_some();
+    if inst.scratch {
+        if has_worktree || has_workspace {
+            tracing::debug!(
+                target: "telemetry",
+                has_worktree,
+                has_workspace,
+                "scratch session also carries worktree/workspace info; bucketing as scratch by precedence"
+            );
+        }
+        return "scratch";
+    }
+    if has_workspace {
+        return "workspace";
+    }
+    if has_worktree {
+        return "worktree";
+    }
+    if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
+        return "sandbox";
+    }
+    "local"
+}
+
 /// Build a `process_start` event, or `None` when telemetry is not opted in
 /// (or `DO_NOT_TRACK` suppresses id generation).
 pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
@@ -151,6 +191,11 @@ pub fn build_usage_snapshot(
 
     let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
     let mut sessions_by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
+    // Pre-seed every substrate to 0 so the census is always complete: a
+    // dashboard never has to coalesce a missing key, and the values always
+    // sum to `session_total`.
+    let mut sessions_by_substrate: BTreeMap<String, u32> =
+        SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect();
     let (mut running, mut idle, mut error, mut cockpit, mut sandboxed, mut yolo) =
         (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
 
@@ -176,6 +221,12 @@ pub fn build_usage_snapshot(
         if inst.yolo_mode {
             yolo += 1;
         }
+
+        // Mutually-exclusive primary substrate; orthogonal to the sandbox count
+        // above (a sandboxed worktree buckets as `worktree` here).
+        *sessions_by_substrate
+            .entry(substrate_bucket(inst).to_string())
+            .or_insert(0) += 1;
 
         // Prefer the canonical detection name; fall back to the raw tool
         // string. Either way it is coerced to an allowlisted bucket.
@@ -216,6 +267,7 @@ pub fn build_usage_snapshot(
         session_yolo: yolo,
         sessions_by_agent,
         sessions_by_model_bucket,
+        sessions_by_substrate,
         features,
         web_seen,
         cockpit_seen,
@@ -468,6 +520,7 @@ mod tests {
             session_yolo: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
+            sessions_by_substrate: BTreeMap::new(),
             features: BTreeMap::new(),
             web_seen: false,
             cockpit_seen: false,
