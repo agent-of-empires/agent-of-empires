@@ -259,6 +259,9 @@ pub struct SpawnConfig {
     pub additional_dirs: Vec<PathBuf>,
     /// Provider env vars to forward (after applying the agent's allowlist).
     pub provider_env: Vec<(String, String)>,
+    /// Optional default reasoning effort to apply on fresh ACP sessions
+    /// through the adapter's `thought_level` config option.
+    pub default_effort: Option<String>,
     /// Reserved for a future agent-in-container that natively speaks
     /// the socket transport. The current cockpit sandbox path runs
     /// `docker exec` from the host-side runner (which already holds the
@@ -1242,6 +1245,7 @@ impl AcpClient {
         let profile = agent_profiles::resolve(&config.agent_key);
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
+        let default_effort = config.default_effort.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would
@@ -1267,6 +1271,7 @@ impl AcpClient {
                 profile,
                 install_binary,
                 source_profile_for_task,
+                default_effort.clone(),
             )
             .await;
         }
@@ -1288,6 +1293,7 @@ impl AcpClient {
             profile,
             install_binary,
             source_profile_for_task,
+            default_effort,
         )
         .await
     }
@@ -1308,6 +1314,7 @@ impl AcpClient {
         profile: &'static agent_profiles::AgentProfile,
         install_binary: String,
         source_profile: Option<String>,
+        default_effort: Option<String>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -1363,6 +1370,7 @@ impl AcpClient {
             profile,
             expected_agent,
             source_profile,
+            default_effort,
         ));
 
         wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
@@ -1398,6 +1406,7 @@ impl AcpClient {
         profile: &'static agent_profiles::AgentProfile,
         install_binary: String,
         source_profile: Option<String>,
+        default_effort: Option<String>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
@@ -1445,6 +1454,7 @@ impl AcpClient {
             profile,
             expected_agent,
             source_profile,
+            default_effort,
         ));
 
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
@@ -1527,6 +1537,7 @@ impl AcpClient {
             profile,
             install_binary,
             source_profile,
+            None,
         )
         .await
     }
@@ -3128,6 +3139,25 @@ fn config_options_event(
     Some(Event::ConfigOptionsUpdated { options: mapped })
 }
 
+fn thought_level_config_id(
+    options: &[agent_client_protocol::schema::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::SessionConfigId> {
+    use agent_client_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
+
+    options.iter().find_map(|option| {
+        if !matches!(
+            option.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        ) {
+            return None;
+        }
+        if !matches!(option.kind, SessionConfigKind::Select(_)) {
+            return None;
+        }
+        Some(option.id.clone())
+    })
+}
+
 /// Build a cockpit `ConfigOptionDescriptor` from an ACP
 /// `SessionConfigOption`. Returns `None` when the option has a kind
 /// the cockpit does not yet render (today everything except `Select`).
@@ -3531,6 +3561,7 @@ async fn run_connection_task<W, R>(
     profile: &'static agent_profiles::AgentProfile,
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
+    default_effort: Option<String>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -4117,10 +4148,52 @@ async fn run_connection_task<W, R>(
                         // initial model + effort + mode set here, not as a
                         // subsequent notification). Surface them so the
                         // cockpit pickers render immediately. See #1403.
-                        if let Some(event) =
-                            config_options_event(new_session.config_options.clone())
-                        {
+                        let config_options = new_session.config_options.clone();
+                        if let Some(event) = config_options_event(config_options.clone()) {
                             let _ = event_tx_for_block.send(event).await;
+                        }
+
+                        if let (Some(effort), Some(options)) =
+                            (default_effort.as_deref(), config_options.as_deref())
+                        {
+                            if let Some(config_id) = thought_level_config_id(options) {
+                                info!(
+                                    target: "cockpit.acp",
+                                    session = %session_label,
+                                    effort,
+                                    "applying default cockpit effort"
+                                );
+                                match connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        id.clone(),
+                                        config_id,
+                                        SessionConfigValueId::new(effort.to_string()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        if let Some(event) =
+                                            config_options_event(Some(resp.config_options))
+                                        {
+                                            let _ = event_tx_for_block.send(event).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "cockpit.acp",
+                                            session = %session_label,
+                                            "default cockpit effort failed: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    target: "cockpit.acp",
+                                    session = %session_label,
+                                    "default cockpit effort skipped; no thought_level option"
+                                );
+                            }
                         }
 
                         // Tell the server-side listener so it can persist the
@@ -6087,6 +6160,7 @@ mod tests {
             cwd,
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -6152,6 +6226,7 @@ mod tests {
             additional_dirs: vec![],
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -6219,6 +6294,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -6263,6 +6339,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -6293,6 +6370,7 @@ mod tests {
             cwd: missing.clone(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: None,

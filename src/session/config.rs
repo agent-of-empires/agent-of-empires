@@ -784,6 +784,11 @@ pub struct SessionConfig {
     )]
     pub agent_cockpit_cmd: HashMap<String, String>,
 
+    /// Per-agent cockpit startup defaults. `model` is forwarded at spawn;
+    /// `effort` is applied through ACP config options when advertised.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cockpit_defaults: HashMap<String, CockpitAgentDefaults>,
+
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
     /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
@@ -945,6 +950,30 @@ pub struct SessionConfig {
     pub confirm_before_quit: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CockpitAgentDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl CockpitAgentDefaults {
+    pub fn is_empty(&self) -> bool {
+        self.model.as_deref().is_none_or(str::is_empty)
+            && self.effort.as_deref().is_none_or(str::is_empty)
+    }
+}
+
+impl SessionConfig {
+    pub fn cockpit_defaults_for(&self, agent: &str) -> Option<&CockpitAgentDefaults> {
+        self.cockpit_defaults
+            .get(agent)
+            .filter(|defaults| !defaults.is_empty())
+    }
+}
+
 /// What a single mouse click on a session row does in the Agent view.
 /// See `SessionConfig::click_action`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1044,7 @@ impl Default for SessionConfig {
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             agent_cockpit_cmd: HashMap::new(),
+            cockpit_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
@@ -2657,6 +2687,13 @@ mod tests {
             .session
             .agent_extra_args
             .insert("opencode".to_string(), "--port 8080".to_string());
+        config.session.cockpit_defaults.insert(
+            "opencode".to_string(),
+            CockpitAgentDefaults {
+                model: Some("openai/gpt-5.5".to_string()),
+                effort: Some("high".to_string()),
+            },
+        );
 
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -2669,6 +2706,14 @@ mod tests {
             deserialized.session.agent_extra_args.get("opencode"),
             Some(&"--port 8080".to_string()),
             "agent_extra_args should survive roundtrip"
+        );
+        assert_eq!(
+            deserialized.session.cockpit_defaults.get("opencode"),
+            Some(&CockpitAgentDefaults {
+                model: Some("openai/gpt-5.5".to_string()),
+                effort: Some("high".to_string()),
+            }),
+            "cockpit_defaults should survive roundtrip"
         );
     }
 

@@ -347,6 +347,7 @@ pub async fn spawn_cockpit(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
+            effort: None,
             stored_acp_session_id,
             sandbox_info,
             source_profile,
@@ -552,6 +553,7 @@ pub async fn switch_cockpit_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            effort: None,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
@@ -1406,6 +1408,7 @@ pub async fn cockpit_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
+                effort: None,
                 stored_acp_session_id,
                 sandbox_info,
                 source_profile,

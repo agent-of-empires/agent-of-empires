@@ -58,6 +58,8 @@ export interface WizardData {
    *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
    *  remembered opt-out would silently defeat the master switch. */
   useCockpit: boolean;
+  cockpitModel: string;
+  cockpitEffort: string;
   [key: string]: unknown;
 }
 
@@ -88,6 +90,8 @@ export type Action =
       sandboxEnabled: boolean;
       tool: string;
       extraEnv: string[];
+      cockpitModel?: string;
+      cockpitEffort?: string;
       /** When true, skip the apply if the user has already edited an
        *  agent-step field. The picker-driven path always sets this false
        *  (the user has already confirmed the overwrite); the mount-time
@@ -106,6 +110,8 @@ export const initialData: WizardData = {
   customInstruction: "", extraArgs: "", commandOverride: "",
   scratch: false,
   useCockpit: true,
+  cockpitModel: "",
+  cockpitEffort: "",
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -147,7 +153,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv"].includes(action.field)) {
+      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "cockpitModel", "cockpitEffort"].includes(action.field)) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };
@@ -182,6 +188,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
           sandboxEnabled: action.sandboxEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
+          cockpitModel: action.cockpitModel ?? "",
+          cockpitEffort: action.cockpitEffort ?? "",
           profileDirty: false,
         },
       };

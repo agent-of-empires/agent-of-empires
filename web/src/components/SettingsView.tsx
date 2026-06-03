@@ -139,6 +139,25 @@ export function resolveSelectedProfile(
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
+function formatJsonSetting(value: unknown): string {
+  if (!value || typeof value !== "object") return "{}";
+  return JSON.stringify(value, null, 2);
+}
+
+function parseJsonObjectSetting(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function SettingsView({
   onClose,
   tab,
@@ -346,6 +365,18 @@ export function SettingsView({
               description="Install status-detection hooks into agent settings files for reliable status tracking"
               checked={(session.agent_status_hooks as boolean) ?? true}
               onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
+            />
+            <TextField
+              label="Cockpit defaults"
+              description='Per-agent cockpit model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              value={formatJsonSetting(session.cockpit_defaults)}
+              onChange={(v) => {
+                const parsed = parseJsonObjectSetting(v);
+                if (parsed) void saveField("session", session, "cockpit_defaults", parsed);
+              }}
+              placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              mono
+              multiline
             />
             <NumberField
               label="Auto-stop idle sessions (s)"

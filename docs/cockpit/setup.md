@@ -120,6 +120,16 @@ a generated name; it never prompts. The TUI `n` flow and the web
 new-session wizard prompt for a name interactively. To name a session
 created from the CLI, pass `--title "<name>"`.
 
+For web-created cockpit sessions, configure per-agent defaults under
+`[session.cockpit_defaults.<agent>]` so the dashboard starts that agent with
+the desired model and, when the adapter advertises it, reasoning effort:
+
+```toml
+[session.cockpit_defaults.opencode]
+model = "openai/gpt-5.5"
+effort = "high"
+```
+
 ### Globally
 
 The settings live in `config.toml` under `[cockpit]`:
