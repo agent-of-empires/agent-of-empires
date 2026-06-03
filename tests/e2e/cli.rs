@@ -69,6 +69,86 @@ fn test_cli_add_next_steps_uses_aoe_binary_name() {
     );
 }
 
+/// #1909: `aoe add --interactive` must fail loudly when stdin is not a
+/// terminal instead of hanging on the name prompt. `run_cli` runs the
+/// binary as a plain subprocess with no controlling TTY, which is the
+/// non-interactive case the guard protects.
+#[test]
+#[serial]
+fn test_cli_add_interactive_requires_tty() {
+    let h = TuiTestHarness::new("cli_add_interactive_no_tty");
+    let project = h.project_path();
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "-i"]);
+    assert!(
+        !output.status.success(),
+        "aoe add -i without a TTY should fail, not hang or succeed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires a terminal"),
+        "expected the --interactive TTY guard message.\nstderr: {}",
+        stderr
+    );
+
+    // The guard runs before any persistence, so no session row is written.
+    let sessions_path =
+        crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    assert!(
+        !sessions_path.exists(),
+        "the TTY guard must bail before writing sessions.json"
+    );
+}
+
+/// #1909: `aoe add --interactive` should prompt for a session name like
+/// the TUI `n` flow. Driven through a tmux pane so stdin is a real
+/// terminal; the typed name must become the session title.
+#[test]
+#[serial]
+fn test_cli_add_interactive_prompts_for_name() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_add_interactive_prompt");
+    let project = h.project_path();
+    let project_arg = project.to_str().unwrap().to_string();
+
+    h.spawn(&["add", &project_arg, "-i"]);
+    h.wait_for("Session name [");
+    h.type_text("InteractivePrompted");
+    h.send_keys("Enter");
+
+    // The add command exits as soon as it persists, tearing down the tmux
+    // pane, so the screen goes blank. Poll the on-disk session store
+    // instead of waiting on screen output.
+    let sessions_path =
+        crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let landed = loop {
+        let found = std::fs::read_to_string(&sessions_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .map(|j| {
+                j.as_array().is_some_and(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|s| s["title"].as_str() == Some("InteractivePrompted"))
+                })
+            })
+            .unwrap_or(false);
+        if found {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert!(
+        landed,
+        "interactive prompt should persist a session titled InteractivePrompted"
+    );
+}
+
 #[test]
 #[serial]
 fn test_cli_add_invalid_path() {
