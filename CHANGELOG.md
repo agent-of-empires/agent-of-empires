@@ -62,6 +62,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **recovery:** Timeout hung on_launch hook to release recovery lock in [#1872](https://github.com/agent-of-empires/agent-of-empires/pull/1872) by [@jerome-benoit](https://github.com/jerome-benoit) ([`31477e1`](https://github.com/agent-of-empires/agent-of-empires/commit/31477e1780d34af6407dbf5d9cdaaa32e2e57509))
 - **sandbox:** Resolve container terminal login shell, add container_shell override in [#1862](https://github.com/agent-of-empires/agent-of-empires/pull/1862) by [@Seluj78](https://github.com/Seluj78) ([`4f4befd`](https://github.com/agent-of-empires/agent-of-empires/commit/4f4befd00423b97d38d198c2b47dce6345864a95))
 - **session:** Kill all tmux session kinds on remove and recovery paths in [#1867](https://github.com/agent-of-empires/agent-of-empires/pull/1867) by [@jerome-benoit](https://github.com/jerome-benoit) ([`2d1e555`](https://github.com/agent-of-empires/agent-of-empires/commit/2d1e555eb200b170c5ec6c3772ffebd64dda459b))
+- **telemetry:** Correct create counter, send-failure handling, and aggregation accuracy in [#1898](https://github.com/agent-of-empires/agent-of-empires/pull/1898) by [@Seluj78](https://github.com/Seluj78) ([`e280c3e`](https://github.com/agent-of-empires/agent-of-empires/commit/e280c3eea786fc8790bb8c80817c151f88c99114))
+- **web:** Activate cockpit_seen telemetry signal in [#1896](https://github.com/agent-of-empires/agent-of-empires/pull/1896) by [@Seluj78](https://github.com/Seluj78) ([`5f4c6d6`](https://github.com/agent-of-empires/agent-of-empires/commit/5f4c6d63b28bd94e3f5f86452b3cbe22cb55b868))
 
 
 ### Features
