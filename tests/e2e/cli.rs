@@ -864,6 +864,79 @@ fn test_cli_rename_preserves_tmux_session() {
         .output();
 }
 
+/// Removing a session via CLI must kill its agent tmux session. Locks the
+/// invariant "session removed implies tmux gone" that the audit identified
+/// as untested on every removal path.
+#[test]
+#[serial]
+fn test_cli_rm_kills_agent_tmux_session() {
+    require_tmux!();
+
+    let h = TuiTestHarness::new("cli_rm_tmux");
+    let project = h.project_path();
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-t", "RmTarget"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"].as_str().expect("session should have id");
+    let truncated_id = &session_id[..8.min(session_id.len())];
+
+    let tmux_name = format!(
+        "{}RmTarget_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        truncated_id
+    );
+
+    let create = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("tmux new-session");
+    assert!(
+        create.status.success(),
+        "failed to create tmux session: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rm_output = h.run_cli(&["rm", session_id, "--force"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm_output.stderr)
+    );
+
+    let still_alive = Command::new("tmux")
+        .args(["has-session", "-t", &tmux_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        !still_alive,
+        "tmux session '{}' should be gone after aoe rm",
+        tmux_name
+    );
+
+    // Cleanup
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+}
+
 /// Initialize a bare-minimum git repo at the given path so worktree operations work.
 fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("create repo dir");

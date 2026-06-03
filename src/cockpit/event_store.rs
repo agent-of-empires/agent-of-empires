@@ -985,8 +985,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let placeholders = std::iter::repeat("?")
-            .take(session_ids.len())
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
             .collect::<Vec<_>>()
             .join(",");
         // Exclude non-substantive lifecycle/metadata events so they do not

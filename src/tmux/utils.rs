@@ -1,5 +1,6 @@
 //! tmux utility functions
 
+use anyhow::{bail, Result};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -252,6 +253,25 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
+/// Run `tmux kill-session -t <name>`. The `can't find session` stderr (in
+/// C locale) is treated as success: callers commonly kill the pane's
+/// process tree first, which can cause tmux to tear down the session
+/// before this call lands. Any other tmux failure returns `Err`. Caller
+/// is responsible for `refresh_session_cache` after a successful kill.
+pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .env("LC_ALL", "C")
+        .args(["kill-session", "-t", name])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("can't find session") {
+            bail!("Failed to kill tmux session '{}': {}", name, stderr);
+        }
+    }
+    Ok(())
+}
+
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
 /// display form shown in UI hints. Preserves case from tmux so users see the
 /// same letter they typed in `~/.tmux.conf`.
@@ -488,6 +508,53 @@ mod tests {
                 "allow-passthrough",
                 "on",
             ]
+        );
+    }
+
+    fn tmux_available() -> bool {
+        Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn kill_session_if_present_swallows_missing_session() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_kill_if_present_missing";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+        assert!(kill_session_if_present(name).is_ok());
+    }
+
+    #[test]
+    fn kill_session_if_present_kills_existing_session() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_kill_if_present_alive";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+        let spawn = Command::new("tmux")
+            .args(["new-session", "-d", "-s", name])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        assert!(kill_session_if_present(name).is_ok());
+        let exists = Command::new("tmux")
+            .args(["has-session", "-t", name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !exists,
+            "session should be gone after kill_session_if_present"
         );
     }
 }

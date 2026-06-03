@@ -1303,9 +1303,11 @@ impl App {
         }
 
         // Best-effort final snapshot on graceful exit, bounded so a dead
-        // endpoint can't delay quit.
+        // endpoint can't delay quit. Deduped against the boot/periodic snapshot
+        // so a launch-then-quit with unchanged sessions doesn't post the same
+        // counts twice within seconds.
         if let Some(snapshot) = self.build_telemetry_snapshot() {
-            crate::telemetry::flush_snapshot(snapshot).await;
+            crate::telemetry::flush_snapshot_if_changed(snapshot).await;
         }
 
         Ok(())

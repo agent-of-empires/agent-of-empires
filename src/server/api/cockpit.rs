@@ -1282,25 +1282,46 @@ pub async fn cockpit_enable(
     }
 
     // Tear down the tmux side. Best-effort: a stale tmux name should
-    // not block the swap.
-    if let Err(e) = instance.kill() {
-        tracing::warn!(target: "cockpit.switch", session = %id, "kill tmux failed: {e}");
+    // not block the swap. Run on a blocking pool worker because each
+    // kill shells out. Warn on agent kill failure to keep signal for
+    // this user-initiated action; ancillary kinds delegate to the
+    // shared helper so any future kind picked up by the audit lands
+    // here automatically.
+    let inst_for_kill = instance.clone();
+    let id_for_log = id.clone();
+    let kill_join = tokio::task::spawn_blocking(move || {
+        if let Err(e) = inst_for_kill.kill() {
+            tracing::warn!(target: "cockpit.switch", session = %inst_for_kill.id, "kill tmux failed: {e}");
+        }
+        inst_for_kill.kill_ancillary_tmux_sessions();
+    })
+    .await;
+    if let Err(join_err) = kill_join {
+        tracing::error!(target: "cockpit.switch", session = %id_for_log, "tmux teardown task panicked: {join_err}");
     }
     instance.cockpit_mode = true;
+    instance.resume_intent = crate::session::ResumeIntent::Default;
 
     // Persist before spawning so a crash mid-swap leaves us in the
     // declared end state, not a half-broken intermediate.
     //
     // The on-disk and in-memory updates mutate ONLY the cockpit-specific
-    // field (`cockpit_mode = true`). Wholesale replacement with a
-    // pre-lock snapshot would clobber concurrent writes to other
-    // fields (status, last_accessed, agent_session_id) made by the
-    // status poll loop or other handlers between the snapshot and the
-    // lock acquisition.
+    // fields (`cockpit_mode = true`, `resume_intent = Default`).
+    // Wholesale replacement with a pre-lock snapshot would clobber
+    // concurrent writes to other fields (status, last_accessed,
+    // agent_session_id) made by the status poll loop or other handlers
+    // between the snapshot and the lock acquisition.
+    //
+    // Clearing `resume_intent` here closes the dormant-intent gap: the
+    // CLI `set-session-id` writes `Use(sid)` to disk, then the user
+    // toggles cockpit on; without this reset, a future `cockpit_disable`
+    // would reload the stale `Use(sid)` and the next non-cockpit launch
+    // would honor a session id the user no longer expects. See #1745.
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.cockpit_mode = true;
+            slot.resume_intent = crate::session::ResumeIntent::Default;
         }
     }
     let id_for_save = id.clone();
@@ -1310,6 +1331,7 @@ pub async fn cockpit_enable(
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.cockpit_mode = true;
+                slot.resume_intent = crate::session::ResumeIntent::Default;
             }
             Ok(())
         })?;

@@ -50,6 +50,7 @@ pub use profile_config::{
     ProfileConfig,
 };
 pub use projects::{Project, ProjectScope};
+pub use recovery::HookTimeoutScope;
 pub use repo_config::{
     check_hook_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,

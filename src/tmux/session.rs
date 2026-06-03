@@ -173,19 +173,7 @@ impl Session {
             process::kill_process_tree(pane_pid);
         }
 
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Session vanished between the exists() check and kill-session
-            // (e.g. process tree kill caused tmux to tear it down). That's
-            // fine -- the goal was to remove the session and it's gone.
-            if !stderr.contains("can't find session") {
-                bail!("Failed to kill tmux session: {}", stderr);
-            }
-        }
+        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
 

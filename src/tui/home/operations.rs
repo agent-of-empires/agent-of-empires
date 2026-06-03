@@ -458,10 +458,28 @@ impl HomeView {
         Ok(())
     }
 
-    /// Force-remove a session from storage without any cleanup.
-    /// Used for sessions stuck in the Deleting state where the background
-    /// deletion thread never returned a result.
+    /// Force-remove a session from storage. Worktree, branch, and
+    /// container cleanup are skipped (the original deletion already
+    /// attempted them); tmux teardown is fired off-thread so a hung
+    /// tmux call cannot block the storage update on the TUI input
+    /// thread. Used for sessions stuck in the Deleting state where
+    /// the background deletion thread never returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if let Some(inst) = self.instances.iter().find(|i| i.id == session_id) {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "force_remove tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
+            });
+        }
         self.remove_instance(session_id);
         self.rebuild_group_trees();
         self.save()?;

@@ -16,9 +16,14 @@ use crate::session::config::UpdateCheckMode;
 use crate::session::Config;
 
 /// Install-level feature adoption: allowlisted feature name -> whether it is
-/// turned on for this install. Built from config so it reflects what the user
-/// opted into, independent of per-session counts (which the snapshot reports
-/// separately).
+/// turned on in the **global** config for this install.
+///
+/// This is deliberately the global, pre-profile-merge config, not a profile's
+/// effective config: it answers "what does this install default to", which is a
+/// stable install-level adoption signal. Because sessions can run under arbitrary
+/// profiles whose overrides are not reflected here, this is not per-session usage;
+/// per-session adoption is reported separately by the snapshot's session counts
+/// (`session_sandboxed`, `session_yolo`, ...). Documented in `docs/telemetry.md`.
 pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
     let mut features = BTreeMap::new();
     features.insert("worktree".to_string(), config.worktree.enabled);

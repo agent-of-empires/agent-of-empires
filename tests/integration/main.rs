@@ -18,6 +18,7 @@ mod hooks_config;
 mod migration_pipeline;
 mod parallel_capture;
 mod profile_management;
+mod recovery_hook_timeout;
 mod repo_config;
 mod sandbox_integration;
 mod session_id_acquisition;

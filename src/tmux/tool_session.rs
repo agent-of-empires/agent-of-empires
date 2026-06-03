@@ -111,14 +111,7 @@ impl ToolSession {
             process::kill_process_tree(pane_pid);
         }
 
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to kill tool session '{}': {}", self.name, stderr);
-        }
+        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
         Ok(())

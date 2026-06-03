@@ -748,15 +748,21 @@ fn run_hooks_captured(
     extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     let in_container = matches!(target, HookTarget::Container { .. });
+    let timeout = crate::session::recovery::current_hook_timeout();
 
     for cmd in commands {
         tracing::info!(target: "session.store", "Running hook: {}", cmd);
         let mut command = build_hook_command(cmd, target, HookSpawnOpts::default(), extra_env);
-        let output = command
+        command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to execute hook: {}", cmd))?;
+            .stderr(std::process::Stdio::piped());
+
+        let output = match timeout {
+            None => command
+                .output()
+                .with_context(|| format!("Failed to execute hook: {}", cmd))?,
+            Some(deadline) => run_hook_with_timeout(&mut command, deadline, cmd)?,
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -778,6 +784,60 @@ fn run_hooks_captured(
         );
     }
     Ok(())
+}
+
+/// Spawn a hook child, drain its pipes concurrently, and enforce a per-call
+/// wall-clock deadline. On timeout, [`crate::process::kill_process_tree`]
+/// reaps the descendant tree (SIGTERM, 100 ms grace, then SIGKILL) so the
+/// recovery cascade can release its cross-process lock (#1265).
+fn run_hook_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    cmd_label: &str,
+) -> Result<std::process::Output> {
+    // Match Command::output's stdin so hooks reading stdin see EOF.
+    command.stdin(std::process::Stdio::null());
+    let child = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn hook: {}", cmd_label))?;
+    let pid = child.id();
+
+    let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
+    std::thread::Builder::new()
+        .name(format!("aoe-hook-drain-{}", pid))
+        .spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        })
+        .expect("hook drain thread spawn");
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(io_err)) => {
+            // Reap defensively: wait_with_output can Err while the child is
+            // still live, which would re-pin the recovery lock.
+            crate::process::kill_process_tree(pid);
+            Err(anyhow::Error::from(io_err)
+                .context(format!("Failed to wait on hook: {}", cmd_label)))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                target: "session.startup_recovery",
+                cmd = %cmd_label,
+                timeout_secs = timeout.as_secs(),
+                "on_launch hook timed out; killing process tree to release recovery lock"
+            );
+            crate::process::kill_process_tree(pid);
+            anyhow::bail!(
+                "on_launch hook timed out after {}s: {}",
+                timeout.as_secs(),
+                cmd_label
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!(
+            "hook drain thread disconnected before reporting result: {}",
+            cmd_label
+        ),
+    }
 }
 
 /// Run hook commands with streamed output sent through a progress channel.
