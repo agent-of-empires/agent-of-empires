@@ -272,10 +272,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    // `#[serial]` because `render` reads `DO_NOT_TRACK`, which other telemetry
+    // tests mutate. With it set, `render_dnt` zeroes the button areas and the
+    // click lands on nothing, so a parallel run flakes this assertion.
     #[test]
+    #[serial]
     fn click_after_render_submits_the_hit_button() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        unsafe { std::env::remove_var("DO_NOT_TRACK") };
         let theme = crate::tui::styles::load_theme("default");
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut d = TelemetryConsentDialog::new();
