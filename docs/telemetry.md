@@ -24,7 +24,15 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
-  - whether the web dashboard / cockpit was opened since the last snapshot.
+  - whether the web dashboard / cockpit was opened since the last snapshot,
+    and a coarse client form-factor class for each (`desktop`, `desktop_pwa`,
+    `mobile`, `mobile_pwa`) so desktop, mobile, and installed-PWA usage can be
+    told apart. This is a was-seen flag per class, never a per-device id: the
+    snapshot's `os` / `arch` describe the daemon host, not the client device,
+    so without this a phone PWA talking to a desktop daemon looked like a
+    desktop client. Only the coarse class is derived (from display-mode,
+    pointer type, and viewport width); no user-agent string, screen size, or
+    device model is read or sent.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events
@@ -101,9 +109,10 @@ until delivery is confirmed, so a failed send does not silently drop them:
 - the CLI `process_start` daily slot is claimed only on a confirmed send, so a
   failed send leaves it open for the next invocation to retry (bounded to once
   per hour so a down endpoint cannot make every `aoe` invocation re-send);
-- the serve `web_seen` / `cockpit_seen` flags and the session-create counter are
-  cleared only after a confirmed snapshot send, so a failed snapshot keeps them
-  for the next one instead of losing that window's signal.
+- the serve `web_seen` / `cockpit_seen` flags, their per-form-factor client
+  maps, and the session-create counter are cleared only after a confirmed
+  snapshot send, so a failed snapshot keeps them for the next one instead of
+  losing that window's signal.
 
 This is coarse, last-write retry, not a durable queue: periodic snapshots are
 still point-in-time, and a snapshot identical to the last confirmed one is
@@ -125,6 +134,9 @@ the install id and does all sending.
 
 **Schema contract.** The wire format is the flat, closed schema in
 `src/telemetry/events.rs`, mirrored by the gateway. New fields must be counts,
-booleans, or short identifier-like strings (and the two allowlisted bucket
-maps); the gateway drops free text, paths, branch-name-like strings, and any
-nested object, so anything richer than a count or flag will not survive ingest.
+booleans, or short identifier-like strings (and the allowlisted bucket maps:
+`sessions_by_agent`, `sessions_by_model_bucket`, `features`, and the
+`web_clients_seen` / `cockpit_clients_seen` form-factor maps, all keyed by short
+identifiers with numeric or boolean values); the gateway drops free text, paths,
+branch-name-like strings, and any nested object, so anything richer than a count
+or flag will not survive ingest.
