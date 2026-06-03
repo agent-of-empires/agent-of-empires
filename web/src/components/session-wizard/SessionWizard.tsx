@@ -40,6 +40,18 @@ function buildInitialData(): WizardData {
   return { ...initialData, tool: loadLastUsedTool() };
 }
 
+function cockpitDefaultsFor(
+  session: Record<string, unknown> | undefined,
+  tool: string,
+): { model: string; effort: string } {
+  const defaults = session?.cockpit_defaults as Record<string, unknown> | undefined;
+  const entry = defaults?.[tool] as Record<string, unknown> | undefined;
+  return {
+    model: typeof entry?.model === "string" ? entry.model : "",
+    effort: typeof entry?.effort === "string" ? entry.effort : "",
+  };
+}
+
 // Wizard: project path → session (title + worktree) → agent → review
 function computeSteps(_data: WizardData): StepDef[] {
   return [
@@ -151,6 +163,8 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
               (v): v is string => typeof v === "string",
             )
           : [];
+        const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
+        const cockpitDefaults = cockpitDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
@@ -163,8 +177,10 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
           sandboxEnabled:
             prefill?.sandboxEnabled ??
             ((sandbox?.enabled_by_default as boolean) ?? false),
-          tool: prefill?.tool || (session?.default_tool as string) || "",
+          tool: defaultTool,
           extraEnv: env,
+          cockpitModel: cockpitDefaults.model,
+          cockpitEffort: cockpitDefaults.effort,
           skipIfDirty: true,
         });
       });
@@ -179,7 +195,14 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
-  const handleApplyProfileDefaults = useCallback((defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => {
+  const handleApplyProfileDefaults = useCallback((defaults: {
+    yoloMode: boolean;
+    sandboxEnabled: boolean;
+    tool: string;
+    extraEnv: string[];
+    cockpitModel?: string;
+    cockpitEffort?: string;
+  }) => {
     dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...defaults });
   }, []);
 
@@ -233,6 +256,14 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
         cockpitMasterEnabled &&
         selectedAgentAcpCapable &&
         d.useCockpit,
+      cockpit_model:
+        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitModel
+          ? d.cockpitModel
+          : undefined,
+      cockpit_effort:
+        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitEffort
+          ? d.cockpitEffort
+          : undefined,
       scratch: d.scratch || undefined,
     };
     const result = await createSession(body);

@@ -23,6 +23,7 @@ import { AgentStep } from "../steps/AgentStep";
 import { SessionWizard } from "../SessionWizard";
 import { initialData } from "../wizardReducer";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
+import { fetchSettings } from "../../../lib/api";
 
 const createSession = vi.fn();
 
@@ -145,12 +146,23 @@ describe("SessionWizard cockpit_mode payload (#1580)", () => {
     createSession.mockResolvedValue({ ok: true, session: { warnings: [] } });
   });
 
-  function renderWizard(cockpitMasterEnabled: boolean) {
+  function renderWizard(cockpitMasterEnabled: boolean, tool = "claude") {
     return render(
       <SessionWizard
         onClose={() => {}}
         onCreated={() => {}}
-        prefill={{ skipToReview: true, path: "/tmp/proj", tool: "claude" }}
+        prefill={{ skipToReview: true, path: "/tmp/proj", tool }}
+        cockpitMasterEnabled={cockpitMasterEnabled}
+      />,
+    );
+  }
+
+  function renderWizardWithoutToolPrefill(cockpitMasterEnabled: boolean) {
+    return render(
+      <SessionWizard
+        onClose={() => {}}
+        onCreated={() => {}}
+        prefill={{ skipToReview: true, path: "/tmp/proj" }}
         cockpitMasterEnabled={cockpitMasterEnabled}
       />,
     );
@@ -185,6 +197,30 @@ describe("SessionWizard cockpit_mode payload (#1580)", () => {
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(
       expect.objectContaining({ tool: "claude", cockpit_mode: false }),
+    );
+  });
+
+  it("sends profile-resolved cockpit model and effort defaults", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: {
+        default_tool: "opencode",
+        cockpit_defaults: {
+          opencode: { model: "openai/gpt-5.5", effort: "high" },
+        },
+      },
+      sandbox: {},
+    } as never);
+    const { getByText } = renderWizardWithoutToolPrefill(true);
+    await waitFor(() => expect(getByText("opencode")).toBeTruthy());
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "opencode",
+        cockpit_mode: true,
+        cockpit_model: "openai/gpt-5.5",
+        cockpit_effort: "high",
+      }),
     );
   });
 });

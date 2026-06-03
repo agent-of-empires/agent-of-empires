@@ -1043,6 +1043,7 @@ async fn build_spawn_request(
         additional_dirs: vec![],
         provider_env: vec![],
         model: target.model.clone(),
+        effort: None,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),

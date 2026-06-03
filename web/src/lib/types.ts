@@ -392,6 +392,10 @@ export interface CreateSessionRequest {
    *  false → tmux passthrough (legacy). Server defaults to true on
    *  web-created sessions; the wizard may override. */
   cockpit_mode?: boolean;
+  /** Optional cockpit model selected before the ACP worker starts. */
+  cockpit_model?: string;
+  /** Optional cockpit reasoning effort applied after ACP config options load. */
+  cockpit_effort?: string;
   /** Scratch mode: server provisions a fresh directory under
    *  `<app_dir>/scratch/<id>/` and ignores `path` (clients send `""`).
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
