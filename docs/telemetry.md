@@ -20,12 +20,16 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
+  - how many sessions were created since the last snapshot, a trend counter so
+    short-lived sessions that start and end between two snapshots are still
+    counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
   - whether the web dashboard / cockpit was opened since the last snapshot.
 
 In practice that is a handful of small (well under 1 KB) requests per active
-install per day, with no retries and no offline buffering, so a flaky network
-drops events rather than building a backlog.
+install per day. There is no offline buffering, so a flaky network drops events
+rather than building a backlog; the only retry is coarse (see "Failure
+isolation" below).
 
 Every agent and model string passes through a sanitizer
 (`src/telemetry/sanitize.rs`) that coerces it to a fixed allowlist: a custom
@@ -41,6 +45,11 @@ driven by a registry in `src/telemetry/features.rs`: tracking a newly gated
 feature is one entry there (name + how to read it from config), not a schema
 change. The key set is fixed and the values are booleans, so a flag can never
 carry a path or name, and the gateway forwards only this allowlisted shape.
+
+The values reflect the **global** config (the install default), not any single
+profile's effective config. It is an install-level default-adoption signal;
+since sessions can run under arbitrary profiles whose overrides are not folded
+in here, per-session usage is reported separately by the session counts above.
 
 ## What is never sent
 
@@ -80,9 +89,25 @@ state explicitly rather than silently ignoring it.
 
 ## Failure isolation
 
-Sends are fire-and-forget with a hard ~2s timeout and every error is swallowed
+Sends are best-effort with a hard ~2s timeout and every error is swallowed
 (logged only at `debug`, `target: "telemetry"`). Telemetry never blocks, stalls
-on exit, or crashes the tool. There is no retry, no offline buffering.
+on exit, or crashes the tool. There is no offline buffering.
+
+A send counts as delivered only on a confirmed `2xx`: a transport error or a
+non-success HTTP status (for example a rejected key or a schema rejection at the
+gateway) is treated as a failure, not a silent success. Signals are not consumed
+until delivery is confirmed, so a failed send does not silently drop them:
+
+- the CLI `process_start` daily slot is claimed only on a confirmed send, so a
+  failed send leaves it open for the next invocation to retry (bounded to once
+  per hour so a down endpoint cannot make every `aoe` invocation re-send);
+- the serve `web_seen` / `cockpit_seen` flags and the session-create counter are
+  cleared only after a confirmed snapshot send, so a failed snapshot keeps them
+  for the next one instead of losing that window's signal.
+
+This is coarse, last-write retry, not a durable queue: periodic snapshots are
+still point-in-time, and a snapshot identical to the last confirmed one is
+deduped rather than re-sent.
 
 ## Backend
 
