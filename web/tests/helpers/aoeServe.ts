@@ -265,6 +265,50 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
 }
 
 /**
+ * Last-resort teardown: group-kill any `aoe __cockpit-runner` still
+ * recorded in the worker registry by reading its pid straight off disk.
+ *
+ * `aoe cockpit stop --all` only works while the daemon is alive; if the
+ * daemon already crashed or was SIGKILLed, its runners (and their node +
+ * `claude` descendants) are orphaned and would leak forever once the temp
+ * HOME is deleted. Each runner is its own process-group leader (spawned via
+ * setsid), so `process.kill(-pid, "SIGKILL")` reaps the whole tree. Runs
+ * before the HOME is wiped. See #1921.
+ */
+async function killOrphanRunners(appDir: string): Promise<void> {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const workersDir = join(appDir, "cockpit-workers");
+  let entries: string[];
+  try {
+    entries = readdirSync(workersDir);
+  } catch {
+    return; // no workers dir; nothing to reap
+  }
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    let pid: unknown;
+    try {
+      pid = JSON.parse(readFileSync(join(workersDir, name), "utf8"))?.pid;
+    } catch {
+      continue; // unparseable record; skip
+    }
+    if (typeof pid !== "number" || pid <= 1) continue;
+    // Negative pid targets the process group (runner + node + claude); the
+    // positive pid is a belt-and-suspenders for a non-leader runner.
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // group already gone
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // leader already gone
+    }
+  }
+}
+
+/**
  * Wait for `serve.token` to appear in the daemon's app dir, then read
  * it. The daemon writes the token early in startup, so by the time
  * `waitForServer` resolves it is on disk; the loop is a small safety
@@ -668,8 +712,24 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     },
     async stop() {
       try {
+        // Terminate cockpit workers BEFORE killing the daemon and deleting
+        // the temp HOME. `cockpit stop --all` makes the still-live daemon
+        // group-kill every per-session `aoe __cockpit-runner` (and its node
+        // + claude descendants). Without it they outlive the daemon, the
+        // HOME is then wiped, and the orphaned tree leaks forever. See
+        // #1921.
+        spawnSync(aoeBinary, ["cockpit", "stop", "--all"], {
+          env: seedEnv,
+          stdio: "ignore",
+          timeout: 10_000,
+        });
         if (proc) await killProc(proc);
       } finally {
+        // Direct fallback for a daemon that was already dead/wedged (so the
+        // RPC above was a no-op): group-kill any runner still recorded in
+        // the registry, reading its pid off disk. Runs before rmSync so we
+        // never orphan a tree by deleting its HOME out from under it.
+        await killOrphanRunners(appDirFor(home, xdg, aoeBinary));
         // Best-effort: kill any tmux server bound to the isolated socket
         // before deleting the dir. Structured view specs leave tmux child
         // processes around that hold open file descriptors and trip
