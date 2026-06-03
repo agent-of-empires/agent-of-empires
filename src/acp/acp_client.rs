@@ -4391,9 +4391,11 @@ async fn run_connection_task<W, R>(
                                     .await
                                 {
                                     Ok(resp) => {
-                                        if let Some(event) =
-                                            config_options_event(Some(resp.config_options))
-                                        {
+                                        if let Some(event) = fold_session_options(
+                                            &model_cache_for_block,
+                                            Some(resp.config_options),
+                                            None,
+                                        ) {
                                             let _ = event_tx_for_block.send(event).await;
                                         }
                                     }
