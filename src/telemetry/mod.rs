@@ -140,6 +140,8 @@ pub fn build_usage_snapshot(
     web_seen: bool,
     cockpit_seen: bool,
     session_creates_since_last_snapshot: u32,
+    auth_mode: Option<&str>,
+    serve_mode: Option<&str>,
 ) -> Option<UsageSnapshot> {
     if !is_opted_in() {
         return None;
@@ -220,6 +222,8 @@ pub fn build_usage_snapshot(
         web_seen,
         cockpit_seen,
         session_creates_since_last_snapshot,
+        auth_mode: auth_mode.map(str::to_string),
+        serve_mode: serve_mode.map(str::to_string),
     })
 }
 
@@ -472,7 +476,34 @@ mod tests {
             web_seen: false,
             cockpit_seen: false,
             session_creates_since_last_snapshot: 0,
+            auth_mode: None,
+            serve_mode: None,
         }
+    }
+
+    // The serve deployment-mode fields are part of the content fingerprint, so a
+    // daemon that switches exposure or auth mode between snapshots is not deduped
+    // away as an unchanged repeat (#1885).
+    #[test]
+    #[serial]
+    fn serve_mode_fields_change_the_fingerprint() {
+        let base = sample_snapshot();
+        let mut serve = sample_snapshot();
+        serve.auth_mode = Some("passphrase".to_string());
+        serve.serve_mode = Some("tailscale".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&base),
+            snapshot_fingerprint(&serve),
+            "adding auth_mode / serve_mode must change the fingerprint"
+        );
+
+        let mut other = serve.clone();
+        other.serve_mode = Some("tunnel".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&serve),
+            snapshot_fingerprint(&other),
+            "a different serve_mode must change the fingerprint"
+        );
     }
 
     // Regression for the duplicate `usage_snapshot` seen in dogfooding: the TUI
