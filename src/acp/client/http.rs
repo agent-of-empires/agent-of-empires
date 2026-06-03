@@ -46,6 +46,13 @@ pub enum HttpError {
     Transport(#[from] reqwest::Error),
     #[error("structured view session {0} not found on the daemon")]
     SessionNotFound(String),
+    // A 404 whose body names the missing nonce: the approval already
+    // resolved server-side (concurrent decision, watchdog cancel, or the
+    // agent offered no matching option). Distinct from SessionNotFound so
+    // the approval flow can clear the card instead of toasting an error.
+    // See #1821.
+    #[error("approval already resolved")]
+    ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
     // The daemon may reject for several reasons: stale token, missing
@@ -320,13 +327,27 @@ async fn check_status(
         return Ok(res);
     }
     let body = res.text().await.unwrap_or_default();
+    Err(classify_error(status, &body, session_id))
+}
+
+/// Map a non-success daemon response onto a typed error. Split out from
+/// `check_status` so the status/body dispatch is unit-testable without a
+/// live `reqwest::Response`.
+fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError {
     match status {
-        StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
+        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
         StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
-            Err(HttpError::ReadOnly)
+            HttpError::ReadOnly
         }
-        StatusCode::NOT_FOUND => Err(HttpError::SessionNotFound(session_id.to_string())),
-        _ => Err(HttpError::Server { status, body }),
+        // A nonce-level 404 (the daemon names the missing approval) is
+        // distinct from a session-level 404 so the approval flow can clear
+        // the card instead of toasting an error. See #1821.
+        StatusCode::NOT_FOUND if body.contains("no pending approval") => HttpError::ApprovalGone,
+        StatusCode::NOT_FOUND => HttpError::SessionNotFound(session_id.to_string()),
+        _ => HttpError::Server {
+            status,
+            body: body.to_string(),
+        },
     }
 }
 
@@ -364,6 +385,41 @@ mod tests {
     // which made the toast actively misleading on `--auth=passphrase`
     // and `--auth=none` daemons that never had a token. Pin the new
     // wording so the env-var hint can't regress back in.
+    #[test]
+    fn classify_error_distinguishes_nonce_404_from_session_404() {
+        // #1821: a 404 naming the missing approval nonce maps to
+        // ApprovalGone so the card clears; a session-level 404 stays
+        // SessionNotFound (a real failure).
+        assert!(matches!(
+            classify_error(
+                StatusCode::NOT_FOUND,
+                "no pending approval with that nonce",
+                "s-1"
+            ),
+            HttpError::ApprovalGone
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::NOT_FOUND, "session has no running cockpit", "s-1"),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+    }
+
+    #[test]
+    fn classify_error_maps_auth_and_read_only() {
+        assert!(matches!(
+            classify_error(StatusCode::UNAUTHORIZED, "", "s-1"),
+            HttpError::Unauthorized
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::FORBIDDEN, "daemon is read-only", "s-1"),
+            HttpError::ReadOnly
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", "s-1"),
+            HttpError::Server { .. }
+        ));
+    }
+
     #[test]
     fn unauthorized_display_omits_token_env_var() {
         let rendered = HttpError::Unauthorized.to_string();

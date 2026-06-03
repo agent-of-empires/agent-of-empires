@@ -176,6 +176,20 @@ impl AcpTranscript {
         *self = Self::new(session_id);
     }
 
+    /// Optimistically clear an approval card by nonce after the resolve
+    /// POST succeeded (204) or the daemon reported the nonce already gone
+    /// (404), instead of waiting on the `ApprovalResolved` broadcast, which
+    /// the seq dedupe can swallow and leave the card stuck. Mirrors the
+    /// `ApprovalResolved` event arm. See #1821.
+    pub fn resolve_approval_locally(&mut self, nonce: &str, decision: ApprovalDecision) {
+        if let Some(&idx) = self.approval_idx.get(nonce) {
+            if let Some(ActivityRow::Approval(row)) = self.rows.get_mut(idx) {
+                row.decision = Some(decision);
+            }
+        }
+        self.pending_approvals.retain(|p| p.nonce != nonce);
+    }
+
     /// Mark `lagged = true`. The view layer is responsible for
     /// noticing this and triggering a /replay refetch.
     pub fn set_lagged(&mut self) {
@@ -706,6 +720,42 @@ mod tests {
             }
             _ => panic!("expected Approval"),
         }
+    }
+
+    #[test]
+    fn resolve_approval_locally_clears_card_without_broadcast() {
+        // #1821: the optimistic clear must remove the pending approval and
+        // stamp the row decision without an ApprovalResolved frame, since
+        // the broadcast can be swallowed by seq dedupe.
+        let mut t = AcpTranscript::new("s-1");
+        let approval = Approval {
+            nonce: Nonce("nonce-1".into()),
+            tool_call: tool("t-1", "Bash"),
+            destructive: true,
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        t.apply(&frame(1, Event::ApprovalRequested { approval }));
+        assert_eq!(t.pending_approvals.len(), 1);
+
+        t.resolve_approval_locally("nonce-1", ApprovalDecision::Deny);
+        assert!(t.pending_approvals.is_empty());
+        match &t.rows[0] {
+            ActivityRow::Approval(row) => {
+                assert_eq!(row.decision, Some(ApprovalDecision::Deny));
+            }
+            _ => panic!("expected Approval"),
+        }
+
+        // A late ApprovalResolved for the same nonce is a harmless no-op.
+        t.apply(&frame(
+            2,
+            Event::ApprovalResolved {
+                nonce: Nonce("nonce-1".into()),
+                decision: ApprovalDecision::Deny,
+            },
+        ));
+        assert!(t.pending_approvals.is_empty());
     }
 
     #[test]

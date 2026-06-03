@@ -80,6 +80,13 @@ approval_timeout_secs = 300
 destructive_require_double_confirm = true
 ```
 
+The card clears as soon as your decision is accepted, rather than waiting
+on the broadcast that confirms it. If the approval already resolved on the
+daemon (a concurrent decision, the silent-tool watchdog, or the agent
+offering no option matching your choice), resolving it again clears the
+card quietly instead of surfacing an error. This holds on both the web
+dashboard and the native TUI cockpit.
+
 ### Notifications and sound
 
 When an approval lands, the structured view fires two channels so a user away

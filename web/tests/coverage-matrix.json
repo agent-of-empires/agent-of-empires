@@ -1277,6 +1277,17 @@
       ]
     },
     {
+      "id": "acp.approval-resolve-clear",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/__tests__/useAcpResolveApproval.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "acp.force-end-turn-gate",
       "kind": "vitest",
       "risk": "medium",
