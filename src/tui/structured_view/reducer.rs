@@ -728,8 +728,11 @@ mod tests {
         // stamp the row decision without an ApprovalResolved frame, since
         // the broadcast can be swallowed by seq dedupe.
         let mut t = AcpTranscript::new("s-1");
+        // Approval correlation id, not a cryptographic nonce; bound once and
+        // reused so the test carries a single source of truth.
+        let nonce = "approval-correlation-id";
         let approval = Approval {
-            nonce: Nonce("nonce-1".into()),
+            nonce: Nonce(nonce.into()),
             tool_call: tool("t-1", "Bash"),
             destructive: true,
             requested_at: Utc::now(),
@@ -738,7 +741,7 @@ mod tests {
         t.apply(&frame(1, Event::ApprovalRequested { approval }));
         assert_eq!(t.pending_approvals.len(), 1);
 
-        t.resolve_approval_locally("nonce-1", ApprovalDecision::Deny);
+        t.resolve_approval_locally(nonce, ApprovalDecision::Deny);
         assert!(t.pending_approvals.is_empty());
         match &t.rows[0] {
             ActivityRow::Approval(row) => {
@@ -751,7 +754,7 @@ mod tests {
         t.apply(&frame(
             2,
             Event::ApprovalResolved {
-                nonce: Nonce("nonce-1".into()),
+                nonce: Nonce(nonce.into()),
                 decision: ApprovalDecision::Deny,
             },
         ));
