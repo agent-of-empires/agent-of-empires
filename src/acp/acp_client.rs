@@ -7363,6 +7363,26 @@ mod tests {
     }
 
     #[test]
+    fn is_mode_advertised_matches_normalized_ids() {
+        let ids = Some(vec!["acceptEdits".to_string(), "plan".to_string()]);
+        // Underscore + case folding both sides.
+        assert!(is_mode_advertised("accept_edits", &ids, false));
+        assert!(is_mode_advertised("acceptEdits", &ids, false));
+        assert!(is_mode_advertised("PLAN", &ids, false));
+        // Not in the advertised set.
+        assert!(!is_mode_advertised("bypassPermissions", &ids, false));
+    }
+
+    #[test]
+    fn is_mode_advertised_without_mode_list_defers_to_config_option() {
+        // No SessionMode list: the agent steers mode through a config option,
+        // so set_mode must NOT be sent (returns false). Without a config-option
+        // mode either, fall back to allowing the legacy set_mode (true).
+        assert!(!is_mode_advertised("plan", &None, true));
+        assert!(is_mode_advertised("plan", &None, false));
+    }
+
+    #[test]
     fn map_tool_call_update_in_progress_with_content_emits_streaming_event() {
         use agent_client_protocol::schema::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,

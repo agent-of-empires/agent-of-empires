@@ -416,8 +416,15 @@ impl AcpTranscript {
                 self.current_mode = Some(current_mode_id.clone());
             }
             Event::ModeChanged { mode } => {
-                // Legacy hard-coded mode enum. Fold to the same field.
-                self.current_mode = Some(format!("{mode:?}"));
+                // Legacy hard-coded mode enum, always emitted right after a
+                // CurrentModeChanged that already carries the real adapter mode
+                // id. Only fall back to the coerced enum label when no raw id
+                // was seen, so an OpenCode `build`/custom agent (which the enum
+                // collapses to `Default`) keeps its real id in the title. See
+                // #1827.
+                if self.current_mode.is_none() {
+                    self.current_mode = Some(format!("{mode:?}"));
+                }
             }
             Event::PromptRejected { .. } => {
                 // The daemon refused the prompt (e.g. read-only mode); no
@@ -463,7 +470,7 @@ impl AcpTranscript {
 mod tests {
     use super::*;
     use crate::acp::approvals::{Approval, Nonce};
-    use crate::acp::state::{Plan, PlanStep, PlanStepStatus, ToolCall};
+    use crate::acp::state::{Plan, PlanStep, PlanStepStatus, SessionMode, ToolCall};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -554,6 +561,42 @@ mod tests {
             })
             .collect();
         assert_eq!(messages, vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn current_mode_keeps_real_id_when_legacy_enum_follows() {
+        // The acp_client emits [CurrentModeChanged{real id}, ModeChanged{enum}]
+        // in that order. An OpenCode `build`/custom agent has no SessionMode
+        // variant, so the enum coerces to Default; the raw id must survive.
+        // See #1827.
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::CurrentModeChanged {
+                current_mode_id: "build".into(),
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::ModeChanged {
+                mode: SessionMode::Default,
+            },
+        ));
+        assert_eq!(t.current_mode.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn current_mode_falls_back_to_enum_when_no_raw_id() {
+        // A bare ModeChanged with no preceding CurrentModeChanged still labels
+        // the mode from the legacy enum.
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::ModeChanged {
+                mode: SessionMode::Plan,
+            },
+        ));
+        assert_eq!(t.current_mode.as_deref(), Some("Plan"));
     }
 
     #[test]
