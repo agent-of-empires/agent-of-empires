@@ -114,11 +114,14 @@ tool's own binary; adapter-backed agents such as Claude keep using
 The web new-session wizard shows the resolved launch command read-only
 so you can confirm it before the session starts.
 
-Session naming differs by entry point. `aoe add` is non-interactive: it
-uses `--title` when given, otherwise the worktree branch name, otherwise
-a generated name; it never prompts. The TUI `n` flow and the web
-new-session wizard prompt for a name interactively. To name a session
-created from the CLI, pass `--title "<name>"`.
+Session naming differs by entry point. By default `aoe add` does not
+prompt for a name: it uses `--title` when given, otherwise the worktree
+branch name, otherwise a generated name. Pass `-i`/`--interactive` to get
+the same name prompt the TUI `n` flow and the web new-session wizard
+provide; it shows the generated default and pressing Enter accepts it.
+`--interactive` requires a terminal and is ignored when `--title` is
+given, so scripted and non-interactive `aoe add` calls keep auto-naming.
+To name a session non-interactively, pass `--title "<name>"`.
 
 For web-created cockpit sessions, configure per-agent defaults under
 `[session.cockpit_defaults.<agent>]` so the dashboard starts that agent with
