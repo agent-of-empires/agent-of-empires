@@ -975,6 +975,35 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
 mod tests {
     use super::*;
 
+    // The telemetry `serve_mode` signal reads `mode_label()`, so it must only
+    // ever emit the closed exposure set, and a named Cloudflare tunnel must
+    // bucket to "tunnel" rather than leak the configured tunnel name (#1885).
+    #[test]
+    fn mode_label_is_closed_and_never_leaks_tunnel_name() {
+        assert_eq!(TunnelKind::Quick.mode_label(), "tunnel");
+        assert_eq!(
+            TunnelKind::Named {
+                tunnel_name: "my-secret-corp-tunnel".to_string(),
+            }
+            .mode_label(),
+            "tunnel",
+        );
+        assert_eq!(TunnelKind::Tailscale.mode_label(), "tailscale");
+
+        for kind in [
+            TunnelKind::Quick,
+            TunnelKind::Named {
+                tunnel_name: "anything".to_string(),
+            },
+            TunnelKind::Tailscale,
+        ] {
+            assert!(
+                matches!(kind.mode_label(), "tunnel" | "tailscale"),
+                "mode_label must stay within the closed exposure set"
+            );
+        }
+    }
+
     #[test]
     fn extract_url_from_typical_output() {
         let line =
