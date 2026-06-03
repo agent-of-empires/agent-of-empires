@@ -148,3 +148,52 @@ pub async fn post_telemetry_seen(
     }
     StatusCode::NO_CONTENT.into_response()
 }
+
+#[derive(Deserialize)]
+pub struct CockpitInteractionRequest {
+    /// Allowlisted interaction kind. Only `"prompt_queued"` today; the field
+    /// is an open string so adding a kind is a one-line match arm here.
+    kind: String,
+}
+
+/// Report a cockpit interaction that only the browser can observe, so the
+/// daemon can fold it into its next opt-in snapshot. The four other
+/// interaction signals (approvals, agent switch, substrate toggle, plan mode)
+/// are tallied daemon-side in their REST handlers and never come through here;
+/// queued prompts are the exception because the prompt queue lives entirely in
+/// the web cockpit's client state. Returns 204 on success; the client need not
+/// branch on consent state (the daemon only sends counts when opted in).
+pub async fn post_telemetry_cockpit_interaction(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CockpitInteractionRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    match req.kind.as_str() {
+        "prompt_queued" => {
+            state
+                .telemetry_cockpit
+                .prompts_queued
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "bad_kind", "message": format!("unknown interaction kind '{other}'")})),
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}

@@ -364,6 +364,16 @@ pub struct AppState {
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
     pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    /// Aggregate cockpit-interaction tallies for the next opt-in snapshot
+    /// (approvals decision mix, agent/substrate switches, plan-mode, queued
+    /// prompts). Same monotonic-counter, decrement-by-reported discipline as
+    /// the `telemetry_*_seen` counters, so an interaction that lands during an
+    /// in-flight send survives to the next snapshot. In-memory on purpose, like
+    /// the `seen` counters: these are coarse opt-in adoption signals, so losing
+    /// a partial window on a rare daemon crash is acceptable, and durability
+    /// would be a deliberate cross-cutting change for all telemetry counters,
+    /// not a per-feature one.
+    pub telemetry_cockpit: CockpitTelemetryCounters,
     /// What the most recent serve snapshot reported, held until its send is
     /// confirmed so the originating signals (the `usage_seen` counts and the
     /// create counter) are cleared only on success. The telemetry loop is the
@@ -862,6 +872,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_cockpit_clients: FormFactorCounters::default(),
         telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_cockpit: CockpitTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
     });
@@ -1284,6 +1295,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/status", get(api::get_telemetry_status))
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
+        .route(
+            "/api/telemetry/cockpit-interaction",
+            post(api::post_telemetry_cockpit_interaction),
+        )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
@@ -1858,6 +1873,25 @@ impl FormFactorCounts {
     }
 }
 
+/// Daemon-side cockpit-interaction tallies for the next opt-in snapshot. Each
+/// is a monotonic `AtomicU32` consumed with the same decrement-by-reported
+/// discipline as `telemetry_*_seen`, so an interaction that lands during an
+/// in-flight send rolls into the next snapshot instead of being dropped.
+///
+/// `plan_mode_seen` is a counter rather than a flag for the same reason: the
+/// snapshot reports the boolean `count > 0`, but consuming it by subtracting
+/// the reported amount keeps a plan-mode entry that arrived mid-send.
+#[derive(Default)]
+pub struct CockpitTelemetryCounters {
+    pub approvals_allow: std::sync::atomic::AtomicU32,
+    pub approvals_allow_always: std::sync::atomic::AtomicU32,
+    pub approvals_deny: std::sync::atomic::AtomicU32,
+    pub agent_switches: std::sync::atomic::AtomicU32,
+    pub substrate_toggles: std::sync::atomic::AtomicU32,
+    pub plan_mode_seen: std::sync::atomic::AtomicU32,
+    pub prompts_queued: std::sync::atomic::AtomicU32,
+}
+
 /// What a serve snapshot reported, so the originating signals can be cleared
 /// only after the send is confirmed. The clear is deferred (rather than reset at
 /// build time) so a failed send retains the signals for the next snapshot.
@@ -1866,6 +1900,22 @@ struct ReportedServeSignals {
     web_clients: FormFactorCounts,
     cockpit_clients: FormFactorCounts,
     session_creates: u32,
+    cockpit: ReportedCockpitCounts,
+}
+
+/// The raw `AtomicU32` values a snapshot folded in, kept so each can be
+/// decremented by exactly the reported amount on a confirmed send. `plan_mode`
+/// is the raw count (not the reported boolean) so a plan-mode entry that
+/// arrived mid-send is preserved rather than wiped.
+#[derive(Default, Clone, Copy)]
+struct ReportedCockpitCounts {
+    approvals_allow: u32,
+    approvals_allow_always: u32,
+    approvals_deny: u32,
+    agent_switches: u32,
+    substrate_toggles: u32,
+    plan_mode: u32,
+    prompts_queued: u32,
 }
 
 /// Build a serve `usage_snapshot` from the live session list, folding in the
@@ -1879,6 +1929,25 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
     let web_clients = state.telemetry_web_clients.read();
     let cockpit_clients = state.telemetry_cockpit_clients.read();
     let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
+    let c = &state.telemetry_cockpit;
+    let reported_cockpit = ReportedCockpitCounts {
+        approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
+        approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
+        approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
+        agent_switches: c.agent_switches.load(Ordering::Relaxed),
+        substrate_toggles: c.substrate_toggles.load(Ordering::Relaxed),
+        plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
+        prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
+    };
+    let cockpit = crate::telemetry::CockpitInteractionCounts {
+        approvals_allow: reported_cockpit.approvals_allow,
+        approvals_allow_always: reported_cockpit.approvals_allow_always,
+        approvals_deny: reported_cockpit.approvals_deny,
+        agent_switches: reported_cockpit.agent_switches,
+        substrate_toggles: reported_cockpit.substrate_toggles,
+        plan_mode_seen: reported_cockpit.plan_mode > 0,
+        prompts_queued: reported_cockpit.prompts_queued,
+    };
     let instances = state.instances.read().await.clone();
     let mut snapshot = crate::telemetry::build_usage_snapshot(
         crate::telemetry::Surface::Serve,
@@ -1887,6 +1956,7 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
         session_creates,
         Some(state.auth_mode),
         Some(state.serve_mode),
+        &cockpit,
     )?;
     // Layer the per-form-factor was-seen maps onto the snapshot. They are serve
     // only (the browser surfaces), so the pure builder leaves them empty and the
@@ -1898,6 +1968,7 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
         web_clients,
         cockpit_clients,
         session_creates,
+        cockpit: reported_cockpit,
     });
     Some(snapshot)
 }
@@ -1922,17 +1993,37 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
         .telemetry_cockpit_clients
         .decrement(&reported.cockpit_clients);
     decrement_reported_count(&state.telemetry_session_creates, reported.session_creates);
+    let c = &state.telemetry_cockpit;
+    let rc = reported.cockpit;
+    decrement_reported_count(&c.approvals_allow, rc.approvals_allow);
+    decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
+    decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
+    decrement_reported_count(&c.agent_switches, rc.agent_switches);
+    decrement_reported_count(&c.substrate_toggles, rc.substrate_toggles);
+    decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
+    decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }
 
 /// Decrement a reported telemetry counter by exactly `reported`, never by more.
-/// Using `fetch_sub(reported)` rather than `swap(0)` preserves any increments
-/// (a create, or a web/cockpit open) that landed between the snapshot build and
-/// the confirmed send, so they roll into the next snapshot instead of being
-/// dropped. A no-op when nothing was reported.
+/// Subtracting the reported amount rather than `swap(0)` preserves any
+/// increments (a create, or a web/cockpit open, or a cockpit interaction) that
+/// landed between the snapshot build and the confirmed send, so they roll into
+/// the next snapshot instead of being dropped. A no-op when nothing was
+/// reported.
+///
+/// The snapshot loop is the sole consumer and runs strictly sequentially (each
+/// send is awaited, then cleared, before the next build), so the counter can
+/// never go below `reported`. The subtraction saturates anyway as cheap
+/// insurance against a future refactor that detaches sends, which would
+/// otherwise be able to underflow-wrap the `AtomicU32`.
 fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u32) {
-    if reported > 0 {
-        counter.fetch_sub(reported, std::sync::atomic::Ordering::Relaxed);
+    if reported == 0 {
+        return;
     }
+    use std::sync::atomic::Ordering;
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(reported))
+    });
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -2974,6 +3065,30 @@ mod tests {
             1,
             "the open that arrived during the send must be retained"
         );
+    }
+
+    // #1888: the same decrement path carries the cockpit-interaction counters,
+    // so an interaction that lands mid-send must survive the clear (the plan
+    // mode counter shown here, which the snapshot reports as the bool count>0).
+    #[test]
+    fn reported_count_decrement_preserves_concurrent_cockpit_interaction() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let plan_mode = AtomicU32::new(2);
+        let reported = plan_mode.load(Ordering::Relaxed);
+        plan_mode.fetch_add(1, Ordering::Relaxed);
+        decrement_reported_count(&plan_mode, reported);
+        assert_eq!(plan_mode.load(Ordering::Relaxed), 1);
+    }
+
+    // The decrement saturates rather than underflow-wrapping the AtomicU32, so a
+    // hypothetical future refactor that detaches sends (double-clearing a
+    // counter) degrades to zero instead of jumping to u32::MAX.
+    #[test]
+    fn reported_count_decrement_saturates_below_zero() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(2);
+        decrement_reported_count(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(feature = "serve")]

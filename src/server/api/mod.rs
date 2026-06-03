@@ -49,7 +49,10 @@ pub use system::{
     list_profiles, list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
     update_profile_settings, update_settings,
 };
-pub use telemetry::{get_telemetry_status, post_telemetry_seen, set_telemetry_consent};
+pub use telemetry::{
+    get_telemetry_status, post_telemetry_cockpit_interaction, post_telemetry_seen,
+    set_telemetry_consent,
+};
 
 const SHELL_METACHARACTERS: &[char] = &[
     ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'', '!', '#',
@@ -207,7 +210,11 @@ mod tests {
             (
                 "api/telemetry.rs",
                 include_str!("telemetry.rs"),
-                &["set_telemetry_consent", "post_telemetry_seen"],
+                &[
+                    "set_telemetry_consent",
+                    "post_telemetry_seen",
+                    "post_telemetry_cockpit_interaction",
+                ],
             ),
         ];
 
