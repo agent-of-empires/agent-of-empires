@@ -7,10 +7,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   hasArgsBody,
+  hasTodoItemsArgsText,
   parseJsonObject,
   pickFirst,
   pickStr,
   previewFromArgs,
+  todoItemsFromArgs,
 } from "./cockpitArgs";
 
 describe("parseJsonObject", () => {
@@ -150,5 +152,46 @@ describe("hasArgsBody", () => {
   it("is true for non-blank non-object payloads, false when blank", () => {
     expect(hasArgsBody("raw text [truncated]")).toBe(true);
     expect(hasArgsBody("   ")).toBe(false);
+  });
+});
+
+describe("todoItemsFromArgs", () => {
+  it("returns todo items with non-blank content", () => {
+    expect(
+      todoItemsFromArgs({
+        todos: [
+          { content: " Check schema ", status: "completed" },
+          { content: "Render todos", status: "in_progress" },
+        ],
+      }),
+    ).toEqual([
+      { content: " Check schema ", status: "completed" },
+      { content: "Render todos", status: "in_progress" },
+    ]);
+  });
+
+  it("ignores whitespace-only todo content", () => {
+    expect(
+      todoItemsFromArgs({
+        todos: [
+          { content: "   ", status: "pending" },
+          { content: "\t", status: "in_progress" },
+          { content: "Keep me", status: "completed" },
+        ],
+      }),
+    ).toEqual([{ content: "Keep me", status: "completed" }]);
+  });
+
+  it("detects todo args only when at least one item has content", () => {
+    expect(
+      hasTodoItemsArgsText(
+        JSON.stringify({ todos: [{ content: "   ", status: "pending" }] }),
+      ),
+    ).toBe(false);
+    expect(
+      hasTodoItemsArgsText(
+        JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }),
+      ),
+    ).toBe(true);
   });
 });

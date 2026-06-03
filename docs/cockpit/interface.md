@@ -294,19 +294,20 @@ single collapsible cards:
   with no agent text between them (for example Read, Read, Grep, Read
   during investigation) collapses into one "actions" card. Expand it to
   see each call as its normal per-tool card.
-- **Consecutive TodoWrite updates.** When the agent fires three or more
-  `TodoWrite` calls back-to-back, the per-call snapshots fold into one
-  todo card titled "updated N times". Collapsed, the card shows the
-  latest list (the only snapshot whose pending/in-progress/done mix is
-  current), so you see what the agent is working on without expanding.
-  Expand it to inspect each individual update in order and audit how the
-  plan evolved during the turn.
+- **Consecutive TodoWrite updates.** When Claude fires three or more
+  `TodoWrite` calls back-to-back, or OpenCode sends three or more
+  `todowrite` updates with a structured `todos` payload, the per-call
+  snapshots fold into one todo card titled "updated N times". Collapsed,
+  the card shows the latest list (the only snapshot whose
+  pending/in-progress/done mix is current), so you see what the agent is
+  working on without expanding. Expand it to inspect each individual
+  update in order and audit how the plan evolved during the turn.
 
 Folding only fires when every call in the run is the same shape. A
-TodoWrite sandwiched between real tool work (Read, Edit) stays inline as
-its own card rather than being hidden inside a group, so a status update
-between actions is never buried. Two-in-a-row stays inline as well; the
-fold threshold is three.
+TodoWrite or `todowrite` update sandwiched between real tool work (Read,
+Edit) stays inline as its own card rather than being hidden inside a
+group, so a status update between actions is never buried. Two-in-a-row
+stays inline as well; the fold threshold is three.
 
 Automatic grouping needs an unbroken run, so a phase where the agent
 narrates between each action (common right after a plan is approved)

@@ -181,6 +181,29 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     ).toEqual(["td1", "td2", "td3"]);
   });
 
+  it("uses the generic group for todo-shaped runs when todos are disabled", () => {
+    const messages = activityToThreadMessages(
+      [
+        userRow("go"),
+        todoStart("td1", [{ content: "a", status: "pending" }]),
+        todoStart("td2", [{ content: "a", status: "in_progress" }]),
+        todoStart("td3", [{ content: "a", status: "completed" }]),
+      ],
+      false,
+      false,
+      false,
+    );
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
+    const toolParts = parts.filter((p) => p.type === "tool-call");
+    expect(toolParts).toHaveLength(1);
+    expect(toolParts[0]!.toolName).toBe(TOOL_GROUP_NAME);
+    expect(toolParts[0]!.toolName).not.toBe(TODO_GROUP_NAME);
+  });
+
   it("leaves 2 consecutive TodoWrite snapshots inline (#1468)", () => {
     const messages = activityToThreadMessages(
       [

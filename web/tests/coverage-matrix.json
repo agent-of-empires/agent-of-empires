@@ -1598,6 +1598,24 @@
       ]
     },
     {
+      "id": "cockpit.opencode-todos",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/CockpitRuntime.test.ts",
+        "src/components/cockpit/ToolCards.render.test.tsx",
+        "src/lib/agentProfiles.test.ts",
+        "src/lib/cockpitTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolCards.tsx",
+        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/lib/agentProfiles.ts",
+        "web/src/lib/cockpitArgs.ts",
+        "web/src/lib/cockpitTypes.ts"
+      ]
+    },
+    {
       "id": "cockpit.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",

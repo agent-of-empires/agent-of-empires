@@ -69,3 +69,28 @@ export function hasArgsBody(argsPreview: string): boolean {
   if (!parsed) return argsPreview.trim().length > 0;
   return Object.keys(parsed).some((k) => !k.startsWith("_aoe_"));
 }
+
+export interface TodoPayloadItem {
+  content: string;
+  status: unknown;
+}
+
+export function todoItemsFromArgs(
+  args: Record<string, unknown> | null,
+): TodoPayloadItem[] {
+  const raw = args?.todos;
+  if (!Array.isArray(raw)) return [];
+  const todos: TodoPayloadItem[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const obj = entry as Record<string, unknown>;
+    const content = typeof obj.content === "string" ? obj.content : "";
+    if (content.trim() === "") continue;
+    todos.push({ content, status: obj.status });
+  }
+  return todos;
+}
+
+export function hasTodoItemsArgsText(argsText: string): boolean {
+  return todoItemsFromArgs(parseJsonObject(argsText)).length > 0;
+}
