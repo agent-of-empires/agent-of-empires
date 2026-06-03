@@ -85,7 +85,7 @@ export function todoItemsFromArgs(
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const obj = entry as Record<string, unknown>;
     const content = typeof obj.content === "string" ? obj.content : "";
-    if (!content) continue;
+    if (content.trim() === "") continue;
     todos.push({ content, status: obj.status });
   }
   return todos;
