@@ -57,7 +57,8 @@ Practical implications:
   a `SIGKILL`, or an ephemeral test `$HOME` that gets deleted) would
   otherwise orphan the runner plus its agent tree forever. Each runner
   carries a watchdog that polls its own registry record and self-destructs
-  (terminating its whole process group) when it observes that it has been
+  (terminating its whole process group when it is the group leader, which
+  it normally is via `setsid`) when it observes that it has been
   abandoned: the record file vanished, the record was taken over by a
   newer runner, or it has been detached with no daemon attached for longer
   than a 48h retention window. The 48h window is generous enough to cover
