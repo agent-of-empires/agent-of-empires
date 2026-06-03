@@ -3490,6 +3490,31 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     out
 }
 
+/// Whether the agent advertised the given mode ID in its session modes
+/// or config-option mode category.
+///
+/// Returns `false` (skip) when:
+/// - `available_mode_ids` is `Some` and the normalized mode_id is not in the list, or
+/// - `available_mode_ids` is `None` and the agent uses config-option modes
+///   (session/set_mode won't work for arbitrary mode IDs).
+///
+/// Returns `true` (allow) only when there is no mode information at all
+/// (e.g. the test shim, which handles all set_mode requests).
+fn is_mode_advertised(
+    mode_id: &str,
+    available_mode_ids: &Option<Vec<String>>,
+    has_config_option_mode: bool,
+) -> bool {
+    match available_mode_ids {
+        Some(ids) => {
+            let normalized = mode_id.replace('_', "").to_lowercase();
+            ids.iter()
+                .any(|id| id.replace('_', "").to_lowercase() == normalized)
+        }
+        None => !has_config_option_mode,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection_task<W, R>(
     transport: ByteStreams<W, R>,
@@ -3860,6 +3885,16 @@ async fn run_connection_task<W, R>(
                 "initialize handshake complete"
             );
 
+            // Track the mode channels the agent advertised so we can skip
+            // session/set_mode requests for modes the agent doesn't support.
+            // When new_session.modes is present, only those IDs are valid.
+            // When config-options have a Mode category, the agent uses
+            // session/set_config_option for modes instead of session/set_mode.
+            // If neither is present (e.g. test shim), allow all set_mode
+            // requests through.
+            let mut available_mode_ids: Option<Vec<String>> = None;
+            let mut has_config_option_mode: bool = false;
+
             let acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -3939,6 +3974,32 @@ async fn run_connection_task<W, R>(
                                         stored_id = %stored,
                                         "session/load succeeded; suppressing post-load history replay"
                                     );
+                                    // Capture available mode info from the
+                                    // load response before consuming resp.
+                                    let modes = resp.modes.as_ref().map(|m| {
+                                        m.available_modes
+                                            .iter()
+                                            .map(|mode| mode.id.0.to_string())
+                                            .collect::<Vec<_>>()
+                                    });
+                                    if modes.is_some() {
+                                        available_mode_ids = modes;
+                                    }
+                                    if resp
+                                        .config_options
+                                        .as_ref()
+                                        .is_some_and(|opts| {
+                                            opts.iter().any(|o| {
+                                                o.category
+                                                    == Some(
+                                                        agent_client_protocol::schema::
+                                                            SessionConfigOptionCategory::Mode,
+                                                    )
+                                            })
+                                        })
+                                    {
+                                        has_config_option_mode = true;
+                                    }
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -3999,6 +4060,34 @@ async fn run_connection_task<W, R>(
                             new_id = %id.0,
                             "session/new succeeded, captured acp_session_id"
                         );
+
+                        // Capture available mode IDs and config-option mode
+                        // category so the SetMode handlers below can skip
+                        // modes the agent has not advertised.
+                        if let Some(modes) = &new_session.modes {
+                            available_mode_ids = Some(
+                                modes
+                                    .available_modes
+                                    .iter()
+                                    .map(|m| m.id.0.to_string())
+                                    .collect(),
+                            );
+                        }
+                        if new_session
+                            .config_options
+                            .as_ref()
+                            .is_some_and(|opts| {
+                                opts.iter().any(|o| {
+                                    o.category
+                                        == Some(
+                                            agent_client_protocol::schema::
+                                                SessionConfigOptionCategory::Mode,
+                                        )
+                                })
+                            })
+                        {
+                            has_config_option_mode = true;
+                        }
 
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
@@ -4515,6 +4604,20 @@ async fn run_connection_task<W, R>(
                                             });
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
+                                            // Skip when the agent has not
+                                            // advertised this mode (see the
+                                            // mode-tracking comments above).
+                                            if !is_mode_advertised(
+                                                &mode_id,
+                                                &available_mode_ids,
+                                                has_config_option_mode,
+                                            ) {
+                                                debug!(
+                                                    target: "cockpit.acp",
+                                                    "skipping session/set_mode mode={mode_id}: not advertised (mid-turn)"
+                                                );
+                                                continue;
+                                            }
                                             info!(
                                                 target: "cockpit.acp",
                                                 "sending session/set_mode mode={mode_id} during in-flight prompt"
@@ -4720,6 +4823,19 @@ async fn run_connection_task<W, R>(
                             .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
+                        // Skip when the agent has not advertised this mode
+                        // (see the mode-tracking comments above).
+                        if !is_mode_advertised(
+                            &mode_id,
+                            &available_mode_ids,
+                            has_config_option_mode,
+                        ) {
+                            debug!(
+                                target: "cockpit.acp",
+                                "skipping session/set_mode mode={mode_id}: not advertised"
+                            );
+                            continue;
+                        }
                         info!(target: "cockpit.acp", "sending session/set_mode mode={mode_id}");
                         // Detached, same shape as the mid-turn path: don't
                         // freeze the cmd_rx loop on the round-trip.
