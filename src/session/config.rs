@@ -433,12 +433,7 @@ pub struct CockpitConfig {
     /// past `resets_at` with grace 0 still cannot cause a tight respawn
     /// loop. See #1722.
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
-    #[setting(
-        label = "Auto-resume grace (s)",
-        widget = "number",
-        min = 0,
-        advanced
-    )]
+    #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
 }
 
@@ -786,7 +781,12 @@ pub struct SessionConfig {
 
     /// Per-agent cockpit startup defaults. `model` is forwarded at spawn;
     /// `effort` is applied through ACP config options when advertised.
+    ///
+    /// Map-of-struct (agent -> {model, effort}); not a flat settings widget,
+    /// so it is configured through the session wizard rather than the generic
+    /// settings panel. Skipped in the derived schema (#1692).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(skip)]
     pub cockpit_defaults: HashMap<String, CockpitAgentDefaults>,
 
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
