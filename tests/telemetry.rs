@@ -7,6 +7,7 @@
 
 use agent_of_empires::session::{save_config, Config, Instance};
 use agent_of_empires::telemetry::{self, Surface};
+use agent_of_empires::update::{ReleasesBehind, UpdateStatus};
 use serial_test::serial;
 
 /// Redirect the app dir at a temp location and clear the telemetry-related env
@@ -26,6 +27,27 @@ fn set_enabled(enabled: bool) {
     let mut config = Config::load_or_warn();
     config.telemetry.enabled = enabled;
     save_config(&config).expect("save config");
+}
+
+/// Write a synthetic update-check cache into the isolated app dir so the
+/// version-health classifiers have deterministic input (no network). `releases`
+/// is newest-first, matching what the updater stores.
+fn write_update_cache(latest: &str, releases: &[&str]) {
+    let dir = agent_of_empires::session::get_app_dir().expect("app dir");
+    let releases_json: Vec<_> = releases
+        .iter()
+        .map(|v| serde_json::json!({ "version": v, "body": "", "published_at": null }))
+        .collect();
+    let cache = serde_json::json!({
+        "checked_at": "2026-06-03T00:00:00Z",
+        "latest_version": latest,
+        "releases": releases_json,
+    });
+    std::fs::write(
+        dir.join("update_cache.json"),
+        serde_json::to_string(&cache).expect("serialize cache"),
+    )
+    .expect("write update cache");
 }
 
 /// Default-off must hold: a fresh install reports no opt-in, no install id,
@@ -225,4 +247,107 @@ fn unreachable_endpoint_never_blocks() {
     );
 
     unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
+}
+
+/// User story (#1887): an opted-in install reports its data-schema version on
+/// `process_start` (covers all surfaces, including CLI-only installs). It is the
+/// build's `migrations::CURRENT_VERSION`, a small integer.
+#[test]
+#[serial]
+fn process_start_carries_data_schema_version() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let event = telemetry::build_process_start(Surface::Cli).expect("event built when opted in");
+    assert_eq!(
+        event.data_schema_version,
+        agent_of_empires::migrations::current_schema_version()
+    );
+    // With no update cache yet, staleness is Unknown, never a false "current".
+    assert_eq!(event.update_status, UpdateStatus::Unknown);
+    assert_eq!(event.update_releases_behind, ReleasesBehind::Unknown);
+}
+
+/// User story (#1887): when the cached update check shows a newer release, both
+/// events reflect the staleness buckets. A latest far above any real build is
+/// `major_behind`; two cached newer releases is `several_behind`, one is
+/// `one_behind`.
+#[test]
+#[serial]
+fn version_health_reflects_cached_update() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // Two cached releases newer than any plausible current build.
+    write_update_cache("9999.0.0", &["9999.0.0", "9998.0.0"]);
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    assert_eq!(snapshot.update_status, UpdateStatus::MajorBehind);
+    assert_eq!(
+        snapshot.update_releases_behind,
+        ReleasesBehind::SeveralBehind
+    );
+
+    let event = telemetry::build_process_start(Surface::Cli).expect("event built when opted in");
+    assert_eq!(event.update_status, UpdateStatus::MajorBehind);
+    assert_eq!(event.update_releases_behind, ReleasesBehind::SeveralBehind);
+
+    // Exactly one cached newer release is one_behind.
+    write_update_cache("9999.0.0", &["9999.0.0"]);
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    assert_eq!(snapshot.update_releases_behind, ReleasesBehind::OneBehind);
+}
+
+/// User story (#1887, privacy reviewer): version-health signals leave the client
+/// only as a small integer and coarse bucket strings. The raw cached "latest"
+/// version string is never serialized into either event.
+#[test]
+#[serial]
+fn version_health_never_leaks_version_string() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let secret_latest = "9999.1234.5678";
+    write_update_cache(secret_latest, &[secret_latest]);
+
+    let snapshot = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    let event = telemetry::build_process_start(Surface::Tui).expect("event built when opted in");
+
+    for serialized in [
+        serde_json::to_string(&snapshot).expect("serialize snapshot"),
+        serde_json::to_string(&event).expect("serialize process_start"),
+    ] {
+        assert!(
+            !serialized.contains(secret_latest),
+            "raw cached latest version leaked into payload: {serialized}"
+        );
+        assert!(
+            !serialized.contains("1234"),
+            "a fragment of the cached version leaked: {serialized}"
+        );
+        // Only the coarse bucket leaves the client.
+        assert!(
+            serialized.contains("major_behind"),
+            "expected the coarse staleness bucket in the payload: {serialized}"
+        );
+    }
+}
+
+/// User story (#1887, opted-out): even with an update cache present and a schema
+/// version on disk, nothing is built or sent when the user has not opted in.
+#[test]
+#[serial]
+fn opted_out_emits_nothing_even_with_version_health_available() {
+    let _tmp = isolate();
+    // Cache present, but telemetry left at its default-off state.
+    write_update_cache("9999.0.0", &["9999.0.0", "9998.0.0"]);
+
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_process_start(Surface::Cli).is_none());
+    assert!(telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0).is_none());
 }
