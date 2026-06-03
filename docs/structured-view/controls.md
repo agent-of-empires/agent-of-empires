@@ -22,6 +22,11 @@ typical set is:
 | `bypassPermissions`  | All tools auto-approved. The structured view analogue of YOLO.                  |
 | `plan`               | Read-only; the agent drafts a plan but does not run side-effectful tools. |
 
+Other adapters report their own ids. Gemini (over `gemini --acp`) uses
+the gemini-cli `ApprovalMode` names: `auto_edit` folds onto `acceptEdits`
+semantics and `yolo` onto `bypassPermissions`, so a Gemini session is
+classified the same as the equivalent `claude-agent-acp` mode.
+
 ### YOLO mode maps to `bypassPermissions`
 
 When `[session] yolo_mode_default = true` (or the wizard's "Auto-approve

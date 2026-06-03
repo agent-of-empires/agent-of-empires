@@ -3054,11 +3054,19 @@ fn map_update_to_events(
             // Emit both events: CurrentModeChanged (the real id) and
             // a best-effort ModeChanged (for the legacy enum-based
             // UI, in case that path is still used somewhere).
+            // Gemini surfaces its approval modes over `gemini --acp` with the
+            // gemini-cli `ApprovalMode` ids (`auto_edit`, `yolo`); fold them
+            // onto the existing semantic equivalents so a Gemini session is
+            // classified the same as the claude-agent-acp modes. See #1819.
             let mode = match id.as_str() {
                 "default" => SessionMode::Default,
                 "plan" => SessionMode::Plan,
-                "accept_edits" | "acceptEdits" => SessionMode::AcceptEdits,
-                "bypass_permissions" | "bypassPermissions" => SessionMode::BypassPermissions,
+                "accept_edits" | "acceptEdits" | "auto_edit" | "autoEdit" => {
+                    SessionMode::AcceptEdits
+                }
+                "bypass_permissions" | "bypassPermissions" | "yolo" => {
+                    SessionMode::BypassPermissions
+                }
                 _ => SessionMode::Default,
             };
             vec![
@@ -7288,6 +7296,70 @@ mod tests {
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
         }
+    }
+
+    fn mode_from_current_mode_update(id: &str) -> SessionMode {
+        use agent_client_protocol::schema::CurrentModeUpdate;
+        let events = map_update_to_events(
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(id.to_string())),
+            &agent_profiles::CLAUDE,
+        );
+        // The arm always emits the raw id alongside the legacy enum, in order.
+        match events.as_slice() {
+            [Event::CurrentModeChanged { current_mode_id }, Event::ModeChanged { mode }] => {
+                assert_eq!(current_mode_id, id, "raw mode id must be preserved");
+                *mode
+            }
+            other => panic!("expected [CurrentModeChanged, ModeChanged], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_mode_update_classifies_gemini_mode_ids() {
+        // Gemini-cli ApprovalMode ids surfaced over `gemini --acp`. See #1819.
+        assert_eq!(
+            mode_from_current_mode_update("yolo"),
+            SessionMode::BypassPermissions
+        );
+        assert_eq!(
+            mode_from_current_mode_update("auto_edit"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("autoEdit"),
+            SessionMode::AcceptEdits
+        );
+    }
+
+    #[test]
+    fn current_mode_update_keeps_existing_mode_ids() {
+        // Regression guard: non-Gemini classification is unchanged.
+        assert_eq!(
+            mode_from_current_mode_update("default"),
+            SessionMode::Default
+        );
+        assert_eq!(mode_from_current_mode_update("plan"), SessionMode::Plan);
+        assert_eq!(
+            mode_from_current_mode_update("accept_edits"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("acceptEdits"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("bypass_permissions"),
+            SessionMode::BypassPermissions
+        );
+        assert_eq!(
+            mode_from_current_mode_update("bypassPermissions"),
+            SessionMode::BypassPermissions
+        );
+        // Unknown ids still fall back to Default.
+        assert_eq!(
+            mode_from_current_mode_update("some_future_mode"),
+            SessionMode::Default
+        );
     }
 
     #[test]
