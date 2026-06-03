@@ -445,25 +445,28 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // resolved command, not the built-in name, otherwise `--cmd opencode`
         // falsely bails when only the override binary (e.g.
         // opencode-plannotator) is installed. See #1910.
-        let resolved_override = config.session.resolve_tool_command(&tool_name);
-        if !resolved_override.is_empty() {
-            let bin = resolved_override.split_whitespace().next().unwrap_or("");
-            if !bin.is_empty() && !crate::cli::cockpit::command_present(bin) {
-                bail!(
-                    "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
-                     See all supported agents: aoe agents",
-                    bin
-                );
+        match override_launch_binary(&tool_name, &config.session) {
+            Some(bin) => {
+                if !crate::cli::cockpit::command_present(&bin) {
+                    bail!(
+                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                         See all supported agents: aoe agents",
+                        bin
+                    );
+                }
             }
-        } else if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
-            if !crate::tmux::is_agent_available(agent_def) {
-                bail!(
-                    "'{}' is not installed or not on $PATH.\n\
-                     Install with: {}\n\
-                     See all supported agents: aoe agents",
-                    agent_def.binary,
-                    agent_def.install_hint
-                );
+            None => {
+                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+                    if !crate::tmux::is_agent_available(agent_def) {
+                        bail!(
+                            "'{}' is not installed or not on $PATH.\n\
+                             Install with: {}\n\
+                             See all supported agents: aoe agents",
+                            agent_def.binary,
+                            agent_def.install_hint
+                        );
+                    }
+                }
             }
         }
         instance.tool = tool_name;
@@ -1066,6 +1069,22 @@ fn detect_tool(cmd: &str) -> Result<String> {
         })
 }
 
+/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
+/// selection when `session.agent_command_override` (or `custom_agents`)
+/// remaps the built-in to a different command. Returns the resolved
+/// command's first word, or `None` when no override applies (the caller
+/// then falls back to the built-in agent's own detection). See #1910.
+fn override_launch_binary(
+    tool: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<String> {
+    session
+        .resolve_tool_command(tool)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
 enum NamedToolSelection {
     Custom(String),
     BuiltIn(String),
@@ -1171,9 +1190,43 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sandbox_image;
+    use super::{override_launch_binary, resolve_sandbox_image};
+    use crate::session::config::SessionConfig;
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[test]
+    fn override_launch_binary_uses_command_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "opencode-plannotator".to_string());
+        // The gate must verify the override binary, not the built-in
+        // `opencode`, so `--cmd opencode` works when only the wrapper is
+        // installed. See #1910.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("opencode-plannotator")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_takes_first_word_of_multiword_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "ocp run sp".to_string());
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("ocp")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_none_without_override() {
+        let session = SessionConfig::default();
+        assert_eq!(override_launch_binary("opencode", &session), None);
+    }
 
     #[test]
     fn flag_overrides_everything() {

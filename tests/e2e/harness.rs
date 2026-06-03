@@ -363,6 +363,25 @@ last_seen_version = "{}"
         self.set_env("AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS", "60000");
     }
 
+    /// Install a no-op executable named `name` on the CLI PATH so a
+    /// presence check (`which` / PATH scan) finds it. Used to stand in for
+    /// an agent wrapper binary (e.g. an `agent_command_override` target)
+    /// without installing the real tool. Returns the dir prepended to PATH.
+    pub fn install_path_command(&mut self, name: &str) -> PathBuf {
+        let bin = self.home_dir.path().join("path-bin");
+        std::fs::create_dir_all(&bin).expect("create path-bin dir");
+        let path = bin.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write path command");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod path command");
+        }
+        self.extra_path_dirs.push(bin.clone());
+        bin
+    }
+
     /// Make `Drop` tear down cockpit workers and the serve daemon.
     pub fn stop_daemon_on_drop(&mut self) {
         self.stop_daemon_on_drop = true;
