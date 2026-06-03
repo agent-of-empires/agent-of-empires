@@ -1200,12 +1200,17 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             pid = record.pid,
             "sweeping orphan worker (no matching session on disk)"
         );
+        // Group-kill with SIGKILL escalation, not a single-pid SIGTERM: the
+        // orphan's node wrapper and `claude` grandchild share the runner's
+        // process group, and a bare SIGTERM to just the leader pid can
+        // leave them alive under PID 1 (part of the leak this fixes). The
+        // escalation runs detached so one stubborn orphan can't stall the
+        // sweep for the grace window. See #1921.
         #[cfg(unix)]
-        if crate::acp::worker_registry::is_pid_alive(record.pid) {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM);
-        }
+        tokio::spawn(crate::acp::worker_registry::reap_group_escalating(
+            record.pid,
+            std::time::Duration::from_secs(2),
+        ));
         crate::acp::worker_registry::delete(&record.session_id).ok();
     }
 }

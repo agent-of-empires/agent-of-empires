@@ -45,8 +45,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
@@ -57,7 +58,71 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::worker_registry::{self, WorkerRecord};
+use super::worker_registry::{self, RunnerRecordState, WorkerRecord};
+
+/// How often the abandonment watchdog inspects its own registry record.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Resolve the watchdog poll interval. Tests shrink it via
+/// `AOE_ACP_WATCHDOG_POLL_MS` so an orphan dies in well under a second
+/// instead of tens of seconds; production always uses
+/// [`WATCHDOG_POLL_INTERVAL`]. Mirrors the
+/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` test knob.
+fn watchdog_poll_interval() -> Duration {
+    std::env::var("AOE_ACP_WATCHDOG_POLL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(WATCHDOG_POLL_INTERVAL)
+}
+
+/// Consecutive `Missing` polls before the watchdog treats the record as
+/// gone for good. Debounced so a daemon-side delete+respawn (supersede) or
+/// an atomic-rename window can't trigger a false self-destruct on a single
+/// observation. The first poll only fires after `WATCHDOG_POLL_INTERVAL`,
+/// which doubles as a startup grace so the initial record write isn't
+/// raced.
+const WATCHDOG_MISSING_THRESHOLD: u32 = 2;
+
+/// Bounded retention for a detached runner. While no daemon is attached,
+/// the runner keeps the agent alive so a fresh `aoe serve` can reattach
+/// mid-turn (this is the whole point of the shim outliving the daemon).
+/// But a daemon that crashes/SIGKILLs in a persistent `$HOME` and never
+/// restarts would otherwise leave the runner + agent alive forever, with
+/// no daemon left to reap them. After this long with no attachment, the
+/// runner self-terminates. Generous enough to cover an overnight or
+/// weekend daemon stop; the clock resets on every reattach. See #1921.
+const DETACHED_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
+
+/// Sentinel in [`DetachedSince`] meaning "a daemon is currently attached",
+/// so the detached-retention clock is not running.
+const ATTACHED: u64 = 0;
+
+/// Shared unix-epoch-seconds marker for when the runner last went
+/// detached, or [`ATTACHED`] while a daemon is connected. Written by the
+/// accept loop on connect/disconnect, read by the watchdog.
+type DetachedSince = AtomicU64;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Why the runner is tearing down. Drives whether teardown deletes the
+/// registry entry: a superseded runner must NOT delete, since the files
+/// now belong to the fresh runner that replaced it.
+#[derive(Debug, Clone, Copy)]
+enum WatchdogShutdown {
+    /// Our registry record vanished (HOME deleted, or daemon `delete`d it).
+    RecordMissing,
+    /// A fresh runner superseded us; the on-disk files are now theirs.
+    Superseded,
+    /// Detached past [`DETACHED_RETENTION`] with no daemon reattaching.
+    DetachedRetentionExpired,
+}
 
 /// Cap on agent → daemon notification lines stored while detached.
 /// Each entry is at most one ndjson line (a few KB). Past this, oldest
@@ -236,8 +301,36 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let shutdown_signal = wait_for_shutdown();
 
     let session_id = args.session_id.clone();
+
+    // Abandonment watchdog: a daemon that dies without explicitly killing
+    // its runners (crash, SIGKILL, or an ephemeral test `$HOME` that gets
+    // deleted) would otherwise leave this runner + agent + grandchildren
+    // alive forever, since every other reaper runs inside a live daemon in
+    // the same `$HOME`. The watchdog gives the runner a self-destruct path.
+    // It polls the registry record via a non-creating read of a path
+    // captured now (while the dir exists), so it never resurrects a deleted
+    // `$HOME`. `detached_since` starts "detached" (no daemon yet) and is
+    // flipped by the accept loop. See #1921.
+    let detached_since: Arc<DetachedSince> = Arc::new(AtomicU64::new(now_secs()));
+    let watchdog_task = {
+        let record_path = worker_registry::record_path(&args.session_id)?;
+        let restart_marker = worker_registry::restart_marker_path(&args.session_id)?;
+        let (watchdog_tx, watchdog_rx) = tokio::sync::oneshot::channel::<WatchdogShutdown>();
+        let handle = tokio::spawn(run_watchdog(
+            record_path,
+            restart_marker,
+            our_pid,
+            Arc::clone(&detached_since),
+            session_id.clone(),
+            watchdog_tx,
+        ));
+        (handle, watchdog_rx)
+    };
+    let (watchdog_handle, mut watchdog_rx) = watchdog_task;
+
     let accept_session_id = session_id.clone();
     let accept_shared = Arc::clone(&shared);
+    let accept_detached = Arc::clone(&detached_since);
     let accept_loop = async move {
         loop {
             match listener.accept().await {
@@ -248,6 +341,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         "daemon connected"
                     );
                     worker_registry::mark_attached(&accept_session_id);
+                    accept_detached.store(ATTACHED, Ordering::Relaxed);
                     handle_connection(
                         stream,
                         Arc::clone(&accept_shared),
@@ -261,6 +355,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         "daemon disconnected; runner stays alive"
                     );
                     worker_registry::mark_detached(&accept_session_id);
+                    accept_detached.store(now_secs(), Ordering::Relaxed);
                 }
                 Err(e) => {
                     warn!(target: "acp.runner", "accept error: {e}");
@@ -270,8 +365,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
     };
 
-    // Wait for: agent exit, signal, or accept loop death (latter is
-    // unreachable but kept for symmetry).
+    // Wait for: agent exit, signal, watchdog self-destruct, or accept loop
+    // death (last is unreachable but kept for symmetry).
     tokio::select! {
         status = agent_child.wait() => {
             match status {
@@ -297,14 +392,164 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
+        reason = &mut watchdog_rx => {
+            if let Ok(reason) = reason {
+                self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
+            }
+        }
         _ = accept_loop => {
             warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
         }
     }
 
+    watchdog_handle.abort();
     agent_stdout_task.abort();
     worker_registry::delete(&session_id).ok();
     Ok(())
+}
+
+/// Poll this runner's own registry record and signal the main loop to
+/// self-destruct when it observes that the runner has been abandoned.
+/// Sends at most one [`WatchdogShutdown`] and returns; the main `select!`
+/// owns the actual teardown so there is exactly one killer (no double-fire
+/// with the signal/agent-exit paths, which simply cancel this task). See
+/// #1921.
+async fn run_watchdog(
+    record_path: PathBuf,
+    restart_marker: PathBuf,
+    own_pid: u32,
+    detached_since: Arc<DetachedSince>,
+    session_id: String,
+    tx: tokio::sync::oneshot::Sender<WatchdogShutdown>,
+) {
+    let mut missing = 0u32;
+    let poll_interval = watchdog_poll_interval();
+    loop {
+        // Sleep first: the initial delay doubles as a startup grace so the
+        // record write at boot isn't raced.
+        tokio::time::sleep(poll_interval).await;
+
+        // Detached-retention backstop for the persistent-`$HOME`
+        // crash-no-restart case, where the record survives but no daemon
+        // is left to reap us.
+        let since = detached_since.load(Ordering::Relaxed);
+        if since != ATTACHED && now_secs().saturating_sub(since) >= DETACHED_RETENTION.as_secs() {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                "detached past retention with no daemon; self-terminating"
+            );
+            let _ = tx.send(WatchdogShutdown::DetachedRetentionExpired);
+            return;
+        }
+
+        match worker_registry::inspect_record_for_runner(&record_path, own_pid) {
+            // Still ours, or a transient read hiccup we shouldn't act on.
+            RunnerRecordState::Matches | RunnerRecordState::Unreadable => missing = 0,
+            RunnerRecordState::Superseded => {
+                warn!(
+                    target: "acp.runner",
+                    session = %session_id,
+                    "registry record now owned by a different pid; superseded, self-terminating"
+                );
+                let _ = tx.send(WatchdogShutdown::Superseded);
+                return;
+            }
+            RunnerRecordState::Missing => {
+                // `aoe acp restart` deletes the record right before it
+                // SIGTERMs us; the marker tells us not to race that to a
+                // hard self-destruct.
+                if restart_marker.exists() {
+                    missing = 0;
+                    continue;
+                }
+                missing += 1;
+                if missing >= WATCHDOG_MISSING_THRESHOLD {
+                    warn!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "registry record gone; abandoned, self-terminating"
+                    );
+                    let _ = tx.send(WatchdogShutdown::RecordMissing);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Tear down the agent process tree after the watchdog flags abandonment.
+/// Politely SIGTERMs the agent, waits briefly, then SIGKILLs the whole
+/// process group (runner + node wrapper + `claude` grandchild) so nothing
+/// is left orphaned under PID 1.
+#[cfg(unix)]
+async fn self_terminate_agent_tree(
+    reason: WatchdogShutdown,
+    session_id: &str,
+    own_pid: u32,
+    agent_child: &mut Child,
+) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::{getpgrp, getpid, Pid};
+
+    info!(
+        target: "acp.runner",
+        session = %session_id,
+        ?reason,
+        "runner abandoned; terminating agent tree"
+    );
+
+    // A superseded runner must NOT delete the registry/socket: those files
+    // now belong to the fresh runner that replaced us, and deleting them
+    // would make the new runner's own watchdog see "missing" and cascade.
+    // Every other reason means we still own them (or they're already gone),
+    // so cleanup is safe and clears a stale socket that would confuse
+    // attach.
+    if !matches!(reason, WatchdogShutdown::Superseded) {
+        worker_registry::delete(session_id).ok();
+    }
+
+    // Polite SIGTERM to the agent (node) so a cooperative adapter can
+    // flush; the group SIGKILL below is the guarantee.
+    if let Some(agent_pid) = agent_child.id() {
+        let _ = kill(Pid::from_raw(agent_pid as i32), Signal::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
+
+    // Final hammer. The runner is its own process-group leader via setsid,
+    // so SIGKILLing the group reaps the node wrapper and its `claude`
+    // grandchild together. It also kills the runner itself, which is
+    // exactly the intent: nothing is left to clean up after this. Guard on
+    // actually being the group leader so a failed setsid can't make us
+    // SIGKILL the daemon's inherited group.
+    if getpgrp() == getpid() {
+        worker_registry::kill_runner_group(own_pid);
+    } else {
+        // setsid failed; we share another group. Never group-kill it. Kill
+        // just the direct child and fall through to a normal runner exit.
+        let _ = agent_child.start_kill();
+        let _ = agent_child.wait().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn self_terminate_agent_tree(
+    reason: WatchdogShutdown,
+    session_id: &str,
+    _own_pid: u32,
+    agent_child: &mut Child,
+) {
+    info!(
+        target: "acp.runner",
+        session = %session_id,
+        ?reason,
+        "runner abandoned; terminating agent"
+    );
+    if !matches!(reason, WatchdogShutdown::Superseded) {
+        worker_registry::delete(session_id).ok();
+    }
+    let _ = agent_child.start_kill();
+    let _ = agent_child.wait().await;
 }
 
 /// State the accept loop and the agent-stdout fanout share. The active

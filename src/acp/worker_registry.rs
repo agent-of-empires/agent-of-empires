@@ -487,6 +487,58 @@ pub fn terminate(session_id: &str) {
     delete(session_id).ok();
 }
 
+/// Reap a runner process group with SIGKILL escalation: SIGTERM the group,
+/// wait `grace` for it to exit, then SIGKILL the group. A bare SIGTERM can
+/// leave a node/`claude` grandchild that ignores it alive under PID 1, so
+/// the escalation is what actually guarantees the tree dies. `killpg`
+/// ignores ESRCH, so the SIGKILL on an already-empty group is a no-op.
+/// Used by the boot reconciler's orphan sweep. See #1921.
+#[cfg(unix)]
+pub async fn reap_group_escalating(pid: u32, grace: std::time::Duration) {
+    terminate_runner_group(pid);
+    tokio::time::sleep(grace).await;
+    kill_runner_group(pid);
+}
+
+/// What this runner's own registry record looks like from its watchdog's
+/// point of view. Computed from a non-creating read of a path captured at
+/// startup; see [`inspect_record_for_runner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRecordState {
+    /// Record present and its `pid` matches ours: we are still the owner.
+    Matches,
+    /// Record file is gone (HOME deleted, or a daemon `delete`d it).
+    Missing,
+    /// Record present but owned by a different pid: a fresh runner has
+    /// superseded us (delete + respawn). We must exit without touching the
+    /// files, which now belong to the new owner.
+    Superseded,
+    /// Read or parse failed for a reason other than absence. Treated as
+    /// non-fatal (transient FS hiccup) by the watchdog.
+    Unreadable,
+}
+
+/// Inspect this runner's registry record WITHOUT creating the workers dir.
+///
+/// The watchdog cannot use [`load`], because `load` -> `record_path` ->
+/// `workers_dir` calls `create_dir_all`, which would recreate the very
+/// directory whose deletion is the watchdog's primary self-destruct signal
+/// (and resurrect a temp `$HOME` a test just removed). The caller captures
+/// the concrete `<session_id>.json` path once at startup, while the dir
+/// still exists, and polls it here. See #1921.
+pub fn inspect_record_for_runner(record_path: &Path, own_pid: u32) -> RunnerRecordState {
+    let bytes = match std::fs::read(record_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RunnerRecordState::Missing,
+        Err(_) => return RunnerRecordState::Unreadable,
+    };
+    match serde_json::from_slice::<WorkerRecord>(&bytes) {
+        Ok(rec) if rec.pid == own_pid => RunnerRecordState::Matches,
+        Ok(_) => RunnerRecordState::Superseded,
+        Err(_) => RunnerRecordState::Unreadable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
