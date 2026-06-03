@@ -1,6 +1,6 @@
 name: Open Release PR
 
-# Weekly release-staging PR (#1140). Runs every Wednesday at 09:00 UTC,
+# Weekly release-staging PR (#1140). Runs every Wednesday at 08:17 UTC,
 # computes the next-patch version from the latest `v*` tag, bumps
 # `Cargo.toml` + `Cargo.lock`, and opens a PR labeled `release-staging`
 # with a plain newest-first commit list in the body. Merging that PR
@@ -20,9 +20,12 @@ name: Open Release PR
 
 on:
   schedule:
-    # Every Wednesday at 09:00 UTC. Cron strings are interpreted in UTC
+    # Every Wednesday at 08:17 UTC. Cron strings are interpreted in UTC
     # regardless of repo timezone, so this stays stable across DST shifts.
-    - cron: '0 9 * * 3'
+    # The off-hour minute (:17, not :00) avoids GitHub's top-of-hour
+    # scheduled-run congestion, which was dropping or heavily delaying
+    # the previous 09:00 trigger.
+    - cron: '17 8 * * 3'
   workflow_dispatch:
     inputs:
       bump:
