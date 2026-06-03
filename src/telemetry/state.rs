@@ -130,6 +130,12 @@ pub fn reset_install_id() -> Option<String> {
 /// failure is logged at `debug` and dropped, since the counts are themselves a
 /// best-effort signal. Caller is responsible for the opt-in gate.
 pub fn record_cli_command(name: &str) {
+    // Defense in depth: never persist a name outside the closed clap vocabulary,
+    // so a buggy caller cannot leave an arg or path in telemetry.json.
+    // build_cli_usage filtering only protects the wire, not the on-disk file.
+    if !crate::cli::CLI_COMMAND_NAMES.contains(&name) {
+        return;
+    }
     let mut state = load_state();
     *state
         .cli_command_counts
