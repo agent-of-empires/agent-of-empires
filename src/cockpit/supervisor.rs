@@ -487,7 +487,7 @@ fn command_matches_binary(command: &str, binary: &str) -> bool {
 /// `spec.command`, any remaining words are prepended to `spec.args`, so
 /// the registry's ACP args (e.g. `acp`) are preserved
 /// (`opencode-plannotator` → `opencode-plannotator acp`). See #1766.
-fn apply_agent_command_override(
+pub(crate) fn apply_agent_command_override(
     selected_agent: &str,
     spec_from_registry: bool,
     ovr: &AgentCommandOverride,

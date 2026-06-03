@@ -439,16 +439,38 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.tool = selection.name().to_string();
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
-        // Verify the agent binary is actually on PATH before creating the session
-        if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
-            if !crate::tmux::is_agent_available(agent_def) {
-                bail!(
-                    "'{}' is not installed or not on $PATH.\n\
-                     Install with: {}\n\
-                     See all supported agents: aoe agents",
-                    agent_def.binary,
-                    agent_def.install_hint
-                );
+        // Verify the binary that will actually launch is on PATH before
+        // creating the session. A configured session.agent_command_override
+        // (or custom_agents) entry replaces the built-in binary, so check the
+        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // falsely bails when only the override binary (e.g.
+        // opencode-plannotator) is installed. See #1910.
+        match override_launch_binary(&tool_name, &config.session) {
+            Some(bin) => {
+                // Use the same detection as tmux (login-shell PATH fallback
+                // included) so an override binary visible only after shell
+                // init isn't rejected here while the non-override path accepts
+                // it. See #1910.
+                if !crate::tmux::is_binary_on_path(&bin) {
+                    bail!(
+                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                         See all supported agents: aoe agents",
+                        bin
+                    );
+                }
+            }
+            None => {
+                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+                    if !crate::tmux::is_agent_available(agent_def) {
+                        bail!(
+                            "'{}' is not installed or not on $PATH.\n\
+                             Install with: {}\n\
+                             See all supported agents: aoe agents",
+                            agent_def.binary,
+                            agent_def.install_hint
+                        );
+                    }
+                }
             }
         }
         instance.tool = tool_name;
@@ -597,17 +619,36 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             // agent's configured ACP command, then verify the binary is on
             // PATH. A missing adapter is a hard error at add-time rather
             // than a silent 404 on the first prompt.
-            let spec = match registry.get(&agent_name) {
-                Some(spec) => spec.clone(),
+            let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
+                Some(spec) => (spec.clone(), true),
                 None => match config.session.agent_cockpit_cmd.get(&agent_name) {
-                    Some(cmd) => crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                    Some(cmd) => (
+                        crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        false,
+                    ),
                     None => bail!(
                         "cockpit agent `{agent_name}` is not in the registry.\n\
                          Run `aoe cockpit doctor` to see configured agents."
                     ),
                 },
             };
+            // Overlay session.agent_command_override the same way the cockpit
+            // spawn path does, so the precondition checks the binary that will
+            // actually launch (e.g. opencode-plannotator), not the bare
+            // registry binary. Without this, a user who installed only the
+            // override binary gets a false "not installed" bail. See #1910.
+            if let Some(ovr) = crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ) {
+                crate::cockpit::supervisor::apply_agent_command_override(
+                    &agent_name,
+                    spec_from_registry,
+                    &ovr,
+                    &mut spec,
+                )?;
+            }
             if !crate::cli::cockpit::command_present(&spec.command) {
                 let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
                     .unwrap_or("install via your package manager and re-run");
@@ -1032,6 +1073,23 @@ fn detect_tool(cmd: &str) -> Result<String> {
         })
 }
 
+/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
+/// selection when `session.agent_command_override` (or `custom_agents`)
+/// remaps the built-in to a different command. Returns the resolved
+/// command's first word, or `None` when no override applies (the caller
+/// then falls back to the built-in agent's own detection). See #1910.
+///
+/// Parsed with `shell_words` so a quoted path (e.g.
+/// `"/opt/My Wrapper/opencode" --mode plan`) yields the real binary, matching
+/// how `apply_agent_command_override` splits the command at spawn time.
+fn override_launch_binary(
+    tool: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<String> {
+    let command = session.resolve_tool_command(tool);
+    shell_words::split(&command).ok()?.into_iter().next()
+}
+
 enum NamedToolSelection {
     Custom(String),
     BuiltIn(String),
@@ -1137,9 +1195,58 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sandbox_image;
+    use super::{override_launch_binary, resolve_sandbox_image};
+    use crate::session::config::SessionConfig;
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[test]
+    fn override_launch_binary_uses_command_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "opencode-plannotator".to_string());
+        // The gate must verify the override binary, not the built-in
+        // `opencode`, so `--cmd opencode` works when only the wrapper is
+        // installed. See #1910.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("opencode-plannotator")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_takes_first_word_of_multiword_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "ocp run sp".to_string());
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("ocp")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_honors_quoted_path() {
+        let mut session = SessionConfig::default();
+        session.agent_command_override.insert(
+            "opencode".to_string(),
+            "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
+        );
+        // shell_words keeps the quoted path intact instead of splitting on
+        // the space, so preflight checks the real binary.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("/opt/My Wrapper/opencode")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_none_without_override() {
+        let session = SessionConfig::default();
+        assert_eq!(override_launch_binary("opencode", &session), None);
+    }
 
     #[test]
     fn flag_overrides_everything() {
