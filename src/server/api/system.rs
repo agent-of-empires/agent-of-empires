@@ -699,13 +699,8 @@ pub struct ServerAbout {
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
     let auth_required = !state.token_manager.is_no_auth().await;
     let passphrase_enabled = state.login_manager.is_enabled();
-    let auth_mode = if auth_required {
-        "token"
-    } else if passphrase_enabled {
-        "passphrase"
-    } else {
-        "none"
-    };
+    let auth_mode =
+        crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
     let cockpit_master_enabled = state
         .cockpit_master_enabled
         .load(std::sync::atomic::Ordering::Relaxed);

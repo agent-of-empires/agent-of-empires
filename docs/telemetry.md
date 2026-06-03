@@ -13,21 +13,38 @@ closed, versioned schema (see `src/telemetry/events.rs`):
 
 - **`process_start`** on boot: surface (`cli` / `tui` / `serve`), aoe version,
   OS, and CPU arch. The `cli` surface is throttled to at most once per install
-  per day, so scripting `aoe` in a loop never floods the endpoint.
-- **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
-  ~12 hours. It is a point-in-time summary of the current install, never a
-  stream of actions:
+  per day, so scripting `aoe` in a loop never floods the endpoint. The long-lived
+  `tui` and `serve` surfaces emit one per launch (not throttled), so a restart is
+  visible; a pathological crash-loop is absorbed by the gateway rather than a
+  local cap.
+- **`usage_snapshot`** from the TUI and `aoe serve`, on start and then about
+  every 12 hours, with a small random jitter on the period so installs that boot
+  together don't snapshot in lockstep. It is a point-in-time summary of the
+  current install, never a stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
   - how many sessions are currently pinned, snoozed, or archived (a
     point-in-time count of the session-organization states, not how often
     those actions were taken),
+  - a per-substrate census: each session is classified into exactly one of
+    `local` / `worktree` / `workspace` / `sandbox` / `scratch` (a closed
+    five-way vocabulary), so the counts partition the session total and answer
+    "of N sessions, how many are worktree vs local vs sandbox vs ...". All five
+    keys are always present. This is orthogonal to the sandbox count above: a
+    sandboxed worktree counts as `worktree` here yet still in the sandbox count,
+    so the `sandbox` bucket means "sandboxed and not also one of the others",
+    not "all sandboxed sessions",
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
   - how many sessions were created since the last snapshot, a trend counter so
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
   - which opt-in features are turned on (see "Feature flags" below),
-  - whether the web dashboard / cockpit was opened since the last snapshot.
+  - whether the web dashboard / cockpit was opened since the last snapshot,
+  - for `aoe serve` only, how the daemon is deployed, decided once at launch:
+    its auth mode (`token`, `passphrase`, or `none`) and its exposure mode
+    (`tunnel` for a Cloudflare quick or named tunnel, `tailscale` for a
+    Tailscale Funnel, or `local`). These are coarse enums only; the TUI reports
+    neither, since it hosts no server.
 
 In practice that is a handful of small (well under 1 KB) requests per active
 install per day. There is no offline buffering, so a flaky network drops events
@@ -58,15 +75,20 @@ in here, per-session usage is reported separately by the session counts above.
 
 Prompts, file or project paths, session titles, branch names, group paths,
 custom command lines, model strings, hostnames, usernames, or anything derived
-from them. The install id is a random UUID generated locally on opt-in; it is
-never derived from hostname, username, MAC, or filesystem.
+from them. For `aoe serve`, the deployment-mode signals carry only the coarse
+auth and exposure enums above: never a tunnel name, named-tunnel hostname,
+`.ts.net` URL, auth token, or passphrase. The install id is a random UUID
+generated locally on opt-in; it is never derived from hostname, username, MAC,
+or filesystem.
 
 ## Anonymous install id
 
 Counting distinct installs needs a stable id. On opt-in, aoe generates a random
 `uuid::Uuid::new_v4()` and stores it in `<app_dir>/telemetry.json` (owner-only).
-It is kept **out of `config.toml`** on purpose, since people routinely paste
-their config into bug reports. Opting out deletes the file; `aoe telemetry
+Updates to that file are serialized with an advisory lock (a `.telemetry.lock`
+sidecar) so concurrent `aoe` processes (TUI, CLI, `aoe serve`) can't clobber each
+other's writes. It is kept **out of `config.toml`** on purpose, since people
+routinely paste their config into bug reports. Opting out deletes the file; `aoe telemetry
 reset-id` rotates it. Resetting mints a brand-new id, so that install then
 counts as a new one in the aggregate distinct-install and retention numbers;
 only reset if you actually want to disassociate from prior counts.
@@ -128,6 +150,7 @@ the install id and does all sending.
 
 **Schema contract.** The wire format is the flat, closed schema in
 `src/telemetry/events.rs`, mirrored by the gateway. New fields must be counts,
-booleans, or short identifier-like strings (and the two allowlisted bucket
-maps); the gateway drops free text, paths, branch-name-like strings, and any
-nested object, so anything richer than a count or flag will not survive ingest.
+booleans, or short identifier-like strings (and the allowlisted bucket maps:
+per-agent, per-model-family, and per-substrate); the gateway drops free text,
+paths, branch-name-like strings, and any nested object, so anything richer than
+a count or flag will not survive ingest.
