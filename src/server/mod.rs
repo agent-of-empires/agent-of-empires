@@ -857,11 +857,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         shutdown: CancellationToken::new(),
     });
 
-    // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
-    // resolved so the first (immediate) tick reports the real `serve_mode`, and
-    // so a daemon whose tunnel failed to start never emits a snapshot at all.
-    spawn_serve_snapshot_loop(state.clone());
-
     let app = build_router(state.clone());
 
     // Cockpit workers for persisted sessions get auto-spawned by the
@@ -887,6 +882,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+
+    // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
+    // resolved (so the first, immediate tick reports the real `serve_mode` and a
+    // daemon whose tunnel failed to start emits nothing) and after cockpit
+    // status seeding plus the synchronous recovery marking (so that first tick's
+    // session counts reflect the restored state rather than a half-loaded one).
+    spawn_serve_snapshot_loop(state.clone());
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
