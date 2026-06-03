@@ -458,6 +458,19 @@ export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
   }).catch(() => {});
 }
 
+/// Report a cockpit interaction the daemon cannot observe itself, so its next
+/// opt-in snapshot can fold it in. Today the only kind is a queued prompt: the
+/// prompt queue lives entirely in client state, so the browser is the one
+/// surface that can report it. Best-effort; the daemon only counts when the
+/// user is opted in.
+export function reportCockpitInteraction(kind: "prompt_queued"): void {
+  void fetch("/api/telemetry/cockpit-interaction", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  }).catch(() => {});
+}
+
 /** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
 export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
   if (!about) return false;

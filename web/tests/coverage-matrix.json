@@ -187,6 +187,18 @@
       ]
     },
     {
+      "id": "telemetry.cockpit-interaction",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useCockpit.queue.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useCockpit.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",

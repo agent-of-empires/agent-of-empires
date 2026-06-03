@@ -35,7 +35,11 @@ import {
   type PersistedEntry,
 } from "../lib/cockpitStateStorage";
 import { getToken } from "../lib/token";
-import { setSessionArchive, setSessionSnooze } from "../lib/api";
+import {
+  reportCockpitInteraction,
+  setSessionArchive,
+  setSessionSnooze,
+} from "../lib/api";
 
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
@@ -1255,6 +1259,10 @@ export function useCockpit(
         // (and drops the whole row on reload) so the quota invariant
         // holds. See #1833 / #1000.
         dispatch({ kind: "enqueue_prompt", text, attachments });
+        // The agent was busy, so this prompt is genuinely queued. Report it for
+        // opt-in telemetry (queue depth lives only in client state, so the
+        // daemon cannot observe queueing on its own).
+        reportCockpitInteraction("prompt_queued");
         return;
       }
       const result = await dispatchPromptNow(text, attachments);

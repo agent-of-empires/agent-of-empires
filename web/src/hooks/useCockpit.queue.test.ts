@@ -16,7 +16,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyCockpitState, type QueuedPrompt } from "../lib/cockpitTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
+import { reportCockpitInteraction } from "../lib/api";
 import { cockpitHookReducer, combineQueuedPrompts, useCockpit } from "./useCockpit";
+
+// Spy on the telemetry ping while keeping the rest of the api module real
+// (the hook also calls setSessionArchive / setSessionSnooze through it).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, reportCockpitInteraction: vi.fn() };
+});
 
 describe("cockpitHookReducer / queue actions", () => {
   it("emptyCockpitState starts with an empty queue", () => {
@@ -313,6 +321,7 @@ describe("useCockpit drain race (#1144)", () => {
     promptPostStatus = 200;
     promptPostBody = "simulated failure";
     promptPostBodies = [];
+    vi.mocked(reportCockpitInteraction).mockClear();
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
       "fetch",
@@ -361,6 +370,39 @@ describe("useCockpit drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts[0]?.text).toBe(
       "queued before open",
     );
+  });
+
+  // #1888: parking a prompt because the agent is busy is the one cockpit
+  // interaction the daemon cannot observe (the queue is client-only), so the
+  // browser pings it for opt-in telemetry.
+  it("reports a prompt_queued telemetry interaction when a prompt parks (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-ping"));
+    await flushAsync();
+    // WS still CONNECTING, so sendPrompt parks the prompt rather than POSTing.
+    act(() => {
+      void result.current.sendPrompt("parked, please count me");
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledTimes(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("does not report a prompt_queued interaction when a prompt POSTs directly (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-noping"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      void result.current.sendPrompt("sent straight through");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(reportCockpitInteraction).not.toHaveBeenCalled();
   });
 
   it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
