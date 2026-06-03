@@ -67,3 +67,45 @@ test("review step shows the resolved cockpit launch command and edits it without
     await serve.stop();
   }
 });
+
+test("review step shows the cockpit registry command, not the bare binary", async ({
+  page,
+}, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    cockpit: true,
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+  });
+
+  try {
+    await page.goto(serve.baseUrl);
+    await page
+      .getByRole("button", { name: "New session", exact: true })
+      .first()
+      .click();
+
+    const wizard = page.locator(
+      'div.fixed.inset-0.z-50:has(h1:has-text("New session"))',
+    );
+    await expect(wizard).toBeVisible({ timeout: 15_000 });
+
+    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
+    await wizard.getByRole("button", { name: "Next" }).click();
+    await expect(
+      wizard.getByRole("heading", { name: "Name your session", exact: true }),
+    ).toBeVisible({ timeout: 10_000 });
+    await wizard.getByRole("button", { name: "Next" }).click();
+
+    // claude's binary is "claude" but its cockpit launcher is
+    // "claude-agent-acp"; the review row must show the latter, which fails
+    // if the resolver regresses to binary + args.
+    await wizard.getByRole("button", { name: "claude", exact: true }).click();
+    await wizard.getByRole("button", { name: "Next" }).click();
+
+    const row = wizard.getByTestId("launch-command-row");
+    await expect(row).toContainText("claude-agent-acp", { timeout: 10_000 });
+  } finally {
+    await serve.stop();
+  }
+});
