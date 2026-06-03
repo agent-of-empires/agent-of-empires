@@ -124,9 +124,28 @@ fn snapshot_buckets_are_sanitized() {
     }
 }
 
+/// User story (#1874): the create-trend counter carries a real value. When N
+/// sessions were created during the window, the snapshot reports
+/// `session_creates_since_last_snapshot == N`; with none created it reports 0.
+#[test]
+#[serial]
+fn snapshot_carries_session_create_count() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0)
+        .expect("snapshot built when opted in");
+    assert_eq!(none.session_creates_since_last_snapshot, 0);
+
+    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7)
+        .expect("snapshot built when opted in");
+    assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
 /// The CLI `process_start` is throttled to once per install per day so a user
-/// scripting `aoe` in a loop can't flood the endpoint: the first claim in a
-/// window succeeds, the next is denied.
+/// scripting `aoe` in a loop can't flood the endpoint: a send is due first, then
+/// not due once a confirmed send claims the daily slot.
 #[test]
 #[serial]
 fn cli_process_start_throttled_to_once_per_window() {
@@ -135,18 +154,52 @@ fn cli_process_start_throttled_to_once_per_window() {
     telemetry::apply_opt_in_change(true);
 
     let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let hour = std::time::Duration::from_secs(60 * 60);
     assert!(
-        telemetry::claim_cli_process_start_slot(day),
-        "first claim in the window should be granted"
+        telemetry::cli_process_start_due(day, hour),
+        "first send in the window should be due"
     );
+    // A confirmed send claims the daily slot.
+    telemetry::record_cli_process_start(true);
     assert!(
-        !telemetry::claim_cli_process_start_slot(day),
-        "second claim within the window should be denied"
+        !telemetry::cli_process_start_due(day, hour),
+        "within the day, no further send is due after a confirmed send"
     );
-    // A zero-length window always re-grants (the stamp is always older).
-    assert!(telemetry::claim_cli_process_start_slot(
+    // Zero gaps always re-grant (every stamp is always older than zero).
+    assert!(telemetry::cli_process_start_due(
+        std::time::Duration::ZERO,
         std::time::Duration::ZERO
     ));
+}
+
+/// User story (#1875): when a CLI `process_start` send fails, the daily throttle
+/// slot is NOT consumed, so the next invocation retries instead of losing the
+/// whole day to one transient failure. The retry gap still bounds how often the
+/// failed send is re-attempted.
+#[test]
+#[serial]
+fn failed_cli_process_start_leaves_daily_slot_open() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let hour = std::time::Duration::from_secs(60 * 60);
+
+    // Simulate a failed send: it stamps the attempt but never claims the slot.
+    telemetry::record_cli_process_start(false);
+
+    // The retry gap blocks an immediate re-attempt against a still-down endpoint.
+    assert!(
+        !telemetry::cli_process_start_due(day, hour),
+        "retry gap must block an immediate re-attempt after a failed send"
+    );
+    // But the daily slot is still open: once the retry gap elapses, a send is due
+    // again, unlike the old behaviour that lost the whole day on one failure.
+    assert!(
+        telemetry::cli_process_start_due(day, std::time::Duration::ZERO),
+        "a failed send must leave the daily slot open for retry"
+    );
 }
 
 /// An unreachable / slow endpoint must never block the CLI: `flush_process_start`

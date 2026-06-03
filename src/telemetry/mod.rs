@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use events::{ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
-pub use state::{claim_cli_process_start_slot, install_id, reset_install_id};
+pub use state::{cli_process_start_due, install_id, record_cli_process_start, reset_install_id};
 
 use crate::session::Instance;
 
@@ -57,6 +57,11 @@ const TELEMETRY_KEY: &str = "7bc5a4e45ce861662b9690a7105da988";
 /// still answers "did this install run the CLI today" without a POST per
 /// command.
 const CLI_PROCESS_START_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Retry backoff after a *failed* CLI `process_start` send. While the daily slot
+/// stays open (a failed send never claims it), this bounds re-attempts to once
+/// per hour so a down endpoint can't make every `aoe` invocation re-send.
+const CLI_PROCESS_START_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// True when `DO_NOT_TRACK` is set to an affirmative value. This is the
 /// absolute override: it wins over `config.telemetry.enabled`.
@@ -140,6 +145,8 @@ pub fn build_usage_snapshot(
         return None;
     }
     let install_id = state::ensure_install_id()?;
+    // Global, pre-profile-merge config on purpose: `features` is an install-level
+    // default-adoption signal, not per-session usage. See `features::active_features`.
     let features = features::active_features(&crate::session::Config::load_or_warn());
 
     let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
@@ -216,10 +223,14 @@ pub fn build_usage_snapshot(
     })
 }
 
-/// POST a serialized event to the endpoint. Every error is swallowed and
-/// logged at `debug` only. Bounded by both a short connect timeout and the
-/// overall [`SEND_TIMEOUT`] so a down endpoint can never delay the caller.
-async fn post<T: serde::Serialize>(event: &T) {
+/// POST a serialized event to the endpoint. Returns `true` only on a *confirmed*
+/// delivery: a transport-level `Ok` whose HTTP status is a 2xx. A transport error
+/// OR a non-success status (4xx/5xx, e.g. a rejected `X-Telemetry-Key` or a
+/// schema rejection at the gateway) returns `false` so callers can defer
+/// consuming a signal until delivery is actually confirmed. Every error is
+/// swallowed and logged at `debug` only. Bounded by both a short connect timeout
+/// and the overall [`SEND_TIMEOUT`] so a down endpoint can never delay the caller.
+async fn post<T: serde::Serialize>(event: &T) -> bool {
     let endpoint = endpoint();
     let client = match reqwest::Client::builder()
         .user_agent(concat!("agent-of-empires/", env!("CARGO_PKG_VERSION")))
@@ -230,7 +241,7 @@ async fn post<T: serde::Serialize>(event: &T) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(target: "telemetry", "failed to build client: {e}");
-            return;
+            return false;
         }
     };
     match client
@@ -240,8 +251,16 @@ async fn post<T: serde::Serialize>(event: &T) {
         .send()
         .await
     {
-        Ok(resp) => tracing::debug!(target: "telemetry", status = %resp.status(), "telemetry sent"),
-        Err(e) => tracing::debug!(target: "telemetry", "telemetry send failed: {e}"),
+        Ok(resp) => {
+            let status = resp.status();
+            let ok = status.is_success();
+            tracing::debug!(target: "telemetry", status = %status, ok, "telemetry send completed");
+            ok
+        }
+        Err(e) => {
+            tracing::debug!(target: "telemetry", "telemetry send failed: {e}");
+            false
+        }
     }
 }
 
@@ -249,28 +268,44 @@ async fn post<T: serde::Serialize>(event: &T) {
 /// returns immediately and never blocks the caller.
 pub fn spawn_process_start(surface: Surface) {
     if let Some(event) = build_process_start(surface) {
-        tokio::spawn(async move { post(&event).await });
+        tokio::spawn(async move {
+            post(&event).await;
+        });
     }
 }
 
 /// Emit a `process_start`, awaiting delivery with a hard timeout so the event
-/// has a chance to flush before the process exits. Bounded by the connect and
-/// send timeouts, so a dead endpoint can never hang the caller; a no-op for the
+/// has a chance to flush before the process exits. Returns whether delivery was
+/// *confirmed* (a 2xx), so a throttled caller can defer claiming its slot until
+/// the send actually succeeds. Bounded by the connect and send timeouts, so a
+/// dead endpoint can never hang the caller; a no-op (returns `false`) for the
 /// common default-off (not opted in) case.
-pub async fn flush_process_start(surface: Surface) {
-    if let Some(event) = build_process_start(surface) {
-        let _ = tokio::time::timeout(SEND_TIMEOUT, post(&event)).await;
-    }
+pub async fn flush_process_start(surface: Surface) -> bool {
+    let Some(event) = build_process_start(surface) else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, post(&event)).await,
+        Ok(true)
+    )
 }
 
 /// CLI entrypoint for `process_start`: same as [`flush_process_start`] for the
 /// `cli` surface, but throttled to at most once per install per day so a user
-/// scripting `aoe` in a loop can't flood the endpoint. The throttle stamp is
-/// only claimed when opted in, so default-off users never touch disk.
+/// scripting `aoe` in a loop can't flood the endpoint. The daily slot is claimed
+/// only after the send is *confirmed*, so a failed send leaves it open for the
+/// next invocation to retry (bounded by [`CLI_PROCESS_START_RETRY_GAP`] so a down
+/// endpoint can't make every invocation re-send). Nothing touches disk unless
+/// opted in and a send is actually due.
 pub async fn flush_cli_process_start() {
-    if is_opted_in() && state::claim_cli_process_start_slot(CLI_PROCESS_START_MIN_GAP) {
-        flush_process_start(Surface::Cli).await;
+    if !is_opted_in() {
+        return;
     }
+    if !cli_process_start_due(CLI_PROCESS_START_MIN_GAP, CLI_PROCESS_START_RETRY_GAP) {
+        return;
+    }
+    let confirmed = flush_process_start(Surface::Cli).await;
+    record_cli_process_start(confirmed);
 }
 
 /// Fingerprint of the last `usage_snapshot` whose send we initiated this
@@ -305,43 +340,75 @@ fn record_snapshot_fp(snapshot: &UsageSnapshot) {
     }
 }
 
-/// True (and records the new fingerprint) when `snapshot` differs from the last
-/// one we initiated a send for this process; false when it is identical. A
-/// poisoned lock fails open: sending is the safe default.
-fn snapshot_is_new(snapshot: &UsageSnapshot) -> bool {
+/// True when `snapshot` is identical (ignoring `sent_at`) to the last one whose
+/// send we *confirmed* this process. Pure peek, no mutation: the fingerprint is
+/// recorded by [`send_snapshot`] only after a confirmed send, so a failed send
+/// never poisons the dedup cache into dropping a later identical retry. A
+/// poisoned lock reports "not a duplicate", so sending is the safe default.
+fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
     let fp = snapshot_fingerprint(snapshot);
     match LAST_SNAPSHOT_FP.lock() {
-        Ok(mut last) => {
-            let is_new = *last != Some(fp);
-            if is_new {
-                *last = Some(fp);
-            }
-            is_new
-        }
-        Err(_) => true,
+        Ok(last) => *last == Some(fp),
+        Err(_) => false,
     }
 }
 
-/// Send a pre-built usage snapshot, detached. Caller builds via
-/// [`build_usage_snapshot`] (returns `None` when not opted in). Records the
-/// fingerprint so a redundant exit snapshot can be suppressed.
+/// Outcome of a snapshot flush, so a caller can decide whether to consume the
+/// state the snapshot reported (e.g. reset `web_seen` / a create counter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Delivery was confirmed (a 2xx). Safe to consume the reported state.
+    Sent,
+    /// Skipped because identical to the last confirmed send. The prior send
+    /// already consumed the reported state; consume nothing again.
+    Deduped,
+    /// The send failed. Retain the reported state so the next snapshot retries.
+    Failed,
+}
+
+/// Send a pre-built usage snapshot, awaiting delivery with a hard timeout.
+/// Records the dedup fingerprint *only on a confirmed send*, so a failed send
+/// never suppresses a later identical retry. Returns whether delivery was
+/// confirmed. Caller builds via [`build_usage_snapshot`] (returns `None` when
+/// not opted in).
+pub async fn send_snapshot(snapshot: UsageSnapshot) -> bool {
+    let confirmed = matches!(
+        tokio::time::timeout(SEND_TIMEOUT, post(&snapshot)).await,
+        Ok(true)
+    );
+    if confirmed {
+        record_snapshot_fp(&snapshot);
+    }
+    confirmed
+}
+
+/// Send a pre-built usage snapshot, detached. Returns immediately and never
+/// blocks the caller; the fingerprint is recorded inside the spawned task only
+/// on a confirmed send.
 pub fn spawn_snapshot(snapshot: UsageSnapshot) {
-    record_snapshot_fp(&snapshot);
-    tokio::spawn(async move { post(&snapshot).await });
+    tokio::spawn(async move {
+        send_snapshot(snapshot).await;
+    });
 }
 
 /// Send the best-effort snapshot on graceful exit, awaiting delivery with a
 /// hard timeout so the final snapshot can flush without risking a hang, but
 /// skipping the send when the snapshot is identical (ignoring `sent_at`) to the
-/// last one already emitted this run. A boot (or periodic) snapshot followed by
-/// a quit with unchanged session state would otherwise post the same counts
-/// twice within seconds; a snapshot that actually changed still flushes.
-pub async fn flush_snapshot_if_changed(snapshot: UsageSnapshot) {
-    if !snapshot_is_new(&snapshot) {
-        tracing::debug!(target: "telemetry", "exit snapshot unchanged since last emit; skipping duplicate");
-        return;
+/// last one already confirmed this run. A boot (or periodic) snapshot followed
+/// by a quit with unchanged session state would otherwise post the same counts
+/// twice within seconds; a snapshot that actually changed still flushes. The
+/// returned [`SendOutcome`] lets the caller consume reported state only when the
+/// send was actually confirmed.
+pub async fn flush_snapshot_if_changed(snapshot: UsageSnapshot) -> SendOutcome {
+    if snapshot_matches_last(&snapshot) {
+        tracing::debug!(target: "telemetry", "exit snapshot unchanged since last confirmed emit; skipping duplicate");
+        return SendOutcome::Deduped;
     }
-    let _ = tokio::time::timeout(SEND_TIMEOUT, post(&snapshot)).await;
+    if send_snapshot(snapshot).await {
+        SendOutcome::Sent
+    } else {
+        SendOutcome::Failed
+    }
 }
 
 #[cfg(test)]
@@ -417,7 +484,8 @@ mod tests {
     fn exit_snapshot_dedups_against_boot_but_resends_on_change() {
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
 
-        // Boot emit records the fingerprint (this is what spawn_snapshot does).
+        // A confirmed boot send records the fingerprint (this is what
+        // `send_snapshot` does on success).
         let boot = sample_snapshot();
         record_snapshot_fp(&boot);
 
@@ -427,25 +495,47 @@ mod tests {
         let mut exit = sample_snapshot();
         exit.sent_at = "2026-06-02T19:00:47Z".to_string();
         assert!(
-            !snapshot_is_new(&exit),
+            snapshot_matches_last(&exit),
             "an unchanged exit snapshot must dedupe against the boot snapshot"
         );
 
-        // A snapshot whose counts actually changed is new and would be sent,
-        // and then becomes the new baseline.
+        // A snapshot whose counts actually changed is not a duplicate, so it
+        // would be sent; a confirmed send then makes it the new baseline.
         let mut changed = sample_snapshot();
         changed.session_total = 8;
         assert!(
-            snapshot_is_new(&changed),
+            !snapshot_matches_last(&changed),
             "a changed snapshot must still be emitted"
         );
+        record_snapshot_fp(&changed);
         let mut changed_again = changed.clone();
         changed_again.sent_at = "2026-06-02T19:05:00Z".to_string();
         assert!(
-            !snapshot_is_new(&changed_again),
+            snapshot_matches_last(&changed_again),
             "repeating the latest snapshot dedups against it"
         );
 
+        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
+    }
+
+    // The fingerprint is recorded only by `send_snapshot` on a confirmed send,
+    // never by `snapshot_matches_last` (a pure peek). So checking a snapshot
+    // without a confirmed send must not poison the dedup cache: a failed boot
+    // send leaves the next identical snapshot eligible to retry, instead of
+    // being silently dropped as a "duplicate" of something never delivered.
+    #[test]
+    #[serial]
+    fn peek_does_not_record_fingerprint() {
+        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
+        let snap = sample_snapshot();
+        assert!(
+            !snapshot_matches_last(&snap),
+            "first peek must not match an empty cache"
+        );
+        assert!(
+            !snapshot_matches_last(&snap),
+            "peeking must not record the fingerprint, so it still does not match"
+        );
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }
 }

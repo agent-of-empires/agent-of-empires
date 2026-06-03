@@ -163,6 +163,17 @@
       ]
     },
     {
+      "id": "telemetry.cockpit-seen",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/cockpit-telemetry-seen.spec.ts"
+      ],
+      "components": [
+        "web/src/App.tsx"
+      ]
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",
