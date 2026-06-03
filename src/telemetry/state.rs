@@ -17,11 +17,17 @@ use crate::session::get_app_dir;
 struct TelemetryState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     install_id: Option<String>,
-    /// Last time a CLI `process_start` was emitted, used to throttle the one
-    /// unbounded event source to at most once per install per day. Long-lived
-    /// surfaces (TUI / serve) emit once per launch and need no throttle.
+    /// Last time a CLI `process_start` was *confirmed delivered*, used to throttle
+    /// the one unbounded event source to at most once per install per day. Long-lived
+    /// surfaces (TUI / serve) emit once per launch and need no throttle. Only stamped
+    /// on a successful send, so a failed send leaves the daily slot open for retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_cli_process_start: Option<DateTime<Utc>>,
+    /// Last time a CLI `process_start` send was *attempted* (success or failure).
+    /// Bounds retries: while the daily slot is open after a failed send, this stops
+    /// every `aoe` invocation from re-attempting against a down endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_cli_process_start_attempt: Option<DateTime<Utc>>,
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -97,28 +103,37 @@ pub fn reset_install_id() -> Option<String> {
     ensure_install_id()
 }
 
-/// Claim the once-per-`min_gap` CLI `process_start` slot. Returns `true` and
-/// stamps "now" when the last emission is older than `min_gap` (or never),
-/// `false` otherwise. This bounds the only unbounded telemetry source: a user
-/// scripting `aoe` in a loop emits at most one CLI `process_start` per window
-/// instead of one per invocation. Caller is responsible for the opt-in gate.
-pub fn claim_cli_process_start_slot(min_gap: Duration) -> bool {
+/// Whether a CLI `process_start` send is due. Due when the last *confirmed*
+/// send is older than `success_gap` (or never) AND the last *attempt* is older
+/// than `retry_gap` (or never). `success_gap` is the real once-per-day throttle
+/// that bounds the only unbounded telemetry source; `retry_gap` bounds how often
+/// a failed send is retried so a down endpoint can't turn every `aoe` invocation
+/// into a fresh attempt. Caller is responsible for the opt-in gate. Read-only:
+/// the stamps are written by [`record_cli_process_start`] after the send.
+pub fn cli_process_start_due(success_gap: Duration, retry_gap: Duration) -> bool {
+    let state = load_state();
+    let now = Utc::now();
+    // A stamp is "fresh" when its positive elapsed is still inside the gap. A
+    // negative elapsed (clock skew) counts as not fresh, so the send is allowed.
+    let fresh = |stamp: Option<DateTime<Utc>>, gap: Duration| match stamp {
+        Some(last) => matches!((now - last).to_std(), Ok(elapsed) if elapsed < gap),
+        None => false,
+    };
+    !fresh(state.last_cli_process_start, success_gap)
+        && !fresh(state.last_cli_process_start_attempt, retry_gap)
+}
+
+/// Record a CLI `process_start` send. Always stamps the attempt (so `retry_gap`
+/// bounds retries); stamps the confirmed-delivery slot only when `success`, so a
+/// failed send leaves the daily slot open for the next invocation to retry.
+pub fn record_cli_process_start(success: bool) {
     let mut state = load_state();
     let now = Utc::now();
-    if let Some(last) = state.last_cli_process_start {
-        // A positive elapsed shorter than the window means "too soon". A
-        // negative elapsed (clock skew) falls through and is allowed.
-        if let Ok(elapsed) = (now - last).to_std() {
-            if elapsed < min_gap {
-                return false;
-            }
-        }
+    state.last_cli_process_start_attempt = Some(now);
+    if success {
+        state.last_cli_process_start = Some(now);
     }
-    state.last_cli_process_start = Some(now);
     if let Err(e) = save_state(&state) {
-        // Persisting the stamp failed; allow this send rather than dropping it,
-        // and try again to persist next time.
         tracing::debug!(target: "telemetry", "failed to persist cli throttle stamp: {e}");
     }
-    true
 }
