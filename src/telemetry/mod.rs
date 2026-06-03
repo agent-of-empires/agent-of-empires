@@ -223,10 +223,13 @@ pub fn build_usage_snapshot(
         }
 
         // Mutually-exclusive primary substrate; orthogonal to the sandbox count
-        // above (a sandboxed worktree buckets as `worktree` here).
+        // above (a sandboxed worktree buckets as `worktree` here). The map is
+        // pre-seeded with the closed vocabulary, so increment the existing key
+        // rather than inserting: any drift in `substrate_bucket` then fails
+        // loudly instead of silently broadening the payload.
         *sessions_by_substrate
-            .entry(substrate_bucket(inst).to_string())
-            .or_insert(0) += 1;
+            .get_mut(substrate_bucket(inst))
+            .expect("SUBSTRATES must contain every substrate bucket") += 1;
 
         // Prefer the canonical detection name; fall back to the raw tool
         // string. Either way it is coerced to an allowlisted bucket.
