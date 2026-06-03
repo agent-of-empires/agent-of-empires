@@ -447,7 +447,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // opencode-plannotator) is installed. See #1910.
         match override_launch_binary(&tool_name, &config.session) {
             Some(bin) => {
-                if !crate::cli::cockpit::command_present(&bin) {
+                // Use the same detection as tmux (login-shell PATH fallback
+                // included) so an override binary visible only after shell
+                // init isn't rejected here while the non-override path accepts
+                // it. See #1910.
+                if !crate::tmux::is_binary_on_path(&bin) {
                     bail!(
                         "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
                          See all supported agents: aoe agents",
@@ -1074,15 +1078,16 @@ fn detect_tool(cmd: &str) -> Result<String> {
 /// remaps the built-in to a different command. Returns the resolved
 /// command's first word, or `None` when no override applies (the caller
 /// then falls back to the built-in agent's own detection). See #1910.
+///
+/// Parsed with `shell_words` so a quoted path (e.g.
+/// `"/opt/My Wrapper/opencode" --mode plan`) yields the real binary, matching
+/// how `apply_agent_command_override` splits the command at spawn time.
 fn override_launch_binary(
     tool: &str,
     session: &crate::session::config::SessionConfig,
 ) -> Option<String> {
-    session
-        .resolve_tool_command(tool)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
+    let command = session.resolve_tool_command(tool);
+    shell_words::split(&command).ok()?.into_iter().next()
 }
 
 enum NamedToolSelection {
@@ -1219,6 +1224,21 @@ mod tests {
         assert_eq!(
             override_launch_binary("opencode", &session).as_deref(),
             Some("ocp")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_honors_quoted_path() {
+        let mut session = SessionConfig::default();
+        session.agent_command_override.insert(
+            "opencode".to_string(),
+            "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
+        );
+        // shell_words keeps the quoted path intact instead of splitting on
+        // the space, so preflight checks the real binary.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("/opt/My Wrapper/opencode")
         );
     }
 
