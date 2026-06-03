@@ -52,6 +52,20 @@ Practical implications:
   restarts and e2e runs (#1689). A runner that is hard-killed with
   `SIGKILL` (which cannot run its own cleanup) can still leak; prefer
   the verbs above over `kill -9`.
+- **Self-termination when abandoned.** The reapers above all run inside a
+  live daemon, so a daemon that dies WITHOUT killing its runners (a crash,
+  a `SIGKILL`, or an ephemeral test `$HOME` that gets deleted) would
+  otherwise orphan the runner plus its agent tree forever. Each runner
+  carries a watchdog that polls its own registry record and self-destructs
+  (terminating its whole process group) when it observes that it has been
+  abandoned: the record file vanished, the record was taken over by a
+  newer runner, or it has been detached with no daemon attached for longer
+  than a 48h retention window. The 48h window is generous enough to cover
+  an overnight or weekend `aoe serve --stop`, and the clock resets on every
+  reattach, so an intentionally stopped session stays reattachable. A
+  pending `aoe cockpit restart` is exempt (the runner sees the restart
+  marker and waits). This is a backstop; the explicit verbs above are
+  still the fast path. See #1921.
 - During the detach window (between `aoe serve --stop` and the next
   `aoe serve`), the runner buffers up to 256 agent → daemon
   notification lines so per-stream chunks emitted while the daemon was
