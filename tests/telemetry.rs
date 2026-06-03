@@ -8,6 +8,9 @@
 use agent_of_empires::session::{save_config, Config, Instance};
 use agent_of_empires::telemetry::{self, Surface};
 use serial_test::serial;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 /// Redirect the app dir at a temp location and clear the telemetry-related env
 /// vars. Returns the guard; keep it alive for the test's duration.
@@ -144,8 +147,8 @@ fn snapshot_carries_session_create_count() {
 }
 
 /// The CLI `process_start` is throttled to once per install per day so a user
-/// scripting `aoe` in a loop can't flood the endpoint: a send is due first, then
-/// not due once a confirmed send claims the daily slot.
+/// scripting `aoe` in a loop can't flood the endpoint: a reservation succeeds
+/// first, then fails once a confirmed send claims the daily slot.
 #[test]
 #[serial]
 fn cli_process_start_throttled_to_once_per_window() {
@@ -153,29 +156,25 @@ fn cli_process_start_throttled_to_once_per_window() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
-    let hour = std::time::Duration::from_secs(60 * 60);
-    assert!(
-        telemetry::cli_process_start_due(day, hour),
-        "first send in the window should be due"
-    );
+    let day = Duration::from_secs(24 * 60 * 60);
+    let hour = Duration::from_secs(60 * 60);
+    let id = telemetry::reserve_cli_process_start(day, hour)
+        .expect("first send in the window should reserve");
+    assert!(!id.is_empty());
     // A confirmed send claims the daily slot.
-    telemetry::record_cli_process_start(true);
+    telemetry::confirm_cli_process_start(&id);
     assert!(
-        !telemetry::cli_process_start_due(day, hour),
-        "within the day, no further send is due after a confirmed send"
+        telemetry::reserve_cli_process_start(day, hour).is_none(),
+        "within the day, no further send reserves after a confirmed send"
     );
     // Zero gaps always re-grant (every stamp is always older than zero).
-    assert!(telemetry::cli_process_start_due(
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO
-    ));
+    assert!(telemetry::reserve_cli_process_start(Duration::ZERO, Duration::ZERO).is_some());
 }
 
-/// User story (#1875): when a CLI `process_start` send fails, the daily throttle
-/// slot is NOT consumed, so the next invocation retries instead of losing the
-/// whole day to one transient failure. The retry gap still bounds how often the
-/// failed send is re-attempted.
+/// User story (#1875): when a CLI `process_start` send fails (reserved but never
+/// confirmed), the daily throttle slot is NOT consumed, so the next invocation
+/// retries instead of losing the whole day to one transient failure. The retry
+/// gap still bounds how often the failed send is re-attempted.
 #[test]
 #[serial]
 fn failed_cli_process_start_leaves_daily_slot_open() {
@@ -183,22 +182,117 @@ fn failed_cli_process_start_leaves_daily_slot_open() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
-    let hour = std::time::Duration::from_secs(60 * 60);
+    let day = Duration::from_secs(24 * 60 * 60);
+    let hour = Duration::from_secs(60 * 60);
 
-    // Simulate a failed send: it stamps the attempt but never claims the slot.
-    telemetry::record_cli_process_start(false);
+    // A reservation that is never confirmed (failed send) stamps the attempt but
+    // never claims the daily slot.
+    telemetry::reserve_cli_process_start(day, hour).expect("first reservation should be due");
 
     // The retry gap blocks an immediate re-attempt against a still-down endpoint.
     assert!(
-        !telemetry::cli_process_start_due(day, hour),
+        telemetry::reserve_cli_process_start(day, hour).is_none(),
         "retry gap must block an immediate re-attempt after a failed send"
     );
     // But the daily slot is still open: once the retry gap elapses, a send is due
     // again, unlike the old behaviour that lost the whole day on one failure.
     assert!(
-        telemetry::cli_process_start_due(day, std::time::Duration::ZERO),
+        telemetry::reserve_cli_process_start(day, Duration::ZERO).is_some(),
         "a failed send must leave the daily slot open for retry"
+    );
+}
+
+/// A late `confirm` whose install id no longer matches (an opt-out or reset-id
+/// landed while the send was in flight) must not recreate `telemetry.json`.
+#[test]
+#[serial]
+fn confirm_after_opt_out_does_not_recreate_state() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let day = Duration::from_secs(24 * 60 * 60);
+    let hour = Duration::from_secs(60 * 60);
+    let id = telemetry::reserve_cli_process_start(day, hour).expect("reservation due");
+
+    // Opt out mid-flight: deletes telemetry.json and its install id.
+    telemetry::apply_opt_in_change(false);
+    assert_eq!(telemetry::install_id(), None);
+
+    // A late confirm with the stale id is a no-op, not a resurrection.
+    telemetry::confirm_cli_process_start(&id);
+    assert_eq!(telemetry::install_id(), None);
+}
+
+/// Item A (#1877): the `telemetry.json` read-modify-write is serialized across
+/// threads/processes, so a concurrent id-generation race can't lose an update.
+/// Without the lock, barrier-synced threads each load an empty state, generate
+/// distinct UUIDs, and return different ids (last-writer-wins); with it, the
+/// first writer wins and every caller observes the same id.
+#[test]
+#[serial]
+fn concurrent_ensure_install_id_yields_single_id() {
+    let _tmp = isolate();
+
+    const N: usize = 32;
+    let barrier = Arc::new(Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                telemetry::ensure_install_id()
+            })
+        })
+        .collect();
+
+    let ids: Vec<Option<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let first = ids[0].clone().expect("an id is generated");
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(
+            id.as_deref(),
+            Some(first.as_str()),
+            "thread {i} returned a different id; a concurrent RMW lost an update"
+        );
+    }
+    assert_eq!(telemetry::install_id(), Some(first));
+}
+
+/// Item A (#1877): exactly one of many concurrent CLI reservations claims the
+/// daily slot. The reserve transaction (due-check + attempt stamp) runs under
+/// the lock, so two `aoe` invocations can't both pass the gate and both send.
+#[test]
+#[serial]
+fn only_one_concurrent_cli_reservation_wins() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let day = Duration::from_secs(24 * 60 * 60);
+    let hour = Duration::from_secs(60 * 60);
+
+    const N: usize = 32;
+    let barrier = Arc::new(Barrier::new(N));
+    let wins = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let wins = Arc::clone(&wins);
+            std::thread::spawn(move || {
+                barrier.wait();
+                if telemetry::reserve_cli_process_start(day, hour).is_some() {
+                    wins.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        wins.load(Ordering::SeqCst),
+        1,
+        "exactly one concurrent reservation must claim the daily slot"
     );
 }
 
