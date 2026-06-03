@@ -143,12 +143,12 @@ fn snapshot_carries_session_create_count() {
     assert_eq!(some.session_creates_since_last_snapshot, 7);
 }
 
-/// The CLI `process_start` is throttled to once per install per day so a user
+/// The CLI `cli_usage` flush is throttled to once per install per day so a user
 /// scripting `aoe` in a loop can't flood the endpoint: a send is due first, then
 /// not due once a confirmed send claims the daily slot.
 #[test]
 #[serial]
-fn cli_process_start_throttled_to_once_per_window() {
+fn cli_usage_flush_throttled_to_once_per_window() {
     let _tmp = isolate();
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
@@ -156,29 +156,29 @@ fn cli_process_start_throttled_to_once_per_window() {
     let day = std::time::Duration::from_secs(24 * 60 * 60);
     let hour = std::time::Duration::from_secs(60 * 60);
     assert!(
-        telemetry::cli_process_start_due(day, hour),
+        telemetry::cli_usage_due(day, hour),
         "first send in the window should be due"
     );
     // A confirmed send claims the daily slot.
-    telemetry::record_cli_process_start(true);
+    telemetry::record_cli_usage_flush(true);
     assert!(
-        !telemetry::cli_process_start_due(day, hour),
+        !telemetry::cli_usage_due(day, hour),
         "within the day, no further send is due after a confirmed send"
     );
     // Zero gaps always re-grant (every stamp is always older than zero).
-    assert!(telemetry::cli_process_start_due(
+    assert!(telemetry::cli_usage_due(
         std::time::Duration::ZERO,
         std::time::Duration::ZERO
     ));
 }
 
-/// User story (#1875): when a CLI `process_start` send fails, the daily throttle
+/// User story (#1875): when a CLI `cli_usage` send fails, the daily throttle
 /// slot is NOT consumed, so the next invocation retries instead of losing the
 /// whole day to one transient failure. The retry gap still bounds how often the
 /// failed send is re-attempted.
 #[test]
 #[serial]
-fn failed_cli_process_start_leaves_daily_slot_open() {
+fn failed_cli_usage_flush_leaves_daily_slot_open() {
     let _tmp = isolate();
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
@@ -187,24 +187,110 @@ fn failed_cli_process_start_leaves_daily_slot_open() {
     let hour = std::time::Duration::from_secs(60 * 60);
 
     // Simulate a failed send: it stamps the attempt but never claims the slot.
-    telemetry::record_cli_process_start(false);
+    telemetry::record_cli_usage_flush(false);
 
     // The retry gap blocks an immediate re-attempt against a still-down endpoint.
     assert!(
-        !telemetry::cli_process_start_due(day, hour),
+        !telemetry::cli_usage_due(day, hour),
         "retry gap must block an immediate re-attempt after a failed send"
     );
     // But the daily slot is still open: once the retry gap elapses, a send is due
     // again, unlike the old behaviour that lost the whole day on one failure.
     assert!(
-        telemetry::cli_process_start_due(day, std::time::Duration::ZERO),
+        telemetry::cli_usage_due(day, std::time::Duration::ZERO),
         "a failed send must leave the daily slot open for retry"
     );
 }
 
-/// An unreachable / slow endpoint must never block the CLI: `flush_process_start`
-/// is bounded and returns well within the timeout even when the endpoint
-/// black-holes the connection.
+/// User story (#1879, maintainer): when an opted-in install runs several CLI
+/// subcommands, the `cli_usage` event reflects the full mix (with repeats),
+/// not just the first command of the day.
+#[test]
+#[serial]
+fn cli_usage_records_each_subcommand() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    telemetry::record_cli_command("add");
+    telemetry::record_cli_command("session");
+    telemetry::record_cli_command("add");
+
+    let event = telemetry::build_cli_usage().expect("event built when opted in with counts");
+    assert_eq!(event.event, "cli_usage");
+    assert_eq!(event.surface, telemetry::Surface::Cli);
+    assert_eq!(event.command_counts.get("add"), Some(&2));
+    assert_eq!(event.command_counts.get("session"), Some(&1));
+    assert_eq!(event.command_counts.len(), 2);
+    assert!(!event.window_start.is_empty());
+
+    // A confirmed flush resets the window so the next event starts fresh.
+    telemetry::record_cli_usage_flush(true);
+    assert!(
+        telemetry::build_cli_usage().is_none(),
+        "counts must reset after a confirmed flush"
+    );
+}
+
+/// User story (#1879, privacy): a reported command is an allowlisted command
+/// name with no args, paths, or flags. The builder filters any key that is not
+/// in the closed clap vocabulary, so a corrupt/hand-edited `telemetry.json`
+/// cannot smuggle arbitrary strings onto the wire.
+#[test]
+#[serial]
+fn cli_usage_drops_non_allowlisted_keys() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    telemetry::record_cli_command("add");
+    // A key that is not a real clap command (as if injected into the state file).
+    telemetry::record_cli_command("/home/me/secret-project");
+
+    let event = telemetry::build_cli_usage().expect("event built");
+    assert_eq!(event.command_counts.get("add"), Some(&1));
+    for key in event.command_counts.keys() {
+        assert!(
+            agent_of_empires::cli::CLI_COMMAND_NAMES.contains(&key.as_str()),
+            "non-allowlisted key `{key}` leaked into command_counts"
+        );
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "key `{key}` is not an identifier-safe token"
+        );
+    }
+    let serialized = serde_json::to_string(&event).expect("serialize");
+    assert!(!serialized.contains("secret-project"));
+}
+
+/// User story (#1879, opted-out): when telemetry is off, recording a CLI command
+/// builds nothing and the no-op recorder never materializes the app dir.
+#[test]
+#[serial]
+fn cli_usage_default_off_records_nothing() {
+    let _tmp = isolate();
+    assert!(!telemetry::is_opted_in());
+    assert!(
+        telemetry::build_cli_usage().is_none(),
+        "no event when not opted in"
+    );
+
+    // The per-command tracker is a true no-op for a not-opted-in install: it must
+    // not create the app dir (so app-data-free commands stay pure) and must not
+    // record or send anything.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(telemetry::track_cli_command("add"));
+    assert!(
+        !agent_of_empires::session::app_dir_exists(),
+        "tracking must not create the app dir when not opted in"
+    );
+    assert!(telemetry::build_cli_usage().is_none());
+}
+
+/// An unreachable / slow endpoint must never block the CLI: `track_cli_command`
+/// (the per-invocation recorder + flush) is bounded and returns well within the
+/// timeout even when the endpoint black-holes the connection.
 #[test]
 #[serial]
 fn unreachable_endpoint_never_blocks() {
@@ -217,11 +303,13 @@ fn unreachable_endpoint_never_blocks() {
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let start = std::time::Instant::now();
-    rt.block_on(telemetry::flush_process_start(Surface::Cli));
+    // Records "add" then flushes (due on a fresh install) against the dead
+    // endpoint; the send is bounded so this returns fast.
+    rt.block_on(telemetry::track_cli_command("add"));
     let elapsed = start.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "flush_process_start blocked for {elapsed:?}; must be bounded"
+        "track_cli_command blocked for {elapsed:?}; must be bounded"
     );
 
     unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
