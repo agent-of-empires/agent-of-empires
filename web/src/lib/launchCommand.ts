@@ -79,6 +79,13 @@ export function resolveLaunchCommand(
     suffix = input.extraArgs?.trim() ?? "";
   }
 
+  // Guard against a stored override that already includes the fixed
+  // suffix (e.g. a pasted "opencode acp" with cockpitArgs ["acp"]) so the
+  // suffix is never shown, or spawned, twice.
+  if (suffix && prefix.endsWith(` ${suffix}`)) {
+    prefix = prefix.slice(0, prefix.length - suffix.length - 1).trimEnd();
+  }
+
   const full = suffix ? `${prefix} ${suffix}` : prefix;
   return { prefix, suffix, full };
 }

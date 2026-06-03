@@ -137,7 +137,15 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
 
   const commit = () => {
     setEditing(false);
-    if (draft !== prefix) onChangePrefix(draft);
+    // Strip the read-only suffix if the user pasted the full command, so
+    // the stored override stays prefix-only and the backend does not
+    // re-append the registry args (e.g. "opencode acp acp").
+    const trimmed = draft.trim();
+    const normalized =
+      suffix && trimmed.endsWith(` ${suffix}`)
+        ? trimmed.slice(0, trimmed.length - suffix.length - 1).trimEnd()
+        : trimmed;
+    if (normalized !== prefix) onChangePrefix(normalized);
   };
 
   const suffixSpan = suffix ? (

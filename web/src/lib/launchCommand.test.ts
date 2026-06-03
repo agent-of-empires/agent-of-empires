@@ -71,6 +71,16 @@ describe("resolveLaunchCommand (cockpit)", () => {
     expect(r.full.match(/acp/g)?.length).toBe(1);
   });
 
+  it("strips a duplicated registry-arg suffix from an override (no double-append)", () => {
+    const r = resolveLaunchCommand({
+      ...base,
+      cockpitCommand: "opencode",
+      cockpitArgs: ["acp"],
+      manualOverride: "opencode acp",
+    });
+    expect(r).toEqual({ prefix: "opencode", suffix: "acp", full: "opencode acp" });
+  });
+
   it("falls back to the tool name when no command is known", () => {
     expect(resolveLaunchCommand({ tool: "opencode", useCockpit: true })).toEqual(
       { prefix: "opencode", suffix: "", full: "opencode" },
