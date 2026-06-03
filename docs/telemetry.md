@@ -8,12 +8,22 @@ content, and it honors `DO_NOT_TRACK`.
 
 ## What is sent
 
-Only when you opt in, and only aggregate counts. Two event kinds, both with a
+Only when you opt in, and only aggregate counts. Three event kinds, all with a
 closed, versioned schema (see `src/telemetry/events.rs`):
 
-- **`process_start`** on boot: surface (`cli` / `tui` / `serve`), aoe version,
-  OS, and CPU arch. The `cli` surface is throttled to at most once per install
-  per day, so scripting `aoe` in a loop never floods the endpoint.
+- **`process_start`** on boot of a long-running surface (`tui` / `serve`): the
+  surface, aoe version, OS, and CPU arch.
+- **`cli_usage`** from short-lived `aoe <subcommand>` invocations: the surface
+  (`cli`), aoe version, OS, CPU arch, a window-start timestamp, and a
+  `command_counts` map of allowlisted subcommand name to invocation count
+  (e.g. `{add: 5, list: 2}`). Each `aoe` run is a separate short-lived process,
+  so counts accumulate on disk and flush as one POST per install per day; the
+  daily throttle means scripting `aoe` in a loop never floods the endpoint, and
+  the count mix answers "which subcommands this install actually uses" rather
+  than just "the CLI ran today". The map keys are the fixed clap subcommand set
+  (`add`, `session`, `telemetry`, ...), filtered against an allowlist before
+  sending, so no argument, flag, or path is ever attached; hidden internal
+  commands are never counted.
 - **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
   ~12 hours. It is a point-in-time summary of the current install, never a
   stream of actions:
@@ -98,9 +108,11 @@ non-success HTTP status (for example a rejected key or a schema rejection at the
 gateway) is treated as a failure, not a silent success. Signals are not consumed
 until delivery is confirmed, so a failed send does not silently drop them:
 
-- the CLI `process_start` daily slot is claimed only on a confirmed send, so a
-  failed send leaves it open for the next invocation to retry (bounded to once
-  per hour so a down endpoint cannot make every `aoe` invocation re-send);
+- the CLI `cli_usage` daily slot is claimed only on a confirmed send, and the
+  accumulated `command_counts` are cleared only then, so a failed send leaves
+  both the slot and the counts intact for the next invocation to retry (bounded
+  to once per hour so a down endpoint cannot make every `aoe` invocation
+  re-send), and a transient failure never drops a window of commands;
 - the serve `web_seen` / `cockpit_seen` flags and the session-create counter are
   cleared only after a confirmed snapshot send, so a failed snapshot keeps them
   for the next one instead of losing that window's signal.
