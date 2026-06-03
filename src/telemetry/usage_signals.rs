@@ -27,7 +27,7 @@ pub const USAGE_SIGNALS: &[&str] = &["web", "cockpit"];
 /// lock-free. The browser pings `POST /api/telemetry/seen`, which folds the
 /// count in here; the next opt-in snapshot reports the map and clears exactly
 /// what it reported once the send is confirmed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UsageSeenCounters {
     counts: BTreeMap<&'static str, AtomicU32>,
 }
