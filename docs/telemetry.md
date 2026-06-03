@@ -13,10 +13,14 @@ closed, versioned schema (see `src/telemetry/events.rs`):
 
 - **`process_start`** on boot: surface (`cli` / `tui` / `serve`), aoe version,
   OS, and CPU arch. The `cli` surface is throttled to at most once per install
-  per day, so scripting `aoe` in a loop never floods the endpoint.
-- **`usage_snapshot`** from the TUI and `aoe serve`, on start and then every
-  ~12 hours. It is a point-in-time summary of the current install, never a
-  stream of actions:
+  per day, so scripting `aoe` in a loop never floods the endpoint. The long-lived
+  `tui` and `serve` surfaces emit one per launch (not throttled), so a restart is
+  visible; a pathological crash-loop is absorbed by the gateway rather than a
+  local cap.
+- **`usage_snapshot`** from the TUI and `aoe serve`, on start and then about
+  every 12 hours, with a small random jitter on the period so installs that boot
+  together don't snapshot in lockstep. It is a point-in-time summary of the
+  current install, never a stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
@@ -62,8 +66,10 @@ never derived from hostname, username, MAC, or filesystem.
 
 Counting distinct installs needs a stable id. On opt-in, aoe generates a random
 `uuid::Uuid::new_v4()` and stores it in `<app_dir>/telemetry.json` (owner-only).
-It is kept **out of `config.toml`** on purpose, since people routinely paste
-their config into bug reports. Opting out deletes the file; `aoe telemetry
+Updates to that file are serialized with an advisory lock (a `.telemetry.lock`
+sidecar) so concurrent `aoe` processes (TUI, CLI, `aoe serve`) can't clobber each
+other's writes. It is kept **out of `config.toml`** on purpose, since people
+routinely paste their config into bug reports. Opting out deletes the file; `aoe telemetry
 reset-id` rotates it. Resetting mints a brand-new id, so that install then
 counts as a new one in the aggregate distinct-install and retention numbers;
 only reset if you actually want to disassociate from prior counts.

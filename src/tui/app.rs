@@ -577,8 +577,11 @@ impl App {
 
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
         // send an initial snapshot, then refresh it periodically and once more
-        // on graceful exit. All sends are detached and swallow errors.
-        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+        // on graceful exit. All sends are detached and swallow errors. The
+        // periodic interval carries bounded jitter (12h + up to 30m) so installs
+        // that boot together don't snapshot in lockstep; the boot snapshot above
+        // stays immediate.
+        let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
         crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
         self.emit_telemetry_snapshot();
         let mut last_telemetry_snapshot = std::time::Instant::now();
@@ -1181,7 +1184,7 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
-            if last_telemetry_snapshot.elapsed() >= TELEMETRY_SNAPSHOT_INTERVAL {
+            if last_telemetry_snapshot.elapsed() >= telemetry_snapshot_interval {
                 last_telemetry_snapshot = std::time::Instant::now();
                 self.emit_telemetry_snapshot();
             }
