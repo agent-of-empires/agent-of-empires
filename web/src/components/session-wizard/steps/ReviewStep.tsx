@@ -6,10 +6,10 @@ import { useServerDown, OFFLINE_TITLE } from "../../../lib/connectionState";
 import type { AgentInfo } from "../../../lib/types";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
-import { useCommandMaps } from "../useCommandMaps";
+import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useCockpit: boolean; [key: string]: unknown; }
-interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; }
+interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; commandMaps?: CommandMaps; }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
@@ -198,7 +198,7 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
   );
 }
 
-export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled }: Props) {
+export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const hasStep = (id: StepId) => steps.some((s) => s.id === id);
   const offline = useServerDown();
   // Scratch sessions intentionally carry no path until the server
@@ -221,7 +221,6 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
   // can confirm (and edit) it before starting. Mirrors the backend
   // precedence; the registry args stay in a read-only suffix so an inline
   // edit only touches the command override (#1911).
-  const commandMaps = useCommandMaps(data.profile);
   const resolved = resolveLaunchCommand({
     tool: data.tool,
     useCockpit: willUseCockpit,

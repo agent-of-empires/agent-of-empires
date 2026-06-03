@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
@@ -12,6 +12,11 @@ import { AgentStep } from "./steps/AgentStep";
 import { ReviewStep } from "./steps/ReviewStep";
 import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
+import {
+  commandMapsFromSettings,
+  EMPTY_COMMAND_MAPS,
+  type CommandMaps,
+} from "./commandMaps";
 
 /** localStorage key persisting the last tool the user picked in the
  *  wizard. Per-browser, scoped by tool registry key. Validated against
@@ -126,6 +131,12 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     agents: [], groups: [], profiles: [], dockerAvailable: false,
   });
 
+  // Profile-resolved override/custom-agent maps for the launch-command
+  // preview. Sourced from the settings the wizard already fetches on open
+  // and on a profile switch, so the preview adds no extra request. See
+  // #1911.
+  const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+
   const steps = useMemo(() => computeSteps(state.data),
     [state.data.sandboxEnabled, state.data.advancedEnabled]);
 
@@ -154,6 +165,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
         prefill?.profile || p.find((x) => x.is_default)?.name || "";
       fetchSettings(effectiveProfile || undefined).then((s) => {
         if (!s) return;
+        setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
@@ -202,8 +214,11 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     extraEnv: string[];
     cockpitModel?: string;
     cockpitEffort?: string;
+    commandMaps?: CommandMaps;
   }) => {
-    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...defaults });
+    const { commandMaps: maps, ...rest } = defaults;
+    if (maps) setCommandMaps(maps);
+    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
   }, []);
 
   const goNext = () => { if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 }); };
@@ -298,10 +313,11 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             dockerAvailable={state.dockerAvailable}
             onApplyProfileDefaults={handleApplyProfileDefaults}
             cockpitMasterEnabled={cockpitMasterEnabled}
+            commandMaps={commandMaps}
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} />;
+        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} commandMaps={commandMaps} />;
       default:
         return null;
     }

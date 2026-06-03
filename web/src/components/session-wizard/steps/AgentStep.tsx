@@ -3,7 +3,7 @@ import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
-import { useCommandMaps } from "../useCommandMaps";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
   tool: string;
@@ -37,7 +37,12 @@ interface Props {
     extraEnv: string[];
     cockpitModel?: string;
     cockpitEffort?: string;
+    commandMaps?: CommandMaps;
   }) => void;
+  /** Profile-resolved override / custom-agent maps, used to preview the
+   *  exact launch command. Sourced from the settings the wizard already
+   *  fetched, so this step issues no extra request. See #1911. */
+  commandMaps?: CommandMaps;
   /** Live value of the cockpit master switch. When true, sessions
    *  the user creates here run in cockpit mode automatically (for
    *  tools with an ACP adapter); when false, every session is tmux.
@@ -133,7 +138,7 @@ function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onCh
   );
 }
 
-export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled }: Props) {
+export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectableAgents = agents.filter(
     (agent) => agent.kind === "custom" || agent.installed,
   );
@@ -143,11 +148,6 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
-
-  // Command-override maps from the profile-resolved config, used to
-  // preview the exact launch command (#1766). Read-only; mirrors the
-  // backend `resolve_tool_command` precedence.
-  const commandMaps = useCommandMaps(data.profile);
 
   // Mirror SessionWizard.handleSubmit / ReviewStep so the preview shows
   // the substrate the session will actually launch with (#1580).
@@ -198,6 +198,7 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
           extraEnv: env,
           cockpitModel: typeof cockpitDefault?.model === "string" ? cockpitDefault.model : "",
           cockpitEffort: typeof cockpitDefault?.effort === "string" ? cockpitDefault.effort : "",
+          commandMaps: commandMapsFromSettings(settings),
         });
       }
     } catch {
