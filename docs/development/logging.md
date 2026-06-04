@@ -197,7 +197,7 @@ Not captured (intentional, v1): `console.error`. Wrapping it produces noisy dupl
 | `<configured>.1` ... `<configured>.<keep_count>` | Rotated files, oldest at the highest number. |
 | `<configured>.lock` | Idle `fs2` advisory lock file used to serialize rotation across processes. Always present after the first rotation; do not delete while any aoe process is running. |
 | `~/.agent-of-empires/runtime_filter` | Atomically written on every successful `aoe log-level` swap; consumed by runner watchers. |
-| `~/.agent-of-empires/acp-workers/<session-id>.log` | Per-session diagnostics surfaced by `aoe acp logs --session <id>`. The runner writes its startup marker and the agent's stderr here directly; the daemon additionally tees every session-scoped tracing event into it (see Per-session tee below). Size-rotated at 10 MiB, keep 2. |
+| `~/.agent-of-empires/acp-workers/<session-id>.log` | Per-session diagnostics surfaced by `aoe acp logs --session <id>`. The runner writes its startup marker and the agent's stderr here directly; the daemon additionally tees every session-scoped tracing event into it (see Per-session tee above). Size-rotated at 10 MiB, keep 2. |
 | `~/.agent-of-empires/serve.log.legacy` | One-shot rename of the pre-consolidation `serve.log` by migration v007. Safe to delete once you've extracted any data you needed. |
 
 On Linux, replace `~/.agent-of-empires` with `$XDG_CONFIG_HOME/agent-of-empires`. Debug builds use `~/.agent-of-empires-dev` to avoid colliding with an installed release.
