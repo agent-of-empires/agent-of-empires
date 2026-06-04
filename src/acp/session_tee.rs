@@ -97,22 +97,27 @@ impl SessionTeeLayer {
             return Some(entry.writer.clone());
         }
         let path = crate::acp::worker_registry::log_path_for(session).ok()?;
+        // At capacity: evict the oldest entry whose writer is idle
+        // (`strong_count == 1`, only the cache holds it). Evicting a writer
+        // still in flight on another thread would let this call open a
+        // second `SizeRotatingWriter` on the same file and race its appends
+        // and rotation. If every cached writer is in flight, drop this event
+        // rather than open a racing writer.
+        if cache.map.len() >= MAX_OPEN_SESSION_LOGS {
+            let evict = cache
+                .map
+                .iter()
+                .filter(|(_, e)| Arc::strong_count(&e.writer) == 1)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())?;
+            cache.map.remove(&evict);
+        }
         let policy = RotationPolicy {
             kind: RotationKind::Size,
             max_size_bytes: PER_SESSION_MAX_BYTES,
             keep_count: PER_SESSION_KEEP,
         };
         let writer = Arc::new(Mutex::new(SizeRotatingWriter::new(path, policy).ok()?));
-        if cache.map.len() >= MAX_OPEN_SESSION_LOGS {
-            if let Some(evict) = cache
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone())
-            {
-                cache.map.remove(&evict);
-            }
-        }
         cache.map.insert(
             session.to_string(),
             Entry {
@@ -285,28 +290,41 @@ mod tests {
     use tracing_subscriber::Registry;
 
     /// Point `get_app_dir` at a throwaway home so `log_path_for` resolves
-    /// under a temp dir. Mirrors `worker_registry::tests::with_temp_home`.
+    /// under a temp dir. Restoration runs from an RAII guard so a panicking
+    /// `f()` cannot leak the temp env into later serialized tests.
     fn with_temp_home<F: FnOnce()>(f: F) {
+        struct EnvGuard {
+            home: Option<std::ffi::OsString>,
+            xdg: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: tests are serialized via `#[serial]`.
+                unsafe {
+                    match self.home.take() {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                    match self.xdg.take() {
+                        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                        None => std::env::remove_var("XDG_CONFIG_HOME"),
+                    }
+                }
+            }
+        }
+
         let tmp = TempDir::new().unwrap();
-        let original = std::env::var_os("HOME");
-        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: tests are serialized via `#[serial]`; the env mutation
-        // window is bounded to this closure and restored on exit.
+        let _guard = EnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg: std::env::var_os("XDG_CONFIG_HOME"),
+        };
+        // SAFETY: tests are serialized via `#[serial]`; the guard restores
+        // the originals on scope exit, including an unwind.
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
         f();
-        unsafe {
-            match original {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match original_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
     }
 
     fn read_log(session: &str) -> String {
