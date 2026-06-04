@@ -58,7 +58,12 @@ fn record_and_check_respawn_budget(
     id: &str,
     now: Instant,
 ) -> bool {
-    let entry = history.entry(id.to_string()).or_default();
+    // Avoid an unconditional `id.to_string()` on the common hit path:
+    // `entry(K)` takes the key by value, so it would allocate every tick.
+    if !history.contains_key(id) {
+        history.insert(id.to_string(), Vec::new());
+    }
+    let entry = history.get_mut(id).expect("inserted above when missing");
     entry.retain(|t| now.duration_since(*t) < RECONCILER_RESPAWN_WINDOW);
     if entry.len() >= RECONCILER_MAX_RESPAWNS_IN_WINDOW {
         return true;
@@ -1352,7 +1357,9 @@ mod tests {
         assert_eq!(history[id].len(), RECONCILER_MAX_RESPAWNS_IN_WINDOW);
 
         // Once the window fully elapses the stale attempts prune and the
-        // session is allowed to retry again.
+        // session is allowed to retry again. Note: in the live system a
+        // parked session never reaches this function again until explicitly
+        // un-parked; this exercises the pruning invariant in isolation.
         let later = now + Duration::from_secs(120);
         assert!(
             !record_and_check_respawn_budget(&mut history, id, later),

@@ -66,8 +66,10 @@ const NOTIFICATION_BUFFER_LINES: usize = 256;
 
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
-/// debug.log without grepping for the absence of success. Matches the
-/// runner-socket-appear deadline the daemon uses. See #1945.
+/// debug.log without grepping for the absence of success. Intentionally
+/// mirrors `runner_socket_deadline()` in `cockpit/acp_client.rs` (the
+/// daemon's 10s wait for this runner's socket to appear); update both if
+/// the handshake window changes. See #1945.
 const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
 
 /// Pipe-read buffer for the agent's stdout. 64KB matches the default
