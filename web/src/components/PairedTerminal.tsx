@@ -90,9 +90,10 @@ function PairedTerminal({
         if (cancelled) return;
         if (ok) {
           setReady(true);
-          requestAnimationFrame(() => {
-            if (consumePendingTerminalFocus("paired")) focusSelf();
-          });
+          // The xterm element and its textarea exist once ensureTerminal
+          // resolves (independent of the `ready` overlay flag), so a pending
+          // paired focus intent can be drained here directly.
+          if (consumePendingTerminalFocus("paired")) focusSelf();
         } else setBootError(true);
       })
       .catch(() => {

@@ -31,8 +31,9 @@ export function ContextPrimerBanner({
 
   // Reset transient state whenever a new reset incident lands.
   const [handledResetSeq, setHandledResetSeq] = useState<number | null>(null);
-  if (available?.resetSeq !== handledResetSeq) {
-    setHandledResetSeq(available?.resetSeq ?? null);
+  const resetSeq = available?.resetSeq ?? null;
+  if (resetSeq !== handledResetSeq) {
+    setHandledResetSeq(resetSeq);
     setError(null);
     setLoading(false);
   }
