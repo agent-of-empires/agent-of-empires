@@ -1,4 +1,4 @@
-//! Regression tests for #1921: an abandoned `aoe __cockpit-runner` must
+//! Regression tests for #1921: an abandoned `aoe __acp-runner` must
 //! self-terminate instead of leaking forever, and a superseded runner must
 //! exit WITHOUT deleting the replacement runner's files.
 //!
@@ -57,14 +57,14 @@ impl Drop for Scratch {
 /// Spawn a runner with `cat` as the fake agent and wait until it has
 /// written its registry record. Returns the child and the record path.
 fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -> (Child, PathBuf) {
-    let workers = app_dir(home, xdg).join("cockpit-workers");
+    let workers = app_dir(home, xdg).join("acp-workers");
     let socket = workers.join(format!("{session_id}.sock"));
     let record = workers.join(format!("{session_id}.json"));
 
     let bin = env!("CARGO_BIN_EXE_aoe");
     let mut child = Command::new(bin)
         .args([
-            "__cockpit-runner",
+            "__acp-runner",
             "--socket",
             socket.to_str().unwrap(),
             "--session-id",
@@ -79,9 +79,9 @@ fn spawn_runner_and_wait_for_record(home: &Path, xdg: &Path, session_id: &str) -
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", xdg)
         // Shrink the watchdog poll so an orphan dies in well under a second.
-        .env("AOE_COCKPIT_WATCHDOG_POLL_MS", "150")
+        .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
         .spawn()
-        .expect("spawn cockpit runner");
+        .expect("spawn acp runner");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !record.exists() {

@@ -64,7 +64,7 @@ Practical implications:
   than a 48h retention window. The 48h window is generous enough to cover
   an overnight or weekend `aoe serve --stop`, and the clock resets on every
   reattach, so an intentionally stopped session stays reattachable. A
-  pending `aoe cockpit restart` is exempt (the runner sees the restart
+  pending `aoe acp restart` is exempt (the runner sees the restart
   marker and waits). This is a backstop; the explicit verbs above are
   still the fast path. See #1921.
 - During the detach window (between `aoe serve --stop` and the next

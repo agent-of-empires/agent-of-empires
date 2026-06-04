@@ -265,10 +265,10 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
 }
 
 /**
- * Last-resort teardown: group-kill any `aoe __cockpit-runner` still
+ * Last-resort teardown: group-kill any `aoe __acp-runner` still
  * recorded in the worker registry by reading its pid straight off disk.
  *
- * `aoe cockpit stop --all` only works while the daemon is alive; if the
+ * `aoe acp stop --all` only works while the daemon is alive; if the
  * daemon already crashed or was SIGKILLed, its runners (and their node +
  * `claude` descendants) are orphaned and would leak forever once the temp
  * HOME is deleted. Each runner is its own process-group leader (spawned via
@@ -277,7 +277,7 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
  */
 async function killOrphanRunners(appDir: string): Promise<void> {
   const { readdirSync, readFileSync } = await import("node:fs");
-  const workersDir = join(appDir, "cockpit-workers");
+  const workersDir = join(appDir, "acp-workers");
   let entries: string[];
   try {
     entries = readdirSync(workersDir);
@@ -712,13 +712,13 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     },
     async stop() {
       try {
-        // Terminate cockpit workers BEFORE killing the daemon and deleting
-        // the temp HOME. `cockpit stop --all` makes the still-live daemon
-        // group-kill every per-session `aoe __cockpit-runner` (and its node
+        // Terminate acp workers BEFORE killing the daemon and deleting
+        // the temp HOME. `acp stop --all` makes the still-live daemon
+        // group-kill every per-session `aoe __acp-runner` (and its node
         // + claude descendants). Without it they outlive the daemon, the
         // HOME is then wiped, and the orphaned tree leaks forever. See
         // #1921.
-        spawnSync(aoeBinary, ["cockpit", "stop", "--all"], {
+        spawnSync(aoeBinary, ["acp", "stop", "--all"], {
           env: seedEnv,
           stdio: "ignore",
           timeout: 10_000,
