@@ -91,7 +91,7 @@ agent command becomes `custom`, an unrecognized model becomes `other`. **Raw
 commands, file paths, titles, branch names, group paths, and prompts are never
 sent.**
 
-#### Model families and the `other` bucket
+### Model families and the `other` bucket
 
 `model_bucket` maps a model string to a small, closed vocabulary of family
 names (`claude`, `openai`, `gemini`, ...); anything it does not recognize
