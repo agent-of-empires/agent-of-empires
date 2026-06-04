@@ -17,7 +17,6 @@ import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import {
   CollapsibleSection,
-  ListField,
   NumberField,
   SelectField,
   TextField,
@@ -123,6 +122,24 @@ const ALL_TAB_IDS = new Set<TabId>([
 function isTabId(value: unknown): value is TabId {
   return typeof value === "string" && ALL_TAB_IDS.has(value as TabId);
 }
+
+// Tabs whose body is rendered (wholly or partly) by the schema-driven
+// SchemaSection. They share one loading/error guard so a slow or failed
+// `GET /api/settings/schema` shows a single spinner/retry instead of each
+// section rendering empty. Tabs absent here are fully hand-written (diff,
+// telemetry) or have no config body (terminal, security, devices).
+const SCHEMA_BACKED_TABS = new Set<TabId>([
+  "session",
+  "sandbox",
+  "worktree",
+  "theme",
+  "sound",
+  "tmux",
+  "updates",
+  "logging",
+  "notifications",
+  "structured-view",
+]);
 
 /// Resolves the value `selectedProfile` should take when the mount-time
 /// `fetchProfiles()` returns. Preserve a user-set selection if it's still a
@@ -333,10 +350,34 @@ export function SettingsView({
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 
+    // Shared guard for every schema-driven tab: one spinner while the schema
+    // loads, one retry on failure.
+    if (SCHEMA_BACKED_TABS.has(activeTab)) {
+      if (schemaLoading) {
+        return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+      }
+      if (schemaError) {
+        return (
+          <div className="space-y-3">
+            <div className="text-sm text-status-error">{schemaError}</div>
+            <button
+              type="button"
+              onClick={() => void loadSchema()}
+              className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
+            >
+              Retry
+            </button>
+          </div>
+        );
+      }
+    }
+
     switch (activeTab) {
       case "session":
         return (
           <div className="space-y-4">
+            {/* Non-schema row: choosing the default profile is a profile-
+                management action, not a config field. */}
             <SelectField
               label="Default profile"
               description="Profile used for new sessions"
@@ -344,31 +385,16 @@ export function SettingsView({
               onChange={(v) => handleSetDefault(v)}
               options={profiles.map((p) => ({ value: p.name, label: p.name }))}
             />
-            <TextField
-              label="Default agent"
-              value={(session.default_tool as string) ?? ""}
-              onChange={(v) => saveField("session", session, "default_tool", v || null)}
-              placeholder="Auto-detect"
-              mono
+            <SchemaSection
+              section="session"
+              schema={schema}
+              values={session}
+              onSaveField={saveSubField}
+              advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
             />
-            <ToggleField
-              label="YOLO mode by default"
-              description="New sessions skip permission prompts"
-              checked={(session.yolo_mode_default as boolean) ?? false}
-              onChange={(v) => saveField("session", session, "yolo_mode_default", v)}
-            />
-            <ToggleField
-              label="Strict hotkeys"
-              description="Require SHIFT on letter-based TUI hotkeys to prevent accidental actions"
-              checked={(session.strict_hotkeys as boolean) ?? false}
-              onChange={(v) => saveField("session", session, "strict_hotkeys", v)}
-            />
-            <ToggleField
-              label="Agent status hooks"
-              description="Install status-detection hooks into agent settings files for reliable status tracking"
-              checked={(session.agent_status_hooks as boolean) ?? true}
-              onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
-            />
+            {/* Non-schema row: acp_defaults is #[setting(skip)] (configured per
+                session via the wizard), so it has no schema descriptor and
+                keeps its bespoke JSON editor. */}
             <TextField
               label="Structured view defaults"
               description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
@@ -381,153 +407,21 @@ export function SettingsView({
               mono
               multiline
             />
-            <NumberField
-              label="Auto-stop idle sessions (s)"
-              description="Seconds a plain tmux session may sit Idle before it is auto-stopped (its tmux session and any sandbox container are killed, leaving a restartable Stopped row). 0 disables (default). A session with an attached tmux client, or used more recently than the threshold, is spared. Checked about once a minute, so the stop can lag by up to a minute. Acp workers use the separate acp setting. Persists to config.toml as session.auto_stop_idle_secs; cross-device. See #1690."
-              value={
-                typeof session.auto_stop_idle_secs === "number"
-                  ? (session.auto_stop_idle_secs as number)
-                  : 0
-              }
-              min={0}
-              onChange={(v) => saveField("session", session, "auto_stop_idle_secs", v)}
-            />
           </div>
         );
 
       case "sandbox":
         return (
-          <div className="space-y-4">
-            <ToggleField
-              label="Sandbox enabled by default"
-              description="Run new sessions in a Docker container"
-              checked={(sandbox.enabled_by_default as boolean) ?? false}
-              onChange={(v) => saveField("sandbox", sandbox, "enabled_by_default", v)}
-            />
-            <TextField
-              label="Default container image"
-              value={(sandbox.default_image as string) ?? ""}
-              onChange={(v) => saveField("sandbox", sandbox, "default_image", v)}
-              placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
-              mono
-            />
-            <SelectField
-              label="Default terminal mode"
-              value={(sandbox.default_terminal_mode as string) ?? "host"}
-              onChange={(v) => saveField("sandbox", sandbox, "default_terminal_mode", v)}
-              options={[
-                { value: "host", label: "Host" },
-                { value: "container", label: "Container" },
-              ]}
-            />
-            <SelectField
-              label="Container runtime"
-              value={(sandbox.container_runtime as string) ?? "docker"}
-              onChange={(v) => saveField("sandbox", sandbox, "container_runtime", v)}
-              options={[
-                { value: "docker", label: "Docker" },
-                { value: "apple_container", label: "Apple Container" },
-              ]}
-            />
-            <ToggleField
-              label="Mount SSH keys"
-              description="Mount ~/.ssh into sandbox containers"
-              checked={(sandbox.mount_ssh as boolean) ?? false}
-              onChange={(v) => saveField("sandbox", sandbox, "mount_ssh", v)}
-            />
-            <ToggleField
-              label="Auto cleanup"
-              description="Remove containers when sessions are deleted"
-              checked={(sandbox.auto_cleanup as boolean) ?? true}
-              onChange={(v) => saveField("sandbox", sandbox, "auto_cleanup", v)}
-            />
-            <CollapsibleSection
-              title="Advanced"
-              subtitle="Resource limits, custom instructions, environment, volumes, and ports."
-            >
-              <TextField
-                label="CPU limit"
-                value={(sandbox.cpu_limit as string) ?? ""}
-                onChange={(v) => saveField("sandbox", sandbox, "cpu_limit", v || null)}
-                placeholder="e.g. 4"
-              />
-              <TextField
-                label="Memory limit"
-                value={(sandbox.memory_limit as string) ?? ""}
-                onChange={(v) => saveField("sandbox", sandbox, "memory_limit", v || null)}
-                placeholder="e.g. 8g"
-              />
-              <TextField
-                label="Custom instruction"
-                description="Text appended to the agent system prompt in sandboxed sessions"
-                value={(sandbox.custom_instruction as string) ?? ""}
-                onChange={(v) => saveField("sandbox", sandbox, "custom_instruction", v || null)}
-                placeholder="Additional instructions for the agent..."
-                multiline
-              />
-              <ListField
-                label="Environment variables"
-                description="Variables passed to sandbox containers (KEY or KEY=VALUE)"
-                items={(sandbox.environment as string[]) ?? []}
-                onChange={(items) => saveField("sandbox", sandbox, "environment", items)}
-                placeholder="KEY or KEY=VALUE"
-                validate={(v) => {
-                  if (!/^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v))
-                    return "Must be KEY or KEY=VALUE (letters, digits, underscores)";
-                  return null;
-                }}
-              />
-              <ListField
-                label="Extra volumes"
-                description="Additional volume mounts (host:container[:ro])"
-                items={(sandbox.extra_volumes as string[]) ?? []}
-                onChange={(items) => saveField("sandbox", sandbox, "extra_volumes", items)}
-                placeholder="/host/path:/container/path"
-                validate={(v) => {
-                  if (!v.includes(":")) return "Must contain ':' (host:container)";
-                  return null;
-                }}
-              />
-              <ListField
-                label="Port mappings"
-                description="Port forwarding (host:container)"
-                items={(sandbox.port_mappings as string[]) ?? []}
-                onChange={(items) => saveField("sandbox", sandbox, "port_mappings", items)}
-                placeholder="3000:3000"
-                validate={(v) => {
-                  if (!/^\d+:\d+$/.test(v)) return "Must be port:port (e.g. 3000:3000)";
-                  return null;
-                }}
-              />
-              <ListField
-                label="Volume ignores"
-                description="Directories excluded from host bind mount"
-                items={(sandbox.volume_ignores as string[]) ?? []}
-                onChange={(items) => saveField("sandbox", sandbox, "volume_ignores", items)}
-                placeholder="node_modules"
-              />
-            </CollapsibleSection>
-          </div>
+          <SchemaSection
+            section="sandbox"
+            schema={schema}
+            values={sandbox}
+            onSaveField={saveSubField}
+            advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
+          />
         );
 
       case "worktree":
-        if (schemaLoading) {
-          return <div className="text-sm text-text-dim">Loading settings schema...</div>;
-        }
-        if (schemaError) {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm text-status-error">{schemaError}</div>
-              <button
-                type="button"
-                onClick={() => void loadSchema()}
-                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
-              >
-                Retry
-              </button>
-            </div>
-          );
-        }
         return (
           <SchemaSection
             section="worktree"
