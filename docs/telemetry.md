@@ -28,9 +28,12 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   allowlist before sending, so no argument, flag, or path is ever attached;
   hidden internal commands are never counted.
 - **`usage_snapshot`** from the TUI and `aoe serve`, on start and then about
-  every 12 hours, with a small random jitter on the period so installs that boot
-  together don't snapshot in lockstep. It is a point-in-time summary of the
-  current install, never a stream of actions:
+  every 4 hours, with a small random jitter on the period so installs that boot
+  together don't snapshot in lockstep. Start and graceful-shutdown snapshots
+  bracket every run, so a short session that never stays up that long is still
+  reported; the periodic cadence only adds mid-life snapshots for a long-running
+  daemon. It is a point-in-time summary of the current install, never a stream
+  of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
   - the peak concurrent session count seen across the window since the last
@@ -77,14 +80,15 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   To capture the agent/model mix and peak concurrency of short-lived sessions
   without sending more often, `aoe serve` samples the live session list locally
   about every 30 minutes and folds each sample into an in-memory aggregate; the
-  send cadence stays at one POST per 12 hours. The sampling is purely local, so
+  send cadence stays at one POST per ~4 hours. The sampling is purely local, so
   network and server load are unchanged. The aggregate lives in memory only: a
-  daemon crash or restart mid-window loses the partial window (only a graceful
-  shutdown flushes it), while machine sleep makes the loop miss sample ticks
-  rather than clearing the window. A session that opens and closes entirely
-  between two ~30-minute samples is still missed by the windowed maps, though
-  its raw count survives in `session_creates_since_last_snapshot`. The TUI keeps
-  the start / shutdown / 12h point-in-time behavior and does not aggregate.
+  graceful shutdown flushes it, but a hard kill (power-off, crash, or `SIGKILL`)
+  loses the partial window, bounded to that ~4h since the last send; machine
+  sleep makes the loop miss sample ticks rather than clearing the window. A
+  session that opens and closes entirely between two ~30-minute samples is still
+  missed by the windowed maps, though its raw count survives in
+  `session_creates_since_last_snapshot`. The TUI keeps the start / shutdown /
+  periodic point-in-time behavior and does not aggregate.
 
 ### Version health
 

@@ -118,7 +118,7 @@ pub struct CliUsage {
 }
 
 /// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
-/// ~12 hours, and best-effort on graceful shutdown. Carries current
+/// ~4 hours, and best-effort on graceful shutdown. Carries current
 /// aggregate state, never a per-action stream. Every string-valued bucket
 /// has already passed through [`super::sanitize`].
 #[derive(Debug, Clone, Serialize)]
@@ -157,7 +157,7 @@ pub struct UsageSnapshot {
     /// Peak concurrent `session_total` observed across the window since the
     /// last snapshot. `aoe serve` folds a sample every ~30 min into a local
     /// aggregate and reports the max here, so a short-lived burst of sessions
-    /// that opens and closes between two 12h sends is still captured. The TUI
+    /// that opens and closes between two 4h sends is still captured. The TUI
     /// does not aggregate, so it reports the point-in-time `session_total`.
     pub peak_concurrent_sessions: u32,
 

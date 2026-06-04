@@ -77,14 +77,19 @@ const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// Base cadence for periodic `usage_snapshot` sends (TUI and serve). The real
-/// period is this plus bounded jitter (see [`snapshot_interval`]).
-pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+/// period is this plus bounded jitter (see [`snapshot_interval`]). Set to 4h so
+/// the steady-state heartbeat covers a typical workday about twice and a hard
+/// kill (power-off / crash, which skips the graceful-shutdown flush) loses at
+/// most one ~4h window rather than 12h. Short-lived runs are already bracketed
+/// by the immediate boot snapshot and the shutdown flush, so this only shapes
+/// the cadence of a long-running daemon.
+pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Upper bound on the random jitter added to [`SNAPSHOT_BASE_INTERVAL`].
 const SNAPSHOT_JITTER: Duration = Duration::from_secs(30 * 60);
 
 /// Periodic snapshot period: [`SNAPSHOT_BASE_INTERVAL`] plus a random offset in
-/// `[0, SNAPSHOT_JITTER)`. A fixed 12h period anchored to process start means a
+/// `[0, SNAPSHOT_JITTER)`. A fixed 4h period anchored to process start means a
 /// fleet that boots together (e.g. a post-update restart wave) keeps snapshotting
 /// in lockstep forever; rolling a per-process jitter decorrelates the periodic
 /// ticks so they spread apart by the second tick. The boot snapshot is sent

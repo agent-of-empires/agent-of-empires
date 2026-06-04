@@ -578,7 +578,7 @@ impl App {
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
         // send an initial snapshot, then refresh it periodically and once more
         // on graceful exit. All sends are detached and swallow errors. The
-        // periodic interval carries bounded jitter (12h + up to 30m) so installs
+        // periodic interval carries bounded jitter (4h + up to 30m) so installs
         // that boot together don't snapshot in lockstep; the boot snapshot above
         // stays immediate.
         let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();

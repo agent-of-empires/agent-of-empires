@@ -1,12 +1,12 @@
 //! Windowed aggregate of live session state for `aoe serve`.
 //!
 //! A point-in-time `usage_snapshot` only sees sessions alive at the instant the
-//! 12h tick fires, so a session that opens and closes between two ticks is
+//! periodic tick fires, so a session that opens and closes between two ticks is
 //! invisible in the agent/model attribution and never lifts the concurrency
 //! peak. `aoe serve` folds a sample of the live session list into a
 //! [`UsageAggregator`] every ~30 min and reports the window's peak concurrency
 //! and distinct-sessions-seen maps at flush time, while keeping the send cadence
-//! at one POST per 12h (see `src/server/mod.rs`).
+//! at one POST per send window (see `src/server/mod.rs`).
 //!
 //! Sampling is coarse on purpose (the issue, #1870, chose a ~30-min interval):
 //! a session born and gone entirely between two samples is still missed, but
@@ -23,7 +23,7 @@ use crate::session::Instance;
 /// for a long stretch would otherwise keep folding new ids forever. Past the
 /// cap we stop adding new ids (peak concurrency and already-seen sessions still
 /// update), bounding worst-case memory without touching the happy path. The
-/// limit is far above any realistic distinct-session count for one 12h window.
+/// limit is far above any realistic distinct-session count for one send window.
 const MAX_SEEN: usize = 10_000;
 
 /// In-memory accumulator folded by the serve telemetry loop. Reset (dropped /

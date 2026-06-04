@@ -1712,20 +1712,20 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 }
 
 /// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
-/// every ~12 hours (jittered), plus a final one on graceful shutdown. The boot
+/// every ~4 hours (jittered), plus a final one on graceful shutdown. The boot
 /// `process_start` is emitted separately by the caller before transport setup.
 /// All sends are best-effort and swallow errors; nothing leaves the box unless
 /// the user opted in and an endpoint is configured.
 fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        // Jittered period (12h + up to 30m) so installs that boot together don't
+        // Jittered period (4h + up to 30m) so installs that boot together don't
         // snapshot in lockstep; the first tick is still immediate (boot
         // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
         let mut interval = tokio::time::interval(crate::telemetry::snapshot_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Sample the live session list more often than we send, folding each
         // sample into a window aggregate so short-lived sessions' agent/model
-        // mix and the concurrency peak survive into the 12h snapshot (#1870).
+        // mix and the concurrency peak survive into the periodic snapshot (#1870).
         // Both tickers share this one task, so a sample tick and a flush tick
         // never run concurrently: the aggregate needs no locking and a plain
         // reset after a confirmed send is race-free. `Skip` so a long suspend
@@ -1737,7 +1737,7 @@ fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
                     // Deduped: a serve process that starts and stops between
-                    // 12h ticks would otherwise emit the initial first-tick
+                    // periodic ticks would otherwise emit the initial first-tick
                     // snapshot and an identical shutdown snapshot seconds apart.
                     // We exit after this, so the aggregate is dropped; no reset.
                     if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
