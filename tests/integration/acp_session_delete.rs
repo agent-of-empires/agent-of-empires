@@ -38,6 +38,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         stored_acp_session_id: None,
         sandbox_info: None,
         source_profile: None,
+        mcp_servers: Vec::new(),
     }
 }
 

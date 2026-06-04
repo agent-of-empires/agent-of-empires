@@ -21,14 +21,14 @@ use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, ModelId, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionModelState, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
-    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    KillTerminalResponse, LoadSessionRequest, McpServer, ModelId, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId, SessionModelState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModelRequest, StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 use agent_client_protocol::{
@@ -46,6 +46,7 @@ use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
+use super::mcp_config;
 use super::permissions::build_approval;
 use super::state::{
     AcpSessionId, AvailableCommand, ConfigOptionCategory, ConfigOptionChoice,
@@ -287,6 +288,12 @@ pub struct SpawnConfig {
     /// structured view sandbox env mirrors the tmux view. `None` for
     /// non-sandboxed sessions.
     pub source_profile: Option<String>,
+    /// MCP servers to forward to the agent on `session/new` and
+    /// `session/load`, resolved from the global `<app_dir>/mcp.json` by the
+    /// supervisor. Capability gating (dropping `http`/`sse` the agent did not
+    /// advertise) happens later, against the `initialize` response. Empty when
+    /// no config file exists, which preserves pre-feature behavior.
+    pub mcp_servers: Vec<McpServer>,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -1241,6 +1248,7 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
+        let mcp_servers = config.mcp_servers.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would
@@ -1267,6 +1275,7 @@ impl AcpClient {
                 install_binary,
                 source_profile_for_task,
                 default_effort.clone(),
+                mcp_servers,
             )
             .await;
         }
@@ -1289,6 +1298,7 @@ impl AcpClient {
             install_binary,
             source_profile_for_task,
             default_effort,
+            mcp_servers,
         )
         .await
     }
@@ -1310,6 +1320,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -1372,6 +1383,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                mcp_servers,
             )
             .instrument(conn_span),
         );
@@ -1410,6 +1422,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
@@ -1463,6 +1476,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                mcp_servers,
             )
             .instrument(conn_span),
         );
@@ -1548,6 +1562,10 @@ impl AcpClient {
             install_binary,
             source_profile,
             None,
+            // Reattach uses ConnectMode::Resume, which reuses the stored ACP
+            // session id without sending session/new or session/load, so no
+            // MCP servers are forwarded here (they were sent on first connect).
+            Vec::new(),
         )
         .await
     }
@@ -3916,6 +3934,7 @@ async fn run_connection_task<W, R>(
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    mcp_servers: Vec<McpServer>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -4293,6 +4312,16 @@ async fn run_connection_task<W, R>(
             let mut available_mode_ids: Option<Vec<String>> = None;
             let mut has_config_option_mode: bool = false;
 
+            // Drop any http/sse servers the agent did not advertise before they
+            // reach session/new or session/load; stdio is always kept. Computed
+            // once here so both the load-attempt and the fresh-session fallback
+            // forward the same gated list.
+            let mcp_servers = mcp_config::filter_for_capabilities(
+                mcp_servers,
+                &init.agent_capabilities.mcp_capabilities,
+                &session_label,
+            );
+
             let acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -4363,7 +4392,8 @@ async fn run_connection_task<W, R>(
                             // key toolCallId-..."). Cleared on Err below if we fall
                             // back to session/new, which has no replay payload.
                             suppress_for_block.store(true, Ordering::Relaxed);
-                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone());
+                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
+                                .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
                                 Ok(resp) => {
                                     info!(
@@ -4453,7 +4483,7 @@ async fn run_connection_task<W, R>(
                             "creating fresh session via session/new"
                         );
                         let new_session = connection
-                            .send_request(NewSessionRequest::new(cwd))
+                            .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
                             .block_task()
                             .await?;
                         let id = new_session.session_id.clone();
@@ -6473,6 +6503,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6539,6 +6570,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6607,6 +6639,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6652,6 +6685,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
@@ -6683,6 +6717,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         match result {

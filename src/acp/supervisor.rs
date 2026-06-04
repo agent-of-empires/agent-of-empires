@@ -1240,6 +1240,46 @@ impl<S: BroadcastSink> Supervisor<S> {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
         })?;
 
+        // Resolve the user's MCP servers from the global `<app_dir>/mcp.json`
+        // so they reach the agent on session/new and session/load. A malformed
+        // file warns and forwards nothing rather than failing every spawn; a
+        // single typo must not brick all structured-view sessions. Project-local
+        // and per-profile sources are deferred (see issue follow-ups).
+        let mcp_servers = match crate::session::get_app_dir() {
+            Ok(app_dir) => match crate::acp::mcp_config::load_global_mcp_servers(&app_dir) {
+                Ok(servers) => {
+                    if !servers.is_empty() {
+                        info!(
+                            target: "acp.mcp",
+                            session = %session_id,
+                            count = servers.len(),
+                            servers = %crate::acp::mcp_config::summarize(&servers),
+                            "forwarding MCP servers from global config"
+                        );
+                    }
+                    servers
+                }
+                Err(e) => {
+                    warn!(
+                        target: "acp.mcp",
+                        session = %session_id,
+                        error = %e,
+                        "failed to load MCP config; forwarding no servers"
+                    );
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    error = %e,
+                    "could not resolve app dir for MCP config; forwarding no servers"
+                );
+                Vec::new()
+            }
+        };
+
         let config = SpawnConfig {
             agent_key: agent.clone(),
             spec,
@@ -1251,6 +1291,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_acp_session_id: stored_acp_session_id.clone(),
             sandbox_info,
             source_profile,
+            mcp_servers,
         };
 
         debug!(
@@ -2914,6 +2955,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         // Save a registry record so the runner-managed `registry_gone`
         // check returns false and we exercise the budget path.
@@ -3004,6 +3046,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3077,6 +3120,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3150,6 +3194,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3276,6 +3321,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            mcp_servers: Vec::new(),
         };
         {
             let mut workers = sup.workers.lock().await;
