@@ -33,6 +33,8 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   current install, never a stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
+  - the peak concurrent session count seen across the window since the last
+    snapshot (point-in-time on the TUI, which does not aggregate),
   - how many sessions are currently pinned, snoozed, or archived (a
     point-in-time count of the session-organization states, not how often
     those actions were taken),
@@ -45,6 +47,11 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     so the `sandbox` bucket means "sandboxed and not also one of the others",
     not "all sandboxed sessions",
   - a per-agent and per-model-family count (e.g. `{claude: 3, codex: 1}`),
+    point-in-time at the snapshot moment,
+  - a per-agent and per-model-family count of the **distinct sessions seen
+    across the window** since the last snapshot, so short-lived sessions caught
+    by a sample still contribute their agent/model mix (populated by `aoe
+    serve`; empty on the TUI). Its sum can exceed the point-in-time total,
   - how many sessions were created since the last snapshot, a trend counter so
     short-lived sessions that start and end between two snapshots are still
     counted (populated by `aoe serve`; the TUI reports `0`),
@@ -66,6 +73,18 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     Tailscale Funnel, or `local`). These are coarse enums only; the TUI reports
     neither, since it hosts no server,
   - the same version-health signals carried on `process_start` (see below).
+
+  To capture the agent/model mix and peak concurrency of short-lived sessions
+  without sending more often, `aoe serve` samples the live session list locally
+  about every 30 minutes and folds each sample into an in-memory aggregate; the
+  send cadence stays at one POST per 12 hours. The sampling is purely local, so
+  network and server load are unchanged. The aggregate lives in memory only: a
+  daemon crash or restart mid-window loses the partial window (only a graceful
+  shutdown flushes it), while machine sleep makes the loop miss sample ticks
+  rather than clearing the window. A session that opens and closes entirely
+  between two ~30-minute samples is still missed by the windowed maps, though
+  its raw count survives in `session_creates_since_last_snapshot`. The TUI keeps
+  the start / shutdown / 12h point-in-time behavior and does not aggregate.
 
 ### Version health
 
