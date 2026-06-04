@@ -75,15 +75,18 @@ async fn configured_mcp_servers_reach_new_session() {
     let servers = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
     assert_eq!(servers.len(), 1, "fixture should parse one server");
 
-    let record = tempfile::NamedTempFile::new().unwrap();
-    let mut config = base_config(std::env::temp_dir(), record.path());
+    // A tempdir + plain path, not NamedTempFile: the shim writes this file from
+    // a separate process, so we must not hold an open handle to it.
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.json");
+    let mut config = base_config(std::env::temp_dir(), &record_path);
     config.mcp_servers = servers;
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-forward".into()))
         .await
         .expect("spawn shim agent");
 
-    let body = read_record(record.path());
+    let body = read_record(&record_path);
     let _ = client.shutdown().await;
 
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("record is JSON");
@@ -105,15 +108,16 @@ async fn no_config_forwards_empty_list() {
     let servers = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
     assert!(servers.is_empty());
 
-    let record = tempfile::NamedTempFile::new().unwrap();
-    let mut config = base_config(std::env::temp_dir(), record.path());
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.json");
+    let mut config = base_config(std::env::temp_dir(), &record_path);
     config.mcp_servers = servers;
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-empty".into()))
         .await
         .expect("spawn shim agent");
 
-    let body = read_record(record.path());
+    let body = read_record(&record_path);
     let _ = client.shutdown().await;
 
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("record is JSON");
