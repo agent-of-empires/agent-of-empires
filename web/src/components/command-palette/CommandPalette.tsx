@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Command } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
 import { GROUP_ORDER } from "./groups";
@@ -12,6 +12,23 @@ interface Props {
 
 export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  // Capture the launcher before moving focus into the palette, then restore
+  // it on close so Esc / backdrop-close return keyboard users to where they
+  // were instead of dropping focus on <body>. autoFocus cannot restore focus,
+  // and capturing in a post-commit effect would already see the input.
+  // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => {
+      clearTimeout(t);
+      const prev = previousFocusRef.current;
+      if (prev?.isConnected) prev.focus();
+    };
+  }, [open]);
 
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
@@ -62,7 +79,6 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </svg>
           <Command.Input
             ref={inputRef}
-            autoFocus
             placeholder="Search actions, sessions, settings…"
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />
