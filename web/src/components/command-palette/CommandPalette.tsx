@@ -18,7 +18,6 @@ export function CommandPalette({ open, onClose, actions }: Props) {
   // it on close so Esc / backdrop-close return keyboard users to where they
   // were instead of dropping focus on <body>. autoFocus cannot restore focus,
   // and capturing in a post-commit effect would already see the input.
-  // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
   useEffect(() => {
     if (!open) return;
     previousFocusRef.current = document.activeElement as HTMLElement | null;
