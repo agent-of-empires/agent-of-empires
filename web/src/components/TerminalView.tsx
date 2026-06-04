@@ -234,7 +234,7 @@ export function TerminalView({
       className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5"
       style={rootStyle}
     >
-      {/* Top-right view switch — discreet pill that lets the
+      {/* Top-right view switch, a discreet pill that lets the
           user flip this session into structured view mode. Only enabled
           for tools whose ACP adapter we ship. */}
       {session?.id && (

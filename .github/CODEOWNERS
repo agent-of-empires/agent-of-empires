@@ -12,11 +12,11 @@
 *                                       @njbrake
 
 # Structured view and web dashboard - acp team can self-route, njbrake co-owns
-/web/                                   @agent-of-empires/cockpit @njbrake
-/src/server/acp_reconciler.rs       @agent-of-empires/cockpit @njbrake
-/src/server/acp_ws.rs               @agent-of-empires/cockpit @njbrake
-/src/server/api/acp.rs              @agent-of-empires/cockpit @njbrake
-/src/tui/structured_view/                  @agent-of-empires/cockpit @njbrake
+/web/                                   @agent-of-empires/acp @njbrake
+/src/server/acp_reconciler.rs       @agent-of-empires/acp @njbrake
+/src/server/acp_ws.rs               @agent-of-empires/acp @njbrake
+/src/server/api/acp.rs              @agent-of-empires/acp @njbrake
+/src/tui/structured_view/                  @agent-of-empires/acp @njbrake
 
 # Security-sensitive surface area - njbrake only
 /src/server/auth.rs                     @njbrake

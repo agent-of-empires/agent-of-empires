@@ -2074,7 +2074,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Shutdown every worker. Called when the user explicitly terminates
-    /// all structured view workers (e.g. `aoe acp stop --all`) — sends ACP
+    /// all structured view workers (e.g. `aoe acp stop --all`); sends ACP
     /// shutdown to each connected client, aborts the drain task, AND
     /// signals every per-session `aoe __acp-runner` so the agent
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
@@ -2484,7 +2484,7 @@ async fn restart_decision(
     };
     // Registry-deletion signal: if the on-disk record for this session
     // was removed but we still hold a WorkerHandle, the user terminated
-    // the runner externally (`aoe acp stop|kill`). Don't respawn —
+    // the runner externally (`aoe acp stop|kill`). Don't respawn;
     // the reconciler will handle a fresh spawn on its next tick if the
     // session is still `structured_view = true`. Returning `UserStopped`
     // both skips the respawn budget bookkeeping and lets the drain task
