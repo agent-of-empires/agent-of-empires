@@ -29,7 +29,7 @@ Only a small set of sub-targets is enumerated in the settings dropdown (see `KNO
 | `hooks` | Agent hook integration (Claude/Settl/Hermes/Kiro) install/uninstall, hook status file lifecycle, user-configured status hook command failures, and attached status hook watcher failures. |
 | `sound` | Notification sound asset download/install and per-event playback. |
 | `telemetry` | Anonymous opt-in usage telemetry: install-id persistence, opt-in/opt-out transitions, and send outcomes (all at `debug`). The `aoe serve` consent route emits under `http.api.telemetry`. |
-| `log.runtime` | Filter swaps (REST + runner file-watch). |
+| `log.runtime` | Filter swaps (REST + runner file-watch). A swap whose new directive equals the active one is a silent no-op: it does not log or rewrite `runtime_filter`, so a watcher write cannot re-trigger itself. |
 
 ## Levels
 
