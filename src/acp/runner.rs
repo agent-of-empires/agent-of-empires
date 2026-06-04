@@ -1002,8 +1002,15 @@ fn init_runner_logging(session_id: &str) -> Result<()> {
     let resolution =
         crate::logging::resolve_sink(&log_cfg, &app_dir, crate::logging::ProcessContext::Runner);
 
-    let init =
-        crate::logging::init_subscriber_with_options(resolution.target, filter, log_cfg.show_spans);
+    // The runner is single-session; its tracing still flows to the shared
+    // debug.log. The per-session tee runs only in the daemon (#1864), so
+    // no tee layer is installed here.
+    let init = crate::logging::init_subscriber_with_options(
+        resolution.target,
+        filter,
+        log_cfg.show_spans,
+        None,
+    );
     if let Some(c) = init.controller {
         crate::logging::install_controller(c);
     }

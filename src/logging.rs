@@ -489,8 +489,18 @@ impl std::fmt::Display for LogFilterError {
 
 impl std::error::Error for LogFilterError {}
 
+/// Optional top-of-stack layer injected at subscriber init. Only the
+/// serve daemon supplies a real one (the per-session tee, see
+/// `crate::acp::session_tee`); the acp module is `serve`-gated, so without
+/// that feature the slot is the no-op `Identity` layer and callers always
+/// pass `None`.
+#[cfg(feature = "serve")]
+pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
+#[cfg(not(feature = "serve"))]
+pub type TeeLayer = tracing_subscriber::layer::Identity;
+
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
-    init_subscriber_with_options(target, filter, false)
+    init_subscriber_with_options(target, filter, false, None)
 }
 
 /// Event formatter that mirrors the default Full output (RFC3339-ish
@@ -534,6 +544,7 @@ pub fn init_subscriber_with_options(
     target: SubscriberTarget,
     filter: String,
     show_spans: bool,
+    session_tee: Option<TeeLayer>,
 ) -> InitResult {
     let parsed = match EnvFilter::builder().with_regex(false).parse(&filter) {
         Ok(f) => f,
@@ -571,6 +582,7 @@ pub fn init_subscriber_with_options(
                     Registry::default()
                         .with(reload_layer)
                         .with(fmt_layer)
+                        .with(session_tee)
                         .try_init()
                         .map_err(|e| e.to_string())
                 } else {
@@ -581,6 +593,7 @@ pub fn init_subscriber_with_options(
                     Registry::default()
                         .with(reload_layer)
                         .with(fmt_layer)
+                        .with(session_tee)
                         .try_init()
                         .map_err(|e| e.to_string())
                 }
@@ -596,6 +609,7 @@ pub fn init_subscriber_with_options(
                 Registry::default()
                     .with(reload_layer)
                     .with(fmt_layer)
+                    .with(session_tee)
                     .try_init()
                     .map_err(|e| e.to_string())
             } else {
@@ -605,6 +619,7 @@ pub fn init_subscriber_with_options(
                 Registry::default()
                     .with(reload_layer)
                     .with(fmt_layer)
+                    .with(session_tee)
                     .try_init()
                     .map_err(|e| e.to_string())
             }

@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 use super::agent_compat::{self, ExpectedAgent};
 use super::agent_profiles;
@@ -1350,23 +1350,31 @@ impl AcpClient {
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
-        tokio::spawn(run_connection_task(
-            transport,
-            event_tx,
-            cmd_rx,
-            cwd,
-            session_label.clone(),
-            Some(child_for_task),
-            pending_for_task,
-            resources,
-            None,
-            mode,
-            Some(ready_tx),
-            profile,
-            expected_agent,
-            source_profile,
-            default_effort,
-        ));
+        // Wrap the per-session connection task in a span carrying the
+        // session id so every nested event inherits it; the daemon's
+        // per-session log tee routes by that field (#1864). The span name
+        // must match `crate::acp::session_tee::SESSION_SPAN`.
+        let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        tokio::spawn(
+            run_connection_task(
+                transport,
+                event_tx,
+                cmd_rx,
+                cwd,
+                session_label.clone(),
+                Some(child_for_task),
+                pending_for_task,
+                resources,
+                None,
+                mode,
+                Some(ready_tx),
+                profile,
+                expected_agent,
+                source_profile,
+                default_effort,
+            )
+            .instrument(conn_span),
+        );
 
         wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
 
@@ -1434,23 +1442,30 @@ impl AcpClient {
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
-        tokio::spawn(run_connection_task(
-            transport,
-            event_tx,
-            cmd_rx,
-            cwd,
-            session_label.clone(),
-            None,
-            pending_for_task,
-            resources,
-            None,
-            mode,
-            Some(ready_tx),
-            profile,
-            expected_agent,
-            source_profile,
-            default_effort,
-        ));
+        // See the sibling spawn in `spawn`: the connection task runs inside
+        // an `acp_session` span so per-session log teeing (#1864) catches
+        // events that do not set the `session` field explicitly.
+        let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        tokio::spawn(
+            run_connection_task(
+                transport,
+                event_tx,
+                cmd_rx,
+                cwd,
+                session_label.clone(),
+                None,
+                pending_for_task,
+                resources,
+                None,
+                mode,
+                Some(ready_tx),
+                profile,
+                expected_agent,
+                source_profile,
+                default_effort,
+            )
+            .instrument(conn_span),
+        );
 
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
 
