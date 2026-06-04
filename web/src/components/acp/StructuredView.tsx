@@ -1075,10 +1075,18 @@ export function WorkingSpinner({
     if (!cancelEscalatesAt) return;
     const target = new Date(cancelEscalatesAt).getTime();
     if (Number.isNaN(target)) return;
-    const t = window.setInterval(() => {
+    const tick = () => {
       setEscalatesInSecs(Math.max(0, Math.ceil((target - Date.now()) / 1000)));
-    }, 1000);
-    return () => window.clearInterval(t);
+    };
+    // Kick off the first value immediately (deferred a tick so it does not
+    // count as set-state-in-effect) so the countdown shows on the same frame
+    // the "Stopping..." badge appears rather than a second later.
+    const kickoff = window.setTimeout(tick, 0);
+    const t = window.setInterval(tick, 1000);
+    return () => {
+      window.clearTimeout(kickoff);
+      window.clearInterval(t);
+    };
   }, [cancelEscalatesAt]);
 
   const state = deriveSpinnerState(thinking, tool);
