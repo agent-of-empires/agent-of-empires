@@ -175,6 +175,13 @@ const PAGES = [
       "Step-by-step guide for adding support for a new AI coding agent to AoE.",
   },
   {
+    source: "docs/development/adding-settings.md",
+    dest: "docs/development/adding-settings.md",
+    title: "Adding a Setting",
+    description:
+      "How to add a configuration setting with the single-source schema that drives the TUI, web dashboard, and server.",
+  },
+  {
     source: "docs/development/logging.md",
     dest: "docs/development/logging.md",
     title: "Logging",
@@ -342,6 +349,7 @@ const URL_MAP = {
   "docs/github-integration.md": "/docs/github-integration/",
   "docs/development.md": "/docs/development/",
   "docs/development/adding-agents.md": "/docs/development/adding-agents/",
+  "docs/development/adding-settings.md": "/docs/development/adding-settings/",
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
   "docs/development/releases.md": "/docs/development/releases/",
