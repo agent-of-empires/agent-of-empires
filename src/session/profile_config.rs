@@ -159,6 +159,29 @@ pub fn validate_volume_format(volume: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a sandbox env entry: bare `KEY` or `KEY=VALUE`. The key is
+/// letters, digits, and underscores and must not start with a digit; the
+/// value (after `=`) is unconstrained. Mirrors the dashboard's client-side
+/// check so the schema drives both surfaces.
+pub fn validate_env_format(entry: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(=.*)?$").unwrap();
+    if re.is_match(entry) {
+        Ok(())
+    } else {
+        Err("Must be KEY or KEY=VALUE (letters, digits, underscores)".to_string())
+    }
+}
+
+/// Validate a `host:container` port mapping (digits only on both sides).
+pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^\d+:\d+$").unwrap();
+    if re.is_match(mapping) {
+        Ok(())
+    } else {
+        Err("Must be port:port (e.g. 3000:3000)".to_string())
+    }
+}
+
 /// Validate Docker memory limit format (e.g., "512m", "2g")
 pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
     if limit.is_empty() {

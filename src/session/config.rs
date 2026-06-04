@@ -1620,6 +1620,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Sandbox Environment",
         widget = "list",
+        validate = "env_list",
         web = "elevation:sandbox config affects host isolation"
     )]
     pub environment: Vec<String>,
@@ -1661,6 +1662,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Port Mappings",
         widget = "list",
+        validate = "port_mapping_list",
         web = "elevation:sandbox config affects host isolation"
     )]
     pub port_mappings: Vec<String>,

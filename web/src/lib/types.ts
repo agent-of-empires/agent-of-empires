@@ -459,7 +459,9 @@ export type SettingsValidation =
   | { rule: "range_u64"; min: number; max?: number }
   | { rule: "non_empty_string" }
   | { rule: "memory_limit" }
-  | { rule: "volume_list" };
+  | { rule: "volume_list" }
+  | { rule: "env_list" }
+  | { rule: "port_mapping_list" };
 
 /** One configurable field. The dotted `${section}.${field}` is its stable id. */
 export interface SettingsFieldDescriptor {
