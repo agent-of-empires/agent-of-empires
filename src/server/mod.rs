@@ -2047,10 +2047,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
     #[cfg(feature = "serve")]
-    let mut acp_respawn_history: std::collections::HashMap<
-        String,
-        Vec<std::time::Instant>,
-    > = std::collections::HashMap::new();
+    let mut acp_respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>> =
+        std::collections::HashMap::new();
     #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
