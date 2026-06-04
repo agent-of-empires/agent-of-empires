@@ -38,21 +38,44 @@ async function enableAndSpawn(baseUrl: string, sessionId: string) {
   expect([200, 202, 409]).toContain(spawnRes.status);
 }
 
+type Json = Record<string, unknown>;
+
 async function waitForReplay(
   baseUrl: string,
   sessionId: string,
-  predicate: (replayJson: string) => boolean,
+  predicate: (replay: Json) => boolean,
   maxAttempts = 30,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const replay = await fetch(
+    const replay = (await fetch(
       `${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
-    ).then((r) => r.json());
-    const json = JSON.stringify(replay);
-    if (predicate(json)) return true;
+    ).then((r) => r.json())) as Json;
+    if (predicate(replay)) return true;
     await new Promise((r) => setTimeout(r, 200));
   }
   return false;
+}
+
+/** Externally-tagged structured view events of `kind` pulled out of the replay's
+ *  typed `frames`, so assertions inspect the specific event payload rather
+ *  than substring-matching one big JSON blob. */
+function frameEvents(replay: Json, kind: string): Json[] {
+  const frames = (replay.frames as Array<{ event?: Json }>) ?? [];
+  return frames
+    .map((f) => f.event?.[kind])
+    .filter((e): e is Json => e != null && typeof e === "object");
+}
+
+/** The synthetic model selector inside a `ConfigOptionsUpdated` payload. */
+function modelOption(event: Json): Json | undefined {
+  const options = (event.options as Json[]) ?? [];
+  return options.find((o) => o.id === SYNTHETIC_MODEL_ID);
+}
+
+function modelChoiceValues(event: Json): string[] {
+  const model = modelOption(event);
+  if (!model) return [];
+  return ((model.options as Json[]) ?? []).map((c) => String(c.value));
 }
 
 const unstableModelEnv = {
@@ -76,14 +99,11 @@ base(
       const sessionId: string = sessions[0]!.id;
       await enableAndSpawn(serve.baseUrl, sessionId);
 
-      const saw = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) =>
-          json.includes("ConfigOptionsUpdated") &&
-          json.includes(SYNTHETIC_MODEL_ID) &&
-          json.includes("fake-sonnet") &&
-          json.includes("fake-opus"),
+      const saw = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
+        frameEvents(replay, "ConfigOptionsUpdated").some((e) => {
+          const values = modelChoiceValues(e);
+          return values.includes("fake-sonnet") && values.includes("fake-opus");
+        }),
       );
       expect(saw).toBe(true);
     } finally {
@@ -108,11 +128,10 @@ base(
       const sessionId: string = sessions[0]!.id;
       await enableAndSpawn(serve.baseUrl, sessionId);
 
-      const sawInitial = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) =>
-          json.includes(SYNTHETIC_MODEL_ID) && json.includes("fake-sonnet"),
+      const sawInitial = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
+        frameEvents(replay, "ConfigOptionsUpdated").some((e) =>
+          modelChoiceValues(e).includes("fake-sonnet"),
+        ),
       );
       expect(sawInitial).toBe(true);
 
@@ -133,14 +152,10 @@ base(
       // The fake only acks set_model; aoe synthesizes the confirming
       // snapshot from the cached state, so the synthetic selector's
       // current_value must flip to the requested model.
-      const sawConfirm = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) =>
-          json.includes("ConfigOptionsUpdated") &&
-          new RegExp(
-            `"${SYNTHETIC_MODEL_ID}"[^}]*"current_value"\\s*:\\s*"fake-opus"`,
-          ).test(json),
+      const sawConfirm = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
+        frameEvents(replay, "ConfigOptionsUpdated").some(
+          (e) => modelOption(e)?.current_value === "fake-opus",
+        ),
       );
       expect(sawConfirm).toBe(true);
     } finally {
@@ -168,10 +183,10 @@ base(
       const sessionId: string = sessions[0]!.id;
       await enableAndSpawn(serve.baseUrl, sessionId);
 
-      const sawInitial = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) => json.includes(SYNTHETIC_MODEL_ID),
+      const sawInitial = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
+        frameEvents(replay, "ConfigOptionsUpdated").some(
+          (e) => modelOption(e) != null,
+        ),
       );
       expect(sawInitial).toBe(true);
 
@@ -189,12 +204,12 @@ base(
       expect(setRes.status).toBeGreaterThanOrEqual(200);
       expect(setRes.status).toBeLessThan(300);
 
-      const sawFailure = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) =>
-          json.includes("ConfigOptionSwitchFailed") &&
-          json.includes("model unavailable"),
+      const sawFailure = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
+        frameEvents(replay, "ConfigOptionSwitchFailed").some(
+          (e) =>
+            e.config_id === SYNTHETIC_MODEL_ID &&
+            String(e.reason).includes("model unavailable"),
+        ),
       );
       expect(sawFailure).toBe(true);
     } finally {
