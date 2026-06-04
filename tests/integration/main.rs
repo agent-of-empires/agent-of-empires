@@ -30,6 +30,9 @@ mod update_command;
 mod worktree_integration;
 
 #[cfg(feature = "serve")]
+mod acp_mcp;
+
+#[cfg(feature = "serve")]
 mod acp_smoke;
 
 #[cfg(feature = "serve")]
