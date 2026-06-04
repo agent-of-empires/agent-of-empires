@@ -97,6 +97,8 @@ afterEach(() => {
   mockedSendData.mockReset();
   mockedActivate.mockReset();
   mockedExitScrollback.mockReset();
+  mockedCtrlActiveRef.current = false;
+  mockedClearCtrlRef.current = null;
 });
 
 describe("TerminalView early-return states", () => {
