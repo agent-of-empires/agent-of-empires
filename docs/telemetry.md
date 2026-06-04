@@ -134,14 +134,22 @@ in here, per-session usage is reported separately by the session counts above.
 ### Usage signals
 
 The snapshot also includes a `usage_seen` map (allowlisted signal name ->
-open-count) so we can see which surfaces installs actually use within a window,
-for example `{web: 3, cockpit: 1}`. It is driven by a registry in
-`src/telemetry/usage_signals.rs`: instrumenting a new surface is one entry there
-(its short name), not a schema change. The key set is fixed and the values are
-counts, so a signal can never carry a path or free text, and the gateway
-forwards only this allowlisted shape. The web dashboard reports an open by
-pinging `POST /api/telemetry/seen`; an unregistered name is rejected. The TUI
-never hosts the web surfaces, so it reports the map zeroed.
+open-count) so we can see which surfaces and features installs actually use
+within a window, for example `{web: 3, cockpit: 1, diff_panel: 2}`. It is driven
+by a registry in `src/telemetry/usage_signals.rs`: instrumenting a new surface
+is one entry there (its short name), not a schema change. The key set is fixed
+and the values are counts, so a signal can never carry a path or free text, and
+the gateway forwards only this allowlisted shape. The web dashboard reports an
+open by pinging `POST /api/telemetry/seen`; an unregistered name is rejected.
+The TUI never hosts the web surfaces, so it reports the map zeroed.
+
+The allowlisted signals are whole-UI opens (`web`, `cockpit`) plus dashboard
+feature opens: `diff_panel` (the git diff panel was opened for a session),
+`diff_comments` (a count of diff-comment prompts sent to the agent), and
+`web_terminal` (the xterm.js terminal was opened). Scratch-session usage is not
+a `usage_seen` signal: it is cross-surface session state, reported point-in-time
+by the `scratch` bucket of the `sessions_by_substrate` census above, which
+covers scratch sessions created from the CLI, TUI, or web wizard alike.
 
 ## What is never sent
 
