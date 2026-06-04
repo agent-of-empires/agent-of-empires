@@ -13,16 +13,19 @@ For running the server, see the [Web Dashboard overview](../web-dashboard.md).
 Settings are organized into the same groups as the TUI:
 
 - **Appearance**: Theme.
-- **Sessions**: Session defaults and Structured view (the structured view master
-  switch plus the replay and watchdog tuning knobs; see
-  [Structured view Setup](../../structured-view/setup.md)).
+- **Sessions**: Session defaults and Structured view (the replay and watchdog
+  tuning knobs; see [Structured view Setup](../../structured-view/setup.md)).
 - **Environment**: Sandbox, Worktree, and Tmux.
 - **Notifications**: Sound and Notifications (web push; see
   [Push notifications](../../push-notifications.md)).
 - **Web Dashboard**: Terminal, Security, and Connected Devices.
 - **System**: Updates and Logging.
 
-Every field that exists in the TUI settings is editable here too.
+Every config field that exists in the TUI settings is editable here too: the
+panel is generated from the same settings schema as the TUI, so a field
+declared once appears on both surfaces and they never drift. The only host-side
+knob the dashboard does not surface is the host environment list, which stays
+TUI/`config.toml`-only.
 
 ## Profiles
 
