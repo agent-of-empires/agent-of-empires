@@ -365,6 +365,10 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
     };
 
+    // Set when teardown must leave the registry/socket in place because a
+    // newer runner now owns them (the superseded case).
+    let mut preserve_registry = false;
+
     // Wait for: agent exit, signal, watchdog self-destruct, or accept loop
     // death (last is unreachable but kept for symmetry).
     tokio::select! {
@@ -394,6 +398,14 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
+                // A superseded runner must not delete the registry/socket:
+                // they belong to the fresh runner that replaced it. The
+                // group-leader teardown SIGKILLs itself and never returns
+                // here, but the non-leader fallback (and the non-unix path)
+                // do return, so guard the post-loop delete below too.
+                if matches!(reason, WatchdogShutdown::Superseded) {
+                    preserve_registry = true;
+                }
                 self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
             }
         }
@@ -404,7 +416,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    worker_registry::delete(&session_id).ok();
+    if !preserve_registry {
+        worker_registry::delete(&session_id).ok();
+    }
     Ok(())
 }
 
