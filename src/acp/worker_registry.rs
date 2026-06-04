@@ -313,15 +313,22 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
     Ok(out)
 }
 
-/// Remove the JSON entry and the unix socket file (if present). The
-/// `.log` file is intentionally left behind so the user can read it
-/// after the worker exits.
+/// Remove the JSON entry and the unix socket file (if present). A
+/// non-empty `.log` file is intentionally left behind so the user can read
+/// it after the worker exits; an empty (0-byte) log carries no post-mortem
+/// value and is swept so a crash loop doesn't litter the workers dir with
+/// dead empty logs. See #1945.
 pub fn delete(session_id: &str) -> Result<()> {
     if let Ok(p) = record_path(session_id) {
         let _ = std::fs::remove_file(&p);
     }
     if let Ok(p) = socket_path_for(session_id) {
         let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(p) = log_path_for(session_id) {
+        if matches!(std::fs::metadata(&p), Ok(m) if m.len() == 0) {
+            let _ = std::fs::remove_file(&p);
+        }
     }
     Ok(())
 }
@@ -767,6 +774,31 @@ mod tests {
             assert!(sock.exists());
             delete("sess").unwrap();
             assert!(!record_path("sess").unwrap().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sweeps_empty_log_but_keeps_nonempty() {
+        with_temp_home(|| {
+            // Empty log (worker died before writing anything): swept.
+            let empty_log = log_path_for("empty").unwrap();
+            std::fs::create_dir_all(empty_log.parent().unwrap()).unwrap();
+            std::fs::write(&empty_log, b"").unwrap();
+            delete("empty").unwrap();
+            assert!(
+                !empty_log.exists(),
+                "0-byte worker log should be swept on delete"
+            );
+
+            // Non-empty log (has post-mortem content): kept.
+            let kept_log = log_path_for("kept").unwrap();
+            std::fs::write(&kept_log, b"agent stderr line\n").unwrap();
+            delete("kept").unwrap();
+            assert!(
+                kept_log.exists(),
+                "non-empty worker log should survive delete for post-mortem"
+            );
         });
     }
 
