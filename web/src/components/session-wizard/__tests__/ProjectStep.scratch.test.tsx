@@ -22,6 +22,11 @@ import type { SessionResponse } from "../../../lib/types";
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   cloneRepo: vi.fn(),
+  // The Browse tab mounts DirectoryBrowser, which probes the filesystem on
+  // mount (getHomePath -> browseFilesystem). Stub both so the tab renders
+  // without hitting the network. ok:false makes navigate() bail cleanly.
+  getHomePath: vi.fn().mockResolvedValue(null),
+  browseFilesystem: vi.fn().mockResolvedValue({ ok: false, entries: [] }),
 }));
 
 import { fetchSessions } from "../../../lib/api";
