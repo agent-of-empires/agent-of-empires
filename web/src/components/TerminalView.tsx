@@ -103,7 +103,6 @@ export function TerminalView({
         lastEnsuredSessionIdRef.current = session.id;
         setEnsureState("ready");
         if (active) activate();
-        if (consumePendingTerminalFocus("agent")) focusSelf();
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
@@ -111,6 +110,16 @@ export function TerminalView({
     });
     return () => controller.abort();
   }, [session.id, active, activate, focusSelf]);
+
+  // Drain a pending agent-focus latch only once the terminal is rendered:
+  // while ensureState is "pending"/"error" the splash is shown and the xterm
+  // textarea is not mounted, so consuming the latch in the boot/retry
+  // callbacks would clear it before focusSelf() could find anything to focus.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (ensureState !== "ready") return;
+    if (consumePendingTerminalFocus("agent")) focusSelf();
+  }, [ensureState, focusSelf]);
 
   const retryEnsure = useCallback(() => {
     setEnsureState((prev) => {
@@ -123,7 +132,6 @@ export function TerminalView({
           lastEnsuredSessionIdRef.current = session.id;
           setEnsureState("ready");
           if (active) activate();
-          if (consumePendingTerminalFocus("agent")) focusSelf();
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -131,7 +139,7 @@ export function TerminalView({
       });
       return "pending";
     });
-  }, [session.id, active, activate, focusSelf]);
+  }, [session.id, active, activate]);
 
   const [hintDismissed, setHintDismissed] = useState(() => {
     try {

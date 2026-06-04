@@ -90,10 +90,6 @@ function PairedTerminal({
         if (cancelled) return;
         if (ok) {
           setReady(true);
-          // The xterm element and its textarea exist once ensureTerminal
-          // resolves (independent of the `ready` overlay flag), so a pending
-          // paired focus intent can be drained here directly.
-          if (consumePendingTerminalFocus("paired")) focusSelf();
         } else setBootError(true);
       })
       .catch(() => {
@@ -103,6 +99,16 @@ function PairedTerminal({
       cancelled = true;
     };
   }, [sessionId, mode, bootAttempt, focusSelf]);
+
+  // Drain a pending paired-focus latch only after `ready` flips and the
+  // terminal renders: while !ready the splash is shown and the xterm textarea
+  // is not mounted, so consuming the latch in the ensureTerminal callback
+  // would clear it before focusSelf() could find anything to focus.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (!ready) return;
+    if (consumePendingTerminalFocus("paired")) focusSelf();
+  }, [ready, focusSelf]);
 
   // Dispatch a window resize after keyboard transitions so anything else
   // watching layout is nudged; the hook's ResizeObserver already refits
