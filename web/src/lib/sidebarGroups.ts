@@ -7,7 +7,8 @@ import type {
 } from "./types";
 import { isSessionActive } from "./session";
 import {
-  compareWorkspacesByLastActivityDesc,
+  compareWorkspacesForComputedSortMode,
+  type SidebarSortMode,
   workspaceIsSunk,
 } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
@@ -112,16 +113,25 @@ function groupDisplayName(path: string): string {
 // so a workspace whose sessions span groups is split into one view per
 // group, each carrying only that group's sessions. Sessions with an empty
 // `group_path` collect into the Ungrouped bucket. Within a group, rows
-// sort by the shared last-activity comparator (the group axis has no
-// manual order in v1); named groups sort alphabetically with Ungrouped
-// pinned to the bottom.
+// sort by the selected sort mode (the group axis has no manual order in
+// v1, so `manual` falls back to last-activity); named groups sort
+// alphabetically with Ungrouped pinned to the bottom regardless of mode.
 export function buildSessionGroups(
   workspaces: Workspace[],
   opts: {
     idleDecayWindowMs: number;
-    isCollapsed: (groupId: string) => boolean;
+    // Drives the within-group row comparator. `manual` falls back to
+    // last-activity here (this axis has no manual drag order), while
+    // `lastActivity` and `attention` are honored. See #1640.
+    sortMode: SidebarSortMode;
+    // `groupPath` is the normalized path ("" for Ungrouped), passed
+    // alongside the synthetic id so nested callers can key collapse state
+    // on the path and dodge the `UNGROUPED_GROUP_ID` sentinel. Flat callers
+    // ignore it. See #1720.
+    isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
+  const compareWorkspace = compareWorkspacesForComputedSortMode(opts.sortMode);
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -156,9 +166,7 @@ export function buildSessionGroups(
   const groups: SidebarGroup[] = [];
   for (const gp of order) {
     const views = byGroup.get(gp)!;
-    views.sort((a, b) =>
-      compareWorkspacesByLastActivityDesc(a.workspace, b.workspace),
-    );
+    views.sort((a, b) => compareWorkspace(a.workspace, b.workspace));
     const id = gp === "" ? UNGROUPED_GROUP_ID : gp;
     const hasActive = views.some((v) => v.workspace.status === "active");
     groups.push({
@@ -171,7 +179,7 @@ export function buildSessionGroups(
       remoteOwner: null,
       workspaces: views,
       status: hasActive ? "active" : "idle",
-      collapsed: opts.isCollapsed(id),
+      collapsed: opts.isCollapsed(id, gp),
       capabilities: { appearance: false, reorder: false, create: "generic" },
       groupPath: gp,
     });
@@ -191,4 +199,60 @@ export function buildSessionGroups(
 // footer, so an all-sunk group's header is not rendered empty.
 export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {
   return group.workspaces.some((v) => !workspaceIsSunk(v.workspace));
+}
+
+// The nested `repo+group` axis (#1720). A repository header keeps its full
+// repo-axis identity (`repo`), and inside it the same `group_path` buckets
+// the user-group axis already computes show up as `subgroups`. This is a
+// composition of the two existing builders, not a third bucketing pass:
+// `repo` comes from `repoGroupToSidebarGroup`, `subgroups` from
+// `buildSessionGroups` over that repo's own workspaces.
+export interface NestedSidebarGroup {
+  repo: SidebarGroup;
+  subgroups: SidebarGroup[];
+}
+
+// Build the nested axis from the already-built repo-axis groups. Top-level
+// ordering, appearance, synthetic Multi-repo / Scratch buckets, and per-repo
+// collapse are inherited verbatim from the repo axis; only manual drag
+// reorder is dropped (the nested axis has no manual order, like the group
+// axis). Each repo's subgroups are the user-group split of just that repo's
+// workspaces, so a workspace whose sessions span groups is sliced per
+// subgroup exactly as the flat group axis does.
+export function buildNestedSidebarGroups(
+  repoGroups: RepoGroup[],
+  opts: {
+    idleDecayWindowMs: number;
+    // Forwarded to the per-repo subgroup builder so subgroup rows honor the
+    // selected sort mode. Top-level repo order is inherited from the repo
+    // axis (already sorted by `useRepoGroups`), so it is not re-sorted here.
+    sortMode: SidebarSortMode;
+    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
+  },
+): NestedSidebarGroup[] {
+  return repoGroups.map((repoGroup) => {
+    const repo = repoGroupToSidebarGroup(repoGroup);
+    const subgroups = buildSessionGroups(repoGroup.workspaces, {
+      idleDecayWindowMs: opts.idleDecayWindowMs,
+      sortMode: opts.sortMode,
+      isCollapsed: (_groupId, groupPath) =>
+        opts.isSubgroupCollapsed(repo.id, groupPath),
+    });
+    return {
+      repo: {
+        ...repo,
+        capabilities: { ...repo.capabilities, reorder: false },
+      },
+      subgroups,
+    };
+  });
+}
+
+// Nested-axis equivalent of `sidebarGroupHasLiveWorkspace`: true while any
+// subgroup still has a live row, so an all-sunk repository block is not
+// rendered as an empty header.
+export function nestedSidebarGroupHasLiveWorkspace(
+  group: NestedSidebarGroup,
+): boolean {
+  return group.subgroups.some(sidebarGroupHasLiveWorkspace);
 }

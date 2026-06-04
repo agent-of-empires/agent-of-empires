@@ -25,11 +25,13 @@ pub struct ProjectsDialog {
     mode: Mode,
     /// Path input when adding
     add_input: Input,
+    /// Optional default base branch input when adding
+    add_base_branch: Input,
     /// Scope selection when adding (Global vs Profile)
     add_scope: ProjectScope,
     /// Allow registering even if path is already in the other scope.
     add_allow_override: bool,
-    /// Cursor field while adding: 0=path, 1=scope, 2=allow-override
+    /// Cursor field while adding: 0=path, 1=base-branch, 2=scope, 3=allow-override
     add_focused: usize,
     error: Option<String>,
     info: Option<String>,
@@ -43,6 +45,7 @@ impl ProjectsDialog {
             selected: 0,
             mode: Mode::Browse,
             add_input: Input::default(),
+            add_base_branch: Input::default(),
             add_scope: ProjectScope::Global,
             add_allow_override: false,
             add_focused: 0,
@@ -92,6 +95,7 @@ impl ProjectsDialog {
             KeyCode::Char('a') => {
                 self.mode = Mode::Adding;
                 self.add_input = Input::default();
+                self.add_base_branch = Input::default();
                 self.add_scope = ProjectScope::Global;
                 self.add_allow_override = false;
                 self.add_focused = 0;
@@ -122,21 +126,21 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 3;
+                self.add_focused = (self.add_focused + 1) % 4;
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 2) % 3;
+                self.add_focused = (self.add_focused + 3) % 4;
                 DialogResult::Continue
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 1 => {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
                 self.add_scope = match self.add_scope {
                     ProjectScope::Global => ProjectScope::Profile,
                     ProjectScope::Profile => ProjectScope::Global,
                 };
                 DialogResult::Continue
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 3 => {
                 self.add_allow_override = !self.add_allow_override;
                 DialogResult::Continue
             }
@@ -156,8 +160,17 @@ impl ProjectsDialog {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
+                let base_branch = {
+                    let b = self.add_base_branch.value().trim();
+                    if b.is_empty() {
+                        None
+                    } else {
+                        Some(b.to_string())
+                    }
+                };
                 let project =
-                    Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope);
+                    Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)
+                        .with_base_branch(base_branch);
                 match projects::add(
                     &self.profile,
                     self.add_scope,
@@ -172,6 +185,7 @@ impl ProjectsDialog {
                         ));
                         self.mode = Mode::Browse;
                         self.add_input = Input::default();
+                        self.add_base_branch = Input::default();
                         self.reload();
                     }
                     Err(e) => self.error = Some(format!("Add failed: {}", e)),
@@ -179,9 +193,16 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             _ => {
-                if self.add_focused == 0 && !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.add_input
-                        .handle_event(&crossterm::event::Event::Key(key));
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match self.add_focused {
+                        0 => self
+                            .add_input
+                            .handle_event(&crossterm::event::Event::Key(key)),
+                        1 => self
+                            .add_base_branch
+                            .handle_event(&crossterm::event::Event::Key(key)),
+                        _ => None,
+                    };
                 }
                 DialogResult::Continue
             }
@@ -192,7 +213,7 @@ impl ProjectsDialog {
         let dialog_width: u16 = 76;
         let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
-            2
+            3
         } else {
             0
         };
@@ -213,7 +234,7 @@ impl ProjectsDialog {
             Constraint::Length(list_height),
             Constraint::Length(1),
             Constraint::Length(if matches!(self.mode, Mode::Adding) {
-                6
+                7
             } else {
                 1
             }),
@@ -246,14 +267,21 @@ impl ProjectsDialog {
                     } else {
                         Style::default().fg(theme.dimmed)
                     };
-                    Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(if idx == self.selected { "› " } else { "  " }, style),
                         Span::styled(project.name.clone(), style),
                         Span::raw(" "),
                         Span::styled(format!("[{}]", project.scope.as_str()), scope_style),
                         Span::raw("  "),
                         Span::styled(project.path.clone(), Style::default().fg(theme.dimmed)),
-                    ])
+                    ];
+                    if let Some(base) = &project.default_base_branch {
+                        spans.push(Span::styled(
+                            format!("  base:{}", base),
+                            Style::default().fg(theme.dimmed),
+                        ));
+                    }
+                    Line::from(spans)
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines), chunks[0]);
@@ -298,7 +326,26 @@ impl ProjectsDialog {
                         Span::raw("")
                     },
                 ]);
-                let scope_label_style = if self.add_focused == 1 {
+                let base_label_style = if self.add_focused == 1 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let base_line = Line::from(vec![
+                    Span::styled("Base branch: ", base_label_style),
+                    Span::styled(
+                        self.add_base_branch.value().to_string(),
+                        Style::default().fg(theme.text),
+                    ),
+                    if self.add_focused == 1 {
+                        Span::styled("█", Style::default().fg(theme.accent))
+                    } else if self.add_base_branch.value().is_empty() {
+                        Span::styled("(auto-detect)", Style::default().fg(theme.dimmed))
+                    } else {
+                        Span::raw("")
+                    },
+                ]);
+                let scope_label_style = if self.add_focused == 2 {
                     Style::default().fg(theme.accent).underlined()
                 } else {
                     Style::default().fg(theme.text)
@@ -314,7 +361,7 @@ impl ProjectsDialog {
                         Style::default().fg(theme.accent).bold(),
                     ),
                 ]);
-                let override_label_style = if self.add_focused == 2 {
+                let override_label_style = if self.add_focused == 3 {
                     Style::default().fg(theme.accent).underlined()
                 } else {
                     Style::default().fg(theme.text)
@@ -331,7 +378,7 @@ impl ProjectsDialog {
                         Style::default().fg(theme.accent).bold(),
                     ),
                 ]);
-                let mut lines = vec![path_line, scope_line, override_line];
+                let mut lines = vec![path_line, base_line, scope_line, override_line];
                 if let Some(err) = &self.error {
                     lines.push(Line::from(Span::styled(
                         err.clone(),
@@ -339,8 +386,23 @@ impl ProjectsDialog {
                     )));
                 }
                 frame.render_widget(Paragraph::new(lines), chunks[2]);
+                // The real terminal cursor follows the focused text field. Each
+                // field renders on its own row within chunks[2], so offset the
+                // 1-row cursor rect by the field's line index.
+                let row = |offset: u16| Rect {
+                    y: chunks[2].y.saturating_add(offset),
+                    height: 1,
+                    ..chunks[2]
+                };
                 if self.add_focused == 0 {
-                    set_prefixed_input_cursor_position(frame, chunks[2], "Path: ", &self.add_input);
+                    set_prefixed_input_cursor_position(frame, row(0), "Path: ", &self.add_input);
+                } else if self.add_focused == 1 {
+                    set_prefixed_input_cursor_position(
+                        frame,
+                        row(1),
+                        "Base branch: ",
+                        &self.add_base_branch,
+                    );
                 }
             }
         }

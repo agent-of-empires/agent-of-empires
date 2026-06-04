@@ -32,14 +32,22 @@ describe("resolveAgentProfile", () => {
     expect(p.parentMetaNamespaces).toEqual(["claudeCode"]);
   });
 
-  it("codex / opencode / gemini disable claude-specific cards", () => {
-    for (const key of ["codex", "opencode", "gemini"] as const) {
+  it("codex / gemini disable claude-specific cards", () => {
+    for (const key of ["codex", "gemini"] as const) {
       const p = resolveAgentProfile(key);
       expect(p.capabilities.todos).toBe(false);
       expect(p.capabilities.skills).toBe(false);
       expect(p.capabilities.wakeup).toBe(false);
       expect(p.parentMetaNamespaces).toEqual([]);
     }
+  });
+
+  it("opencode supports todowrite cards but keeps other claude-specific cards disabled", () => {
+    const p = resolveAgentProfile("opencode");
+    expect(p.capabilities.todos).toBe(true);
+    expect(p.capabilities.skills).toBe(false);
+    expect(p.capabilities.wakeup).toBe(false);
+    expect(p.parentMetaNamespaces).toEqual([]);
   });
 
   it("codex aliases route shell / apply_patch / view_file to canonical cards", () => {

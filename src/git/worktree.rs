@@ -988,6 +988,67 @@ impl GitWorktree {
         Ok(())
     }
 
+    /// Whether a local branch `refs/heads/<branch>` exists in this repo.
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        let refname = format!("refs/heads/{branch}");
+        match super::command::run_git(
+            &self.repo_path,
+            ["show-ref", "--verify", "--quiet", &refname],
+        ) {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Move a managed worktree directory via `git worktree move`, which
+    /// relocates the checkout and updates the linked-worktree gitdir
+    /// metadata. A plain filesystem rename would leave git's bookkeeping
+    /// pointing at the old path, so always go through git here.
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+        if !from.exists() {
+            return Err(GitError::WorktreeNotFound(from.to_path_buf()));
+        }
+        if to.exists() {
+            return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
+        }
+        let from_str = from
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let to_str = to
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+
+        tracing::info!(target: "git.worktree",
+            from = %from.display(),
+            to = %to.display(),
+            "move_worktree: invoking `git worktree move`"
+        );
+        let output =
+            super::command::run_git(&self.repo_path, ["worktree", "move", from_str, to_str])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
+    /// Rename a local branch via `git branch -m`. Works while the branch is
+    /// checked out in a worktree (git updates that worktree's HEAD). Errors
+    /// if `old` does not exist or `new` already exists.
+    pub fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        tracing::info!(target: "git.worktree",
+            old, new,
+            repo = %self.repo_path.display(),
+            "rename_branch: invoking `git branch -m`"
+        );
+        let output = super::command::run_git(&self.repo_path, ["branch", "-m", old, new])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
     pub fn compute_path(&self, branch: &str, template: &str, session_id: &str) -> Result<PathBuf> {
         let repo_name = self
             .repo_path

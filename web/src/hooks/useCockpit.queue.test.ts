@@ -16,7 +16,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyCockpitState, type QueuedPrompt } from "../lib/cockpitTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
-import { cockpitHookReducer, combineQueuedPrompts, useCockpit } from "./useCockpit";
+import { reportCockpitInteraction } from "../lib/api";
+import {
+  cockpitHookReducer,
+  combineQueuedPrompts,
+  useCockpit,
+} from "./useCockpit";
+
+// Spy on the telemetry ping while keeping the rest of the api module real
+// (the hook also calls setSessionArchive / setSessionSnooze through it).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, reportCockpitInteraction: vi.fn() };
+});
 
 describe("cockpitHookReducer / queue actions", () => {
   it("emptyCockpitState starts with an empty queue", () => {
@@ -38,12 +50,41 @@ describe("cockpitHookReducer / queue actions", () => {
       expect(s2.queuedPrompts).toHaveLength(2);
       expect(s2.queuedPrompts[0]?.text).toBe("first");
       expect(s2.queuedPrompts[1]?.text).toBe("second");
-      expect(s2.queuedPrompts[0]?.queuedAt).toBe(
-        "2026-01-01T00:00:00.000Z",
-      );
+      expect(s2.queuedPrompts[0]?.queuedAt).toBe("2026-01-01T00:00:00.000Z");
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("enqueue_prompt carries attachments onto the queued row (#1833)", () => {
+    const s1 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "with image",
+      attachments: [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "x.png",
+        },
+      ],
+    });
+    expect(s1.queuedPrompts[0]?.attachments).toHaveLength(1);
+    expect(s1.queuedPrompts[0]?.attachments?.[0]?.name).toBe("x.png");
+  });
+
+  it("enqueue_prompt omits the attachments key for a text-only send", () => {
+    const s1 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "text only",
+    });
+    expect(s1.queuedPrompts[0]?.attachments).toBeUndefined();
+    const s2 = cockpitHookReducer(emptyCockpitState(), {
+      kind: "enqueue_prompt",
+      text: "empty list",
+      attachments: [],
+    });
+    expect(s2.queuedPrompts[0]?.attachments).toBeUndefined();
   });
 
   it("dequeue_prompt removes the matching entry by id", () => {
@@ -202,6 +243,13 @@ describe("combineQueuedPrompts (combined drain mode)", () => {
   it("returns a single entry unchanged for a one-item queue", () => {
     expect(combineQueuedPrompts([mk("a", "only one")])).toBe("only one");
   });
+
+  it("skips empty (attachment-only) entries so no stray blank lines appear (#1833)", () => {
+    expect(
+      combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")]),
+    ).toBe("before\n\nafter");
+    expect(combineQueuedPrompts([mk("a", ""), mk("b", "")])).toBe("");
+  });
 });
 
 // Hook-level regression tests for #1144: queued prompts were silently
@@ -280,6 +328,7 @@ describe("useCockpit drain race (#1144)", () => {
     promptPostStatus = 200;
     promptPostBody = "simulated failure";
     promptPostBodies = [];
+    vi.mocked(reportCockpitInteraction).mockClear();
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
       "fetch",
@@ -328,6 +377,81 @@ describe("useCockpit drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts[0]?.text).toBe(
       "queued before open",
     );
+  });
+
+  // #1888: parking a prompt because the agent is busy is the one cockpit
+  // interaction the daemon cannot observe (the queue is client-only), so the
+  // browser pings it for opt-in telemetry.
+  it("reports a prompt_queued telemetry interaction when a prompt parks (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-ping"));
+    await flushAsync();
+    // WS still CONNECTING, so sendPrompt parks the prompt rather than POSTing.
+    act(() => {
+      void result.current.sendPrompt("parked, please count me");
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledTimes(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("does not report a prompt_queued interaction when a prompt POSTs directly (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-noping"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      void result.current.sendPrompt("sent straight through");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(reportCockpitInteraction).not.toHaveBeenCalled();
+  });
+
+  it("reports a prompt_queued interaction on the retryable-failure requeue path (#1888)", async () => {
+    // Idle-dormant wake: the worker was reaped, so sendPrompt POSTs directly
+    // to wake it. When that POST fails retryably (worker_not_ready 503), the
+    // prompt is re-queued, and that re-queue must ping telemetry too.
+    const { result } = renderHook(() =>
+      useCockpit("sess-retry-requeue", "absent"),
+    );
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    // idle_auto_stop sets workerIdleStopped (not workerStopped), so sendPrompt
+    // takes the direct-POST wake path rather than parking up front.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-retry-requeue",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    // Force the wake POST to fail retryably.
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    act(() => {
+      void result.current.sendPrompt("retry me");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledTimes(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
   it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
@@ -395,7 +519,9 @@ describe("useCockpit drain race (#1144)", () => {
   it("a fresh prompt POSTs (wakes) instead of parking when the worker is idle-dormant (#1689)", async () => {
     // workerState="absent": the reconciler reaped the worker for
     // inactivity. The REST poll reads "absent" until the respawn lands.
-    const { result } = renderHook(() => useCockpit("sess-idle-fresh", "absent"));
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-fresh", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -449,7 +575,9 @@ describe("useCockpit drain race (#1144)", () => {
     // a cold-absent resume, then the reconciler reaped it to dormant.
     // The dormancy signal must let the drain effect fire the parked
     // prompt (the wake POST), otherwise it sits queued forever.
-    const { result } = renderHook(() => useCockpit("sess-idle-drain", "absent"));
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-drain", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -559,11 +687,14 @@ describe("useCockpit drain race (#1144)", () => {
     );
   });
 
-  it("keeps the error banner on a worker_not_ready 503 for an attachment send (#1748)", async () => {
-    // Attachments cannot be re-queued (the local queue is text-only), so a
-    // worker_not_ready 503 for an attachment send has no retry path. The
-    // banner must show rather than being suppressed as transient.
-    const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
+  it("re-queues an attachment send without an error banner on a worker_not_ready 503 (#1833)", async () => {
+    // The local queue now carries attachments in memory, so a
+    // worker_not_ready 503 for an attachment send has a retry path: park
+    // it (image included) and suppress the banner, exactly like a
+    // text-only send. The drain re-fires it once the worker comes online.
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-attach", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -597,9 +728,234 @@ describe("useCockpit drain race (#1144)", () => {
     });
     await flushAsync();
 
-    expect(result.current.state.lastError ?? "").toContain(
-      "Could not send prompt (503)",
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
     );
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
+    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.attachments?.[0]?.name).toBe(
+      "shot.png",
+    );
+  });
+
+  it("queues an attachment send mid-turn instead of dropping it (#1833)", async () => {
+    // The bug: sending an image while the agent is still producing the
+    // previous turn surfaced an error and the composer cleared the image,
+    // losing it. It must queue like text and drain on Stopped.
+    const { result } = renderHook(() => useCockpit("sess-attach-midturn"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // Kick a turn so turnActive flips on.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-midturn",
+          seq: 1,
+          event: { UserPromptSent: { text: "kicker" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.turnActive).toBe(true);
+
+    // Send an image while the turn is active.
+    await act(async () => {
+      await result.current.sendPrompt("look at this", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "shot.png",
+        },
+      ]);
+    });
+    await flushAsync();
+
+    // No POST yet, no error banner, and the image is parked on the queue.
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.lastError ?? "").not.toContain(
+      "Could not send prompt",
+    );
+    expect(result.current.state.lastError ?? "").not.toContain("Attachments");
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
+
+    // End the turn: the drain fires and the POST carries the attachment.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-midturn",
+          seq: 2,
+          event: { Stopped: { reason: "prompt_complete" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    const sent = JSON.parse(promptPostBodies[0]!) as {
+      text: string;
+      attachments: Array<{ name?: string; data: string }>;
+    };
+    expect(sent.text).toBe("look at this");
+    expect(sent.attachments).toHaveLength(1);
+    expect(sent.attachments[0]?.name).toBe("shot.png");
+    expect(sent.attachments[0]?.data).toBe("aA==");
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("combined-mode drain merges attachments from every queued row into one POST (#1833)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-attach-combined"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-combined",
+          seq: 1,
+          event: { UserPromptSent: { text: "kicker" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    act(() => {
+      void result.current.sendPrompt("first", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "a.png",
+        },
+      ]);
+    });
+    act(() => {
+      void result.current.sendPrompt("second", [
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "bB==",
+          name: "b.png",
+        },
+      ]);
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(2);
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-attach-combined",
+          seq: 2,
+          event: { Stopped: { reason: "prompt_complete" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    const sent = JSON.parse(promptPostBodies[0]!) as {
+      text: string;
+      attachments: Array<{ name?: string }>;
+    };
+    expect(sent.text).toBe("first\n\nsecond");
+    expect(sent.attachments.map((a) => a.name)).toEqual(["a.png", "b.png"]);
+    expect(result.current.state.queuedPrompts).toEqual([]);
+  });
+
+  it("drains a queued prompt only after rate-limit auto-resume (#1722)", async () => {
+    // Worker is absent while parked on a rate limit; once the daemon
+    // auto-resumes (breadcrumb clears the banner, REST poll flips the
+    // worker to running, AcpSessionAssigned lands) the drain effect must
+    // dispatch the prompt the user queued during the wait, and not before.
+    const { result, rerender } = renderHook(
+      ({ ws }: { ws: "absent" | "resuming" | "running" }) =>
+        useCockpit("sess-rl-resume", ws),
+      { initialProps: { ws: "absent" as const } },
+    );
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    // The provider reported a usage limit; the worker parks.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 1,
+          event: {
+            RateLimit: {
+              info: {
+                status: "usage limit reached",
+                resets_at: "2026-06-01T12:10:00Z",
+                kind: "rate_limit",
+              },
+            },
+          },
+        }),
+      } as MessageEvent);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 2,
+          event: { Stopped: { reason: "rate_limited" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.rateLimit).not.toBeNull();
+
+    // The user queues a follow-up during the park. Worker is absent, so
+    // it must NOT POST yet.
+    act(() => {
+      void result.current.sendPrompt("run after the reset");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(0);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+
+    // Auto-resume fires: the breadcrumb clears the banner, the reconciler
+    // respawns the worker (REST poll -> running) and emits
+    // AcpSessionAssigned. The drain effect now dispatches the queued prompt.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 3,
+          event: {
+            RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" },
+          },
+        }),
+      } as MessageEvent);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-rl-resume",
+          seq: 4,
+          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+        }),
+      } as MessageEvent);
+    });
+    rerender({ ws: "running" as const });
+    await flushAsync();
+
+    expect(result.current.state.rateLimit).toBeNull();
+    expect(promptPostCount).toBe(1);
+    expect(promptPostBodies[0]).toContain("run after the reset");
     expect(result.current.state.queuedPrompts).toEqual([]);
   });
 

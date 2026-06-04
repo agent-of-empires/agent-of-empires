@@ -45,6 +45,7 @@ pub enum ActionId {
     Stop,
     Delete,
     Rename,
+    SetWorktreeName,
     Diff,
     Serve,
     Settings,
@@ -452,6 +453,22 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::SetWorktreeName,
+        non_strict: &[k('W')],
+        strict: &[ctrl('w')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Edit worktree workdir name",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Edit worktree workdir name",
+            keywords: &["worktree", "workdir", "directory", "branch", "rename"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Diff,
         non_strict: &[k('D')],
         strict: &[ctrl('d')],
@@ -656,6 +673,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Stop => "stop",
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",
+        ActionId::SetWorktreeName => "set-worktree-name",
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",

@@ -286,6 +286,117 @@ describe("applyEvent / UserPromptSent", () => {
     );
   });
 
+  it("patches a Codex diff onto the edit card when it arrives via ToolCallUpdated, and preserves it on a later text-only update", () => {
+    // Codex emits the apply_patch diff on the update/completion frames,
+    // not the initial tool_call. A non-empty diff list replaces the
+    // card's diffs; a later text-only update must not blank them. See
+    // #1721.
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-edit",
+            name: "Edit src/foo.rs",
+            kind: "edit",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-edit",
+          title: null,
+          args_preview: null,
+          diffs: [
+            {
+              path: "src/foo.rs",
+              old_text: "old",
+              new_text: "new",
+              created_at: new Date().toISOString(),
+            },
+          ],
+        },
+      },
+    });
+    const row = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
+    );
+    expect(row?.tool?.diffs?.length).toBe(1);
+    expect(row?.tool?.diffs?.[0].path).toBe("src/foo.rs");
+    expect(state.inFlightTool?.diffs?.length).toBe(1);
+
+    // A subsequent text-only update (no diffs) must preserve them.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-edit",
+          title: "Edit src/foo.rs",
+          args_preview: null,
+          diffs: null,
+        },
+      },
+    });
+    const rowAfter = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-edit",
+    );
+    expect(rowAfter?.tool?.diffs?.length).toBe(1);
+  });
+
+  it("patches OpenCode todowrite args when ToolCallUpdated supplies todos later", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-todos",
+            name: "todowrite",
+            kind: "other",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    const todos = JSON.stringify({
+      todos: [
+        {
+          content: "Render OpenCode todos",
+          priority: "high",
+          status: "in_progress",
+        },
+      ],
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-todos",
+          title: "1 todos",
+          args_preview: todos,
+        },
+      },
+    });
+
+    const startRow = state.activity.find(
+      (a) => a.kind === "tool_start" && a.toolCallId === "tc-todos",
+    );
+    expect(startRow?.tool?.name).toBe("1 todos");
+    expect(startRow?.tool?.args_preview).toBe(todos);
+    expect(state.inFlightTool?.name).toBe("1 todos");
+    expect(state.inFlightTool?.args_preview).toBe(todos);
+  });
+
   it("uses 'tool failed' when error event has no content", () => {
     const state = applyEvent(emptyCockpitState(), {
       session_id: "s-1",
@@ -2421,5 +2532,189 @@ describe("applyEvent / thinking-state honesty (#1213)", () => {
     // The WorkingSpinner derives state as tool > thinking > working.
     expect(state.thinking).toBe(false);
     expect(state.inFlightTool).not.toBeNull();
+  });
+});
+
+describe("applyEvent / start-less tool flows (#1713)", () => {
+  // Gemini's permission flow ships completions/updates with no preceding
+  // ToolCallStarted frame. The reducer must synthesize a start row so the
+  // card still renders, and a sparse permission start must not clobber a
+  // richer real start frame for the same id.
+
+  function toolCall(id: string, over: Partial<ToolCall> = {}): ToolCall {
+    return {
+      id,
+      name: "Write file",
+      kind: "edit",
+      args_preview: "",
+      started_at: "2026-01-01T00:00:00Z",
+      ...over,
+    };
+  }
+
+  it("synthesizes a tool_start row when a completion arrives with no start", () => {
+    const state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallCompleted: {
+          tool_call_id: "orphan-1",
+          is_error: false,
+          content: "done output",
+          completed_at: "2026-01-01T00:00:01Z",
+        },
+      },
+    });
+    const start = state.activity.find(
+      (r) => r.kind === "tool_start" && r.toolCallId === "orphan-1",
+    );
+    expect(start).toBeDefined();
+    const done = state.activity.find(
+      (r) => r.kind === "tool_complete" && r.toolCallId === "orphan-1",
+    );
+    expect(done?.text).toBe("done output");
+    // A synthesized card counts as turn output, so the turn-end logic
+    // must not append "Command produced no output."
+    expect(state.turnHasOutput).toBe(true);
+  });
+
+  it("synthesizes a tool_start row when an update arrives with no start", () => {
+    const state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "orphan-2",
+          title: "run_shell_command",
+          args_preview: '{"command":"ls"}',
+        },
+      },
+    });
+    const start = state.activity.find(
+      (r) => r.kind === "tool_start" && r.toolCallId === "orphan-2",
+    );
+    expect(start).toBeDefined();
+    expect(start?.tool?.name).toBe("run_shell_command");
+    expect(start?.tool?.args_preview).toBe('{"command":"ls"}');
+  });
+
+  it("a sparse permission start does not clobber a richer real start", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-1", {
+            kind: "execute",
+            args_preview: '{"command":"ls -la"}',
+          }),
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-1", { kind: "other", args_preview: "" }),
+        },
+      },
+    });
+    const rows = state.activity.filter(
+      (r) => r.kind === "tool_start" && r.toolCallId === "dup-1",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.tool?.args_preview).toBe('{"command":"ls -la"}');
+    expect(rows[0]?.tool?.kind).toBe("execute");
+  });
+
+  it("a later rich start frame fills in a sparse permission start", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-2", { kind: "other", args_preview: "" }),
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-2", {
+            kind: "execute",
+            args_preview: '{"command":"pwd"}',
+          }),
+        },
+      },
+    });
+    const rows = state.activity.filter(
+      (r) => r.kind === "tool_start" && r.toolCallId === "dup-2",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.tool?.args_preview).toBe('{"command":"pwd"}');
+    expect(rows[0]?.tool?.kind).toBe("execute");
+  });
+
+  it("prefers the later started_at when a real start follows a permission start", () => {
+    let state = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-3", {
+            kind: "other",
+            args_preview: "",
+            started_at: "2026-01-01T00:00:00Z",
+          }),
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: toolCall("dup-3", {
+            kind: "execute",
+            args_preview: '{"command":"pwd"}',
+            started_at: "2026-01-01T00:00:05Z",
+          }),
+        },
+      },
+    });
+    const row = state.activity.find(
+      (r) => r.kind === "tool_start" && r.toolCallId === "dup-3",
+    );
+    expect(row?.tool?.started_at).toBe("2026-01-01T00:00:05Z");
+    expect(row?.at).toBe("2026-01-01T00:00:05Z");
+  });
+});
+
+describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
+  it("clears the rate-limit banner so the composer unlocks", () => {
+    let state: CockpitState = applyEvent(emptyCockpitState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        RateLimit: {
+          info: {
+            status: "usage limit reached",
+            resets_at: "2026-06-01T12:10:00Z",
+            kind: "rate_limit",
+          },
+        },
+      },
+    });
+    expect(state.rateLimit).not.toBeNull();
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
+    });
+    expect(state.rateLimit).toBeNull();
   });
 });

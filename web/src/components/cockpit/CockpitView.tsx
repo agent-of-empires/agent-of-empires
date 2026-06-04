@@ -26,11 +26,19 @@ import {
   Clock,
   Info,
   ListChecks,
+  Paperclip,
   RotateCcw,
   X,
 } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
+import { CockpitFileRefContext } from "./CockpitFileRefContext";
+import type { FileRef } from "../../lib/fileRef";
+import {
+  ToolDensityToggle,
+  ToolDisplayModeProvider,
+  useToolDensityPref,
+} from "./ToolDisplayMode";
 import {
   CockpitRuntime,
   SUBAGENT_TASK_NAME,
@@ -108,6 +116,12 @@ interface Props {
    *  timestamps come back as null and we fall through to the live
    *  variant. See #1581. */
   snoozedUntil: string | null;
+  /** Open a local file reference cited in the transcript (Codex
+   *  `path:line` markdown links). Provided to the markdown anchor
+   *  override via context so a click opens the in-app file viewer
+   *  instead of navigating away. Omit to leave such links as normal
+   *  anchors. See #1718. */
+  onOpenFileRef?: (ref: FileRef) => void;
 }
 
 const STARTER_PROMPTS = [
@@ -122,34 +136,44 @@ export function CockpitView({
   tool,
   archivedAt,
   snoozedUntil,
+  onOpenFileRef,
 }: Props) {
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
   // event-log state. See #1101.
   const [showClearedTurns, setShowClearedTurns] = useState(false);
+  // Tool-card density is a client-side view preference (localStorage),
+  // not reducer state and not a daemon config field. See #1767.
+  const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
-    <AgentProfileProvider toolKey={tool}>
-      <CockpitRuntime
-        sessionId={sessionId}
-        cockpitWorkerState={cockpitWorkerState}
-        archivedAt={archivedAt}
-        snoozedUntil={snoozedUntil}
-        showClearedTurns={showClearedTurns}
-      >
-        {(ctx) => (
-          <CockpitChrome
+    <CockpitFileRefContext.Provider value={{ onOpenFileRef }}>
+      <AgentProfileProvider toolKey={tool}>
+        <ToolDisplayModeProvider density={toolDensity}>
+          <CockpitRuntime
             sessionId={sessionId}
             cockpitWorkerState={cockpitWorkerState}
-            showClearedTurns={showClearedTurns}
-            onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
             archivedAt={archivedAt}
             snoozedUntil={snoozedUntil}
-            {...ctx}
-          />
-        )}
-      </CockpitRuntime>
-    </AgentProfileProvider>
+            showClearedTurns={showClearedTurns}
+          >
+            {(ctx) => (
+              <CockpitChrome
+                sessionId={sessionId}
+                cockpitWorkerState={cockpitWorkerState}
+                showClearedTurns={showClearedTurns}
+                onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                toolDensity={toolDensity}
+                onToggleToolDensity={toggleToolDensity}
+                archivedAt={archivedAt}
+                snoozedUntil={snoozedUntil}
+                {...ctx}
+              />
+            )}
+          </CockpitRuntime>
+        </ToolDisplayModeProvider>
+      </AgentProfileProvider>
+    </CockpitFileRefContext.Provider>
   );
 }
 
@@ -158,6 +182,8 @@ function CockpitChrome({
   cockpitWorkerState,
   showClearedTurns,
   onToggleClearedTurns,
+  toolDensity,
+  onToggleToolDensity,
   archivedAt,
   snoozedUntil,
   state,
@@ -188,6 +214,8 @@ function CockpitChrome({
   cockpitWorkerState: "absent" | "resuming" | "running";
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
+  toolDensity: "detailed" | "compact";
+  onToggleToolDensity: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
 }) {
@@ -382,6 +410,15 @@ function CockpitChrome({
             <ThreadPrimitive.Empty>
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
+
+            {state.activity.length > 0 && (
+              <div className="mb-2 flex">
+                <ToolDensityToggle
+                  density={toolDensity}
+                  onToggle={onToggleToolDensity}
+                />
+              </div>
+            )}
 
             {clearedSummary && clearedSummary.hiddenCount > 0 && (
               <ClearedTurnsBanner
@@ -2284,6 +2321,30 @@ function QueuedPromptRow({
             >
               {rowExpanded ? "Show less" : "…"}
             </button>
+          )}
+          {prompt.attachments && prompt.attachments.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1.5" data-testid="queued-attachments">
+              {prompt.attachments.map((att, i) => (
+                <span
+                  key={`${att.name ?? att.kind}-${i}`}
+                  className="flex items-center gap-1 rounded border border-sky-700/40 bg-sky-950/30 py-0.5 pl-0.5 pr-1.5 text-[10px] text-sky-200"
+                  title={att.name ?? att.kind}
+                >
+                  {att.kind === "image" ? (
+                    <img
+                      src={`data:${att.mimeType};base64,${att.dataB64}`}
+                      alt={att.name ?? "attachment"}
+                      className="h-5 w-5 rounded object-cover"
+                    />
+                  ) : (
+                    <Paperclip className="h-3 w-3" />
+                  )}
+                  <span className="max-w-[100px] truncate">
+                    {att.name ?? att.kind}
+                  </span>
+                </span>
+              ))}
+            </div>
           )}
         </div>
       )}

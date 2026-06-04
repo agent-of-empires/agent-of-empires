@@ -20,6 +20,7 @@ pub(crate) mod serde_helpers;
 pub mod settings_schema;
 pub mod stop;
 mod storage;
+pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
@@ -88,6 +89,16 @@ pub fn get_app_dir() -> Result<PathBuf> {
         fs::create_dir_all(&dir)?;
     }
     Ok(dir)
+}
+
+/// Whether the app data dir already exists, **without** creating it (unlike
+/// [`get_app_dir`], which auto-creates). Lets side-effect-sensitive callers
+/// probe install state cheaply: the per-command telemetry recorder uses it to
+/// stay a true no-op for app-data-free commands (`aoe completion`, `aoe init`,
+/// ...) on an install that is not opted in, so those commands keep working in
+/// read-only / sandboxed (e.g. Nix) environments without materializing the dir.
+pub fn app_dir_exists() -> bool {
+    get_app_dir_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 fn get_app_dir_path() -> Result<PathBuf> {

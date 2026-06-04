@@ -251,6 +251,15 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub devices: RwLock<Vec<DeviceInfo>>,
     pub behind_tunnel: bool,
+    /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` /
+    /// `"none"`). `/api/about` and the opt-in telemetry snapshot both read this
+    /// single value rather than re-deriving it; immutable for the daemon's
+    /// lifetime. Never the token or passphrase itself, only the mode.
+    pub auth_mode: &'static str,
+    /// Coarse exposure mode resolved once at launch from the active transport
+    /// (`"tunnel"` / `"tailscale"` / `"local"`), fed to the telemetry snapshot.
+    /// Never a tunnel name, hostname, or `.ts.net` URL, only the mode.
+    pub serve_mode: &'static str,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
@@ -331,24 +340,42 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
-    /// Counts browser reports that the web dashboard / cockpit web UI was opened,
-    /// so the next opt-in telemetry snapshot can carry `web_seen` / `cockpit_seen`
-    /// (the wire field is the boolean `count > 0`). A monotonic counter rather than
-    /// a flag so the snapshot loop can decrement by exactly what it reported (like
-    /// the create counter): an open that lands during an in-flight send is then
-    /// preserved for the next snapshot instead of being cleared away. The browser
-    /// never posts to the telemetry backend; it pings the local daemon (`POST
-    /// /api/telemetry/seen`), which folds the count into its own snapshot.
-    pub telemetry_web_seen: std::sync::atomic::AtomicU32,
-    pub telemetry_cockpit_seen: std::sync::atomic::AtomicU32,
+    /// Allowlisted usage-signal counters: per-signal counts of browser reports
+    /// that a surface (web dashboard / cockpit web UI) was opened, so the next
+    /// opt-in telemetry snapshot can carry the `usage_seen` map. Monotonic
+    /// counters rather than flags so the snapshot loop can decrement by exactly
+    /// what it reported (like the create counter): an open that lands during an
+    /// in-flight send is preserved for the next snapshot instead of being cleared
+    /// away. The browser never posts to the telemetry backend; it pings the local
+    /// daemon (`POST /api/telemetry/seen`), which folds the count in here.
+    /// Instrumenting a new surface is one entry in `telemetry::usage_signals`.
+    pub telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters,
+    /// Per-form-factor open counts for the web dashboard / cockpit, layered on
+    /// the `usage_seen` registry counts above so the snapshot can report which
+    /// client classes (desktop / mobile / PWA) used each surface. The registry
+    /// counts the open; a classified open additionally bumps the matching class
+    /// here. An unclassified open (older frontend, no `form_factor`) is counted
+    /// only by the registry. See `telemetry::form_factor` and #1883.
+    pub telemetry_web_clients: FormFactorCounters,
+    pub telemetry_cockpit_clients: FormFactorCounters,
     /// Sessions created since the last opt-in telemetry snapshot. Feeds the
     /// `session_creates_since_last_snapshot` trend counter so short-lived sessions
     /// that start and end between two snapshots are still counted. Decremented (by
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
     pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    /// Aggregate cockpit-interaction tallies for the next opt-in snapshot
+    /// (approvals decision mix, agent/substrate switches, plan-mode, queued
+    /// prompts). Same monotonic-counter, decrement-by-reported discipline as
+    /// the `telemetry_*_seen` counters, so an interaction that lands during an
+    /// in-flight send survives to the next snapshot. In-memory on purpose, like
+    /// the `seen` counters: these are coarse opt-in adoption signals, so losing
+    /// a partial window on a rare daemon crash is acceptable, and durability
+    /// would be a deliberate cross-cutting change for all telemetry counters,
+    /// not a per-feature one.
+    pub telemetry_cockpit: CockpitTelemetryCounters,
     /// What the most recent serve snapshot reported, held until its send is
-    /// confirmed so the originating signals (`web_seen` / `cockpit_seen` / the
+    /// confirmed so the originating signals (the `usage_seen` counts and the
     /// create counter) are cleared only on success. The telemetry loop is the
     /// sole reader/writer, so it never overlaps an in-flight build.
     telemetry_last_reported: std::sync::Mutex<Option<ReportedServeSignals>>,
@@ -461,6 +488,22 @@ pub struct ServerConfig<'a> {
     /// same surface as `remote`, without spawning a tunnel.
     pub behind_proxy: bool,
     pub open_browser: bool,
+}
+
+/// Resolve the coarse auth-mode label the same way `/api/about` reports it, so
+/// the value is derived once from a single place. Token auth wins over a
+/// passphrase second factor when both are configured.
+pub(crate) async fn resolve_auth_mode(
+    token_manager: &TokenManager,
+    login_manager: &login::LoginManager,
+) -> &'static str {
+    if !token_manager.is_no_auth().await {
+        "token"
+    } else if login_manager.is_enabled() {
+        "passphrase"
+    } else {
+        "none"
+    }
 }
 
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
@@ -592,59 +635,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor
     };
 
-    let state = Arc::new(AppState {
-        profile: profile.to_string(),
-        read_only,
-        instances: RwLock::new(instances),
-        token_manager: Arc::clone(&token_manager),
-        login_manager: Arc::clone(&login_manager),
-        rate_limiter: Arc::clone(&rate_limiter),
-        devices: RwLock::new(Vec::new()),
-        behind_tunnel: remote || behind_proxy,
-        instance_locks: RwLock::new(std::collections::HashMap::new()),
-        recently_restarted: crate::session::recovery::new_recently_restarted(),
-        cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
-            // Seed with an already-stale timestamp so the first request
-            // forces a fresh resolve instead of handing out an empty map.
-            refreshed_at: std::time::Instant::now() - CLEANUP_DEFAULTS_TTL,
-            entries: std::collections::HashMap::new(),
-        }),
-        remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
-        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
-        #[cfg(feature = "serve")]
-        cockpit_events_tx: cockpit_events_tx.clone(),
-        #[cfg(feature = "serve")]
-        cockpit_event_store: cockpit_event_store.clone(),
-        #[cfg(feature = "serve")]
-        cockpit_master_enabled,
-        #[cfg(feature = "serve")]
-        cockpit_supervisor: cockpit_supervisor.clone(),
-        push: push_state,
-        push_enabled,
-        web_config: config.web.clone(),
-        last_web_activity: std::sync::atomic::AtomicI64::new(0),
-        telemetry_web_seen: std::sync::atomic::AtomicU32::new(0),
-        telemetry_cockpit_seen: std::sync::atomic::AtomicU32::new(0),
-        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
-        telemetry_last_reported: std::sync::Mutex::new(None),
-        shutdown: CancellationToken::new(),
-    });
+    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
+    // The boot announcement fires here, before transport setup, so a launch
+    // attempt is still recorded even if a remote tunnel later fails to come up.
+    // The periodic `usage_snapshot` loop is spawned only after the transport is
+    // resolved (below), so its first tick can report the real `serve_mode`.
+    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
 
-    // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot
-    // and refresh an aggregate snapshot periodically. Detached; errors are
-    // swallowed.
-    spawn_telemetry_loop(state.clone());
-
-    let app = build_router(state.clone());
-
-    // Cockpit workers for persisted sessions get auto-spawned by the
-    // reconciler in `status_poll_loop`. The poll interval's first tick
-    // fires immediately, so on cold startup this is equivalent to the
-    // old in-place loop here, while also covering sessions added via
-    // `aoe add --cockpit` while serve is already running. The
-    // reconciler short-circuits when `cockpit.enabled = false`.
+    // Resolve the coarse auth mode once at launch; `/api/about` and the
+    // telemetry snapshot both read this single value.
+    let auth_mode = resolve_auth_mode(&token_manager, &login_manager).await;
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -823,6 +823,69 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     };
 
+    // Coarse exposure label for telemetry, read straight from the resolved
+    // transport so it cannot drift from what was actually spawned: the tunnel
+    // handle reports "tunnel" (Cloudflare quick or named) or "tailscale", and a
+    // local-only daemon has no handle. Named-tunnel names never leak; only the
+    // coarse mode is taken.
+    let serve_mode: &'static str = tunnel_handle
+        .as_ref()
+        .map(|h| h.mode_label())
+        .unwrap_or("local");
+
+    let state = Arc::new(AppState {
+        profile: profile.to_string(),
+        read_only,
+        instances: RwLock::new(instances),
+        token_manager: Arc::clone(&token_manager),
+        login_manager: Arc::clone(&login_manager),
+        rate_limiter: Arc::clone(&rate_limiter),
+        devices: RwLock::new(Vec::new()),
+        behind_tunnel: remote || behind_proxy,
+        auth_mode,
+        serve_mode,
+        instance_locks: RwLock::new(std::collections::HashMap::new()),
+        recently_restarted: crate::session::recovery::new_recently_restarted(),
+        cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
+            // Seed with an already-stale timestamp so the first request
+            // forces a fresh resolve instead of handing out an empty map.
+            refreshed_at: std::time::Instant::now() - CLEANUP_DEFAULTS_TTL,
+            entries: std::collections::HashMap::new(),
+        }),
+        remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        #[cfg(feature = "serve")]
+        cockpit_events_tx: cockpit_events_tx.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_event_store: cockpit_event_store.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_master_enabled,
+        #[cfg(feature = "serve")]
+        cockpit_supervisor: cockpit_supervisor.clone(),
+        push: push_state,
+        push_enabled,
+        web_config: config.web.clone(),
+        last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
+        telemetry_web_clients: FormFactorCounters::default(),
+        telemetry_cockpit_clients: FormFactorCounters::default(),
+        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_cockpit: CockpitTelemetryCounters::default(),
+        telemetry_last_reported: std::sync::Mutex::new(None),
+        shutdown: CancellationToken::new(),
+    });
+
+    let app = build_router(state.clone());
+
+    // Cockpit workers for persisted sessions get auto-spawned by the
+    // reconciler in `status_poll_loop`. The poll interval's first tick
+    // fires immediately, so on cold startup this is equivalent to the
+    // old in-place loop here, while also covering sessions added via
+    // `aoe add --cockpit` while serve is already running. The
+    // reconciler short-circuits when `cockpit.enabled = false`.
+
     // Seed cockpit sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
     // `state.instances` and the cockpit_event_listener only sees
@@ -839,6 +902,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+
+    // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
+    // resolved (so the first, immediate tick reports the real `serve_mode` and a
+    // daemon whose tunnel failed to start emits nothing) and after cockpit
+    // status seeding plus the synchronous recovery marking (so that first tick's
+    // session counts reflect the restored state rather than a half-loaded one).
+    spawn_serve_snapshot_loop(state.clone());
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
@@ -1120,6 +1190,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}",
             patch(api::rename_session).delete(api::delete_session),
         )
+        .route("/api/sessions/{id}/group", patch(api::update_session_group))
         .route(
             "/api/sessions/{id}/diff/files",
             get(api::session_diff_files),
@@ -1135,6 +1206,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/diff-base",
             patch(api::update_session_diff_base),
+        )
+        .route(
+            "/api/sessions/{id}/worktree-name",
+            patch(api::set_worktree_name),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
         .route(
@@ -1181,6 +1256,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
+        .route(
+            "/api/app-state/web-tour-seen",
+            post(api::mark_web_tour_seen),
+        )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
@@ -1216,6 +1295,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/status", get(api::get_telemetry_status))
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
+        .route(
+            "/api/telemetry/cockpit-interaction",
+            post(api::post_telemetry_cockpit_interaction),
+        )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
@@ -1643,32 +1726,46 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh
 }
 
-/// Background task: emit an opt-in telemetry `process_start` for the serve
-/// surface, then a `usage_snapshot` immediately and every 12 hours, plus a
-/// final one on graceful shutdown. All sends are best-effort and swallow
-/// errors; nothing leaves the box unless the user opted in and an endpoint is
-/// configured.
-fn spawn_telemetry_loop(state: Arc<AppState>) {
-    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
+/// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
+/// every ~4 hours (jittered), plus a final one on graceful shutdown. The boot
+/// `process_start` is emitted separately by the caller before transport setup.
+/// All sends are best-effort and swallow errors; nothing leaves the box unless
+/// the user opted in and an endpoint is configured.
+fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
+        // Jittered period (4h + up to 30m) so installs that boot together don't
+        // snapshot in lockstep; the first tick is still immediate (boot
+        // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
+        let mut interval = tokio::time::interval(crate::telemetry::snapshot_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Sample the live session list more often than we send, folding each
+        // sample into a window aggregate so short-lived sessions' agent/model
+        // mix and the concurrency peak survive into the periodic snapshot (#1870).
+        // Both tickers share this one task, so a sample tick and a flush tick
+        // never run concurrently: the aggregate needs no locking and a plain
+        // reset after a confirmed send is race-free. `Skip` so a long suspend
+        // does not fire a run of catch-up samples on wake.
+        let mut sample = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
                     // Deduped: a serve process that starts and stops between
-                    // 12h ticks would otherwise emit the initial first-tick
+                    // periodic ticks would otherwise emit the initial first-tick
                     // snapshot and an identical shutdown snapshot seconds apart.
-                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                    // We exit after this, so the aggregate is dropped; no reset.
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
                         let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
                         clear_reported_serve_signals(&state, outcome);
                     }
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
                         // Awaited (not detached) so the reported signals are
                         // cleared only after a confirmed send. A failed send
-                        // retains web_seen / cockpit_seen / the create counter
+                        // retains the usage_seen counts / the create counter
                         // for the next snapshot instead of dropping them.
                         let outcome = if crate::telemetry::send_snapshot(snapshot).await {
                             crate::telemetry::SendOutcome::Sent
@@ -1676,44 +1773,236 @@ fn spawn_telemetry_loop(state: Arc<AppState>) {
                             crate::telemetry::SendOutcome::Failed
                         };
                         clear_reported_serve_signals(&state, outcome);
+                        // Reset the window only after a confirmed send, mirroring
+                        // the signal-clear discipline: a failed send keeps the
+                        // aggregate so the next flush re-reports the full window.
+                        if outcome == crate::telemetry::SendOutcome::Sent {
+                            aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+                        }
                     }
+                }
+                _ = sample.tick() => {
+                    let instances = state.instances.read().await.clone();
+                    aggregator.sample(&instances);
                 }
             }
         }
     });
 }
 
+/// Per-form-factor open counters for one web surface (dashboard or cockpit).
+/// A fixed, lock-free set over the closed [`crate::telemetry::WebClientFormFactor`]
+/// allowlist: the seen endpoint increments the matching class, the snapshot
+/// reads exact counts, and a confirmed send decrements by exactly what it
+/// reported (so an open landing during an in-flight send survives, mirroring
+/// the coarse `telemetry_web_seen` counter). Named fields rather than a map so
+/// no free-form string key can ever enter daemon state.
+#[derive(Default)]
+pub struct FormFactorCounters {
+    desktop: std::sync::atomic::AtomicU32,
+    desktop_pwa: std::sync::atomic::AtomicU32,
+    mobile: std::sync::atomic::AtomicU32,
+    mobile_pwa: std::sync::atomic::AtomicU32,
+}
+
+impl FormFactorCounters {
+    fn field(&self, ff: crate::telemetry::WebClientFormFactor) -> &std::sync::atomic::AtomicU32 {
+        use crate::telemetry::WebClientFormFactor::*;
+        match ff {
+            Desktop => &self.desktop,
+            DesktopPwa => &self.desktop_pwa,
+            Mobile => &self.mobile,
+            MobilePwa => &self.mobile_pwa,
+        }
+    }
+
+    /// Record one classified open of the given client class.
+    pub fn increment(&self, ff: crate::telemetry::WebClientFormFactor) {
+        self.field(ff)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Point-in-time read of every class count, so the snapshot loop can later
+    /// decrement by exactly the values it reported.
+    fn read(&self) -> FormFactorCounts {
+        use std::sync::atomic::Ordering;
+        let mut counts = FormFactorCounts::default();
+        for ff in crate::telemetry::WebClientFormFactor::ALL {
+            counts.set(ff, self.field(ff).load(Ordering::Relaxed));
+        }
+        counts
+    }
+
+    /// Subtract exactly the reported counts after a confirmed send. Never zeroes,
+    /// so an open that landed mid-send rolls into the next snapshot.
+    fn decrement(&self, reported: &FormFactorCounts) {
+        for ff in crate::telemetry::WebClientFormFactor::ALL {
+            let n = reported.get(ff);
+            if n > 0 {
+                self.field(ff)
+                    .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// A snapshot's reported per-class counts. Plain values (not atomics) so they
+/// can be stashed in [`ReportedServeSignals`] and replayed on confirm.
+#[derive(Default, Clone, Copy)]
+struct FormFactorCounts {
+    desktop: u32,
+    desktop_pwa: u32,
+    mobile: u32,
+    mobile_pwa: u32,
+}
+
+impl FormFactorCounts {
+    fn slot(&mut self, ff: crate::telemetry::WebClientFormFactor) -> &mut u32 {
+        use crate::telemetry::WebClientFormFactor::*;
+        match ff {
+            Desktop => &mut self.desktop,
+            DesktopPwa => &mut self.desktop_pwa,
+            Mobile => &mut self.mobile,
+            MobilePwa => &mut self.mobile_pwa,
+        }
+    }
+
+    fn set(&mut self, ff: crate::telemetry::WebClientFormFactor, n: u32) {
+        *self.slot(ff) = n;
+    }
+
+    fn get(&self, ff: crate::telemetry::WebClientFormFactor) -> u32 {
+        match ff {
+            crate::telemetry::WebClientFormFactor::Desktop => self.desktop,
+            crate::telemetry::WebClientFormFactor::DesktopPwa => self.desktop_pwa,
+            crate::telemetry::WebClientFormFactor::Mobile => self.mobile,
+            crate::telemetry::WebClientFormFactor::MobilePwa => self.mobile_pwa,
+        }
+    }
+
+    /// Per-class was-seen map for the snapshot wire: only classes with a
+    /// positive count appear, each as `true`. Empty (and so omitted) when no
+    /// classified client opened the surface.
+    fn seen_map(&self) -> std::collections::BTreeMap<String, bool> {
+        let mut map = std::collections::BTreeMap::new();
+        for ff in crate::telemetry::WebClientFormFactor::ALL {
+            if self.get(ff) > 0 {
+                map.insert(ff.key().to_string(), true);
+            }
+        }
+        map
+    }
+}
+
+/// Daemon-side cockpit-interaction tallies for the next opt-in snapshot. Each
+/// is a monotonic `AtomicU32` consumed with the same decrement-by-reported
+/// discipline as `telemetry_*_seen`, so an interaction that lands during an
+/// in-flight send rolls into the next snapshot instead of being dropped.
+///
+/// `plan_mode_seen` is a counter rather than a flag for the same reason: the
+/// snapshot reports the boolean `count > 0`, but consuming it by subtracting
+/// the reported amount keeps a plan-mode entry that arrived mid-send.
+#[derive(Default)]
+pub struct CockpitTelemetryCounters {
+    pub approvals_allow: std::sync::atomic::AtomicU32,
+    pub approvals_allow_always: std::sync::atomic::AtomicU32,
+    pub approvals_deny: std::sync::atomic::AtomicU32,
+    pub agent_switches: std::sync::atomic::AtomicU32,
+    pub substrate_toggles: std::sync::atomic::AtomicU32,
+    pub plan_mode_seen: std::sync::atomic::AtomicU32,
+    pub prompts_queued: std::sync::atomic::AtomicU32,
+}
+
 /// What a serve snapshot reported, so the originating signals can be cleared
 /// only after the send is confirmed. The clear is deferred (rather than reset at
 /// build time) so a failed send retains the signals for the next snapshot.
 struct ReportedServeSignals {
-    web_seen: u32,
-    cockpit_seen: u32,
+    usage_seen: std::collections::BTreeMap<String, u32>,
+    web_clients: FormFactorCounts,
+    cockpit_clients: FormFactorCounts,
     session_creates: u32,
+    cockpit: ReportedCockpitCounts,
+}
+
+/// The raw `AtomicU32` values a snapshot folded in, kept so each can be
+/// decremented by exactly the reported amount on a confirmed send. `plan_mode`
+/// is the raw count (not the reported boolean) so a plan-mode entry that
+/// arrived mid-send is preserved rather than wiped.
+#[derive(Default, Clone, Copy)]
+struct ReportedCockpitCounts {
+    approvals_allow: u32,
+    approvals_allow_always: u32,
+    approvals_deny: u32,
+    agent_switches: u32,
+    substrate_toggles: u32,
+    plan_mode: u32,
+    prompts_queued: u32,
 }
 
 /// Build a serve `usage_snapshot` from the live session list, folding in the
-/// `web_seen` / `cockpit_seen` open counts and the session-create trend counter
-/// *without resetting them*. The reported counts are stashed in `AppState` so
+/// `usage_seen` open counts and the session-create trend counter *without
+/// resetting them*. The reported counts are stashed in `AppState` so
 /// [`clear_reported_serve_signals`] can subtract exactly what was reported once
 /// the send is confirmed. Returns `None` when telemetry is not opted in.
-async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::UsageSnapshot> {
+///
+/// The live read is also folded into `aggregator` as the flush-moment sample,
+/// then the window's peak concurrency and distinct-sessions-seen maps override
+/// the point-in-time defaults `build_usage_snapshot` produced (#1870). The
+/// point-in-time `session_total` and status/sandbox/yolo/cockpit counts keep
+/// their instant-of-flush meaning.
+async fn build_serve_snapshot(
+    state: &AppState,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+) -> Option<crate::telemetry::UsageSnapshot> {
     use std::sync::atomic::Ordering;
-    let web_seen = state.telemetry_web_seen.load(Ordering::Relaxed);
-    let cockpit_seen = state.telemetry_cockpit_seen.load(Ordering::Relaxed);
+    let usage_seen = state.telemetry_usage_seen.snapshot();
+    let web_clients = state.telemetry_web_clients.read();
+    let cockpit_clients = state.telemetry_cockpit_clients.read();
     let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
+    let c = &state.telemetry_cockpit;
+    let reported_cockpit = ReportedCockpitCounts {
+        approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
+        approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
+        approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
+        agent_switches: c.agent_switches.load(Ordering::Relaxed),
+        substrate_toggles: c.substrate_toggles.load(Ordering::Relaxed),
+        plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
+        prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
+    };
+    let cockpit = crate::telemetry::CockpitInteractionCounts {
+        approvals_allow: reported_cockpit.approvals_allow,
+        approvals_allow_always: reported_cockpit.approvals_allow_always,
+        approvals_deny: reported_cockpit.approvals_deny,
+        agent_switches: reported_cockpit.agent_switches,
+        substrate_toggles: reported_cockpit.substrate_toggles,
+        plan_mode_seen: reported_cockpit.plan_mode > 0,
+        prompts_queued: reported_cockpit.prompts_queued,
+    };
     let instances = state.instances.read().await.clone();
-    let snapshot = crate::telemetry::build_usage_snapshot(
+    aggregator.sample(&instances);
+    let mut snapshot = crate::telemetry::build_usage_snapshot(
         crate::telemetry::Surface::Serve,
         &instances,
-        web_seen > 0,
-        cockpit_seen > 0,
+        usage_seen.clone(),
         session_creates,
+        Some(state.auth_mode),
+        Some(state.serve_mode),
+        &cockpit,
     )?;
+    // Layer the per-form-factor was-seen maps onto the snapshot. They are serve
+    // only (the browser surfaces), so the pure builder leaves them empty and the
+    // daemon fills them here from its client counters.
+    snapshot.web_clients_seen = web_clients.seen_map();
+    snapshot.cockpit_clients_seen = cockpit_clients.seen_map();
+    snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
+    snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
+    snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
-        web_seen,
-        cockpit_seen,
+        usage_seen,
+        web_clients,
+        cockpit_clients,
         session_creates,
+        cockpit: reported_cockpit,
     });
     Some(snapshot)
 }
@@ -1721,11 +2010,10 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
 /// Clear the signals a serve snapshot reported, but only when the send was
 /// confirmed (`SendOutcome::Sent`). On `Deduped` the prior confirmed send
 /// already cleared them; on `Failed` they are retained so the next snapshot
-/// re-reports them. The create counter is decremented by exactly the reported
-/// value (not reset to 0). All three signals (the two `seen` open counts and the
-/// create counter) are decremented by exactly what was reported, so an open or a
-/// create that landed during the in-flight send survives into the next snapshot
-/// instead of being cleared away.
+/// re-reports them. Every signal (the `usage_seen` open counts and the create
+/// counter) is decremented by exactly what was reported, not reset to 0, so an
+/// open or a create that landed during the in-flight send survives into the
+/// next snapshot instead of being cleared away.
 fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::SendOutcome) {
     let Some(reported) = state.telemetry_last_reported.lock().unwrap().take() else {
         return;
@@ -1733,20 +2021,43 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
     if outcome != crate::telemetry::SendOutcome::Sent {
         return;
     }
-    decrement_reported_count(&state.telemetry_web_seen, reported.web_seen);
-    decrement_reported_count(&state.telemetry_cockpit_seen, reported.cockpit_seen);
+    state.telemetry_usage_seen.decrement(&reported.usage_seen);
+    state.telemetry_web_clients.decrement(&reported.web_clients);
+    state
+        .telemetry_cockpit_clients
+        .decrement(&reported.cockpit_clients);
     decrement_reported_count(&state.telemetry_session_creates, reported.session_creates);
+    let c = &state.telemetry_cockpit;
+    let rc = reported.cockpit;
+    decrement_reported_count(&c.approvals_allow, rc.approvals_allow);
+    decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
+    decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
+    decrement_reported_count(&c.agent_switches, rc.agent_switches);
+    decrement_reported_count(&c.substrate_toggles, rc.substrate_toggles);
+    decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
+    decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }
 
 /// Decrement a reported telemetry counter by exactly `reported`, never by more.
-/// Using `fetch_sub(reported)` rather than `swap(0)` preserves any increments
-/// (a create, or a web/cockpit open) that landed between the snapshot build and
-/// the confirmed send, so they roll into the next snapshot instead of being
-/// dropped. A no-op when nothing was reported.
+/// Subtracting the reported amount rather than `swap(0)` preserves any
+/// increments (a create, or a web/cockpit open, or a cockpit interaction) that
+/// landed between the snapshot build and the confirmed send, so they roll into
+/// the next snapshot instead of being dropped. A no-op when nothing was
+/// reported.
+///
+/// The snapshot loop is the sole consumer and runs strictly sequentially (each
+/// send is awaited, then cleared, before the next build), so the counter can
+/// never go below `reported`. The subtraction saturates anyway as cheap
+/// insurance against a future refactor that detaches sends, which would
+/// otherwise be able to underflow-wrap the `AtomicU32`.
 fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u32) {
-    if reported > 0 {
-        counter.fetch_sub(reported, std::sync::atomic::Ordering::Relaxed);
+    if reported == 0 {
+        return;
     }
+    use std::sync::atomic::Ordering;
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(reported))
+    });
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -1764,6 +2075,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut last_idle_reap: Option<std::time::Instant> = None;
     #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
+    #[cfg(feature = "serve")]
+    let mut last_rate_limit_reap: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
 
@@ -1896,6 +2209,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 &state,
                 &mut attempted_cockpit_spawns,
                 &mut last_idle_reap,
+                &mut last_rate_limit_reap,
             )
             .await;
 
@@ -2711,6 +3025,10 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
         // Running/Waiting turn (a respawn during an active turn
         // would otherwise stop the spinner mid-stream).
         Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
+        // Auto-resume after a rate-limit park: the worker is coming back.
+        // Heal any sticky error so the sidebar dot recovers; the imminent
+        // fresh spawn emits AcpSessionAssigned and live events right after.
+        Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
         _ => None,
     }
 }
@@ -2748,6 +3066,65 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
 
+    // #1883: the per-form-factor counters dedup repeated same-class opens to a
+    // single was-seen entry, and the confirmed-send decrement subtracts exactly
+    // what was reported so a class opened during an in-flight send survives.
+    #[test]
+    fn form_factor_counters_dedup_and_preserve_in_flight_opens() {
+        use crate::telemetry::WebClientFormFactor::{Desktop, MobilePwa};
+
+        let counters = FormFactorCounters::default();
+        // Two desktop opens and one mobile-PWA open before the snapshot builds.
+        counters.increment(Desktop);
+        counters.increment(Desktop);
+        counters.increment(MobilePwa);
+
+        let reported = counters.read();
+        // Repeated same-class pings collapse to one was-seen entry on the wire.
+        let map = reported.seen_map();
+        assert_eq!(map.get("desktop"), Some(&true));
+        assert_eq!(map.get("mobile_pwa"), Some(&true));
+        assert_eq!(map.get("mobile"), None, "unseen classes are absent");
+        assert_eq!(map.len(), 2);
+
+        // A mobile-PWA open lands while the snapshot is in flight.
+        counters.increment(MobilePwa);
+        // The confirmed send clears only the reported counts.
+        counters.decrement(&reported);
+
+        let after = counters.read();
+        assert_eq!(after.get(Desktop), 0, "reported desktop opens cleared");
+        assert_eq!(
+            after.get(MobilePwa),
+            1,
+            "the open that arrived during the send must be retained"
+        );
+    }
+
+    // #1888: the same decrement path carries the cockpit-interaction counters,
+    // so an interaction that lands mid-send must survive the clear (the plan
+    // mode counter shown here, which the snapshot reports as the bool count>0).
+    #[test]
+    fn reported_count_decrement_preserves_concurrent_cockpit_interaction() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let plan_mode = AtomicU32::new(2);
+        let reported = plan_mode.load(Ordering::Relaxed);
+        plan_mode.fetch_add(1, Ordering::Relaxed);
+        decrement_reported_count(&plan_mode, reported);
+        assert_eq!(plan_mode.load(Ordering::Relaxed), 1);
+    }
+
+    // The decrement saturates rather than underflow-wrapping the AtomicU32, so a
+    // hypothetical future refactor that detaches sends (double-clearing a
+    // counter) degrades to zero instead of jumping to u32::MAX.
+    #[test]
+    fn reported_count_decrement_saturates_below_zero() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(2);
+        decrement_reported_count(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
     #[cfg(feature = "serve")]
     #[test]
     fn derive_cockpit_status_maps_terminal_events() {
@@ -2763,6 +3140,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         assert_eq!(
             derive_cockpit_status(&Event::UserPromptSent {
@@ -2809,6 +3187,15 @@ mod tests {
         assert_eq!(
             derive_cockpit_status(&Event::AcpSessionAssigned {
                 acp_session_id: "uuid".into()
+            }),
+            Some(StatusIntent::HealError)
+        );
+        // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
+        // the worker is coming back, so clear a sticky error without
+        // clobbering an in-progress turn. See #1722.
+        assert_eq!(
+            derive_cockpit_status(&Event::RateLimitAutoResumed {
+                resets_at: chrono::Utc::now()
             }),
             Some(StatusIntent::HealError)
         );
@@ -2985,6 +3372,25 @@ mod tests {
             entries: std::collections::HashMap::new(),
         };
         assert!(cache.stale());
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_mode_matches_about_precedence() {
+        let token = TokenManager::new(Some("abc123".to_string()), Duration::from_secs(3600));
+        let no_token = TokenManager::new(None, Duration::from_secs(3600));
+        let passphrase = login::LoginManager::new(Some("hunter2"));
+        let no_passphrase = login::LoginManager::new(None);
+
+        // A token wins over a passphrase second factor when both are set.
+        assert_eq!(resolve_auth_mode(&token, &passphrase).await, "token");
+        assert_eq!(resolve_auth_mode(&token, &no_passphrase).await, "token");
+        // No token but a passphrase reports passphrase auth.
+        assert_eq!(
+            resolve_auth_mode(&no_token, &passphrase).await,
+            "passphrase"
+        );
+        // Neither configured is the security-relevant fully-open mode.
+        assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
     }
 
     #[tokio::test]

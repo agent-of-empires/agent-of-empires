@@ -1568,6 +1568,13 @@ mod tests {
         assert!(!requires_elevation(&Method::DELETE, "/api/projects/myproj"));
         assert!(!requires_elevation(&Method::POST, "/api/push/subscribe"));
         assert!(!requires_elevation(&Method::POST, "/api/push/unsubscribe"));
+        // Cosmetic UI state: marking the web tour seen flips one bool and
+        // grants no capability, so it stays off the passphrase wall (the
+        // handler still enforces read_only). See #1832.
+        assert!(!requires_elevation(
+            &Method::POST,
+            "/api/app-state/web-tour-seen"
+        ));
 
         // Read-only GETs are NOT gated even on settings/profile paths.
         assert!(!requires_elevation(&Method::GET, "/api/settings"));

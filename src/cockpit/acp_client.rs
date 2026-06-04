@@ -259,6 +259,9 @@ pub struct SpawnConfig {
     pub additional_dirs: Vec<PathBuf>,
     /// Provider env vars to forward (after applying the agent's allowlist).
     pub provider_env: Vec<(String, String)>,
+    /// Optional default reasoning effort to apply on fresh ACP sessions
+    /// through the adapter's `thought_level` config option.
+    pub default_effort: Option<String>,
     /// Reserved for a future agent-in-container that natively speaks
     /// the socket transport. The current cockpit sandbox path runs
     /// `docker exec` from the host-side runner (which already holds the
@@ -378,7 +381,7 @@ const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from
 /// against the adapter ignoring the signal, not against socket /
 /// stdout / process-level wedges that prevent the PromptResponse from
 /// reaching the daemon at all. See #1196.
-const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Vendor-agnostic silent-orphan grace fallback used when no config
 /// value is available. Mirrors `CockpitConfig::silent_orphan_grace_secs`
@@ -683,6 +686,25 @@ impl SilentOrphanWatchdog {
             }
             LifecycleSignal::TerminalUsage => {
                 self.cost_seen = true;
+                // A cost-resolved UsageUpdate is the end-of-turn marker
+                // (mid-turn usages carry `cost: null`, see #1360). A
+                // backgrounded command is fire-and-forget: the agent
+                // launches it and moves on, so it legitimately outlives
+                // the turn and its suppression is moot once the turn
+                // ends. Drop it here, otherwise `effective_grace` keeps
+                // the 30-minute floor and a turn that streamed its final
+                // usage but never returned the PromptResponse hangs for
+                // half an hour instead of recovering on the fast grace
+                // (#1858). Self-correcting: if the turn somehow
+                // continues, the next Progress / ToolStarted /
+                // ToolCompleted clears `cost_seen` and the next
+                // backgrounded tool re-arms suppression. An AsyncAgent
+                // await blocks the turn (the agent idles waiting and
+                // resumes in-band), so its floor is left intact to
+                // preserve the #1360 fix.
+                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
+                    self.off_protocol_work_seen = None;
+                }
             }
             LifecycleSignal::WakeupPending { at } => {
                 self.saw_first_progress = true;
@@ -1223,6 +1245,7 @@ impl AcpClient {
         let profile = agent_profiles::resolve(&config.agent_key);
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
+        let default_effort = config.default_effort.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would
@@ -1248,6 +1271,7 @@ impl AcpClient {
                 profile,
                 install_binary,
                 source_profile_for_task,
+                default_effort.clone(),
             )
             .await;
         }
@@ -1269,6 +1293,7 @@ impl AcpClient {
             profile,
             install_binary,
             source_profile_for_task,
+            default_effort,
         )
         .await
     }
@@ -1289,6 +1314,7 @@ impl AcpClient {
         profile: &'static agent_profiles::AgentProfile,
         install_binary: String,
         source_profile: Option<String>,
+        default_effort: Option<String>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -1344,6 +1370,7 @@ impl AcpClient {
             profile,
             expected_agent,
             source_profile,
+            default_effort,
         ));
 
         wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
@@ -1379,6 +1406,7 @@ impl AcpClient {
         profile: &'static agent_profiles::AgentProfile,
         install_binary: String,
         source_profile: Option<String>,
+        default_effort: Option<String>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
@@ -1426,6 +1454,7 @@ impl AcpClient {
             profile,
             expected_agent,
             source_profile,
+            default_effort,
         ));
 
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
@@ -1508,6 +1537,7 @@ impl AcpClient {
             profile,
             install_binary,
             source_profile,
+            None,
         )
         .await
     }
@@ -2780,7 +2810,10 @@ fn map_update_to_events(
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
-            let args_preview = preview_args(&raw_args);
+            // Empty (not the literal "null") when the agent ships no
+            // raw_input, so argless tool cards render a clean empty-state.
+            // See #1713.
+            let args_preview = preview_optional_args(tc.raw_input.as_ref());
             let parent_tool_call_id = profile.parent_tool_use_id_from_meta(&tc.meta);
             if let Some(parent) = parent_tool_call_id.as_deref() {
                 // Breadcrumb so AOE_ACP_TRACE=1 sessions can verify the
@@ -2799,6 +2832,11 @@ fn map_update_to_events(
             } else {
                 None
             };
+            // Codex (and any ACP agent) can attach structured file diffs to
+            // the initial tool_call via `ToolCallContent::Diff`. Bridge them
+            // onto the ToolCall so the edit card shows the path + preview
+            // instead of "(unknown file)". See #1721.
+            let diffs = extract_diffs_from_content(&tc.content);
             let tool_call = ToolCall {
                 id: tc.tool_call_id.0.to_string(),
                 name: tc.title.clone(),
@@ -2807,14 +2845,11 @@ fn map_update_to_events(
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id,
                 memory_recall,
+                diffs,
             };
             let mut events = vec![Event::ToolCallStarted { tool_call }];
             if is_destructive(&tc.title, &args_preview) {
                 debug!(target: "cockpit.acp", "tool {} flagged destructive on tool_call ingest", tc.title);
-            }
-            // If the same payload carries diff content, surface it.
-            if let Some(diff) = extract_diff_from_locations(&tc.locations) {
-                events.push(Event::DiffEmitted { diff });
             }
             // claude-agent-acp routes Claude's built-in ExitPlanMode through
             // the tool channel (kind=switch_mode, plan markdown in
@@ -2873,10 +2908,34 @@ fn map_update_to_events(
                 .as_ref()
                 .map(|blocks| extract_tool_content_text(blocks))
                 .unwrap_or_default();
-            let new_args_preview = update.fields.raw_input.as_ref().map(preview_args);
+            // Codex emits `apply_patch` diffs on the in-progress and
+            // completion updates, not only the initial tool_call. Pull any
+            // Diff blocks off this frame so the edit card's path + preview
+            // survive when they arrive late. `Some` here REPLACES the card's
+            // diffs in the reducer; absent diff blocks stay `None` so a
+            // text-only update can't wipe diffs from an earlier frame. See
+            // #1721.
+            let new_diffs = update.fields.content.as_ref().and_then(|blocks| {
+                let diffs = extract_diffs_from_content(blocks);
+                (!diffs.is_empty()).then_some(diffs)
+            });
+            // Drop an explicit JSON null so a late-arriving update never
+            // patches the card's args with the literal "null"; leaving it
+            // None means the reducer keeps whatever args it already has.
+            // See #1713.
+            let new_args_preview = update
+                .fields
+                .raw_input
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(preview_args);
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
-            if new_title.is_some() || new_args_preview.is_some() || in_progress {
+            if new_title.is_some()
+                || new_args_preview.is_some()
+                || in_progress
+                || new_diffs.is_some()
+            {
                 events.push(Event::ToolCallUpdated {
                     tool_call_id: id.clone(),
                     title: new_title,
@@ -2886,6 +2945,7 @@ fn map_update_to_events(
                     } else {
                         None
                     },
+                    diffs: new_diffs,
                 });
             }
             if completed {
@@ -2976,6 +3036,7 @@ fn map_update_to_events(
                         started_at: now,
                         parent_tool_call_id: None,
                         memory_recall: None,
+                        diffs: Vec::new(),
                     },
                 },
                 Event::PlanUpdated {
@@ -3076,6 +3137,25 @@ fn config_options_event(
     let mapped: Vec<ConfigOptionDescriptor> =
         raw.into_iter().filter_map(map_acp_config_option).collect();
     Some(Event::ConfigOptionsUpdated { options: mapped })
+}
+
+fn thought_level_config_id(
+    options: &[agent_client_protocol::schema::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::SessionConfigId> {
+    use agent_client_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
+
+    options.iter().find_map(|option| {
+        if !matches!(
+            option.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        ) {
+            return None;
+        }
+        if !matches!(option.kind, SessionConfigKind::Select(_)) {
+            return None;
+        }
+        Some(option.id.clone())
+    })
 }
 
 /// Build a cockpit `ConfigOptionDescriptor` from an ACP
@@ -3220,11 +3300,38 @@ fn preview_args(raw: &serde_json::Value) -> String {
     out
 }
 
+/// Preview for an optional ACP `raw_input`. Treats both a missing field
+/// (`None`) and an explicit JSON `null` as "no args provided", returning
+/// an empty string. The empty string lets the UI render a dedicated
+/// empty-state instead of the literal text "null" that
+/// `preview_args(&Value::Null)` would otherwise produce. Gemini's
+/// permission flow ships argless tool calls this way. See #1713.
+fn preview_optional_args(raw: Option<&serde_json::Value>) -> String {
+    match raw {
+        Some(value) if !value.is_null() => preview_args(value),
+        _ => String::new(),
+    }
+}
+
+/// Close a permission-request tool card with a terminal error row when
+/// the user denies (or no compatible option exists). Pairs the start
+/// frame emitted in `handle_permission_request`; without it a denied tool
+/// hangs on "running" until the turn ends. See #1713.
+async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &str, content: &str) {
+    let _ = event_tx
+        .send(Event::ToolCallCompleted {
+            tool_call_id: tool_call_id.to_string(),
+            is_error: true,
+            content: content.to_string(),
+            completed_at: chrono::Utc::now(),
+        })
+        .await;
+}
+
 /// Concat the textual portion of a tool call's `content` array. Drops
 /// non-text content blocks (images, resources, embedded terminals); the
-/// per-tool renderer fall-back path only knows how to display text. Diffs
-/// are surfaced separately via `extract_diff_from_locations` (and could
-/// later be picked up here too via `ToolCallContent::Diff`).
+/// per-tool renderer fall-back path only knows how to display text. Diff
+/// blocks are bridged separately by `extract_diffs_from_content`.
 fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallContent]) -> String {
     use agent_client_protocol::schema::ToolCallContent;
     let mut out = String::new();
@@ -3288,13 +3395,59 @@ fn extract_memory_recall(
     })
 }
 
-fn extract_diff_from_locations(
-    _locations: &[agent_client_protocol::schema::ToolCallLocation],
-) -> Option<DiffPreview> {
-    // Pulling structured diffs out of a ToolCall update requires reading
-    // the `content` array (ToolCallContent::Diff). Left as a follow-up;
-    // the cockpit UI already reuses the existing diff viewer for this.
-    None
+/// Max bytes of diff text kept per side (old/new) when bridging an ACP
+/// `ToolCallContent::Diff` into a cockpit `DiffPreview`. The card only
+/// previews ~20 lines, but the untrimmed text is persisted in the event
+/// store and shipped over every WS replay frame, so a large `apply_patch`
+/// would bloat both without a cap here. Mirrors `preview_args`' 16 KB ceiling.
+const MAX_DIFF_TEXT_BYTES: usize = 16 * 1024;
+
+/// Max number of per-file diffs kept from a single tool call. A patch
+/// touching more files than this keeps the first `MAX_TOOL_DIFFS` rather
+/// than letting one event grow unbounded.
+const MAX_TOOL_DIFFS: usize = 16;
+
+/// Truncate diff text to `MAX_DIFF_TEXT_BYTES` on a UTF-8 char boundary,
+/// appending a sentinel so the cut reads as intentional rather than as a
+/// corrupt diff.
+fn cap_diff_text(text: &str) -> String {
+    if text.len() <= MAX_DIFF_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_DIFF_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_string();
+    out.push_str("\n\u{2026}[truncated]");
+    out
+}
+
+/// Bridge ACP `ToolCallContent::Diff` blocks into cockpit `DiffPreview`
+/// entries. Codex routes `apply_patch` edits through this channel (one
+/// block per touched file) instead of the legacy `old_string`/`new_string`
+/// raw_input keys, so the edit card reads the path and +/- preview from
+/// here. Non-diff blocks (text, images, terminals) are ignored; the enum
+/// is `#[non_exhaustive]`, so the wildcard arm keeps this compiling as the
+/// schema grows. Per-side text is capped and the list bounded. See #1721.
+fn extract_diffs_from_content(
+    blocks: &[agent_client_protocol::schema::ToolCallContent],
+) -> Vec<DiffPreview> {
+    use agent_client_protocol::schema::ToolCallContent;
+    let created_at = chrono::Utc::now();
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolCallContent::Diff(d) => Some(DiffPreview {
+                path: d.path.to_string_lossy().to_string(),
+                old_text: d.old_text.as_deref().map(cap_diff_text),
+                new_text: Some(cap_diff_text(&d.new_text)),
+                created_at,
+            }),
+            _ => None,
+        })
+        .take(MAX_TOOL_DIFFS)
+        .collect()
 }
 
 /// Dispatch the experimental `session/delete` RPC from the connect
@@ -3367,6 +3520,31 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     out
 }
 
+/// Whether the agent advertised the given mode ID in its session modes
+/// or config-option mode category.
+///
+/// Returns `false` (skip) when:
+/// - `available_mode_ids` is `Some` and the normalized mode_id is not in the list, or
+/// - `available_mode_ids` is `None` and the agent uses config-option modes
+///   (session/set_mode won't work for arbitrary mode IDs).
+///
+/// Returns `true` (allow) only when there is no mode information at all
+/// (e.g. the test shim, which handles all set_mode requests).
+fn is_mode_advertised(
+    mode_id: &str,
+    available_mode_ids: &Option<Vec<String>>,
+    has_config_option_mode: bool,
+) -> bool {
+    match available_mode_ids {
+        Some(ids) => {
+            let normalized = mode_id.replace('_', "").to_lowercase();
+            ids.iter()
+                .any(|id| id.replace('_', "").to_lowercase() == normalized)
+        }
+        None => !has_config_option_mode,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection_task<W, R>(
     transport: ByteStreams<W, R>,
@@ -3383,6 +3561,7 @@ async fn run_connection_task<W, R>(
     profile: &'static agent_profiles::AgentProfile,
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
+    default_effort: Option<String>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -3737,6 +3916,16 @@ async fn run_connection_task<W, R>(
                 "initialize handshake complete"
             );
 
+            // Track the mode channels the agent advertised so we can skip
+            // session/set_mode requests for modes the agent doesn't support.
+            // When new_session.modes is present, only those IDs are valid.
+            // When config-options have a Mode category, the agent uses
+            // session/set_config_option for modes instead of session/set_mode.
+            // If neither is present (e.g. test shim), allow all set_mode
+            // requests through.
+            let mut available_mode_ids: Option<Vec<String>> = None;
+            let mut has_config_option_mode: bool = false;
+
             let acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -3816,6 +4005,32 @@ async fn run_connection_task<W, R>(
                                         stored_id = %stored,
                                         "session/load succeeded; suppressing post-load history replay"
                                     );
+                                    // Capture available mode info from the
+                                    // load response before consuming resp.
+                                    let modes = resp.modes.as_ref().map(|m| {
+                                        m.available_modes
+                                            .iter()
+                                            .map(|mode| mode.id.0.to_string())
+                                            .collect::<Vec<_>>()
+                                    });
+                                    if modes.is_some() {
+                                        available_mode_ids = modes;
+                                    }
+                                    if resp
+                                        .config_options
+                                        .as_ref()
+                                        .is_some_and(|opts| {
+                                            opts.iter().any(|o| {
+                                                o.category
+                                                    == Some(
+                                                        agent_client_protocol::schema::
+                                                            SessionConfigOptionCategory::Mode,
+                                                    )
+                                            })
+                                        })
+                                    {
+                                        has_config_option_mode = true;
+                                    }
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -3877,6 +4092,34 @@ async fn run_connection_task<W, R>(
                             "session/new succeeded, captured acp_session_id"
                         );
 
+                        // Capture available mode IDs and config-option mode
+                        // category so the SetMode handlers below can skip
+                        // modes the agent has not advertised.
+                        if let Some(modes) = &new_session.modes {
+                            available_mode_ids = Some(
+                                modes
+                                    .available_modes
+                                    .iter()
+                                    .map(|m| m.id.0.to_string())
+                                    .collect(),
+                            );
+                        }
+                        if new_session
+                            .config_options
+                            .as_ref()
+                            .is_some_and(|opts| {
+                                opts.iter().any(|o| {
+                                    o.category
+                                        == Some(
+                                            agent_client_protocol::schema::
+                                                SessionConfigOptionCategory::Mode,
+                                        )
+                                })
+                            })
+                        {
+                            has_config_option_mode = true;
+                        }
+
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
                         // than the hard-coded four. Claude's adapter typically
@@ -3905,10 +4148,52 @@ async fn run_connection_task<W, R>(
                         // initial model + effort + mode set here, not as a
                         // subsequent notification). Surface them so the
                         // cockpit pickers render immediately. See #1403.
-                        if let Some(event) =
-                            config_options_event(new_session.config_options.clone())
-                        {
+                        let config_options = new_session.config_options.clone();
+                        if let Some(event) = config_options_event(config_options.clone()) {
                             let _ = event_tx_for_block.send(event).await;
+                        }
+
+                        if let (Some(effort), Some(options)) =
+                            (default_effort.as_deref(), config_options.as_deref())
+                        {
+                            if let Some(config_id) = thought_level_config_id(options) {
+                                info!(
+                                    target: "cockpit.acp",
+                                    session = %session_label,
+                                    effort,
+                                    "applying default cockpit effort"
+                                );
+                                match connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        id.clone(),
+                                        config_id,
+                                        SessionConfigValueId::new(effort.to_string()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        if let Some(event) =
+                                            config_options_event(Some(resp.config_options))
+                                        {
+                                            let _ = event_tx_for_block.send(event).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "cockpit.acp",
+                                            session = %session_label,
+                                            "default cockpit effort failed: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    target: "cockpit.acp",
+                                    session = %session_label,
+                                    "default cockpit effort skipped; no thought_level option"
+                                );
+                            }
                         }
 
                         // Tell the server-side listener so it can persist the
@@ -4392,6 +4677,20 @@ async fn run_connection_task<W, R>(
                                             });
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
+                                            // Skip when the agent has not
+                                            // advertised this mode (see the
+                                            // mode-tracking comments above).
+                                            if !is_mode_advertised(
+                                                &mode_id,
+                                                &available_mode_ids,
+                                                has_config_option_mode,
+                                            ) {
+                                                debug!(
+                                                    target: "cockpit.acp",
+                                                    "skipping session/set_mode mode={mode_id}: not advertised (mid-turn)"
+                                                );
+                                                continue;
+                                            }
                                             info!(
                                                 target: "cockpit.acp",
                                                 "sending session/set_mode mode={mode_id} during in-flight prompt"
@@ -4597,6 +4896,19 @@ async fn run_connection_task<W, R>(
                             .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
+                        // Skip when the agent has not advertised this mode
+                        // (see the mode-tracking comments above).
+                        if !is_mode_advertised(
+                            &mode_id,
+                            &available_mode_ids,
+                            has_config_option_mode,
+                        ) {
+                            debug!(
+                                target: "cockpit.acp",
+                                "skipping session/set_mode mode={mode_id}: not advertised"
+                            );
+                            continue;
+                        }
                         info!(target: "cockpit.acp", "sending session/set_mode mode={mode_id}");
                         // Detached, same shape as the mid-turn path: don't
                         // freeze the cmd_rx loop on the round-trip.
@@ -5179,13 +5491,10 @@ async fn handle_permission_request(
         .title
         .clone()
         .unwrap_or_else(|| "tool call".into());
-    let raw_args = request
-        .tool_call
-        .fields
-        .raw_input
-        .clone()
-        .unwrap_or(serde_json::Value::Null);
-    let args_preview = preview_args(&raw_args);
+    // Empty (not the literal "null") when the permission request ships no
+    // raw_input, which Gemini's confirm-required tools routinely do. The
+    // approval card then renders a clean empty-state. See #1713.
+    let args_preview = preview_optional_args(request.tool_call.fields.raw_input.as_ref());
     let tool_call = ToolCall {
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
@@ -5200,7 +5509,20 @@ async fn handle_permission_request(
         started_at: chrono::Utc::now(),
         parent_tool_call_id: profile.parent_tool_use_id_from_meta(&request.tool_call.meta),
         memory_recall: None,
+        diffs: Vec::new(),
     };
+    // Gemini's confirm-required tools never send a standalone `tool_call`
+    // start frame (only requestPermission, then a completion update), so
+    // without this the approved tool would have no transcript card and
+    // its later completion would render nothing. Emit a start frame from
+    // the ToolCall we just built; the reducer dedupes tool_start by id,
+    // so a later real start frame merges in place rather than doubling
+    // the card. See #1713.
+    let _ = event_tx
+        .send(Event::ToolCallStarted {
+            tool_call: tool_call.clone(),
+        })
+        .await;
     let approval = build_approval(tool_call);
     let nonce = approval.nonce.clone();
 
@@ -5259,6 +5581,13 @@ async fn handle_permission_request(
                         decision,
                     })
                     .await;
+                // A denied tool will not run, so the start frame emitted
+                // above would otherwise hang on "running" until the turn
+                // ends. Close it immediately with a terminal error row.
+                // See #1713.
+                if matches!(decision, ApprovalDecision::Deny) {
+                    emit_permission_denied(&event_tx, &tool_call_id, "permission denied").await;
+                }
                 (
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
                     "selected",
@@ -5268,10 +5597,30 @@ async fn handle_permission_request(
                     target: "cockpit.acp",
                     "agent did not offer a {decision:?}-compatible option; cancelling"
                 );
+                // No compatible option: the agent gets Cancelled, but the
+                // user still acted, so clear the approval card and close
+                // the hanging start frame. See #1713.
+                let _ = event_tx
+                    .send(Event::ApprovalResolved {
+                        nonce: nonce.clone(),
+                        decision: ApprovalDecision::Cancelled,
+                    })
+                    .await;
+                emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
                 (RequestPermissionOutcome::Cancelled, "cancelled")
             }
         }
         Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => {
+            // Cancellation (explicit cancel_permission, or the resolver
+            // dropped on teardown) emits no agent completion, so close the
+            // start frame and clear the approval here too. See #1713.
+            let _ = event_tx
+                .send(Event::ApprovalResolved {
+                    nonce: nonce.clone(),
+                    decision: ApprovalDecision::Cancelled,
+                })
+                .await;
+            emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
             (RequestPermissionOutcome::Cancelled, "cancelled")
         }
     };
@@ -5396,7 +5745,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_background_command_lifts_grace_above_fast_grace() {
+    async fn watchdog_terminal_usage_clears_background_command_suppression() {
+        // Regression for #1858. A backgrounded command lifts the grace to
+        // the 30-minute off-protocol floor mid-turn (so a legit `cmd &`
+        // is not killed), but a backgrounded command is fire-and-forget
+        // and outlives the turn. Once the cost-resolved UsageUpdate
+        // (TerminalUsage, the end-of-turn marker) arrives, the floor must
+        // drop so a turn that streamed its final usage but never returned
+        // the PromptResponse recovers on the fast grace instead of
+        // hanging for 30 minutes.
         let cfg = watchdog_test_cfg();
         let t0 = tokio::time::Instant::now();
         let wall = chrono::Utc::now();
@@ -5423,19 +5780,76 @@ mod tests {
             wall,
             cfg,
         );
+        // Before the terminal usage the floor holds: 60s in must not fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
         w.apply_signal(
             LifecycleSignal::TerminalUsage,
             t0 + std::time::Duration::from_secs(3),
             wall,
             cfg,
         );
-        // 60s after last progress: well past fast grace (20s) and past
-        // base grace (120s)? No. Past fast but inside base. Off-protocol
-        // floor lifts grace to 30 min so we must NOT fire here.
+        // TerminalUsage cleared the background-command suppression.
+        assert!(w.off_protocol_work_seen().is_none());
+        // Now the fast grace (20s) applies, measured from the last
+        // progress at t0+2s. Inside the window: no fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(10), cfg));
+        // Past the fast grace (elapsed 23s > 20s): the wedge recovers
+        // instead of waiting out the 30-minute floor.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_terminal_usage_then_background_command_rearms_floor() {
+        // Self-correction: TerminalUsage clearing background suppression
+        // must not be permanent. If activity resumes after the terminal
+        // usage (cost_seen flips false on Progress) and a new backgrounded
+        // command completes, the off-protocol floor re-arms.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-a".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(w.off_protocol_work_seen().is_none());
+        // Turn continues: more progress, then another backgrounded tool.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-b".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(4),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "a fresh backgrounded command after terminal usage must re-arm the floor",
+        );
+        // Floor is back: must not fire well past the fast grace.
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
-        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
-        // Past the 30-min floor: watchdog finally recovers.
-        assert!(w.should_fire(t0 + std::time::Duration::from_secs(60 * 35), cfg));
     }
 
     #[tokio::test]
@@ -5746,6 +6160,7 @@ mod tests {
             cwd,
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -5811,6 +6226,7 @@ mod tests {
             additional_dirs: vec![],
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -5878,6 +6294,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
@@ -5922,6 +6339,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -5952,6 +6370,7 @@ mod tests {
             cwd: missing.clone(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -6208,6 +6627,17 @@ mod tests {
         // AllowAlways. Falls back gracefully.
         let id = pick_option_id(&options, ApprovalDecision::Allow).unwrap();
         assert_eq!(id.0.as_ref(), "always");
+    }
+
+    #[test]
+    fn preview_optional_args_empty_for_missing_or_null() {
+        // #1713: a missing or explicitly-null raw_input must preview as
+        // empty (so the UI shows a clean empty-state) rather than the
+        // literal "null" that preview_args(&Value::Null) would produce.
+        assert_eq!(preview_optional_args(None), "");
+        assert_eq!(preview_optional_args(Some(&serde_json::Value::Null)), "");
+        let obj = serde_json::json!({ "command": "ls" });
+        assert_eq!(preview_optional_args(Some(&obj)), r#"{"command":"ls"}"#);
     }
 
     #[test]
@@ -6769,6 +7199,7 @@ mod tests {
                 started_at,
                 title,
                 args_preview,
+                diffs,
             } => {
                 assert_eq!(tool_call_id, "tc-3");
                 assert!(
@@ -6777,8 +7208,138 @@ mod tests {
                 );
                 assert!(title.is_none());
                 assert!(args_preview.is_none());
+                assert!(diffs.is_none());
             }
             other => panic!("expected ToolCallUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_diffs_from_content_bridges_diff_blocks_and_ignores_others() {
+        use agent_client_protocol::schema::{Content, Diff, ToolCallContent};
+        let blocks = vec![
+            ToolCallContent::Content(Content::new("some text")),
+            ToolCallContent::Diff(Diff::new("src/foo.rs", "new body").old_text("old body")),
+            // New-file diff: old_text is None.
+            ToolCallContent::Diff(Diff::new("src/new.rs", "created")),
+        ];
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), 2, "text blocks must be ignored");
+        assert_eq!(diffs[0].path, "src/foo.rs");
+        assert_eq!(diffs[0].old_text.as_deref(), Some("old body"));
+        assert_eq!(diffs[0].new_text.as_deref(), Some("new body"));
+        assert_eq!(diffs[1].path, "src/new.rs");
+        assert_eq!(diffs[1].old_text, None, "new file carries no old_text");
+        assert_eq!(diffs[1].new_text.as_deref(), Some("created"));
+    }
+
+    #[test]
+    fn extract_diffs_from_content_caps_per_side_text() {
+        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        let huge = "x".repeat(MAX_DIFF_TEXT_BYTES + 4096);
+        let blocks = vec![ToolCallContent::Diff(
+            Diff::new("src/big.rs", huge.clone()).old_text(huge),
+        )];
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), 1);
+        let new_len = diffs[0].new_text.as_deref().unwrap().len();
+        let old_len = diffs[0].old_text.as_deref().unwrap().len();
+        assert!(
+            new_len < MAX_DIFF_TEXT_BYTES + 64,
+            "new_text must be capped, got {new_len}"
+        );
+        assert!(
+            old_len < MAX_DIFF_TEXT_BYTES + 64,
+            "old_text must be capped, got {old_len}"
+        );
+        assert!(diffs[0]
+            .new_text
+            .as_deref()
+            .unwrap()
+            .contains("[truncated]"));
+    }
+
+    #[test]
+    fn extract_diffs_from_content_caps_diff_count() {
+        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        let blocks: Vec<ToolCallContent> = (0..MAX_TOOL_DIFFS + 8)
+            .map(|i| ToolCallContent::Diff(Diff::new(format!("f{i}.rs"), "x")))
+            .collect();
+        let diffs = extract_diffs_from_content(&blocks);
+        assert_eq!(diffs.len(), MAX_TOOL_DIFFS, "diff count must be bounded");
+    }
+
+    #[test]
+    fn map_tool_call_bridges_diff_content_onto_started_tool() {
+        // Codex attaches the apply_patch diff to the initial `tool_call`
+        // frame as ToolCallContent::Diff. The edit card reads path + preview
+        // from ToolCall.diffs, so it must survive ingest. See #1721.
+        use agent_client_protocol::schema::{Diff, ToolCall, ToolCallContent, ToolKind};
+        let mut tc = ToolCall::new("tc-edit-1", "Edit src/foo.rs");
+        tc.kind = ToolKind::Edit;
+        tc.content = vec![ToolCallContent::Diff(
+            Diff::new("src/foo.rs", "new").old_text("old"),
+        )];
+        let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CODEX);
+        match &events[0] {
+            Event::ToolCallStarted { tool_call } => {
+                assert_eq!(tool_call.diffs.len(), 1);
+                assert_eq!(tool_call.diffs[0].path, "src/foo.rs");
+                assert_eq!(tool_call.diffs[0].new_text.as_deref(), Some("new"));
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_carries_diff_content() {
+        // Codex also re-sends the diff on the in-progress and completion
+        // updates; those must reach the reducer via ToolCallUpdated.diffs so
+        // a late-arriving diff still lands on the card. See #1721.
+        use agent_client_protocol::schema::{
+            Diff, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/foo.rs", "new").old_text("old"),
+            )]);
+        let update = ToolCallUpdate::new("tc-edit-1", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CODEX,
+        );
+        let updated = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolCallUpdated { diffs, .. } => Some(diffs),
+                _ => None,
+            })
+            .expect("a ToolCallUpdated event must be emitted for a diff-only update");
+        let diffs = updated.as_ref().expect("diffs must be Some");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "src/foo.rs");
+    }
+
+    #[test]
+    fn map_tool_call_update_text_only_leaves_diffs_none() {
+        // A text-only update must not carry Some([]) (which would wipe an
+        // earlier frame's diffs in the reducer). See #1721.
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new("done"))]);
+        let update = ToolCallUpdate::new("tc-edit-1", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CODEX,
+        );
+        for e in &events {
+            if let Event::ToolCallUpdated { diffs, .. } = e {
+                assert!(diffs.is_none(), "text-only update must leave diffs None");
+            }
         }
     }
 

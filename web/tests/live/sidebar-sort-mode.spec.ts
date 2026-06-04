@@ -1,17 +1,19 @@
-// Live coverage for the sidebar sort-mode toggle (#1418).
+// Live coverage for the sidebar sort picker (#1418, #1640).
 //
 // Drives a real `aoe serve` subprocess against three seeded sessions
 // whose `created_at` timestamps differ by ~1.2s each. Asserts that
-// flipping the toggle to "lastActivity" reorders the sidebar rows by
-// newest-created first, and that the localStorage-backed preference
-// survives a page reload.
+// selecting "Last activity" reorders the sidebar rows by newest-created
+// first, that selecting "Attention" is reachable and persists, and that
+// the localStorage-backed preference survives a page reload.
 //
-// Pure comparator semantics across `last_accessed_at`, `idle_entered_at`,
-// and `created_at` (including null fallback) are covered by the Vitest
-// suite at web/src/lib/__tests__/sidebarSort.test.ts. The mocked
-// Playwright suite at web/tests/sidebar-sort-mode.spec.ts covers drag
-// disablement and the multi-repo pin. This spec proves the wiring boots
-// against the real server end-to-end.
+// Pure comparator semantics (status ranks, urgent promotion, null
+// fallback) are covered by the Vitest suite at
+// web/src/lib/__tests__/sidebarSort.test.ts, and status-differentiated
+// Attention ordering by the mocked Playwright suite at
+// web/tests/sidebar-sort-mode.spec.ts (live sessions all share a status,
+// so the live spec proves wiring, not the status comparator). The mocked
+// suite also covers drag disablement and the multi-repo pin. This spec
+// proves the wiring boots against the real server end-to-end.
 //
 // Pairs with web/tests/live/workspace-ordering.spec.ts for manual-mode
 // regressions.
@@ -97,9 +99,19 @@ async function readWorkspaceTitles(page: import("@playwright/test").Page) {
 
 const TOGGLE = "[data-testid='sidebar-sort-toggle']";
 
-base.describe("sidebar sort-mode live (#1418)", () => {
+// The control is a dropdown picker: open it, then click the labeled option.
+async function selectSortMode(
+  page: import("@playwright/test").Page,
+  mode: string,
+) {
+  await page.locator(TOGGLE).click();
+  await page.locator(`[data-testid='sidebar-sort-option-${mode}']`).click();
+  await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", mode);
+}
+
+base.describe("sidebar sort picker live (#1418, #1640)", () => {
   base(
-    "toggle reorders by newest-created and persists across reload",
+    "picker reorders by newest-created, reaches attention, and persists across reload",
     async ({ page }, testInfo) => {
       const serve = await spawnAoeServe({
         authMode: "none",
@@ -140,11 +152,7 @@ base.describe("sidebar sort-mode live (#1418)", () => {
           "oldest-session",
         ]);
 
-        await page.locator(TOGGLE).click();
-        await expect(page.locator(TOGGLE)).toHaveAttribute(
-          "data-sort-mode",
-          "lastActivity",
-        );
+        await selectSortMode(page, "lastActivity");
 
         await expect
           .poll(() => readWorkspaceTitles(page), { timeout: 5000 })
@@ -154,7 +162,7 @@ base.describe("sidebar sort-mode live (#1418)", () => {
             "oldest-session",
           ]);
 
-        // Reload: localStorage carries the toggle state across reloads
+        // Reload: localStorage carries the picker state across reloads
         // even against the live server.
         await page.reload();
         await expect(rows).toHaveCount(3, { timeout: 10_000 });
@@ -170,16 +178,23 @@ base.describe("sidebar sort-mode live (#1418)", () => {
             "oldest-session",
           ]);
 
-        // Toggle back: returns to whatever the server has as manual
+        // Attention is reachable end-to-end and persists. All three live
+        // sessions share a status, so the rendered order is not asserted
+        // here (the mocked suite covers status-differentiated ordering);
+        // this proves the third mode boots against the real server.
+        await selectSortMode(page, "attention");
+        await expect(rows).toHaveCount(3, { timeout: 5000 });
+        const storedAttention = await page.evaluate(() =>
+          window.localStorage.getItem("aoe-sidebar-sort-mode"),
+        );
+        expect(storedAttention).toBe("attention");
+
+        // Back to manual: returns to whatever the server has as manual
         // order. We don't assert a specific order here because the
         // server's workspace-ordering merge produces an order that's
         // valid but depends on observation timing; the contract we
-        // care about is "toggle back exits last-activity mode."
-        await page.locator(TOGGLE).click();
-        await expect(page.locator(TOGGLE)).toHaveAttribute(
-          "data-sort-mode",
-          "manual",
-        );
+        // care about is "selecting manual exits the computed modes."
+        await selectSortMode(page, "manual");
       } finally {
         await serve.stop();
       }

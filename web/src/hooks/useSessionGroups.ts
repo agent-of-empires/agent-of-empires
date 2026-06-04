@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Workspace } from "../lib/types";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { buildSessionGroups, type SidebarGroup } from "../lib/sidebarGroups";
+import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
 // Distinct from the repo axis prefix (`aoe-repo-collapsed-`) so collapse
@@ -13,7 +14,10 @@ function loadCollapsed(id: string): boolean {
   return safeGetItem(`${COLLAPSED_KEY_PREFIX}${id}`) === "1";
 }
 
-export function useSessionGroups(workspaces: Workspace[]): {
+export function useSessionGroups(
+  workspaces: Workspace[],
+  sortMode: SidebarSortMode,
+): {
   groups: SidebarGroup[];
   toggleGroupCollapsed: (groupId: string) => void;
 } {
@@ -24,9 +28,10 @@ export function useSessionGroups(workspaces: Workspace[]): {
     () =>
       buildSessionGroups(workspaces, {
         idleDecayWindowMs,
+        sortMode,
         isCollapsed: (id) => collapsedMap[id] ?? loadCollapsed(id),
       }),
-    [workspaces, idleDecayWindowMs, collapsedMap],
+    [workspaces, idleDecayWindowMs, sortMode, collapsedMap],
   );
 
   // The updater stays pure: it reads the current value but performs no

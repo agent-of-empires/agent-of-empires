@@ -41,6 +41,13 @@ export interface SessionResponse {
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** True when the agent has flagged this session as urgent via the
+   *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
+   *  (false for archived / snoozed sessions). The sidebar's Attention sort
+   *  floats urgent rows above non-urgent ones within their triage tier.
+   *  Optional so older payloads and test fixtures without the field read as
+   *  not-urgent. See #1640. */
+  urgent?: boolean;
   /** RFC3339 timestamp at which the session was web-pinned, or null /
    *  undefined when not pinned. Distinct from `favorited`: favorite is
    *  the TUI within-tier attention-sort signal; pin is the hard
@@ -295,6 +302,14 @@ export interface AgentInfo {
    *  The wizard reads this to decide whether a new session runs in
    *  cockpit or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** The ACP command a built-in agent launches in cockpit (e.g.
+   *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
+   *  substitution. Can differ from `binary`. Absent for custom agents,
+   *  whose command values are never serialized by the backend. */
+  cockpit_command?: string;
+  /** Registry args appended to `cockpit_command` (e.g. `["acp"]` for
+   *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
+  cockpit_args?: string[];
 }
 
 /** Profile info returned by /api/profiles */
@@ -353,6 +368,8 @@ export interface ProjectInfo {
   name: string;
   path: string;
   scope: "global" | "profile";
+  /** Default base branch for new worktree branches against this project's repo. */
+  default_base_branch?: string;
 }
 
 /** Docker status returned by /api/docker/status */
@@ -385,6 +402,10 @@ export interface CreateSessionRequest {
    *  false → tmux passthrough (legacy). Server defaults to true on
    *  web-created sessions; the wizard may override. */
   cockpit_mode?: boolean;
+  /** Optional cockpit model selected before the ACP worker starts. */
+  cockpit_model?: string;
+  /** Optional cockpit reasoning effort applied after ACP config options load. */
+  cockpit_effort?: string;
   /** Scratch mode: server provisions a fresh directory under
    *  `<app_dir>/scratch/<id>/` and ignores `path` (clients send `""`).
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;

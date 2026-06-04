@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type MutableRefObject,
@@ -13,10 +14,9 @@ import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowLeftRight,
-  Clock,
   GripVertical,
+  Hourglass,
   Layers,
-  ListOrdered,
   Moon,
   Pencil,
   Pin,
@@ -45,7 +45,9 @@ import type {
 } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
+  nestedSidebarGroupHasLiveWorkspace,
   sidebarGroupHasLiveWorkspace,
+  type NestedSidebarGroup,
   type SidebarGroup,
 } from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
@@ -63,10 +65,9 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   renameSession,
-  setSessionArchive,
   setSessionNotifications,
-  setSessionPin,
-  setSessionSnooze,
+  setWorktreeName,
+  updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
@@ -74,18 +75,40 @@ import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
 import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
-import { reportError } from "../lib/toastBus";
+import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
 import {
-  resolveEffectiveSnoozedUntil,
-  snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
   workspaceIsPinned,
   workspaceIsSunk,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
+import {
+  effectiveArchivedOf,
+  effectivePinnedOf,
+  effectiveSnoozedUntilOf,
+  type OptimisticTriage,
+} from "../lib/sidebarOptimistic";
+import { useSidebarTriage } from "../hooks/useSidebarTriage";
+import {
+  EMPTY_SELECTION,
+  classifyClick,
+  selectionReducer,
+} from "../lib/sidebarSelection";
+import {
+  bucketSelectionForBulk,
+  summarizeBulkResults,
+} from "../lib/sidebarBulk";
+import { reportError, reportInfo } from "../lib/toastBus";
+import { BulkActionBar } from "./BulkActionBar";
+// Re-exported for back-compat with `SnoozeModal.test.tsx`, which imports it
+// from this module; the definition now lives in `sidebarOptimistic.ts`.
+export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
+import { SessionGroupModal } from "./SessionGroupModal";
+import { SidebarSortPicker } from "./SidebarSortPicker";
+import { Tooltip } from "./Tooltip";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -140,6 +163,10 @@ const typedClosestCenter: CollisionDetection = (args) => {
 
 interface Props {
   groups: SidebarGroup[];
+  // The nested `repo+group` axis model (#1720). Only consumed when
+  // `axis === "repo+group"`; the flat `groups` list drives the other axes.
+  nestedGroups: NestedSidebarGroup[];
+  onToggleSubgroup: (repoId: string, groupPath: string) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
@@ -317,17 +344,6 @@ function formatDurationSecondsShort(seconds: number): string {
   return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
-/** Wall-clock target for an optimistic snooze: `Date.now() + minutes
- *  * 60_000` as an RFC3339 ISO string. Sits outside the component so
- *  the `Date.now()` call doesn't trip
- *  `react-hooks/purity`; the event handler that calls it is itself a
- *  closure, not a render. The exact value is throwaway (the server's
- *  response on the next poll is the source of truth), so a few ms
- *  of jitter is harmless. See #1581. */
-export function makeOptimisticSnoozedUntil(minutes: number): string {
-  return new Date(Date.now() + minutes * 60_000).toISOString();
-}
-
 /** Compact "time remaining" label for the snooze chip computed once at
  *  render time (no per-second timer, by design: snooze rows poll the
  *  sessions API at the existing cadence and the static label is more
@@ -418,10 +434,19 @@ function SortableSessionRow({
   rowKey?: string;
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  isSelected: boolean;
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -543,17 +568,39 @@ function SortableRepoGroup({
 export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
-  onClick,
+  isSelected,
+  onActivate,
   onDelete,
   readOnly,
   indented,
+  optimistic,
+  onPinToggle,
+  onArchiveToggle,
+  onSnooze,
 }: {
   workspace: Workspace;
   isActive: boolean;
-  onClick: () => void;
+  // Whether this row is part of the sidebar multi-select. See #1724.
+  isSelected: boolean;
+  // Row click. The parent interprets the modifier keys (plain navigates,
+  // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
+  // than navigating directly. See #1724.
+  onActivate: (e: {
+    metaKey: boolean;
+    ctrlKey: boolean;
+    shiftKey: boolean;
+  }) => void;
   onDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
+  // Optimistic triage overlay for this row plus the parent-owned mutation
+  // callbacks. Triage state used to live in the row as three `useState`s;
+  // it now lives in the sidebar so bulk actions can drive many rows from
+  // one place. See #1724.
+  optimistic: OptimisticTriage;
+  onPinToggle: (ws: Workspace, pinned: boolean) => void;
+  onArchiveToggle: (ws: Workspace, archived: boolean) => void;
+  onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(
@@ -628,6 +675,21 @@ export const SessionRow = memo(function SessionRow({
   // `hasDraft` ORs the same set. Lets a user juggling sessions see at a
   // glance which rows have prompts pending without opening the cockpit.
   const queuedCount = useQueuedCountForSessions(sessionIds);
+  // Rate-limit park visibility parity with the cockpit notice (#1715).
+  // The server maps rate-limited stops to Idle, so the status glyph can't
+  // distinguish a parked session from a normal idle one; surface it here
+  // from the same cockpit-state mirror the queued badge reads.
+  const rateLimited = useRateLimitedForSessions(sessionIds);
+  const rateLimitResetLabel = useMemo(() => {
+    if (!rateLimited?.resetsAt) return null;
+    const reset = new Date(rateLimited.resetsAt);
+    return Number.isNaN(reset.getTime())
+      ? null
+      : reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }, [rateLimited]);
+  const rateLimitTitle = rateLimited
+    ? `Rate-limited${rateLimited.count > 1 ? ` (${rateLimited.count} sessions)` : ""}${rateLimitResetLabel ? `; resets at ${rateLimitResetLabel}` : ""}`
+    : "";
 
   const setNotifyPreset = async (preset: NotifyPreset) => {
     setContextMenu(null);
@@ -635,106 +697,34 @@ export const SessionRow = memo(function SessionRow({
     await setSessionNotifications(sessionId, preset);
   };
 
-  // Triage actions (pin / archive / snooze). Optimistic state lets the
-  // glyph, chip, and tier flip immediately on click; on PATCH failure we
-  // revert and surface a toast. The optimistic snap clears itself once
-  // the next sessions-poll reflects the same value, so a successful
-  // round-trip is invisible to the user (just feels fast).
-  const [optimisticPinned, setOptimisticPinned] = useState<boolean | null>(
-    null,
-  );
-  const [optimisticArchived, setOptimisticArchived] = useState<boolean | null>(
-    null,
-  );
-  // Optimistic `snoozed_until` override. `undefined` = no override
-  // (use the prop), a string = pretend the server already returned
-  // this RFC3339 timestamp, `null` = pretend the server already
-  // unsnoozed. Clears once the prop matches the override on the next
-  // poll, matching the pin / archive pattern above.
-  const [optimisticSnoozedUntil, setOptimisticSnoozedUntil] = useState<
-    string | null | undefined
-  >(undefined);
+  // Triage actions (pin / archive / snooze). The optimistic overlay and the
+  // network calls live in the sidebar parent now (keyed by workspace id) so
+  // a bulk action can drive many rows at once; the row just closes its own
+  // menu/modal and delegates the mutation. See #1724. The optimistic snap
+  // still clears itself once the next sessions-poll reflects the same value,
+  // so a successful round-trip is invisible to the user (just feels fast).
   // Snooze duration picker. Lives in its own portal-rendered modal,
   // independent of the context menu's lifecycle so the parent-menu
   // dismissal listener cannot close the picker out from under us.
   const [snoozeModalOpen, setSnoozeModalOpen] = useState(false);
-  useEffect(() => {
-    if (optimisticPinned !== null && optimisticPinned === isPinned) {
-      setOptimisticPinned(null);
-    }
-  }, [isPinned, optimisticPinned]);
-  useEffect(() => {
-    if (optimisticArchived !== null && optimisticArchived === isArchived) {
-      setOptimisticArchived(null);
-    }
-  }, [isArchived, optimisticArchived]);
-  useEffect(() => {
-    if (optimisticSnoozedUntil === undefined) return;
-    // Clear the override only when the server value actually matches
-    // it. A naive "both non-null" check used to fire prematurely
-    // when the user re-snoozed an already-snoozed row: the prop
-    // was still the OLD timestamp but non-null, the override was
-    // the NEW timestamp, the effect treated them as a match, and
-    // the chip snapped back to the stale time until the next
-    // poll. See #1581 CodeRabbit review.
-    if (optimisticSnoozedUntil === null && snoozedUntil == null) {
-      setOptimisticSnoozedUntil(undefined);
-      return;
-    }
-    if (
-      optimisticSnoozedUntil != null &&
-      snoozedUntil != null &&
-      snoozeTimestampCloseEnough(optimisticSnoozedUntil, snoozedUntil)
-    ) {
-      setOptimisticSnoozedUntil(undefined);
-    }
-  }, [snoozedUntil, optimisticSnoozedUntil]);
+  // Edit-workdir-name picker, also in its own portal-rendered modal so the
+  // context-menu dismissal listener does not close it. See #1723.
+  const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
 
-  const togglePin = async () => {
+  const togglePin = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isPinned;
-    setOptimisticPinned(next);
-    const result = await setSessionPin(sessionId, next);
-    if (!result) {
-      setOptimisticPinned(null);
-      reportError(next ? "Failed to pin session" : "Failed to unpin session");
-    }
+    onPinToggle(workspace, !effectivePinnedOf(optimistic, isPinned));
   };
 
-  const toggleArchive = async () => {
+  const toggleArchive = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const next = !isArchived;
-    setOptimisticArchived(next);
-    const result = await setSessionArchive(sessionId, next);
-    if (!result) {
-      setOptimisticArchived(null);
-      reportError(
-        next ? "Failed to archive session" : "Failed to unarchive session",
-      );
-    }
+    onArchiveToggle(workspace, !effectiveArchivedOf(optimistic, isArchived));
   };
 
-  const applySnooze = async (minutes: number | null) => {
+  const applySnooze = (minutes: number | null) => {
     setContextMenu(null);
     setSnoozeModalOpen(false);
-    if (!sessionId) return;
-    // Optimistic flip: render the snooze chip + sink the row before
-    // the PATCH round-trip lands, matching the pin / archive
-    // affordance. For positive minutes we synthesise a target
-    // timestamp; the server is the source of truth and the value is
-    // discarded on the next poll, so a few ms of drift is harmless.
-    const optimisticUntil =
-      minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
-    setOptimisticSnoozedUntil(optimisticUntil);
-    const result = await setSessionSnooze(sessionId, minutes);
-    if (!result) {
-      setOptimisticSnoozedUntil(undefined);
-      reportError(
-        minutes == null ? "Failed to unsnooze session" : "Failed to snooze session",
-      );
-    }
+    onSnooze(workspace, minutes);
   };
 
   // Close the context menu first, then open the modal in the next
@@ -759,19 +749,18 @@ export const SessionRow = memo(function SessionRow({
   };
 
   // Effective state for rendering: optimistic overrides win until the
-  // prop catches up (cleared in the effects above).
-  const effectivePinned = optimisticPinned ?? isPinned;
-  const effectiveArchived = optimisticArchived ?? isArchived;
-  const effectiveSnoozedUntil = resolveEffectiveSnoozedUntil(
-    optimisticSnoozedUntil,
-    snoozedUntil,
-  );
+  // sidebar's overlay reconciler drops them once the prop catches up.
+  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
+  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
   const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
+  const sessionGroup = firstSession?.group_path ?? "";
+  const [editingGroup, setEditingGroup] = useState(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
   const touchOpenedAt = useRef(0);
@@ -872,6 +861,27 @@ export const SessionRow = memo(function SessionRow({
     await renameSession(sessionId, trimmed);
   };
 
+  // Editing the workdir name moves the worktree directory, so it is only
+  // offered for an aoe-managed worktree session that is not running. See
+  // #1723.
+  const canEditWorkdir =
+    !!firstSession?.has_managed_worktree && !runningSession && !!sessionId;
+
+  const openWorkdirModal = () => {
+    setContextMenu(null);
+    setWorkdirModalOpen(true);
+  };
+
+  const startGroupEdit = () => {
+    setContextMenu(null);
+    setEditingGroup(true);
+  };
+
+  const saveGroup = async (group: string): Promise<boolean> => {
+    if (!sessionId) return false;
+    return updateSessionGroup(sessionId, group);
+  };
+
   const handleDelete = () => {
     setContextMenu(null);
     onDelete?.(workspace.id);
@@ -906,13 +916,9 @@ export const SessionRow = memo(function SessionRow({
         data-testid="sidebar-session-row"
         draggable={false}
         onClick={(e) => {
-          if (
-            e.button !== 0 ||
-            e.metaKey ||
-            e.ctrlKey ||
-            e.shiftKey ||
-            e.altKey
-          ) {
+          // Let the browser handle non-primary clicks (middle-click still
+          // opens the session href in a new tab) and Alt+click.
+          if (e.button !== 0 || e.altKey) {
             return;
           }
           if (isDeleting) {
@@ -923,22 +929,31 @@ export const SessionRow = memo(function SessionRow({
             e.preventDefault();
             return;
           }
+          // Primary click (plain or with Shift / Cmd / Ctrl): the parent
+          // decides navigate vs. select. Always preventDefault so a modifier
+          // click builds the selection instead of following the href.
           e.preventDefault();
-          onClick();
+          onActivate(e);
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
         onTouchMove={clearLongPress}
         onTouchCancel={clearLongPress}
+        data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           indented ? "pl-6 pr-3" : "px-3"
         } ${
           isActive
             ? "bg-surface-850 border-l-2 border-brand-600"
             : "border-l-2 border-transparent hover:bg-surface-700/40"
+        } ${
+          isSelected
+            ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10"
+            : ""
         } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
+        {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <span
             className={`text-sm shrink-0 leading-none font-mono ${textClass}`}
@@ -986,6 +1001,19 @@ export const SessionRow = memo(function SessionRow({
                   className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
                 >
                   {queuedCount}
+                </span>
+              )}
+              {rateLimited && (
+                <span
+                  title={rateLimitTitle}
+                  aria-label={rateLimitTitle}
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-700/40 bg-orange-950/30 px-1 text-[10px] font-mono font-medium text-orange-300"
+                >
+                  <Hourglass className="h-3 w-3" />
+                  {rateLimited.count > 1 && (
+                    <span className="tabular-nums">{rateLimited.count}</span>
+                  )}
+                  {rateLimitResetLabel && <span>{rateLimitResetLabel}</span>}
                 </span>
               )}
               {effectiveArchived && (
@@ -1087,6 +1115,24 @@ export const SessionRow = memo(function SessionRow({
           >
             Rename
           </button>
+          {!readOnly && canEditWorkdir && (
+            <button
+              onClick={openWorkdirModal}
+              data-testid="sidebar-context-menu-edit-workdir"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Edit workdir name
+            </button>
+          )}
+          {!readOnly && (
+            <button
+              onClick={startGroupEdit}
+              data-testid="sidebar-context-menu-edit-group"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Edit group
+            </button>
+          )}
           {!readOnly && cockpitSession && (
             <button
               onClick={handleSwitchAgent}
@@ -1231,9 +1277,170 @@ export const SessionRow = memo(function SessionRow({
           />,
           document.body,
         )}
+      {workdirModalOpen &&
+        sessionId &&
+        createPortal(
+          <WorkdirNameModal
+            title={label}
+            currentBranch={branchLabel}
+            onCancel={() => setWorkdirModalOpen(false)}
+            onSubmit={async (name, renameBranch) => {
+              const res = await setWorktreeName(sessionId, name, renameBranch);
+              if (res.ok) setWorkdirModalOpen(false);
+              return res;
+            }}
+          />,
+          document.body,
+        )}
+      {editingGroup &&
+        createPortal(
+          <SessionGroupModal
+            sessionTitle={sessionTitle || label}
+            currentGroup={sessionGroup}
+            onSave={saveGroup}
+            onClose={() => setEditingGroup(false)}
+          />,
+          document.body,
+        )}
     </>
   );
 });
+
+/** Edit-workdir-name modal. Renamed the worktree directory and, when the
+ *  user opts in, the git branch. Rendered as its own portal so it is
+ *  independent of the row's context menu. See #1723. */
+export function WorkdirNameModal({
+  title,
+  currentBranch,
+  onCancel,
+  onSubmit,
+}: {
+  title: string;
+  currentBranch: string | null;
+  onCancel: () => void;
+  onSubmit: (
+    name: string,
+    renameBranch: boolean,
+  ) => Promise<{ ok: boolean; message?: string }>;
+}) {
+  const [name, setName] = useState("");
+  const [renameBranch, setRenameBranch] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const submit = async () => {
+    if (busy) return;
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError("Enter a new workdir name.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const res = await onSubmit(trimmed, renameBranch);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.message ?? "Failed to edit the workdir name.");
+    }
+  };
+
+  return (
+    <div
+      data-testid="workdir-modal-backdrop"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Edit workdir name"
+    >
+      <div
+        data-testid="workdir-modal"
+        className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
+      >
+        <div className="px-4 py-3 border-b border-surface-700/40">
+          <div
+            className="text-sm font-mono text-text-primary truncate"
+            title={title}
+          >
+            Edit workdir name
+            <span className="text-text-muted"> · {title}</span>
+          </div>
+          {currentBranch && (
+            <div className="mt-1 text-[11px] text-text-dim font-mono">
+              Current branch: {currentBranch}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 flex flex-col gap-3">
+          <input
+            type="text"
+            autoFocus
+            aria-label="New workdir name"
+            disabled={busy}
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submit();
+              }
+            }}
+            placeholder="new-workdir-name"
+            data-testid="workdir-modal-name"
+            className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none focus:border-brand-600 disabled:opacity-50"
+          />
+          <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={renameBranch}
+              onChange={(e) => setRenameBranch(e.target.checked)}
+              data-testid="workdir-modal-rename-branch"
+            />
+            Also rename git branch
+          </label>
+          {error && (
+            <div
+              data-testid="workdir-modal-error"
+              className="text-[11px] text-status-error"
+            >
+              {error}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1 text-sm text-text-secondary hover:bg-surface-700/50 rounded cursor-pointer transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => void submit()}
+            disabled={busy}
+            data-testid="workdir-modal-save"
+            className="px-3 py-1 text-sm text-text-primary bg-brand-600 hover:bg-brand-500 rounded cursor-pointer transition-colors disabled:opacity-50"
+          >
+            {busy ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /** Bounds for `validate_snooze_duration` on the server. Mirrored
  *  client-side so the modal can pre-validate and disable the submit
@@ -1609,6 +1816,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
         }`}
         style={headerStyle}
       >
+        {/* dnd-kit's setActivatorNodeRef is a ref-setter callback meant for
+            JSX ref=; react-hooks/refs misreads the "Ref"-named prop as a ref
+            value read during render and taints the whole dragHandle object.
+            We never touch .current here, so the warning is a false positive. */}
+        {/* eslint-disable react-hooks/refs */}
         {dragHandle && (
           <button
             ref={dragHandle.setActivatorNodeRef}
@@ -1622,6 +1834,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             <GripVertical className="h-3.5 w-3.5" />
           </button>
         )}
+        {/* eslint-enable react-hooks/refs */}
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
           onClick={onClick}
@@ -1732,17 +1945,6 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   );
 });
 
-function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
-  return (
-    <span className="relative group/tip inline-flex">
-      {children}
-      <span className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-full mt-1.5 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary whitespace-nowrap opacity-0 scale-95 transition-all duration-100 group-hover/tip:opacity-100 group-hover/tip:scale-100 z-50">
-        {text}
-      </span>
-    </span>
-  );
-}
-
 function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   return (
     ws.displayName.toLowerCase().includes(q) ||
@@ -1753,8 +1955,37 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   );
 }
 
+// The grouping toggle cycles through the three axes on each click. Order is
+// chosen so the first click off the default still lands on the flat group
+// axis (preserving the pre-#1720 repo -> group step), then adds nesting.
+const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
+  repo: "group",
+  group: "repo+group",
+  "repo+group": "repo",
+};
+
+const AXIS_HEADING: Record<SidebarAxis, string> = {
+  repo: "Projects",
+  group: "Groups",
+  "repo+group": "Projects",
+};
+
+const AXIS_TOOLTIP: Record<SidebarAxis, string> = {
+  repo: "Grouping: by repository",
+  group: "Grouping: by user group",
+  "repo+group": "Grouping: by repository, then user group",
+};
+
+const AXIS_ARIA: Record<SidebarAxis, string> = {
+  repo: "Group sessions by repository",
+  group: "Group sessions by user group",
+  "repo+group": "Group sessions by repository, then user group",
+};
+
 export function WorkspaceSidebar({
   groups,
+  nestedGroups,
+  onToggleSubgroup,
   onReorderWorkspaces,
   onReorderGroups,
   activeId,
@@ -1874,7 +2105,31 @@ export function WorkspaceSidebar({
     [groups, onReorderWorkspaces, onReorderGroups],
   );
 
+  // All workspaces flattened across groups, deduped by id. A workspace can
+  // appear under more than one group (group axis), so without the dedupe the
+  // same id would surface twice in `selectedWorkspaces` and bulk actions
+  // would fan out to the same session more than once. First occurrence wins.
+  const allWorkspaces = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Workspace[] = [];
+    for (const g of groups) {
+      for (const v of g.workspaces) {
+        if (seen.has(v.workspace.id)) continue;
+        seen.add(v.workspace.id);
+        out.push(v.workspace);
+      }
+    }
+    return out;
+  }, [groups]);
+
+  // Optimistic triage overlay + single-id PATCH wiring, lifted out of
+  // SessionRow so single-row and (in #1724) bulk actions share one source of
+  // truth. Triage always targets the workspace's primary session.
+  const triage = useSidebarTriage(allWorkspaces);
+
   const q = filterQuery.trim().toLowerCase();
+
+  const isNested = axis === "repo+group";
 
   const filteredGroups = q
     ? groups
@@ -1888,7 +2143,190 @@ export function WorkspaceSidebar({
         .filter((g) => g.workspaces.length > 0)
     : groups;
 
-  const hasResults = filteredGroups.length > 0;
+  // Filter the nested model the same way the flat list is filtered: a row
+  // survives if it matches, or if its subgroup or repo header name matches;
+  // empty subgroups and then empty repos drop out. See #1720.
+  const filteredNested: NestedSidebarGroup[] = q
+    ? nestedGroups
+        .map((ng) => ({
+          repo: ng.repo,
+          subgroups: ng.subgroups
+            .map((sg) => ({
+              ...sg,
+              workspaces: sg.workspaces.filter(
+                (v) =>
+                  workspaceMatchesFilter(v.workspace, q) ||
+                  sg.displayName.toLowerCase().includes(q) ||
+                  ng.repo.displayName.toLowerCase().includes(q),
+              ),
+            }))
+            .filter((sg) => sg.workspaces.length > 0),
+        }))
+        .filter((ng) => ng.subgroups.length > 0)
+    : nestedGroups;
+
+  const hasResults = isNested
+    ? filteredNested.length > 0
+    : filteredGroups.length > 0;
+
+  // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
+  // or persisted); the anchor pivots Shift+click ranges. See #1724.
+  const [selection, dispatchSelection] = useReducer(
+    selectionReducer,
+    EMPTY_SELECTION,
+  );
+
+  // Workspace ids in the exact order they render, so a Shift+click range
+  // spans only what the user can see: collapsed groups and (when collapsed)
+  // the sunk section contribute no rows, and a filter trims to matches. This
+  // must mirror the render below; both walk filteredGroups the same way.
+  const flatRenderedOrder = useMemo(() => {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    // A workspace that renders under more than one group still resolves to a
+    // single selectable id, so the range order keeps only its first
+    // occurrence; pushing it twice would make Shift+range math ambiguous.
+    const push = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    };
+    for (const g of filteredGroups) {
+      if (!sidebarGroupHasLiveWorkspace(g)) continue;
+      const expanded = q ? true : !g.collapsed;
+      if (!expanded) continue;
+      for (const v of g.workspaces) {
+        if (!workspaceIsSunk(v.workspace)) push(v.workspace.id);
+      }
+    }
+    if (sunkExpanded) {
+      for (const g of filteredGroups) {
+        for (const v of g.workspaces) {
+          if (workspaceIsSunk(v.workspace)) push(v.workspace.id);
+        }
+      }
+    }
+    return ids;
+  }, [filteredGroups, q, sunkExpanded]);
+
+  // Drop selected ids for workspaces that no longer exist (a session was
+  // deleted or moved). Existence-based, not visibility-based: collapsing a
+  // group or filtering keeps the selection, matching file-manager behavior;
+  // only a vanished workspace is pruned. Range math above is already scoped
+  // to the visible order.
+  const existingWorkspaceIds = useMemo(
+    () => new Set(allWorkspaces.map((w) => w.id)),
+    [allWorkspaces],
+  );
+  useEffect(() => {
+    dispatchSelection({ type: "prune", validIds: existingWorkspaceIds });
+  }, [existingWorkspaceIds]);
+
+  const clearSelection = useCallback(
+    () => dispatchSelection({ type: "clear" }),
+    [],
+  );
+
+  // Read-only viewers can't act on a selection (the bulk bar is hidden), so
+  // never let one accumulate: drop any existing selection when read-only
+  // turns on. Row clicks are forced down the navigate path below.
+  useEffect(() => {
+    if (readOnly) dispatchSelection({ type: "clear" });
+  }, [readOnly]);
+
+  // Selected workspaces (existing ones only) and their per-action eligibility
+  // buckets, for the bulk bar. Deduped against existence so a stale id never
+  // resolves to a phantom workspace.
+  const selectedWorkspaces = useMemo(
+    () => allWorkspaces.filter((w) => selection.selectedIds.has(w.id)),
+    [allWorkspaces, selection.selectedIds],
+  );
+  const bulkBuckets = useMemo(
+    () => bucketSelectionForBulk(selectedWorkspaces, triage.optimisticFor),
+    [selectedWorkspaces, triage],
+  );
+
+  // Run a bulk triage action over its eligible subset, then summarize and
+  // clear the selection. One summary toast instead of per-row toasts.
+  const runBulkAction = useCallback(
+    async (
+      verb: string,
+      run: () => Promise<readonly { ok: boolean; skipped?: boolean }[]>,
+    ) => {
+      const results = await run();
+      const summary = summarizeBulkResults(verb, results);
+      if (results.some((r) => !r.ok && !r.skipped)) reportError(summary);
+      else reportInfo(summary);
+      clearSelection();
+    },
+    [clearSelection],
+  );
+
+  const onBulkPin = useCallback(
+    (wss: Workspace[], pinned: boolean) =>
+      void runBulkAction(pinned ? "Pinned" : "Unpinned", () =>
+        triage.bulkPin(wss, pinned),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkArchive = useCallback(
+    (wss: Workspace[], archived: boolean) =>
+      void runBulkAction(archived ? "Archived" : "Unarchived", () =>
+        triage.bulkArchive(wss, archived),
+      ),
+    [runBulkAction, triage],
+  );
+  const onBulkSnooze = useCallback(
+    (wss: Workspace[], minutes: number | null) =>
+      void runBulkAction(minutes == null ? "Unsnoozed" : "Snoozed", () =>
+        triage.bulkSnooze(wss, minutes),
+      ),
+    [runBulkAction, triage],
+  );
+
+  // Interpret a row click: plain click clears the selection and navigates
+  // (today's behavior), modifier clicks build the selection instead. The row
+  // has already guarded button / deleting / drag, and called preventDefault.
+  const handleRowActivate = useCallback(
+    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+      // Read-only: ignore modifier gestures entirely and always navigate, so
+      // no hidden selection state can build up.
+      if (readOnly) {
+        dispatchSelection({ type: "clear" });
+        setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+        onSelect(workspaceId);
+        return;
+      }
+      const intent = classifyClick(e);
+      switch (intent) {
+        case "navigate":
+          dispatchSelection({ type: "clear" });
+          setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
+          onSelect(workspaceId);
+          break;
+        case "toggle":
+          dispatchSelection({ type: "toggle", id: workspaceId });
+          break;
+        case "range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: false,
+          });
+          break;
+        case "additive-range":
+          dispatchSelection({
+            type: "range",
+            targetId: workspaceId,
+            orderedIds: flatRenderedOrder,
+            additive: true,
+          });
+          break;
+      }
+    },
+    [activeId, onSelect, flatRenderedOrder, readOnly],
+  );
 
   const toggleFilter = () => {
     setFilterOpen((o) => {
@@ -1945,33 +2383,27 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           open ? "translate-x-0" : "-translate-x-full md:hidden"
         }`}
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span className="text-sm text-text-muted flex-1">
-            {axis === "group" ? "Groups" : "Projects"}
+            {AXIS_HEADING[axis]}
           </span>
-          <Tooltip
-            text={
-              axis === "group"
-                ? "Grouping: by user group"
-                : "Grouping: by repository"
-            }
-          >
+          <Tooltip text={AXIS_TOOLTIP[axis]}>
             <button
-              onClick={() => onAxisChange(axis === "repo" ? "group" : "repo")}
-              aria-pressed={axis === "group"}
+              onClick={() => onAxisChange(NEXT_AXIS[axis])}
+              aria-pressed={axis !== "repo"}
               aria-label={
-                axis === "group"
-                  ? "Group sessions by user group, currently pressed"
-                  : "Group sessions by repository"
+                axis === "repo"
+                  ? AXIS_ARIA[axis]
+                  : `${AXIS_ARIA[axis]}, currently pressed`
               }
               data-testid="sidebar-axis-toggle"
               data-axis={axis}
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                axis === "group"
+                axis !== "repo"
                   ? "text-brand-500"
                   : "text-text-dim hover:text-text-secondary"
               }`}
@@ -1979,40 +2411,10 @@ export function WorkspaceSidebar({
               <Layers className="h-3.5 w-3.5" />
             </button>
           </Tooltip>
-          <Tooltip
-            text={
-              sortMode === "lastActivity"
-                ? "Sort: last activity, drag disabled"
-                : "Sort: manual, drag enabled"
-            }
-          >
-            <button
-              onClick={() =>
-                onSortModeChange(
-                  sortMode === "manual" ? "lastActivity" : "manual",
-                )
-              }
-              aria-pressed={sortMode === "lastActivity"}
-              aria-label={
-                sortMode === "lastActivity"
-                  ? "Sort by last activity, currently pressed"
-                  : "Sort by manual order"
-              }
-              data-testid="sidebar-sort-toggle"
-              data-sort-mode={sortMode}
-              className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                sortMode === "lastActivity"
-                  ? "text-brand-500"
-                  : "text-text-dim hover:text-text-secondary"
-              }`}
-            >
-              {sortMode === "lastActivity" ? (
-                <Clock className="h-3.5 w-3.5" />
-              ) : (
-                <ListOrdered className="h-3.5 w-3.5" />
-              )}
-            </button>
-          </Tooltip>
+          <SidebarSortPicker
+            sortMode={sortMode}
+            onSortModeChange={onSortModeChange}
+          />
           <Tooltip text="Filter">
             <button
               onClick={toggleFilter}
@@ -2085,7 +2487,20 @@ export function WorkspaceSidebar({
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        {!readOnly && (
+          <BulkActionBar
+            selectedCount={selection.selectedIds.size}
+            buckets={bulkBuckets}
+            snoozePresets={SNOOZE_PRESETS}
+            onBulkPin={onBulkPin}
+            onBulkArchive={onBulkArchive}
+            onBulkSnooze={onBulkSnooze}
+            onClear={clearSelection}
+          />
+        )}
+
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
+          {!isNested && (
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
             sensors={sensors}
@@ -2153,15 +2568,21 @@ export function WorkspaceSidebar({
                                 isActive={
                                   v.workspace.id === displayedActiveId
                                 }
-                                onClick={() => {
-                                  setOptimisticActive({
-                                    id: v.workspace.id,
-                                    fromActiveId: activeId,
-                                  });
-                                  onSelect(v.workspace.id);
-                                }}
+                                isSelected={
+                                  !readOnly &&
+                                  selection.selectedIds.has(v.workspace.id)
+                                }
+                                onActivate={(e) =>
+                                  handleRowActivate(v.workspace.id, e)
+                                }
                                 onDelete={onDeleteSession}
                                 readOnly={readOnly}
+                                optimistic={triage.optimisticFor(
+                                  v.workspace.id,
+                                )}
+                                onPinToggle={triage.pinToggle}
+                                onArchiveToggle={triage.archiveToggle}
+                                onSnooze={triage.snooze}
                                 // Drag is disabled when the tier
                                 // comparator already controls placement:
                                 // lastActivity mode has no manual
@@ -2210,6 +2631,102 @@ export function WorkspaceSidebar({
             })()}
           </DndContext>
           </DragSuppressContext.Provider>
+          )}
+          {isNested &&
+            filteredNested
+              .filter(nestedSidebarGroupHasLiveWorkspace)
+              .map((ng) => {
+                const repo = ng.repo;
+                const repoExpanded = q ? true : !repo.collapsed;
+                const repoHasActiveChild = ng.subgroups.some((sg) =>
+                  sg.workspaces.some(
+                    (v) => v.workspace.id === displayedActiveId,
+                  ),
+                );
+                return (
+                  <div
+                    key={repo.id}
+                    data-testid="sidebar-nested-repo"
+                    data-repo-id={repo.id}
+                  >
+                    <SidebarGroupHeader
+                      group={{ ...repo, collapsed: !repoExpanded }}
+                      hasActiveChild={!repoExpanded && repoHasActiveChild}
+                      onClick={() => !q && onToggleGroup(repo.id)}
+                      onUpdateAppearance={onUpdateRepoAppearance}
+                      onNewSession={() =>
+                        repo.capabilities.create === "repo" && repo.repoPath
+                          ? onCreateSession(repo.repoPath)
+                          : onNew()
+                      }
+                      offline={offline}
+                    />
+                    {repoExpanded &&
+                      ng.subgroups
+                        .filter(sidebarGroupHasLiveWorkspace)
+                        .map((sg) => {
+                          const groupPath = sg.groupPath ?? "";
+                          const subExpanded = q ? true : !sg.collapsed;
+                          const subHasActiveChild = sg.workspaces.some(
+                            (v) => v.workspace.id === displayedActiveId,
+                          );
+                          // Sunk rows are pulled into the single global
+                          // footer below, exactly like the flat axes, so
+                          // each subgroup renders only its live tier.
+                          const liveWorkspaces = sg.workspaces.filter(
+                            (v) => !workspaceIsSunk(v.workspace),
+                          );
+                          return (
+                            <div
+                              key={`${repo.id}::${groupPath}`}
+                              className="pl-3"
+                              data-testid="sidebar-nested-subgroup"
+                              data-repo-id={repo.id}
+                            >
+                              <SidebarGroupHeader
+                                group={{ ...sg, collapsed: !subExpanded }}
+                                hasActiveChild={
+                                  !subExpanded && subHasActiveChild
+                                }
+                                onClick={() =>
+                                  !q && onToggleSubgroup(repo.id, groupPath)
+                                }
+                                onUpdateAppearance={onUpdateRepoAppearance}
+                                onNewSession={onNew}
+                                offline={offline}
+                              />
+                              {subExpanded &&
+                                liveWorkspaces.map((v) => (
+                                  <SessionRow
+                                    key={`${repo.id}::${groupPath}::${v.key}`}
+                                    workspace={v.workspace}
+                                    isActive={
+                                      v.workspace.id === displayedActiveId
+                                    }
+                                    isSelected={
+                                      !readOnly &&
+                                      selection.selectedIds.has(v.workspace.id)
+                                    }
+                                    onActivate={(e) =>
+                                      handleRowActivate(v.workspace.id, e)
+                                    }
+                                    onDelete={onDeleteSession}
+                                    readOnly={readOnly}
+                                    optimistic={triage.optimisticFor(
+                                      v.workspace.id,
+                                    )}
+                                    onPinToggle={triage.pinToggle}
+                                    onArchiveToggle={triage.archiveToggle}
+                                    onSnooze={triage.snooze}
+                                    indented
+                                  />
+                                ))}
+                            </div>
+                          );
+                        })}
+                  </div>
+                );
+              })}
           {(() => {
             // Single global "Snoozed & archived" section at the very
             // bottom of the sidebar. Aggregates sunk workspaces from
@@ -2218,10 +2735,18 @@ export function WorkspaceSidebar({
             // Rows are listed flat in the order they appear inside
             // their respective groups; each row's SessionRow already
             // surfaces the title/branch/repo chips that anchor it to
-            // its project. See #1581.
-            const sunkWorkspaces = filteredGroups.flatMap((g) =>
-              g.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
-            );
+            // its project. The nested axis flattens across its
+            // repo -> subgroup tree to feed the same bucket. See #1581,
+            // #1720.
+            const sunkWorkspaces = isNested
+              ? filteredNested.flatMap((ng) =>
+                  ng.subgroups.flatMap((sg) =>
+                    sg.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
+                  ),
+                )
+              : filteredGroups.flatMap((g) =>
+                  g.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
+                );
             if (sunkWorkspaces.length === 0) return null;
             return (
               <div data-testid="sidebar-sunk-section">
@@ -2259,15 +2784,16 @@ export function WorkspaceSidebar({
                       key={v.key}
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
-                      onClick={() => {
-                        setOptimisticActive({
-                          id: v.workspace.id,
-                          fromActiveId: activeId,
-                        });
-                        onSelect(v.workspace.id);
-                      }}
+                      isSelected={
+                        !readOnly && selection.selectedIds.has(v.workspace.id)
+                      }
+                      onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
+                      optimistic={triage.optimisticFor(v.workspace.id)}
+                      onPinToggle={triage.pinToggle}
+                      onArchiveToggle={triage.archiveToggle}
+                      onSnooze={triage.snooze}
                       indented
                     />
                   ))}
@@ -2280,6 +2806,40 @@ export function WorkspaceSidebar({
               <p className="text-sm text-text-muted">
                 No matches for &ldquo;{filterQuery}&rdquo;
               </p>
+            </div>
+          )}
+
+          {!hasResults && !filterQuery && (
+            <div
+              className="px-4 py-10 text-center"
+              data-testid="sidebar-empty-state"
+            >
+              <p className="text-sm font-medium text-text-secondary">
+                No sessions yet
+              </p>
+              <p className="mt-1 text-[13px] text-text-muted">
+                Create a session to start working in a repo.
+              </p>
+              <button
+                onClick={onNew}
+                disabled={offline}
+                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                New session
+              </button>
             </div>
           )}
         </div>

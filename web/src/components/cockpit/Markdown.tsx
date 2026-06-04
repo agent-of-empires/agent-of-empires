@@ -29,6 +29,8 @@ import {
   loadLanguage,
 } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
+import { parseFileRef } from "../../lib/fileRef";
+import { useCockpitFileRef } from "./CockpitFileRefContext";
 
 interface Props {
   text: string;
@@ -77,7 +79,57 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
         CodeHeader,
         table: TableWithScroll,
         blockquote: Blockquote,
+        a: TranscriptLink,
       }}
+    />
+  );
+}
+
+/**
+ * Transcript link. Two behaviors:
+ *
+ *  - Local file references (e.g. Codex's `[app.ts](/repo/src/app.ts:42)`)
+ *    are intercepted: clicking opens the file in the in-app diff/file
+ *    viewer via the cockpit file-ref handler, keeping the current
+ *    `/session/<id>` route instead of navigating the tab to a dead
+ *    filesystem path. Only active when a handler is provided and the
+ *    href parses as a local file ref. See #1718.
+ *  - Everything else (docs, CI, repo links) keeps the same-tab-is-bad
+ *    treatment from #1714: open in a new tab with the dashboard-standard
+ *    safe rel (guards against tabnabbing), so following a link does not
+ *    replace the live cockpit session.
+ *
+ * Existing anchor props (href, title, className, children) are forwarded
+ * untouched, and the `target`/`rel` fallback is preserved so a
+ * non-intercepted link (or a middle-click / "open in new tab") still
+ * behaves as before.
+ */
+function TranscriptLink({
+  href,
+  onClick,
+  ...rest
+}: React.ComponentPropsWithoutRef<"a">) {
+  const { onOpenFileRef } = useCockpitFileRef();
+
+  function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {
+    if (href && onOpenFileRef) {
+      const ref = parseFileRef(href);
+      if (ref) {
+        e.preventDefault();
+        onOpenFileRef(ref);
+        return;
+      }
+    }
+    onClick?.(e);
+  }
+
+  return (
+    <a
+      {...rest}
+      href={href}
+      onClick={handleClick}
+      target="_blank"
+      rel="noopener noreferrer"
     />
   );
 }

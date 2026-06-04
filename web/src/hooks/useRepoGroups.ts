@@ -12,7 +12,11 @@ import {
   persistRepoGroupOrder,
 } from "../lib/repoGroupOrder";
 import {
+  compareWorkspacesByAttention,
   compareWorkspacesByLastActivityDesc,
+  repoGroupAttentionRank,
+  repoGroupIsFavorited,
+  repoGroupIsUrgent,
   repoGroupLastActivityMs,
   workspaceTriageTier,
   type SidebarSortMode,
@@ -49,8 +53,11 @@ function isScratchWorkspace(ws: Workspace): boolean {
 // When `sortMode === "lastActivity"` (opt-in, per-browser, #1418), the
 // manual rank is bypassed in favour of a recency comparator that keys on
 // max(last_accessed_at, idle_entered_at, created_at) across each
-// workspace's sessions. The multi-repo group stays pinned to the bottom
-// in both modes so its position is predictable across toggles.
+// workspace's sessions. When `sortMode === "attention"` (#1640) it is
+// bypassed in favour of the status-triage comparator (urgent, then
+// Waiting / Error first). The synthetic multi-repo and scratch groups stay
+// pinned to the bottom in every computed mode so their position is
+// predictable across toggles.
 export function useRepoGroups(
   workspaces: Workspace[],
   workspaceOrdering: readonly string[] = [],
@@ -96,10 +103,15 @@ export function useRepoGroups(
         if (ar > br) return 1;
         return a.id.localeCompare(b.id);
       });
-    const sortByActivity = (list: Workspace[]) =>
-      [...list].sort(compareWorkspacesByLastActivityDesc);
-    const sortWorkspaces =
-      sortMode === "lastActivity" ? sortByActivity : sortByRank;
+    const sortWorkspaces = (list: Workspace[]) => {
+      if (sortMode === "attention") {
+        return [...list].sort(compareWorkspacesByAttention);
+      }
+      if (sortMode === "lastActivity") {
+        return [...list].sort(compareWorkspacesByLastActivityDesc);
+      }
+      return sortByRank(list);
+    };
 
     const byRepo = new Map<string, Workspace[]>();
     const multiRepo: Workspace[] = [];
@@ -194,6 +206,33 @@ export function useRepoGroups(
       id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
 
     repoGroups.sort((a, b) => {
+      if (sortMode === "attention") {
+        // Computed order, like lastActivity: manual group drag does not
+        // apply and synthetic groups stay pinned to the bottom in a stable
+        // order (real repos, then multi-repo, then scratch), kept
+        // consistent with lastActivity rather than letting a scratch group
+        // with one Waiting session leapfrog every real repo. Among real
+        // groups: urgent first, then best attention rank, then favorited,
+        // then most-recent activity, then a deterministic repoPath
+        // tie-break. See #1640.
+        if (a.id === SCRATCH_GROUP_ID) return 1;
+        if (b.id === SCRATCH_GROUP_ID) return -1;
+        if (a.id === MULTI_REPO_GROUP_ID) return 1;
+        if (b.id === MULTI_REPO_GROUP_ID) return -1;
+        const au = repoGroupIsUrgent(a.workspaces);
+        const bu = repoGroupIsUrgent(b.workspaces);
+        if (au !== bu) return au ? -1 : 1;
+        const ar = repoGroupAttentionRank(a.workspaces);
+        const br = repoGroupAttentionRank(b.workspaces);
+        if (ar !== br) return ar - br;
+        const af = repoGroupIsFavorited(a.workspaces);
+        const bf = repoGroupIsFavorited(b.workspaces);
+        if (af !== bf) return af ? -1 : 1;
+        const ak = repoGroupLastActivityMs(a.workspaces);
+        const bk = repoGroupLastActivityMs(b.workspaces);
+        if (ak !== bk) return bk - ak;
+        return a.repoPath.localeCompare(b.repoPath);
+      }
       if (sortMode === "lastActivity") {
         // The order is computed here, so manual group order (and group
         // drag) does not apply; synthetic groups stay pinned to the

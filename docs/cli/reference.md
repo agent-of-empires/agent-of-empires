@@ -21,6 +21,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session rename`↴](#aoe-session-rename)
+* [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
 * [`aoe session set-session-id`↴](#aoe-session-set-session-id)
@@ -142,6 +143,7 @@ Add a new session
 ###### **Options:**
 
 * `-t`, `--title <TITLE>` — Session title (defaults to folder name)
+* `-i`, `--interactive` — Prompt for the session name, mirroring the TUI `n` flow. Shows the generated default; press Enter to accept it. Ignored when --title is given. Requires an interactive terminal
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
 * `--tool <TOOL>` — Named built-in or configured custom agent to run
@@ -299,6 +301,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `attach` — Attach to session interactively
 * `show` — Show session details
 * `rename` — Rename a session
+* `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
 * `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
@@ -397,6 +400,23 @@ Rename a session
 
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
+
+
+
+## `aoe session set-worktree-name`
+
+Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
+
+**Usage:** `aoe session set-worktree-name [OPTIONS] --name <NAME> [IDENTIFIER]`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title (optional, auto-detects in tmux)
+
+###### **Options:**
+
+* `--name <NAME>` — New workdir (worktree directory) name
+* `--rename-branch` — Also rename the underlying git branch to match the new name
 
 
 
@@ -738,6 +758,7 @@ Add a project to the registry
   Possible values: `global`, `profile`
 
 * `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
+* `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project in a multi-repo workspace. When omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
 
 
 
@@ -999,6 +1020,7 @@ Start a web dashboard for remote session access
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is reachable on Linux/BSD
+* `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
 
 
 

@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::cockpit::approvals::Nonce;
 use crate::cockpit::event_store::AttachmentBlob;
 use crate::cockpit::protocol::{
-    ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest, FilesResponse,
-    PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse, ResolveApprovalRequest,
-    SwitchAgentRequest, SwitchAgentResponse,
+    ApprovalDecisionWire, ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest,
+    FilesResponse, PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse,
+    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
 use crate::cockpit::state::PromptAttachmentKind;
 use crate::cockpit::supervisor::SupervisorError;
@@ -347,10 +347,15 @@ pub async fn spawn_cockpit(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
+            effort: None,
             stored_acp_session_id,
             sandbox_info,
             source_profile,
             yolo_mode,
+            agent_command_override: crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ),
         })
         .await
     {
@@ -548,12 +553,20 @@ pub async fn switch_cockpit_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            effort: None,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
+            // Gated in the supervisor: only applies when the selected
+            // agent equals the instance tool and its binary matches, so
+            // an explicit switch to a different agent is unaffected.
+            agent_command_override: crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ),
         })
         .await;
     if let Err(e) = spawn_result {
@@ -578,6 +591,13 @@ pub async fn switch_cockpit_agent(
                 .into_response(),
         };
     }
+
+    // Spawn succeeded: a mid-session agent switch actually happened. Tally it
+    // for the opt-in telemetry snapshot.
+    state
+        .telemetry_cockpit
+        .agent_switches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Persist the agent change AFTER spawn succeeded. The new agent's
     // session/new will emit a fresh AcpSessionAssigned which will then
@@ -1281,6 +1301,14 @@ pub async fn cockpit_enable(
             .into_response();
     }
 
+    // A real terminal -> cockpit transition is now committed (the idempotent
+    // already-cockpit and unresolvable-agent cases returned above). Tally the
+    // substrate toggle for the opt-in telemetry snapshot.
+    state
+        .telemetry_cockpit
+        .substrate_toggles
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Tear down the tmux side. Best-effort: a stale tmux name should
     // not block the swap. Run on a blocking pool worker because each
     // kill shells out. Warn on agent kill failure to keep signal for
@@ -1360,6 +1388,10 @@ pub async fn cockpit_enable(
     let stored_acp_session_id = instance.cockpit_acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     let profile_for_spawn = profile.clone();
+    let command_override = crate::server::cockpit_reconciler::command_override_for_spawn(
+        &instance.tool,
+        &instance.command,
+    );
     let state_for_spawn = state.clone();
     tokio::spawn(async move {
         let inst_lock = state_for_spawn.instance_lock(&session_id).await;
@@ -1391,10 +1423,12 @@ pub async fn cockpit_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
+                effort: None,
                 stored_acp_session_id,
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                agent_command_override: command_override,
             })
             .await
         {
@@ -1440,6 +1474,14 @@ pub async fn cockpit_disable(
         })
         .into_response();
     }
+
+    // A real cockpit -> terminal transition is now committed (the idempotent
+    // already-terminal case returned above). Tally the substrate toggle for the
+    // opt-in telemetry snapshot.
+    state
+        .telemetry_cockpit
+        .substrate_toggles
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Tear down the cockpit worker. Disabling cockpit mode discards the
     // conversation (we delete on-disk history and clear the stored ACP
@@ -1555,7 +1597,18 @@ pub async fn cockpit_set_mode(
         Err(rej) => return rej.into_response(),
     };
     match state.cockpit_supervisor.set_mode(&id, &req.mode_id).await {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => {
+            // The agent accepted the mode switch. "plan" is the canonical ACP
+            // mode id; tally plan-mode adoption for the opt-in telemetry
+            // snapshot. Other modes are out of scope for now.
+            if req.mode_id == "plan" {
+                state
+                    .telemetry_cockpit
+                    .plan_mode_seen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
         Err(SupervisorError::UnknownSession(_)) => {
             (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
         }
@@ -1620,12 +1673,16 @@ pub async fn resolve_approval(
         Err(rej) => return rej.into_response(),
     };
     let nonce = Nonce(nonce_str);
+    let decision = req.decision;
     match state
         .cockpit_supervisor
-        .resolve_permission(&id, nonce, req.decision.into())
+        .resolve_permission(&id, nonce, decision.into())
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            record_approval_decision(&state, decision);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(SupervisorError::UnknownSession(_)) => {
             (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
         }
@@ -1638,6 +1695,21 @@ pub async fn resolve_approval(
         )
             .into_response(),
     }
+}
+
+/// Tally a user-resolved approval for the opt-in telemetry snapshot. Only the
+/// three real user decisions are counted; the synthetic daemon-restart
+/// `Cancelled` decision is not a user choice and never reaches this endpoint,
+/// but is matched explicitly so adding a wire variant is a compile error here.
+fn record_approval_decision(state: &AppState, decision: ApprovalDecisionWire) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counter = match decision {
+        ApprovalDecisionWire::Allow => &state.telemetry_cockpit.approvals_allow,
+        ApprovalDecisionWire::AllowAlways => &state.telemetry_cockpit.approvals_allow_always,
+        ApprovalDecisionWire::Deny => &state.telemetry_cockpit.approvals_deny,
+        ApprovalDecisionWire::Cancelled => return,
+    };
+    counter.fetch_add(1, Relaxed);
 }
 
 /// Build a markdown context primer from the persisted cockpit event

@@ -118,6 +118,13 @@ This is what you reach for after a rate-limit hand-off: switch claude to codex w
   observed on the cockpit side and we'll update the profile.
 - Gemini's `save_memory` tool lands on the generic card today. A dedicated
   card is a follow-up.
+- Gemini permissioned tools (`run_shell_command` / `write_file` / `replace`)
+  now render an approval card with a clean empty-state when the agent ships
+  no raw arguments (rather than a literal `null`), and the tool card always
+  appears in the transcript even when the agent sends a completion without a
+  start frame. Tool completions can still collapse to a bare `completed`
+  label when the agent returns non-text output (shell `AnsiOutput`,
+  structured results); richer completion rendering is a follow-up.
 - Multimodal input (image upload in the composer) is not implemented;
   gemini is the canonical target when it lands.
 - Runtime capability discovery from the ACP `InitializeResponse` isn't

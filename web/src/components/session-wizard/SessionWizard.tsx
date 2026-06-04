@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
@@ -12,6 +12,11 @@ import { AgentStep } from "./steps/AgentStep";
 import { ReviewStep } from "./steps/ReviewStep";
 import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
+import {
+  commandMapsFromSettings,
+  EMPTY_COMMAND_MAPS,
+  type CommandMaps,
+} from "./commandMaps";
 
 /** localStorage key persisting the last tool the user picked in the
  *  wizard. Per-browser, scoped by tool registry key. Validated against
@@ -38,6 +43,18 @@ function saveLastUsedTool(tool: string): void {
  *  prefill path overrides this when `prefill.tool` is set. */
 function buildInitialData(): WizardData {
   return { ...initialData, tool: loadLastUsedTool() };
+}
+
+function cockpitDefaultsFor(
+  session: Record<string, unknown> | undefined,
+  tool: string,
+): { model: string; effort: string } {
+  const defaults = session?.cockpit_defaults as Record<string, unknown> | undefined;
+  const entry = defaults?.[tool] as Record<string, unknown> | undefined;
+  return {
+    model: typeof entry?.model === "string" ? entry.model : "",
+    effort: typeof entry?.effort === "string" ? entry.effort : "",
+  };
 }
 
 // Wizard: project path → session (title + worktree) → agent → review
@@ -114,6 +131,12 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     agents: [], groups: [], profiles: [], dockerAvailable: false,
   });
 
+  // Profile-resolved override/custom-agent maps for the launch-command
+  // preview. Sourced from the settings the wizard already fetches on open
+  // and on a profile switch, so the preview adds no extra request. See
+  // #1911.
+  const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+
   const steps = useMemo(() => computeSteps(state.data),
     [state.data.sandboxEnabled, state.data.advancedEnabled]);
 
@@ -142,6 +165,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
         prefill?.profile || p.find((x) => x.is_default)?.name || "";
       fetchSettings(effectiveProfile || undefined).then((s) => {
         if (!s) return;
+        setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
@@ -151,6 +175,8 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
               (v): v is string => typeof v === "string",
             )
           : [];
+        const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
+        const cockpitDefaults = cockpitDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
@@ -163,8 +189,10 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
           sandboxEnabled:
             prefill?.sandboxEnabled ??
             ((sandbox?.enabled_by_default as boolean) ?? false),
-          tool: prefill?.tool || (session?.default_tool as string) || "",
+          tool: defaultTool,
           extraEnv: env,
+          cockpitModel: cockpitDefaults.model,
+          cockpitEffort: cockpitDefaults.effort,
           skipIfDirty: true,
         });
       });
@@ -179,8 +207,18 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
-  const handleApplyProfileDefaults = useCallback((defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => {
-    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...defaults });
+  const handleApplyProfileDefaults = useCallback((defaults: {
+    yoloMode: boolean;
+    sandboxEnabled: boolean;
+    tool: string;
+    extraEnv: string[];
+    cockpitModel?: string;
+    cockpitEffort?: string;
+    commandMaps?: CommandMaps;
+  }) => {
+    const { commandMaps: maps, ...rest } = defaults;
+    if (maps) setCommandMaps(maps);
+    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
   }, []);
 
   const goNext = () => { if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 }); };
@@ -233,6 +271,14 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
         cockpitMasterEnabled &&
         selectedAgentAcpCapable &&
         d.useCockpit,
+      cockpit_model:
+        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitModel
+          ? d.cockpitModel
+          : undefined,
+      cockpit_effort:
+        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitEffort
+          ? d.cockpitEffort
+          : undefined,
       scratch: d.scratch || undefined,
     };
     const result = await createSession(body);
@@ -267,10 +313,11 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             dockerAvailable={state.dockerAvailable}
             onApplyProfileDefaults={handleApplyProfileDefaults}
             cockpitMasterEnabled={cockpitMasterEnabled}
+            commandMaps={commandMaps}
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} />;
+        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} commandMaps={commandMaps} />;
       default:
         return null;
     }

@@ -595,6 +595,7 @@ impl HomeView {
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
+            worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
             hook_trust_dialog,
@@ -829,6 +830,7 @@ impl HomeView {
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.worktree_name_dialog.is_some()
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()

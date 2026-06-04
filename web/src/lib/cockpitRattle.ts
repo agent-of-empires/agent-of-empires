@@ -29,6 +29,16 @@ export const SPINNER_INTERVAL_MS = 80;
 export const VERB_INTERVAL_MS = 18_000;
 
 /**
+ * Max characters of the tool name inlined into the spinner verb. The
+ * spinner is a single italic inline line, but `inFlightTool.name` carries
+ * the ACP tool title, which for Bash is the full command line (a heredoc
+ * or piped consult-llm dispatch can run hundreds of chars). Clamping here
+ * keeps `Dispatching Bash…` and short titles intact while stopping a long
+ * command from flooding the row. See #1728.
+ */
+export const TOOL_LABEL_MAX = 24;
+
+/**
  * General "agent is working" pool. Used when there's no thinking/tool
  * sub-state to be more specific. Themed around empire building and
  * statecraft — conscripting, mining, forging, scouting, etc.
@@ -141,7 +151,11 @@ export function chooseVerb(
       "Wielding",
     ];
     const v = verbs[pickIndex(verbs.length, seed)];
-    return `${v} ${toolName}…`;
+    const label =
+      toolName.length > TOOL_LABEL_MAX
+        ? toolName.slice(0, TOOL_LABEL_MAX).trimEnd()
+        : toolName;
+    return `${v} ${label}…`;
   }
   if (state === "thinking") {
     return `${THINKING_VERBS[pickIndex(THINKING_VERBS.length, seed)]}…`;

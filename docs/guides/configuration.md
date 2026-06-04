@@ -95,6 +95,10 @@ default_tool = "claude"   # any supported agent name
 yolo_mode_default = false
 agent_status_hooks = true
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
+
+[session.cockpit_defaults.opencode]
+model = "openai/gpt-5.5"
+effort = "high"
 ```
 
 | Option | Default | Description |
@@ -108,6 +112,7 @@ auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
 | `agent_cockpit_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in cockpit (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is cockpit-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
+| `cockpit_defaults` | `{}` | Per-agent defaults for cockpit startup. `model` is forwarded when the worker starts; `effort` is applied through the agent's ACP `thought_level` config option when advertised. Example: `[session.cockpit_defaults.opencode] model = "openai/gpt-5.5" effort = "high"`. |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 

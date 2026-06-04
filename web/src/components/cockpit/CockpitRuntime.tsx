@@ -41,6 +41,8 @@ import type {
   PromptAttachmentInput,
   ToolCall,
 } from "../../lib/cockpitTypes";
+import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/cockpitArgs";
+import { useAgentProfile } from "../../lib/agentProfileContext";
 
 interface Props {
   sessionId: string;
@@ -122,6 +124,7 @@ export function CockpitRuntime({
   children,
 }: Props) {
   const cockpit = useCockpit(sessionId, cockpitWorkerState, archivedAt, snoozedUntil);
+  const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
@@ -144,8 +147,14 @@ export function CockpitRuntime({
         cockpit.state.activity,
         cockpit.state.turnActive,
         showClearedTurns,
+        agentProfile.capabilities.todos,
       ),
-    [cockpit.state.activity, cockpit.state.turnActive, showClearedTurns],
+    [
+      cockpit.state.activity,
+      cockpit.state.turnActive,
+      showClearedTurns,
+      agentProfile.capabilities.todos,
+    ],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -228,6 +237,7 @@ export function activityToThreadMessages(
   rows: readonly ActivityRow[],
   turnActive: boolean,
   showClearedTurns = false,
+  todosEnabled = true,
 ): ThreadMessageLike[] {
   // Fold pre-clear turns by default. When the user has run `/clear`,
   // earlier rows describe a conversation the model has forgotten; the
@@ -253,7 +263,7 @@ export function activityToThreadMessages(
 
   const flushAssistant = () => {
     if (!currentAssistant) return;
-    messages.push(currentAssistant.build());
+    messages.push(currentAssistant.build(todosEnabled));
     currentAssistant = null;
   };
 
@@ -508,9 +518,9 @@ class AssistantBuilder {
     }
   }
 
-  build(): ThreadMessageLike {
+  build(todosEnabled: boolean): ThreadMessageLike {
     const subagentCollapsed = collapseSubagents(this.parts);
-    const grouped = collapseToolRuns(subagentCollapsed);
+    const grouped = collapseToolRuns(subagentCollapsed, todosEnabled);
     return {
       id: this.id,
       role: "assistant",
@@ -526,21 +536,16 @@ class AssistantBuilder {
   }
 }
 
-function isTodoWriteArgsText(argsText: string): boolean {
-  try {
-    const parsed = JSON.parse(argsText);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const title = (parsed as Record<string, unknown>)._aoe_title;
-      if (typeof title === "string" && title.startsWith("Update TODOs")) {
-        return true;
-      }
-      const todos = (parsed as Record<string, unknown>).todos;
-      if (Array.isArray(todos)) return true;
+function isTodoWriteArgsText(argsText: string, todosEnabled: boolean): boolean {
+  if (!todosEnabled) return false;
+  const parsed = parseJsonObject(argsText);
+  if (parsed) {
+    const title = parsed._aoe_title;
+    if (typeof title === "string" && title.startsWith("Update TODOs")) {
+      return true;
     }
-  } catch {
-    // ignore
   }
-  return false;
+  return hasTodoItemsArgsText(argsText);
 }
 
 /** Synthetic toolName for a Claude sub-agent (Task) and its child tool
@@ -706,7 +711,10 @@ function buildGroupChildren(run: DraftPart[]): {
  *  underlying tool-call data is preserved verbatim inside the group's
  *  argsText payload so the renderer can expand back to the original
  *  per-tool cards on click. */
-function collapseToolRuns(parts: DraftPart[]): DraftPart[] {
+function collapseToolRuns(
+  parts: DraftPart[],
+  todosEnabled: boolean,
+): DraftPart[] {
   const out: DraftPart[] = [];
   let run: DraftPart[] = [];
   const flushRun = () => {
@@ -720,7 +728,7 @@ function collapseToolRuns(parts: DraftPart[]): DraftPart[] {
       // expand. TodoWrites are detected via the `_aoe_title` echo /
       // `todos` payload stashed in argsText.
       const isTodo = (p: DraftPart) =>
-        p.type === "tool-call" && isTodoWriteArgsText(p.argsText);
+        p.type === "tool-call" && isTodoWriteArgsText(p.argsText, todosEnabled);
       if (run.every(isTodo)) {
         const { childIds, children } = buildGroupChildren(run);
         out.push({

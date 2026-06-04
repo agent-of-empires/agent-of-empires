@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::containers::{self, ContainerRuntimeInterface};
@@ -18,6 +19,12 @@ pub struct AddArgs {
     /// Session title (defaults to folder name)
     #[arg(short = 't', long)]
     title: Option<String>,
+
+    /// Prompt for the session name, mirroring the TUI `n` flow. Shows the
+    /// generated default; press Enter to accept it. Ignored when --title
+    /// is given. Requires an interactive terminal.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     /// Group path (defaults to parent folder)
     #[arg(short = 'g', long)]
@@ -138,6 +145,13 @@ pub struct AddArgs {
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
+    // Fail fast before any filesystem side effects: --interactive must
+    // have a real terminal to read the name from, otherwise the prompt
+    // would block on EOF or a PTY harness would hang.
+    if args.interactive && !std::io::stdin().is_terminal() {
+        bail!("--interactive requires a terminal; pass --title for non-interactive naming");
+    }
+
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
     // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
@@ -215,12 +229,37 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
         if !all_extra_repos.is_empty() {
+            let session_base = args.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = builder::project_base_branches(profile);
+            let resolve_extra = |path: &std::path::Path| {
+                let project = project_bases
+                    .get(&crate::session::projects::canonical_key(
+                        &path.to_string_lossy(),
+                    ))
+                    .map(String::as_str);
+                builder::resolve_base_branch(session_base, project, global_default)
+            };
+
+            // The launch repo never consults the per-project layer: explicit
+            // session base, then the global/profile default.
+            let primary = builder::WorkspaceRepoSpec {
+                base_branch: builder::resolve_base_branch(session_base, None, global_default),
+                path: path.clone(),
+            };
+            let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
+                .iter()
+                .map(|p| builder::WorkspaceRepoSpec {
+                    base_branch: resolve_extra(p),
+                    path: p.clone(),
+                })
+                .collect();
+
             let ws_result = builder::create_workspace(
-                &path,
-                &all_extra_repos,
+                &primary,
+                &extra_repos,
                 branch,
                 args.create_branch,
-                args.base_branch.as_deref(),
                 &config.worktree.workspace_path_template,
                 init_submodules,
             )?;
@@ -299,13 +338,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
+                // Single-repo sessions only have the launch repo, so fall back
+                // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    args.base_branch.as_deref()
+                    builder::resolve_base_branch(
+                        args.base_branch.as_deref(),
+                        None,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
                 } else {
                     None
                 };
-                let warnings =
-                    git_wt.create_worktree(branch, &worktree_path, args.create_branch, base)?;
+                let warnings = git_wt.create_worktree(
+                    branch,
+                    &worktree_path,
+                    args.create_branch,
+                    base.as_deref(),
+                )?;
 
                 path = worktree_path;
 
@@ -314,7 +363,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
                     created_at: Utc::now(),
-                    base_branch: base.map(|s| s.to_string()),
+                    base_branch: base,
                 });
 
                 for w in &warnings {
@@ -346,7 +395,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // Generate title: use provided title, or branch name for worktree sessions, or random civ
+    // Generate title: use provided title, or branch name for worktree sessions, or random civ.
+    // With --interactive (and no --title), prompt for the name TUI-style,
+    // prefilling the generated default. The chosen title, whatever its
+    // source, runs through the same duplicate (title + path) check.
     let final_title = if let Some(title) = &args.title {
         let trimmed_title = title.trim();
         if is_duplicate_session(&instances, trimmed_title, path.to_str().unwrap_or("")) {
@@ -364,12 +416,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Ok(());
         }
         trimmed_title.to_string()
-    } else if let Some(ref branch) = args.worktree_branch {
-        let branch_title = branch.trim().to_string();
-        if is_duplicate_session(&instances, &branch_title, path.to_str().unwrap_or("")) {
+    } else {
+        let default_title = if let Some(ref branch) = args.worktree_branch {
+            branch.trim().to_string()
+        } else {
+            let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+            civilizations::generate_random_title(&existing_titles)
+        };
+        let chosen_title = if args.interactive {
+            prompt_session_title(&default_title)?
+        } else {
+            default_title
+        };
+        if is_duplicate_session(&instances, &chosen_title, path.to_str().unwrap_or("")) {
             println!(
                 "Session already exists with same title and path: {}",
-                branch_title
+                chosen_title
             );
             cleanup_partial_session(
                 &path,
@@ -380,10 +442,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
             return Ok(());
         }
-        branch_title
-    } else {
-        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-        civilizations::generate_random_title(&existing_titles)
+        chosen_title
     };
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
@@ -415,16 +474,38 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.tool = selection.name().to_string();
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
-        // Verify the agent binary is actually on PATH before creating the session
-        if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
-            if !crate::tmux::is_agent_available(agent_def) {
-                bail!(
-                    "'{}' is not installed or not on $PATH.\n\
-                     Install with: {}\n\
-                     See all supported agents: aoe agents",
-                    agent_def.binary,
-                    agent_def.install_hint
-                );
+        // Verify the binary that will actually launch is on PATH before
+        // creating the session. A configured session.agent_command_override
+        // (or custom_agents) entry replaces the built-in binary, so check the
+        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // falsely bails when only the override binary (e.g.
+        // opencode-plannotator) is installed. See #1910.
+        match override_launch_binary(&tool_name, &config.session) {
+            Some(bin) => {
+                // Use the same detection as tmux (login-shell PATH fallback
+                // included) so an override binary visible only after shell
+                // init isn't rejected here while the non-override path accepts
+                // it. See #1910.
+                if !crate::tmux::is_binary_on_path(&bin) {
+                    bail!(
+                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                         See all supported agents: aoe agents",
+                        bin
+                    );
+                }
+            }
+            None => {
+                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+                    if !crate::tmux::is_agent_available(agent_def) {
+                        bail!(
+                            "'{}' is not installed or not on $PATH.\n\
+                             Install with: {}\n\
+                             See all supported agents: aoe agents",
+                            agent_def.binary,
+                            agent_def.install_hint
+                        );
+                    }
+                }
             }
         }
         instance.tool = tool_name;
@@ -573,17 +654,36 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             // agent's configured ACP command, then verify the binary is on
             // PATH. A missing adapter is a hard error at add-time rather
             // than a silent 404 on the first prompt.
-            let spec = match registry.get(&agent_name) {
-                Some(spec) => spec.clone(),
+            let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
+                Some(spec) => (spec.clone(), true),
                 None => match config.session.agent_cockpit_cmd.get(&agent_name) {
-                    Some(cmd) => crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                    Some(cmd) => (
+                        crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        false,
+                    ),
                     None => bail!(
                         "cockpit agent `{agent_name}` is not in the registry.\n\
                          Run `aoe cockpit doctor` to see configured agents."
                     ),
                 },
             };
+            // Overlay session.agent_command_override the same way the cockpit
+            // spawn path does, so the precondition checks the binary that will
+            // actually launch (e.g. opencode-plannotator), not the bare
+            // registry binary. Without this, a user who installed only the
+            // override binary gets a false "not installed" bail. See #1910.
+            if let Some(ovr) = crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ) {
+                crate::cockpit::supervisor::apply_agent_command_override(
+                    &agent_name,
+                    spec_from_registry,
+                    &ovr,
+                    &mut spec,
+                )?;
+            }
             if !crate::cli::cockpit::command_present(&spec.command) {
                 let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
                     .unwrap_or("install via your package manager and re-run");
@@ -892,6 +992,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
+/// Prompt for a session title on stderr, mirroring the TUI `n` flow's
+/// "auto-generates if empty" field. Empty input or EOF keeps
+/// `default_title`; a non-empty line is trimmed and used. Only reached in
+/// `--interactive` mode, which already verified stdin is a terminal.
+fn prompt_session_title(default_title: &str) -> Result<String> {
+    use std::io::Write;
+
+    eprint!("Session name [{}]: ", default_title);
+    std::io::stderr().flush()?;
+
+    let mut input = String::new();
+    let read = std::io::stdin().read_line(&mut input)?;
+    if read == 0 {
+        return Ok(default_title.to_string());
+    }
+
+    let trimmed = input.trim();
+    Ok(if trimmed.is_empty() {
+        default_title.to_string()
+    } else {
+        trimmed.to_string()
+    })
+}
+
 fn cleanup_partial_session(
     path: &std::path::Path,
     worktree_info: Option<&crate::session::WorktreeInfo>,
@@ -982,6 +1106,23 @@ fn detect_tool(cmd: &str) -> Result<String> {
                 crate::agents::agent_names().join(", ")
             )
         })
+}
+
+/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
+/// selection when `session.agent_command_override` (or `custom_agents`)
+/// remaps the built-in to a different command. Returns the resolved
+/// command's first word, or `None` when no override applies (the caller
+/// then falls back to the built-in agent's own detection). See #1910.
+///
+/// Parsed with `shell_words` so a quoted path (e.g.
+/// `"/opt/My Wrapper/opencode" --mode plan`) yields the real binary, matching
+/// how `apply_agent_command_override` splits the command at spawn time.
+fn override_launch_binary(
+    tool: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<String> {
+    let command = session.resolve_tool_command(tool);
+    shell_words::split(&command).ok()?.into_iter().next()
 }
 
 enum NamedToolSelection {
@@ -1089,9 +1230,58 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sandbox_image;
+    use super::{override_launch_binary, resolve_sandbox_image};
+    use crate::session::config::SessionConfig;
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[test]
+    fn override_launch_binary_uses_command_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "opencode-plannotator".to_string());
+        // The gate must verify the override binary, not the built-in
+        // `opencode`, so `--cmd opencode` works when only the wrapper is
+        // installed. See #1910.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("opencode-plannotator")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_takes_first_word_of_multiword_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "ocp run sp".to_string());
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("ocp")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_honors_quoted_path() {
+        let mut session = SessionConfig::default();
+        session.agent_command_override.insert(
+            "opencode".to_string(),
+            "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
+        );
+        // shell_words keeps the quoted path intact instead of splitting on
+        // the space, so preflight checks the real binary.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("/opt/My Wrapper/opencode")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_none_without_override() {
+        let session = SessionConfig::default();
+        assert_eq!(override_launch_binary("opencode", &session), None);
+    }
 
     #[test]
     fn flag_overrides_everything() {

@@ -17,6 +17,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   // Add-form state
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
+  const [baseBranch, setBaseBranch] = useState("");
   const [scope, setScope] = useState<"global" | "profile">("global");
   const [allowOverride, setAllowOverride] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
@@ -43,6 +44,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
       name: name.trim() || undefined,
       scope,
       allow_override: allowOverride || undefined,
+      default_base_branch: baseBranch.trim() || undefined,
     });
     setSubmitting(false);
     if (!result.ok) {
@@ -51,6 +53,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
     }
     setPath("");
     setName("");
+    setBaseBranch("");
     setScope("global");
     setAllowOverride(false);
     setShowAdd(false);
@@ -146,6 +149,15 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 mb-3"
             />
 
+            <label className="block text-[12px] text-text-dim mb-1">Default base branch for extra repos (optional)</label>
+            <input
+              type="text"
+              value={baseBranch}
+              onChange={(e) => setBaseBranch(e.target.value)}
+              placeholder="blank = inherit global default, then auto-detect"
+              className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono mb-3"
+            />
+
             <label className="block text-[12px] text-text-dim mb-1">Scope</label>
             <div className="flex gap-2 mb-4">
               {(["global", "profile"] as const).map((s) => (
@@ -189,6 +201,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                   setShowBrowser(false);
                   setPath("");
                   setName("");
+                  setBaseBranch("");
                   setScope("global");
                   setAllowOverride(false);
                   setError(null);
@@ -256,6 +269,12 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                   <p className="text-[11px] font-mono text-text-dim truncate mt-0.5" title={p.path}>
                     {p.path}
                   </p>
+                  {p.default_base_branch && (
+                    <p className="text-[11px] text-text-dim mt-0.5">
+                      base branch:{" "}
+                      <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
+                    </p>
+                  )}
                 </div>
                 {!readOnly && (
                   <button

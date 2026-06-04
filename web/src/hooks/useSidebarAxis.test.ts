@@ -27,6 +27,12 @@ describe("useSidebarAxis", () => {
     expect(result.current[0]).toBe("group");
   });
 
+  it("hydrates from a stored 'repo+group' value (#1720)", () => {
+    window.localStorage.setItem(SIDEBAR_AXIS_KEY, "repo+group");
+    const { result } = renderHook(() => useSidebarAxis());
+    expect(result.current[0]).toBe("repo+group");
+  });
+
   it("falls back to 'repo' for an unrecognised stored value", () => {
     window.localStorage.setItem(SIDEBAR_AXIS_KEY, "garbage");
     const { result } = renderHook(() => useSidebarAxis());
@@ -42,6 +48,17 @@ describe("useSidebarAxis", () => {
 
     expect(result.current[0]).toBe("group");
     expect(window.localStorage.getItem(SIDEBAR_AXIS_KEY)).toBe("group");
+  });
+
+  it("setter persists the 'repo+group' axis (#1720)", () => {
+    const { result } = renderHook(() => useSidebarAxis());
+
+    act(() => {
+      result.current[1]("repo+group");
+    });
+
+    expect(result.current[0]).toBe("repo+group");
+    expect(window.localStorage.getItem(SIDEBAR_AXIS_KEY)).toBe("repo+group");
   });
 
   it("setter is stable across renders (useCallback)", () => {

@@ -5,9 +5,11 @@ import { getReviewSummary } from "../sessionNames";
 import { useServerDown, OFFLINE_TITLE } from "../../../lib/connectionState";
 import type { AgentInfo } from "../../../lib/types";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { resolveLaunchCommand } from "../../../lib/launchCommand";
+import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useCockpit: boolean; [key: string]: unknown; }
-interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; }
+interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; commandMaps?: CommandMaps; }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
@@ -109,7 +111,94 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
   );
 }
 
-export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled }: Props) {
+/** Click-to-edit row for the resolved launch command. Only the command
+ *  prefix is editable; it is written back to the per-session command
+ *  override. The arg suffix (cockpit registry args or tmux extra args) is
+ *  always-appended and rendered read-only, so editing can never duplicate
+ *  it (e.g. "opencode acp" never becomes "opencode acp acp"). See #1911. */
+function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
+  label: string;
+  prefix: string;
+  suffix: string;
+  onChangePrefix: (v: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(prefix);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.select();
+  }, [editing]);
+
+  const startEditing = () => {
+    setDraft(prefix);
+    setEditing(true);
+  };
+
+  const commit = () => {
+    setEditing(false);
+    // Strip the read-only suffix if the user pasted the full command, so
+    // the stored override stays prefix-only and the backend does not
+    // re-append the registry args (e.g. "opencode acp acp").
+    const trimmed = draft.trim();
+    const normalized =
+      suffix && trimmed.endsWith(` ${suffix}`)
+        ? trimmed.slice(0, trimmed.length - suffix.length - 1).trimEnd()
+        : trimmed;
+    if (normalized !== prefix) onChangePrefix(normalized);
+  };
+
+  const suffixSpan = suffix ? (
+    <span className="text-text-dim"> {suffix}</span>
+  ) : null;
+
+  if (editing) {
+    return (
+      <div className="flex justify-between items-center w-full py-3 border-b border-surface-800 last:border-0 -mx-2 px-2 gap-3">
+        <span className="text-sm text-text-dim shrink-0">{label}</span>
+        <div className="flex items-center min-w-0 flex-1 justify-end gap-0 text-sm font-mono">
+          <input
+            ref={inputRef}
+            type="text"
+            data-testid="launch-command-input"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                e.stopPropagation();
+                commit();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setEditing(false);
+              }
+            }}
+            className="min-w-0 flex-1 text-right bg-surface-800 border border-brand-600 rounded px-2 py-1 text-text-primary focus:outline-none"
+          />
+          {suffixSpan}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={startEditing}
+      data-testid="launch-command-row"
+      className="flex justify-between items-center w-full py-3 border-b border-surface-800 last:border-0 text-left cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md"
+    >
+      <span className="text-sm text-text-dim">{label}</span>
+      <span className="text-sm font-mono truncate ml-4 text-text-primary">
+        {prefix}
+        {suffixSpan}
+      </span>
+    </button>
+  );
+}
+
+export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const hasStep = (id: StepId) => steps.some((s) => s.id === id);
   const offline = useServerDown();
   // Scratch sessions intentionally carry no path until the server
@@ -127,6 +216,22 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
     cockpitMasterEnabled &&
     isAcpCapable(data.tool, selectedAgent?.acp_capable) &&
     data.useCockpit;
+
+  // Resolve the exact launch command the session will run, so the user
+  // can confirm (and edit) it before starting. Mirrors the backend
+  // precedence; the registry args stay in a read-only suffix so an inline
+  // edit only touches the command override (#1911).
+  const resolved = resolveLaunchCommand({
+    tool: data.tool,
+    useCockpit: willUseCockpit,
+    binary: selectedAgent?.binary,
+    cockpitCommand: selectedAgent?.cockpit_command,
+    cockpitArgs: selectedAgent?.cockpit_args,
+    extraArgs: data.extraArgs,
+    manualOverride: data.commandOverride,
+    agentCommandOverride: commandMaps.agentCommandOverride,
+    customAgents: commandMaps.customAgents,
+  });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -201,9 +306,20 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
         )}
         <Row label="Auto-approve" value={data.yoloMode ? "On" : "Off"} stepId="agent" onJumpTo={onJumpTo} />
         {data.group && <Row label="Group" value={data.group} />}
-        {data.extraArgs && <Row label="Extra args" value={data.extraArgs} />}
         {data.customInstruction && <Row label="Instructions" value="(set)" />}
-        {data.commandOverride && <Row label="Command override" value={data.commandOverride} />}
+        {data.tool && (
+          <EditableCommandRow
+            label="Launch command"
+            prefix={resolved.prefix}
+            suffix={resolved.suffix}
+            onChangePrefix={(v) => onChange("commandOverride", v)}
+          />
+        )}
+        {willUseCockpit && data.extraArgs.trim() && (
+          <p className="pt-2 text-xs text-status-warning" data-testid="extra-args-ignored-review">
+            Extra args are ignored for cockpit sessions.
+          </p>
+        )}
       </div>
       {error && <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">{error}</div>}
       {offline && (

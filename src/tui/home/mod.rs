@@ -36,7 +36,7 @@ use super::dialogs::{
     GroupDeleteOptionsDialog, GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog,
     IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog,
-    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
+    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog, WorktreeNameDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -399,6 +399,7 @@ pub struct HomeView {
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
+    pub(super) worktree_name_dialog: Option<WorktreeNameDialog>,
     pub(super) restart_dialog: Option<RestartDialog>,
     /// Right-click popup on the sidebar list. Anchored to a screen
     /// position when opened; the renderer clamps it into view.
@@ -855,6 +856,7 @@ impl HomeView {
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
+            worktree_name_dialog: None,
             restart_dialog: None,
             context_menu: None,
             group_rename_context: None,
@@ -2360,6 +2362,7 @@ impl HomeView {
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
             || self.hook_trust_dialog.is_some()
@@ -2396,6 +2399,7 @@ impl HomeView {
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
             || self.hook_trust_dialog.is_some()

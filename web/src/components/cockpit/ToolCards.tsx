@@ -44,7 +44,12 @@ import {
 } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
-import { parseJsonObject, pickFirst, pickStr } from "../../lib/cockpitArgs";
+import {
+  parseJsonObject,
+  pickFirst,
+  pickStr,
+  todoItemsFromArgs,
+} from "../../lib/cockpitArgs";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
 import type { ActivityRow, ToolCall } from "../../lib/cockpitTypes";
 import { diffPair } from "../../lib/diffPair";
@@ -62,6 +67,7 @@ import {
 } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 
 interface Props {
@@ -243,24 +249,42 @@ function statusFor(result?: ActivityRow): Status {
 
 // Per-card expand state for tool cards. Failed cards auto-open so the
 // user sees the error immediately, but the chevron must still fold them
-// once read. We model the user's choice as a nullable override: while
-// it is null we derive openness from the current props
-// (`status === "err" || defaultOpen`), so both a replayed already-failed
+// once read. We model the user's choice as an override scoped to the
+// active tool density: while no override matches the current density we
+// derive openness from the baseline, so both a replayed already-failed
 // card (mounts as err) and a live card that fails mid-stream
 // (running -> err) open during render with no effect and no one-frame
-// collapse flash. The first user toggle pins `userOpen` and is respected
-// from then on, even if the card later re-enters err. See #1467.
+// collapse flash. The first user toggle pins the override and is
+// respected from then on, even if the card later re-enters err. See
+// #1467.
+//
+// The baseline folds in the transcript density (#1767): "compact" makes
+// every card default collapsed, "detailed" keeps the caller's
+// `defaultOpen`. Errored cards always auto-open regardless of density so
+// compact mode never hides a failure. Scoping the override to the
+// density means flipping the global toggle re-applies the baseline for
+// every untouched card without a useEffect.
 function useToolCardExpansion(status: Status, defaultOpen = false) {
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = userOpen ?? (status === "err" || defaultOpen);
+  const density = useToolDisplayMode();
+  const baseline =
+    status === "err" ? true : density === "compact" ? false : defaultOpen;
+  const [override, setOverride] = useState<{
+    density: ToolDensity;
+    open: boolean;
+  } | null>(null);
+  const active =
+    override && override.density === density ? override.open : null;
+  const open = active ?? baseline;
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
-      setUserOpen((prev) => {
-        const current = prev ?? (status === "err" || defaultOpen);
-        return typeof action === "function" ? action(current) : action;
+      setOverride((prev) => {
+        const current =
+          prev && prev.density === density ? prev.open : baseline;
+        const next = typeof action === "function" ? action(current) : action;
+        return { density, open: next };
       });
     },
-    [status, defaultOpen],
+    [density, baseline],
   );
   return [open, setOpen] as const;
 }
@@ -750,18 +774,40 @@ function EditToolCard({ tool, result }: Props) {
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
-  const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
-  const oldText = pickStr(args, "old_string", "oldString", "old_str") ?? "";
-  const newText =
+  // Codex (and any ACP agent) attaches structured per-file diffs via
+  // ToolCallContent::Diff; prefer those for path + body and fall back to
+  // the legacy old_string/new_string args shape otherwise. See #1721.
+  const structuredDiffs = tool.diffs ?? [];
+  const hasStructuredDiffs = structuredDiffs.length > 0;
+  const legacyOld = pickStr(args, "old_string", "oldString", "old_str") ?? "";
+  const legacyNew =
     pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
+  const hasLegacyDiff = legacyOld !== "" || legacyNew !== "";
+  const path =
+    pickFirst(structuredDiffs[0]?.path, argPath, title, tool.name) ??
+    "(unknown file)";
   const [open, setOpen] = useToolCardExpansion(status);
-  const hasDiff = oldText !== "" || newText !== "";
-  const verb = oldText ? "edit" : "write";
+  const hasDiff = hasStructuredDiffs || hasLegacyDiff;
+  // "edit" when a prior version existed, "write" for a fresh file.
+  const isEdit = hasStructuredDiffs
+    ? structuredDiffs.some((d) => (d.old_text ?? "") !== "")
+    : legacyOld !== "";
+  const verb = isEdit ? "edit" : "write";
+  const multiFile = structuredDiffs.length > 1;
 
-  const { adds, dels } = useMemo(
-    () => diffPair(oldText, newText),
-    [oldText, newText],
-  );
+  const { adds, dels } = useMemo(() => {
+    const ds = tool.diffs ?? [];
+    if (ds.length > 0) {
+      return ds.reduce(
+        (acc, d) => {
+          const p = diffPair(d.old_text ?? "", d.new_text ?? "");
+          return { adds: acc.adds + p.adds, dels: acc.dels + p.dels };
+        },
+        { adds: 0, dels: 0 },
+      );
+    }
+    return diffPair(legacyOld, legacyNew);
+  }, [tool.diffs, legacyOld, legacyNew]);
   const meta = hasDiff && (adds > 0 || dels > 0) && (
     <span className="hidden md:inline text-[11px]">
       <span className="text-emerald-400">+{adds}</span>{" "}
@@ -780,7 +826,7 @@ function EditToolCard({ tool, result }: Props) {
       endedAt={result?.at}
       icon={<Pencil className="h-3.5 w-3.5" />}
       label={verb}
-      primary={path}
+      primary={multiFile ? `${path} +${structuredDiffs.length - 1} more` : path}
       meta={errorChip ? undefined : meta}
       expanded={open}
       onToggle={
@@ -788,14 +834,33 @@ function EditToolCard({ tool, result }: Props) {
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {hasDiff && (
+          {hasStructuredDiffs ? (
             <div className="border-t border-surface-800 bg-surface-950">
-              <StringDiff
-                oldText={oldText}
-                newText={newText}
-                filePath={path}
-              />
+              {structuredDiffs.map((d, i) => (
+                <div key={`${d.path}-${i}`}>
+                  {multiFile && (
+                    <div className="px-2 py-1 text-[11px] text-text-dim">
+                      {d.path}
+                    </div>
+                  )}
+                  <StringDiff
+                    oldText={d.old_text ?? ""}
+                    newText={d.new_text ?? ""}
+                    filePath={d.path}
+                  />
+                </div>
+              ))}
             </div>
+          ) : (
+            hasLegacyDiff && (
+              <div className="border-t border-surface-800 bg-surface-950">
+                <StringDiff
+                  oldText={legacyOld}
+                  newText={legacyNew}
+                  filePath={path}
+                />
+              </div>
+            )
           )}
         </ToolErrorBody>
       }
@@ -966,37 +1031,22 @@ interface TodoItem {
   status: TodoStatus;
 }
 
-/** Heuristic for Claude's TodoWrite tool. The adapter ships it as a
- *  `kind: "think"` tool call with the joined todo list crammed into the
- *  title (`"Update TODOs: a, b, c"`) and the structured `{todos: [...]}`
- *  payload in raw_input. We detect via the title prefix and parse the
- *  args payload to render a proper checklist. See #1064. Profile-keyed
- *  so coincidental matches on other agents return early. */
+/** Heuristic for agent todo tools. Claude and OpenCode both carry the
+ *  current list in `args_preview.todos`, but their titles differ. The
+ *  profile opt-in is the safety gate; the structured todo payload is the
+ *  shared discriminator so grouping and rendering agree. See #1905. */
 function classifyTodoWrite(
   tool: ToolCall,
   profile: AgentProfile,
 ): { isTodoWrite: true; todos: TodoItem[] } | { isTodoWrite: false } {
-  const title = tool.name?.trim() ?? "";
-  const prefixes = profile.specialTitles.todoPrefixes;
-  const looksLikeTodo =
-    title === "TodoWrite" || prefixes.some((p) => title.startsWith(p));
-  if (!looksLikeTodo) return { isTodoWrite: false };
+  if (!profile.capabilities.todos) return { isTodoWrite: false };
   const args = parseJsonObject(tool.args_preview);
-  if (!args) return { isTodoWrite: false };
-  const raw = args.todos;
-  if (!Array.isArray(raw)) return { isTodoWrite: false };
-  const todos: TodoItem[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const obj = entry as Record<string, unknown>;
-    const content = typeof obj.content === "string" ? obj.content : "";
-    if (!content) continue;
-    todos.push({
-      content,
-      status: normaliseTodoStatus(obj.status),
-    });
-  }
-  if (todos.length === 0) return { isTodoWrite: false };
+  const payload = todoItemsFromArgs(args);
+  if (payload.length === 0) return { isTodoWrite: false };
+  const todos = payload.map((entry) => ({
+    content: entry.content,
+    status: normaliseTodoStatus(entry.status),
+  }));
   return { isTodoWrite: true, todos };
 }
 
@@ -1318,9 +1368,6 @@ interface ToolGroupItem {
  *  matching how the Claude Code CLI condenses silent investigation
  *  phases. See #1057. */
 export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
-  const [open, setOpen] = useState(false);
-  if (items.length === 0) return null;
-
   const runningCount = items.filter((i) => !i.result).length;
   const errorCount = items.filter(
     (i) => i.result && i.result.kind === "tool_error",
@@ -1329,6 +1376,11 @@ export function ToolGroupCard({ items }: { items: ToolGroupItem[] }) {
   // 11-step investigation doesn't make the whole investigation
   // failed; per-child status stays on the inner cards. See #1102.
   const status: Status = runningCount > 0 ? "running" : "ok";
+  // Route through the shared hook (not a bare useState) so the group
+  // folds with the transcript density toggle too. Called before the
+  // empty-items guard to keep hook order stable. See #1767.
+  const [open, setOpen] = useToolCardExpansion(status, false);
+  if (items.length === 0) return null;
 
   const breakdown = summariseKinds(items, errorCount);
 

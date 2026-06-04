@@ -19,15 +19,7 @@ Mobile and touch behavior is documented inline on each page, next to the surface
 
 The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
 
-## Building from source
-
-If building from source, you need the `serve` Cargo feature and Node.js/npm:
-
-```bash
-cargo build --release --features serve
-```
-
-The build automatically runs `npm install && npm run build` in the `web/` directory to compile the React frontend. The output is embedded in the binary, so there are no separate files to deploy.
+If you build from source, the dashboard requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
 
 ## Starting the server
 
@@ -235,49 +227,10 @@ aoe serve --daemon
 
 `Ctrl-C` on a foreground `aoe serve`, and `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open dashboard tabs. Live cockpit and terminal WebSocket clients receive a close frame with code `1001` ("going away") so the browser logs a clean reason and skips its transient-error reconnect backoff for one cycle. The reconnect resumes normally once a fresh `aoe serve` is running. A 5-second hard cap acts as a safety net: if any handler fails to honor the shutdown signal, the process still exits and emits `WARN shutdown: graceful shutdown exceeded grace window, forcing exit`.
 
-## Architecture
+## How it works
 
-The server embeds an axum web server that serves a React frontend and provides:
-
-- REST API for session listing and control (`/api/sessions`); see the [HTTP API Reference](../api.md) for the orchestration endpoints (`send`, `output`)
-- WebSocket PTY relay for terminal streaming (`/sessions/:id/ws`)
-- Token-based authentication via cookie, query parameter, or WebSocket protocol header
-- Rate limiting, token rotation, and device tracking
-- Security headers (X-Frame-Options, Referrer-Policy)
-
-Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over WebSocket. This gives the browser a real terminal experience identical to SSH.
+`aoe serve` runs an embedded server inside the `aoe` process; your browser connects to it to list sessions, stream terminal output, and (when write access is enabled) send input. Each terminal is backed by a real `tmux` session, so your work survives browser crashes, network drops, and reconnects.
 
 The terminal disconnect banner surfaces a WebSocket close code when it can't reach a working pane. The decoder ring for those codes lives on the [Terminal view](web/terminal.md#terminal-websocket-close-codes) page.
 
-## Frontend development
-
-The React frontend lives in `web/`. One command from the repo root builds the
-serve-enabled binary, then runs the backend and the Vite dev server together:
-
-```bash
-cargo xtask dev
-```
-
-This starts `aoe serve --no-auth` on port 8081 and the Vite dev server on
-[http://localhost:5173](http://localhost:5173), pointing Vite at the backend via
-`VITE_PROXY`. Open the `:5173` URL (not `:8081`): Vite serves the app with hot
-module reload and proxies `/api` and the `/sessions/*/ws` relays to the backend,
-so edits to `.tsx` files reload instantly while API and terminal traffic keep
-working. One Ctrl-C stops both processes. Override ports with `--serve-port` /
-`--web-port`. Unix only.
-
-To run the two halves by hand instead:
-
-```bash
-cd web
-npm install
-npm run dev     # Vite dev server with HMR on port 5173
-```
-
-For API/WebSocket requests, run the Rust server simultaneously:
-
-```bash
-cargo run --features serve -- serve
-```
-
-If you are making only frontend changes and want to work on the local frontend against a "production" backend instead of a local build, set `VITE_PROXY` (shell env or `web/.env`) to that `aoe serve` origin, including a non-cargo install on a custom port, and the dev server forwards `/api` and `/sessions/*/ws` (terminal + cockpit) there: `VITE_PROXY=http://localhost:50106 npm run dev`. Without it the dev server behaves as before; HMR is unaffected either way.
+For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).
