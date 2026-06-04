@@ -2339,7 +2339,8 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/acp-stories/diff-base-picker.spec.ts"
+        "tests/live/acp-stories/diff-base-picker.spec.ts",
+        "tests/live/diff-base-from-worktree.spec.ts"
       ],
       "components": [
         "web/src/components/diff/DiffFileList.tsx"
