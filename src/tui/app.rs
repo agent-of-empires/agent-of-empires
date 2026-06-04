@@ -2880,7 +2880,7 @@ mod tests {
     fn split_trailing_enter_peels_terminating_enter() {
         // Regression: typing "hi<Enter>" with <5ms key gaps used to land
         // as a single burst whose string `"hi\n"` was forwarded to
-        // handle_paste — the textarea inserted `\n` as data and the
+        // handle_paste, so the textarea inserted `\n` as data and the
         // dialog's Submit branch never fired. Peel the trailing Enter
         // so handle_paste sees `"hi"` and we replay Enter for Submit.
         let burst_keys = vec![
@@ -2912,7 +2912,7 @@ mod tests {
 
     #[test]
     fn split_trailing_enter_keeps_mid_burst_enter_when_burst_ends_on_char() {
-        // Burst ends on a printable char — no trailing Enter to peel.
+        // Burst ends on a printable char, so there is no trailing Enter to peel.
         // The embedded Enter stays in the paste text.
         let burst_keys = vec![
             key(KeyCode::Char('h'), KeyModifiers::NONE),
