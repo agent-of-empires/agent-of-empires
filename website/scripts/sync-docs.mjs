@@ -41,6 +41,13 @@ const PAGES = [
       "Per-repo configuration and hooks for Agent of Empires sessions.",
   },
   {
+    source: "docs/guides/mcp-servers.md",
+    dest: "guides/mcp-servers.md",
+    title: "MCP Servers",
+    description:
+      "Forward configured MCP servers to structured-view agents via mcp.json.",
+  },
+  {
     source: "docs/guides/sandbox.md",
     dest: "guides/sandbox.md",
     title: "Docker Sandbox: Quick Reference",
@@ -369,6 +376,7 @@ const URL_MAP = {
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
+  "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
