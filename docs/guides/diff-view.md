@@ -108,8 +108,9 @@ then worktree base, then `diff.default_branch`, then auto-detection.
 See #1951.
 
 - **Web dashboard**: click the `vs <ref>` chip in the diff header, pick
-  a branch from the typeahead (local + remote-only), or use
-  "Reset to auto-detected" to clear.
+  a branch from the typeahead (local + remote-only), or reset to clear
+  the override (the comparison then falls back to the worktree base, or
+  auto-detection when none was recorded).
 - **TUI diff view**: press `b`, pick a branch; the choice is persisted
   to `sessions.json` and restored on next launch.
 - **CLI**: `aoe session set-base <session> <branch>` to set,
