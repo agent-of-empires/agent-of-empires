@@ -212,14 +212,19 @@ pub fn apply_persisted_config(
     };
     match set_filter(&filter) {
         Ok(swap) => {
-            tracing::info!(
-                target: "log.runtime",
-                previous = %swap.previous,
-                current = %swap.current,
-                source = "settings",
-                "filter swapped"
-            );
-            persist_runtime_filter(&swap.current, app_dir);
+            // Skip the log and the disk write on a no-op: persisting an
+            // unchanged directive needlessly re-fires every runner's watcher
+            // (#1894).
+            if swap.changed {
+                tracing::info!(
+                    target: "log.runtime",
+                    previous = %swap.previous,
+                    current = %swap.current,
+                    source = "settings",
+                    "filter swapped"
+                );
+                persist_runtime_filter(&swap.current, app_dir);
+            }
         }
         Err(LogFilterError::Unavailable) => {
             // No reload handle installed (e.g. TUI process). Still persist
@@ -424,14 +429,30 @@ impl FilterController {
     }
 
     fn swap(&self, filter: EnvFilter, directive: String) -> Result<SwapResult, LogFilterError> {
-        let previous = self.current();
+        // Hold the `current` lock across the compare and the modify so two
+        // concurrent swaps cannot interleave and both observe `changed`.
+        let mut current = self.current.lock().unwrap();
+        let previous = current.clone();
+        // No-op: the active directive already equals the requested one.
+        // Skip the reload-handle modify entirely and report `changed=false`
+        // so callers stay silent. A no-op swap that logged at INFO is what
+        // fed the file-watch OOM loop in #1894: the log line landed in the
+        // watched dir and re-triggered the watcher.
+        if previous == directive {
+            return Ok(SwapResult {
+                previous,
+                current: directive,
+                changed: false,
+            });
+        }
         self.inner
             .modify(|f| *f = filter)
             .map_err(|e| LogFilterError::Invalid(e.to_string()))?;
-        *self.current.lock().unwrap() = directive.clone();
+        *current = directive.clone();
         Ok(SwapResult {
             previous,
             current: directive,
+            changed: true,
         })
     }
 }
@@ -440,6 +461,10 @@ impl FilterController {
 pub struct SwapResult {
     pub previous: String,
     pub current: String,
+    /// `false` when the requested directive already matched the active one,
+    /// so the swap was a no-op. Callers gate logging and persistence on this
+    /// to avoid the self-sustaining file-watch loop (#1894).
+    pub changed: bool,
 }
 
 #[derive(Debug)]
@@ -974,13 +999,16 @@ fn apply_filter_file(path: &std::path::Path) {
         return;
     }
     match set_filter(directive) {
-        Ok(swap) => tracing::info!(
+        // No-op swaps stay silent: logging here would write into the watched
+        // dir and re-trigger the watcher (#1894).
+        Ok(swap) if swap.changed => tracing::info!(
             target: "log.runtime",
             previous = %swap.previous,
             current = %swap.current,
             source = "file-watch",
             "runner filter swapped"
         ),
+        Ok(_) => {}
         Err(e) => tracing::warn!(
             target: "log.runtime",
             error = %e,
@@ -1004,6 +1032,44 @@ mod tests {
         assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
         assert_eq!(LogLevel::parse("trace "), Some(LogLevel::Trace));
         assert_eq!(LogLevel::parse("bogus"), None);
+    }
+
+    /// Build a `FilterController` backed by a reload handle, installed as
+    /// the thread-local default subscriber so the reload handle's `modify`
+    /// can upgrade its weak reference. The returned guard must outlive the
+    /// controller; the default is thread-scoped, so it does not collide
+    /// with the process-global subscriber other tests install.
+    fn test_controller(initial: &str) -> (FilterController, tracing::subscriber::DefaultGuard) {
+        let filter = EnvFilter::builder()
+            .with_regex(false)
+            .parse(initial)
+            .expect("valid initial filter");
+        let (layer, handle) = reload::Layer::new(filter);
+        let guard = tracing::subscriber::set_default(Registry::default().with(layer));
+        let controller = FilterController {
+            inner: handle,
+            current: Mutex::new(initial.to_string()),
+        };
+        (controller, guard)
+    }
+
+    #[test]
+    fn swap_reports_changed_then_noop() {
+        let (c, _guard) = test_controller("agent_of_empires=info");
+        let first = c.set_filter("agent_of_empires=debug").expect("swap ok");
+        assert!(
+            first.changed,
+            "first swap to a new directive must report changed"
+        );
+        assert_eq!(first.previous, "agent_of_empires=info");
+        assert_eq!(first.current, "agent_of_empires=debug");
+
+        // Re-applying the identical directive (the #1894 file-watch case)
+        // must be a silent no-op so callers do not log or persist.
+        let second = c.set_filter("agent_of_empires=debug").expect("swap ok");
+        assert!(!second.changed, "identical re-apply must report no-op");
+        assert_eq!(second.previous, second.current);
+        assert_eq!(c.current(), "agent_of_empires=debug");
     }
 
     #[test]
