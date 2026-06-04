@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "lint": "eslint . --max-warnings 6",
+    "lint": "eslint .",
     "preview": "vite preview",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
