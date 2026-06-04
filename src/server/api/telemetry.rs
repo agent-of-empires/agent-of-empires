@@ -185,7 +185,7 @@ pub async fn post_telemetry_cockpit_interaction(
             state
                 .telemetry_cockpit
                 .prompts_queued
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         other => {
             return (

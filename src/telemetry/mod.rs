@@ -853,7 +853,8 @@ mod tests {
                 usage_signals::zeroed(),
                 0,
                 None,
-                None
+                None,
+                &CockpitInteractionCounts::default()
             )
             .is_none(),
             "opted-out install must not build a snapshot"
@@ -969,6 +970,7 @@ mod tests {
             std::slice::from_ref(&inst),
             usage_signals::zeroed(),
             3,
+            &CockpitInteractionCounts::default(),
         );
 
         assert_eq!(snapshot.install_id, "test-install-id");
