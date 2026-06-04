@@ -8,7 +8,7 @@
 // (the server rejects writes to them).
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SchemaSection } from "../SchemaSection";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 
@@ -127,5 +127,138 @@ describe("SchemaSection contract", () => {
     expect(screen.queryByText("Extra volumes")).toBeNull();
     fireEvent.click(screen.getByText("Advanced"));
     expect(screen.getByText("Extra volumes")).toBeTruthy();
+  });
+});
+
+describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
+  it("renders a registered custom widget via its widget.id", () => {
+    render(
+      <SchemaSection
+        section="sound"
+        schema={[
+          descriptor({
+            section: "sound",
+            field: "mode",
+            label: "Mode",
+            widget: { kind: "custom", id: "sound-mode" },
+          }),
+        ]}
+        values={{ mode: "random" }}
+        onSaveField={vi.fn()}
+      />,
+    );
+    // SoundModeWidget renders a select with the Random/Specific options.
+    const select = screen.getByText("Mode").parentElement?.querySelector(
+      "select",
+    ) as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    expect(select.value).toBe("random");
+  });
+
+  it("shows a visible fallback for an unregistered custom widget", () => {
+    render(
+      <SchemaSection
+        section="sound"
+        schema={[
+          descriptor({
+            section: "sound",
+            field: "mystery",
+            label: "Mystery knob",
+            widget: { kind: "custom", id: "no-such-widget" },
+          }),
+        ]}
+        values={{}}
+        onSaveField={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/No web control registered/)).toBeTruthy();
+    expect(screen.getByText(/no-such-widget/)).toBeTruthy();
+  });
+
+  it("runs onAfterSave once after a successful save", async () => {
+    const onSaveField = vi.fn(() => true);
+    const onAfterSave = vi.fn();
+    const { container } = render(
+      <SchemaSection
+        section="acp"
+        schema={[
+          descriptor({
+            section: "acp",
+            field: "show_tool_durations",
+            label: "Show tool-call durations",
+            widget: { kind: "toggle" },
+          }),
+        ]}
+        values={{ show_tool_durations: false }}
+        onSaveField={onSaveField}
+        onAfterSave={onAfterSave}
+      />,
+    );
+    fireEvent.click(container.querySelector("button[role=switch]")!);
+    await waitFor(() =>
+      expect(onAfterSave).toHaveBeenCalledWith(
+        expect.objectContaining({ section: "acp", field: "show_tool_durations" }),
+        true,
+      ),
+    );
+  });
+
+  it("flags non-overridable (global-only) fields in their description", () => {
+    render(
+      <SchemaSection
+        section="web"
+        schema={[
+          descriptor({
+            section: "web",
+            field: "notify_on_idle",
+            label: "Notify on idle",
+            widget: { kind: "toggle" },
+            profile_overridable: false,
+          }),
+        ]}
+        values={{}}
+        onSaveField={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/Applies to all profiles/)).toBeTruthy();
+  });
+
+  it("rejects a malformed env entry and accepts a valid one (env_list)", () => {
+    const onSaveField = vi.fn();
+    render(
+      <SchemaSection
+        section="sandbox"
+        schema={[
+          descriptor({
+            field: "environment",
+            label: "Environment variables",
+            widget: { kind: "list" },
+            validation: { rule: "env_list" },
+          }),
+        ]}
+        values={{ environment: [] }}
+        onSaveField={onSaveField}
+      />,
+    );
+    const root = screen
+      .getByText("Environment variables")
+      .parentElement?.parentElement as HTMLElement;
+    const addBtn = screen
+      .getByText("Environment variables")
+      .parentElement?.querySelector("button") as HTMLButtonElement;
+    fireEvent.click(addBtn);
+    const input = root.querySelector('input[type="text"]') as HTMLInputElement;
+
+    // Invalid: leading digit. The validator blocks the commit.
+    fireEvent.change(input, { target: { value: "1bad" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSaveField).not.toHaveBeenCalled();
+
+    // Valid KEY=VALUE commits.
+    fireEvent.change(input, { target: { value: "FOO=bar" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSaveField).toHaveBeenCalledWith("sandbox", "environment", [
+      "FOO=bar",
+    ]);
   });
 });

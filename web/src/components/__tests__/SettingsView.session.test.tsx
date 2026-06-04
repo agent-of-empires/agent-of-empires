@@ -12,23 +12,36 @@ import * as api from "../../lib/api";
 
 const PROFILES = [{ name: "main", is_default: true }];
 
+// The session tab is schema-driven (#1692): auto_stop_idle_secs is a number
+// field built from this descriptor. The default-profile selector and the
+// acp_defaults JSON editor are non-schema rows rendered alongside it.
+const SESSION_SCHEMA = [
+  {
+    section: "session",
+    field: "auto_stop_idle_secs",
+    category: "Interaction",
+    label: "Auto-stop idle sessions (s)",
+    description: "",
+    widget: { kind: "number", min: 0 },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+];
+
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
     Promise.resolve({ session: {}, acp: {}, sandbox: {}, worktree: {} }),
   ),
+  getSettingsSchema: vi.fn(() => Promise.resolve(SESSION_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
 }));
-
-const SERVER_ABOUT = {
-  acp_show_tool_durations: true,
-  acp_queue_drain_mode: "combined" as const,
-  acp_max_concurrent_resumes: 4,
-};
 
 function numberInputByLabel(
   container: HTMLElement,

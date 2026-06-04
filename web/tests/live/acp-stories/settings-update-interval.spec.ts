@@ -21,7 +21,7 @@ base("update check-interval NumberField round-trips through the UI", async ({ pa
     await waitForSettingsLoaded(page);
     await openSettingsTab(page, "Updates");
 
-    const input = settingsNumberInputByLabel(page, "Check interval (hours)");
+    const input = settingsNumberInputByLabel(page, "Check Interval (hours)");
     await expect(input).toBeVisible({ timeout: 10_000 });
 
     await input.fill("12");
@@ -30,7 +30,7 @@ base("update check-interval NumberField round-trips through the UI", async ({ pa
     await page.reload();
     await waitForSettingsLoaded(page);
     await openSettingsTab(page, "Updates");
-    const reloaded = settingsNumberInputByLabel(page, "Check interval (hours)");
+    const reloaded = settingsNumberInputByLabel(page, "Check Interval (hours)");
     await expect(reloaded).toHaveValue("12", { timeout: 10_000 });
   } finally {
     await serve.stop();

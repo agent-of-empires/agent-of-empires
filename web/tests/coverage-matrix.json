@@ -122,7 +122,7 @@
       ],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/ThemeSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -222,42 +222,32 @@
       ],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/ElevationPrompt.tsx",
         "web/src/lib/fetchInterceptor.ts"
       ]
     },
     {
-      "id": "settings.sound-payload",
+      "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/settings/__tests__/SoundSettings.test.tsx"
+        "src/components/settings/__tests__/customWidgets.test.tsx"
       ],
       "components": [
-        "web/src/components/settings/SoundSettings.tsx"
+        "web/src/components/settings/customWidgets.tsx"
       ]
     },
     {
-      "id": "settings.update-payload",
-      "kind": "vitest",
+      "id": "settings.schema-persistence",
+      "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "src/components/settings/__tests__/UpdateSettings.test.tsx"
+        "tests/live/settings-persistence-schema.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/UpdateSettings.tsx"
-      ]
-    },
-    {
-      "id": "settings.tmux-payload",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/TmuxSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/TmuxSettings.tsx"
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -279,15 +269,6 @@
       "components": [
         "web/src/components/SettingsView.tsx"
       ]
-    },
-    {
-      "id": "settings.theme-payload",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/ThemeSettings.test.tsx"
-      ],
-      "components": []
     },
     {
       "id": "settings.sidebar-tui-grouping",
@@ -334,7 +315,7 @@
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/FormFields.tsx",
-        "web/src/components/settings/LoggingSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -347,18 +328,6 @@
       "components": [
         "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/FormFields.tsx"
-      ]
-    },
-    {
-      "id": "settings.logging-payload",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/LoggingSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/LoggingSettings.tsx",
         "web/src/components/settings/FormFields.tsx"
       ]
     },
@@ -1799,7 +1768,7 @@
         "tests/live/acp-stories/settings-tmux-select.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/TmuxSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/settings/FormFields.tsx"
       ]
     },
@@ -1811,7 +1780,7 @@
         "tests/live/acp-stories/settings-tmux-mouse.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/TmuxSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -2209,7 +2178,7 @@
         "tests/live/acp-stories/settings-theme-select.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -2220,7 +2189,7 @@
         "tests/live/acp-stories/settings-theme-custom.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/lib/theme.ts"
       ]
     },
@@ -2232,7 +2201,7 @@
         "tests/live/acp-stories/settings-theme-custom-malformed.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -2243,7 +2212,7 @@
         "tests/live/acp-stories/settings-theme-color-mode.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/hooks/useResolvedTheme.ts"
       ]
     },
@@ -2255,7 +2224,7 @@
         "tests/live/acp-stories/settings-theme-failure-revert.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/hooks/useResolvedTheme.ts"
       ]
@@ -2268,7 +2237,7 @@
         "tests/live/acp-stories/settings-logging-level.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/LoggingSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -2279,7 +2248,7 @@
         "tests/live/acp-stories/settings-update-interval.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/UpdateSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
@@ -2290,7 +2259,7 @@
         "tests/live/acp-stories/settings-sound-toggle.spec.ts"
       ],
       "components": [
-        "web/src/components/settings/SoundSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {

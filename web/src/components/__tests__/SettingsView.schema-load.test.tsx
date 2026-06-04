@@ -42,12 +42,6 @@ vi.mock("../../lib/api", () => ({
   deleteProfile: vi.fn(() => Promise.resolve(true)),
 }));
 
-const SERVER_ABOUT = {
-  acp_show_tool_durations: true,
-  acp_queue_drain_mode: "combined" as const,
-  acp_max_concurrent_resumes: 4,
-};
-
 function renderView(tab: string) {
   return render(
     <SettingsView

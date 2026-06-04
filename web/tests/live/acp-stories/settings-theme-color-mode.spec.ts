@@ -44,7 +44,7 @@ base("color-mode change PATCHes but does not dispatch theme-picker-changed", asy
       timeout: 10_000,
     });
 
-    const colorMode = settingsSelectByLabel(page, "Color mode");
+    const colorMode = settingsSelectByLabel(page, "Color Mode");
     await expect(colorMode).toBeVisible({ timeout: 10_000 });
 
     // useResolvedTheme fires aoe:theme-changed once on mount when its

@@ -83,7 +83,7 @@ test("worktree, structured-view, and logging advanced folds expand in the browse
     // "Bare Repo Template") rather than the old hand-written web copy.
     { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
     { tab: "structured-view", anchor: "Show tool-call durations", field: /^Replay buffer bytes$/ },
-    { tab: "logging", anchor: "Default level", field: /^Output$/ },
+    { tab: "logging", anchor: "Default level", field: /^Output \(restart req\.\)$/ },
   ];
 
   for (const { tab, anchor, field } of cases) {

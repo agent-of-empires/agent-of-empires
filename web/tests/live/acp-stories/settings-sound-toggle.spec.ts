@@ -21,7 +21,7 @@ base("sound enabled toggle round-trips through the UI", async ({ page }, testInf
     // description text and walk up to the wrapper, then grab the
     // switch button.
     const toggle = page
-      .getByText("Play sounds on session status changes")
+      .getByText("Play sounds on agent state transitions")
       .locator(
         'xpath=ancestor::div[contains(@class, "flex") and contains(@class, "items-center") and contains(@class, "justify-between")][1]',
       )
@@ -36,7 +36,7 @@ base("sound enabled toggle round-trips through the UI", async ({ page }, testInf
     await page.reload();
     await openSettingsTab(page, "Sound");
     const reloaded = page
-      .getByText("Play sounds on session status changes")
+      .getByText("Play sounds on agent state transitions")
       .locator(
         'xpath=ancestor::div[contains(@class, "flex") and contains(@class, "items-center") and contains(@class, "justify-between")][1]',
       )
