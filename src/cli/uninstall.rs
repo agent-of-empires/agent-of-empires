@@ -45,9 +45,9 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
 
-    // Collect all possible data directory locations. The legacy home-dotfile
-    // path is always included so an install that upgraded but never re-launched
-    // (and thus never migrated) is still cleaned up.
+    // Collect all possible data directory locations. The home-dotfile path is
+    // always included (it is the macOS default and the pre-XDG Linux location),
+    // alongside the XDG path, so either layout is cleaned up.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let data_dirs = {
         let mut dirs = vec![home_dir.join(".agent-of-empires")];
