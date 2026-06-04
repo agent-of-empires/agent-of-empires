@@ -7319,7 +7319,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
         let _guard = KillTmuxOnDrop(session_name.clone());
-        let launch = format!("cat {}; sleep 300", pane_file.to_string_lossy());
+        // Single-quote the path so a temp dir with spaces or shell
+        // metacharacters (e.g. macOS `$TMPDIR`) can't break the launch
+        // command; embedded single quotes are closed/escaped/reopened.
+        let quoted_pane_file =
+            format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let launch = format!("cat {quoted_pane_file}; sleep 300");
         let created = std::process::Command::new("tmux")
             .args([
                 "new-session",
