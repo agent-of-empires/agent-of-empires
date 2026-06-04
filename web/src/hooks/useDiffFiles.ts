@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getSessionDiffFiles } from "../lib/api";
+import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
 import type { RepoBase, RichDiffFile } from "../lib/types";
 
 const POLL_INTERVAL = 10_000;
@@ -31,6 +31,9 @@ export function useDiffFiles(
   const lastFingerprintRef = useRef("");
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const requestIdRef = useRef(0);
+  // Session the `diff_panel` usage signal last fired for, so opening the panel
+  // reports once per session rather than on every 10s poll tick or re-render.
+  const diffPanelSeenForRef = useRef<string | null>(null);
 
   const fetchFiles = useCallback(async () => {
     if (!sessionId) return;
@@ -74,6 +77,12 @@ export function useDiffFiles(
       intervalRef.current = null;
     }
     if (enabled && sessionId) {
+      // The diff panel is open for this session: report a feature-usage signal
+      // once per session activation (deduped by sessionId), not per poll tick.
+      if (diffPanelSeenForRef.current !== sessionId) {
+        diffPanelSeenForRef.current = sessionId;
+        reportTelemetrySeen("diff_panel");
+      }
       intervalRef.current = setInterval(() => void fetchFiles(), POLL_INTERVAL);
     }
     return () => {

@@ -11,6 +11,7 @@ import type {
   ResumeOutputMessage,
 } from "../lib/types";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
+import { reportTelemetrySeen } from "../lib/api";
 import { getToken } from "../lib/token";
 import { useWebSettings } from "./useWebSettings";
 import { TerminalTiming } from "../lib/terminalTiming";
@@ -223,6 +224,10 @@ export function useTerminal(
   // ws.close() on a CLOSED socket is a no-op, which was the bug behind
   // the dead Retry button after retries exhausted. See #1009.
   const connectRef = useRef<(() => void) | null>(null);
+  // Fire the `web_terminal` usage signal once per hook lifetime, not on every
+  // reconnect: ws.onopen runs again after a WiFi blip, and the telemetry intent
+  // is "this terminal was opened", not "the socket reconnected N times".
+  const telemetrySeenRef = useRef(false);
   // Reverse pointer so the `online` / `pageshow` listeners installed
   // inside the connect-effect can call manualReconnect (defined below
   // the effect) without re-running the effect itself.
@@ -641,6 +646,10 @@ export function useTerminal(
           readyState: ws.readyState,
           protocol: ws.protocol,
         });
+        if (!telemetrySeenRef.current) {
+          telemetrySeenRef.current = true;
+          reportTelemetrySeen("web_terminal");
+        }
         // Reset the dedup baseline so the first resize on a fresh
         // connection always reaches the server, even if it matches
         // the size we last sent on the previous (now-closed) socket.

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
 import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
+import { reportTelemetrySeen } from "../../../lib/api";
 
 interface Props {
   sessionId: string;
@@ -82,6 +83,9 @@ export function SendCommentsDialog({
         }
         return;
       }
+      // Count each successful diff-comments send (a low-frequency action, so a
+      // count is more useful than a boolean). Only on a confirmed 2xx.
+      reportTelemetrySeen("diff_comments");
       onSent();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Network error";
