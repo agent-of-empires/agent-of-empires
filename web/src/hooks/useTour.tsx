@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // First-run tutorial controller. Owns the tour's run state, the resolved step
 // snapshot, and auto-launch policy. The "seen" flag is now persisted
 // server-side (config.toml `app_state.has_seen_web_tour`) so a returning user

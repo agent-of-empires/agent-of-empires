@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";

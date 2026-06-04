@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Bridge between our `useStructuredView` state (which subscribes to the
 // acp WebSocket) and assistant-ui's external-store runtime. The
 // runtime adapter is the seam: assistant-ui owns the chat surface

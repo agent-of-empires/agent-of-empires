@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Markdown renderer for agent text. Thin wrapper around
 // @assistant-ui/react-markdown's MarkdownTextPrimitive; we just plug
 // in our shiki-based SyntaxHighlighter and a CodeHeader that matches

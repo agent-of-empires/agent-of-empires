@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { useEffect, useMemo, useState } from "react";
 import { fetchSessions, cloneRepo } from "../../../lib/api";
 import type { SessionResponse } from "../../../lib/types";

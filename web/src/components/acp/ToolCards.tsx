@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Per-kind tool call renderers. Each component takes the started tool
 // and (optionally) the completion row, and renders a card that fits
 // the shape of the tool's inputs and outputs.

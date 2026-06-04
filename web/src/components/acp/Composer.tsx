@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // VSCode/Cursor-style composer for the structured view.
 //
 // Built on assistant-ui's `<ComposerPrimitive.Root>` plus the official

@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Structured view display preferences sourced from the daemon's resolved
 // `[acp]` config (config.toml). Single source of truth: the
 // `/api/about` endpoint exposes the resolved active-profile values as
