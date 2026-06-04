@@ -15,13 +15,8 @@ import {
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField, TextField } from "./settings/FormFields";
-import { ThemeSettings } from "./settings/ThemeSettings";
 import { DiffSettings } from "./settings/DiffSettings";
-import { SoundSettings } from "./settings/SoundSettings";
-import { UpdateSettings } from "./settings/UpdateSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
-import { TmuxSettings } from "./settings/TmuxSettings";
-import { LoggingSettings } from "./settings/LoggingSettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
 
 type TabId =
@@ -424,19 +419,55 @@ export function SettingsView({
         );
 
       case "theme":
-        return <ThemeSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+        return (
+          <SchemaSection
+            section="theme"
+            schema={schema}
+            values={(settings?.theme ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+          />
+        );
       case "diff":
         return <DiffSettings />;
       case "sound":
-        return <SoundSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+        return (
+          <SchemaSection
+            section="sound"
+            schema={schema}
+            values={(settings?.sound ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+          />
+        );
       case "tmux":
-        return <TmuxSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+        return (
+          <SchemaSection
+            section="tmux"
+            schema={schema}
+            values={(settings?.tmux ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+          />
+        );
       case "updates":
-        return <UpdateSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+        return (
+          <SchemaSection
+            section="updates"
+            schema={schema}
+            values={(settings?.updates ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+          />
+        );
       case "telemetry":
         return <TelemetrySettings />;
       case "logging":
-        return <LoggingSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+        return (
+          <SchemaSection
+            section="logging"
+            schema={schema}
+            values={(settings?.logging ?? {}) as Record<string, unknown>}
+            onSaveField={saveSubField}
+            advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
+          />
+        );
 
       case "notifications":
         return (
