@@ -54,7 +54,7 @@ base("add a project from the Projects view", async ({ page }, testInfo) => {
     await page.getByRole("button", { name: "+ Add project" }).click();
     await page.getByPlaceholder("/path/to/repo").fill(projectPath);
     await page
-      .getByPlaceholder("auto-detect (e.g. main, develop)")
+      .getByPlaceholder("inherit global default, else auto-detect")
       .fill("develop");
     await page.getByRole("button", { name: "Add", exact: true }).click();
 
