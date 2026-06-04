@@ -317,9 +317,9 @@ export function SettingsView({
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 
-    // Shared guard for every schema-driven tab: one spinner while the schema
-    // loads, one retry on failure.
-    if (SCHEMA_BACKED_TABS.has(activeTab)) {
+    // The spinner/retry shown in place of a SchemaSection while the schema
+    // loads or after it fails. Returns null once the schema is ready.
+    const schemaGuard = () => {
       if (schemaLoading) {
         return <div className="text-sm text-text-dim">Loading settings schema...</div>;
       }
@@ -337,6 +337,20 @@ export function SettingsView({
           </div>
         );
       }
+      return null;
+    };
+
+    // Pure schema tabs (whole body is one SchemaSection) short-circuit on the
+    // guard. Mixed tabs (session, notifications) render their non-schema rows
+    // regardless and guard only the SchemaSection slot, so a slow or failed
+    // schema fetch never hides the default-profile selector or the push block.
+    if (
+      SCHEMA_BACKED_TABS.has(activeTab) &&
+      activeTab !== "session" &&
+      activeTab !== "notifications"
+    ) {
+      const guard = schemaGuard();
+      if (guard) return guard;
     }
 
     switch (activeTab) {
@@ -354,14 +368,18 @@ export function SettingsView({
             />
             {/* acp_defaults (Structured View Defaults) is now schema-driven via
                 the acp-defaults custom widget, so it renders inside this
-                SchemaSection alongside the rest of the session fields. */}
-            <SchemaSection
-              section="session"
-              schema={schema}
-              values={session}
-              onSaveField={saveSubField}
-              advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
-            />
+                SchemaSection alongside the rest of the session fields. The
+                guard covers only the schema rows; the selector above always
+                shows. */}
+            {schemaGuard() ?? (
+              <SchemaSection
+                section="session"
+                schema={schema}
+                values={session}
+                onSaveField={saveSubField}
+                advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
+              />
+            )}
           </div>
         );
 
@@ -441,23 +459,25 @@ export function SettingsView({
       case "notifications":
         return (
           <div className="space-y-6">
+            {/* Browser-push controls render regardless of schema state. */}
             <NotificationSettings />
-            {settings && (
-              <div className="space-y-4">
-                <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">
-                  Server Defaults
-                </h4>
-                <p className="text-xs text-text-dim">
-                  Controls which session events trigger push notifications on the server.
-                </p>
-                <SchemaSection
-                  section="web"
-                  schema={schema}
-                  values={web}
-                  onSaveField={saveSubField}
-                />
-              </div>
-            )}
+            <div className="space-y-4">
+              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">
+                Server Defaults
+              </h4>
+              <p className="text-xs text-text-dim">
+                Controls which session events trigger push notifications on the server.
+              </p>
+              {schemaGuard() ??
+                (settings && (
+                  <SchemaSection
+                    section="web"
+                    schema={schema}
+                    values={web}
+                    onSaveField={saveSubField}
+                  />
+                ))}
+            </div>
           </div>
         );
 
