@@ -8,7 +8,7 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-REPO="njbrake/agent-of-empires"
+REPO="agent-of-empires/agent-of-empires"
 BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
 
 echo "Fetching sha256 hashes for v${VERSION}..."

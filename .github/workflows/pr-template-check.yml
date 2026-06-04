@@ -12,7 +12,13 @@ on:
 
 jobs:
   check-template:
-    if: github.event_name == 'pull_request_target' && github.actor != 'dependabot[bot]'
+    # Key the skip on the PR author, not github.actor. The actor is whoever
+    # triggered the event; on an `edited` event fired by a maintainer or
+    # another bot the actor is the editor, so a github.actor guard would let
+    # the check run against Dependabot's templateless body. Matches the
+    # close-stale job and the nix-npm-hash escape hatch, which both key on
+    # pull_request.user.login.
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -50,7 +56,18 @@ jobs:
               body.includes('<!-- nix-npm-hash:') &&
               body.includes('## Checklist');
 
-            const hasChecklist = hasAllTemplateSections || isNixNpmHashBotPr;
+            // Escape hatch for the weekly release-staging PR
+            // (`.github/workflows/open-release-pr.yml`), whose body is a
+            // version bump plus changelog, not the contributor template.
+            // It carries a `<!-- release-version: -->` marker; gate on
+            // actor login = github-actions[bot] so a human PR cannot opt
+            // out by pasting the marker into its body.
+            const isReleaseStagingBotPr =
+              actor === 'github-actions[bot]' &&
+              body.includes('<!-- release-version:');
+
+            const hasChecklist =
+              hasAllTemplateSections || isNixNpmHashBotPr || isReleaseStagingBotPr;
 
             const prNumber = context.payload.pull_request.number;
             const labelName = 'missing-template';
@@ -162,6 +179,15 @@ jobs:
               // Skip Dependabot PRs
               if (pr.user?.login === 'dependabot[bot]') {
                 console.log(`Skipping Dependabot PR #${pr.number}`);
+                continue;
+              }
+
+              // Skip the weekly release-staging PR; its body is exempt
+              // from the template check above, so it should never be
+              // closed for missing it.
+              if (pr.user?.login === 'github-actions[bot]' &&
+                  (pr.body || '').includes('<!-- release-version:')) {
+                console.log(`Skipping release-staging PR #${pr.number}`);
                 continue;
               }
 

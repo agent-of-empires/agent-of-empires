@@ -1,1 +1,45 @@
-* @njbrake
+# CODEOWNERS - merge gating for agent-of-empires/agent-of-empires
+#
+# Last-match-wins semantics. Pair with branch protection / ruleset on `main`:
+#   - Require PR before merging
+#   - Require status checks (CI) to pass
+#   - Require signed commits
+#   - Require review from Code Owners
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: njbrake reviews everything not otherwise scoped
+*                                       @njbrake
+
+# Structured view and web dashboard - acp team can self-route, njbrake co-owns
+/web/                                   @agent-of-empires/acp @njbrake
+/src/server/acp_reconciler.rs       @agent-of-empires/acp @njbrake
+/src/server/acp_ws.rs               @agent-of-empires/acp @njbrake
+/src/server/api/acp.rs              @agent-of-empires/acp @njbrake
+/src/tui/structured_view/                  @agent-of-empires/acp @njbrake
+
+# Security-sensitive surface area - njbrake only
+/src/server/auth.rs                     @njbrake
+/src/server/login.rs                    @njbrake
+/src/server/rate_limit.rs               @njbrake
+/src/server/tunnel.rs                   @njbrake
+/src/server/push.rs                     @njbrake
+/src/server/push_send.rs                @njbrake
+
+# Architecture and data-safety critical - njbrake only
+/src/migrations/                        @njbrake
+/src/session/storage.rs                 @njbrake
+/src/tmux/                              @njbrake
+
+# Supply chain, build, release - njbrake only
+/Cargo.toml                             @njbrake
+/Cargo.lock                             @njbrake
+/scripts/                               @njbrake
+/.github/                               @njbrake
+/flake.nix                              @njbrake
+/flake.lock                             @njbrake
+
+# Repo governance - njbrake only
+/AGENTS.md                              @njbrake
+/CLAUDE.md                              @njbrake
+/DESIGN.md                              @njbrake

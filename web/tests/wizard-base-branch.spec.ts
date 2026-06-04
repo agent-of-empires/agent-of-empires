@@ -99,8 +99,15 @@ async function openWizardOnSessionStep(page: Page) {
   await nextBtn.click();
 }
 
+// #1514 folds the worktree controls (including the Base branch picker)
+// behind a top-level "Advanced" disclosure that defaults closed. Expand
+// it before reaching the base-branch picker.
+async function expandAdvanced(page: Page) {
+  await page.getByRole("button", { name: "Advanced" }).click();
+}
+
 test.describe("Wizard base branch (#948)", () => {
-  test("Advanced section is collapsed by default on the session step", async ({ page }) => {
+  test("Base branch section is collapsed by default on the session step", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -108,8 +115,9 @@ test.describe("Wizard base branch (#948)", () => {
     await openWizardOnSessionStep(page);
     // Session step renders "Name your session" as the heading.
     await expect(page.getByText("Name your session")).toBeVisible();
+    await expandAdvanced(page);
     // Worktree toggle is on by default; if a previous test left it
-    // off, click to re-enable so the Advanced section renders.
+    // off, click to re-enable so the Base branch section renders.
     // `#969` added a second toggle ("Attach to existing branch") on this
     // step, so target the worktree toggle by its accessible name.
     const toggle = page.getByRole("switch", { name: /Create a worktree/ });
@@ -117,12 +125,12 @@ test.describe("Wizard base branch (#948)", () => {
       await toggle.click();
     }
     await expect(
-      page.getByRole("button", { name: /Advanced/i }),
+      page.getByRole("button", { name: "Base branch" }),
     ).toBeVisible();
     await expect(page.getByLabel("Base branch")).toHaveCount(0);
   });
 
-  test("expanding Advanced fetches branches with include_remote=true", async ({
+  test("expanding Base branch fetches branches with include_remote=true", async ({
     page,
   }) => {
     await mockApis(page);
@@ -142,7 +150,8 @@ test.describe("Wizard base branch (#948)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWizardOnSessionStep(page);
-    await page.getByRole("button", { name: /Advanced/i }).click();
+    await expandAdvanced(page);
+    await page.getByRole("button", { name: "Base branch" }).click();
     await expect(page.getByLabel("Base branch")).toBeVisible();
     await expect.poll(() => capturedUrl?.searchParams.get("include_remote")).toBe(
       "true",
@@ -164,7 +173,8 @@ test.describe("Wizard base branch (#948)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWizardOnSessionStep(page);
-    await page.getByRole("button", { name: /Advanced/i }).click();
+    await expandAdvanced(page);
+    await page.getByRole("button", { name: "Base branch" }).click();
     const baseInput = page.getByLabel("Base branch");
     await baseInput.click();
     const option = page.getByRole("option", { name: /release-1\.2/ });

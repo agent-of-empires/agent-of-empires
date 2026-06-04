@@ -3,11 +3,12 @@ import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 
 // In-diff comments end-to-end (#928).
-// - Cockpit-only feature: a non-cockpit session must not show the
+// - Structured view-only feature: a non-structured view session must not show the
 //   `+` gutter button or the banner.
 // - Click `+` to comment on a single line; save; card renders.
 // - Open the send dialog, edit intro, send; comments clear; POST
-//   reaches /cockpit/prompt with the assembled body.
+//   reaches /acp/prompt/diff-comments with the structured body
+//   (intro/outro/comments/isMultiRepo/assembledMarkdown). See #1123.
 // - Comments persist to localStorage and reload back into the UI.
 
 const FILE_PATH = "src/example.ts";
@@ -55,13 +56,13 @@ const DIFF_FILE_RESPONSE = {
 };
 
 interface SetupOpts {
-  cockpitMode?: boolean;
-  cockpitWorkerState?: "absent" | "resuming" | "running";
+  structuredView?: boolean;
+  acpWorkerState?: "absent" | "resuming" | "running";
 }
 
 async function setup(page: Page, opts: SetupOpts = {}) {
-  const cockpitMode = opts.cockpitMode ?? true;
-  const cockpitWorkerState = opts.cockpitWorkerState ?? "running";
+  const structuredView = opts.structuredView ?? true;
+  const acpWorkerState = opts.acpWorkerState ?? "running";
   await page.route("**/api/login/status", (r) =>
     r.fulfill({ json: { required: false, authenticated: true } }),
   );
@@ -107,8 +108,8 @@ async function setup(page: Page, opts: SetupOpts = {}) {
             has_terminal: true,
             profile: "default",
             workspace_repos: [],
-            cockpit_mode: cockpitMode,
-            cockpit_worker_state: cockpitWorkerState,
+            view: structuredView ? "structured" : "terminal",
+            acp_worker_state: acpWorkerState,
             claude_fullscreen: false,
           },
         ],
@@ -128,11 +129,11 @@ async function setup(page: Page, opts: SetupOpts = {}) {
   await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) =>
     r.fulfill({ json: DIFF_FILE_RESPONSE }),
   );
-  // Cockpit panel endpoints — content irrelevant for these tests.
-  await page.route("**/api/sessions/*/cockpit/**", (r) =>
+  // Structured view panel endpoints — content irrelevant for these tests.
+  await page.route("**/api/sessions/*/acp/**", (r) =>
     r.fulfill({ json: {} }),
   );
-  await page.routeWebSocket(/\/sessions\/.*\/(ws|cockpit-ws)$/, () => {
+  await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {
     // No-op: we don't need a working stream for diff comment tests.
   });
 }
@@ -229,14 +230,36 @@ test.describe("Diff comments (#928)", () => {
     await expect(page.getByText("nit").first()).toBeVisible();
   });
 
-  test("send dialog POSTs to /cockpit/prompt and clears comments on success", async ({
+  test("send dialog POSTs structured body to /acp/prompt/diff-comments and clears comments on success", async ({
     page,
   }) => {
     await setup(page);
-    let captured: { text?: string } | null = null;
-    await page.route("**/api/sessions/*/cockpit/prompt", (r) => {
-      captured = JSON.parse(r.request().postData() || "{}");
-      return r.fulfill({ json: {} });
+    interface CapturedBody {
+      intro?: string;
+      outro?: string;
+      isMultiRepo?: boolean;
+      comments?: Array<{ body?: string }>;
+      assembledMarkdown?: string;
+    }
+    let captured: CapturedBody | null = null;
+    await page.route(
+      "**/api/sessions/*/acp/prompt/diff-comments",
+      (r) => {
+        captured = JSON.parse(r.request().postData() || "{}");
+        return r.fulfill({ json: {} });
+      },
+    );
+    // Capture the usage-signal pings so we can assert `diff_comments` fires
+    // on a confirmed send (#1881).
+    const seenSignals: string[] = [];
+    await page.route("**/api/telemetry/seen", (r) => {
+      try {
+        const body = JSON.parse(r.request().postData() || "{}");
+        if (typeof body.surface === "string") seenSignals.push(body.surface);
+      } catch {
+        // Ignore unparseable bodies.
+      }
+      return r.fulfill({ status: 204, body: "" });
     });
     await openSessionAndFile(page);
     await startSingleLineComment(page, "new", 3);
@@ -251,17 +274,29 @@ test.describe("Diff comments (#928)", () => {
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
     // Confirm send (dialog's own Send button is the last one in the DOM).
     await page.getByRole("button", { name: /^Send$/ }).last().click();
-    await expect.poll(() => captured?.text).toBeTruthy();
-    expect(captured?.text).toContain("Hey:");
-    expect(captured?.text).toContain("## Diff comments");
-    expect(captured?.text).toContain("rename");
-    expect(captured?.text).toContain("Please address these comments.");
+    await expect.poll(() => captured?.assembledMarkdown).toBeTruthy();
+    // Structured fields the transcript card renders from.
+    expect(captured?.intro).toBe("Hey:");
+    expect(captured?.outro).toBe("Please address these comments.");
+    expect(captured?.isMultiRepo).toBe(false);
+    expect(captured?.comments).toHaveLength(1);
+    expect(captured?.comments?.[0]?.body).toContain("rename");
+    // assembledMarkdown is the agent-visible body, no base64 sentinel.
+    expect(captured?.assembledMarkdown).toContain("Hey:");
+    expect(captured?.assembledMarkdown).toContain("## Diff comments");
+    expect(captured?.assembledMarkdown).toContain("rename");
+    expect(captured?.assembledMarkdown).toContain(
+      "Please address these comments.",
+    );
+    expect(captured?.assembledMarkdown).not.toContain("aoe:diff-comments");
     // Banner cleared.
     await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
+    // The confirmed send fired the diff_comments usage signal (#1881).
+    await expect.poll(() => seenSignals).toContain("diff_comments");
   });
 
-  test("hides feature for non-cockpit sessions", async ({ page }) => {
-    await setup(page, { cockpitMode: false });
+  test("hides feature for non-structured view sessions", async ({ page }) => {
+    await setup(page, { structuredView: false });
     await openSessionAndFile(page);
     // `+` button shouldn't render for tmux sessions.
     await expect(
@@ -270,7 +305,7 @@ test.describe("Diff comments (#928)", () => {
   });
 
   test("send button disabled when worker not running", async ({ page }) => {
-    await setup(page, { cockpitMode: true, cockpitWorkerState: "absent" });
+    await setup(page, { structuredView: true, acpWorkerState: "absent" });
     await openSessionAndFile(page);
     await startSingleLineComment(page, "new", 3);
     await page

@@ -14,11 +14,11 @@ A shared 60-second post-send cooldown per session prevents rapid re-buzzing when
 
 Each session also has per-session overrides that beat the server-wide defaults: you can enable `Idle` notifications only on the one long-running session you care about, for example, without flooding yourself every time any session finishes.
 
-The fourth event type comes from cockpit sessions and runs on its own rules:
+The fourth event type comes from structured view sessions and runs on its own rules:
 
-- **Cockpit approval**, a cockpit-driven agent emits an `ApprovalRequested` event because a tool needs your permission. Fires immediately (no dwell), tag `cockpit-approval-<session>`, and **bypasses** the TUI/web-active suppression below. Even when the dashboard or TUI is foregrounded the approval still routes through web push: the service worker forwards focused clients to an in-app toast instead of an OS banner so you still get an audible/visual cue. The cockpit also plays a browser-side chime keyed off `[sound] on_approval`; see [Sound effects](sounds.md). The corresponding `Waiting` status push is suppressed while the approval is unresolved, so you do not get a second OS banner for the same underlying event.
+- **Structured view approval**, a structured view-driven agent emits an `ApprovalRequested` event because a tool needs your permission. Fires immediately (no dwell), tag `acp-approval-<session>`, and **bypasses** the TUI/web-active suppression below. Even when the dashboard or TUI is foregrounded the approval still routes through web push: the service worker forwards focused clients to an in-app toast instead of an OS banner so you still get an audible/visual cue. The structured view also plays a browser-side chime keyed off `[sound] on_approval`; see [Sound effects](sounds.md). The corresponding `Waiting` status push is suppressed while the approval is unresolved, so you do not get a second OS banner for the same underlying event.
 
-Status notifications are suppressed when you're already looking at aoe (cockpit approvals ignore this list):
+Status notifications are suppressed when you're already looking at aoe (structured view approvals ignore this list):
 
 - **Dashboard focused (per-device):** if the PWA browser tab is visible and focused, that device skips the OS notification and shows an in-app toast instead.
 - **TUI active (all devices):** if the `aoe` TUI is running on the same machine as the server, all push notifications to all devices are suppressed. The TUI writes a heartbeat file (`$app_dir/tui.active`) every 10 seconds; the push consumer skips delivery when the file was modified within the last 30 seconds.

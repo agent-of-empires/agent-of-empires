@@ -71,6 +71,14 @@ pub struct ProjectAddArgs {
     /// scopes hold the same path, the profile entry shadows the global one.
     #[arg(long)]
     allow_override: bool,
+
+    /// Default base branch for new worktree branches created against this
+    /// project, whether it is the launch repo or an extra repo in a multi-repo
+    /// workspace. An explicit session base wins; when omitted, falls back to
+    /// the global/profile `worktree.default_base_branch`, then the repo's
+    /// detected default branch.
+    #[arg(long = "base-branch")]
+    base_branch: Option<String>,
 }
 
 #[derive(Args)]
@@ -91,6 +99,8 @@ struct ProjectInfo {
     name: String,
     path: String,
     scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_base_branch: Option<String>,
 }
 
 #[tracing::instrument(target = "cli.project", skip_all, fields(profile = %profile, profile_explicit))]
@@ -124,6 +134,7 @@ async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
                 name: p.name.clone(),
                 path: p.path.clone(),
                 scope: p.scope.as_str().to_string(),
+                default_base_branch: p.default_base_branch.clone(),
             })
             .collect();
         super::output::print_json(&info)?;
@@ -139,6 +150,9 @@ async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
     println!("Projects:\n");
     for p in &entries {
         println!("  • {} [{}]  {}", p.name, p.scope.as_str(), p.path);
+        if let Some(base) = &p.default_base_branch {
+            println!("      base branch: {base}");
+        }
     }
     let n = entries.len();
     println!(
@@ -176,7 +190,8 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
             .unwrap_or_else(|| "project".to_string())
     });
 
-    let project = Project::new(name.clone(), canonical.to_string_lossy(), scope);
+    let project = Project::new(name.clone(), canonical.to_string_lossy(), scope)
+        .with_base_branch(args.base_branch);
     let saved = projects::add(profile, scope, project, args.allow_override)?;
     println!(
         "✓ Registered project '{}' [{}] at {}",
@@ -184,6 +199,9 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         scope.as_str(),
         saved.path
     );
+    if let Some(base) = &saved.default_base_branch {
+        println!("  Default base branch: {base}");
+    }
     Ok(())
 }
 

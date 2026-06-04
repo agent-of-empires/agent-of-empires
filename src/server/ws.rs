@@ -31,6 +31,32 @@ const CLOSE_CODE_PTY_DEAD: u16 = 4001;
 /// a transient transport error and skip its reconnect backoff for one
 /// cycle. See #1198.
 const CLOSE_CODE_GOING_AWAY: u16 = 1001;
+
+/// WebSocket close code 1011 ("internal server error"). Sent on the
+/// OS-level early-return paths in `handle_terminal_ws` (openpty,
+/// attach-session spawn, PTY reader/writer clone). Browser falls through
+/// to its standard retry ladder with a parseable reason. Beats the
+/// opaque 1006 that early `return;` would otherwise produce. See #1455.
+const CLOSE_CODE_INTERNAL_ERROR: u16 = 1011;
+
+/// WebSocket close code 1013 ("try again later"). Sent when the tmux
+/// pane is not ready within the bounded readiness window. Browser
+/// retries on the fast-start ladder. Distinct from 1011 (internal
+/// server fault) and 4001 (permanently dead pane) so logs separate
+/// transient warm-up from genuine failure. See #1455.
+const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// Total time we'll spend waiting for the tmux session + pane to be
+/// attachable before giving up and closing 1013. 2s covers tmux warm-up
+/// across the slow machines we've seen reports from while staying short
+/// enough that a truly dead pane doesn't hold the upgrade open for the
+/// user. See #1455.
+const TMUX_READY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Poll interval for the readiness wait. 50ms gives ~40 probes inside
+/// the 2s window; each probe shells out to `tmux has-session` and (if
+/// that passes) `tmux list-panes`, which is cheap.
+const TMUX_READY_POLL: Duration = Duration::from_millis(50);
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -367,7 +393,7 @@ type SessionPrimaries = Arc<RwLock<std::collections::HashMap<String, String>>>;
 type SessionPauseCounts = Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>;
 
 async fn handle_terminal_ws(
-    socket: WebSocket,
+    mut socket: WebSocket,
     tmux_name: String,
     read_only: bool,
     primaries: SessionPrimaries,
@@ -391,6 +417,40 @@ async fn handle_terminal_ws(
         "ws upgrade complete, starting PTY relay"
     );
 
+    // Wait for tmux session + at least one live pane to be attachable
+    // before spawning `tmux attach-session`. Closes the race where the
+    // browser dialed in fractions of a second after the session was
+    // created and the attach raced the tmux daemon's pane bookkeeping.
+    // The `terminal_ws` (agent main) route lacks an analog of
+    // `respawn_paired_if_dead`, so without this poll a fresh `aoe serve`
+    // would let the first attach exit with PTY EOF, the send task would
+    // close 4001 (pty_dead), and the client would burn its retry budget
+    // on a session that was about to become healthy. See #1455.
+    match wait_for_tmux_ready(&tmux_name).await {
+        PaneReadiness::Ready => {}
+        PaneReadiness::Dead => {
+            warn!(
+                target: "terminal.ws",
+                client = %client_id,
+                tmux = %tmux_name,
+                "all panes reported dead during readiness wait, closing 4001"
+            );
+            close_early(&mut socket, CLOSE_CODE_PTY_DEAD, "pty_dead").await;
+            return;
+        }
+        PaneReadiness::NotReady => {
+            warn!(
+                target: "terminal.ws",
+                client = %client_id,
+                tmux = %tmux_name,
+                timeout_ms = TMUX_READY_TIMEOUT.as_millis() as u64,
+                "tmux not ready within bounded wait, closing 1013"
+            );
+            close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "tmux_not_ready").await;
+            return;
+        }
+    }
+
     // Spawn tmux attach inside a PTY
     let pty_system = NativePtySystem::default();
     let pair = match pty_system.openpty(PtySize {
@@ -407,6 +467,7 @@ async fn handle_terminal_ws(
                 tmux = %tmux_name,
                 "openpty failed, aborting ws: {}", e
             );
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "openpty_failed").await;
             return;
         }
     };
@@ -426,6 +487,12 @@ async fn handle_terminal_ws(
                 tmux = %tmux_name,
                 "spawn tmux attach-session failed: {}", e
             );
+            close_early(
+                &mut socket,
+                CLOSE_CODE_INTERNAL_ERROR,
+                "attach_spawn_failed",
+            )
+            .await;
             return;
         }
     };
@@ -455,6 +522,7 @@ async fn handle_terminal_ws(
             );
             let _ = child.kill();
             let _ = child.wait();
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "pty_reader_failed").await;
             return;
         }
     };
@@ -470,6 +538,7 @@ async fn handle_terminal_ws(
             );
             let _ = child.kill();
             let _ = child.wait();
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "pty_writer_failed").await;
             return;
         }
     };
@@ -816,6 +885,10 @@ async fn handle_terminal_ws(
                     .await;
                 }
                 Message::Text(text) => {
+                    // Stamp arrival before parse so a timing_ping can report
+                    // the server's own parse-to-enqueue cost. Cheap, and text
+                    // control frames are rare (not per-keystroke).
+                    let text_recv = Instant::now();
                     // JSON control messages (resize, activate) are always allowed
                     if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
                         match control {
@@ -930,6 +1003,22 @@ async fn handle_terminal_ws(
                                     &this_ws_paused_for_recv,
                                 )
                                 .await;
+                            }
+                            ControlMessage::TimingPing { seq, client_t } => {
+                                // Bounce straight back over the control
+                                // channel. Never touches the PTY, never
+                                // logs (a sub-second cadence would flood the
+                                // log). server_busy_us captures parse +
+                                // dispatch + serialize on this task.
+                                let pong = TimingPong {
+                                    kind: "timing_pong",
+                                    seq,
+                                    client_t,
+                                    server_busy_us: text_recv.elapsed().as_micros() as u64,
+                                };
+                                if let Ok(text) = serde_json::to_string(&pong) {
+                                    let _ = ctrl_tx_for_recv.send(text).await;
+                                }
                             }
                         }
                     } else if !read_only {
@@ -1171,6 +1260,103 @@ async fn resize_pty(
     .await;
 }
 
+/// Send a Close frame on an early-return path that hasn't split the
+/// socket yet. The `let _ = ` discards send errors: if the peer is
+/// already gone the close frame is moot, and we're returning anyway.
+async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+/// Outcome of one tmux-readiness probe. `Ready` lets the caller proceed
+/// to `tmux attach-session`; `NotReady` means try again after the poll
+/// interval; `Dead` short-circuits the wait when every pane is reported
+/// dead (no point in polling further).
+#[derive(Debug, PartialEq, Eq)]
+enum PaneReadiness {
+    Ready,
+    NotReady,
+    Dead,
+}
+
+/// Parse `tmux list-panes -F "#{pane_dead}"` output: one line per pane,
+/// each line `0` (alive) or `1` (dead). Empty output means the session
+/// exists but has no panes yet (not ready). All-dead means the pane has
+/// permanently exited.
+fn parse_pane_dead_output(output: &str) -> PaneReadiness {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return PaneReadiness::NotReady;
+    }
+    if lines.contains(&"0") {
+        PaneReadiness::Ready
+    } else {
+        PaneReadiness::Dead
+    }
+}
+
+/// Poll `tmux has-session` + `tmux list-panes` at TMUX_READY_POLL until
+/// the session has at least one alive pane, or until TMUX_READY_TIMEOUT
+/// expires. Returns the final outcome so the caller can distinguish a
+/// transient warm-up (`NotReady` -> retryable 1013) from a permanently
+/// dead pane (`Dead` -> 4001 short-circuit). Bails out early on `Dead`
+/// rather than polling further because no amount of waiting will make
+/// an exited pane reattachable.
+async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
+    let deadline = Instant::now() + TMUX_READY_TIMEOUT;
+    loop {
+        match probe_tmux_readiness(tmux_name).await {
+            PaneReadiness::Ready => return PaneReadiness::Ready,
+            PaneReadiness::Dead => return PaneReadiness::Dead,
+            PaneReadiness::NotReady => {
+                if Instant::now() >= deadline {
+                    return PaneReadiness::NotReady;
+                }
+                tokio::time::sleep(TMUX_READY_POLL).await;
+            }
+        }
+    }
+}
+
+/// One probe iteration: `tmux has-session` then (on success) `tmux
+/// list-panes -F "#{pane_dead}"`. Both shell out to the tmux binary;
+/// they're cheap (microseconds in the happy path) so the 50ms poll
+/// floor dominates wall time, not subprocess overhead.
+async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
+    let name = tmux_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let has_session = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &name])
+            .output();
+        let has_session_ok = match has_session {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        };
+        if !has_session_ok {
+            return PaneReadiness::NotReady;
+        }
+        let panes = std::process::Command::new("tmux")
+            .args(["list-panes", "-t", &name, "-F", "#{pane_dead}"])
+            .output();
+        match panes {
+            Ok(o) if o.status.success() => {
+                parse_pane_dead_output(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => PaneReadiness::NotReady,
+        }
+    })
+    .await
+    .unwrap_or(PaneReadiness::NotReady)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum ControlMessage {
@@ -1194,6 +1380,27 @@ enum ControlMessage {
     /// `pause_output`. SIGCONT to a non-stopped process is a no-op.
     #[serde(rename = "resume_output")]
     ResumeOutput,
+    /// Latency probe from the web terminal under `?debug=terminal-timing`.
+    /// Bounced straight back as a `timing_pong` over the control channel,
+    /// never reaching the PTY. `client_t` is an opaque client timestamp
+    /// echoed unchanged so the browser can compute the round trip. The
+    /// variant is always parseable but only exercised by debug clients, so
+    /// normal sessions pay nothing beyond one extra serde tag. See #1453.
+    #[serde(rename = "timing_ping")]
+    TimingPing { seq: u64, client_t: f64 },
+}
+
+/// Server reply to a [`ControlMessage::TimingPing`]. `server_busy_us` is
+/// this handler's own parse-to-enqueue duration, so the client can
+/// subtract it from the observed round trip to isolate network plus
+/// WebSocket transit without any client/server clock sync. See #1453.
+#[derive(serde::Serialize)]
+struct TimingPong {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u64,
+    client_t: f64,
+    server_busy_us: u64,
 }
 
 #[cfg(test)]
@@ -1267,6 +1474,66 @@ mod tests {
         let p = make_primaries();
         release_primary(&p, "session-1", "ws-0").await;
         assert!(p.read().await.is_empty());
+    }
+
+    #[test]
+    fn parse_pane_dead_empty_is_not_ready() {
+        // `list-panes` succeeded but the session has no panes yet
+        // (transient state during tmux session creation).
+        assert_eq!(parse_pane_dead_output(""), PaneReadiness::NotReady);
+        assert_eq!(parse_pane_dead_output("   \n\n  "), PaneReadiness::NotReady);
+    }
+
+    #[test]
+    fn parse_pane_dead_single_alive_is_ready() {
+        assert_eq!(parse_pane_dead_output("0\n"), PaneReadiness::Ready);
+        assert_eq!(parse_pane_dead_output("0"), PaneReadiness::Ready);
+    }
+
+    #[test]
+    fn parse_pane_dead_single_dead_is_dead() {
+        assert_eq!(parse_pane_dead_output("1\n"), PaneReadiness::Dead);
+    }
+
+    #[test]
+    fn parse_pane_dead_mixed_is_ready() {
+        // One alive pane is enough; tmux attach finds the alive one.
+        assert_eq!(parse_pane_dead_output("1\n0\n"), PaneReadiness::Ready);
+        assert_eq!(parse_pane_dead_output("0\n1\n1\n"), PaneReadiness::Ready);
+    }
+
+    #[test]
+    fn parse_pane_dead_all_dead_is_dead() {
+        assert_eq!(parse_pane_dead_output("1\n1\n1\n"), PaneReadiness::Dead);
+    }
+
+    #[test]
+    fn timing_ping_deserializes() {
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"timing_ping","seq":7,"client_t":1234.5}"#).unwrap();
+        match msg {
+            ControlMessage::TimingPing { seq, client_t } => {
+                assert_eq!(seq, 7);
+                assert_eq!(client_t, 1234.5);
+            }
+            _ => panic!("expected TimingPing"),
+        }
+    }
+
+    #[test]
+    fn timing_pong_serializes_with_type_tag() {
+        let pong = TimingPong {
+            kind: "timing_pong",
+            seq: 7,
+            client_t: 1234.5,
+            server_busy_us: 42,
+        };
+        let json = serde_json::to_string(&pong).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "timing_pong");
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["client_t"], 1234.5);
+        assert_eq!(parsed["server_busy_us"], 42);
     }
 
     #[tokio::test]

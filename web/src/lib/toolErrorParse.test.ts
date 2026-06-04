@@ -1,5 +1,5 @@
 // Tests for the `<tool_use_error>` wrapper-parser used by every per-kind
-// cockpit tool card's error body. See issue #1090.
+// structured view tool card's error body. See issue #1090.
 
 import { describe, expect, it } from "vitest";
 

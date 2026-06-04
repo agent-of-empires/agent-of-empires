@@ -26,13 +26,44 @@ const ONE_WEEK: u32 = 7 * 24 * 60;
 
 pub struct SnoozeDurationDialog {
     title: String,
+    /// Hit rect per preset row, paired with the minutes it submits.
+    /// Captured during `render` so a click on a row produces the same
+    /// Submit as the matching digit key.
+    row_rects: Vec<(u32, Rect)>,
+    /// Hover-tracked row index. Drives the row highlight without
+    /// changing semantics: a row hover doesn't itself submit, only a
+    /// click on the row does.
+    hovered_row: Option<usize>,
 }
 
 impl SnoozeDurationDialog {
     pub fn new(session_title: &str) -> Self {
         Self {
             title: session_title.to_string(),
+            row_rects: Vec::new(),
+            hovered_row: None,
         }
+    }
+
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<u32>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        self.row_rects
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(minutes, _)| DialogResult::Submit(*minutes))
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let pos = ratatui::layout::Position::from((col, row));
+        let new_hover = self
+            .row_rects
+            .iter()
+            .position(|(_, rect)| rect.contains(pos));
+        if self.hovered_row == new_hover {
+            return false;
+        }
+        self.hovered_row = new_hover;
+        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<u32> {
@@ -50,7 +81,8 @@ impl SnoozeDurationDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.row_rects.clear();
         let dialog_area = super::centered_rect(area, 52, 14);
         frame.render_widget(Clear, dialog_area);
 
@@ -93,22 +125,33 @@ impl SnoozeDurationDialog {
 
         let key_style = Style::default().fg(theme.waiting).bold();
         let text_style = Style::default().fg(theme.text);
-        let row = |k: &'static str, label: &'static str| {
-            Paragraph::new(Line::from(vec![
+        let hover_text_style = Style::default().fg(theme.accent).bold();
+        let presets: &[(u32, &str, &str, usize)] = &[
+            (ONE_HOUR, "1", "1 hour", 2),
+            (TWO_HOURS, "2", "2 hours", 3),
+            (THREE_HOURS, "3", "3 hours", 4),
+            (FOUR_HOURS, "4", "4 hours", 5),
+            (FIVE_HOURS, "5", "5 hours", 6),
+            (SIX_HOURS, "6", "6 hours", 7),
+            (ONE_DAY, "8", "24 hours (1 day)", 8),
+            (ONE_WEEK, "0", "1 week", 9),
+        ];
+        for (idx, (minutes, k, label, ci)) in presets.iter().enumerate() {
+            let area = chunks[*ci];
+            let label_style = if self.hovered_row == Some(idx) {
+                hover_text_style
+            } else {
+                text_style
+            };
+            let line = Paragraph::new(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("[{}]", k), key_style),
                 Span::raw("  "),
-                Span::styled(label, text_style),
-            ]))
-        };
-        frame.render_widget(row("1", "1 hour"), chunks[2]);
-        frame.render_widget(row("2", "2 hours"), chunks[3]);
-        frame.render_widget(row("3", "3 hours"), chunks[4]);
-        frame.render_widget(row("4", "4 hours"), chunks[5]);
-        frame.render_widget(row("5", "5 hours"), chunks[6]);
-        frame.render_widget(row("6", "6 hours"), chunks[7]);
-        frame.render_widget(row("8", "24 hours (1 day)"), chunks[8]);
-        frame.render_widget(row("0", "1 week"), chunks[9]);
+                Span::styled(*label, label_style),
+            ]));
+            frame.render_widget(line, area);
+            self.row_rects.push((*minutes, area));
+        }
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "aoe-settings-derive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Derive macro emitting settings FieldDescriptors from Config sub-structs (#1692)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"

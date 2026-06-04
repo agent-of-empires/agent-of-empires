@@ -52,6 +52,10 @@ pub struct HookEvent {
     pub matcher: Option<&'static str>,
     /// AoE status to write when this event fires (`"running"`, `"idle"`, `"waiting"`).
     pub status: Option<&'static str>,
+    /// When `true`, install an additional hook command that extracts
+    /// `session_id` from the agent's stdin JSON payload and writes it to
+    /// `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`.
+    pub session_id_capture: bool,
 }
 
 /// Configuration for installing status-detection hooks into an agent's settings file.
@@ -103,32 +107,85 @@ pub struct AgentDef {
     pub install_hint: &'static str,
 }
 
-/// Hook events shared by Claude Code and Cursor CLI.
-const CLAUDE_CURSOR_HOOK_EVENTS: &[HookEvent] = &[
+/// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
+/// `session_id_capture: true` so the per-instance sidecar
+/// (`/tmp/aoe-hooks/<id>/session_id`) is updated whenever Claude rotates
+/// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
+/// `claude_poll_fn` reads this sidecar before falling back to its disk
+/// scan.
+const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "SessionStart",
+        matcher: None,
+        status: None,
+        session_id_capture: true,
+    },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
+        session_id_capture: true,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
+    },
+];
+
+/// Cursor CLI hook events. No `session_id_capture`: Cursor's session id is
+/// not consumed by AoE pollers, and Cursor's hook payload uses a different
+/// schema, so installing the capture command would do useless work on every
+/// `UserPromptSubmit`.
+const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "PreToolUse",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "UserPromptSubmit",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Stop",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Notification",
+        matcher: Some("permission_prompt|elicitation_dialog"),
+        status: Some("waiting"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "ElicitationResult",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
     },
 ];
 
@@ -141,26 +198,31 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
     },
 ];
 
@@ -171,31 +233,37 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         name: "SessionStart",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some("waiting"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
 ];
 
@@ -212,7 +280,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CLAUDE_CONFIG_DIR", "/root/.claude")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".claude/settings.json",
-            events: CLAUDE_CURSOR_HOOK_EVENTS,
+            events: CLAUDE_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
@@ -295,21 +363,25 @@ pub const AGENTS: &[AgentDef] = &[
                     name: "BeforeTool",
                     matcher: None,
                     status: Some("running"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some("running"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some("idle"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some("waiting"),
+                    session_id_capture: false,
                 },
             ],
         }),
@@ -330,7 +402,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".cursor/settings.json",
-            events: CLAUDE_CURSOR_HOOK_EVENTS,
+            events: CURSOR_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,

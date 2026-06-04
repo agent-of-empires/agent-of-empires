@@ -33,6 +33,17 @@ function commitNumber(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
+// The sink & rotation fields now live inside a default-collapsed "Advanced"
+// CollapsibleSection, so they are absent from the DOM until the fold is
+// expanded. Click the fold trigger (the only button carrying aria-expanded)
+// before reaching for those fields.
+function expandAdvanced(container: HTMLElement) {
+  const trigger = container.querySelector(
+    "button[aria-expanded]",
+  ) as HTMLButtonElement;
+  fireEvent.click(trigger);
+}
+
 function findSelectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
   const labels = container.querySelectorAll("label");
   for (const l of labels) {
@@ -74,10 +85,10 @@ describe("LoggingSettings contract", () => {
 
   it("per-target select adds a new key to logging.targets", () => {
     const { onSaveField, container } = mount({ default_level: "info" });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "trace" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
-      "cockpit.acp": "trace",
+      "acp.protocol": "trace",
     });
   });
 
@@ -86,28 +97,36 @@ describe("LoggingSettings contract", () => {
       default_level: "info",
       targets: { "auth.token": "warn" },
     });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "debug" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
       "auth.token": "warn",
-      "cockpit.acp": "debug",
+      "acp.protocol": "debug",
     });
   });
 
   it("per-target select with empty value deletes the override", () => {
     const { onSaveField, container } = mount({
       default_level: "info",
-      targets: { "cockpit.acp": "trace", "auth.token": "warn" },
+      targets: { "acp.protocol": "trace", "auth.token": "warn" },
     });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
       "auth.token": "warn",
     });
   });
 
+  it("sink & rotation fields are hidden until the Advanced fold is expanded", () => {
+    const { container } = mount({});
+    expect(() => findSelectByLabel(container, "Output")).toThrow();
+    expandAdvanced(container);
+    expect(findSelectByLabel(container, "Output")).toBeTruthy();
+  });
+
   it("output select emits logging.output", () => {
     const { onSaveField, container } = mount({});
+    expandAdvanced(container);
     const select = findSelectByLabel(container, "Output");
     fireEvent.change(select, { target: { value: "stdout" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "output", "stdout");
@@ -115,6 +134,7 @@ describe("LoggingSettings contract", () => {
 
   it("file_path text commits on blur", () => {
     const { onSaveField, container } = mount({ file_path: "debug.log" });
+    expandAdvanced(container);
     // The TextField wraps an <input type=text>; the first such input in the
     // panel is the file_path field.
     const input = container.querySelector(
@@ -130,6 +150,7 @@ describe("LoggingSettings contract", () => {
 
   it("file_path falls back to 'debug.log' when blanked", () => {
     const { onSaveField, container } = mount({ file_path: "custom.log" });
+    expandAdvanced(container);
     const input = container.querySelector(
       "input[type=text]",
     ) as HTMLInputElement;
@@ -143,6 +164,7 @@ describe("LoggingSettings contract", () => {
 
   it("rotation select emits logging.rotation", () => {
     const { onSaveField, container } = mount({});
+    expandAdvanced(container);
     const select = findSelectByLabel(container, "Rotation");
     fireEvent.change(select, { target: { value: "never" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "rotation", "never");
@@ -150,6 +172,7 @@ describe("LoggingSettings contract", () => {
 
   it("max_size_mib commits a numeric value", () => {
     const { onSaveField, container } = mount({ max_size_mib: 50 });
+    expandAdvanced(container);
     const input = findNumberInputByLabel(container, "Max size (MiB)");
     commitNumber(input, "256");
     expect(onSaveField).toHaveBeenCalledWith("logging", "max_size_mib", 256);
@@ -157,6 +180,7 @@ describe("LoggingSettings contract", () => {
 
   it("keep_count commits a numeric value", () => {
     const { onSaveField, container } = mount({ keep_count: 5 });
+    expandAdvanced(container);
     const input = findNumberInputByLabel(container, "Keep count");
     commitNumber(input, "10");
     expect(onSaveField).toHaveBeenCalledWith("logging", "keep_count", 10);
@@ -164,6 +188,7 @@ describe("LoggingSettings contract", () => {
 
   it("show_spans toggle emits logging.show_spans", () => {
     const { onSaveField, container } = mount({ show_spans: false });
+    expandAdvanced(container);
     const toggle = container.querySelector(
       "button[role=switch]",
     ) as HTMLButtonElement;

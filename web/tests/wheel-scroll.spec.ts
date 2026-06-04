@@ -42,7 +42,7 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     // resize/activate on connect). Until readyState is OPEN, sendWheel
     // silently drops messages.
     await expect
-      .poll(() => handle.wsMessages.length, { timeout: 5_000 })
+      .poll(() => handle.wsMessages.length, { timeout: 10_000 })
       .toBeGreaterThan(0);
   }
 
@@ -69,6 +69,33 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     );
   }
 
+  // Re-fire the wheel burst on every poll tick until the expected side
+  // effect lands. A single synthetic burst can arrive in a transient
+  // not-ready window (renderer init / socket-open timing under heavy CI
+  // parallelism), where the custom wheel handler never forwards it and the
+  // SGR bytes are silently dropped. Polling only the observation can't
+  // recover from a dropped burst, so it would wait out the full timeout and
+  // fail with "Received: 0". Re-firing recovers as soon as the handler is
+  // live. Only sound for monotonic effects: the wheel direction is fixed, so
+  // extra bursts can only push the observed value further past the threshold,
+  // never back across it.
+  async function fireUntil(
+    page: Page,
+    opts: { deltaY: number; ctrlKey?: boolean; times?: number },
+    predicate: () => boolean | Promise<boolean>,
+    timeout = 10_000,
+  ) {
+    await expect
+      .poll(
+        async () => {
+          await fireWheel(page, opts);
+          return await predicate();
+        },
+        { timeout },
+      )
+      .toBe(true);
+  }
+
   test("scroll down sends SGR wheel-down escape sequences", async ({
     page,
   }) => {
@@ -83,13 +110,11 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     // deltaY > 0 = scroll down. Fire enough events to exceed pxPerWheel
     // threshold (fontSize 14 * LINES_PER_WHEEL 2 = 28px per wheel tick).
     // deltaY=120 is a typical single mouse wheel notch on most browsers.
-    await fireWheel(page, { deltaY: 120, times: 3 });
-
-    // WebSocket message delivery from page to Playwright handler is async;
-    // poll briefly so the assertion doesn't race the message capture.
-    await expect
-      .poll(() => countSeq(handle, WHEEL_DOWN_SEQ), { timeout: 2_000 })
-      .toBeGreaterThan(0);
+    await fireUntil(
+      page,
+      { deltaY: 120, times: 3 },
+      () => countSeq(handle, WHEEL_DOWN_SEQ) > 0,
+    );
     expect(countSeq(handle, WHEEL_UP_SEQ)).toBe(0);
   });
 
@@ -103,11 +128,11 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     handle.wsMessages.length = 0;
 
     // deltaY < 0 = scroll up
-    await fireWheel(page, { deltaY: -120, times: 3 });
-
-    await expect
-      .poll(() => countSeq(handle, WHEEL_UP_SEQ), { timeout: 2_000 })
-      .toBeGreaterThan(0);
+    await fireUntil(
+      page,
+      { deltaY: -120, times: 3 },
+      () => countSeq(handle, WHEEL_UP_SEQ) > 0,
+    );
     expect(countSeq(handle, WHEEL_DOWN_SEQ)).toBe(0);
   });
 
@@ -150,19 +175,20 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     await openSession(page, handle);
     handle.wsMessages.length = 0;
 
-    // Ctrl+wheel should zoom, not scroll
-    await fireWheel(page, { deltaY: -60, ctrlKey: true, times: 2 });
-
-    await expect
-      .poll(
-        () =>
-          page.evaluate(() => {
-            const raw = localStorage.getItem("aoe-web-settings");
-            return raw ? JSON.parse(raw).desktopFontSize : null;
-          }),
-        { timeout: 2_000 },
-      )
-      .toBeGreaterThan(14);
+    // Ctrl+wheel should zoom, not scroll. Re-fire until the zoom lands:
+    // extra ctrl+wheel bursts only zoom further in, never back, and never
+    // emit scroll sequences, so the scroll-count assertion below still holds.
+    await fireUntil(
+      page,
+      { deltaY: -60, ctrlKey: true, times: 2 },
+      async () => {
+        const size = await page.evaluate(() => {
+          const raw = localStorage.getItem("aoe-web-settings");
+          return raw ? JSON.parse(raw).desktopFontSize : null;
+        });
+        return typeof size === "number" && size > 14;
+      },
+    );
 
     // No SGR scroll sequences should have been sent
     const scrollCount =
@@ -190,19 +216,27 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
       page.getByRole("button", { name: "Back to live" }),
     ).toHaveCount(0);
 
-    await fireWheel(page, { deltaY: -120, times: 3 });
     const hasText = (needle: string) =>
       handle.wsMessages.some((m) => m.includes(Buffer.from(needle)));
 
-    await expect.poll(() => hasText('"type":"pause_output"')).toBe(true);
+    // Wheel-up enters scrollback (pause_output). Re-firing up only deepens
+    // scrollback, so the pause transition is monotonic and re-fire-safe.
+    await fireUntil(
+      page,
+      { deltaY: -120, times: 3 },
+      () => hasText('"type":"pause_output"'),
+    );
     expect(hasText('"type":"resume_output"')).toBe(false);
 
-    // Scroll back down enough wheel ticks to zero the depth. The client
-    // emitted N wheel-UPs; N wheel-DOWNs should be enough. (deltaY=120
-    // with fontSize 14 gives ~4 wheels per fireWheel call; use times: 5
-    // to overshoot and guarantee the transition.)
-    await fireWheel(page, { deltaY: 120, times: 5 });
-    await expect.poll(() => hasText('"type":"resume_output"')).toBe(true);
+    // Scroll back down to zero the depth; on desktop tmux auto-exits
+    // copy-mode and the client emits resume_output. Re-fire down until that
+    // lands: each burst drives depth toward 0 and stops at 0, so re-firing
+    // can only reach (never overshoot past) the resume transition.
+    await fireUntil(
+      page,
+      { deltaY: 120, times: 5 },
+      () => hasText('"type":"resume_output"'),
+    );
 
     // Still no button on desktop at any point.
     await expect(

@@ -282,7 +282,11 @@ mod tests {
         }
     }
 
+    // Pulls `hello-world` from a live registry, so it flakes on a transient
+    // pull failure or network hang in CI. Per the Docker-test convention,
+    // gate it behind `#[ignore]` so it only runs when explicitly requested.
     #[test]
+    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
     fn test_image_exists_locally_with_common_image() {
         for rt in [
             docker_if_available(),
@@ -311,7 +315,10 @@ mod tests {
         }
     }
 
+    // Pulls `hello-world` from a live registry; same flake risk as
+    // `test_image_exists_locally_with_common_image`, so gate it the same way.
     #[test]
+    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
     fn test_ensure_image_uses_local_image() {
         for rt in [
             docker_if_available(),
@@ -358,6 +365,7 @@ mod tests {
         let rt = ContainerRuntime::podman();
         assert!(rt.base.supports_read_only_volumes);
         assert!(rt.base.supports_remove_volumes);
+        assert!(rt.base.supports_named_volumes);
         assert_eq!(rt.base.remove_subcommand, "rm");
         assert_eq!(rt.base.pull_prefix, &["pull"]);
     }

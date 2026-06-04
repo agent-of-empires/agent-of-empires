@@ -118,6 +118,14 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
+    // Drag tests rely on the sidebar starting in manual sort mode (the
+    // default). If a future change flips the default to last-activity,
+    // the drag affordance disappears and these tests break in confusing
+    // ways. Assert the toggle's state up front so the failure mode is
+    // obvious. See #1418.
+    await expect(
+      page.locator("[data-testid='sidebar-sort-toggle']"),
+    ).toHaveAttribute("data-sort-mode", "manual");
     await expect
       .poll(() => readWorkspaceOrder(page), { timeout: 8000 })
       .toEqual(["old-ws", "new-ws"]);

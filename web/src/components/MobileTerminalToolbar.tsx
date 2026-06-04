@@ -44,17 +44,16 @@ function extractClipboardText(cd: DataTransfer | null): string {
 interface Props {
   sendData: (data: string) => void;
   termRef: RefObject<Terminal | null>;
-  keyboardHeight: number;
+  keyboardOpen: boolean;
   /**
-   * Latched keyboard reservation from useMobileKeyboard. When > 0 the
-   * parent (TerminalView) is permanently padding the layout for the
-   * keyboard, so the strip should not add its own env() fallback (which
-   * would oscillate with live keyboardHeight and resize the terminal
-   * container by py-1.5's 6px on every show/hide). Optional: PairedTerminal
-   * doesn't apply the sticky reservation, so it omits this and the strip
-   * falls back to the env() behavior.
+   * Set when the parent already pads its layout by the live keyboard
+   * occlusion (TerminalView). The strip then sits above the keyboard on its
+   * own and must not add an env() inset, which would double-count and shift
+   * the strip on every keyboard cycle. Optional: PairedTerminal (RightPanel)
+   * does not pad for the keyboard, so it omits this and the strip falls back
+   * to env(keyboard-inset-height) to lift itself above the keyboard.
    */
-  reservedKeyboardHeight?: number;
+  parentHandlesKeyboardInset?: boolean;
   ctrlActive: boolean;
   onCtrlToggle: () => void;
 }
@@ -67,8 +66,8 @@ const ARROW_RIGHT = "\x1b[C";
 export function MobileTerminalToolbar({
   sendData,
   termRef,
-  keyboardHeight,
-  reservedKeyboardHeight = 0,
+  keyboardOpen,
+  parentHandlesKeyboardInset = false,
   ctrlActive,
   onCtrlToggle,
 }: Props) {
@@ -109,21 +108,15 @@ export function MobileTerminalToolbar({
   const strip =
     "shrink-0 flex items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
 
-  // Parent (TerminalView) reserves paddingBottom for the keyboard
-  // (sticky once any keyboard has opened), so once that has happened the
-  // strip naturally sits above it and we want padding-bottom: 0. When no
-  // reservation has ever latched (iPadOS floating keyboards don't shrink
-  // visualViewport), fall back to env(keyboard-inset-height) so the strip
-  // still lifts above the keyboard.
-  //
-  // We DON'T toggle on live keyboardHeight: that would flip the strip's
-  // padding by py-1.5's 6px on every soft-keyboard show/hide, which
-  // propagates into the terminal container and SIGWINCHes claude on
-  // every cycle. The reservation, by contrast, only changes once per
-  // session.
+  // Parent (TerminalView) pads its layout by the live keyboard occlusion, so
+  // the strip already sits above the keyboard and must not add its own inset.
+  // RightPanel's paired terminal does not pad for the keyboard, so it omits
+  // the flag and the strip falls back to env(keyboard-inset-height) to lift
+  // itself above the keyboard.
   const stripStyle = {
-    paddingBottom:
-      reservedKeyboardHeight > 0 ? "0" : "env(keyboard-inset-height, 0px)",
+    paddingBottom: parentHandlesKeyboardInset
+      ? "0"
+      : "env(keyboard-inset-height, 0px)",
   };
 
   const arrowHint = (axis: DragAxis) =>
@@ -233,7 +226,7 @@ export function MobileTerminalToolbar({
             activeEl instanceof HTMLTextAreaElement ||
             activeEl instanceof HTMLInputElement;
 
-          if (keyboardHeight > 0 && activeIsEditable) {
+          if (keyboardOpen && activeIsEditable) {
             let recovered = "";
             const onPaste: EventListener = (e: Event) => {
               recovered = extractClipboardText(

@@ -50,7 +50,7 @@ use super::AppState;
 pub(crate) const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Step-up elevation window. Required for high-risk operations
-/// (terminal attach, cockpit command execution, file writes,
+/// (terminal attach, structured view command execution, file writes,
 /// destructive session ops). See #1131.
 const ELEVATION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
@@ -542,7 +542,7 @@ pub struct ElevateRequest {
 ///
 /// Re-verifies the passphrase against the configured hash and, on
 /// success, sets the calling session's elevation window. Sensitive
-/// routes (terminal attach, cockpit command execution, file writes)
+/// routes (terminal attach, structured view command execution, file writes)
 /// gate on the resulting `is_elevated` flag in the auth middleware.
 /// Already requires a valid token, login session cookie, and device
 /// binding by the time the handler runs (the middleware enforces all

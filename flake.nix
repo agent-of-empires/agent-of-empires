@@ -58,7 +58,7 @@
 
                 Supports Claude Code, OpenCode, Mistral Vibe, Codex CLI, and Gemini CLI.
               '';
-              homepage = "https://github.com/njbrake/agent-of-empires";
+              homepage = "https://github.com/agent-of-empires/agent-of-empires";
               license = licenses.mit;
               platforms = platforms.unix;
               mainProgram = "aoe";
@@ -75,7 +75,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-RTL/3DccMZODLr9lMZdQfoMFtK2ZsARFMABh4SUV4xI=";
+            npmDepsHash = "sha256-EaRBjJLUWHUhM/gkErP8yHK+qF7hgY/8N4NQ1i5JNJc=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

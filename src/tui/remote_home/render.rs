@@ -26,7 +26,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeSt
 fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
     let spans = vec![
         Span::styled(
-            " Remote cockpit · ",
+            " Remote agent sessions · ",
             Style::default()
                 .fg(theme.title)
                 .add_modifier(Modifier::BOLD),
@@ -53,14 +53,14 @@ fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeS
         return;
     }
     if state.loading && state.sessions.is_empty() {
-        let para = Paragraph::new("loading remote cockpit sessions…")
-            .style(Style::default().fg(theme.hint));
+        let para =
+            Paragraph::new("loading remote agent sessions…").style(Style::default().fg(theme.hint));
         frame.render_widget(para, area);
         return;
     }
     if state.sessions.is_empty() {
         let para = Paragraph::new(
-            "No cockpit sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nCockpit sessions are created via `aoe add --cockpit` on the host\n(or the web dashboard's New Session dialog).",
+            "No structured view sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nAcp sessions are created via `aoe add --structured-view` on the host\n(or the web dashboard's New Session dialog).",
         )
         .style(Style::default().fg(theme.hint));
         frame.render_widget(para, area);

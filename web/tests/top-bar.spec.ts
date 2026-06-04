@@ -42,8 +42,8 @@ test.describe("Top bar", () => {
     await page.getByRole("menuitem", { name: "About" }).click();
     await expect(page.getByRole("heading", { name: "Agent of Empires" })).toBeVisible();
     await expect(page.getByRole("link", { name: /agent-of-empires\.com/i })).toBeVisible();
-    await expect(page.getByRole("link", { name: /github\.com\/njbrake/i })).toBeVisible();
-    await expect(page.getByRole("link", { name: /@natebrake/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /github\.com\/agent-of-empires/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /@agentofempires/i })).toBeVisible();
   });
 
   test("About modal closes on Escape", async ({ page }) => {

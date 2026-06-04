@@ -20,6 +20,13 @@ const PAGES_DIR = join(__dirname, "..", "src", "pages");
 const PAGES = [
   // --- Guides (docs/guides/ → pages/guides/) ---
   {
+    source: "docs/guides/shell-completions.md",
+    dest: "guides/shell-completions.md",
+    title: "Shell Completions",
+    description:
+      "Install and refresh tab-completion for the aoe CLI in bash, zsh, fish, PowerShell, and elvish.",
+  },
+  {
     source: "docs/guides/diff-view.md",
     dest: "guides/diff-view.md",
     title: "Diff View",
@@ -62,6 +69,34 @@ const PAGES = [
       "Access your Agent of Empires sessions from your phone via Tailscale Funnel or Cloudflare Tunnel with QR pairing.",
   },
   {
+    source: "docs/guides/web/dashboard.md",
+    dest: "guides/web/dashboard.md",
+    title: "Dashboard & Workspaces",
+    description:
+      "The web dashboard layout: workspace sidebar, status glyphs, the session-creation wizard, command palette, sidebar sort, and triage.",
+  },
+  {
+    source: "docs/guides/web/terminal.md",
+    dest: "guides/web/terminal.md",
+    title: "Terminal View",
+    description:
+      "The browser agent and paired terminals: PTY relay, scrollback, reconnect behavior, WebSocket close codes, and read-only mode.",
+  },
+  {
+    source: "docs/guides/web/diff.md",
+    dest: "guides/web/diff.md",
+    title: "Web Diff View",
+    description:
+      "Review a session's changes from the browser: the flat / tree changed-files list, per-session base override, and inline review comments.",
+  },
+  {
+    source: "docs/guides/web/settings.md",
+    dest: "guides/web/settings.md",
+    title: "Settings & Profiles",
+    description:
+      "The web settings tabs, the profile picker, connected-device tracking, and the step-up elevation gate for persisted config edits.",
+  },
+  {
     source: "docs/guides/worktrees.md",
     dest: "guides/worktrees.md",
     title: "Worktrees Reference",
@@ -88,6 +123,20 @@ const PAGES = [
     title: "Multi-Repo Workspaces",
     description:
       "Drive a single Agent of Empires session across several git repositories with the project registry and multi-select pickers.",
+  },
+  {
+    source: "docs/guides/scratch-sessions.md",
+    dest: "guides/scratch-sessions.md",
+    title: "Scratch Sessions",
+    description:
+      "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
+  },
+  {
+    source: "docs/guides/live-mode.md",
+    dest: "guides/live-mode.md",
+    title: "Live Mode",
+    description:
+      "A feels-attached alternative to a full tmux attach: the dashboard stays visible while keystrokes relay to the agent. Covers the Ctrl+B leader menu, the collapsible sidebar, scrolling, and the exit chord.",
   },
 
   // --- Docs pages (docs/ → pages/docs/) ---
@@ -147,6 +196,13 @@ const PAGES = [
       "Weekly release cadence, automated staging PR, post-merge tagger, and emergency-release path for Agent of Empires maintainers.",
   },
   {
+    source: "docs/development/web-dashboard.md",
+    dest: "docs/development/web-dashboard.md",
+    title: "Web Dashboard Development",
+    description:
+      "Build the web dashboard from source, run the frontend dev workflow (cargo xtask dev and manual Vite + VITE_PROXY), and the server architecture.",
+  },
+  {
     source: "docs/sounds.md",
     dest: "docs/sounds.md",
     title: "Sound Effects",
@@ -158,7 +214,7 @@ const PAGES = [
     dest: "docs/push-notifications.md",
     title: "Push Notifications",
     description:
-      "Browser and PWA push notifications for Agent of Empires session status changes and cockpit approvals.",
+      "Browser and PWA push notifications for Agent of Empires session status changes and structured view approvals.",
   },
   {
     source: "docs/features.md",
@@ -166,6 +222,13 @@ const PAGES = [
     title: "Features",
     description:
       "Canonical inventory of every Agent of Empires feature, grouped by surface and capability, with links to each guide.",
+  },
+  {
+    source: "docs/github-integration.md",
+    dest: "docs/github-integration.md",
+    title: "GitHub Integration",
+    description:
+      "How Agent of Empires resolves a GitHub token, the per-failure hints it shows, and what is deferred to follow-ups.",
   },
   {
     source: "docs/guides/podman.md",
@@ -196,18 +259,53 @@ const PAGES = [
       "Complete command-line reference for the aoe CLI tool.",
   },
   {
-    source: "docs/cockpit.md",
-    dest: "docs/cockpit.md",
-    title: "Cockpit (Native Agent Rendering)",
+    source: "docs/structured-view.md",
+    dest: "docs/structured-view.md",
+    title: "Structured View (Web Dashboard)",
     description:
-      "Mobile-first native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
+      "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
-    source: "docs/cockpit/multi-agent.md",
-    dest: "docs/cockpit/multi-agent.md",
-    title: "Cockpit Multi-Agent Support",
+    source: "docs/structured-view/multi-agent.md",
+    dest: "docs/structured-view/multi-agent.md",
+    title: "Structured View Multi-Agent Support",
     description:
-      "Per-agent cockpit feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
+      "Per-agent feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
+  },
+  {
+    source: "docs/structured-view/setup.md",
+    dest: "docs/structured-view/setup.md",
+    title: "Structured View Setup",
+    description:
+      "Confirm prerequisites with aoe acp doctor, pick structured view or terminal view per session, attach across machines, and drive it from the CLI.",
+  },
+  {
+    source: "docs/structured-view/interface.md",
+    dest: "docs/structured-view/interface.md",
+    title: "Structured View Interface",
+    description:
+      "The TUI and web structured views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
+  },
+  {
+    source: "docs/structured-view/controls.md",
+    dest: "docs/structured-view/controls.md",
+    title: "Structured View Modes, Approvals & Model Controls",
+    description:
+      "Permission modes, YOLO and bypassPermissions, approval cards and notifications, plus the model and reasoning-effort selectors.",
+  },
+  {
+    source: "docs/structured-view/persistence.md",
+    dest: "docs/structured-view/persistence.md",
+    title: "Structured View Persistence & Recovery",
+    description:
+      "How agent workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
+  },
+  {
+    source: "docs/structured-view/troubleshooting.md",
+    dest: "docs/structured-view/troubleshooting.md",
+    title: "Structured View Troubleshooting",
+    description:
+      "The structured view security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
   },
   {
     source: "docs/guides/tool-sessions.md",
@@ -223,6 +321,13 @@ const PAGES = [
     description:
       "REST endpoints for driving Agent of Empires sessions from external orchestrators.",
   },
+  {
+    source: "docs/telemetry.md",
+    dest: "docs/telemetry.md",
+    title: "Telemetry",
+    description:
+      "How Agent of Empires' anonymous, opt-in usage telemetry works: what is and isn't collected, the DO_NOT_TRACK override, and how to enable or disable it.",
+  },
 ];
 
 // Every known docs path → website URL, used for link rewriting.
@@ -234,34 +339,49 @@ const URL_MAP = {
   "docs/sounds.md": "/docs/sounds/",
   "docs/push-notifications.md": "/docs/push-notifications/",
   "docs/features.md": "/docs/features/",
+  "docs/github-integration.md": "/docs/github-integration/",
   "docs/development.md": "/docs/development/",
   "docs/development/adding-agents.md": "/docs/development/adding-agents/",
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
   "docs/development/releases.md": "/docs/development/releases/",
+  "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
-  "docs/cockpit.md": "/docs/cockpit/",
-  "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
+  "docs/structured-view.md": "/docs/structured-view/",
+  "docs/structured-view/multi-agent.md": "/docs/structured-view/multi-agent/",
+  "docs/structured-view/setup.md": "/docs/structured-view/setup/",
+  "docs/structured-view/interface.md": "/docs/structured-view/interface/",
+  "docs/structured-view/controls.md": "/docs/structured-view/controls/",
+  "docs/structured-view/persistence.md": "/docs/structured-view/persistence/",
+  "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
   "docs/api.md": "/docs/api/",
+  "docs/telemetry.md": "/docs/telemetry/",
   // Guides
+  "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
+  "docs/guides/web/dashboard.md": "/guides/web/dashboard/",
+  "docs/guides/web/terminal.md": "/guides/web/terminal/",
+  "docs/guides/web/diff.md": "/guides/web/diff/",
+  "docs/guides/web/settings.md": "/guides/web/settings/",
   "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
   "docs/guides/worktrees.md": "/guides/worktrees/",
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",
   "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
+  "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
+  "docs/guides/live-mode.md": "/guides/live-mode/",
   "docs/guides/tool-sessions.md": "/guides/tool-sessions/",
   "docs/guides/podman.md": "/guides/podman/",
   "docs/guides/apple-containers.md": "/guides/apple-containers/",
 };
 
 const GITHUB_BASE =
-  "https://github.com/njbrake/agent-of-empires/blob/main/";
+  "https://github.com/agent-of-empires/agent-of-empires/blob/main/";
 
 function rewriteLinks(content, sourceDir) {
   // Rewrite markdown links to .md files: [text](target.md) or [text](target.md#anchor)
@@ -331,8 +451,8 @@ function computeLayoutPath(dest) {
 }
 
 function escapeYaml(str) {
-  if (/[:"']/.test(str)) {
-    return `"${str.replace(/"/g, '\\"')}"`;
+  if (/[:"'\\]/.test(str)) {
+    return `"${str.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   }
   return str;
 }

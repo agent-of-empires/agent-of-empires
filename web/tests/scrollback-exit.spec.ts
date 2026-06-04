@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import {
   mockTerminalApis,
   installTerminalSpies,
@@ -36,11 +36,7 @@ function countSeq(handle: MockHandle, seq: string): number {
 }
 
 async function openSession(page: Page) {
-  const sidebarToggle = page.getByRole("button", { name: "Toggle sidebar" });
-  if (await sidebarToggle.isVisible()) {
-    await sidebarToggle.click();
-    await page.waitForTimeout(300);
-  }
+  await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
 }

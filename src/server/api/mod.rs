@@ -1,49 +1,56 @@
 //! HTTP REST handlers for the web dashboard backend.
 //!
 //! Originally a single 2,151-line module; split into:
-//!   - `sessions` — session CRUD, ensure-* lifecycle endpoints, and rich diff
-//!   - `git`      — repo cloning and branch listing
-//!   - `system`   — agents, settings, themes, profiles, filesystem,
+//!   - `sessions`: session CRUD, ensure-* lifecycle endpoints, and rich diff
+//!   - `git`: repo cloning and branch listing
+//!   - `system`: agents, settings, themes, profiles, filesystem,
 //!     groups, docker, about, devices
-//!   - this file  — shared validation helpers + module declarations and
+//!   - this file: shared validation helpers + module declarations and
 //!     re-exports so external callers keep `api::*` paths.
 
 pub(super) use super::AppState;
 
 #[cfg(feature = "serve")]
-mod client_log;
+mod acp;
 #[cfg(feature = "serve")]
-mod cockpit;
+mod client_log;
 mod git;
 mod log_level;
 mod projects;
 mod sessions;
 mod system;
+mod telemetry;
 
 #[cfg(feature = "serve")]
-pub use cockpit::{
-    cockpit_cancel, cockpit_context_primer, cockpit_disable, cockpit_enable, cockpit_files,
-    cockpit_force_end_turn, cockpit_prompt, cockpit_replay, cockpit_set_mode, list_cockpit_agents,
-    resolve_approval, set_cockpit_master, shutdown_cockpit, spawn_cockpit, switch_cockpit_agent,
+pub use acp::{
+    acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
+    acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
+    acp_set_mode, acp_worker_log, list_acp_agents, resolve_approval, shutdown_acp, spawn_acp,
+    switch_acp_agent,
 };
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
-pub use projects::{create_project, delete_project, list_projects};
+pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
     list_sessions, read_output, rename_session, send_message, session_diff_file,
-    session_diff_files, update_session_diff_base, update_session_notifications,
+    session_diff_files, set_worktree_name, update_session_archive, update_session_diff_base,
+    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
-    get_settings, get_update_status, list_agents, list_devices, list_groups, list_profiles,
-    list_sounds, list_themes, rename_profile, serve_sound_file, update_profile_settings,
-    update_settings,
+    get_settings, get_settings_schema, get_update_status, list_agents, list_devices, list_groups,
+    list_profiles, list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
+    update_profile_settings, update_settings,
+};
+pub use telemetry::{
+    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
+    set_telemetry_consent,
 };
 
 const SHELL_METACHARACTERS: &[char] = &[
@@ -61,53 +68,12 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
     Ok(())
 }
 
-/// Sections that PATCH /api/settings (global config) may write.
-///
-/// Keep this list narrower than the profile-write list: anything here lands
-/// in the process-global Config and is shared by every profile, so the bar
-/// for inclusion is higher. `description` is intentionally absent because
-/// it is a per-profile field (#949).
-pub(super) const ALLOWED_GLOBAL_SETTINGS_SECTIONS: &[&str] = &[
-    "theme", "session", "tmux", "updates", "sound", "sandbox", "worktree",
-    // web: audited 2026-04-24, contains only boolean notification toggles
-    // (notifications_enabled, notify_on_waiting, notify_on_idle, notify_on_error).
-    // No shell commands, no binary paths, no RCE surface.
-    "web",
-    // logging: persistent tracing filter (default_level + per-target map).
-    // No shell commands, no binary paths. Values are validated against the
-    // EnvFilter parser before being written back to disk.
-    "logging",
-];
-
-/// Sections that PATCH /api/settings/profile/:name may write.
-///
-/// Superset of the global list; adds `description`, which is a top-level
-/// per-profile string field (Option<String>) surfaced as helper text in
-/// the wizard profile picker (#949). Plain text only, no shell
-/// metacharacters or binary paths.
-pub(super) const ALLOWED_PROFILE_SETTINGS_SECTIONS: &[&str] = &[
-    "theme",
-    "session",
-    "tmux",
-    "updates",
-    "sound",
-    "sandbox",
-    "worktree",
-    "web",
-    "logging",
-    "description",
-];
-
-pub(super) const SESSION_BLOCKED_FIELDS: &[&str] = &[
-    "agent_command_override",
-    "agent_extra_args",
-    "extra_env",
-    // custom_agents maps names to arbitrary shell commands (e.g., "ssh -t host claude").
-    // agent_detect_as maps names to detection targets but is part of the agent config
-    // surface that should only be editable locally.
-    "custom_agents",
-    "agent_detect_as",
-];
+// The settings PATCH write surface (which sections/fields the web may write,
+// which need elevation, which are host-only) is no longer a hand-kept list
+// here: it is derived from the settings schema in
+// `crate::session::settings_schema::policy`, the single source of truth shared
+// with the TUI and web (#1692). See `update_settings` / `update_profile_settings`
+// in `system.rs`, which validate each PATCH leaf via `validate_patch`.
 
 /// Validate that a profile name contains only safe characters.
 /// Rejects path traversal attempts (../, /) and shell metacharacters.
@@ -131,20 +97,19 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    //! Regression tests that pin security-critical constants.
+    //! Regression tests that pin security-critical helpers.
     //!
-    //! These three constants were silently rewritten in an earlier hand-
-    //! assembled version of this split. The failure mode was specific: a
-    //! refactor PR that claimed "no behavior changes" dropped 4 shell
-    //! metacharacters (`#`, `[`, `]`, `~`) from the injection blocklist,
-    //! added `"hooks"` to the settings-write allowlist (a hooks section
-    //! set via the API runs arbitrary shell commands on session start;
-    //! local RCE), and replaced the `SESSION_BLOCKED_FIELDS` contents
-    //! with two field names that don't exist on `SessionConfig`,
-    //! turning the blocklist into a no-op.
+    //! `SHELL_METACHARACTERS` was silently rewritten in an earlier hand-
+    //! assembled version of this split: a refactor PR that claimed "no
+    //! behavior changes" dropped 4 shell metacharacters (`#`, `[`, `]`,
+    //! `~`) from the injection blocklist. Pin its contents here so the
+    //! next refactor that touches this file fails CI instead of silently
+    //! regressing security.
     //!
-    //! Pin the contents here so the next refactor that touches this
-    //! file fails CI instead of silently regressing security.
+    //! The settings PATCH write surface (allowed sections, blocked agent-
+    //! command fields, elevation surfaces) is no longer a constant here:
+    //! it is derived from the settings schema and pinned by the tests in
+    //! `crate::session::settings_schema::policy` (#1692).
     use super::*;
 
     /// Read-only audit: every mutating handler must check `state.read_only`
@@ -180,12 +145,17 @@ mod tests {
                     "create_session",
                     "delete_session",
                     "rename_session",
+                    "set_worktree_name",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                    "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                    "update_session_pin",
+                    "update_session_archive",
+                    "update_session_snooze",
                     "update_workspace_ordering",
                 ],
             ),
@@ -198,13 +168,14 @@ mod tests {
             (
                 "api/projects.rs",
                 include_str!("projects.rs"),
-                &["create_project", "delete_project"],
+                &["create_project", "delete_project", "update_project"],
             ),
             (
                 "api/system.rs",
                 include_str!("system.rs"),
                 &[
                     "update_settings",
+                    "mark_web_tour_seen",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",
@@ -213,19 +184,20 @@ mod tests {
                 ],
             ),
             (
-                "api/cockpit.rs",
-                include_str!("cockpit.rs"),
+                "api/acp.rs",
+                include_str!("acp.rs"),
                 &[
-                    "spawn_cockpit",
-                    "shutdown_cockpit",
-                    "cockpit_prompt",
-                    "cockpit_cancel",
-                    "cockpit_force_end_turn",
-                    "cockpit_enable",
-                    "cockpit_disable",
-                    "cockpit_set_mode",
+                    "spawn_acp",
+                    "shutdown_acp",
+                    "acp_prompt",
+                    "acp_prompt_diff_comments",
+                    "acp_cancel",
+                    "acp_force_end_turn",
+                    "acp_enable",
+                    "acp_disable",
+                    "acp_set_mode",
+                    "acp_set_config_option",
                     "resolve_approval",
-                    "set_cockpit_master",
                 ],
             ),
             (
@@ -233,12 +205,21 @@ mod tests {
                 include_str!("../push.rs"),
                 &["subscribe", "unsubscribe", "test"],
             ),
+            (
+                "api/telemetry.rs",
+                include_str!("telemetry.rs"),
+                &[
+                    "set_telemetry_consent",
+                    "post_telemetry_seen",
+                    "post_telemetry_structured_interaction",
+                ],
+            ),
         ];
 
         let guard_patterns: &[&str] = &[
             "state.read_only",
             "self.read_only",
-            // Cockpit handlers use the shared helper from api/cockpit.rs.
+            // Acp handlers use the shared helper from api/acp.rs.
             "read_only_block(",
         ];
         let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
@@ -306,12 +287,17 @@ mod tests {
                     "create_session",
                     "delete_session",
                     "rename_session",
+                    "set_worktree_name",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                    "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                    "update_session_pin",
+                    "update_session_archive",
+                    "update_session_snooze",
                     "update_workspace_ordering",
                 ],
             ),
@@ -324,7 +310,7 @@ mod tests {
             (
                 "api/projects.rs",
                 include_str!("projects.rs"),
-                &["create_project", "delete_project"],
+                &["create_project", "delete_project", "update_project"],
             ),
             (
                 "api/system.rs",
@@ -339,19 +325,29 @@ mod tests {
                 ],
             ),
             (
-                "api/cockpit.rs",
-                include_str!("cockpit.rs"),
+                "api/acp.rs",
+                include_str!("acp.rs"),
                 &[
-                    "spawn_cockpit",
-                    "shutdown_cockpit",
-                    "cockpit_prompt",
-                    "cockpit_cancel",
-                    "cockpit_force_end_turn",
-                    "cockpit_enable",
-                    "cockpit_disable",
-                    "cockpit_set_mode",
+                    "spawn_acp",
+                    "shutdown_acp",
+                    "acp_prompt",
+                    "acp_prompt_diff_comments",
+                    "acp_cancel",
+                    "acp_force_end_turn",
+                    "acp_enable",
+                    "acp_disable",
+                    "acp_set_mode",
+                    "acp_set_config_option",
                     "resolve_approval",
-                    "set_cockpit_master",
+                ],
+            ),
+            (
+                "api/telemetry.rs",
+                include_str!("telemetry.rs"),
+                &[
+                    "set_telemetry_consent",
+                    "post_telemetry_seen",
+                    "post_telemetry_structured_interaction",
                 ],
             ),
             (
@@ -445,7 +441,7 @@ mod tests {
         assert_eq!(
             SHELL_METACHARACTERS.len(),
             expected.len(),
-            "SHELL_METACHARACTERS size changed — every addition/removal must be \
+            "SHELL_METACHARACTERS size changed; every addition/removal must be \
              reviewed as a security change, not a refactor tidy-up"
         );
         for c in expected {
@@ -475,102 +471,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn allowed_global_settings_sections_are_pinned() {
-        // If you're adding a new top-level settings section, add it here AND
-        // confirm the schema deserializes user input safely (no shell
-        // commands that run on launch, no binary overrides). The `hooks`
-        // section in particular must NOT be API-writable because global
-        // hooks bypass the trust prompt that gates repo hooks.
-        //
-        // Global allowlist is intentionally narrower than the profile
-        // allowlist: profile-only fields (e.g., `description`) must not be
-        // accepted by PATCH /api/settings, only by the per-profile endpoint.
-        let expected: &[&str] = &[
-            "theme", "session", "tmux", "updates", "sound", "sandbox", "worktree",
-            // web: audited 2026-04-24. WebConfig has 4 boolean fields
-            // (notifications_enabled, notify_on_waiting, notify_on_idle,
-            // notify_on_error). No shell commands, no binary paths.
-            "web",
-            // logging: persistent tracing filter. EnvFilter parser
-            // validates every value before save_config writes it back.
-            "logging",
-        ];
-        assert_eq!(
-            ALLOWED_GLOBAL_SETTINGS_SECTIONS.len(),
-            expected.len(),
-            "ALLOWED_GLOBAL_SETTINGS_SECTIONS size changed — adding a section widens \
-             the API write surface and must be reviewed as a security change. \
-             In particular, do NOT add 'hooks' without auditing the RCE surface."
-        );
-        for section in expected {
-            assert!(
-                ALLOWED_GLOBAL_SETTINGS_SECTIONS.contains(section),
-                "ALLOWED_GLOBAL_SETTINGS_SECTIONS lost section {:?}",
-                section
-            );
-        }
-        // Explicitly guard against accidental hooks re-addition.
-        assert!(
-            !ALLOWED_GLOBAL_SETTINGS_SECTIONS.contains(&"hooks"),
-            "hooks must not be API-writable: global/profile hooks bypass the \
-             repo-hook trust prompt and run arbitrary shell commands on session \
-             start (local RCE)"
-        );
-        // `description` is a per-profile field and must not appear on the
-        // global endpoint, even though it is plain text and safe in itself.
-        assert!(
-            !ALLOWED_GLOBAL_SETTINGS_SECTIONS.contains(&"description"),
-            "description is a per-profile field and must only be writable via \
-             PATCH /api/settings/profile/:name, not the global endpoint"
-        );
-    }
-
-    #[test]
-    fn allowed_profile_settings_sections_are_pinned() {
-        // Profile allowlist is the global list plus `description`. Anything
-        // global can also be set per-profile (overrides); profile-only fields
-        // (`description` today) are the additions.
-        let expected: &[&str] = &[
-            "theme",
-            "session",
-            "tmux",
-            "updates",
-            "sound",
-            "sandbox",
-            "worktree",
-            "web",
-            "logging",
-            // description: optional string surfaced in the wizard profile
-            // picker (#949). Plain text, no shell metacharacters.
-            "description",
-        ];
-        assert_eq!(
-            ALLOWED_PROFILE_SETTINGS_SECTIONS.len(),
-            expected.len(),
-            "ALLOWED_PROFILE_SETTINGS_SECTIONS size changed — adding a section \
-             widens the API write surface and must be reviewed as a security change."
-        );
-        for section in expected {
-            assert!(
-                ALLOWED_PROFILE_SETTINGS_SECTIONS.contains(section),
-                "ALLOWED_PROFILE_SETTINGS_SECTIONS lost section {:?}",
-                section
-            );
-        }
-        assert!(
-            !ALLOWED_PROFILE_SETTINGS_SECTIONS.contains(&"hooks"),
-            "hooks must not be API-writable on any endpoint"
-        );
-        // Every global section must also be writable per-profile (overrides).
-        for section in ALLOWED_GLOBAL_SETTINGS_SECTIONS {
-            assert!(
-                ALLOWED_PROFILE_SETTINGS_SECTIONS.contains(section),
-                "global section {:?} must also be accepted by the per-profile endpoint",
-                section
-            );
-        }
-    }
+    // The settings PATCH write-surface pins (allowed sections, blocked session
+    // fields, elevation surfaces) moved to
+    // `crate::session::settings_schema::policy` when the curated constants were
+    // replaced by schema-derived `validate_patch` (#1692). The security
+    // invariants (hooks never writable, agent-command fields denied,
+    // sandbox/worktree require elevation) are pinned by that module's tests.
 
     #[test]
     fn profile_name_rejects_path_traversal() {
@@ -589,37 +495,5 @@ mod tests {
         assert!(validate_profile_name("my-profile").is_ok());
         assert!(validate_profile_name("profile_2").is_ok());
         assert!(validate_profile_name("A").is_ok());
-    }
-
-    #[test]
-    fn session_blocked_fields_are_pinned() {
-        // These fields let an API caller swap the agent binary,
-        // append arbitrary argv, inject environment variables, or define
-        // custom agent commands — all command-injection vectors. If Rust
-        // renames a field it must be renamed here in the same commit.
-        let expected: &[&str] = &[
-            "agent_command_override",
-            "agent_extra_args",
-            "extra_env",
-            // custom_agents: maps agent names to arbitrary shell commands
-            "custom_agents",
-            // agent_detect_as: part of the agent config surface
-            "agent_detect_as",
-        ];
-        assert_eq!(
-            SESSION_BLOCKED_FIELDS.len(),
-            expected.len(),
-            "SESSION_BLOCKED_FIELDS size changed — this is the blocklist \
-             that strips attacker-supplied command-injection vectors from \
-             incoming /api/settings session objects. Changes must be \
-             reviewed as a security change."
-        );
-        for field in expected {
-            assert!(
-                SESSION_BLOCKED_FIELDS.contains(field),
-                "SESSION_BLOCKED_FIELDS lost field {:?}",
-                field
-            );
-        }
     }
 }

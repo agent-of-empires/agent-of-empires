@@ -1,6 +1,6 @@
 //! Reusable list picker overlay component
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
@@ -21,6 +21,17 @@ pub struct ListPicker {
     selected: usize,
     items: Vec<String>,
     title: String,
+    /// Rect of the rendered dialog (border + content). Captured by
+    /// `render` so a click outside the dialog can dismiss it the way
+    /// a desktop popup would, and clicks inside the list area are
+    /// gated cleanly.
+    dialog_area: Rect,
+    /// Rect of the visible list area + offset of the first rendered
+    /// item into the filtered list. Together they let `handle_click`
+    /// and `handle_hover` map a `(col, row)` straight to an item
+    /// index without re-deriving the scroll math.
+    list_area: Rect,
+    list_scroll_offset: usize,
 }
 
 impl ListPicker {
@@ -31,7 +42,63 @@ impl ListPicker {
             selected: 0,
             items: Vec::new(),
             title: title.into(),
+            dialog_area: Rect::default(),
+            list_area: Rect::default(),
+            list_scroll_offset: 0,
         }
+    }
+
+    /// Resolve a `(col, row)` to a filtered-list index using the last
+    /// rendered list area + scroll offset. `None` for clicks outside
+    /// the list rows.
+    fn row_to_filtered_idx(&self, col: u16, row: u16) -> Option<usize> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if !self.list_area.contains(pos) {
+            return None;
+        }
+        let row_in_list = (row - self.list_area.y) as usize;
+        let abs_idx = self.list_scroll_offset + row_in_list;
+        let filtered = self.filtered_items();
+        if abs_idx >= filtered.len() {
+            return None;
+        }
+        Some(abs_idx)
+    }
+
+    /// Route a left-click. Returns:
+    ///   - `Selected(value)` when the click lands on a list row,
+    ///   - `Cancelled` when the click lands outside the dialog
+    ///     (matches the desktop "click-outside dismisses popup" idiom),
+    ///   - `Continue` when the click lands on the dialog border /
+    ///     filter input / hints (keep the picker open so a stray
+    ///     click on the title doesn't drop the user's filter).
+    pub fn handle_click(&mut self, col: u16, row: u16) -> ListPickerResult {
+        if !self
+            .dialog_area
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            self.active = false;
+            return ListPickerResult::Cancelled;
+        }
+        if let Some(idx) = self.row_to_filtered_idx(col, row) {
+            let value = self.filtered_items()[idx].clone();
+            self.active = false;
+            return ListPickerResult::Selected(value);
+        }
+        ListPickerResult::Continue
+    }
+
+    /// Move the highlight to whatever row the mouse is hovering.
+    /// Returns true when the selection actually changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let Some(idx) = self.row_to_filtered_idx(col, row) else {
+            return false;
+        };
+        if self.selected == idx {
+            return false;
+        }
+        self.selected = idx;
+        true
     }
 
     pub fn is_active(&self) -> bool {
@@ -75,15 +142,16 @@ impl ListPicker {
                 self.active = false;
                 result
             }
-            KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Arrow keys only for navigation: every printable char belongs to
+            // the filter input (a "j" or "k" in a project/branch/group name
+            // must be typable), matching DirPicker and the command palette.
+            KeyCode::Up => {
                 if self.selected > 0 {
                     self.selected -= 1;
                 }
                 ListPickerResult::Continue
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Down => {
                 if filtered_len > 0 && self.selected < filtered_len - 1 {
                     self.selected += 1;
                 }
@@ -98,15 +166,25 @@ impl ListPicker {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let filtered = self.filtered_items();
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Compute the dialog rect first (only needs the filtered count)
+        // and stash it before calling `filtered_items()` again below.
+        // The cached `filtered_items()` borrow holds self immutably for
+        // its whole lifetime, which conflicts with the `&mut self`
+        // assignment to `dialog_area` if we keep one Vec around.
         let max_visible: usize = 8;
-        let list_height = filtered.len().min(max_visible) as u16;
+        let filtered_count = self.filtered_items().len();
+        let list_height = filtered_count.min(max_visible) as u16;
         // filter input (1) + border gap (1) + list + hint (1) + borders (2) + margin (2)
         let dialog_height = (list_height + 7).min(area.height);
         let dialog_width: u16 = 50;
 
         let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
+        // Own the filtered list (Vec<String>) instead of borrowing
+        // (Vec<&String>) so subsequent `&mut self` writes below don't
+        // conflict with the borrow.
+        let filtered: Vec<String> = self.filtered_items().into_iter().cloned().collect();
         frame.render_widget(Clear, dialog_area);
 
         let title = format!(" {} ", self.title);
@@ -148,6 +226,8 @@ impl ListPicker {
         } else {
             0
         };
+        self.list_area = chunks[2];
+        self.list_scroll_offset = scroll_offset;
 
         let mut lines: Vec<Line> = Vec::new();
         if filtered.is_empty() {
@@ -194,7 +274,7 @@ impl ListPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -264,15 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn test_navigation_jk() {
+    fn test_j_and_k_type_into_filter_not_navigate() {
         let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
+        picker.activate(vec![
+            "jukebox".to_string(),
+            "kanban".to_string(),
+            "webapp".to_string(),
+        ]);
 
         picker.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.selected, 0, "'j' must not move the selection");
+        assert_eq!(picker.filter.value(), "j");
+        assert_eq!(picker.filtered_items().len(), 1);
 
+        picker.handle_key(key(KeyCode::Backspace));
         picker.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(picker.selected, 0);
+        picker.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(picker.selected, 0, "'k' must not move the selection");
+        assert_eq!(picker.filter.value(), "ka");
+        assert_eq!(*picker.filtered_items()[0], "kanban");
     }
 
     #[test]

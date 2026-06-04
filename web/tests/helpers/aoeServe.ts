@@ -49,7 +49,7 @@ export interface SpawnOptions {
    * When true and `authMode === "passphrase"`, the harness POSTs
    * `/api/login` itself after boot to mint a session cookie + record
    * the device binding secret. Useful for fixtures that need a
-   * pre-authed browser context (e.g. a future cockpit-under-passphrase
+   * pre-authed browser context (e.g. a future acp-under-passphrase
    * spec). Defaults to false: specs that drive LoginPage end-to-end
    * (the `auth-login-passphrase` spec) want to start with no cookie
    * so the LoginPage actually renders.
@@ -70,13 +70,18 @@ export interface SpawnOptions {
   tokenGraceSecs?: number;
   /**
    * When true, install `fakeAcpAgent.mjs` as the `claude` / `aoe-agent`
-   * shim instead of the tail-f-dev-null stub, and flip the cockpit
-   * master enable flag via `PATCH /api/cockpit/master` after the server
+   * shim instead of the tail-f-dev-null stub, and flip the structured view
+   * master enable flag via `PATCH /api/acp/master` after the server
    * boots.
    */
-  cockpit?: boolean;
-  /** Optional path to a FAKE_ACP_SCRIPT for cockpit tests. */
+  acp?: boolean;
+  /** Optional path to a FAKE_ACP_SCRIPT for structured view tests. */
   fakeAcpScript?: string;
+  /** Extra environment variables exported in the fake-ACP shim. Lets
+   *  structured view tests toggle behavior on the fake agent (e.g. force a
+   *  rejection of session/set_config_option) without writing a full
+   *  scripted turn file. */
+  extraEnv?: Record<string, string>;
   /**
    * Runs after the isolated $HOME tree is set up and the fake shim is on
    * PATH, but BEFORE `aoe serve` spawns. Use to call `aoe add` so the
@@ -147,7 +152,7 @@ export interface ServeHandle {
    * back. The captured port is reused after the dead listener releases
    * it on `exit`. Token-mode reads the freshly written `serve.token`
    * and updates `handle.authToken`. Does NOT re-run passphrase
-   * `preloginViaHarness` or cockpit master enable; specs that need
+   * `preloginViaHarness` or structured view master enable; specs that need
    * those across a restart should call `spawnAoeServe` again.
    */
   restart(): Promise<void>;
@@ -260,6 +265,50 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
 }
 
 /**
+ * Last-resort teardown: group-kill any `aoe __acp-runner` still
+ * recorded in the worker registry by reading its pid straight off disk.
+ *
+ * `aoe acp stop --all` only works while the daemon is alive; if the
+ * daemon already crashed or was SIGKILLed, its runners (and their node +
+ * `claude` descendants) are orphaned and would leak forever once the temp
+ * HOME is deleted. Each runner is its own process-group leader (spawned via
+ * setsid), so `process.kill(-pid, "SIGKILL")` reaps the whole tree. Runs
+ * before the HOME is wiped. See #1921.
+ */
+async function killOrphanRunners(appDir: string): Promise<void> {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const workersDir = join(appDir, "acp-workers");
+  let entries: string[];
+  try {
+    entries = readdirSync(workersDir);
+  } catch {
+    return; // no workers dir; nothing to reap
+  }
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    let pid: unknown;
+    try {
+      pid = JSON.parse(readFileSync(join(workersDir, name), "utf8"))?.pid;
+    } catch {
+      continue; // unparseable record; skip
+    }
+    if (typeof pid !== "number" || pid <= 1) continue;
+    // Negative pid targets the process group (runner + node + claude); the
+    // positive pid is a belt-and-suspenders for a non-leader runner.
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // group already gone
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // leader already gone
+    }
+  }
+}
+
+/**
  * Wait for `serve.token` to appear in the daemon's app dir, then read
  * it. The daemon writes the token early in startup, so by the time
  * `waitForServer` resolves it is on disk; the loop is a small safety
@@ -327,26 +376,33 @@ async function waitForServer(
 
 function writeFakeClaudeShim(binDir: string): void {
   // Dashboard tracer specs only need the tmux pane to stay open with a
-  // long-running process. Cockpit specs swap this for the ACP agent shim
-  // via `writeFakeAcpShim`.
+  // long-running process. Structured view specs swap this for the ACP agent shim
+  // via `writeFakeAcpShim`. Install shims for the built-in agents the
+  // wizard UI surfaces (claude / codex / gemini); the agent picker
+  // filters by `which <binary>` (src/tmux/mod.rs::is_agent_available),
+  // so without these the picker only offers claude and persistence
+  // specs that pick a non-default tool would hang on a missing button.
   const script = "#!/bin/bash\nexec tail -f /dev/null\n";
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
+  for (const name of ["claude", "codex", "gemini", "opencode"]) {
+    const path = join(binDir, name);
+    writeFileSync(path, script);
+    chmodSync(path, 0o755);
+  }
 }
 
 function writeFakeAcpShim(
   binDir: string,
   fakeAcpScript: string | undefined,
   fakeAcpDebugLog: string,
+  extraEnv: Record<string, string> | undefined,
 ): void {
-  // The cockpit supervisor resolves the agent through `AgentRegistry`
-  // (src/cockpit/agent_registry.rs): the `claude` tool key maps to
+  // The structured view supervisor resolves the agent through `AgentRegistry`
+  // (src/acp/agent_registry.rs): the `claude` tool key maps to
   // command `claude-agent-acp`, not `claude`. `resolve_agent_command`
   // walks $PATH and node-version dirs, so without a `claude-agent-acp`
   // entry in the shim dir the supervisor falls through to the real
   // installed adapter, which then surfaces "Authentication required"
-  // on the first prompt. Shim every name a cockpit test can land on.
+  // on the first prompt. Shim every name a structured view test can land on.
   //
   // The shim also re-exports diagnostic env vars (FAKE_ACP_SCRIPT,
   // FAKE_ACP_DEBUG_LOG) so they reach the node child even when the
@@ -362,35 +418,14 @@ function writeFakeAcpShim(
     scriptLines.push("unset FAKE_ACP_SCRIPT");
   }
   scriptLines.push(`export FAKE_ACP_DEBUG_LOG=${JSON.stringify(fakeAcpDebugLog)}`);
+  for (const [key, value] of Object.entries(extraEnv ?? {})) {
+    scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
+  }
   const script = `#!/bin/bash\n${scriptLines.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
-  for (const name of ["claude", "claude-agent-acp", "aoe-agent"]) {
+  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode"]) {
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
-  }
-}
-
-async function enableCockpitMaster(
-  baseUrl: string,
-  sessionCookie?: { name: string; value: string },
-): Promise<void> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (sessionCookie) {
-    // Required when authMode === "passphrase"; loopback bypass kicks in
-    // for token+loopback callers, but PATCH /api/cockpit/master predates
-    // any browser navigation, so the SPA hasn't yet seeded the cookie
-    // into a Playwright context. Include it on the harness's own request.
-    headers.Cookie = `${sessionCookie.name}=${sessionCookie.value}`;
-  }
-  const res = await fetch(`${baseUrl}/api/cockpit/master`, {
-    method: "PATCH",
-    headers,
-    body: JSON.stringify({ enabled: true }),
-  });
-  if (!res.ok) {
-    throw new Error(
-      `PATCH /api/cockpit/master failed: ${res.status} ${await res.text()}`,
-    );
   }
 }
 
@@ -434,7 +469,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   //
   // Use `/tmp/...` as the base instead of `tmpdir()`. On macOS,
   // `tmpdir()` resolves to `/private/var/folders/<hash>/T/...` (~95
-  // chars). After we append `/.agent-of-empires-dev/cockpit-workers/
+  // chars). After we append `/.agent-of-empires-dev/acp-workers/
   // <session_id>.sock` (~60 chars) we blow past the 104-byte
   // `sun_path` limit on Darwin unix sockets and the runner's
   // `UnixListener::bind` fails with ENAMETOOLONG. Because the runner
@@ -460,8 +495,8 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const fakeAcpDebugLog = join(home, "fake-acp.log");
-  if (opts.cockpit) {
-    writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog);
+  if (opts.acp) {
+    writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
   } else {
     writeFakeClaudeShim(shimBin);
   }
@@ -476,15 +511,15 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     TMUX_TMPDIR: tmuxTmp,
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Lift the runner-socket appearance deadline. The `aoe
-    // __cockpit-runner` shim re-execs the debug `aoe` binary, which
+    // __acp-runner` shim re-execs the debug `aoe` binary, which
     // under v8 coverage + 3 parallel workers + tmux + a fake-ACP node
     // subprocess can take >10s to bind its unix listener on a
     // contended runner. The production 10s default in
     // `runner_socket_deadline()` covers cold caches; tests need
-    // headroom or `cockpit_enable` fails with `runner socket … did
+    // headroom or `acp_enable` fails with `runner socket … did
     // not appear within 10s` (deterministic on slower local + CI
     // machines, never on hot caches). Honored only in debug builds.
-    AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS: "60000",
+    AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS: "60000",
     // FAKE_ACP_DEBUG_LOG is *also* re-exported by the shim itself
     // (see writeFakeAcpShim) because the daemon -> runner -> node
     // spawn chain on CI Linux did not propagate this env var from
@@ -500,6 +535,15 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // under contention and triggering an optimistic-update revert).
     // Override via process env if a future investigation needs it.
     AOE_LOG_LEVEL: process.env.AOE_LOG_LEVEL ?? "info",
+    // Suppress the first-load telemetry consent modal. Every live spec boots
+    // a fresh HOME where `has_responded_to_telemetry` is false, so the modal
+    // (`telemetry-modal-title`, a z-50 full-screen backdrop) would otherwise
+    // intercept pointer events and time out every `click`. `DO_NOT_TRACK`
+    // makes `/api/telemetry/status` report `do_not_track: true`, which App.tsx
+    // treats as "never auto-show the modal". The consent flow itself is
+    // covered by the Vitest + RTL contract tests, not the live suite. A future
+    // live spec that exercises the modal can unset this in its own env.
+    DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
   };
 
   if (authMode === "token") {
@@ -668,10 +712,26 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     },
     async stop() {
       try {
+        // Terminate acp workers BEFORE killing the daemon and deleting
+        // the temp HOME. `acp stop --all` makes the still-live daemon
+        // group-kill every per-session `aoe __acp-runner` (and its node
+        // + claude descendants). Without it they outlive the daemon, the
+        // HOME is then wiped, and the orphaned tree leaks forever. See
+        // #1921.
+        spawnSync(aoeBinary, ["acp", "stop", "--all"], {
+          env: seedEnv,
+          stdio: "ignore",
+          timeout: 10_000,
+        });
         if (proc) await killProc(proc);
       } finally {
+        // Direct fallback for a daemon that was already dead/wedged (so the
+        // RPC above was a no-op): group-kill any runner still recorded in
+        // the registry, reading its pid off disk. Runs before rmSync so we
+        // never orphan a tree by deleting its HOME out from under it.
+        await killOrphanRunners(appDirFor(home, xdg, aoeBinary));
         // Best-effort: kill any tmux server bound to the isolated socket
-        // before deleting the dir. Cockpit specs leave tmux child
+        // before deleting the dir. Structured view specs leave tmux child
         // processes around that hold open file descriptors and trip
         // ENOTEMPTY on rmSync if not cleaned up first.
         try {
@@ -707,9 +767,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     handle.deviceBindingSecret = deviceBindingSecret;
   }
 
-  if (opts.cockpit) {
-    await enableCockpitMaster(baseUrl, handle.sessionCookie);
-  }
+  // The structured view is the default for ACP-capable agents now (the master
+  // switch was removed), so the harness no longer enables anything here.
+  // `opts.structured view` is accepted for source compatibility and ignored.
+  void opts.acp;
 
   return handle;
 }

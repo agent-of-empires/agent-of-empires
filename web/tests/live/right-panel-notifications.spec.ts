@@ -1,13 +1,13 @@
 // Live-backend spec: right panel's "non-diff" surfaces (#1221).
 //
 // Two tests live here:
-//   1) Paired-terminal toggle on a non-cockpit session. The lower half
+//   1) Paired-terminal toggle on a non-structured view session. The lower half
 //      of `RightPanel.tsx` exposes a Host / Container shell mode picker
 //      (`src/components/RightPanel.tsx:373-397`). Non-sandboxed sessions
 //      must show Host only; Container is gated on `is_sandboxed`. This
 //      asserts the toggle exists and that the paired-terminal pane
 //      mounts.
-//   2) Comments-banner notification flow on a cockpit session. Once a
+//   2) Comments-banner notification flow on a structured view session. Once a
 //      user stages a comment via the diff "+" gutter, the
 //      `CommentsBanner` (`src/components/diff/comments/CommentsBanner.tsx`)
 //      surfaces a notification chip in the right panel with the comment
@@ -72,11 +72,11 @@ base(
 );
 
 base(
-  "right panel notifications: cockpit comments banner appears on stage, clears on discard",
+  "right panel notifications: structured view comments banner appears on stage, clears on discard",
   async ({ page }, testInfo) => {
     const serve = await spawnAoeServe({
       authMode: "none",
-      cockpit: true,
+      acp: true,
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
       seedFn: ({ home, env }) => {
@@ -105,15 +105,15 @@ base(
       const sessions = await listSessions(serve.baseUrl);
       const sessionId = sessions.find((s) => s.title === "rp-notif")?.id;
       if (!sessionId) {
-        throw new Error("seeded cockpit session not visible in /api/sessions");
+        throw new Error("seeded structured view session not visible in /api/sessions");
       }
 
-      // Flip per-session cockpit_mode so the SPA renders the comments
+      // Flip per-session structured_view so the SPA renders the comments
       // affordances on the diff viewer. Same pattern as
-      // cockpit-spawn-prompt.spec.ts; the supervisor spawn is async, so
+      // acp-spawn-prompt.spec.ts; the supervisor spawn is async, so
       // give it a beat before driving the UI.
       const enableRes = await fetch(
-        `${serve.baseUrl}/api/sessions/${sessionId}/cockpit/enable`,
+        `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
         { method: "POST" },
       );
       expect(enableRes.ok).toBeTruthy();

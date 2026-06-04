@@ -13,11 +13,11 @@ Adding an agent involves these files:
 | `src/hooks/mod.rs` | Hook installer (if the agent supports hooks) |
 | `src/session/instance.rs` | Wire hook installation + env prefix |
 | `src/session/container_config.rs` | Config mount for Docker sandbox |
-| `src/cockpit/agent_registry.rs` | Cockpit ACP adapter entry (only if the agent ships an ACP server) |
-| `src/cockpit/agent_profiles.rs` + `web/src/lib/agentProfiles.ts` | Cockpit profile (clear aliases, meta namespace, capability gates, tool aliases) |
-| `src/cockpit/install_hints.rs` | Install hint surfaced by `aoe cockpit doctor` and handshake failures |
+| `src/acp/agent_registry.rs` | Structured view ACP adapter entry (only if the agent ships an ACP server) |
+| `src/acp/agent_profiles.rs` + `web/src/lib/agentProfiles.ts` | Structured view profile (clear aliases, meta namespace, capability gates, tool aliases) |
+| `src/acp/install_hints.rs` | Install hint surfaced by `aoe acp doctor` and handshake failures |
 | `docker/Dockerfile` | Install agent in sandbox image |
-| `docs/cockpit/multi-agent.md` | Per-agent cockpit feature matrix |
+| `docs/acp/multi-agent.md` | Per-agent structured view feature matrix |
 | `README.md`, `docs/` | Documentation updates |
 
 ## Levels of Support
@@ -197,15 +197,15 @@ In `src/tmux/status_detection.rs`, add a test for your detection function.
 
 In `src/session/instance.rs`, add your agent to `test_status_hook_env_prefix_includes_hermes` (if hook-based).
 
-### 8. Add the Cockpit Profile (if the agent has an ACP server)
+### 8. Add the Structured view Profile (if the agent has an ACP server)
 
 If the agent publishes an ACP server (its CLI accepts `acp`, `--acp`, or
-ships a separate `*-acp` adapter binary), wire cockpit support too.
+ships a separate `*-acp` adapter binary), wire structured view support too.
 
-1. Add the binary to `src/cockpit/agent_registry.rs::with_defaults()`
+1. Add the binary to `src/acp/agent_registry.rs::with_defaults()`
    keyed on the same name you used in `src/agents.rs`.
-2. Add an install hint to `src/cockpit/install_hints.rs::install_hint_for`.
-3. Add a server-side profile to `src/cockpit/agent_profiles.rs`:
+2. Add an install hint to `src/acp/install_hints.rs::install_hint_for`.
+3. Add a server-side profile to `src/acp/agent_profiles.rs`:
 
    ```rust
    pub const MYAGENT: AgentProfile = AgentProfile {
@@ -247,12 +247,12 @@ ships a separate `*-acp` adapter binary), wire cockpit support too.
 
    Add it to `PROFILES` so `resolveAgentProfile("myagent")` returns it.
 
-5. Document the agent in `docs/cockpit/multi-agent.md` (per-agent
-   feature matrix + which cockpit features work / fall back / fire).
+5. Document the agent in `docs/acp/multi-agent.md` (per-agent
+   feature matrix + which structured view features work / fall back / fire).
 
 Profile data should be conservative. When the adapter's tool surface
 isn't verified, leave the alias map empty rather than guessing; the
-cockpit will render the generic tool card, which is the right fallback.
+structured view will render the generic tool card, which is the right fallback.
 
 ### 9. Update Documentation
 
@@ -287,6 +287,15 @@ cargo build
 ```
 
 Set `hook_config: Some(AgentHookConfig { ... })` in the agent def; the generic `install_hooks()` handles it.
+
+#### `HookEvent` flags
+
+Each entry in `events: &[HookEvent]` carries:
+
+- `name` — the agent's event name (e.g., `"PreToolUse"`).
+- `matcher` — optional pattern for events that need it (e.g., Claude's `Notification` matcher).
+- `status` — `Some("running" | "waiting" | "idle")` to install a status-writer command on this event, or `None` if the event is purely lifecycle.
+- `session_id_capture` — `true` to install an additional command that extracts the active `session_id` from the agent's stdin JSON and writes it atomically to `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`. Read by [`session-resume`](../guides/session-resume.md)'s poller as the primary capture source. Currently used only by Claude on `SessionStart` and `UserPromptSubmit`; other agents either don't pre-mint UUIDs (so capture is post-launch from disk) or use a different payload schema (Cursor, Codex). Setting both `status: Some(...)` and `session_id_capture: true` emits two commands under the same matcher block; the session-id command is placed first so it consumes stdin before the status writer.
 
 ### Codex (custom TOML)
 

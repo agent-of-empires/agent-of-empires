@@ -63,7 +63,7 @@ function toggleMobileSidebar(btn) {
 }
 
 // Fetch GitHub star count
-fetch('https://api.github.com/repos/njbrake/agent-of-empires')
+fetch('https://api.github.com/repos/agent-of-empires/agent-of-empires')
   .then(res => res.json())
   .then(data => {
     const count = data.stargazers_count;

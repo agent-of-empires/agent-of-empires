@@ -50,7 +50,7 @@ aoe remove <session> --keep-container
 ```toml
 [sandbox]
 enabled_by_default = false
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
 auto_cleanup = true
 cpu_limit = "4"
 memory_limit = "8g"
@@ -64,17 +64,32 @@ environment = ["ANTHROPIC_API_KEY"]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled_by_default` | `false` | Auto-enable sandbox for new sessions |
-| `default_image` | `ghcr.io/njbrake/aoe-sandbox:latest` | Docker image to use |
+| `default_image` | `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Docker image to use |
 | `auto_cleanup` | `true` | Remove containers when sessions are deleted |
 | `cpu_limit` | (none) | CPU limit (e.g., "4") |
 | `memory_limit` | (none) | Memory limit (e.g., "8g") |
 | `environment` | `[]` | Env vars for containers (bare KEY or KEY=VALUE, see below) |
 | `volume_ignores` | `[]` | Directories to exclude from the project mount via anonymous volumes |
+| `volume_ignores_strategy` | `"anonymous"` | How `volume_ignores` are mounted: `"anonymous"` (default) or `"named"` (required on macOS/VirtioFS, see below) |
 | `extra_volumes` | `[]` | Additional volume mounts |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
 | `default_terminal_mode` | `"host"` | Paired terminal location: `"host"` (on host machine) or `"container"` (inside Docker) |
 
 ## Volume Mounts
+
+### Volume Ignores Strategy (macOS/VirtioFS)
+
+By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume_ignores_strategy = "anonymous"`). This works on Linux, but on macOS with Docker Desktop's VirtioFS, anonymous volumes may not reliably shadow bind-mount subdirectories, causing host-side directories like `.venv` or `node_modules` to remain visible inside the container.
+
+To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Named volumes are explicitly removed when the session is deleted.
+
+```toml
+[sandbox]
+volume_ignores = ["node_modules", ".venv", "target"]
+volume_ignores_strategy = "named"
+```
+
+> Named volumes are not supported on Apple Container. Setting `"named"` on Apple Container falls back to anonymous volume behavior with a warning.
 
 ### Automatic Mounts
 
@@ -128,15 +143,15 @@ Containers are named: `aoe-sandbox-{session_id_first_8_chars}`
 
 Example: `aoe-sandbox-a1b2c3d4`
 
-## Cockpit Mode Inside the Sandbox
+## Structured view Mode Inside the Sandbox
 
-Cockpit-mode sessions can run inside the sandbox container. When both are enabled, the cockpit runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
+Agent-view sessions can run inside the sandbox container. When both are enabled, the structured view runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
 
-- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.37.0`, floor pin)
+- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.39.0`, floor pin)
 - `codex-acp` (`@zed-industries/codex-acp`)
 - `pi-acp`
 
-Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the cockpit handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
+Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the structured view handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
 
 ## How It Works
 
@@ -202,8 +217,8 @@ AOE provides two official sandbox images:
 
 | Image | Description |
 |-------|-------------|
-| `ghcr.io/njbrake/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, git, ripgrep, fzf |
-| `ghcr.io/njbrake/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
+| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, git, ripgrep, fzf |
+| `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
 
 ### Dev Sandbox Tools
 
@@ -218,11 +233,11 @@ To use the dev sandbox:
 
 ```bash
 # Per-session
-aoe add --sandbox-image ghcr.io/njbrake/aoe-dev-sandbox:latest .
+aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .
 
 # Or set as default in ~/.agent-of-empires/config.toml
 [sandbox]
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 ```
 
 ## Custom Docker Images
@@ -234,7 +249,7 @@ The default sandbox image includes all supported agents, git, and basic developm
 Create a `Dockerfile` in your project (or a shared location):
 
 ```dockerfile
-FROM ghcr.io/njbrake/aoe-sandbox:latest
+FROM ghcr.io/agent-of-empires/aoe-sandbox:latest
 
 # Example: Add Python for a data science project
 RUN apt-get update && apt-get install -y \

@@ -5,6 +5,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 pub struct HooksInstallDialog {
@@ -13,6 +14,11 @@ pub struct HooksInstallDialog {
     needs_codex_trust_note: bool,
     selected: bool, // true = Accept, false = Cancel
     scroll_offset: u16,
+    accept_button_area: Rect,
+    cancel_button_area: Rect,
+    /// Which button the mouse is over, for the hover highlight. Visual
+    /// only; never changes `selected`.
+    hover: HoverState,
 }
 
 impl HooksInstallDialog {
@@ -55,7 +61,32 @@ impl HooksInstallDialog {
             needs_codex_trust_note,
             selected: true,
             scroll_offset: 0,
+            accept_button_area: Rect::default(),
+            cancel_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<bool>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if self.accept_button_area.contains(pos) {
+            return Some(DialogResult::Submit(true));
+        }
+        if self.cancel_button_area.contains(pos) {
+            return Some(DialogResult::Cancel);
+        }
+        None
+    }
+
+    /// Highlight the button under the cursor without changing the
+    /// Accept / Cancel selection. See `ConfirmDialog::handle_hover` for
+    /// the rationale. Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(
+            col,
+            row,
+            &[self.accept_button_area, self.cancel_button_area],
+        )
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<bool> {
@@ -145,7 +176,7 @@ impl HooksInstallDialog {
         lines
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let content_lines = self.build_content_lines();
         let content_height = content_lines.len() as u16 + 6; // header + spacing + buttons
 
@@ -208,17 +239,43 @@ impl HooksInstallDialog {
             Style::default().fg(theme.dimmed)
         };
 
+        let accept_label = "[Accept (y)]";
+        let cancel_label = "[Cancel (Esc)]";
+        let gap: u16 = 4;
+        let prefix: u16 = 2;
+        let accept_w = accept_label.chars().count() as u16;
+        let cancel_w = cancel_label.chars().count() as u16;
+        let total = prefix + accept_w + gap + cancel_w;
+        let button_area = chunks[2];
+        if button_area.width >= total {
+            let left_pad = (button_area.width - total) / 2;
+            let accept_x = button_area.x + left_pad + prefix;
+            let cancel_x = accept_x + accept_w + gap;
+            self.accept_button_area = Rect::new(accept_x, button_area.y, accept_w, 1);
+            self.cancel_button_area = Rect::new(cancel_x, button_area.y, cancel_w, 1);
+        } else {
+            self.accept_button_area = Rect::default();
+            self.cancel_button_area = Rect::default();
+        }
+
         let buttons = Line::from(vec![
             Span::raw("  "),
-            Span::styled("[Accept (y)]", accept_style),
+            Span::styled(accept_label, accept_style),
             Span::raw("    "),
-            Span::styled("[Cancel (Esc)]", cancel_style),
+            Span::styled(cancel_label, cancel_style),
         ]);
 
         frame.render_widget(
             Paragraph::new(buttons).alignment(Alignment::Center),
-            chunks[2],
+            button_area,
         );
+
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.accept_button_area, self.cancel_button_area])
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -318,6 +375,27 @@ mod tests {
     }
 
     #[test]
+    fn hover_highlights_button_without_changing_selection() {
+        let mut dialog = HooksInstallDialog::new("claude");
+        dialog.accept_button_area = Rect::new(2, 5, 12, 1);
+        dialog.cancel_button_area = Rect::new(20, 5, 14, 1);
+        assert!(dialog.selected);
+
+        // Over Accept: highlight it, selection unchanged.
+        assert!(dialog.handle_hover(3, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.accept_button_area));
+        assert!(dialog.selected, "hover must not flip the selection");
+
+        // Over Cancel.
+        assert!(dialog.handle_hover(21, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
+
+        // Off the buttons clears.
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
+    }
+
+    #[test]
     fn test_content_shows_settings_path() {
         let dialog = HooksInstallDialog::new("claude");
         let lines = dialog.build_content_lines();
@@ -410,7 +488,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let codex_home = tmp.path().join("profile-codex-home");

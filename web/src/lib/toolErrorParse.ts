@@ -11,7 +11,7 @@ export interface ParsedToolError {
    *  adapter sent `is_error: true` with no body. */
   body: string;
   /** Tag name when the original payload was wrapped in
-   *  `<tag>...</tag>`. The cockpit renders this as a small label
+   *  `<tag>...</tag>`. The structured view renders this as a small label
    *  outside the error body so the source is clear without polluting
    *  the message itself. Null when the payload was a bare string. */
   tag: string | null;

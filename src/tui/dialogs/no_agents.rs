@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 /// Result of the no-agents dialog interaction.
@@ -21,13 +22,40 @@ pub enum NoAgentsAction {
 pub struct NoAgentsDialog {
     /// true = "Re-check" focused, false = "Quit" focused
     recheck_focused: bool,
+    recheck_button_area: Rect,
+    quit_button_area: Rect,
+    /// Which button the mouse is over, for the hover highlight. Visual
+    /// only; never changes `recheck_focused`.
+    hover: HoverState,
 }
 
 impl NoAgentsDialog {
     pub fn new() -> Self {
         Self {
             recheck_focused: true,
+            recheck_button_area: Rect::default(),
+            quit_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<NoAgentsAction>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if self.recheck_button_area.contains(pos) {
+            return Some(DialogResult::Submit(NoAgentsAction::Recheck));
+        }
+        if self.quit_button_area.contains(pos) {
+            return Some(DialogResult::Submit(NoAgentsAction::Quit));
+        }
+        None
+    }
+
+    /// Highlight the button under the cursor without changing the
+    /// Re-check / Quit focus. See `ConfirmDialog::handle_hover` for the
+    /// rationale. Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.recheck_button_area, self.quit_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NoAgentsAction> {
@@ -53,7 +81,7 @@ impl NoAgentsDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_area = super::centered_rect(area, 70, 20);
 
         frame.render_widget(Clear, dialog_area);
@@ -142,6 +170,27 @@ impl NoAgentsDialog {
             Span::styled("[Quit]", quit_style),
         ]);
 
+        let button_area = chunks[1];
+        // Compute centered button positions deterministically so the
+        // hit rects line up with the rendered glyphs.
+        let recheck_label = "[Re-check]";
+        let quit_label = "[Quit]";
+        let gap: u16 = 4;
+        let total_width =
+            recheck_label.chars().count() as u16 + gap + quit_label.chars().count() as u16;
+        if button_area.width >= total_width {
+            let left_pad = (button_area.width - total_width) / 2;
+            let recheck_x = button_area.x + left_pad;
+            let recheck_w = recheck_label.chars().count() as u16;
+            let quit_x = recheck_x + recheck_w + gap;
+            let quit_w = quit_label.chars().count() as u16;
+            self.recheck_button_area = Rect::new(recheck_x, button_area.y, recheck_w, 1);
+            self.quit_button_area = Rect::new(quit_x, button_area.y, quit_w, 1);
+        } else {
+            self.recheck_button_area = Rect::default();
+            self.quit_button_area = Rect::default();
+        }
+
         frame.render_widget(
             Paragraph::new(vec![
                 buttons,
@@ -151,8 +200,15 @@ impl NoAgentsDialog {
                 )),
             ])
             .alignment(Alignment::Center),
-            chunks[1],
+            button_area,
         );
+
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.recheck_button_area, self.quit_button_area])
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -215,6 +271,23 @@ mod tests {
         // Enter now submits Quit
         let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
+    }
+
+    #[test]
+    fn hover_highlights_button_without_changing_focus() {
+        let mut dialog = NoAgentsDialog::new();
+        dialog.recheck_button_area = Rect::new(2, 5, 10, 1);
+        dialog.quit_button_area = Rect::new(16, 5, 6, 1);
+        assert!(dialog.recheck_focused);
+
+        // Over Quit: highlight it, focus unchanged.
+        assert!(dialog.handle_hover(17, 5));
+        assert_eq!(dialog.hover.current(), Some(dialog.quit_button_area));
+        assert!(dialog.recheck_focused, "hover must not move focus");
+
+        // Off the buttons clears.
+        assert!(dialog.handle_hover(99, 99));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

@@ -83,34 +83,44 @@ async function openSessionStep(page: Page) {
   await expect(page.getByText("Name your session")).toBeVisible();
 }
 
+// #1514 folds the worktree controls (including the attach-existing
+// toggle and the Base branch picker) behind a top-level "Advanced"
+// disclosure that defaults closed. Expand it before asserting on them.
+async function expandAdvanced(page: Page) {
+  await page.getByRole("button", { name: "Advanced" }).click();
+}
+
 test.describe("Wizard attach-existing toggle (#969)", () => {
-  test("toggle is off by default; Advanced section visible", async ({ page }) => {
+  test("toggle is off by default; Base branch section visible", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
+    await expandAdvanced(page);
     const attachToggle = page
       .locator("label", { hasText: "Attach to existing branch" })
       .locator("role=switch");
     await expect(attachToggle).toBeVisible();
     await expect(attachToggle).toHaveAttribute("aria-checked", "false");
-    // Advanced disclosure is the base-branch picker (only meaningful for new-branch creates).
-    await expect(page.getByRole("button", { name: /Advanced/i })).toBeVisible();
+    // The base-branch picker (only meaningful for new-branch creates) is
+    // its own "Base branch" disclosure inside Advanced.
+    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
   });
 
-  test("turning attach on hides the Advanced base-branch section", async ({
+  test("turning attach on hides the Base branch section", async ({
     page,
   }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
+    await expandAdvanced(page);
     const attachToggle = page
       .locator("label", { hasText: "Attach to existing branch" })
       .locator("role=switch");
     await attachToggle.click();
     await expect(attachToggle).toHaveAttribute("aria-checked", "true");
-    await expect(page.getByRole("button", { name: /Advanced/i })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
   test("submit with attach off sends create_new_branch=true", async ({ page }) => {
@@ -150,6 +160,7 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
+    await expandAdvanced(page);
     await page.getByPlaceholder("Uses session title if empty").fill("feat/new");
     await page.getByRole("button", { name: /Next/ }).click();
     // Agent step → Next (defaults already set)
@@ -198,6 +209,7 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
+    await expandAdvanced(page);
     await page
       .getByPlaceholder("Uses session title if empty")
       .fill("feat/existing");

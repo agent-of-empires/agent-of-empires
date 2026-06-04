@@ -17,15 +17,19 @@
 
 mod harness;
 
+mod acp_focus_isolation_e2e;
+mod acp_tool_cards_e2e;
 mod cli;
 mod command_palette;
 mod errors;
+mod intro;
 mod logs;
 mod new_session;
 mod profile_picker;
 mod project_registry;
 mod sandbox;
 mod serve;
+mod settings;
 mod tool_sessions;
 mod tui_launch;
 mod unified_view;

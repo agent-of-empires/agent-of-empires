@@ -34,10 +34,6 @@
       "reason": "Trigger covered by command-palette.spec.ts"
     },
     {
-      "path": "web/src/components/ViewportFullscreenFab.tsx",
-      "reason": "Mobile fullscreen FAB; covered indirectly by mobile-keyboard.spec.ts"
-    },
-    {
       "path": "web/src/components/UpdateBanner.tsx",
       "reason": "Update banner covered by update-banner.spec.ts (mocked)"
     },

@@ -91,7 +91,7 @@ Override sandbox settings for this repo:
 ```toml
 [sandbox]
 enabled_by_default = true
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["NODE_ENV", "DATABASE_URL", "CUSTOM_KEY=value"]
 volume_ignores = ["node_modules", ".next", "target"]
 extra_volumes = ["/data:/data:ro"]
@@ -159,7 +159,7 @@ default_tool = "claude"
 
 [sandbox]
 enabled_by_default = true
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]
 volume_ignores = ["node_modules", ".next"]
 

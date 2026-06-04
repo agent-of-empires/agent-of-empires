@@ -18,65 +18,12 @@
 // so the hold has to outlast the activation window without moving more
 // than 8px.
 
-import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
+import { spawnAoeServe, listSessions } from "../helpers/aoeServe";
 import {
-  spawnAoeServe,
-  listSessions,
-  resolveAoeBinary,
-} from "../helpers/aoeServe";
-
-function seedThreeSessionsInOneRepo(titles: [string, string, string]) {
-  return ({ home, env }: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => {
-    const binary = resolveAoeBinary();
-    const projectDir = join(home, "repo");
-    mkdirSync(projectDir, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: projectDir });
-    spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
-      cwd: projectDir,
-      env: {
-        ...env,
-        GIT_AUTHOR_NAME: "t",
-        GIT_AUTHOR_EMAIL: "t@t",
-        GIT_COMMITTER_NAME: "t",
-        GIT_COMMITTER_EMAIL: "t@t",
-      },
-    });
-    for (const title of titles) {
-      const res = spawnSync(
-        binary,
-        ["add", projectDir, "-t", title, "-c", "claude"],
-        { env },
-      );
-      if (res.status !== 0) {
-        throw new Error(
-          `aoe add failed for ${title}: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-        );
-      }
-    }
-  };
-}
-
-async function readVisibleSessionTitles(page: import("@playwright/test").Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const rows = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        "[data-testid='sidebar-session-row']",
-      ),
-    );
-    // Scope to the label span specifically (see WorkspaceSidebar.tsx:587).
-    // A bare `[title]` selector can pick up a Wakeup or Plan chip if either
-    // ever renders on the row.
-    return rows
-      .map(
-        (r) =>
-          r.querySelector("span.truncate[title]")?.getAttribute("title") ?? "",
-      )
-      .filter(Boolean);
-  });
-}
+  readVisibleSessionTitles,
+  seedSessionsInRepo,
+} from "../helpers/sidebar";
 
 base.describe("workspace ordering live round-trip (#1220)", () => {
   base("press-and-hold drag reorders and round-trips PUT /api/workspace-ordering", async ({ page }, testInfo) => {
@@ -89,7 +36,7 @@ base.describe("workspace ordering live round-trip (#1220)", () => {
       authMode: "none",
       workerIndex: testInfo.workerIndex,
       parallelIndex: testInfo.parallelIndex,
-      seedFn: seedThreeSessionsInOneRepo(["alpha", "beta", "gamma"]),
+      seedFn: seedSessionsInRepo({ titles: ["alpha", "beta", "gamma"] }),
     });
 
     try {

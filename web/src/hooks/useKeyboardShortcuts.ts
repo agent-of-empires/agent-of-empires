@@ -1,52 +1,24 @@
 import { useEffect } from "react";
-import type { ProjectStripShortcut } from "./useWebSettings";
+import {
+  IS_MAC,
+  matchProjectNavigationShortcut,
+  matchShortcut,
+} from "../lib/shortcuts";
+import type { ShortcutActions } from "../lib/shortcuts";
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-
-interface ShortcutActions {
-  onNew: () => void;
-  onDiff: () => void;
-  onEscape: () => void;
-  onHelp: () => void;
-  onSettings: () => void;
-  onPalette: () => void;
-  onToggleSidebar: () => void;
-  onToggleRightPanel: () => void;
-  onToggleTerminalFocus: () => void;
-  onPreviousProject?: () => void;
-  onNextProject?: () => void;
-  projectStripShortcut?: ProjectStripShortcut;
-}
+export type { ShortcutActions };
 
 /**
- * Global keyboard shortcuts for the dashboard.
+ * Global keyboard shortcuts for the dashboard. Bindings, help-overlay labels,
+ * and tour hints all read from the single SHORTCUTS registry in lib/shortcuts.
+ * This hook is the DOM seam: it decides whether the keydown target is an input,
+ * delegates matching to the pure matchShortcut, and applies the effects.
+ *
  * Single-key shortcuts fire only when no input/textarea/terminal is focused.
  * Cmd+K (Mac) / Ctrl+K (other) and Escape fire regardless of focus.
  */
 export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
   useEffect(() => {
-    const matchesProjectNavigationShortcut = (
-      e: KeyboardEvent,
-      shortcut: ProjectStripShortcut,
-    ) => {
-      if (shortcut === "disabled") return false;
-      if (e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) {
-        return false;
-      }
-      if (shortcut === "alt-hl") {
-        return e.altKey && !e.ctrlKey && !e.shiftKey;
-      }
-      if (shortcut === "ctrl-alt-hl") {
-        return (
-          (e.ctrlKey && e.altKey && !e.shiftKey) ||
-          (e.shiftKey && e.altKey && !e.ctrlKey)
-        );
-      }
-      return e.ctrlKey && !e.altKey && !e.shiftKey;
-    };
-
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const isInput =
@@ -60,42 +32,16 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       const isProjectStripInput = !!target?.closest("[data-project-strip='true']");
 
       const actions = getActions();
-      const mod = IS_MAC ? e.metaKey : e.metaKey || e.ctrlKey;
-
-      // Palette: Cmd+K (Mac) / Ctrl+K (other), works everywhere.
-      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        e.stopPropagation();
-        actions.onPalette();
-        return;
-      }
-
-      // Toggle terminal focus: Cmd+` (Mac) / Ctrl+` (other), works everywhere.
-      // Use e.code so layouts where backtick lives behind a modifier still match.
-      // No stopPropagation: preventDefault is enough to suppress the browser's
-      // own Cmd+` window cycling, and we don't want to silently shadow other
-      // doc-level listeners that might want this combo.
-      if (mod && !e.shiftKey && !e.altKey && e.code === "Backquote") {
-        e.preventDefault();
-        actions.onToggleTerminalFocus();
-        return;
-      }
-
-      const projectStripShortcut =
-        actions.projectStripShortcut ?? "ctrl-alt-hl";
-      const isProjectNavigationShortcut = matchesProjectNavigationShortcut(
+      const projectNavigation = matchProjectNavigationShortcut(
         e,
-        projectStripShortcut,
+        actions.projectStripShortcut ?? "ctrl-alt-hl",
+        { isInput, isTerminalInput, isProjectStripInput },
       );
-      if (
-        isProjectNavigationShortcut &&
-        (!isInput ||
-          isTerminalInput ||
-          isProjectStripInput ||
-          projectStripShortcut === "ctrl-alt-hl")
-      ) {
+      if (projectNavigation) {
         const action =
-          e.code === "KeyH" ? actions.onPreviousProject : actions.onNextProject;
+          projectNavigation === "previous"
+            ? actions.onPreviousProject
+            : actions.onNextProject;
         if (action) {
           e.preventDefault();
           e.stopPropagation();
@@ -104,51 +50,12 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
         }
       }
 
-      // Use e.code for B shortcuts because Option+B on Mac produces "∫"
-      // instead of "b", causing e.key matching to fail.
-      // Toggle right panel: Cmd+Opt+B (Mac) / Ctrl+Alt+B (other)
-      // Check alt combo first so Cmd+B doesn't swallow Cmd+Opt+B.
-      if (mod && !e.shiftKey && e.altKey && e.code === "KeyB") {
-        e.preventDefault();
-        e.stopPropagation();
-        actions.onToggleRightPanel();
-        return;
-      }
+      const matched = matchShortcut(e, { mac: IS_MAC, isInput });
+      if (!matched) return;
 
-      // Toggle left sidebar: Cmd+B (Mac) / Ctrl+B (other)
-      if (mod && !e.shiftKey && !e.altKey && e.code === "KeyB") {
-        e.preventDefault();
-        e.stopPropagation();
-        actions.onToggleSidebar();
-        return;
-      }
-
-      if (e.key === "Escape") {
-        actions.onEscape();
-        return;
-      }
-
-      if (isInput) return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-      switch (e.key) {
-        case "n":
-          e.preventDefault();
-          actions.onNew();
-          break;
-        case "D":
-          e.preventDefault();
-          actions.onDiff();
-          break;
-        case "?":
-          e.preventDefault();
-          actions.onHelp();
-          break;
-        case "s":
-          e.preventDefault();
-          actions.onSettings();
-          break;
-      }
+      if (matched.preventDefault) e.preventDefault();
+      if (matched.stopPropagation) e.stopPropagation();
+      actions[matched.shortcut.action]();
     };
 
     // Capture phase so we observe the keydown before xterm.js's helper

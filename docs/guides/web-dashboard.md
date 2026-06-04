@@ -2,19 +2,24 @@
 
 The web dashboard lets you monitor and interact with agent sessions from any browser, including your phone, tablet, or another computer. It runs as an embedded web server inside the `aoe` binary.
 
+![The web dashboard on desktop: workspace sidebar, live agent terminal, and diff panel](../assets/web/dashboard.png)
+
+## In this section
+
+This page is the overview: how to run `aoe serve`, the access and auth modes, the security model, and PWA install. The rest of the surface has its own pages:
+
+- **[Dashboard & workspaces](web/dashboard.md)**: the layout, status glyphs, the session-creation wizard, sidebar sort, triage (pin / archive / snooze), command palette, and the first-run tutorial.
+- **[Terminal view](web/terminal.md)**: the agent and paired terminals, reconnect behavior, the WebSocket close-code reference, and read-only mode.
+- **[Diff view](web/diff.md)**: reviewing changed files, the flat / tree file list, per-session base override, and inline review comments.
+- **[Settings & profiles](web/settings.md)**: the settings tabs, profile picker, connected-device tracking, and step-up elevation.
+
+Mobile and touch behavior is documented inline on each page, next to the surface it applies to.
+
 ## Availability
 
-The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/njbrake/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
+The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
 
-## Building from source
-
-If building from source, you need the `serve` Cargo feature and Node.js/npm:
-
-```bash
-cargo build --release --features serve
-```
-
-The build automatically runs `npm install && npm run build` in the `web/` directory to compile the React frontend. The output is embedded in the binary, so there are no separate files to deploy.
+If you build from source, the dashboard requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
 
 ## Starting the server
 
@@ -177,6 +182,8 @@ The upstream proxy must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads
 - **Rate limiting:** 5 failed login attempts from an IP trigger a 15-minute lockout. Uses `Cf-Connecting-IP` / `X-Forwarded-For` from loopback peers (covers `--remote` tunnel mode and `--behind-proxy` reverse-proxy mode) to prevent IP spoofing.
 - **Token rotation:** In `--remote` mode, the token rotates every 4 hours with a 5-minute grace period for active sessions.
 - **Device tracking:** Connected devices (IP, browser, last seen) are visible in Settings > Security.
+- **Step-up elevation:** A "Confirm passphrase" prompt appears on writes whose payload can plant code for the next session spawn: the `sandbox` and `worktree` sections. Confirmation lasts 15 minutes. User-preference writes (theme, sound, updates, notification toggles, logging filter, profile description, and safe session fields like `yolo_mode_default`) save without the prompt; saving a theme should not feel like signing in again.
+- **Local-only fields:** The agent-command surface (`session.agent_command_override`, `session.agent_extra_args`, `session.custom_agents`, `session.agent_detect_as`) and the status-hook shell commands (`status_hooks.on_*`) map names to arbitrary host commands, so the dashboard never writes them: the server rejects a PATCH that touches them and they are editable only in the TUI on the host. The per-field policy is derived from the settings schema (#1692), so this list stays in sync automatically.
 
 ### Security headers
 
@@ -218,44 +225,12 @@ aoe serve --daemon
 
 ### Shutdown behavior
 
-`Ctrl-C` on a foreground `aoe serve`, and `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open dashboard tabs. Live cockpit and terminal WebSocket clients receive a close frame with code `1001` ("going away") so the browser logs a clean reason and skips its transient-error reconnect backoff for one cycle. The reconnect resumes normally once a fresh `aoe serve` is running. A 5-second hard cap acts as a safety net: if any handler fails to honor the shutdown signal, the process still exits and emits `WARN shutdown: graceful shutdown exceeded grace window, forcing exit`.
+`Ctrl-C` on a foreground `aoe serve`, and `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open dashboard tabs. Live structured view and terminal WebSocket clients receive a close frame with code `1001` ("going away") so the browser logs a clean reason and skips its transient-error reconnect backoff for one cycle. The reconnect resumes normally once a fresh `aoe serve` is running. A 5-second hard cap acts as a safety net: if any handler fails to honor the shutdown signal, the process still exits and emits `WARN shutdown: graceful shutdown exceeded grace window, forcing exit`.
 
-## Features
+## How it works
 
-- **Session list** with live status updates (Running, Waiting, Idle, Error)
-- **Live terminal** via PTY relay, full terminal experience with all key sequences
-- **Stop/restart** sessions from the browser
-- **Mobile-responsive** layout (sidebar collapses on small screens)
-- **Multi-profile** support (shows sessions from all profiles)
-- **Connected Devices** view in Settings > Security
-- **Push notifications** on Waiting / Idle / Error transitions, with per-session overrides ([guide](push-notifications.md))
+`aoe serve` runs an embedded server inside the `aoe` process; your browser connects to it to list sessions, stream terminal output, and (when write access is enabled) send input. Each terminal is backed by a real `tmux` session, so your work survives browser crashes, network drops, and reconnects.
 
-## Architecture
+The terminal disconnect banner surfaces a WebSocket close code when it can't reach a working pane. The decoder ring for those codes lives on the [Terminal view](web/terminal.md#terminal-websocket-close-codes) page.
 
-The server embeds an axum web server that serves a React frontend and provides:
-
-- REST API for session listing and control (`/api/sessions`); see the [HTTP API Reference](../api.md) for the orchestration endpoints (`send`, `output`)
-- WebSocket PTY relay for terminal streaming (`/sessions/:id/ws`)
-- Token-based authentication via cookie, query parameter, or WebSocket protocol header
-- Rate limiting, token rotation, and device tracking
-- Security headers (X-Frame-Options, Referrer-Policy)
-
-Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over WebSocket. This gives the browser a real terminal experience identical to SSH.
-
-## Frontend development
-
-The React frontend lives in `web/`:
-
-```bash
-cd web
-npm install
-npm run dev     # Vite dev server with HMR on port 5173
-```
-
-For API/WebSocket requests, run the Rust server simultaneously:
-
-```bash
-cargo run --features serve -- serve
-```
-
-The Vite dev server proxies API requests to the Rust server (configure in `vite.config.ts` if needed).
+For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

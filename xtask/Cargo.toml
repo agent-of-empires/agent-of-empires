@@ -9,3 +9,7 @@ agent-of-empires = { path = "..", features = ["serve"] }
 clap = { version = "4.6", features = ["derive"] }
 clap-markdown = "0.1"
 regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+ctrlc = "3"
+nix = { version = "0.31", features = ["signal"] }

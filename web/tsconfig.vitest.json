@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.vitest.tsbuildinfo"
+  },
+  // Scoped to the dedicated type-test files only. tsc still pulls in the
+  // production source they import, but the rest of the runtime test
+  // suite (excluded from tsc by `tsconfig.app.json`) stays unchecked, so
+  // its pre-existing loose typings don't fail the typecheck run.
+  "include": ["src/**/*.types.test.ts"],
+  "exclude": []
+}

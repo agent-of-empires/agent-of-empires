@@ -11,6 +11,8 @@ use crate::tui::styles::Theme;
 pub struct ToolPickerDialog {
     items: Vec<ToolPickerEntry>,
     cursor: usize,
+    dialog_area: Rect,
+    list_area: Rect,
 }
 
 struct ToolPickerEntry {
@@ -30,7 +32,49 @@ impl ToolPickerDialog {
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
-        Self { items, cursor: 0 }
+        Self {
+            items,
+            cursor: 0,
+            dialog_area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    fn row_to_idx(&self, col: u16, row: u16) -> Option<usize> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if !self.list_area.contains(pos) {
+            return None;
+        }
+        let row_in_list = (row - self.list_area.y) as usize;
+        if row_in_list >= self.items.len() {
+            return None;
+        }
+        Some(row_in_list)
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
+        if !self
+            .dialog_area
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            return DialogResult::Cancel;
+        }
+        let Some(idx) = self.row_to_idx(col, row) else {
+            return DialogResult::Continue;
+        };
+        self.cursor = idx;
+        DialogResult::Submit(self.items[idx].name.clone())
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let Some(idx) = self.row_to_idx(col, row) else {
+            return false;
+        };
+        if self.cursor == idx {
+            return false;
+        }
+        self.cursor = idx;
+        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<String> {
@@ -67,11 +111,12 @@ impl ToolPickerDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let width = 50u16.min(area.width.saturating_sub(4));
         // +2 for borders, +1 for the footer hint row.
         let height = (self.items.len() as u16 + 3).min(area.height.saturating_sub(4));
         let dialog_area = centered_rect(area, width, height);
+        self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);
 
@@ -91,6 +136,7 @@ impl ToolPickerDialog {
             .split(inner);
         let list_area = chunks[0];
         let footer_area = chunks[1];
+        self.list_area = list_area;
 
         let items: Vec<ListItem> = self
             .items

@@ -43,12 +43,12 @@ type LiveFixtures = {
    */
   serveToken: ServeHandle;
   /**
-   * Cockpit fixture. Only supported with `authMode: "none"` today; the
-   * harness calls `PATCH /api/cockpit/master` without a session cookie.
-   * If you need passphrase + cockpit, call `spawnAoeServe` directly and
+   * Structured view fixture. Only supported with `authMode: "none"` today; the
+   * harness calls `PATCH /api/acp/master` without a session cookie.
+   * If you need passphrase + structured view, call `spawnAoeServe` directly and
    * pass the `sessionCookie` through to the master-enable request.
    */
-  serveCockpit: ServeHandle;
+  serveAcp: ServeHandle;
 };
 
 /**
@@ -76,7 +76,13 @@ export async function seedAuth(
     const secret = handle.deviceBindingSecret;
     await page.addInitScript((s) => {
       try {
-        window.localStorage.setItem("aoe-device-binding-secret", s);
+        // Storage key must match `STORAGE_KEY` in web/src/lib/deviceBinding.ts.
+        // The SPA reads this on the first authenticated fetch via
+        // `getOrCreateDeviceBindingSecret()`; if it does not find a
+        // matching base64url-32-byte value it generates a fresh one,
+        // which would not match the binding the harness used at
+        // `POST /api/login`, and subsequent requests would 401.
+        window.localStorage.setItem("aoe_device_binding_secret_v1", s);
       } catch {
         // localStorage may be unavailable depending on origin state.
       }
@@ -122,10 +128,10 @@ export const test = base.extend<LiveFixtures>({
     await use(h);
     await h.stop();
   },
-  serveCockpit: async ({}, use, testInfo) => {
+  serveAcp: async ({}, use, testInfo) => {
     const h = await spawnAoeServe({
       authMode: "none",
-      cockpit: true,
+      acp: true,
       // Specs that want a custom script set `FAKE_ACP_SCRIPT` themselves
       // through testInfo.use() overrides or call `spawnAoeServe` directly.
       fakeAcpScript: process.env.FAKE_ACP_SCRIPT,

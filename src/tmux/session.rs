@@ -173,19 +173,7 @@ impl Session {
             process::kill_process_tree(pane_pid);
         }
 
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Session vanished between the exists() check and kill-session
-            // (e.g. process tree kill caused tmux to tear it down). That's
-            // fine -- the goal was to remove the session and it's gone.
-            if !stderr.contains("can't find session") {
-                bail!("Failed to kill tmux session: {}", stderr);
-            }
-        }
+        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
 
@@ -364,14 +352,27 @@ impl Session {
         let line_count = text.lines().count();
         let max_line = text.lines().map(str::len).max().unwrap_or(0);
 
-        // Long or multi-line messages go through the tmux paste-buffer path
-        // (load-buffer over stdin, then paste-buffer with bracketed-paste
+        // Non-trivial or multi-line messages go through the tmux paste-buffer
+        // path (load-buffer over stdin, then paste-buffer with bracketed-paste
         // markers). The per-line `send-keys -l` + ESC+CR path encodes
         // newlines as Shift+Enter, which is brittle compared to the
         // bracketed-paste contract claude-code (and most agents in raw mode)
-        // are designed to ingest; the byte threshold is a conservative cap
-        // so very long single-line payloads also take the safer path.
-        const PASTE_BYTE_THRESHOLD: usize = 2048;
+        // are designed to ingest.
+        //
+        // The threshold is intentionally small: bracketed paste is also what
+        // prevents the receiving agent's input-burst detector from treating
+        // the trailing Enter as part of the keystroke stream and inserting a
+        // newline instead of submitting. Empirically, on Mosh sessions
+        // (bracketed-paste stripped end-to-end) a single-line ~365-byte
+        // VoiceInk dictation that took the `send-keys -l` path was followed
+        // by `tmux send-keys Enter` at 0ms and the agent rendered the text
+        // but never submitted, because the Enter arrived inside the burst
+        // window. Routing anything beyond a handful of characters through
+        // the bracketed-paste path frames it as a paste, after which the
+        // trailing Enter reliably submits. See gemini-cli#26114 for
+        // independent confirmation that claude-code handles paste correctly
+        // only when bracketed-paste markers are present.
+        const PASTE_BYTE_THRESHOLD: usize = 16;
         let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
 
         tracing::debug!(target: "tmux.command",
@@ -399,6 +400,55 @@ impl Session {
         Self::tmux_send(&target, &["Enter"])?;
 
         Ok(())
+    }
+
+    /// Restore automatic window sizing after live-send forced a manual
+    /// size. tmux's `resize-window -x -y` silently switches the window-
+    /// size option to `manual`, so without this call a later
+    /// `attach-session` from a full-size terminal would keep the window
+    /// at the small preview dimensions live-send left behind. Re-setting
+    /// the option to `latest` is the documented escape hatch and matches
+    /// the policy `append_window_size_args` installs at session create.
+    /// Best-effort: failures (session gone, tmux ENOENT) are swallowed
+    /// so a stuck pane never blocks the user's exit from live mode.
+    pub fn reset_size_to_latest_client(&self) {
+        if !self.exists() {
+            return;
+        }
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", &self.name, "window-size", "latest"])
+            .output();
+    }
+
+    /// Resize the (detached) window to `cols`x`rows`. Best-effort: a missing
+    /// session or a tmux ENOENT is swallowed so a transient failure never
+    /// blocks a render.
+    ///
+    /// Used to keep a detached agent's pane sized to the visible preview area:
+    /// a full-screen agent is sized to whatever terminal it was last attached
+    /// from, so without this it renders taller than the preview window and the
+    /// bottom-anchored capture clips the top rows (worse when the info header
+    /// steals rows). Mirrors what live-send does through its worker.
+    ///
+    /// NOTE: tmux's `resize-window -x -y` silently flips the window-size option
+    /// to `manual`, so any later `attach-session` must call
+    /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
+    /// or the window stays pinned at these preview dimensions.
+    pub fn resize_window(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 || !self.exists() {
+            return;
+        }
+        let _ = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+            ])
+            .output();
     }
 
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.

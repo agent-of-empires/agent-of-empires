@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, ContainerRuntimeInterface, EnvEntry, VolumeMount};
+pub use container_interface::{
+    ContainerConfig, ContainerRuntimeInterface, EnvEntry, NamedVolumeMount, VolumeMount,
+};
 use error::Result;
 pub use runtime::ContainerRuntime;
 
@@ -133,6 +135,24 @@ impl DockerContainer {
         result
     }
 
+    /// Remove all named ignore volumes for this session (prefix = `aoe-vi-{session_id}-`).
+    ///
+    /// Must be called after container removal during session deletion. Named volumes are not
+    /// removed by `docker rm -v`; they require explicit cleanup. Safe to call even when the
+    /// container is already gone — volumes can outlive their container.
+    pub fn remove_named_ignore_volumes(&self, session_id: &str) {
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self.runtime.base.remove_named_ignore_volumes(&prefix) {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to remove named ignore volumes"
+            );
+        }
+    }
+
     pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
         self.runtime.exec_command(&self.name, options, cmd)
     }
@@ -188,10 +208,12 @@ mod tests {
                 "/workspace/myproject/target".to_string(),
                 "/workspace/myproject/node_modules".to_string(),
             ],
+            named_ignore_volumes: vec![],
             environment: vec![],
             cpu_limit: None,
             memory_limit: None,
             port_mappings: vec![],
+            ..Default::default()
         };
 
         let args = container.build_create_args(&config);
@@ -217,10 +239,12 @@ mod tests {
             working_dir: "/workspace".to_string(),
             volumes: vec![],
             anonymous_volumes: vec![],
+            named_ignore_volumes: vec![],
             environment: vec![],
             cpu_limit: None,
             memory_limit: None,
             port_mappings: vec![],
+            ..Default::default()
         };
 
         let args = container.build_create_args(&config);

@@ -79,6 +79,7 @@ mod tests {
             delete_sandbox: false,
             force_delete: false,
             detach_hooks: true,
+            keep_scratch: false,
         });
 
         let mut result = None;

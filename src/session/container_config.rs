@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::containers::{ContainerConfig, EnvEntry, VolumeMount};
+use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
 use crate::git::GitWorktree;
+use crate::session::config::VolumeIgnoresStrategy;
 
 use super::environment::collect_environment;
 use super::instance::SandboxInfo;
@@ -962,6 +963,34 @@ impl<'a> ContainerAgentSelection<'a> {
     }
 }
 
+/// Produce a deterministic Docker volume name for a named volume_ignores mount.
+///
+/// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
+/// A short hash of the container path is appended to handle slug collisions.
+fn named_volume_for(session_id: &str, container_path: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let slug: String = sanitize(container_path.trim_start_matches('/'))
+        .chars()
+        .take(40)
+        .collect();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    container_path.hash(&mut h);
+    let hash = format!("{:x}", h.finish());
+    let hash12 = &hash[..12.min(hash.len())];
+    format!("aoe-vi-{}-{}-{}", session_id, slug, hash12)
+}
+
 /// Build a full `ContainerConfig` for creating a sandboxed container.
 ///
 /// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
@@ -1146,7 +1175,9 @@ pub(crate) fn build_container_config(
             let hermes_hooks = agent.name == "hermes";
             let kiro_hooks = agent.name == "kiro";
             if hermes_hooks || kiro_hooks || agent.hook_config.is_some() {
-                let hook_dir = crate::hooks::hook_status_dir(instance_id);
+                let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
+                    "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
+                )?;
                 if let Err(e) = std::fs::create_dir_all(&hook_dir) {
                     tracing::warn!(target: "session.profile",
                         "Failed to create hook directory {}: {}",
@@ -1190,7 +1221,11 @@ pub(crate) fn build_container_config(
                         let result = if agent.name == "codex" {
                             crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
                         } else {
-                            crate::hooks::install_hooks(&settings_file, hook_cfg.events)
+                            crate::hooks::install_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
                         };
                         if let Err(e) = result {
                             tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
@@ -1247,13 +1282,10 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Filter anonymous_volumes to exclude paths that conflict with extra_volumes
-    // (extra_volumes should take precedence over volume_ignores)
-    // Conflicts include:
-    //   - Exact match: both point to same path
-    //   - Anonymous volume is parent of extra_volume (would shadow the mount)
-    //   - Anonymous volume is inside extra_volume (redundant/conflicting)
-    let anonymous_volumes: Vec<String> = volume_ignore_bases
+    // Expand all volume_ignores paths and filter conflicts with extra_volumes.
+    // (extra_volumes take precedence over volume_ignores)
+    // Conflicts: exact match, anonymous is a parent of extra, or inside extra.
+    let expanded_ignore_paths: Vec<String> = volume_ignore_bases
         .iter()
         .flat_map(|base_path| {
             sandbox_config
@@ -1261,14 +1293,30 @@ pub(crate) fn build_container_config(
                 .iter()
                 .map(move |ignore| format!("{}/{}", base_path, ignore))
         })
-        .filter(|anon_path| {
+        .filter(|path| {
             !extra_volume_container_paths.iter().any(|extra_path| {
-                anon_path == extra_path
-                    || extra_path.starts_with(&format!("{}/", anon_path))
-                    || anon_path.starts_with(&format!("{}/", extra_path))
+                path == extra_path
+                    || extra_path.starts_with(&format!("{}/", path))
+                    || path.starts_with(&format!("{}/", extra_path))
             })
         })
         .collect();
+
+    // Route by strategy: anonymous volumes are the default; named volumes fix VirtioFS on macOS.
+    let (anonymous_volumes, named_ignore_volumes): (Vec<String>, Vec<NamedVolumeMount>) =
+        match sandbox_config.volume_ignores_strategy {
+            VolumeIgnoresStrategy::Anonymous => (expanded_ignore_paths, vec![]),
+            VolumeIgnoresStrategy::Named => {
+                let named = expanded_ignore_paths
+                    .into_iter()
+                    .map(|container_path| NamedVolumeMount {
+                        volume_name: named_volume_for(instance_id, &container_path),
+                        container_path,
+                    })
+                    .collect();
+                (vec![], named)
+            }
+        };
 
     // Deduplicate volumes by container_path (last writer wins, so extra_volumes
     // from user config override automatic mounts).
@@ -1287,10 +1335,12 @@ pub(crate) fn build_container_config(
         working_dir: workspace_path,
         volumes: deduped,
         anonymous_volumes,
+        named_ignore_volumes,
         environment,
         cpu_limit: sandbox_config.cpu_limit,
         memory_limit: sandbox_config.memory_limit,
         port_mappings: sandbox_config.port_mappings.clone(),
+        selinux_relabel: sandbox_config.selinux_relabel,
     })
 }
 
@@ -2474,7 +2524,7 @@ mod tests {
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Create a project directory with repo config
@@ -2565,7 +2615,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
     fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Main repo with repo config under .agent-of-empires/
@@ -2640,7 +2690,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_installs_codex_hooks_files() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -2677,7 +2727,8 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
         }));
 
-        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         assert!(
             config
                 .volumes
@@ -2690,10 +2741,51 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
 
     #[test]
     #[serial_test::serial]
+    fn test_build_container_config_refuses_unsafe_instance_id() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            "../etc",
+            None,
+            "",
+        );
+
+        let err = match result {
+            Ok(_) => panic!("must refuse unsafe instance id"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AOE_INSTANCE_ID"),
+            "error must surface validator failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_build_container_config_respects_profile_hooks_disabled() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
@@ -2729,7 +2821,8 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
         assert!(!codex_sandbox.join("config.toml").exists());
 
-        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         assert!(
             !config
                 .volumes
@@ -2745,7 +2838,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let mut global = crate::session::config::Config::default();
@@ -2795,7 +2888,8 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         assert!(codex_config.contains("[[hooks.PreToolUse]]"));
         assert!(codex_config.contains("aoe-hooks"));
 
-        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
         assert!(
             config
                 .volumes
@@ -2811,7 +2905,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
     fn test_refresh_agent_configs_preserves_codex_hooks_and_trust_state() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let codex_dir = temp_home.path().join(".codex");
@@ -2874,7 +2968,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -2917,7 +3011,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -2975,15 +3069,15 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
             .path()
             .join(".config")
-            .join(crate::session::APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
 
         let profiles_dir = app_dir.join("profiles");
@@ -3123,7 +3217,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
     fn test_volume_ignores_applied_to_parent_repo_mount() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, repo_path) = setup_regular_repo();
@@ -3240,7 +3334,7 @@ volume_ignores = ["target", "node_modules"]
     fn test_volume_ignores_applied_to_bare_repo_worktree() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_worktree();
@@ -3455,7 +3549,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_default_adc_when_flag_set_and_tool_is_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3481,7 +3575,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_custom_path_from_google_application_credentials() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
 
@@ -3511,7 +3605,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_unset() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3532,7 +3626,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_tool_is_not_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3555,7 +3649,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_is_empty_string() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3578,7 +3672,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_adc_file_missing() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3594,5 +3688,68 @@ volume_ignores = ["target"]
         );
 
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    // --- named_volume_for tests ---
+
+    #[test]
+    fn test_named_volume_for_is_deterministic() {
+        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
+        let b = named_volume_for("sess-abc123", "/workspace/node_modules");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_differs_by_path() {
+        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
+        let b = named_volume_for("sess-abc123", "/workspace/.venv");
+        assert_ne!(a, b, "Different paths must produce different volume names");
+    }
+
+    #[test]
+    fn test_named_volume_for_differs_by_session_id() {
+        let a = named_volume_for("sess-aaa", "/workspace/node_modules");
+        let b = named_volume_for("sess-bbb", "/workspace/node_modules");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_sanitizes_unsafe_chars() {
+        let name = named_volume_for("sess-1", "/workspace/path with spaces/foo:bar");
+        assert!(
+            !name.contains(' ') && !name.contains(':'),
+            "Volume name must not contain spaces or colons"
+        );
+    }
+
+    #[test]
+    fn test_named_volume_for_starts_with_prefix() {
+        let name = named_volume_for("sess-xyz", "/workspace/target");
+        assert!(name.starts_with("aoe-vi-sess-xyz-"));
+    }
+
+    #[test]
+    fn test_named_volume_for_slug_collision_prevented_by_hash() {
+        // Two paths that have the same 40-char slug prefix (unlikely but possible for long paths)
+        // are disambiguated by the hash suffix.
+        let path1 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v1";
+        let path2 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v2";
+        let a = named_volume_for("sess-1", path1);
+        let b = named_volume_for("sess-1", path2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_prefix_does_not_match_longer_session_id() {
+        // "sess1" must not match volumes belonging to "sess10".
+        // The cleanup prefix is "aoe-vi-{session_id}-" (trailing dash), so a volume
+        // named "aoe-vi-sess10-..." must NOT start with "aoe-vi-sess1-".
+        let vol_sess10 = named_volume_for("sess10", "/workspace/node_modules");
+        let prefix_sess1 = format!("aoe-vi-{}-", "sess1");
+        assert!(
+            !vol_sess10.starts_with(&prefix_sess1),
+            "Volume for sess10 must not match the cleanup prefix for sess1: {}",
+            vol_sess10
+        );
     }
 }

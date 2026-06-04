@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use aoe_settings_derive::SettingsSection;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -13,33 +14,75 @@ use crate::session::{Instance, Status};
 
 const DEFAULT_DEBOUNCE_MS: u64 = 100;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "status_hooks", category = "Status Hooks")]
 pub struct StatusHookConfig {
+    /// Run local commands when TUI sessions change status.
     #[serde(default)]
+    #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
 
-    #[serde(
-        default = "default_debounce_ms",
-        skip_serializing_if = "is_default_debounce_ms"
-    )]
+    /// Milliseconds a status must remain stable before running hook commands.
+    /// Always serialized (no skip-at-default) so every surface that reads the
+    /// config JSON, including the settings schema consumers, sees a concrete
+    /// value rather than an absent leaf that would display as 0 (#1692).
+    #[serde(default = "default_debounce_ms")]
+    #[setting(label = "Debounce (ms)", widget = "number", min = 0)]
     pub debounce_ms: u64,
 
+    /// Shell command run when a session enters Starting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Starting",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_starting: Option<String>,
 
+    /// Shell command run when a session enters Running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Running",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_running: Option<String>,
 
+    /// Shell command run when a session enters Waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Waiting",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_waiting: Option<String>,
 
+    /// Shell command run when a session enters Idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Idle",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_idle: Option<String>,
 
+    /// Shell command run when a session enters Error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Error",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_error: Option<String>,
 
+    /// Shell command run after the status-specific command on every status
+    /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "On Any Change",
+        widget = "optional_text",
+        web = "local_only:runs a local shell command on status change, a host execution surface"
+    )]
     pub on_change: Option<String>,
 }
 
@@ -56,33 +99,6 @@ impl Default for StatusHookConfig {
             on_change: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StatusHookConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub debounce_ms: Option<u64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_starting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_running: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_waiting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_idle: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_change: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,36 +146,6 @@ impl StatusHookContext {
             ("AOE_NEW_STATUS", self.new_status.as_str().to_string()),
             ("AOE_STATUS_CHANGED_AT", self.changed_at.to_rfc3339()),
         ]
-    }
-}
-
-pub fn apply_status_hook_overrides(
-    target: &mut StatusHookConfig,
-    source: &StatusHookConfigOverride,
-) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(debounce_ms) = source.debounce_ms {
-        target.debounce_ms = debounce_ms;
-    }
-    if source.on_starting.is_some() {
-        target.on_starting = source.on_starting.clone();
-    }
-    if source.on_running.is_some() {
-        target.on_running = source.on_running.clone();
-    }
-    if source.on_waiting.is_some() {
-        target.on_waiting = source.on_waiting.clone();
-    }
-    if source.on_idle.is_some() {
-        target.on_idle = source.on_idle.clone();
-    }
-    if source.on_error.is_some() {
-        target.on_error = source.on_error.clone();
-    }
-    if source.on_change.is_some() {
-        target.on_change = source.on_change.clone();
     }
 }
 
@@ -229,10 +215,6 @@ fn non_empty_command(value: Option<&str>) -> Option<&str> {
 
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
-}
-
-fn is_default_debounce_ms(value: &u64) -> bool {
-    *value == DEFAULT_DEBOUNCE_MS
 }
 
 fn spawn_transition_commands(
@@ -530,34 +512,6 @@ mod tests {
             commands_for_transition(Status::Running, Status::Waiting, &config),
             vec!["change-command".to_string()]
         );
-    }
-
-    #[test]
-    fn applies_profile_overrides() {
-        let mut config = StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("global".to_string()),
-            ..Default::default()
-        };
-        let override_config = StatusHookConfigOverride {
-            enabled: Some(false),
-            on_waiting: Some("profile".to_string()),
-            ..Default::default()
-        };
-        apply_status_hook_overrides(&mut config, &override_config);
-        assert!(!config.enabled);
-        assert_eq!(config.on_waiting.as_deref(), Some("profile"));
-    }
-
-    #[test]
-    fn applies_debounce_profile_override() {
-        let mut config = StatusHookConfig::default();
-        let override_config = StatusHookConfigOverride {
-            debounce_ms: Some(500),
-            ..Default::default()
-        };
-        apply_status_hook_overrides(&mut config, &override_config);
-        assert_eq!(config.debounce_ms, 500);
     }
 
     #[test]

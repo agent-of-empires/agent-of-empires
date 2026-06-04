@@ -194,6 +194,7 @@ mod config {
         let config = DiffConfig {
             default_branch: Some("main".to_string()),
             context_lines: 10,
+            split_view: false,
         };
 
         let serialized = toml::to_string(&config).unwrap();
@@ -201,5 +202,6 @@ mod config {
 
         assert_eq!(config.default_branch, deserialized.default_branch);
         assert_eq!(config.context_lines, deserialized.context_lines);
+        assert_eq!(config.split_view, deserialized.split_view);
     }
 }

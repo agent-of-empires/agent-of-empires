@@ -1,3 +1,4 @@
+/* eslint-disable no-control-regex -- this file's whole job is to match ESC sequences */
 // ANSI SGR parser for Bash tool output.
 //
 // claude-agent-acp forwards `\x1b[...m` color escapes from commands

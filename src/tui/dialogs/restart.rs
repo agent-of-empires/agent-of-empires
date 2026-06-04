@@ -13,6 +13,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::session::profile_config::resolve_config_or_warn;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{profile_cycler_spans, tool_cycler_spans};
 use crate::tui::styles::Theme;
 
@@ -35,6 +36,11 @@ pub struct RestartDialog {
     tool_index: usize,
     /// 0 = profile, 1 = tool.
     focused_field: usize,
+    profile_selector_area: Rect,
+    tool_selector_area: Rect,
+    /// Which selector row the mouse is over, for the hover highlight.
+    /// Visual only; never moves keyboard `focused_field`.
+    hover: HoverState,
 }
 
 impl RestartDialog {
@@ -63,6 +69,60 @@ impl RestartDialog {
             profile_index,
             tool_index,
             focused_field: 0,
+            profile_selector_area: Rect::default(),
+            tool_selector_area: Rect::default(),
+            hover: HoverState::default(),
+        }
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RestartData>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if self.profile_selector_area.contains(pos) {
+            self.focused_field = 0;
+            if !self.available_profiles.is_empty() {
+                self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
+                // Mirror keyboard cycling: when the profile changes,
+                // re-resolve the tool default so the picker updates too.
+                self.sync_tool_from_profile();
+            }
+            return Some(DialogResult::Continue);
+        }
+        if self.tool_selector_area.contains(pos) {
+            self.focused_field = 1;
+            if !self.available_tools.is_empty() {
+                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
+            }
+            return Some(DialogResult::Continue);
+        }
+        None
+    }
+
+    /// Highlight the selector row under the cursor without moving the
+    /// focused field. Click commits via `handle_click`; see
+    /// `ConfirmDialog::handle_hover` for the rationale (mouse drift
+    /// between the user reading the dialog and hitting a keystroke must
+    /// not silently shift which field that key targets). Returns `true`
+    /// when the highlighted row changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(
+            col,
+            row,
+            &[self.profile_selector_area, self.tool_selector_area],
+        )
+    }
+
+    /// Re-resolve the default tool for the currently selected profile
+    /// and snap `tool_index` accordingly, matching the keyboard's
+    /// "cycle profile -> auto-pick its default_tool" behavior.
+    fn sync_tool_from_profile(&mut self) {
+        let Some(profile) = self.selected_profile().map(String::from) else {
+            return;
+        };
+        let cfg = resolve_config_or_warn(&profile);
+        if let Some(default_tool) = cfg.session.default_tool.as_ref() {
+            if let Some(idx) = self.available_tools.iter().position(|t| t == default_tool) {
+                self.tool_index = idx;
+            }
         }
     }
 
@@ -194,7 +254,7 @@ impl RestartDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_area = super::centered_rect(area, 54, 14);
         frame.render_widget(Clear, dialog_area);
 
@@ -242,8 +302,17 @@ impl RestartDialog {
         frame.render_widget(Paragraph::new(current_tool_line), chunks[2]);
 
         self.render_profile_selector(frame, chunks[4], theme);
+        self.profile_selector_area = chunks[4];
         self.render_tool_selector(frame, chunks[5], theme);
+        self.tool_selector_area = chunks[5];
         self.render_hints(frame, chunks[7], theme);
+
+        if let Some(rect) = self
+            .hover
+            .current_in(&[self.profile_selector_area, self.tool_selector_area])
+        {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 
     /// Profile picker, rendered via the shared `profile_cycler_spans` so the
@@ -462,6 +531,24 @@ mod tests {
             d.handle_key(key(KeyCode::Char('x'))),
             DialogResult::Continue
         ));
+    }
+
+    #[test]
+    fn hover_highlights_selector_without_moving_focus() {
+        // Stage selector rects manually; the real ones come from render().
+        let mut d = RestartDialog::new("S", "default", "claude", profiles(), tools());
+        d.profile_selector_area = Rect::new(2, 4, 50, 1);
+        d.tool_selector_area = Rect::new(2, 5, 50, 1);
+        assert_eq!(d.focused_field, 0);
+
+        // Over the tool row: highlight it, focus unchanged.
+        assert!(d.handle_hover(5, 5));
+        assert_eq!(d.hover.current(), Some(d.tool_selector_area));
+        assert_eq!(d.focused_field, 0, "hover must not move the focused field");
+
+        // Off both rows clears the highlight.
+        assert!(d.handle_hover(99, 99));
+        assert_eq!(d.hover.current(), None);
     }
 
     #[test]

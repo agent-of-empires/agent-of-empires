@@ -23,6 +23,10 @@ jobs:
   validate:
     name: Validate Version
     runs-on: ubuntu-latest
+    # Required-reviewer gate. Pauses every release (tag push or manual
+    # dispatch) until njbrake approves in the Actions UI. The whole pipeline
+    # waits here, so no build compute or release publish runs without sign-off.
+    environment: release
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -55,6 +59,18 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: validate
     runs-on: ${{ matrix.os }}
+    # Linux jobs build inside manylinux_2_28 containers (AlmaLinux 8 base,
+    # glibc 2.28) so the released binary runs on every common server distro
+    # from RHEL 8 / Ubuntu 20.04 / Debian 11 / Amazon Linux 2 forward, instead
+    # of failing on anything older than ubuntu-24.04's glibc 2.39. macOS jobs
+    # leave `matrix.container` unset and run directly on the runner host.
+    # See issue #1578 and Kobzol's "Building Rust binaries in CI that work
+    # with older GLIBC" for context. If the manylinux base is ever bumped,
+    # bump LINUX_GLIBC_FLOOR below, MIN_GLIBC in scripts/install.sh, and the
+    # Prerequisites note in docs/installation.md in the same PR.
+    container: ${{ matrix.container }}
+    env:
+      LINUX_GLIBC_FLOOR: '2.28'
     strategy:
       fail-fast: false
       matrix:
@@ -67,9 +83,14 @@ jobs:
             name: aoe-darwin-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
             name: aoe-linux-amd64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            # GitHub-hosted arm64 runner (free for public repos since 2025-08).
+            # Building natively here means we don't need a cross-toolchain
+            # inside the container.
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
             name: aoe-linux-arm64
 
     steps:
@@ -78,7 +99,32 @@ jobs:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
 
-      - name: Setup Node.js
+      - name: Install container build dependencies (Linux)
+        if: matrix.container != ''
+        run: |
+          # manylinux_2_28 is AlmaLinux 8 (dnf-based). The image ships gcc,
+          # binutils, make, and core perl already; we add git for cargo's
+          # git deps, xz for tarball decompression, and three perl pieces
+          # that AlmaLinux 8's minimal perl install does NOT include but
+          # this workflow needs:
+          #   perl-IPC-Cmd     - openssl-src Configure step (config.pm)
+          #   perl-Time-Piece  - openssl-src Makefile.in line 37
+          #   perl-Digest-SHA  - provides the `shasum` command used to
+          #                      write the .sha256 file in Package step
+          # All three are in Ubuntu's perl-base by default, which is why
+          # the previous ubuntu-latest runner build didn't trip on any
+          # of them. FindBin and other standard Perl modules are in the
+          # base `perl` package on AlmaLinux 8, no separate install.
+          dnf install -y --setopt=install_weak_deps=False \
+            git curl tar gzip xz \
+            perl-IPC-Cmd perl-Time-Piece perl-Digest-SHA
+          # Node 22 via NodeSource. Node 22 requires glibc 2.28+, which is
+          # exactly what manylinux_2_28 ships, so this resolves cleanly.
+          curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+          dnf install -y nodejs
+
+      - name: Setup Node.js (macOS)
+        if: matrix.container == ''
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
@@ -87,22 +133,36 @@ jobs:
         run: cd web && npm install && npm run build
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Build
+        run: cargo build --release --features serve --target ${{ matrix.target }}
+
+      - name: Verify Linux binary glibc floor
+        if: matrix.container != ''
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          # Hard CI guard against the same regression that produced #1578:
+          # if the binary ever requires GLIBC symbols newer than the
+          # manylinux base ships, fail the release before publishing.
+          # objdump ships in binutils, already present in manylinux_2_28.
+          BIN="target/${{ matrix.target }}/release/aoe"
+          REQUIRED=$(objdump -T "$BIN" \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+              | sed 's/GLIBC_//' \
+              | sort -uV \
+              | tail -1)
+          echo "Highest GLIBC symbol required: ${REQUIRED:-<none>}"
+          echo "Configured floor:              ${LINUX_GLIBC_FLOOR}"
+          if [ -z "$REQUIRED" ]; then
+              echo "::warning::No GLIBC symbols found; binary may be statically linked"
+              exit 0
           fi
-          cargo build --release --features serve --target ${{ matrix.target }}
+          if [ "$(printf '%s\n%s\n' "$LINUX_GLIBC_FLOOR" "$REQUIRED" | sort -V | tail -1)" != "$LINUX_GLIBC_FLOOR" ]; then
+              echo "::error::Binary requires GLIBC_${REQUIRED} but floor is ${LINUX_GLIBC_FLOOR}. The container image or build deps likely changed; bump LINUX_GLIBC_FLOOR + scripts/install.sh MIN_GLIBC + docs/installation.md together, or fix the regression."
+              exit 1
+          fi
 
       - name: Package
         run: |
@@ -110,6 +170,11 @@ jobs:
           cp target/${{ matrix.target }}/release/aoe dist/${{ matrix.name }}
           cd dist
           tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          # shasum is a perl script that ships in macOS by default and is
+          # provided on Linux by perl-Digest-SHA (installed above for the
+          # manylinux jobs). Using shasum keeps the command identical on
+          # all four matrix entries; sha256sum would work on Linux but is
+          # not installed on macOS by default.
           shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact
@@ -135,7 +200,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@e0eafa9a0d485c37f97c0f7beb930a58a2facbac # v2.79.4
+        uses: taiki-e/install-action@6ed6112eb9893c58dd600eebccdf6e77ab7bfa9c # v2.79.12
         with:
           tool: git-cliff
 

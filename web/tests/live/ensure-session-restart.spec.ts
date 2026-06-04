@@ -127,6 +127,15 @@ base.describe("ensure_session restart flow", () => {
         },
       });
 
+      // Delay /ensure so Playwright reliably observes the "pending"
+      // placeholder. Without this the live backend can resolve the
+      // restart before the assertion's first retry, and the placeholder
+      // mounts + unmounts inside a single frame.
+      await page.route("**/api/sessions/*/ensure", async (route) => {
+        await new Promise((r) => setTimeout(r, 2000));
+        await route.continue();
+      });
+
       await page.goto(`${serve.baseUrl}/`);
       const sessionButton = page
         .getByRole("link")

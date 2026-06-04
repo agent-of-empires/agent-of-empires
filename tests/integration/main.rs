@@ -18,8 +18,10 @@ mod hooks_config;
 mod migration_pipeline;
 mod parallel_capture;
 mod profile_management;
+mod recovery_hook_timeout;
 mod repo_config;
 mod sandbox_integration;
+mod session_id_acquisition;
 mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;
@@ -28,10 +30,13 @@ mod update_command;
 mod worktree_integration;
 
 #[cfg(feature = "serve")]
-mod cockpit_acp_smoke;
+mod acp_smoke;
+
+#[cfg(feature = "serve")]
+mod acp_session_delete;
 
 #[cfg(all(feature = "serve", debug_assertions))]
-mod cockpit_midturn_resume;
+mod acp_midturn_resume;
 
 #[cfg(all(feature = "serve", debug_assertions))]
-mod cockpit_silent_orphan;
+mod acp_silent_orphan;

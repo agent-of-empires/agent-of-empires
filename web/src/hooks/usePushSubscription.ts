@@ -119,7 +119,6 @@ export function usePushSubscription() {
     // refresh() is the initial-mount fetch; setState-in-effect is the
     // correct pattern here (nothing external to subscribe to, just a
     // one-shot async read of feature availability + server status).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh();
   }, [refresh]);
 

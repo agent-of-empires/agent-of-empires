@@ -18,7 +18,7 @@ const SPLIT_STORAGE_KEY = "aoe-split-ratio";
 const RIGHT_PANEL_KEY = "aoe-right-collapsed";
 
 async function stubQuotaForKey(page: Page, key: string) {
-  await page.addInitScript(({ key }) => {
+  await page.addInitScript(({ key: _key }) => {
     (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor =
       new Set();
     const original = Storage.prototype.setItem;

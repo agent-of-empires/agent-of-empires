@@ -345,7 +345,7 @@ pub struct PushState {
 /// URL but does not require deliverability; major push services do not
 /// validate this for reachability in practice. We use the project's
 /// public URL so providers that do care have somewhere real to reach.
-pub const VAPID_SUBJECT: &str = "https://github.com/njbrake/agent-of-empires";
+pub const VAPID_SUBJECT: &str = "https://github.com/agent-of-empires/agent-of-empires";
 
 impl PushState {
     pub fn init(app_dir: &Path) -> anyhow::Result<Self> {
@@ -634,16 +634,16 @@ async fn fire_due_pushes(
             continue;
         }
 
-        // Cockpit approval pushes are dispatched immediately from
-        // `cockpit_event_listener` with their own tag and bypass the
+        // Acp approval pushes are dispatched immediately from
+        // `acp_event_listener` with their own tag and bypass the
         // TUI/web active-session suppression. If the session has any
-        // unresolved cockpit approvals, the user has already been
+        // unresolved structured view approvals, the user has already been
         // notified through that channel; a second status-change push
         // five seconds later for the same underlying event would just
         // be noise. See #1038.
         if event == NotificationEvent::Waiting
             && !app_state
-                .cockpit_event_store
+                .acp_event_store
                 .unresolved_approval_nonces(&instance_id)
                 .is_empty()
         {
@@ -698,8 +698,8 @@ async fn fire_due_pushes(
     }
 }
 
-/// Fire a one-shot push notification when a cockpit session's pending
-/// `ScheduleWakeup` actually triggers. Called from the cockpit event
+/// Fire a one-shot push notification when a structured view session's pending
+/// `ScheduleWakeup` actually triggers. Called from the structured view event
 /// listener when a `UserPromptSent` arrives while a `WakeupScheduled`
 /// is the most recent un-fired wakeup for the session. Bypasses the
 /// dwell/cooldown machinery the status-change consumer uses because

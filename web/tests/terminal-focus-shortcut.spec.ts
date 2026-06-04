@@ -41,9 +41,9 @@ async function focusKind(page: Page, kind: "agent" | "paired") {
       .focus();
     return;
   }
-  // Pick the visible paired panel: on desktop the inline copy
-  // (md:flex), on mobile the slide-in (md:hidden by default desktop).
-  // Filter by visibility so we hit whichever the user would actually use.
+  // The paired panel renders once (the inline desktop split copy); on
+  // mobile it is promoted into the single pane. Filter by visibility to
+  // hit whichever instance the user would actually use.
   const visiblePaired = page.locator('[data-term="paired"]:visible').first();
   await visiblePaired.locator("textarea").focus();
 }
@@ -65,21 +65,21 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("toggles between agent and paired with the right panel open", async ({
     page,
-  }, testInfo) => {
+  }, _testInfo) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(2);
+    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
 
     await focusKind(page, "agent");
     await expect.poll(() => focusedKind(page)).toBe("agent");
     await shot(page, "01-agent-focused.png");
 
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
     await shot(page, "02-paired-focused.png");
 
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
     await shot(page, "03-back-to-agent.png");
   });
@@ -95,24 +95,24 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // Semantic match for VSCode's Ctrl+` "open/focus the terminal": from
     // outside both panes, focus lands in paired (the secondary shell).
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
   test("expands collapsed right panel and focuses paired (latch)", async ({
     page,
-  }, testInfo) => {
+  }, _testInfo) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
 
-    await page.keyboard.press("Control+Alt+b");
+    await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(0);
     await shot(page, "04-collapsed.png");
 
     await focusKind(page, "agent");
-    await page.keyboard.press("Control+`");
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(2);
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
     await expect.poll(() => focusedKind(page)).toBe("paired");
     await shot(page, "05-expanded-paired-focused.png");
   });
@@ -137,7 +137,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     // state. focusSelf in PairedTerminal can't find a textarea, so the
     // listener calls setPendingTerminalFocus("paired").
     await focusKind(page, "agent");
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
 
     // Within 3s the ensureTerminal mock returns, ready flips true,
     // the consume-on-ready effect fires, focus lands in paired.
@@ -166,7 +166,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     // Agent terminal still mounted as "Starting session..." so its xterm
     // textarea doesn't exist yet. Press Cmd+` → target=agent → listener
     // sets the pending latch.
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
 
     // ensureSession resolves, ensureState flips to ready, consume effect
     // fires, focus lands on agent.
@@ -175,7 +175,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("with diff viewer open, Cmd+` to agent closes the diff", async ({
     page,
-  }, testInfo) => {
+  }, _testInfo) => {
     await mockTerminalApis(page);
     // Provide one file in the diff list. Don't mock the file content
     // endpoint — DiffFileViewer can render an error state and the test
@@ -212,7 +212,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("paired");
 
     // Press Cmd+` → handler clears selectedFilePath, then rAF-dispatches.
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
     await shot(page, "07-after-toggle-agent.png");
   });
@@ -225,7 +225,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // 11 toggles total = odd flips from agent → paired.
     for (let i = 0; i < 11; i++) {
-      await page.keyboard.press("Control+`");
+      await page.keyboard.press("ControlOrMeta+`");
     }
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
@@ -240,7 +240,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
       page.locator('[data-term="agent"]').first(),
     ).toHaveClass(/term-focused/);
 
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     // The visible paired panel should pick up term-focused.
     await expect(
       page.locator('[data-term="paired"]:visible').first(),
@@ -262,21 +262,18 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
 
-    // Right panel starts collapsed on mobile; expand it via the existing
-    // shortcut so the slide-in mounts.
-    await page.keyboard.press("Control+Alt+b");
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(2);
-
-    // Focus the visible paired (mobile slide-in). On a mobile viewport
-    // the desktop-inline copy has md:flex hidden, so :visible filters to
-    // the slide-in instance.
-    await focusKind(page, "paired");
+    // Single full-viewport pane on mobile (#1452). Cmd+` promotes and
+    // focuses the paired shell, mounting it lazily; there is exactly one
+    // paired instance, no slide-in copy.
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
     await expect.poll(() => focusedKind(page)).toBe("paired");
 
-    await page.keyboard.press("Control+`");
+    // Pressing again returns to the agent terminal.
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
 
-    await page.keyboard.press("Control+`");
+    await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 });

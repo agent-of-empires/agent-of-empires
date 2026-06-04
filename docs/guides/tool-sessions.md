@@ -87,8 +87,8 @@ Three ways to open a tool, in roughly the order you'll grow into them:
 Once you're in tool preview mode:
 
 - `Enter` attaches you to the tool full-screen.
-- The hotkey **toggles** preview off and back to the agent view.
-- `Esc`, `;`, or `t` returns to the agent view.
+- The hotkey **toggles** preview off and back to the structured view.
+- `Esc`, `;`, or `t` returns to the structured view.
 
 Once you're attached:
 
@@ -146,7 +146,7 @@ hotkey = "Alt+g"
 
 Now `Alt+g` on any agent session previews lazygit running against that
 session's worktree; pressing `Alt+g` a second time toggles back to the
-agent view. Each worktree has its own staged hunks.
+structured view. Each worktree has its own staged hunks.
 
 ### File browser with a custom config
 

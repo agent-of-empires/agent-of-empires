@@ -66,7 +66,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s1"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={false}
       />,
     );
@@ -78,7 +77,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s2"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={false}
       />,
     );
@@ -93,7 +91,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s1"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
       />,
     );
@@ -105,7 +102,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s2"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
       />,
     );
@@ -122,7 +118,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s1"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={2}
       />,
@@ -135,7 +130,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s2"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={2}
       />,
@@ -149,7 +143,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s3"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={1}
       />,
@@ -167,7 +160,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s1"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={2}
       />,
@@ -180,7 +172,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s2"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={2}
       />,
@@ -194,7 +185,6 @@ describe("TerminalSessionStack", () => {
       <TerminalSessionStack
         activeSessionId="s3"
         sessions={sessions}
-        cockpitMasterEnabled={false}
         persistent={true}
         maxPersistentTerminals={2}
       />,

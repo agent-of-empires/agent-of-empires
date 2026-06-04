@@ -140,12 +140,13 @@ fn test_container_lifecycle() {
     let config = containers::ContainerConfig {
         working_dir: "/workspace".to_string(),
         volumes: vec![],
-
         anonymous_volumes: vec![],
+        named_ignore_volumes: vec![],
         environment: vec![],
         cpu_limit: None,
         memory_limit: None,
         port_mappings: vec![],
+        ..Default::default()
     };
 
     let container_id = container.create(&config).unwrap();
@@ -182,12 +183,13 @@ fn test_container_force_remove() {
     let config = containers::ContainerConfig {
         working_dir: "/workspace".to_string(),
         volumes: vec![],
-
         anonymous_volumes: vec![],
+        named_ignore_volumes: vec![],
         environment: vec![],
         cpu_limit: None,
         memory_limit: None,
         port_mappings: vec![],
+        ..Default::default()
     };
 
     container.create(&config).unwrap();

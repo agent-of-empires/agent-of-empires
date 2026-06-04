@@ -1,14 +1,14 @@
-// Per-agent classifier profiles for the cockpit's frontend tool-card
-// dispatch. Mirrors src/cockpit/agent_profiles.rs (server-side gates);
+// Per-agent classifier profiles for the structured view's frontend tool-card
+// dispatch. Mirrors src/acp/agent_profiles.rs (server-side gates);
 // this side covers the React presentation: which tool names map to
-// which cards, which claude-only cards (TodoWrite, Skill, Schedule)
+// which cards, which specialised cards (TodoWrite, Skill, Schedule)
 // should fire for this agent, which MCP prefixes to recognise.
 //
 // Profile data is conservative. Where the adapter's actual tool surface
 // hasn't been verified hands-on, the entry is omitted rather than
 // guessed; the user sees a generic tool card instead of the wrong
 // specialised one. Adding a new agent: append an entry below, mirror
-// in src/cockpit/agent_profiles.rs, document in docs/cockpit/multi-agent.md.
+// in src/acp/agent_profiles.rs, document in docs/structured-view/multi-agent.md.
 
 /** Card categories the renderer dispatches to. Keep aligned with the
  *  switch in `ToolCards.renderToolCard`. */
@@ -25,13 +25,13 @@ export interface AgentProfile {
   /** Registry key, matches `AgentRegistry` on the server side
    *  (e.g. `claude`, `codex`, `opencode`, `gemini`). */
   key: string;
-  /** Capability gates for claude-specific specialised cards. When a
+  /** Capability gates for specialised cards. When a
    *  capability is `false`, the matching classifier short-circuits
    *  before consulting tool title heuristics, so coincidental tool
    *  names on other agents don't render a TodoCard / SkillCard /
    *  ScheduleCard. */
   capabilities: {
-    /** Claude's `TodoWrite` (kind=think, title=`"Update TODOs: ..."`). */
+    /** Agent todo tools, e.g. Claude `TodoWrite` or OpenCode `todowrite`. */
     todos: boolean;
     /** Claude's `Skill` (kind=other, title=`"Skill"`). */
     skills: boolean;
@@ -41,12 +41,18 @@ export interface AgentProfile {
      *  Currently informational; subagent indentation only renders when
      *  `parentMetaNamespaces` is also non-empty. */
     subagents: boolean;
+    /** Whether the mode picker may fall back to Claude's hardcoded
+     *  Default/Plan/AcceptEdits/Yolo taxonomy when the agent advertises
+     *  no modes through either the config-option channel or ACP
+     *  SessionModeState. Claude-family only; other agents render no mode
+     *  picker rather than a phantom vocabulary they reject (#1764). */
+    legacyModeFallback: boolean;
   };
   /** `_meta.<namespace>.parentToolUseId` lookup order for subagent
    *  child linkage. Empty when the agent's parent-child linkage isn't
-   *  verified; the cockpit doesn't guess a namespace. */
+   *  verified; the structured view doesn't guess a namespace. */
   parentMetaNamespaces: string[];
-  /** MCP tool-name prefixes the cockpit recognises. Claude-agent-acp
+  /** MCP tool-name prefixes the structured view recognises. Claude-agent-acp
    *  wraps MCP calls as `mcp__server__verb`; other adapters may use
    *  the same convention or not advertise MCP at all. */
   mcpPrefixes: string[];
@@ -61,15 +67,12 @@ export interface AgentProfile {
    *  should route to that card when the wire `tool.kind` lands as
    *  `"other"` or doesn't otherwise indicate the right surface. */
   aliases: Partial<Record<CardKind, string[]>>;
-  /** Title equality checks for claude's specialised cards. The
+  /** Title equality checks for Claude's specialised cards. The
    *  current claude-agent-acp behavior threads the raw tool name
    *  through the `Other` arm of its title-rewriter; other agents that
    *  happen to emit the same name shouldn't fire the card unless
    *  their profile lists it too. */
   specialTitles: {
-    /** Prefixes matched against the wire `tool.name` for TodoWrite
-     *  classification (claude emits `"Update TODOs: ..."`). */
-    todoPrefixes: string[];
     /** Lowercased title values matched for the Skill card. */
     skillNames: string[];
     /** Exact title values matched for the Schedule cards. */
@@ -79,13 +82,12 @@ export interface AgentProfile {
 
 const CLAUDE: AgentProfile = {
   key: "claude",
-  capabilities: { todos: true, skills: true, wakeup: true, subagents: true },
+  capabilities: { todos: true, skills: true, wakeup: true, subagents: true, legacyModeFallback: true },
   parentMetaNamespaces: ["claudeCode"],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/clear"],
   aliases: {},
   specialTitles: {
-    todoPrefixes: ["Update TODOs"],
     skillNames: ["skill", "claude-skill"],
     scheduleNames: ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
   },
@@ -98,7 +100,7 @@ const CLAUDE_CODE: AgentProfile = {
 
 const CODEX: AgentProfile = {
   key: "codex",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false },
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/new"],
@@ -107,16 +109,12 @@ const CODEX: AgentProfile = {
     edit: ["apply_patch"],
     read: ["view_file", "read_file", "read"],
   },
-  specialTitles: {
-    todoPrefixes: [],
-    skillNames: [],
-    scheduleNames: [],
-  },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const OPENCODE: AgentProfile = {
   key: "opencode",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: true },
+  capabilities: { todos: true, skills: false, wakeup: false, subagents: true, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/new"],
@@ -128,16 +126,12 @@ const OPENCODE: AgentProfile = {
     fetch: ["webfetch"],
     think: ["task"],
   },
-  specialTitles: {
-    todoPrefixes: [],
-    skillNames: [],
-    scheduleNames: [],
-  },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const GEMINI: AgentProfile = {
   key: "gemini",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false },
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
@@ -148,31 +142,27 @@ const GEMINI: AgentProfile = {
     search: ["grep", "glob"],
     fetch: ["web_fetch"],
   },
-  specialTitles: {
-    todoPrefixes: [],
-    skillNames: [],
-    scheduleNames: [],
-  },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const VIBE: AgentProfile = {
   key: "vibe",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false },
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { todoPrefixes: [], skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const PI: AgentProfile = {
   key: "pi",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false },
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { todoPrefixes: [], skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const AOE_AGENT: AgentProfile = {
@@ -185,12 +175,12 @@ const AOE_AGENT: AgentProfile = {
  *  through the generic card path rather than crashing. */
 export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   key: "default",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false },
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
   aliases: {},
-  specialTitles: { todoPrefixes: [], skillNames: [], scheduleNames: [] },
+  specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
 const PROFILES: Record<string, AgentProfile> = {
@@ -216,7 +206,7 @@ export function resolveAgentProfile(
 /** True when `text`'s trimmed body matches one of `aliases`, either as
  *  the entire prompt or as a `<alias> <args>` invocation. Mirror of the
  *  server-side `AgentProfile::is_clear_command` in
- *  `src/cockpit/agent_profiles.rs` so the cockpit's combined-mode drain
+ *  `src/acp/agent_profiles.rs` so the structured view's combined-mode drain
  *  splits at exactly the same boundary the server detects as a session
  *  clear (#1356). */
 export function isClearAlias(

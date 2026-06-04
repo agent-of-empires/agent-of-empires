@@ -5,10 +5,48 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use super::error::{GitError, Result};
 use super::open_repo_at;
 use super::template::{resolve_template, TemplateVars};
+
+/// Strip embedded credentials from URL-style substrings before stderr
+/// gets logged or surfaced to the user. Git fetch errors typically echo
+/// the remote URL, so a misconfigured `https://user:token@host/repo`
+/// would otherwise leak the token into `debug.log` and into the wizard
+/// toast.
+///
+/// Matches `<scheme>://<userinfo>@<host>` patterns and replaces the
+/// userinfo (everything between `://` and `@`) with `<redacted>`.
+/// Schemes other than the common `http(s)`/`ssh`/`git+ssh` still match
+/// because git accepts arbitrary URL schemes.
+fn sanitize_remote_credentials(s: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"([a-zA-Z][a-zA-Z0-9+\-.]*://)[^/\s@]+@").expect("static regex always compiles")
+    });
+    re.replace_all(s, "${1}<redacted>@").into_owned()
+}
+
+/// Classify a failed `git worktree add` into a typed error.
+///
+/// The branch-already-checked-out case (git prints `'<branch>' is already
+/// used by worktree at '<path>'`, or `already checked out at '<path>'` on
+/// older git) becomes a clean `BranchAlreadyCheckedOut` that names the
+/// branch and drops the raw stderr (including the other worktree's path).
+/// Everything else stays `WorktreeCommandFailed`, with any credentialed
+/// remote URL redacted before it can be surfaced.
+fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
+    let lower = combined.to_ascii_lowercase();
+    if lower.contains("already used by worktree") || lower.contains("already checked out at") {
+        GitError::BranchAlreadyCheckedOut(branch.to_string())
+    } else {
+        GitError::WorktreeCommandFailed(sanitize_remote_credentials(combined))
+    }
+}
 
 /// Remote name used as a fallback when no candidate remote can be picked
 /// from the local refs. Real selection happens in
@@ -22,6 +60,20 @@ pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub is_detached: bool,
+}
+
+/// Result of a `git fetch` attempt initiated by `fetch_branch`. `Ok`
+/// indicates the fetch ran to completion (the remote tip may or may
+/// not have advanced; we do not parse fetch output to distinguish).
+/// The non-`Ok` variants carry a short description that callers
+/// surface to the user as a warning so they know the new worktree may
+/// be starting from a stale local ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    Ok,
+    Failed(String),
+    Skipped(String),
+    TimedOut,
 }
 
 /// Resolved default branch with the remote it came from, if any.
@@ -171,11 +223,16 @@ impl GitWorktree {
         Some(git_or_bare_dir.to_path_buf())
     }
 
-    /// Fetch a specific branch from a remote. Fails silently on network errors
-    /// or missing remotes (logs a warning), so callers can fall back to local state.
-    /// Stdin is piped to null to prevent SSH passphrase prompts from hanging.
-    /// Times out after 10 seconds.
-    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<()> {
+    /// Fetch a specific branch from a remote. Returns a `FetchOutcome`
+    /// describing whether the fetch ran successfully, failed, was
+    /// skipped (e.g. spawn error), or timed out. Callers that build a
+    /// warnings vector for the user (see `create_worktree`) should
+    /// route non-`Ok` outcomes into it so the user knows the new
+    /// worktree may be starting from a stale local ref.
+    ///
+    /// Stdin is piped to null to prevent SSH passphrase prompts from
+    /// hanging. Times out after 10 seconds.
+    pub fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
         let mut child = match std::process::Command::new("git")
             .args(["fetch", remote, branch])
             .current_dir(&self.repo_path)
@@ -193,7 +250,7 @@ impl GitWorktree {
                     error = %e,
                     "git fetch spawn failed"
                 );
-                return Ok(());
+                return FetchOutcome::Skipped(format!("spawn failed: {e}"));
             }
         };
 
@@ -206,15 +263,21 @@ impl GitWorktree {
                 Ok(Some(status)) => {
                     let elapsed = start.elapsed();
                     if !status.success() {
+                        let mut msg = String::new();
                         if let Some(mut stderr) = child.stderr.take() {
-                            let mut msg = String::new();
                             let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
-                            tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} failed: {}", msg.trim());
                         }
-                    } else {
-                        tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", elapsed);
+                        let sanitized = sanitize_remote_credentials(msg.trim());
+                        tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} failed: {sanitized}");
+                        let detail = if sanitized.is_empty() {
+                            format!("git fetch exited with {status}")
+                        } else {
+                            sanitized
+                        };
+                        return FetchOutcome::Failed(detail);
                     }
-                    return Ok(());
+                    tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", elapsed);
+                    return FetchOutcome::Ok;
                 }
                 Ok(None) => {
                     if start.elapsed() > timeout {
@@ -224,16 +287,88 @@ impl GitWorktree {
                             "git fetch {remote}/{branch} timed out after {}s",
                             timeout.as_secs()
                         );
-                        return Ok(());
+                        return FetchOutcome::TimedOut;
                     }
                     std::thread::sleep(poll_interval);
                 }
                 Err(e) => {
                     tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} error: {e}");
-                    return Ok(());
+                    return FetchOutcome::Failed(format!("wait error: {e}"));
                 }
             }
         }
+    }
+
+    /// Format a user-visible warning describing a non-`Ok`
+    /// `FetchOutcome` and push it onto `warnings`. No-op for
+    /// `FetchOutcome::Ok`. Used by `create_worktree` so fetch failures
+    /// reach the wizard toast / CLI stderr / TUI dialog via the
+    /// existing post-checkout warning surface.
+    fn record_fetch_warning(
+        &self,
+        warnings: &mut Vec<String>,
+        outcome: &FetchOutcome,
+        remote: &str,
+        branch: &str,
+    ) {
+        let detail = match outcome {
+            FetchOutcome::Ok => return,
+            FetchOutcome::Failed(msg) => msg.clone(),
+            FetchOutcome::Skipped(msg) => msg.clone(),
+            FetchOutcome::TimedOut => "timed out after 10s".to_string(),
+        };
+        warnings.push(format!(
+            "git fetch {remote} {branch} failed for {repo}: {detail}",
+            repo = self.repo_path.display()
+        ));
+    }
+
+    /// Pick the remote with the freshest copy of `branch_name`. Walks
+    /// every configured remote, looks up
+    /// `refs/remotes/<remote>/<branch_name>`, and returns the remote
+    /// whose ref has the most recent commit time. Ties break in favor
+    /// of `origin`, then alphabetically by remote name.
+    ///
+    /// Returns `None` when no configured remote tracks `branch_name`.
+    ///
+    /// Used by `create_worktree` for the explicit-base-branch arm so a
+    /// fork plus `upstream` layout (issue #1029) fetches the user's
+    /// requested base from the canonical remote rather than a stale
+    /// `origin`. The autodetect arm continues to use
+    /// `detect_default_branch_info`, which scores `main`/`master`
+    /// across remotes with HEAD-ancestry filtering.
+    pub fn pick_remote_for_branch(&self, branch_name: &str) -> Option<String> {
+        let repo = open_repo_at(&self.repo_path).ok()?;
+        let remotes = repo.remotes().ok()?;
+        let mut best: Option<(String, i64)> = None;
+        for remote in remotes.iter().filter_map(|r| r.ok().flatten()) {
+            let full = format!("{remote}/{branch_name}");
+            let Ok(b) = repo.find_branch(&full, git2::BranchType::Remote) else {
+                continue;
+            };
+            let Ok(commit) = b.get().peel_to_commit() else {
+                continue;
+            };
+            let t = commit.time().seconds();
+            let take = match &best {
+                None => true,
+                Some((cur_name, cur_t)) => {
+                    if t != *cur_t {
+                        t > *cur_t
+                    } else if cur_name == FETCH_REMOTE {
+                        false
+                    } else if remote == FETCH_REMOTE {
+                        true
+                    } else {
+                        remote < cur_name.as_str()
+                    }
+                }
+            };
+            if take {
+                best = Some((remote.to_string(), t));
+            }
+        }
+        best.map(|(name, _)| name)
     }
 
     /// Detect the default branch name by short name only. Wraps
@@ -367,15 +502,30 @@ impl GitWorktree {
         // Fetch from remote so the worktree starts from the latest state.
         // For new branches, fetch the base branch (default branch unless the
         // caller specified one) to use as the base. For existing branches,
-        // fetch the branch itself. Fails silently on network errors, falling
-        // back to local refs.
+        // fetch the branch itself. Fetch failures are surfaced as warnings
+        // via `record_fetch_warning` so the user knows the new worktree may
+        // be starting from a stale local ref instead of failing silently.
         let t = std::time::Instant::now();
-        let resolved_base: Option<(String, Option<String>)> = if create_branch {
+        // (name, remote, explicit) — `explicit` flips the lookup chain
+        // below from "fall through to HEAD" to "return BranchNotFound"
+        // when neither a remote-tracking ref nor a local branch with the
+        // user-typed name exists. A typo in `--base-branch` should
+        // surface as an error, not as a session quietly anchored to a
+        // bystander commit.
+        let resolved_base: Option<(String, Option<String>, bool)> = if create_branch {
             match base_branch {
                 Some(b) if !b.trim().is_empty() => {
                     let base = b.trim().to_string();
-                    self.fetch_branch(FETCH_REMOTE, &base)?;
-                    Some((base, None))
+                    // Apply canonical-remote scoring to explicit base
+                    // branches too. On a fork plus `upstream` layout,
+                    // `upstream/<base>` is usually the freshest copy;
+                    // hardcoding `origin/<base>` lands new branches on
+                    // the stale fork tip (issue #1511 / #1029).
+                    let remote = self.pick_remote_for_branch(&base);
+                    let fetch_remote = remote.as_deref().unwrap_or(FETCH_REMOTE);
+                    let outcome = self.fetch_branch(fetch_remote, &base);
+                    self.record_fetch_warning(&mut warnings, &outcome, fetch_remote, &base);
+                    Some((base, remote, true))
                 }
                 _ => {
                     let info = self
@@ -385,12 +535,14 @@ impl GitWorktree {
                             remote: None,
                         });
                     let fetch_remote = info.remote.as_deref().unwrap_or(FETCH_REMOTE);
-                    self.fetch_branch(fetch_remote, &info.name)?;
-                    Some((info.name, info.remote))
+                    let outcome = self.fetch_branch(fetch_remote, &info.name);
+                    self.record_fetch_warning(&mut warnings, &outcome, fetch_remote, &info.name);
+                    Some((info.name, info.remote, false))
                 }
             }
         } else {
-            self.fetch_branch(FETCH_REMOTE, branch)?;
+            let outcome = self.fetch_branch(FETCH_REMOTE, branch);
+            self.record_fetch_warning(&mut warnings, &outcome, FETCH_REMOTE, branch);
             None
         };
         tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
@@ -398,17 +550,22 @@ impl GitWorktree {
         let t = std::time::Instant::now();
         let repo = open_repo_at(&self.repo_path)?;
 
-        if let Some((base, base_remote)) = resolved_base {
+        if let Some((base, base_remote, explicit)) = resolved_base {
             // Branch from the picked remote's tip when the auto-detected
             // canonical remote isn't `origin` (issue #1029: fork+upstream
             // layouts). When the caller passed an explicit `--base-branch`,
             // try `origin/<base>` first to preserve historical behavior.
             // Falls back to a local branch with the same name (lets users
             // base off a teammate's local-only branch), then to HEAD,
-            // then to any local branch (bare repo with broken HEAD).
+            // then to any local branch (bare repo with broken HEAD), but
+            // only when the base came from autodetection. An explicit
+            // `--base-branch` that resolves to none of the above is a
+            // user-visible error: surfacing it as BranchNotFound keeps
+            // typos from silently producing a session anchored to a
+            // bystander commit.
             let primary_remote = base_remote.as_deref().unwrap_or(FETCH_REMOTE);
             let remote_ref = format!("{primary_remote}/{base}");
-            let commit_oid = repo
+            let direct_match = repo
                 .find_branch(&remote_ref, git2::BranchType::Remote)
                 .ok()
                 .and_then(|b| b.get().target())
@@ -428,23 +585,31 @@ impl GitWorktree {
                     repo.find_branch(&base, git2::BranchType::Local)
                         .ok()
                         .and_then(|b| b.get().target())
-                })
-                .or_else(|| {
-                    repo.head()
-                        .ok()
-                        .and_then(|h| h.peel_to_commit().ok())
-                        .map(|c| c.id())
-                })
-                .or_else(|| {
-                    repo.branches(Some(git2::BranchType::Local))
-                        .ok()
-                        .and_then(|mut branches| {
-                            branches.find_map(|b| b.ok().and_then(|(b, _)| b.get().target()))
-                        })
-                })
-                .ok_or_else(|| {
-                    GitError::WorktreeCommandFailed("No commits found to branch from".to_string())
-                })?;
+                });
+
+            let commit_oid = if let Some(oid) = direct_match {
+                oid
+            } else if explicit {
+                return Err(GitError::BranchNotFound(base));
+            } else {
+                repo.head()
+                    .ok()
+                    .and_then(|h| h.peel_to_commit().ok())
+                    .map(|c| c.id())
+                    .or_else(|| {
+                        repo.branches(Some(git2::BranchType::Local)).ok().and_then(
+                            |mut branches| {
+                                branches.find_map(|b| b.ok().and_then(|(b, _)| b.get().target()))
+                            },
+                        )
+                    })
+                    .ok_or_else(|| {
+                        GitError::WorktreeCommandFailed(
+                            "No commits found to branch from".to_string(),
+                        )
+                    })?
+            };
+
             let commit = repo.find_commit(commit_oid)?;
             repo.branch(branch, &commit, false)?;
         } else {
@@ -491,6 +656,11 @@ impl GitWorktree {
                 (true, false) => stderr,
                 (false, false) => format!("{stdout}\n{stderr}"),
             };
+            // Redact any credentialed remote URL before this text can reach
+            // the debug log or the client (via the warnings channel below or
+            // the error message). Idempotent, so the second pass inside
+            // `classify_worktree_add_failure` is a no-op.
+            let combined = sanitize_remote_credentials(&combined);
 
             // post-checkout hooks (e.g. pre-commit's hook-type=post-checkout
             // running uv-sync, npm install, etc.) can fail after git has
@@ -507,7 +677,7 @@ impl GitWorktree {
                 tracing::warn!(target: "git.worktree", "worktree create: {}", warning);
                 warnings.push(warning);
             } else {
-                return Err(GitError::WorktreeCommandFailed(combined));
+                return Err(classify_worktree_add_failure(&combined, branch));
             }
         }
 
@@ -712,7 +882,7 @@ impl GitWorktree {
             });
         }
 
-        for name_str in worktrees.iter().flatten() {
+        for name_str in worktrees.iter().filter_map(|r| r.ok().flatten()) {
             if let Ok(wt) = repo.find_worktree(name_str) {
                 if let Ok(path) = wt.path().canonicalize() {
                     entries.push(WorktreeEntry {
@@ -818,6 +988,67 @@ impl GitWorktree {
         Ok(())
     }
 
+    /// Whether a local branch `refs/heads/<branch>` exists in this repo.
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        let refname = format!("refs/heads/{branch}");
+        match super::command::run_git(
+            &self.repo_path,
+            ["show-ref", "--verify", "--quiet", &refname],
+        ) {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Move a managed worktree directory via `git worktree move`, which
+    /// relocates the checkout and updates the linked-worktree gitdir
+    /// metadata. A plain filesystem rename would leave git's bookkeeping
+    /// pointing at the old path, so always go through git here.
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+        if !from.exists() {
+            return Err(GitError::WorktreeNotFound(from.to_path_buf()));
+        }
+        if to.exists() {
+            return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
+        }
+        let from_str = from
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let to_str = to
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+
+        tracing::info!(target: "git.worktree",
+            from = %from.display(),
+            to = %to.display(),
+            "move_worktree: invoking `git worktree move`"
+        );
+        let output =
+            super::command::run_git(&self.repo_path, ["worktree", "move", from_str, to_str])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
+    /// Rename a local branch via `git branch -m`. Works while the branch is
+    /// checked out in a worktree (git updates that worktree's HEAD). Errors
+    /// if `old` does not exist or `new` already exists.
+    pub fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        tracing::info!(target: "git.worktree",
+            old, new,
+            repo = %self.repo_path.display(),
+            "rename_branch: invoking `git branch -m`"
+        );
+        let output = super::command::run_git(&self.repo_path, ["branch", "-m", old, new])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
     pub fn compute_path(&self, branch: &str, template: &str, session_id: &str) -> Result<PathBuf> {
         let repo_name = self
             .repo_path
@@ -840,7 +1071,7 @@ impl GitWorktree {
         let repo = open_repo_at(path)?;
         let head = repo.head()?;
 
-        if let Some(branch_name) = head.shorthand() {
+        if let Ok(branch_name) = head.shorthand() {
             Ok(branch_name.to_string())
         } else {
             Err(GitError::NotAGitRepo)
@@ -869,7 +1100,12 @@ fn collect_default_branch_candidates(repo: &git2::Repository) -> Vec<Candidate> 
         .remotes()
         .ok()
         .as_ref()
-        .map(|rs| rs.iter().flatten().map(String::from).collect())
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| r.ok().flatten())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut stated_defaults: Vec<(String, String)> = Vec::new();
@@ -878,7 +1114,7 @@ fn collect_default_branch_candidates(repo: &git2::Repository) -> Vec<Candidate> 
         let Ok(reference) = repo.find_reference(&head_ref_name) else {
             continue;
         };
-        let Some(target) = reference.symbolic_target() else {
+        let Ok(Some(target)) = reference.symbolic_target() else {
             continue;
         };
         let prefix = format!("refs/remotes/{remote}/");
@@ -1014,10 +1250,65 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use serial_test::serial;
     use tempfile::TempDir;
+
+    /// RAII guard that allows git's `file://` transport for this process and
+    /// any `git` subprocess it spawns, via `GIT_CONFIG_*` environment
+    /// injection. `git submodule update` blocks the file transport by
+    /// default (CVE-2022-39253), and `create_worktree` intentionally does
+    /// not override that, so the submodule fixture tests opt in here for the
+    /// production-side update. Restores the prior environment on drop.
+    ///
+    /// Every caller is `#[serial(submodule)]` so this permissive setting
+    /// never overlaps `test_create_worktree_skips_blocked_local_submodules`,
+    /// which depends on the default block.
+    struct AllowFileTransport {
+        prev_count: Option<String>,
+        prev_key: Option<String>,
+        prev_value: Option<String>,
+    }
+
+    impl AllowFileTransport {
+        fn set() -> Self {
+            let guard = Self {
+                prev_count: std::env::var("GIT_CONFIG_COUNT").ok(),
+                prev_key: std::env::var("GIT_CONFIG_KEY_0").ok(),
+                prev_value: std::env::var("GIT_CONFIG_VALUE_0").ok(),
+            };
+            // SAFETY: mutating the environment is unsafe in the 2024 edition
+            // because it can race with concurrent reads on other threads.
+            // The `#[serial(submodule)]` annotation on every caller, plus the
+            // fact that no other test reads these `GIT_CONFIG_*` vars, keeps
+            // this race-free in practice.
+            unsafe {
+                std::env::set_var("GIT_CONFIG_COUNT", "1");
+                std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
+                std::env::set_var("GIT_CONFIG_VALUE_0", "always");
+            }
+            guard
+        }
+    }
+
+    impl Drop for AllowFileTransport {
+        fn drop(&mut self) {
+            // SAFETY: see `AllowFileTransport::set`.
+            unsafe {
+                match &self.prev_count {
+                    Some(v) => std::env::set_var("GIT_CONFIG_COUNT", v),
+                    None => std::env::remove_var("GIT_CONFIG_COUNT"),
+                }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var("GIT_CONFIG_KEY_0", v),
+                    None => std::env::remove_var("GIT_CONFIG_KEY_0"),
+                }
+                match &self.prev_value {
+                    Some(v) => std::env::set_var("GIT_CONFIG_VALUE_0", v),
+                    None => std::env::remove_var("GIT_CONFIG_VALUE_0"),
+                }
+            }
+        }
+    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -1032,64 +1323,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    struct GitDaemonGuard {
-        child: std::process::Child,
-    }
-
-    impl Drop for GitDaemonGuard {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    fn pick_free_port() -> u16 {
-        TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    fn spawn_git_daemon(base_path: &Path, repo_name: &str) -> (GitDaemonGuard, String) {
-        let port = pick_free_port();
-        let child = std::process::Command::new("git")
-            .args([
-                "daemon",
-                "--reuseaddr",
-                "--export-all",
-                &format!("--base-path={}", base_path.display()),
-                "--listen=127.0.0.1",
-                &format!("--port={port}"),
-                base_path.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let guard = GitDaemonGuard { child };
-        let url = format!("git://127.0.0.1:{port}/{repo_name}");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let output = std::process::Command::new("git")
-                .args(["ls-remote", &url])
-                .output()
-                .unwrap();
-            if output.status.success() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "git daemon did not become ready for {url}:\nstdout: {}\nstderr: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        (guard, url)
     }
 
     fn setup_test_repo() -> (TempDir, git2::Repository) {
@@ -1581,7 +1814,7 @@ mod tests {
         let head_branch = repo
             .head()
             .ok()
-            .and_then(|h| h.shorthand().map(String::from))
+            .and_then(|h| h.shorthand().ok().map(String::from))
             .expect("HEAD should be a branch");
 
         let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
@@ -1639,15 +1872,15 @@ mod tests {
             .unwrap();
 
         // Try creating again at a different path but same branch - git won't
-        // allow two worktrees to check out the same branch.
+        // allow two worktrees to check out the same branch. This is the
+        // branch-already-checked-out case, so it maps to the typed
+        // BranchAlreadyCheckedOut error naming the branch.
         let wt_path2 = dir.path().join("fail-worktree-2");
         let result = git_wt.create_worktree("fail-branch", &wt_path2, false, None);
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("worktree command failed"),
-            "Expected WorktreeCommandFailed error, got: {err_msg}"
-        );
+        match result {
+            Err(GitError::BranchAlreadyCheckedOut(branch)) => assert_eq!(branch, "fail-branch"),
+            other => panic!("Expected BranchAlreadyCheckedOut error, got: {other:?}"),
+        }
     }
 
     // ---- Full worktree creation flow tests for regular repos ----
@@ -2445,15 +2678,88 @@ mod tests {
     // --- fetch_branch tests ---
 
     #[test]
-    fn test_fetch_branch_ok_when_no_remote() {
-        let (dir, _repo) = setup_test_repo();
-        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
-        // No remote configured, fetch should return Ok (silent failure)
-        assert!(git_wt.fetch_branch("origin", "main").is_ok());
+    fn test_sanitize_remote_credentials_redacts_https_userinfo() {
+        let s = "fatal: unable to access 'https://alice:supersecret@github.com/foo/bar.git/': 404";
+        let out = sanitize_remote_credentials(s);
+        assert!(!out.contains("supersecret"), "token leaked: {out}");
+        assert!(!out.contains("alice:"), "username leaked: {out}");
+        assert!(
+            out.contains("https://<redacted>@github.com/foo/bar.git/"),
+            "expected redacted URL, got: {out}"
+        );
     }
 
     #[test]
-    fn test_fetch_branch_ok_when_branch_missing_on_remote() {
+    fn test_sanitize_remote_credentials_redacts_ssh_userinfo() {
+        let s = "Could not read from remote ssh://git:tokenval@example.com:22/foo";
+        let out = sanitize_remote_credentials(s);
+        assert!(!out.contains("tokenval"), "token leaked: {out}");
+        assert!(out.contains("ssh://<redacted>@example.com:22/foo"));
+    }
+
+    #[test]
+    fn test_sanitize_remote_credentials_passes_through_when_no_userinfo() {
+        let s = "fatal: 'origin' does not appear to be a git repository";
+        assert_eq!(sanitize_remote_credentials(s), s);
+        let s2 = "fatal: unable to access 'https://github.com/foo/bar.git/'";
+        assert_eq!(sanitize_remote_credentials(s2), s2);
+    }
+
+    #[test]
+    fn test_sanitize_remote_credentials_does_not_touch_scp_style() {
+        // `git@host:path` is the SCP-style ref, not a URL with userinfo.
+        // Without a `scheme://` prefix the regex does not match, which
+        // is correct: there is no embedded password to redact.
+        let s = "fatal: Could not read from remote: git@github.com:foo/bar.git";
+        assert_eq!(sanitize_remote_credentials(s), s);
+    }
+
+    #[test]
+    fn test_classify_worktree_add_failure_branch_in_use() {
+        // Current git wording.
+        let combined =
+            "fatal: 'feature/foo' is already used by worktree at '/tmp/repo-worktrees/feature-foo'";
+        match classify_worktree_add_failure(combined, "feature/foo") {
+            GitError::BranchAlreadyCheckedOut(b) => assert_eq!(b, "feature/foo"),
+            other => panic!("expected BranchAlreadyCheckedOut, got {other:?}"),
+        }
+        // Older git wording.
+        let combined_old = "fatal: 'feature/foo' is already checked out at '/tmp/other'";
+        assert!(matches!(
+            classify_worktree_add_failure(combined_old, "feature/foo"),
+            GitError::BranchAlreadyCheckedOut(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_worktree_add_failure_redacts_credentials() {
+        let combined =
+            "fatal: unable to access 'https://alice:supersecret@github.com/foo/bar.git/': 403";
+        match classify_worktree_add_failure(combined, "feature/foo") {
+            GitError::WorktreeCommandFailed(msg) => {
+                assert!(!msg.contains("supersecret"), "token leaked: {msg}");
+                assert!(!msg.contains("alice:"), "username leaked: {msg}");
+            }
+            other => panic!("expected WorktreeCommandFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_branch_returns_failed_when_no_remote() {
+        let (dir, _repo) = setup_test_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        // No remote configured: `git fetch origin main` exits non-zero
+        // with a "remote does not exist" message. Surface as Failed so
+        // callers can write a warning.
+        let outcome = git_wt.fetch_branch("origin", "main");
+        assert!(
+            matches!(outcome, FetchOutcome::Failed(_)),
+            "expected Failed, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_fetch_branch_returns_failed_when_branch_missing_on_remote() {
         let remote_dir = TempDir::new().unwrap();
         let _remote = git2::Repository::init_bare(remote_dir.path()).unwrap();
 
@@ -2463,8 +2769,41 @@ mod tests {
             git2::Repository::clone(remote_dir.path().to_str().unwrap(), local_dir.path()).unwrap();
 
         let git_wt = GitWorktree::new(local_dir.path().to_path_buf()).unwrap();
-        // Fetching a branch that doesn't exist on the remote should succeed silently
-        assert!(git_wt.fetch_branch("origin", "nonexistent-branch").is_ok());
+        // Fetching a branch that doesn't exist on the remote should
+        // surface as Failed (not Ok), so create_worktree can record it
+        // as a warning for the user.
+        let outcome = git_wt.fetch_branch("origin", "nonexistent-branch");
+        assert!(
+            matches!(outcome, FetchOutcome::Failed(_)),
+            "expected Failed, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_fetch_branch_returns_ok_when_branch_exists_on_remote() {
+        // Sanity: real fetch path returns Ok. Sets up a tiny "remote"
+        // repo with a single commit on main, clones it locally, and
+        // re-runs fetch.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = git2::Repository::init_bare(remote_dir.path()).unwrap();
+        remote.set_head("refs/heads/main").unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let blob = remote.blob(b"hello").unwrap();
+            let mut tb = remote.treebuilder(None).unwrap();
+            tb.insert("file.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let tree = remote.find_tree(tree_id).unwrap();
+        remote
+            .commit(Some("refs/heads/main"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        let local_dir = TempDir::new().unwrap();
+        git2::Repository::clone(remote_dir.path().to_str().unwrap(), local_dir.path()).unwrap();
+
+        let git_wt = GitWorktree::new(local_dir.path().to_path_buf()).unwrap();
+        assert_eq!(git_wt.fetch_branch("origin", "main"), FetchOutcome::Ok);
     }
 
     // --- create_worktree fetch integration test ---
@@ -2540,18 +2879,28 @@ mod tests {
         );
     }
 
-    /// Build a main repo with a single submodule served by a `git daemon`
-    /// fixture, then create a `test-feature` branch on its current HEAD.
-    /// Returns the `TempDir` containers, the daemon guard (must stay alive
-    /// for `git submodule update` to reach the URL), and the repo path.
+    /// Build a main repo with a single submodule served from a local
+    /// `file://` bare repo, then create a `test-feature` branch on its
+    /// current HEAD. Returns the `TempDir` containers (which must stay
+    /// alive for `git submodule update` to reach the URL) and the repo
+    /// path.
+    ///
+    /// Uses a local `file://` transport rather than a `git daemon`: the
+    /// daemon variant cloned over `git://` with no timeout, so a stalled
+    /// clone could hang the whole test run indefinitely on slower CI
+    /// runners (observed on macOS). `file://` is deterministic and
+    /// offline. git blocks the file transport for submodules by default
+    /// (the CVE-2022-39253 mitigation); the `submodule add` here opts in
+    /// per-command with `-c protocol.file.allow=always`, and the caller
+    /// installs an [`AllowFileTransport`] env guard so the production-side
+    /// `git submodule update` (which inherits the test process env) can
+    /// clone too.
     ///
     /// The submodule is added at `.claude/` and contains a `skill.md` file,
     /// so tests can assert on `wt_path.join(".claude").join("skill.md")` to
     /// distinguish "submodule initialized" from "only .gitmodules checked
     /// out".
-    fn build_repo_with_submodule_and_branch(
-        branch: &str,
-    ) -> (TempDir, TempDir, GitDaemonGuard, TempDir) {
+    fn build_repo_with_submodule_and_branch(branch: &str) -> (TempDir, TempDir, TempDir) {
         let submodule_src_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_src_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -2578,9 +2927,9 @@ mod tests {
             )
             .unwrap();
 
-        let daemon_root = TempDir::new().unwrap();
+        let submodule_bare_dir = TempDir::new().unwrap();
         run_git(
-            daemon_root.path(),
+            submodule_bare_dir.path(),
             &[
                 "clone",
                 "--bare",
@@ -2588,7 +2937,10 @@ mod tests {
                 "submodule.git",
             ],
         );
-        let (daemon, submodule_url) = spawn_git_daemon(daemon_root.path(), "submodule.git");
+        let submodule_url = format!(
+            "file://{}",
+            submodule_bare_dir.path().join("submodule.git").display()
+        );
 
         let repo_dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(repo_dir.path()).unwrap();
@@ -2614,9 +2966,20 @@ mod tests {
             repo_dir.path(),
             &["config", "user.email", "test@example.com"],
         );
+        // `git submodule add` blocks the `file://` transport by default
+        // (CVE-2022-39253); allow it for just this command. The later
+        // production-side `git submodule update` is allowed via the
+        // `AllowFileTransport` env guard the calling test installs.
         run_git(
             repo_dir.path(),
-            &["submodule", "add", &submodule_url, ".claude"],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &submodule_url,
+                ".claude",
+            ],
         );
         run_git(repo_dir.path(), &["commit", "-am", "Add submodule"]);
 
@@ -2624,12 +2987,14 @@ mod tests {
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch(branch, &head_commit, false).unwrap();
 
-        (submodule_src_dir, daemon_root, daemon, repo_dir)
+        (submodule_src_dir, submodule_bare_dir, repo_dir)
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_initializes_submodules() {
-        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+        let _git_allow = AllowFileTransport::set();
+        let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
         let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
@@ -2646,10 +3011,13 @@ mod tests {
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_skips_submodules_when_disabled() {
         // with_init_submodules(false) must skip the `git submodule update`
         // step entirely so the worktree shows up before submodules clone.
-        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+        // The guard only covers the fixture's `submodule add`; init is off.
+        let _git_allow = AllowFileTransport::set();
+        let (_submodule_src, _submodule_bare, repo_dir) =
             build_repo_with_submodule_and_branch("test-feature");
 
         let git_wt = GitWorktree::new(repo_dir.path().to_path_buf())
@@ -2676,7 +3044,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(submodule)]
     fn test_create_worktree_skips_blocked_local_submodules() {
+        // Serial with the other submodule tests (but installs no
+        // `AllowFileTransport` guard) so it always observes git's default
+        // file-transport block that this test asserts on.
         let submodule_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -2893,5 +3265,304 @@ mod tests {
             "symlinks should not be counted alongside their target"
         );
         assert_eq!(stats.total_bytes, 3);
+    }
+
+    // --- pick_remote_for_branch + fork+upstream explicit-base tests ---
+
+    /// Build a fork plus upstream layout where `upstream/<branch>` is
+    /// strictly ahead of `origin/<branch>`. Returns the temp dirs that
+    /// must outlive the test (else the remotes vanish), the local clone
+    /// path, the commit OID at the upstream tip, and the commit OID at
+    /// the origin tip.
+    ///
+    /// The local clone has `origin` configured (the fork) plus an
+    /// `upstream` remote pointing at the canonical repo, mirroring the
+    /// fork-plus-upstream developer setup.
+    fn setup_fork_upstream_layout(
+        branch: &str,
+    ) -> (TempDir, TempDir, TempDir, git2::Oid, git2::Oid) {
+        let sig_a = git2::Signature::new(
+            "Test",
+            "test@example.com",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let sig_b = git2::Signature::new(
+            "Test",
+            "test@example.com",
+            &git2::Time::new(1_700_001_000, 0),
+        )
+        .unwrap();
+
+        let upstream_dir = TempDir::new().unwrap();
+        let upstream = git2::Repository::init_bare(upstream_dir.path()).unwrap();
+        upstream.set_head(&format!("refs/heads/{branch}")).unwrap();
+        let tree_a_id = {
+            let blob = upstream.blob(b"hello").unwrap();
+            let mut tb = upstream.treebuilder(None).unwrap();
+            tb.insert("file.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let tree_a = upstream.find_tree(tree_a_id).unwrap();
+        let commit_a = upstream
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &sig_a,
+                &sig_a,
+                "commit A",
+                &tree_a,
+                &[],
+            )
+            .unwrap();
+
+        let origin_dir = TempDir::new().unwrap();
+        let origin = git2::Repository::init_bare(origin_dir.path()).unwrap();
+        origin.set_head(&format!("refs/heads/{branch}")).unwrap();
+        let origin_tree_id = {
+            let blob = origin.blob(b"hello").unwrap();
+            let mut tb = origin.treebuilder(None).unwrap();
+            tb.insert("file.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let origin_tree = origin.find_tree(origin_tree_id).unwrap();
+        let origin_tip = origin
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &sig_a,
+                &sig_a,
+                "commit A",
+                &origin_tree,
+                &[],
+            )
+            .unwrap();
+
+        let commit_a_obj = upstream.find_commit(commit_a).unwrap();
+        let tree_b = {
+            let blob = upstream.blob(b"world").unwrap();
+            let mut tb = upstream.treebuilder(Some(&tree_a)).unwrap();
+            tb.insert("file2.txt", blob, 0o100644).unwrap();
+            let id = tb.write().unwrap();
+            upstream.find_tree(id).unwrap()
+        };
+        let commit_b = upstream
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &sig_b,
+                &sig_b,
+                "commit B",
+                &tree_b,
+                &[&commit_a_obj],
+            )
+            .unwrap();
+
+        let local_dir = TempDir::new().unwrap();
+        git2::Repository::clone(origin_dir.path().to_str().unwrap(), local_dir.path()).unwrap();
+        run_git(
+            local_dir.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                upstream_dir.path().to_str().unwrap(),
+            ],
+        );
+        run_git(local_dir.path(), &["fetch", "upstream"]);
+
+        (upstream_dir, origin_dir, local_dir, commit_b, origin_tip)
+    }
+
+    #[test]
+    fn test_pick_remote_for_branch_picks_freshest_remote() {
+        let (_upstream, _origin, local, _upstream_tip, _origin_tip) =
+            setup_fork_upstream_layout("release-1");
+        let git_wt = GitWorktree::new(local.path().to_path_buf()).unwrap();
+        let picked = git_wt.pick_remote_for_branch("release-1");
+        assert_eq!(
+            picked.as_deref(),
+            Some("upstream"),
+            "upstream/release-1 is newer than origin/release-1; should pick upstream"
+        );
+    }
+
+    #[test]
+    fn test_pick_remote_for_branch_returns_none_when_branch_not_on_any_remote() {
+        let (_upstream, _origin, local, _upstream_tip, _origin_tip) =
+            setup_fork_upstream_layout("release-1");
+        let git_wt = GitWorktree::new(local.path().to_path_buf()).unwrap();
+        assert_eq!(git_wt.pick_remote_for_branch("does-not-exist"), None);
+    }
+
+    #[test]
+    fn test_pick_remote_for_branch_prefers_origin_on_commit_time_tie() {
+        // Both remotes carry an identical commit (same time, same
+        // tree). Tiebreak rule keeps `origin` as the conservative
+        // default — matches historical behavior before fork+upstream
+        // scoring landed.
+        let sig = git2::Signature::new(
+            "Test",
+            "test@example.com",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+
+        fn seed_branch(
+            sig: &git2::Signature,
+            branch: &str,
+            content: &[u8],
+        ) -> (TempDir, git2::Oid) {
+            let dir = TempDir::new().unwrap();
+            let repo = git2::Repository::init_bare(dir.path()).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            let tree_id = {
+                let blob = repo.blob(content).unwrap();
+                let mut tb = repo.treebuilder(None).unwrap();
+                tb.insert("file.txt", blob, 0o100644).unwrap();
+                tb.write().unwrap()
+            };
+            let tree = repo.find_tree(tree_id).unwrap();
+            let oid = repo
+                .commit(
+                    Some(&format!("refs/heads/{branch}")),
+                    sig,
+                    sig,
+                    "init",
+                    &tree,
+                    &[],
+                )
+                .unwrap();
+            (dir, oid)
+        }
+
+        let (a_dir, _a_oid) = seed_branch(&sig, "main", b"hello");
+        let (b_dir, _b_oid) = seed_branch(&sig, "main", b"hello");
+
+        let local_dir = TempDir::new().unwrap();
+        git2::Repository::clone(a_dir.path().to_str().unwrap(), local_dir.path()).unwrap();
+        run_git(
+            local_dir.path(),
+            &["remote", "add", "upstream", b_dir.path().to_str().unwrap()],
+        );
+        run_git(local_dir.path(), &["fetch", "upstream"]);
+
+        let git_wt = GitWorktree::new(local_dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            git_wt.pick_remote_for_branch("main").as_deref(),
+            Some("origin"),
+            "ties on commit_time should fall back to origin"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_explicit_base_branches_off_freshest_remote() {
+        // Fork plus upstream layout, user passes `--base-branch main`.
+        // The new branch must land on upstream/main (the fresh tip),
+        // not origin/main (the stale fork tip). Regression for #1511.
+        let (_upstream, _origin, local, upstream_tip, origin_tip) =
+            setup_fork_upstream_layout("main");
+        assert_ne!(upstream_tip, origin_tip, "test fixture mis-set up");
+
+        let git_wt = GitWorktree::new(local.path().to_path_buf()).unwrap();
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("hotfix-wt");
+        git_wt
+            .create_worktree("hotfix-1", &wt_path, true, Some("main"))
+            .unwrap();
+
+        let local_repo = git2::Repository::open(local.path()).unwrap();
+        let new_branch_tip = local_repo
+            .find_branch("hotfix-1", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            new_branch_tip, upstream_tip,
+            "hotfix-1 should branch off upstream/main ({upstream_tip}), \
+             not stale origin/main ({origin_tip})"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_explicit_base_typo_returns_branch_not_found() {
+        // A typo in `--base-branch` must not silently produce a worktree
+        // anchored to HEAD. With no remote-tracking ref and no local
+        // branch by the typo'd name, create_worktree must surface
+        // BranchNotFound so the caller can show the user the typo.
+        let (dir, _repo) = setup_test_repo();
+        let repo_path = dir.path();
+        let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("hotfix-wt");
+        let result = git_wt.create_worktree("hotfix-1", &wt_path, true, Some("maain"));
+        match result {
+            Err(GitError::BranchNotFound(name)) => {
+                assert_eq!(name, "maain", "error should name the typo'd base");
+            }
+            other => panic!("expected BranchNotFound, got {other:?}"),
+        }
+        assert!(
+            !wt_path.exists(),
+            "no worktree should be created when base resolution fails"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_autodetected_base_still_falls_through_to_head() {
+        // When no explicit base is passed, autodetect runs and may yield
+        // a name that ultimately can't be resolved (e.g. a brand-new
+        // local-only repo where `main` exists but the lookup chain
+        // somehow misses it). The fallback to HEAD must still kick in
+        // so the historical behavior of "create the worktree off HEAD"
+        // is preserved. This is the autodetect twin of the typo test.
+        let (dir, repo) = setup_test_repo();
+        let repo_path = dir.path();
+        let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("autodetected-wt");
+        git_wt
+            .create_worktree("new-feature", &wt_path, true, None)
+            .expect("autodetect path should still succeed via HEAD fallback");
+        assert!(wt_path.exists(), "worktree should be created");
+        assert!(repo
+            .find_branch("new-feature", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_create_worktree_surfaces_fetch_failure_as_warning() {
+        // Configure a remote pointing at a non-existent path. The
+        // fetch call inside create_worktree exits non-zero, but the
+        // worktree itself should still get created (from the local
+        // initial commit). The non-fatal failure should land in the
+        // returned warnings vector so the wizard / CLI can show it.
+        let (dir, _repo) = setup_test_repo();
+        let repo_path = dir.path();
+
+        // Point `origin` at a path that doesn't exist; `git fetch`
+        // will exit non-zero with a "Could not read from remote" style
+        // error.
+        let bogus_remote = dir.path().join("does-not-exist.git");
+        run_git(
+            repo_path,
+            &["remote", "add", "origin", bogus_remote.to_str().unwrap()],
+        );
+
+        let git_wt = GitWorktree::new(repo_path.to_path_buf()).unwrap();
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("new-feature");
+        let warnings = git_wt
+            .create_worktree("new-feature", &wt_path, true, None)
+            .expect("create_worktree should still succeed when fetch fails");
+
+        assert!(
+            wt_path.exists() && wt_path.join(".git").exists(),
+            "worktree should be created even when fetch fails"
+        );
+        let joined = warnings.join("\n");
+        assert!(
+            joined.contains("git fetch") && joined.contains("failed for"),
+            "warnings should mention the fetch failure; got: {joined}"
+        );
     }
 }

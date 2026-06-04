@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 
 use crate::containers::{self, ContainerRuntimeInterface};
+use crate::git::error::GitError;
 use crate::git::GitWorktree;
 
 use super::{
@@ -42,6 +43,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Scratch session: ignore `path`, provision a fresh directory under
+    /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
+    /// the deletion path removes the directory. Mutually exclusive with
+    /// worktree/workspace and with non-empty `extra_repo_paths`.
+    pub scratch: bool,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -72,20 +78,97 @@ pub struct WorkspaceResult {
     pub warnings: Vec<String>,
 }
 
+/// Normalize a base-branch string, treating empty/whitespace as unset.
+fn normalize_base(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve a repo's effective base branch with precedence:
+/// explicit session base > per-project default > global/profile default.
+/// `None` means "auto-detect the repo's default branch".
+pub(crate) fn resolve_base_branch(
+    session: Option<&str>,
+    project: Option<&str>,
+    global: Option<&str>,
+) -> Option<String> {
+    normalize_base(session)
+        .or_else(|| normalize_base(project))
+        .or_else(|| normalize_base(global))
+}
+
+/// Resolve one repo's effective base branch, consulting its registered
+/// per-project default. The registry stores each project at its repo root, so
+/// the lookup keys on `find_main_repo(repo_path)`; `repo_path` itself may be a
+/// subdirectory or a worktree, which would miss a root-keyed entry. Precedence:
+/// explicit session base > per-project default > global/profile default.
+fn resolve_repo_base_branch(
+    repo_path: &std::path::Path,
+    session: Option<&str>,
+    project_bases: &std::collections::HashMap<String, String>,
+    global: Option<&str>,
+) -> Option<String> {
+    let main_repo =
+        GitWorktree::find_main_repo(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let key = crate::session::projects::canonical_key(&main_repo.to_string_lossy());
+    let project = project_bases.get(&key).map(String::as_str);
+    resolve_base_branch(session, project, global)
+}
+
+/// Map of canonical repo path to configured default base branch for every
+/// registered project (global + profile) that sets one. Used to fill in the
+/// per-project layer of `resolve_repo_base_branch` for the launch repo and any
+/// extra repos when building a session.
+pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
+    crate::session::projects::load_merged(profile)
+        .unwrap_or_else(|e| {
+            // Don't fork worktrees from the wrong base in silence: if the
+            // registry can't be read, log it so the missing per-project
+            // defaults are explainable instead of mysterious.
+            tracing::warn!(
+                target: "session.create",
+                "Failed to load project registry for base-branch defaults; \
+                 repos fall back to the global default: {e}"
+            );
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|p| {
+            let base = p.default_base_branch?;
+            let base = base.trim().to_string();
+            if base.is_empty() {
+                None
+            } else {
+                Some((crate::session::projects::canonical_key(&p.path), base))
+            }
+        })
+        .collect()
+}
+
+/// One repository in a multi-repo workspace, paired with the base branch its
+/// freshly-created worktree branch should fork from. `base_branch` is the
+/// fully resolved value (`None` means auto-detect the repo's default branch);
+/// callers apply the session > per-project > global precedence before building
+/// this list.
+pub struct WorkspaceRepoSpec {
+    pub path: PathBuf,
+    pub base_branch: Option<String>,
+}
+
 /// Create a multi-repo workspace with worktrees for each repository.
 ///
 /// Validates repo paths, detects name collisions, creates worktrees inside
 /// a shared workspace directory, and rolls back on any error.
 pub fn create_workspace(
-    primary_path: &std::path::Path,
-    extra_repo_paths: &[PathBuf],
+    primary: &WorkspaceRepoSpec,
+    extra_repos: &[WorkspaceRepoSpec],
     branch: &str,
     create_new_branch: bool,
-    base_branch: Option<&str>,
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
-    let primary_main_repo = GitWorktree::find_main_repo(primary_path)?;
+    let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -96,17 +179,22 @@ pub fn create_workspace(
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
-    let all_repo_paths: Vec<PathBuf> = std::iter::once(primary_path.to_path_buf())
-        .chain(
-            extra_repo_paths
-                .iter()
-                .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone())),
-        )
-        .collect();
+    // (canonicalized path, resolved base branch) for the primary repo followed
+    // by every extra repo. The primary path is left as the caller passed it;
+    // extras are canonicalized to match how they are stored/compared.
+    let all_repos: Vec<(PathBuf, Option<String>)> =
+        std::iter::once((primary.path.clone(), primary.base_branch.clone()))
+            .chain(extra_repos.iter().map(|r| {
+                (
+                    r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
+                    r.base_branch.clone(),
+                )
+            }))
+            .collect();
 
     // Check for duplicate repo directory names
     let mut seen_names = std::collections::HashSet::new();
-    for repo_path in &all_repo_paths {
+    for (repo_path, _) in &all_repos {
         let name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -137,9 +225,10 @@ pub fn create_workspace(
         repo_name: String,
         main_repo_path: PathBuf,
         worktree_subdir: PathBuf,
+        base_branch: Option<String>,
     }
-    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repo_paths.len());
-    for repo_path in &all_repo_paths {
+    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
+    for (repo_path, base_branch) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
             cleanup(&[], &workspace_path);
             bail!(
@@ -166,6 +255,7 @@ pub fn create_workspace(
             repo_name,
             main_repo_path,
             worktree_subdir,
+            base_branch: base_branch.clone(),
         });
     }
 
@@ -181,7 +271,7 @@ pub fn create_workspace(
                 .iter()
                 .map(|plan| {
                     let branch = branch.to_string();
-                    let base = base_branch.map(|b| b.to_string());
+                    let base = plan.base_branch.clone();
                     let main_repo_path = plan.main_repo_path.clone();
                     let worktree_subdir = plan.worktree_subdir.clone();
                     let repo_name = plan.repo_name.clone();
@@ -300,6 +390,15 @@ pub fn build_instance(
         bail!("{} does not support worktree mode.", params.tool);
     }
 
+    if params.scratch {
+        if params.worktree_enabled {
+            bail!("Cannot combine --scratch with worktree mode");
+        }
+        if !params.extra_repo_paths.is_empty() {
+            bail!("Cannot combine --scratch with extra repository paths");
+        }
+    }
+
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
@@ -310,19 +409,32 @@ pub fn build_instance(
         }
     }
 
-    let config = super::repo_config::resolve_config_with_repo(
-        profile,
-        std::path::Path::new(&params.path),
-    )
-    .unwrap_or_else(|e| {
-        tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
-        Config::default()
-    });
+    // Scratch sessions have no project repo, so config resolution falls
+    // back to global+profile defaults (`Path::new("")` makes
+    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    let config_path = if params.scratch {
+        std::path::PathBuf::new()
+    } else {
+        std::path::PathBuf::from(&params.path)
+    };
+    let config =
+        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+            tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
+            Config::default()
+        });
 
-    let mut final_path = PathBuf::from(&params.path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| params.path.clone());
+    let mut final_path = if params.scratch {
+        // Provisioning happens after `Instance::new` so we can key the
+        // directory on the generated instance id. Leave `final_path` empty
+        // for now; the worktree/workspace and path-existence blocks below
+        // are gated on the same flag.
+        String::new()
+    } else {
+        PathBuf::from(&params.path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| params.path.clone())
+    };
 
     let mut worktree_info = None;
     let mut created_worktree = None;
@@ -365,15 +477,46 @@ pub fn build_instance(
             let primary_path = PathBuf::from(&params.path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&params.path));
-            let extra_paths: Vec<PathBuf> =
-                params.extra_repo_paths.iter().map(PathBuf::from).collect();
+
+            let session_base = params.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = project_base_branches(profile);
+
+            // Every repo, including the launch repo, forks from its own
+            // registered per-project default when no explicit session base is
+            // given. Keyed by repo root so a launch path inside a subdirectory
+            // still matches a root-registered project.
+            let primary = WorkspaceRepoSpec {
+                base_branch: resolve_repo_base_branch(
+                    &primary_path,
+                    session_base,
+                    &project_bases,
+                    global_default,
+                ),
+                path: primary_path,
+            };
+            let extra_repos: Vec<WorkspaceRepoSpec> = params
+                .extra_repo_paths
+                .iter()
+                .map(|p| {
+                    let path = PathBuf::from(p);
+                    WorkspaceRepoSpec {
+                        base_branch: resolve_repo_base_branch(
+                            &path,
+                            session_base,
+                            &project_bases,
+                            global_default,
+                        ),
+                        path,
+                    }
+                })
+                .collect();
 
             let ws_result = create_workspace(
-                &primary_path,
-                &extra_paths,
+                &primary,
+                &extra_repos,
                 branch,
                 params.create_new_branch,
-                params.base_branch.as_deref(),
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
             )?;
@@ -443,15 +586,21 @@ pub fn build_instance(
                 let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
 
                 if worktree_path.exists() {
-                    bail!("Worktree already exists at {}", worktree_path.display());
+                    return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                let w = git_wt.create_worktree(
-                    branch,
-                    &worktree_path,
-                    true,
+                // The launch repo forks from its registered per-project default
+                // when no explicit session base is given (then global/profile,
+                // then auto-detect). Keyed by repo root via the shared helper.
+                let project_bases = project_base_branches(profile);
+                let base = resolve_repo_base_branch(
+                    &main_repo_path,
                     params.base_branch.as_deref(),
-                )?;
+                    &project_bases,
+                    config.worktree.default_base_branch.as_deref(),
+                );
+
+                let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
                 warnings.extend(w);
 
                 final_path = worktree_path.to_string_lossy().to_string();
@@ -464,24 +613,33 @@ pub fn build_instance(
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
                     created_at: Utc::now(),
-                    base_branch: params.base_branch.clone(),
+                    base_branch: base,
                 });
             }
         }
     }
 
-    // Validate that the final path exists and is a directory.
-    // This catches cases where the user typed a non-existent path in the TUI;
-    // without this check tmux silently falls back to the home directory.
-    let final_path_buf = PathBuf::from(&final_path);
-    if !final_path_buf.exists() {
-        bail!("Project path does not exist: {}", final_path);
-    }
-    if !final_path_buf.is_dir() {
-        bail!("Project path is not a directory: {}", final_path);
+    // For scratch sessions, `final_path` is intentionally empty here; the
+    // scratch directory is provisioned below after `Instance::new` runs (we
+    // need the instance id to name the directory). For all other sessions,
+    // catch the typed-a-bad-path case before tmux silently falls back to
+    // the home directory.
+    if !params.scratch {
+        let final_path_buf = PathBuf::from(&final_path);
+        if !final_path_buf.exists() {
+            bail!("Project path does not exist: {}", final_path);
+        }
+        if !final_path_buf.is_dir() {
+            bail!("Project path is not a directory: {}", final_path);
+        }
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    if params.scratch {
+        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
+        instance.project_path = dir.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
     instance.group_path = params.group;
     instance.tool = params.tool.clone();
     instance.detect_as = config
@@ -567,6 +725,25 @@ pub fn cleanup_instance(
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
 ) {
+    // Scratch dirs are provisioned eagerly inside `build_instance`
+    // (well before this helper's other cleanup targets exist), so an
+    // abort between provisioning and the caller finishing the session
+    // would otherwise leak the directory on disk. Guard the removal
+    // through `is_scratch_path` so a tampered `project_path` cannot
+    // wipe unrelated app data.
+    if instance.scratch {
+        let scratch_path = PathBuf::from(&instance.project_path);
+        if super::scratch::is_scratch_path(&scratch_path) {
+            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
+                tracing::warn!(
+                    target: "session.create",
+                    "Failed to clean up scratch dir: {}",
+                    e
+                );
+            }
+        }
+    }
+
     if let Some(wt) = created_worktree {
         if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
             if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
@@ -596,6 +773,8 @@ pub fn cleanup_instance(
                     tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
                 }
             }
+            // Remove named ignore volumes even if the container is already gone.
+            container.remove_named_ignore_volumes(&instance.id);
         }
     }
 
@@ -661,7 +840,7 @@ fn resolve_worktree_branch(
 /// `git-check-ref-format(1)`) with '-'. Unlike `branch_name_from_title`
 /// this keeps the user's casing and preserves '/' so `feat/auth`-style
 /// branches survive when the user types them explicitly.
-fn git_sanitize_branch_name(s: &str) -> String {
+pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_was_dash = false;
     for ch in s.trim().chars() {
@@ -995,11 +1174,16 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &repo_a,
-            &[repo_b],
+            &WorkspaceRepoSpec {
+                path: repo_a,
+                base_branch: None,
+            },
+            &[WorkspaceRepoSpec {
+                path: repo_b,
+                base_branch: None,
+            }],
             "nonexistent-branch",
             false,
-            None,
             &template,
             true,
         );
@@ -1038,11 +1222,13 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &repo_a,
+            &WorkspaceRepoSpec {
+                path: repo_a,
+                base_branch: None,
+            },
             &[],
             "nonexistent-branch",
             false,
-            None,
             &template,
             true,
         );
@@ -1063,14 +1249,182 @@ mod tests {
         assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
     }
 
+    #[test]
+    fn resolve_base_branch_precedence() {
+        // Explicit session base wins over everything.
+        assert_eq!(
+            resolve_base_branch(Some("session"), Some("project"), Some("global")),
+            Some("session".to_string())
+        );
+        // Per-project default fills in when there is no session base.
+        assert_eq!(
+            resolve_base_branch(None, Some("project"), Some("global")),
+            Some("project".to_string())
+        );
+        // Global/profile default is the last configured layer.
+        assert_eq!(
+            resolve_base_branch(None, None, Some("global")),
+            Some("global".to_string())
+        );
+        // Nothing set means auto-detect.
+        assert_eq!(resolve_base_branch(None, None, None), None);
+        // Empty/whitespace at any layer is treated as unset and skipped.
+        assert_eq!(
+            resolve_base_branch(Some("   "), Some(""), Some("global")),
+            Some("global".to_string())
+        );
+        assert_eq!(resolve_base_branch(Some("  "), None, None), None);
+    }
+
+    #[test]
+    fn resolve_repo_base_branch_keys_launch_repo_by_root() {
+        let (parent, _tip) = init_repo_with_branch("proj", "release");
+        let root = parent.path().join("proj");
+        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(key, "develop".to_string());
+
+        // No explicit session base: the launch repo forks from its registered
+        // per-project default.
+        assert_eq!(
+            resolve_repo_base_branch(&root, None, &bases, Some("global")),
+            Some("develop".to_string())
+        );
+
+        // Explicit session base still wins over the per-project default.
+        assert_eq!(
+            resolve_repo_base_branch(&root, Some("hotfix"), &bases, Some("global")),
+            Some("hotfix".to_string())
+        );
+
+        // No registered entry for this repo: fall back to the global default.
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            resolve_repo_base_branch(&root, None, &empty, Some("global")),
+            Some("global".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_repo_base_branch_matches_when_launching_from_a_worktree() {
+        // A session launched from a linked worktree of the registered repo
+        // still resolves the project default, because find_main_repo maps the
+        // worktree back to its main repo (the registry's key).
+        let (parent, _tip) = init_repo_with_branch("proj", "release");
+        let root = parent.path().join("proj");
+        let main_wt = GitWorktree::new(root.clone()).unwrap();
+        let wt_path = parent.path().join("proj-wt");
+        main_wt
+            .create_worktree("wt-branch", &wt_path, true, None)
+            .unwrap();
+
+        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(key, "develop".to_string());
+
+        assert_eq!(
+            resolve_repo_base_branch(&wt_path, None, &bases, None),
+            Some("develop".to_string())
+        );
+    }
+
+    /// Create a repo with `main` plus a second branch holding a distinct
+    /// commit. Returns the parent TempDir and the second branch's tip oid so a
+    /// test can assert a worktree forked from it instead of `main`.
+    fn init_repo_with_branch(name: &str, branch: &str) -> (tempfile::TempDir, git2::Oid) {
+        let parent = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let dir = parent.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        std::fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        let base_commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Branch off and add a distinct commit so the tip differs from `main`.
+        let base = repo.find_commit(base_commit).unwrap();
+        repo.branch(branch, &base, false).unwrap();
+        std::fs::write(dir.join("RELEASE.md"), "release\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("RELEASE.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        let branch_ref = format!("refs/heads/{branch}");
+        let release_commit = repo
+            .commit(Some(&branch_ref), &sig, &sig, "release", &tree, &[&base])
+            .unwrap();
+
+        (parent, release_commit)
+    }
+
+    #[test]
+    fn create_workspace_honors_per_repo_base_branch() {
+        // The extra repo's worktree should fork from its own configured base
+        // branch, while the primary repo forks from its default branch.
+        let (parent_primary, _) = init_repo_with_branch("primary", "release");
+        let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
+        let primary = parent_primary.path().join("primary");
+        let extra = parent_extra.path().join("extra");
+
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec {
+                path: primary,
+                base_branch: None,
+            },
+            &[WorkspaceRepoSpec {
+                path: extra,
+                base_branch: Some("release".to_string()),
+            }],
+            "feature-x",
+            true,
+            &template,
+            true,
+        )
+        .expect("workspace creation should succeed");
+
+        let extra_repo = result
+            .workspace_info
+            .repos
+            .iter()
+            .find(|r| r.name == "extra")
+            .expect("extra repo present in workspace");
+        let wt = git2::Repository::open(&extra_repo.worktree_path).unwrap();
+        let head = wt.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(
+            head.id(),
+            extra_release_tip,
+            "extra repo worktree should branch from its configured `release` base"
+        );
+    }
+
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
-            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+            config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             temp_home.join(crate::session::APP_DIR_NAME_OTHER)
         }
@@ -1093,6 +1447,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            scratch: false,
         }
     }
 
@@ -1218,6 +1573,61 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("No launch command resolved for custom agent 'whitespace-agent'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_scratch_provisions_app_dir() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.path = String::new();
+        params.scratch = true;
+        params.sandbox = false;
+
+        let result = build_instance(params, &[], &[], "default")
+            .expect("scratch build must succeed without a project path");
+
+        assert!(
+            result.instance.scratch,
+            "scratch flag must be persisted on the instance"
+        );
+        let provisioned = std::path::PathBuf::from(&result.instance.project_path);
+        assert!(provisioned.exists());
+        assert!(super::super::scratch::is_scratch_path(&provisioned));
+
+        let _ = std::fs::remove_dir_all(&provisioned);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_scratch_with_worktree() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.scratch = true;
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("scratch + worktree must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
             "unexpected error: {err}"
         );
     }

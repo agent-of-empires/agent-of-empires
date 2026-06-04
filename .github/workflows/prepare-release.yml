@@ -12,6 +12,11 @@ jobs:
   prepare:
     name: Bump Version & Tag
     runs-on: ubuntu-latest
+    # Required-reviewer gate. The `release` environment has njbrake as the
+    # only reviewer, so any workflow_dispatch trigger pauses until he clicks
+    # approve in the Actions UI. Prevents non-maintainer collaborators from
+    # firing the version bump + tag push via the Actions UI.
+    environment: release
     permissions:
       contents: write
     # Hoist the version input out of every run: step's shell, so it lands in
@@ -31,7 +36,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install release tools
-        uses: taiki-e/install-action@e0eafa9a0d485c37f97c0f7beb930a58a2facbac # v2.79.4
+        uses: taiki-e/install-action@6ed6112eb9893c58dd600eebccdf6e77ab7bfa9c # v2.79.12
         with:
           tool: cargo-edit,git-cliff
 

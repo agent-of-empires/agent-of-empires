@@ -12,9 +12,9 @@
 # merges will run well below this, so the report-only philosophy lives
 # in the Codecov "informational" flag at the project level until the
 # follow-ups (#1217-#1224) lift the baseline.
+# Touched 2026-05-28 to force another YAML re-resolve after reinstalling the Codecov GitHub App on the agent-of-empires org. The 2026-05-27 touch happened before the App install was completed; per-PR processing was still falling back to defaults (bare-bones comment, missing codecov/project status) because the "Current bot" field on the Codecov repo config page stayed at "none".
 
 comment:
-  after_n_builds: 1
   layout: "header, diff, files, components, sunburst, uncovered, footer"
   behavior: default
   # Only post (or update) the PR comment when patch / project coverage
@@ -28,6 +28,17 @@ comment:
 
 codecov:
   disable_default_path_fixes: false
+  # Hold all Codecov notifications (PR comment + status checks) until every
+  # flag has reported. Our CI uploads three separate LCOVs (vitest,
+  # playwright-mocked, playwright-live); without this Codecov evaluates and
+  # posts after the first one lands, then re-evaluates and re-posts on each
+  # subsequent upload, causing patch/project numbers to churn live during CI.
+  # `wait_for_ci: true` additionally holds notifications until GitHub Actions
+  # reports the workflow done, so a hung uploader cannot trigger a premature
+  # evaluation either.
+  notify:
+    after_n_builds: 3
+    wait_for_ci: true
 
 # One flag per test type. Each CI job uploads its own LCOV with its own
 # flag, and Codecov merges them server-side into the combined coverage
@@ -60,12 +71,12 @@ component_management:
     statuses: []
   individual_components:
     # ============================================================
-    # COCKPIT (native agent rendering)
+    # STRUCTURED VIEW (native structured rendering)
     # ============================================================
-    - component_id: "cockpit-ui"
-      name: "Cockpit UI"
+    - component_id: "structured-view-ui"
+      name: "Structured View UI"
       paths:
-        - "web/src/components/cockpit/**"
+        - "web/src/components/acp/**"
 
     # ============================================================
     # DIFF VIEWER + COMMENTS

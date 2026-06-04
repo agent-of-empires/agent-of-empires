@@ -1,6 +1,6 @@
 // React context exposing the active session's AgentProfile to the
-// cockpit's deeply-nested renderers. The wizard's `tool` field flows
-// into `SessionResponse.tool`, which the cockpit reads at view-mount
+// structured view's deeply-nested renderers. The wizard's `tool` field flows
+// into `SessionResponse.tool`, which the structured view reads at view-mount
 // time and feeds to the provider; classifiers in ToolCards consume it
 // via `useAgentProfile()`.
 //

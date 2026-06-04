@@ -7,7 +7,7 @@ This document is the long-form reference for the web suite. The short version li
 | Suite | Config | Where | Speed | When to use |
 |---|---|---|---|---|
 | Mocked Playwright | `web/playwright.config.ts` | `web/tests/*.spec.ts` | Fast | UI logic that does not depend on real backend state |
-| Live Playwright | `web/playwright.live.config.ts` | `web/tests/live/*.spec.ts` | Slower (real cargo binary + tmux) | Backend, persistence, auth, sessions, cockpit, read-only |
+| Live Playwright | `web/playwright.live.config.ts` | `web/tests/live/*.spec.ts` | Slower (real cargo binary + tmux) | Backend, persistence, auth, sessions, structured view, read-only |
 | Vitest + RTL + MSW | `web/vite.config.ts` (`test` block) | `web/src/**/__tests__/`, `web/src/**/*.test.{ts,tsx}` | Very fast | Request-payload permutations, local UI state |
 
 Run them:
@@ -24,7 +24,7 @@ npm run test:unit -- --coverage                          # vitest with v8 covera
 
 Decision tree:
 
-1. Does the test need real backend persistence, auth, tmux, git, or cockpit? → live Playwright.
+1. Does the test need real backend persistence, auth, tmux, git, or structured view? → live Playwright.
 2. Does the test need a browser-specific behavior (focus, keyboard, drag-drop, modal escape, touch event) with no real backend? → mocked Playwright.
 3. Otherwise → Vitest + React Testing Library, with MSW if you need to assert request payloads.
 
@@ -68,21 +68,21 @@ Fixtures:
 - `servePassphrase` : `aoe serve --passphrase aoe-e2e-fixed-passphrase`. The harness mints a session cookie via `POST /api/login` and exposes it as `handle.sessionCookie`. Specs that drive auth from the browser side use `seedAuth(page, handle)` to inject cookie + binding secret before the first navigation.
 - `serveToken` : `aoe serve --auth=token`. The harness reads the daemon-written `serve.token` from the isolated app dir and exposes the value as `handle.authToken` plus its on-disk path as `handle.tokenFile`. Rotation-aware specs call `spawnAoeServe` directly with `tokenLifetimeSecs` / `tokenGraceSecs` overrides; both env vars are debug-build only (`AOE_TEST_TOKEN_LIFETIME_SECS`, `AOE_TEST_TOKEN_GRACE_SECS`) and ignored in release.
 - `serveReadOnly` : `aoe serve --no-auth --read-only`.
-- `serveCockpit` : like `serve` but the fake-ACP agent (see below) is on `$PATH` as `claude`, `claude-agent-acp`, and `aoe-agent`, and `PATCH /api/cockpit/master` is called after startup. The `claude-agent-acp` name matters because the cockpit supervisor resolves the `claude` tool key through `AgentRegistry` to command `claude-agent-acp`, not `claude`; without that shim the supervisor would fall through to the system-installed adapter and fail with "Authentication required" on the first prompt.
+- `serveAcp` : like `serve` but the fake-ACP agent (see below) is on `$PATH` as `claude`, `claude-agent-acp`, and `aoe-agent`, (the structured view is the default, so no enable step is needed). The `claude-agent-acp` name matters because the structured view supervisor resolves the `claude` tool key through `AgentRegistry` to command `claude-agent-acp`, not `claude`; without that shim the supervisor would fall through to the system-installed adapter and fail with "Authentication required" on the first prompt.
 
 Isolation per test:
 
 - Fresh `mkdtemp` for `HOME`, with `XDG_CONFIG_HOME`, `TMPDIR`, `TMUX_TMPDIR`, and `bin/` as subdirs (all `0700`).
 - Port: `5200 + workerIndex*100 + parallelIndex + attempt*7`. Five retries on bind failure.
-- Fake `claude` shim in `home/bin/claude` (`exec tail -f /dev/null`). Cockpit fixture overrides with the fake-ACP shim, installed under `claude`, `claude-agent-acp`, and `aoe-agent`.
+- Fake `claude` shim in `home/bin/claude` (`exec tail -f /dev/null`). Structured view fixture overrides with the fake-ACP shim, installed under `claude`, `claude-agent-acp`, and `aoe-agent`.
 - `stop()` does `SIGTERM` with a 2s wait, `SIGKILL` fallback, then `rm -rf home`. Never calls `tmux kill-server` (would kill the developer's tmux).
-- `restart()` kills the running proc (`SIGTERM` then `SIGKILL` after 2s) and respawns with the same args on the same port. Used by connectivity-recovery specs (`disconnect-banner.spec.ts`) that need to observe `setServerDown(true)` on SIGTERM and `setServerDown(false)` after the server comes back. Token mode re-reads the freshly written `serve.token` so `handle.authToken` tracks the second boot. Does NOT re-run passphrase prelogin or cockpit master-enable across the restart; specs that need those should call `spawnAoeServe` again.
+- `restart()` kills the running proc (`SIGTERM` then `SIGKILL` after 2s) and respawns with the same args on the same port. Used by connectivity-recovery specs (`disconnect-banner.spec.ts`) that need to observe `setServerDown(true)` on SIGTERM and `setServerDown(false)` after the server comes back. Token mode re-reads the freshly written `serve.token` so `handle.authToken` tracks the second boot. Does NOT re-run passphrase prelogin or structured view master-enable across the restart; specs that need those should call `spawnAoeServe` again.
 
 Binary resolution: `AOE_E2E_BINARY` env wins; otherwise `<repo>/target/release/aoe`. `liveGlobalSetup.ts` runs once before any worker and calls `cargo build --features serve --release` if the binary is missing.
 
 ## Fake ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`)
 
-Cockpit specs need a deterministic ACP agent because the real `claude` subprocess depends on Anthropic credentials and emits non-deterministic output. The fake speaks the minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0:
+Structured view specs need a deterministic ACP agent because the real `claude` subprocess depends on Anthropic credentials and emits non-deterministic output. The fake speaks the minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0:
 
 - `initialize` returns protocolVersion 1 + agentCapabilities.
 - `session/new` and `session/load` return a deterministic sessionId.
@@ -107,15 +107,15 @@ Script file shape:
 }
 ```
 
-Specs that need a custom script call `spawnAoeServe({ cockpit: true, fakeAcpScript: "/tmp/script.json", ... })` directly instead of using the `serveCockpit` fixture.
+Specs that need a custom script call `spawnAoeServe({ acp: true, fakeAcpScript: "/tmp/script.json", ... })` directly instead of using the `serveAcp` fixture.
 
-## Cockpit user-story specs
+## Structured view user-story specs
 
-`web/tests/live/cockpit-stories/` holds UI-driven cockpit specs that
+`web/tests/live/acp-stories/` holds UI-driven structured view specs that
 drive the React surface end-to-end (clicks, keystrokes, navigation) and
 assert on rendered DOM. They complement the REST-contract specs at
-`web/tests/live/cockpit-*.spec.ts`, which assert against
-`/api/sessions/:id/cockpit/replay`. The story specs catch reducer-to-render
+`web/tests/live/acp-*.spec.ts`, which assert against
+`/api/sessions/:id/acp/replay`. The story specs catch reducer-to-render
 plumbing breakage that the REST tracers cannot see.
 
 Pattern:
@@ -123,12 +123,12 @@ Pattern:
 ```ts
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
-import { enableCockpitAndWait, waitForCockpitView } from "../../helpers/cockpit";
+import { enableStructuredViewAndWait, waitForStructuredView } from "../../helpers/acp";
 
 base("send message via Enter renders agent chunk", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
-    cockpit: true,
+    acp: true,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
     seedFn: seedSessionViaAoeAdd({ title: "story" }),
@@ -138,9 +138,9 @@ base("send message via Enter renders agent chunk", async ({ page }, testInfo) =>
     const seeded = sessions.find((s) => s.title === "story");
     if (!seeded) throw new Error("seeded session 'story' missing");
     const sessionId = seeded.id;
-    await enableCockpitAndWait(serve.baseUrl, sessionId);
+    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
     await page.goto(`${serve.baseUrl}/session/${sessionId}`);
-    await waitForCockpitView(page);
+    await waitForStructuredView(page);
     const composer = page.getByRole("textbox", { name: /Send a message/i });
     await composer.fill("hello");
     await composer.press("Enter");
@@ -151,17 +151,17 @@ base("send message via Enter renders agent chunk", async ({ page }, testInfo) =>
 });
 ```
 
-`enableCockpitAndWait` posts to `/cockpit/enable`, asserts the response
+`enableStructuredViewAndWait` posts to `/acp/enable`, asserts the response
 was 2xx (so a 4xx/5xx surfaces immediately rather than as a noisy
 readiness timeout), and then waits for the supervisor handshake.
-`waitForCockpitView` waits for the React tree to mount the composer.
+`waitForStructuredView` waits for the React tree to mount the composer.
 Together they ensure both sides are ready before any click or keystroke.
 Look up the seeded session by `title` rather than `sessions[0]` so the
 spec stays deterministic if seeding adds more rows later.
 
 Custom per-spec scripts go through a temp file (see
-`cockpit-stories/approval-allow.spec.ts` or `cockpit-approval.spec.ts`
-for the canonical setup); the `serveCockpit` fixture is for stories
+`acp-stories/approval-allow.spec.ts` or `acp-approval.spec.ts`
+for the canonical setup); the `serveAcp` fixture is for stories
 happy with the default chunk-then-stop script.
 
 ## Coverage matrix
@@ -219,14 +219,14 @@ Report-only in this PR. Phase-2 threshold floor and phase-3 ratchet upward are t
 
 - `--no-auth`, `--passphrase`, and `--auth=token` are the supported auth modes. Token-mode specs need a debug-build `aoe` because `AOE_TEST_TOKEN_LIFETIME_SECS` and `AOE_TEST_TOKEN_GRACE_SECS` are gated behind `cfg!(debug_assertions)`; release builds keep the production 24h/4h lifetimes and 300s grace.
 - The fake-ACP agent does not delegate FS or terminal calls back to the supervisor. If a scripted turn emits `tool_call_started` for a tool that would normally call `fs/write`, the supervisor will not actually write anything (and the test should not assume it does).
-- Cockpit replay uses the in-memory broadcast channel plus the SQLite event store. If a test asserts a specific event in the replay, give the supervisor up to a few hundred ms to flush (the included tracer specs poll for up to 6 seconds).
+- Structured view replay uses the in-memory broadcast channel plus the SQLite event store. If a test asserts a specific event in the replay, give the supervisor up to a few hundred ms to flush (the included tracer specs poll for up to 6 seconds).
 - Synthetic touchmove events for mobile specs fire back-to-back with Δt≈1ms. Cap velocity and per-frame emit counts in production code, or a real device will look sane while the e2e produces runaway momentum (and vice versa).
 
 ## Adding a new live spec
 
 1. Create `web/tests/live/<surface>.spec.ts`.
 2. Import from `../helpers/liveTest`.
-3. Pick a fixture (`serve`, `servePassphrase`, `serveToken`, `serveReadOnly`, `serveCockpit`) or call `spawnAoeServe()` directly if you need custom options.
+3. Pick a fixture (`serve`, `servePassphrase`, `serveToken`, `serveReadOnly`, `serveAcp`) or call `spawnAoeServe()` directly if you need custom options.
 4. Add (or update) the matching surface entry in `web/tests/coverage-matrix.json`. Make sure every component the spec touches is in its `components[]` (or already in another surface or the exempt list).
 5. Run `node web/tests/validate-coverage-matrix.mjs` locally. CI runs the same script.
 6. Run `npx playwright test --config=playwright.live.config.ts <your spec>` to confirm it passes. Live specs require tmux installed and `cargo build --features serve --release` to have run at least once.

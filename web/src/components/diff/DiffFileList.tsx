@@ -4,6 +4,10 @@ import type { BranchInfo } from "../../lib/api";
 import { buildDiffTree, type DiffTreeNode } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { fetchBranches, setSessionDiffBase } from "../../lib/api";
+import {
+  CopyPathContextMenu,
+  type PathMenuState,
+} from "./CopyPathContextMenu";
 
 interface Props {
   files: RichDiffFile[];
@@ -85,6 +89,7 @@ function FlatList({
           <button
             key={`${file.repo_name ?? ""}::${file.path}`}
             data-index={i}
+            data-path={file.path}
             onClick={() => onSelectFile(file.path, file.repo_name)}
             onMouseEnter={() => onFocusIndex(i)}
             className={`w-full text-left px-3 py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${
@@ -161,6 +166,7 @@ function TreeView({
             <button
               key={nodeKey(node)}
               data-index={i}
+              data-path={node.path}
               onClick={() => onToggleDir(node.path)}
               onMouseEnter={() => onFocusIndex(i)}
               aria-expanded={!node.collapsed}
@@ -203,6 +209,7 @@ function TreeView({
           <button
             key={`${file.repo_name ?? ""}::${file.path}`}
             data-index={i}
+            data-path={file.path}
             onClick={() =>
               onSelectFile(file.path, repoNameForSelect ?? file.repo_name)
             }
@@ -390,8 +397,22 @@ export function DiffFileList({
     [itemCount, clampedFocusedIndex, viewMode, treeNodes, files, toggleDir, onSelectFile],
   );
 
+  const [pathMenu, setPathMenu] = useState<PathMenuState | null>(null);
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    const el = (e.target as HTMLElement).closest<HTMLElement>("[data-path]");
+    const path = el?.getAttribute("data-path");
+    if (!path) return; // not on a file/folder row: let the native menu show
+    e.preventDefault();
+    setPathMenu({ x: e.clientX, y: e.clientY, path });
+  }, []);
+  const closePathMenu = useCallback(() => setPathMenu(null), []);
+
   return (
-    <div className="flex flex-col h-full bg-surface-900 overflow-hidden">
+    <div
+      className="flex flex-col h-full bg-surface-900 overflow-hidden"
+      onContextMenu={handleContextMenu}
+    >
+      <CopyPathContextMenu menu={pathMenu} onClose={closePathMenu} />
       {/* Header */}
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
@@ -680,6 +701,7 @@ function RepoBody({
           <button
             key={`${file.repo_name ?? ""}::${file.path}`}
             type="button"
+            data-path={file.path}
             onClick={() => onSelectFile(file.path, file.repo_name)}
             className={`w-full text-left px-6 py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${
               isSelected

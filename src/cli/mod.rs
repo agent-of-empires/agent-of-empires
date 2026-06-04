@@ -1,10 +1,11 @@
 //! CLI command implementations
 
+#[cfg(feature = "serve")]
+pub mod acp;
 pub mod add;
 pub mod agents;
-#[cfg(feature = "serve")]
-pub mod cockpit;
 pub mod definition;
+pub mod extract_session_id;
 pub mod group;
 pub mod init;
 pub mod list;
@@ -21,6 +22,7 @@ pub mod serve;
 pub mod session;
 pub mod sounds;
 pub mod status;
+pub mod telemetry;
 pub mod theme;
 pub mod tmux;
 pub mod uninstall;
@@ -29,7 +31,7 @@ pub mod update;
 pub mod url;
 pub mod worktree;
 
-pub use definition::{Cli, Commands};
+pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
 use crate::session::Instance;
 use anyhow::{bail, Result};

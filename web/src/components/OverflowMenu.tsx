@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { type TourAnchorId } from "../lib/tourSteps";
 
 export interface OverflowItem {
   label: string;
@@ -7,9 +8,12 @@ export interface OverflowItem {
 
 interface Props {
   items: OverflowItem[];
+  /** Tour anchor attached to the trigger button (the stable, always-rendered
+   *  element), so the tour can point at the menu without it being open. */
+  triggerDataTour?: TourAnchorId;
 }
 
-export function OverflowMenu({ items }: Props) {
+export function OverflowMenu({ items, triggerDataTour }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -33,6 +37,7 @@ export function OverflowMenu({ items }: Props) {
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
+        data-tour={triggerDataTour}
         className="w-8 h-8 flex items-center justify-center rounded-md cursor-pointer text-text-muted hover:text-text-secondary hover:bg-surface-700/50 transition-colors"
         aria-label="More options"
         aria-haspopup="menu"

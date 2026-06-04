@@ -4,16 +4,38 @@
 //! `Storage` serialises read-modify-write cycles via two layers:
 //!
 //! 1. **In-process per-profile mutex** (one `Arc<Mutex<()>>` per profile name,
-//!    registered process-wide). Cheap, kills intra-process races between
-//!    threads sharing the same `Storage` profile.
+//!    registered process-wide). Performance + observability layer, not a
+//!    correctness primitive on the supported platforms (Linux, macOS): a
+//!    userspace mutex is roughly an order of magnitude cheaper than the
+//!    flock syscall on the uncontended path, and same-thread re-entry
+//!    deadlocks here immediately rather than via a 50ms polling loop on
+//!    the flock. Removing this layer would still produce correct on-disk
+//!    state because `fs2::FileExt` maps to `flock(2)`, whose locks are
+//!    scoped to the open file description (OFD) on **both** Linux and
+//!    macOS/BSD. (A common misconception is that macOS `flock` is
+//!    process-scoped; it is not. Apple's flock(2) man page and
+//!    `xnu/bsd/kern/kern_descrip.c::sys_flock` key the lock on
+//!    `fp->fp_glob`, the open file description, identical in effect to
+//!    Linux's documented OFD scoping.) Every `Storage::update` opens its
+//!    own fd via `OpenOptions::open`, so two `Storage` handles in the
+//!    same process get distinct OFDs and `flock` between them conflicts
+//!    just as it does between processes. If AoE is ever ported to a
+//!    platform whose underlying lock primitive is process-scoped (e.g.
+//!    POSIX `fcntl(F_SETLK)` advisory locks, or certain Windows backends
+//!    that key on the `HANDLE` rather than the open file description),
+//!    this mutex becomes load-bearing and must not be removed without
+//!    re-establishing intra-process exclusion.
 //! 2. **Cross-process advisory `flock(2)`** on a sidecar lock file
 //!    (`<profile_dir>/.storage.lock` for sessions+groups,
-//!    `<app_dir>/.workspace-ordering.lock` for ordering). Polled
-//!    `fs2::FileExt::try_lock_exclusive` with a 50ms backoff so a >1s wait
-//!    can fire a single `tracing::warn`; the kernel releases the lock on
-//!    process exit, including SIGKILL, so a crashed peer cannot wedge other
-//!    aoe processes. Mirrors the pattern already used by `recovery.rs` and
-//!    `logging.rs`.
+//!    `<app_dir>/.workspace-ordering.lock` for ordering). Sole guarantor
+//!    of write serialisation; `atomic_write` separately guarantees that
+//!    lock-free readers observe a consistent JSON document. Every mutator
+//!    holds the flock from before `load` until after `atomic_write`.
+//!    Polled `fs2::FileExt::try_lock_exclusive` with a 50ms backoff so
+//!    that a wait longer than 1s fires a single `tracing::warn`; the
+//!    kernel releases the lock on process exit, including SIGKILL, so a
+//!    crashed peer cannot wedge other aoe processes. Mirrors the pattern
+//!    already used by `recovery.rs` and `logging.rs`.
 //!
 //! All mutation goes through `update` (load -> mutate -> save under both
 //! locks). `save_workspace_ordering` is private and only consumed by
@@ -403,7 +425,7 @@ mod tests {
 
     fn setup_test_home(temp: &std::path::Path) {
         std::env::set_var("HOME", temp);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
     }
 

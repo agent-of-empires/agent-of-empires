@@ -3,15 +3,19 @@
 mod changelog;
 mod command_palette;
 mod confirm;
+mod context_menu;
 mod custom_instruction;
 mod delete_options;
 mod group_delete_options;
+mod group_picker;
 mod hook_trust;
 mod hooks_install;
 mod info;
+mod intro;
 mod new_session;
 mod no_agents;
 mod profile_picker;
+mod project_session_picker;
 mod projects;
 mod rename;
 mod restart;
@@ -19,24 +23,31 @@ mod send_message;
 #[cfg(feature = "serve")]
 mod serve;
 mod snooze_duration;
+mod sort_picker;
+mod telemetry_consent;
 mod tool_picker;
 mod update_confirm;
-mod welcome;
+mod worktree_name;
 
 pub use changelog::ChangelogDialog;
 pub use command_palette::{
     builtin_commands, CommandPaletteDialog, PaletteAction, PaletteCommand, PaletteGroup,
 };
 pub use confirm::ConfirmDialog;
+pub use context_menu::{ContextMenuAction, ContextMenuDialog};
 pub use custom_instruction::CustomInstructionDialog;
 pub use delete_options::{DeleteDialogConfig, DeleteOptions, UnifiedDeleteDialog};
 pub use group_delete_options::{GroupDeleteOptions, GroupDeleteOptionsDialog};
+pub use group_picker::GroupPickerDialog;
 pub use hook_trust::{HookTrustAction, HookTrustDialog};
 pub use hooks_install::HooksInstallDialog;
 pub use info::InfoDialog;
+pub use intro::{IntroDialog, IntroOutcome};
+pub(crate) use new_session::project_picker_label;
 pub use new_session::{NewSessionData, NewSessionDialog};
 pub use no_agents::{NoAgentsAction, NoAgentsDialog};
 pub use profile_picker::{ProfileEntry, ProfilePickerAction, ProfilePickerDialog};
+pub use project_session_picker::ProjectSessionPickerDialog;
 pub use projects::ProjectsDialog;
 pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use restart::{RestartData, RestartDialog};
@@ -44,9 +55,11 @@ pub use send_message::SendMessageDialog;
 #[cfg(feature = "serve")]
 pub use serve::{ServeAction, ServeView};
 pub use snooze_duration::SnoozeDurationDialog;
+pub use sort_picker::SortPickerDialog;
+pub use telemetry_consent::TelemetryConsentDialog;
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
-pub use welcome::WelcomeDialog;
+pub use worktree_name::{WorktreeNameData, WorktreeNameDialog};
 
 pub enum DialogResult<T> {
     Continue,

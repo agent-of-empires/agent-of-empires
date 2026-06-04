@@ -70,6 +70,7 @@ export function getOrCreateDeviceBindingSecret(): string {
   } catch (err) {
     throw new Error(
       `Could not persist device binding secret: ${describeError(err)}`,
+      { cause: err },
     );
   }
   cached = secret;

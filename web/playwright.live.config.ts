@@ -21,7 +21,7 @@ export default defineConfig({
   timeout: 60_000,
   // Three workers on the 4-core GitHub runner. Each worker runs a real
   // chromium, a debug-build `aoe serve`, a tmux instance, and (for
-  // cockpit specs) a fake-ACP node subprocess; with v8 coverage
+  // structured view specs) a fake-ACP node subprocess; with v8 coverage
   // instrumented, 4 workers reliably starved one of them just long
   // enough for whichever spec was waiting on a tight turnActive /
   // WebSocket window to time out. The failing spec rotated across

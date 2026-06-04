@@ -34,6 +34,10 @@ pub(super) const HELP_DIALOG_WIDTH: u16 = 85;
 
 pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
+        name: "Scratch",
+        description: "Ctrl+T from any field: run in a fresh scratch dir (no project path needed)",
+    },
+    FieldHelp {
         name: "Profile",
         description: "Settings profile for session defaults (Left/Right to cycle)",
     },
@@ -103,6 +107,10 @@ pub struct NewSessionData {
     pub extra_args: String,
     /// Command override for the agent binary (replaces the default binary)
     pub command_override: String,
+    /// Scratch session: provision a fresh directory under
+    /// `<app_dir>/scratch/<id>/` and persist `instance.scratch = true`.
+    /// Mutually exclusive with worktree mode.
+    pub scratch: bool,
 }
 
 pub struct NewSessionDialog {
@@ -153,6 +161,10 @@ pub struct NewSessionDialog {
     /// Extra environment entries (session-specific).
     /// `KEY` = pass through, `KEY=VALUE` = set explicitly.
     pub(super) extra_env: Vec<String>,
+    /// True after the user edits the sandbox env list in this dialog.
+    /// Inherited config is shown for review, but is not submitted as a
+    /// per-session override unless this flips.
+    pub(super) extra_env_overridden: bool,
     /// Whether the env list is expanded (editing mode)
     pub(super) env_list_expanded: bool,
     /// Currently selected index in the env list
@@ -203,6 +215,28 @@ pub struct NewSessionDialog {
     /// Inline confirmation for creating a non-existent directory.
     /// None = inactive, Some(true) = Yes selected, Some(false) = No selected.
     pub(super) confirm_create_dir: Option<bool>,
+    /// Scratch-session marker. When true, submission skips the path
+    /// canonicalize/exists checks; the server (or `aoe add` CLI path)
+    /// provisions a fresh scratch directory. Toggled with Ctrl+T from
+    /// anywhere in the form. Mutually exclusive with worktree mode.
+    pub(super) scratch: bool,
+    /// Per-field hit rect captured by the renderer of the main form
+    /// so a mouse click / hover can target the same cells the user
+    /// sees. Each entry is `(focused_field_index, rect)`. Cleared and
+    /// repopulated every frame; empty while an overlay (sandbox config,
+    /// tool config, worktree config, loading, dir picker, etc.) is up,
+    /// so a stray click during one of those modes won't snap focus to
+    /// the underlying main-form field that used to sit there.
+    pub(super) focusable_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Rects for the sandbox-config overlay, keyed by
+    /// `sandbox_focused_field`. Populated only when that overlay is up.
+    pub(super) sandbox_config_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Rects for the tool-config overlay, keyed by
+    /// `tool_config_focused_field`.
+    pub(super) tool_config_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Rects for the worktree-config overlay, keyed by
+    /// `worktree_config_focused_field`.
+    pub(super) worktree_config_rects: Vec<(usize, ratatui::layout::Rect)>,
 }
 
 /// Shared logic for handling key events in an editable list (env keys or env values).
@@ -434,6 +468,7 @@ impl NewSessionDialog {
             yolo_mode,
             yolo_mode_default: yolo_mode,
             extra_env,
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -455,17 +490,31 @@ impl NewSessionDialog {
             path_ghost: None,
             group_ghost: None,
             confirm_create_dir: None,
+            scratch: false,
+            focusable_rects: Vec::new(),
+            sandbox_config_rects: Vec::new(),
+            tool_config_rects: Vec::new(),
+            worktree_config_rects: Vec::new(),
         }
     }
 
     /// Pre-fill the path field (e.g. from a selected session).
     pub fn set_path(&mut self, path: String) {
         self.path = Input::new(path);
+        if !self.extra_env_overridden {
+            self.reload_config_defaults();
+        }
     }
 
     /// Pre-fill the group field (e.g. from a selected session or group).
     pub fn set_group(&mut self, group: String) {
         self.group = Input::new(group);
+    }
+
+    /// Move focus to the title field. Used by "new from selection", where the
+    /// path is pre-filled so the user lands directly on naming the session.
+    pub fn focus_title(&mut self) {
+        self.focused_field = self.title_field();
     }
 
     #[cfg(test)]
@@ -552,6 +601,27 @@ impl NewSessionDialog {
         self.available_profiles.len() > 1
     }
 
+    fn resolve_config_for_path(&self, profile: &str) -> crate::session::Config {
+        let path = self.path.value().trim();
+        if path.is_empty() {
+            resolve_config_or_warn(profile)
+        } else {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(path),
+            )
+        }
+    }
+
+    fn refresh_inherited_sandbox_settings(&mut self) {
+        if !self.sandbox_enabled || self.extra_env_overridden {
+            return;
+        }
+        let config = self.resolve_config_for_path(&self.profile);
+        self.extra_env = config.sandbox.environment.clone();
+        self.inherited_settings = build_inherited_settings(&config.sandbox);
+    }
+
     /// Whether the currently selected tool is always in YOLO mode (no opt-in needed).
     fn selected_tool_always_yolo(&self) -> bool {
         let tool_name = &self.available_tools[self.tool_index];
@@ -593,7 +663,7 @@ impl NewSessionDialog {
     fn reload_config_defaults(&mut self) {
         let profile = self.selected_profile().to_string();
         self.profile = profile.clone();
-        let config = resolve_config_or_warn(&profile);
+        let config = self.resolve_config_for_path(&profile);
 
         // Reset tool index
         self.tool_index = if let Some(ref default_tool) = config.session.default_tool {
@@ -624,6 +694,7 @@ impl NewSessionDialog {
             self.extra_env.clear();
             self.inherited_settings.clear();
         }
+        self.extra_env_overridden = false;
 
         // Reset extra args and command override for new default tool
         let selected_tool = self
@@ -700,6 +771,7 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             extra_env: Vec::new(),
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -721,6 +793,11 @@ impl NewSessionDialog {
             path_ghost: None,
             group_ghost: None,
             confirm_create_dir: None,
+            scratch: false,
+            focusable_rects: Vec::new(),
+            sandbox_config_rects: Vec::new(),
+            tool_config_rects: Vec::new(),
+            worktree_config_rects: Vec::new(),
         }
     }
 
@@ -764,6 +841,7 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             extra_env: Vec::new(),
+            extra_env_overridden: false,
             env_list_expanded: false,
             env_selected_index: 0,
             env_editing_input: None,
@@ -785,6 +863,11 @@ impl NewSessionDialog {
             path_ghost: None,
             group_ghost: None,
             confirm_create_dir: None,
+            scratch: false,
+            focusable_rects: Vec::new(),
+            sandbox_config_rects: Vec::new(),
+            tool_config_rects: Vec::new(),
+            worktree_config_rects: Vec::new(),
         }
     }
 
@@ -796,11 +879,257 @@ impl NewSessionDialog {
 /// Label shown in the registered-projects picker. Includes scope so users
 /// can disambiguate when the same name exists across scopes (rare; the
 /// merger dedupes by path, not name).
-fn project_picker_label(p: &crate::session::Project) -> String {
+pub(crate) fn project_picker_label(p: &crate::session::Project) -> String {
     format!("{} [{}]  {}", p.name, p.scope.as_str(), p.path)
 }
 
 impl NewSessionDialog {
+    /// Route a left-click on the main form. Returns `Some(Continue)`
+    /// when the click landed on a focusable field (focus moves and,
+    /// for checkbox / cycler rows, the value advances the same way
+    /// Space / Left+Right would). Returns `None` when the click missed
+    /// every captured rect or when the dialog is in an overlay mode
+    /// where the main-form rects don't apply (the renderer leaves
+    /// `focusable_rects` empty in those modes).
+    ///
+    /// The overlay modes (sandbox/tool/worktree config, dir picker,
+    /// group/branch/projects picker, help) are still keyboard-only;
+    /// `handle_click` only fires on the top-level form.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
+        let pos = ratatui::layout::Position::from((col, row));
+
+        // List pickers (group / branch / projects) float over every
+        // other surface (main form AND config overlays), so route their
+        // clicks first. Otherwise the worktree config overlay below
+        // would swallow clicks meant for the branch picker that pops
+        // up from inside it.
+        if self.group_picker.is_active() {
+            match self.group_picker.handle_click(col, row) {
+                ListPickerResult::Continue | ListPickerResult::Cancelled => {
+                    return Some(DialogResult::Continue);
+                }
+                ListPickerResult::Selected(value) => {
+                    self.group = Input::new(value);
+                    self.clear_group_ghost();
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
+        if self.branch_picker.is_active() {
+            match self.branch_picker.handle_click(col, row) {
+                ListPickerResult::Continue | ListPickerResult::Cancelled => {
+                    return Some(DialogResult::Continue);
+                }
+                ListPickerResult::Selected(value) => {
+                    self.worktree_branch = Input::new(value);
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
+        if self.projects_picker.is_active() {
+            match self.projects_picker.handle_click(col, row) {
+                ListPickerResult::Continue | ListPickerResult::Cancelled => {
+                    return Some(DialogResult::Continue);
+                }
+                ListPickerResult::Selected(value) => {
+                    // Mirror the Enter-key handler in the worktree-config
+                    // path: resolve the display name back to a project
+                    // path via `available_projects` and append to
+                    // `workspace_repos` if not already present.
+                    if let Some(project) = self
+                        .available_projects
+                        .iter()
+                        .find(|p| project_picker_label(p) == value)
+                    {
+                        let path = project.path.clone();
+                        if !self.workspace_repos.iter().any(|p| p == &path) {
+                            self.workspace_repos.push(path);
+                        }
+                    }
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
+
+        // Config overlays (sandbox / tool / worktree) take precedence
+        // over the main form: their rects are populated only while
+        // their mode is active.
+        if self.sandbox_config_mode {
+            if let Some(hit) = self
+                .sandbox_config_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+                .map(|(f, _)| *f)
+            {
+                self.sandbox_focused_field = hit;
+            }
+            return Some(DialogResult::Continue);
+        }
+        if self.tool_config_mode {
+            if let Some(hit) = self
+                .tool_config_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+                .map(|(f, _)| *f)
+            {
+                self.tool_config_focused_field = hit;
+            }
+            return Some(DialogResult::Continue);
+        }
+        if self.worktree_config_mode {
+            if let Some(hit) = self
+                .worktree_config_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+                .map(|(f, _)| *f)
+            {
+                self.worktree_config_focused_field = hit;
+                // Field index 1 is the new-branch checkbox in the
+                // worktree-config overlay; a click toggles it like Space
+                // would on the keyboard.
+                if hit == 1 {
+                    self.create_new_branch = !self.create_new_branch;
+                }
+            }
+            return Some(DialogResult::Continue);
+        }
+
+        let hit_field = self
+            .focusable_rects
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(field, _)| *field)?;
+        self.focused_field = hit_field;
+        self.activate_focused_field();
+        Some(DialogResult::Continue)
+    }
+
+    /// Hover only updates the active picker's row highlight (menu-style
+    /// behavior the user expects). It deliberately does NOT move focus
+    /// between form fields; main form or any of the config overlays.
+    /// Stealing focus from the field the user is typing into just
+    /// because the mouse cursor drifts across the dialog is jarring.
+    /// Click still sets focus.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.group_picker.is_active() {
+            return self.group_picker.handle_hover(col, row);
+        }
+        if self.branch_picker.is_active() {
+            return self.branch_picker.handle_hover(col, row);
+        }
+        if self.projects_picker.is_active() {
+            return self.projects_picker.handle_hover(col, row);
+        }
+        false
+    }
+
+    /// Perform the focused field's primary action: toggle a checkbox,
+    /// cycle a picker. Text fields (path, title, group) have no primary
+    /// action and are left alone. Mirrors the per-field branches of
+    /// `handle_key`'s Space / Left / Right handlers so a click produces
+    /// byte-identical state changes.
+    fn activate_focused_field(&mut self) {
+        let has_profile_selection = self.available_profiles.len() > 1;
+        let has_tool_selection = self.available_tools.len() > 1;
+        let is_host_only = self.selected_tool_host_only();
+        let has_sandbox = self.docker_available && !is_host_only;
+        let has_yolo = !self.selected_tool_always_yolo();
+        let profile_field = if has_profile_selection { 0 } else { usize::MAX };
+        let mut fi = if has_profile_selection { 1 } else { 0 };
+        fi += 2; // title + path
+        let tool_field = if has_tool_selection {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
+        let yolo_mode_field = if has_yolo {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
+        let worktree_field = if !is_host_only {
+            let f = fi;
+            fi += 1;
+            f
+        } else {
+            usize::MAX
+        };
+        let sandbox_field = if has_sandbox {
+            // No `fi += 1` here; sandbox is the last index we need to
+            // resolve, and the unused assignment trips clippy.
+            fi
+        } else {
+            usize::MAX
+        };
+
+        if self.focused_field == profile_field {
+            if self.available_profiles.len() > 1 {
+                self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
+                // Mirror the keyboard cycle: pick up the new profile's
+                // defaults (sandbox, yolo, hooks, tool override) so the
+                // dialog reflects what a submit would actually create.
+                self.reload_config_defaults();
+            }
+        } else if self.focused_field == tool_field {
+            if self.available_tools.len() > 1 {
+                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
+                // Same side effects the Space/Left/Right tool handler
+                // applies: always-yolo tools force the toggle, host-only
+                // tools clear sandbox + worktree, and the per-tool config
+                // overlay (and its branch override) get re-resolved.
+                if self.selected_tool_always_yolo() {
+                    self.yolo_mode = true;
+                } else {
+                    self.yolo_mode = self.yolo_mode_default;
+                }
+                if self.selected_tool_host_only() {
+                    self.sandbox_enabled = false;
+                    self.worktree_enabled = false;
+                    self.worktree_branch.reset();
+                }
+                self.reload_tool_config();
+            }
+        } else if self.focused_field == yolo_mode_field {
+            self.yolo_mode = !self.yolo_mode;
+        } else if self.focused_field == worktree_field {
+            // Mirror the keyboard handler: worktree and scratch are
+            // mutually exclusive, so a click on the worktree row while
+            // scratch is on surfaces an inline hint rather than
+            // silently toggling.
+            if self.scratch {
+                self.error_message = Some(
+                    "Worktree is disabled in scratch mode. Press Ctrl+T to leave scratch first."
+                        .to_string(),
+                );
+            } else {
+                self.worktree_enabled = !self.worktree_enabled;
+                if !self.worktree_enabled {
+                    self.worktree_config_mode = false;
+                }
+            }
+        } else if self.focused_field == sandbox_field {
+            self.sandbox_enabled = !self.sandbox_enabled;
+            if self.sandbox_enabled {
+                let config = self.resolve_config_for_path(&self.profile);
+                self.extra_env = config.sandbox.environment.clone();
+                self.inherited_settings = build_inherited_settings(&config.sandbox);
+                self.extra_env_overridden = false;
+            } else {
+                self.extra_env.clear();
+                self.extra_env_overridden = false;
+                self.env_list_expanded = false;
+                self.env_editing_input = None;
+                self.inherited_settings.clear();
+                self.sandbox_config_mode = false;
+            }
+        }
+        // Path / Title / Group: focus change only, no toggle action.
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
         // When loading, only allow Esc to cancel
         if self.loading {
@@ -876,6 +1205,22 @@ impl NewSessionDialog {
             return DialogResult::Continue;
         }
 
+        // Ctrl+T toggles the scratch-session mode from anywhere in the
+        // form. Mutually exclusive with worktrees AND with extra-repo
+        // workspaces; turning on scratch clears all three so the
+        // submit payload mirrors the user's intent if they toggle
+        // scratch off again later.
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.scratch = !self.scratch;
+            if self.scratch {
+                self.worktree_enabled = false;
+                self.workspace_repos.clear();
+                self.workspace_repos_expanded = false;
+            }
+            self.error_message = None;
+            return DialogResult::Continue;
+        }
+
         let has_profile_selection = self.available_profiles.len() > 1;
         let has_tool_selection = self.available_tools.len() > 1;
         let is_host_only = self.selected_tool_host_only();
@@ -947,6 +1292,7 @@ impl NewSessionDialog {
                 return DialogResult::Continue;
             }
             if self.focused_field == sandbox_field && self.sandbox_enabled {
+                self.refresh_inherited_sandbox_settings();
                 self.sandbox_config_mode = true;
                 self.sandbox_focused_field = 0;
                 return DialogResult::Continue;
@@ -972,11 +1318,16 @@ impl NewSessionDialog {
             }
             KeyCode::Enter => {
                 self.error_message = None;
-                let path_str = self.path.value().trim().to_string();
-                let resolved = path_input::expand_tilde(&path_str);
-                if !std::path::Path::new(&resolved).exists() {
-                    self.confirm_create_dir = Some(false);
-                    return DialogResult::Continue;
+                // Scratch sessions skip the path-existence check: the
+                // server (or `aoe add` CLI) provisions the scratch dir on
+                // submit.
+                if !self.scratch {
+                    let path_str = self.path.value().trim().to_string();
+                    let resolved = path_input::expand_tilde(&path_str);
+                    if !std::path::Path::new(&resolved).exists() {
+                        self.confirm_create_dir = Some(false);
+                        return DialogResult::Continue;
+                    }
                 }
                 self.build_submit_result()
             }
@@ -1062,6 +1413,18 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == worktree_field =>
             {
+                // Scratch and worktree are mutually exclusive. Without this
+                // guard the user could Ctrl+T (scratch on, worktree forced
+                // off) then Space the worktree row back on, and submit a
+                // payload the server rejects with 400. Surface the conflict
+                // here instead of trusting the server-side mutex to catch
+                // every UI path.
+                if self.scratch {
+                    self.error_message = Some(
+                        "Worktree is disabled in scratch mode. Press Ctrl+T to leave scratch first.".to_string(),
+                    );
+                    return DialogResult::Continue;
+                }
                 self.worktree_enabled = !self.worktree_enabled;
                 if !self.worktree_enabled {
                     self.worktree_config_mode = false;
@@ -1073,11 +1436,13 @@ impl NewSessionDialog {
             {
                 self.sandbox_enabled = !self.sandbox_enabled;
                 if self.sandbox_enabled {
-                    let config = resolve_config_or_warn(&self.profile);
+                    let config = self.resolve_config_for_path(&self.profile);
                     self.extra_env = config.sandbox.environment.clone();
                     self.inherited_settings = build_inherited_settings(&config.sandbox);
+                    self.extra_env_overridden = false;
                 } else {
                     self.extra_env.clear();
+                    self.extra_env_overridden = false;
                     self.env_list_expanded = false;
                     self.env_editing_input = None;
                     self.inherited_settings.clear();
@@ -1394,6 +1759,7 @@ impl NewSessionDialog {
 
         // Validate the current entry if the list changed
         if self.extra_env != snapshot {
+            self.extra_env_overridden = true;
             self.error_message = self
                 .extra_env
                 .get(self.env_selected_index)
@@ -1617,14 +1983,20 @@ impl NewSessionDialog {
         DialogResult::Submit(NewSessionData {
             profile: self.selected_profile().to_string(),
             title: final_title,
-            path: self.path.value().trim().to_string(),
+            // Scratch sessions send an empty path; the server / `aoe add`
+            // CLI provisions a fresh scratch directory keyed on the instance id.
+            path: if self.scratch {
+                String::new()
+            } else {
+                self.path.value().trim().to_string()
+            },
             group: self.group.value().trim().to_string(),
             tool: self.available_tools[self.tool_index].clone(),
-            worktree_enabled: self.worktree_enabled,
+            worktree_enabled: !self.scratch && self.worktree_enabled,
             worktree_branch,
             create_new_branch: self.create_new_branch,
             base_branch,
-            extra_repo_paths: if self.worktree_enabled {
+            extra_repo_paths: if !self.scratch && self.worktree_enabled {
                 self.workspace_repos.clone()
             } else {
                 Vec::new()
@@ -1632,13 +2004,14 @@ impl NewSessionDialog {
             sandbox: self.sandbox_enabled,
             sandbox_image: self.sandbox_image.value().trim().to_string(),
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
-            extra_env: if self.sandbox_enabled {
+            extra_env: if self.sandbox_enabled && self.extra_env_overridden {
                 self.extra_env.clone()
             } else {
                 Vec::new()
             },
             extra_args: self.extra_args.value().trim().to_string(),
             command_override: self.command_override.value().trim().to_string(),
+            scratch: self.scratch,
         })
     }
 

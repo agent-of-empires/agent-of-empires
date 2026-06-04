@@ -10,28 +10,16 @@ use tracing::warn;
 
 use crate::session::{get_app_dir, get_update_settings};
 
-const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+const GITHUB_OWNER: &str = "agent-of-empires";
+const GITHUB_REPO: &str = "agent-of-empires";
 
 /// Resolve the GitHub API base URL, honoring `AOE_UPDATE_API_BASE` for
 /// hermetic tests. The override mirrors `AOE_UPDATE_BASE_URL` (which
 /// covers tarball downloads); tests that need to exercise the CLI
 /// without rate-limiting GitHub set both.
 fn github_api_base() -> String {
-    std::env::var("AOE_UPDATE_API_BASE").unwrap_or_else(|_| DEFAULT_GITHUB_API_BASE.to_string())
-}
-
-fn github_api_latest_url() -> String {
-    format!(
-        "{}/repos/njbrake/agent-of-empires/releases/latest",
-        github_api_base()
-    )
-}
-
-fn github_api_releases_url() -> String {
-    format!(
-        "{}/repos/njbrake/agent-of-empires/releases?per_page=20",
-        github_api_base()
-    )
+    std::env::var("AOE_UPDATE_API_BASE")
+        .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
 }
 
 /// Public release-page URL for a given version tag. Stable enough to
@@ -44,7 +32,7 @@ pub fn release_page_url(version: &str) -> String {
         format!("v{}", version)
     };
     format!(
-        "https://github.com/njbrake/agent-of-empires/releases/tag/{}",
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/{}",
         tag
     )
 }
@@ -56,19 +44,47 @@ pub struct UpdateInfo {
     pub latest_version: String,
 }
 
+/// Coarse update-staleness signal by semver distance, derived from the cached
+/// update check. Carries no raw version string, only the magnitude of the gap,
+/// so telemetry can answer "are installs on patched/recent versions" without
+/// leaking which version anyone runs. See `crate::telemetry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStatus {
+    /// No usable cache (never checked, or a malformed/unparsable cached latest).
+    Unknown,
+    /// The cached latest is not newer than the running build.
+    Current,
+    /// Behind by a patch only (major and minor match).
+    PatchBehind,
+    /// Behind by a minor (major matches).
+    MinorBehind,
+    /// Behind by a major.
+    MajorBehind,
+}
+
+/// Coarse "how many releases behind" signal, counted from the cached release
+/// list. Complements [`UpdateStatus`]: a `major_behind` + `one_behind` pair
+/// reveals a thin/fallback cache that only fetched the latest release, while
+/// `minor_behind` + `several_behind` is a genuinely lagging install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleasesBehind {
+    /// No cache to count from.
+    Unknown,
+    /// On the cached latest.
+    Current,
+    /// Exactly one cached release is newer (or the cache only knows the latest).
+    OneBehind,
+    /// Two or more cached releases are newer.
+    SeveralBehind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInfo {
     pub version: String,
     pub body: String,
     pub published_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    #[serde(default)]
-    body: Option<String>,
-    published_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,10 +158,11 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         }
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("agent-of-empires")
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    let client = crate::github::GitHubClient::unauthenticated(crate::github::GitHubClientConfig {
+        api_base: github_api_base(),
+        user_agent: crate::github::DEFAULT_USER_AGENT.to_string(),
+        timeout: std::time::Duration::from_secs(5),
+    })?;
 
     // Fetch all releases (includes body/release notes)
     let releases = match fetch_releases(&client).await {
@@ -162,19 +179,10 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         .unwrap_or_default();
 
     if latest_version.is_empty() {
-        // Fall back to latest endpoint if releases fetch failed
-        let response = client.get(github_api_latest_url()).send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to check for updates: HTTP {}", response.status());
-        }
-        let release: GitHubRelease = response.json().await?;
-        let version = release.tag_name.trim_start_matches('v').to_string();
-
-        let release_info = ReleaseInfo {
-            version: version.clone(),
-            body: release.body.unwrap_or_default(),
-            published_at: release.published_at,
-        };
+        // Fall back to the latest-release endpoint if the releases list failed.
+        let release = client.latest_release(GITHUB_OWNER, GITHUB_REPO).await?;
+        let release_info = release_info_from(release);
+        let version = release_info.version.clone();
 
         let cache = UpdateCache {
             checked_at: chrono::Utc::now(),
@@ -218,34 +226,17 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 }
 
 #[tracing::instrument(target = "update.fetch", skip_all)]
-async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<ReleaseInfo>> {
-    let url = github_api_releases_url();
-    tracing::debug!(target: "update.fetch", %url, "GET releases");
-    let response = client.get(&url).send().await?;
-    let status = response.status();
-    tracing::debug!(
-        target: "update.fetch",
-        status = %status,
-        content_length = ?response.content_length(),
-        "releases response"
-    );
+async fn fetch_releases(client: &crate::github::GitHubClient) -> Result<Vec<ReleaseInfo>> {
+    let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 20).await?;
+    Ok(releases.into_iter().map(release_info_from).collect())
+}
 
-    if !status.is_success() {
-        anyhow::bail!("Failed to fetch releases: HTTP {}", status);
+fn release_info_from(release: crate::github::GitHubRelease) -> ReleaseInfo {
+    ReleaseInfo {
+        version: release.tag_name.trim_start_matches('v').to_string(),
+        body: release.body.unwrap_or_default(),
+        published_at: release.published_at,
     }
-
-    let github_releases: Vec<GitHubRelease> = response.json().await?;
-
-    let releases = github_releases
-        .into_iter()
-        .map(|r| ReleaseInfo {
-            version: r.tag_name.trim_start_matches('v').to_string(),
-            body: r.body.unwrap_or_default(),
-            published_at: r.published_at,
-        })
-        .collect();
-
-    Ok(releases)
 }
 
 /// Get cached release notes, filtered to show only releases newer than from_version.
@@ -270,11 +261,8 @@ fn filter_releases(releases: Vec<ReleaseInfo>, from_version: Option<&str>) -> Ve
 }
 
 pub(crate) fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse_version =
-        |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
-
-    let latest_parts = parse_version(latest);
-    let current_parts = parse_version(current);
+    let latest_parts = version_parts(latest);
+    let current_parts = version_parts(current);
 
     for i in 0..latest_parts.len().max(current_parts.len()) {
         let l = latest_parts.get(i).copied().unwrap_or(0);
@@ -287,6 +275,78 @@ pub(crate) fn is_newer_version(latest: &str, current: &str) -> bool {
         }
     }
     false
+}
+
+fn version_parts(v: &str) -> Vec<u32> {
+    v.split('.').filter_map(|s| s.parse().ok()).collect()
+}
+
+/// Classify the semver distance between the running build and a cached latest.
+/// Pure (no I/O) so the bucketing is unit-testable without app-dir/env coupling.
+/// An empty or unparsable cached latest is [`UpdateStatus::Unknown`], never
+/// silently treated as `Current`.
+fn classify_update_status(current: &str, cached_latest: Option<&str>) -> UpdateStatus {
+    let Some(latest) = cached_latest.map(str::trim).filter(|s| !s.is_empty()) else {
+        return UpdateStatus::Unknown;
+    };
+    let latest_parts = version_parts(latest);
+    if latest_parts.is_empty() {
+        return UpdateStatus::Unknown;
+    }
+    if !is_newer_version(latest, current) {
+        return UpdateStatus::Current;
+    }
+    let current_parts = version_parts(current);
+    let part = |parts: &[u32], i: usize| parts.get(i).copied().unwrap_or(0);
+    if part(&latest_parts, 0) > part(&current_parts, 0) {
+        UpdateStatus::MajorBehind
+    } else if part(&latest_parts, 1) > part(&current_parts, 1) {
+        UpdateStatus::MinorBehind
+    } else {
+        UpdateStatus::PatchBehind
+    }
+}
+
+/// Classify how many cached releases are newer than the running build. Pure (no
+/// I/O). When the cached latest is newer but the release list does not enumerate
+/// it (an old or fallback cache that only stored the latest), reports the
+/// conservative [`ReleasesBehind::OneBehind`] rather than overstating the depth.
+fn classify_releases_behind(
+    current: &str,
+    cached_latest: Option<&str>,
+    releases: &[ReleaseInfo],
+) -> ReleasesBehind {
+    let Some(latest) = cached_latest.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ReleasesBehind::Unknown;
+    };
+    if version_parts(latest).is_empty() {
+        return ReleasesBehind::Unknown;
+    }
+    if !is_newer_version(latest, current) {
+        return ReleasesBehind::Current;
+    }
+    let newer = releases
+        .iter()
+        .filter(|r| is_newer_version(&r.version, current))
+        .count();
+    if newer >= 2 {
+        ReleasesBehind::SeveralBehind
+    } else {
+        ReleasesBehind::OneBehind
+    }
+}
+
+/// Read the cached update check (no network) and classify both version-health
+/// signals in one pass. Returns [`UpdateStatus::Unknown`] / [`ReleasesBehind::Unknown`]
+/// when no cache exists. Used by telemetry; the opt-in gate is the caller's job.
+pub fn cached_version_health(current: &str) -> (UpdateStatus, ReleasesBehind) {
+    let cache = load_cache();
+    let latest = cache.as_ref().map(|c| c.latest_version.as_str());
+    let releases: &[ReleaseInfo] = cache.as_ref().map(|c| c.releases.as_slice()).unwrap_or(&[]);
+    (
+        classify_update_status(current, latest),
+        classify_releases_behind(current, latest, releases),
+    )
 }
 
 pub async fn print_update_notice() {
@@ -401,6 +461,57 @@ mod tests {
         let filtered = filter_releases(releases.clone(), Some("0.3.0"));
 
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_classify_update_status_buckets_by_semver_distance() {
+        use UpdateStatus::*;
+        // No cache / empty / unparsable latest => Unknown, never Current.
+        assert_eq!(classify_update_status("1.2.3", None), Unknown);
+        assert_eq!(classify_update_status("1.2.3", Some("")), Unknown);
+        assert_eq!(classify_update_status("1.2.3", Some("   ")), Unknown);
+        assert_eq!(classify_update_status("1.2.3", Some("garbage")), Unknown);
+        // Latest not newer => Current.
+        assert_eq!(classify_update_status("1.2.3", Some("1.2.3")), Current);
+        assert_eq!(classify_update_status("1.2.3", Some("1.2.0")), Current);
+        // Distance buckets.
+        assert_eq!(classify_update_status("1.2.3", Some("1.2.4")), PatchBehind);
+        assert_eq!(classify_update_status("1.2.3", Some("1.3.0")), MinorBehind);
+        assert_eq!(classify_update_status("1.2.3", Some("2.0.0")), MajorBehind);
+    }
+
+    #[test]
+    fn test_classify_releases_behind_counts_cached_releases() {
+        use ReleasesBehind::*;
+        let releases = vec![
+            make_release("1.3.0"),
+            make_release("1.2.5"),
+            make_release("1.2.3"),
+            make_release("1.2.0"),
+        ];
+        // No cache => Unknown.
+        assert_eq!(classify_releases_behind("1.2.3", None, &[]), Unknown);
+        // Latest not newer => Current.
+        assert_eq!(
+            classify_releases_behind("1.3.0", Some("1.3.0"), &releases),
+            Current
+        );
+        // Two cached releases newer than 1.2.3 (1.3.0, 1.2.5) => SeveralBehind.
+        assert_eq!(
+            classify_releases_behind("1.2.3", Some("1.3.0"), &releases),
+            SeveralBehind
+        );
+        // Exactly one newer => OneBehind.
+        assert_eq!(
+            classify_releases_behind("1.2.5", Some("1.3.0"), &releases),
+            OneBehind
+        );
+        // Thin/fallback cache: latest newer but list does not enumerate it =>
+        // conservative OneBehind, not overstated.
+        assert_eq!(
+            classify_releases_behind("1.2.3", Some("9.9.9"), &[]),
+            OneBehind
+        );
     }
 
     #[test]

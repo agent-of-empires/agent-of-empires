@@ -8,42 +8,50 @@ pub(crate) mod container_config;
 pub mod deletion;
 pub(crate) mod environment;
 mod groups;
+pub mod idle_reap;
 mod instance;
 pub mod poller;
 pub mod profile_config;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
+pub mod scratch;
 pub(crate) mod serde_helpers;
+pub mod settings_schema;
+pub mod stop;
 mod storage;
+pub mod worktree_edit;
 
-pub use crate::sound::{SoundConfig, SoundConfigOverride};
-pub use crate::status_hooks::{StatusHookConfig, StatusHookConfigOverride};
+pub use crate::sound::SoundConfig;
+pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
-    get_update_settings, load_config, save_config, validate_snooze_duration, Config,
-    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, RowTagMode, SandboxConfig,
-    SessionConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig,
-    WorktreeConfig,
+    get_telemetry_settings, get_update_settings, load_config, save_config,
+    validate_snooze_duration, ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode,
+    GroupByMode, NewSessionAttachMode, RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig,
+    ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig,
+    VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
 pub use groups::{
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, Group, GroupTree, Item,
+    append_archived_section, append_archived_section_by_project, archived_project_sub_path,
+    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles,
+    is_archived_section_path, is_within_archived_section, Group, GroupTree, Item,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH,
 };
-pub(crate) use instance::persist_session_to_storage;
+pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, StartOutcome, Status,
-    TerminalInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
+    Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_memory_limit, validate_volume_format,
-    CockpitConfigOverride, HooksConfigOverride, ProfileConfig, SandboxConfigOverride,
-    SessionConfigOverride, ThemeConfigOverride, TmuxConfigOverride, UpdatesConfigOverride,
-    WorktreeConfigOverride,
+    ProfileConfig,
 };
 pub use projects::{Project, ProjectScope};
+pub use recovery::HookTimeoutScope;
 pub use repo_config::{
     check_hook_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
@@ -58,22 +66,94 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Linux app dir name (under `$XDG_CONFIG_HOME`). Debug builds use a `-dev`
-/// suffix so a `cargo run` instance shares no state with an installed
+/// App dir name under the XDG config base (`$XDG_CONFIG_HOME`, default
+/// `~/.config`). Always used on Linux; used on macOS when the user opts into
+/// the XDG layout (see [`get_app_dir_path`] and issue #1948). Debug builds use
+/// a `-dev` suffix so a `cargo run` instance shares no state with an installed
 /// release binary.
-pub const APP_DIR_NAME_LINUX: &str = if cfg!(debug_assertions) {
+pub const APP_DIR_NAME_XDG: &str = if cfg!(debug_assertions) {
     "agent-of-empires-dev"
 } else {
     "agent-of-empires"
 };
 
-/// macOS/Windows app dir name (under `$HOME`). Debug builds use a `-dev`
-/// suffix; see `APP_DIR_NAME_LINUX`.
+/// Home-dotfile app dir name (under `$HOME`). The default on macOS and the
+/// only location on Windows. Debug builds use a `-dev` suffix; see
+/// `APP_DIR_NAME_XDG`.
 pub const APP_DIR_NAME_OTHER: &str = if cfg!(debug_assertions) {
     ".agent-of-empires-dev"
 } else {
     ".agent-of-empires"
 };
+
+/// Resolve the XDG-style config base directory: `$XDG_CONFIG_HOME` when set to
+/// an absolute path, otherwise `~/.config`.
+///
+/// On Linux this matches `dirs::config_dir()`. macOS uses it for the XDG layout
+/// (rather than `dirs::config_dir()`, which there resolves to `~/Library/
+/// Application Support`) so a dotfile manager like chezmoi can share one global
+/// config path with Linux. See issue #1948.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn xdg_config_base() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        if dir.is_absolute() {
+            return Ok(dir);
+        }
+    }
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+        .join(".config"))
+}
+
+/// Whether `$XDG_CONFIG_HOME` is set to an absolute path, i.e. the user has
+/// meaningfully opted into the XDG layout. A relative or empty value is ignored
+/// per the XDG spec (and by [`xdg_config_base`]), so it does not count.
+#[cfg(target_os = "macos")]
+fn xdg_config_home_set() -> bool {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(|v| std::path::Path::new(&v).is_absolute())
+        .unwrap_or(false)
+}
+
+/// macOS app-dir resolution: prefer the XDG location, fall back to the
+/// home-dotfile location, without ever moving data. See issue #1948.
+///
+/// Precedence (the first matching rule wins):
+/// 1. the XDG dir already exists -> use it (picks up a `~/.config` tree synced
+///    from Linux even when `$XDG_CONFIG_HOME` is unset);
+/// 2. the legacy dir already exists -> use it (an existing install keeps its
+///    data in place even after the user later sets `$XDG_CONFIG_HOME`);
+/// 3. `$XDG_CONFIG_HOME` is set -> use the XDG dir (a fresh XDG opt-in);
+/// 4. otherwise -> the home-dotfile dir (the historical macOS default).
+///
+/// `xdg_name` / `legacy_name` are passed in (rather than read from the
+/// constants) so the dev/release namespace warning can resolve the release
+/// pair from a debug build.
+#[cfg(target_os = "macos")]
+fn macos_app_dir(xdg_name: &str, legacy_name: &str) -> Option<PathBuf> {
+    let xdg = xdg_config_base().ok()?.join(xdg_name);
+    let legacy = dirs::home_dir()?.join(legacy_name);
+    Some(resolve_app_dir_with_fallback(
+        xdg,
+        legacy,
+        xdg_config_home_set(),
+    ))
+}
+
+/// Pure precedence used by [`macos_app_dir`]; split out so the rule is testable
+/// off-macOS. See that function for the meaning of each branch.
+#[cfg(any(target_os = "macos", test))]
+fn resolve_app_dir_with_fallback(xdg: PathBuf, legacy: PathBuf, xdg_env_set: bool) -> PathBuf {
+    if xdg.exists() {
+        xdg
+    } else if legacy.exists() {
+        legacy
+    } else if xdg_env_set {
+        xdg
+    } else {
+        legacy
+    }
+}
 
 pub fn get_app_dir() -> Result<PathBuf> {
     let dir = get_app_dir_path()?;
@@ -83,13 +163,25 @@ pub fn get_app_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Whether the app data dir already exists, **without** creating it (unlike
+/// [`get_app_dir`], which auto-creates). Lets side-effect-sensitive callers
+/// probe install state cheaply: the per-command telemetry recorder uses it to
+/// stay a true no-op for app-data-free commands (`aoe completion`, `aoe init`,
+/// ...) on an install that is not opted in, so those commands keep working in
+/// read-only / sandboxed (e.g. Nix) environments without materializing the dir.
+pub fn app_dir_exists() -> bool {
+    get_app_dir_path().map(|p| p.exists()).unwrap_or(false)
+}
+
 fn get_app_dir_path() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?
-        .join(APP_DIR_NAME_LINUX);
+    let dir = xdg_config_base()?.join(APP_DIR_NAME_XDG);
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let dir = macos_app_dir(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
         .join(APP_DIR_NAME_OTHER);
@@ -116,13 +208,17 @@ pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     }
 
     #[cfg(target_os = "linux")]
-    let release_dir = dirs::config_dir()?.join("agent-of-empires");
-    #[cfg(not(target_os = "linux"))]
+    let release_dir = xdg_config_base().ok()?.join("agent-of-empires");
+    #[cfg(target_os = "macos")]
+    let release_dir = macos_app_dir("agent-of-empires", ".agent-of-empires")?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let release_dir = dirs::home_dir()?.join(".agent-of-empires");
 
     #[cfg(target_os = "linux")]
-    let dev_dir = dirs::config_dir()?.join(APP_DIR_NAME_LINUX);
-    #[cfg(not(target_os = "linux"))]
+    let dev_dir = xdg_config_base().ok()?.join(APP_DIR_NAME_XDG);
+    #[cfg(target_os = "macos")]
+    let dev_dir = macos_app_dir(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let dev_dir = dirs::home_dir()?.join(APP_DIR_NAME_OTHER);
 
     let release_populated = fs::read_dir(&release_dir)
@@ -304,6 +400,24 @@ mod profile_listing_tests {
     }
 }
 
+/// Validate `AOE_INSTANCE_ID` is safe as a single path component and
+/// for shell interpolation. Allowlist `[A-Za-z0-9_-]`, max 64 bytes.
+pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("AOE_INSTANCE_ID must not be empty");
+    }
+    if id.len() > 64 {
+        anyhow::bail!("AOE_INSTANCE_ID too long ({} bytes, max 64)", id.len());
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("AOE_INSTANCE_ID contains disallowed characters");
+    }
+    Ok(())
+}
+
 /// Validate that `name` is a safe, single-component profile name.
 ///
 /// Defense in depth: `get_profile_dir` and `delete_profile` ultimately
@@ -450,42 +564,77 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     }
 }
 
-// ── TUI heartbeat ──────────────────────────────────────────────────────────
+// ── TUI presence ────────────────────────────────────────────────────────────
+//
+// Each running TUI process drops a `<pid>` file under `tui-presence/` and
+// refreshes its mtime on the heartbeat tick. This lets us (a) tell the push
+// consumer whether *any* TUI is watching, and (b) count how many TUIs are
+// alive so the footer can surface "another instance is watching" when two
+// `aoe` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
+// tmux client list to read). A presence file is considered live while its
+// mtime is fresh; stale ones (crash without cleanup) are swept on read.
 
-const TUI_HEARTBEAT_FILE: &str = "tui.active";
+const TUI_PRESENCE_DIR: &str = "tui-presence";
 
-/// Write (or touch) the TUI heartbeat file so the push consumer knows the
-/// TUI is currently running. Called periodically from the TUI event loop.
+fn presence_dir() -> Option<std::path::PathBuf> {
+    get_app_dir().ok().map(|d| d.join(TUI_PRESENCE_DIR))
+}
+
+fn own_presence_file() -> Option<std::path::PathBuf> {
+    presence_dir().map(|d| d.join(std::process::id().to_string()))
+}
+
+/// Write (or touch) this process's presence file so the push consumer knows
+/// a TUI is running and other TUIs can count us. Called periodically from the
+/// TUI event loop.
 pub fn write_tui_heartbeat() {
-    if let Ok(dir) = get_app_dir() {
-        let _ = fs::write(dir.join(TUI_HEARTBEAT_FILE), b"");
+    if let Some(dir) = presence_dir() {
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join(std::process::id().to_string()), b"");
     }
 }
 
-/// Remove the heartbeat file on TUI exit.
+/// Remove this process's presence file on TUI exit.
 pub fn clear_tui_heartbeat() {
-    if let Ok(dir) = get_app_dir() {
-        let _ = fs::remove_file(dir.join(TUI_HEARTBEAT_FILE));
+    if let Some(file) = own_presence_file() {
+        let _ = fs::remove_file(file);
     }
 }
 
-/// Returns true if the TUI heartbeat file was modified within `threshold`.
+/// Count TUI presence files whose mtime is fresh within `threshold`, sweeping
+/// any stale entries left behind by crashed processes. Returns the number of
+/// live TUIs (including this process, if its file is fresh).
+pub fn count_active_tuis(threshold: Duration) -> usize {
+    let dir = match presence_dir() {
+        Some(d) => d,
+        None => return 0,
+    };
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut live = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or(Duration::MAX) < threshold)
+            .unwrap_or(false);
+        if fresh {
+            live += 1;
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    live
+}
+
+/// Returns true if any TUI presence file was modified within `threshold`.
 /// Used by the push consumer to suppress notifications when the user is
-/// actively watching the TUI.
+/// actively watching a TUI.
 pub fn is_tui_active(threshold: Duration) -> bool {
-    let dir = match get_app_dir() {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let meta = match fs::metadata(dir.join(TUI_HEARTBEAT_FILE)) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let modified = match meta.modified() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    modified.elapsed().unwrap_or(Duration::MAX) < threshold
+    count_active_tuis(threshold) > 0
 }
 
 #[cfg(test)]
@@ -495,18 +644,131 @@ mod tests {
     fn isolate_app_dir() -> tempfile::TempDir {
         let temp_home = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         temp_home
     }
 
     fn app_dir(temp_home: &tempfile::TempDir) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        let dir = temp_home.path().join(".config").join(APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let dir = temp_home.path().join(".config").join(APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let dir = temp_home.path().join(APP_DIR_NAME_OTHER);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_xdg_config_base_prefers_absolute_xdg_config_home() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp.path());
+        let custom = temp.path().join("custom-xdg");
+        std::env::set_var("XDG_CONFIG_HOME", &custom);
+
+        assert_eq!(xdg_config_base().unwrap(), custom);
+        // The global config path is derived from that base on both Linux and
+        // macOS, so a dotfile manager sees a single location. See issue #1948.
+        assert_eq!(get_app_dir_path().unwrap(), custom.join(APP_DIR_NAME_XDG));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_xdg_config_base_falls_back_to_home_dot_config() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp.path());
+        // A relative (non-absolute) value is ignored per the XDG spec.
+        std::env::set_var("XDG_CONFIG_HOME", "relative/path");
+
+        assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
+    }
+
+    // Precedence behind the macOS read-fallback resolution (issue #1948). These
+    // exercise the pure rule, so they run on every platform's CI, not just
+    // macOS where `macos_app_dir` is compiled.
+    #[test]
+    fn test_fallback_prefers_existing_xdg_dir_even_over_legacy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let xdg = tmp.path().join(".config").join("agent-of-empires");
+        let legacy = tmp.path().join(".agent-of-empires");
+        fs::create_dir_all(&xdg).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+
+        // Both present: XDG wins, so there is never a split brain.
+        assert_eq!(
+            resolve_app_dir_with_fallback(xdg.clone(), legacy.clone(), true),
+            xdg
+        );
+        assert_eq!(
+            resolve_app_dir_with_fallback(xdg.clone(), legacy, false),
+            xdg
+        );
+    }
+
+    #[test]
+    fn test_fallback_keeps_legacy_when_xdg_absent_even_if_env_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let xdg = tmp.path().join(".config").join("agent-of-empires");
+        let legacy = tmp.path().join(".agent-of-empires");
+        fs::create_dir_all(&legacy).unwrap();
+
+        // An existing install that later sets XDG_CONFIG_HOME keeps reading its
+        // data in place; nothing appears as a fresh install.
+        assert_eq!(
+            resolve_app_dir_with_fallback(xdg, legacy.clone(), true),
+            legacy
+        );
+    }
+
+    #[test]
+    fn test_fallback_fresh_install_follows_env() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let xdg = tmp.path().join(".config").join("agent-of-empires");
+        let legacy = tmp.path().join(".agent-of-empires");
+
+        // Neither dir exists yet: XDG_CONFIG_HOME set -> XDG opt-in; unset ->
+        // the historical macOS home-dotfile default.
+        assert_eq!(
+            resolve_app_dir_with_fallback(xdg.clone(), legacy.clone(), true),
+            xdg
+        );
+        assert_eq!(
+            resolve_app_dir_with_fallback(xdg, legacy.clone(), false),
+            legacy
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_tui_presence_counts_and_sweeps() {
+        let temp = isolate_app_dir();
+        let pdir = app_dir(&temp).join(TUI_PRESENCE_DIR);
+
+        // Our own heartbeat counts as one live TUI.
+        write_tui_heartbeat();
+        assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
+        assert!(is_tui_active(Duration::from_secs(30)));
+
+        // A second instance's presence file bumps the count to two.
+        fs::write(pdir.join("999999"), b"").unwrap();
+        assert_eq!(count_active_tuis(Duration::from_secs(30)), 2);
+
+        // A zero threshold makes every file stale; they're swept and the
+        // directory is left empty.
+        assert_eq!(count_active_tuis(Duration::ZERO), 0);
+        assert!(!is_tui_active(Duration::from_secs(30)));
+        assert_eq!(fs::read_dir(&pdir).unwrap().count(), 0);
+
+        // Exit cleanup removes only our own file.
+        write_tui_heartbeat();
+        fs::write(pdir.join("999999"), b"").unwrap();
+        clear_tui_heartbeat();
+        assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
     }
 
     #[test]
@@ -551,9 +813,9 @@ mod tests {
     }
 
     fn release_dir_in(temp: &tempfile::TempDir) -> PathBuf {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let d = temp.path().join(".config").join("agent-of-empires");
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let d = temp.path().join(".agent-of-empires");
         d
     }
@@ -766,6 +1028,58 @@ mod tests {
         assert!(
             !unknown_dir.exists(),
             "load_profile_config must not create profiles/<unknown>/ as a side effect",
+        );
+    }
+
+    #[test]
+    fn validate_instance_id_rejects_unsafe() {
+        assert!(validate_instance_id("").is_err(), "empty");
+        assert!(validate_instance_id("..").is_err(), "parent ref");
+        assert!(validate_instance_id(".").is_err(), "current ref");
+        assert!(validate_instance_id("/etc").is_err(), "absolute path");
+        assert!(validate_instance_id("foo/bar").is_err(), "subdir traversal");
+        assert!(validate_instance_id("foo\\bar").is_err(), "backslash");
+        assert!(validate_instance_id("foo\0bar").is_err(), "NUL byte");
+        assert!(validate_instance_id("foo bar").is_err(), "whitespace");
+        assert!(
+            validate_instance_id(&"x".repeat(65)).is_err(),
+            "over length cap"
+        );
+    }
+
+    #[test]
+    fn validate_instance_id_accepts_production_and_test() {
+        assert!(
+            validate_instance_id("a3f7c2d1e4b89012").is_ok(),
+            "production hex"
+        );
+        assert!(
+            validate_instance_id("0123456789abcdef").is_ok(),
+            "production hex lower"
+        );
+        assert!(validate_instance_id("compact").is_ok(), "test label");
+        assert!(validate_instance_id("nested_first").is_ok(), "underscore");
+        assert!(validate_instance_id("a-b-c").is_ok(), "hyphen");
+    }
+
+    #[test]
+    fn validate_instance_id_error_messages_do_not_echo_input() {
+        const SENTINEL: &str = "ZZ_unique_sentinel_aabbcc";
+
+        let bad = format!("{SENTINEL}/x");
+        let e = validate_instance_id(&bad).unwrap_err().to_string();
+        assert!(e.contains("disallowed"));
+        assert!(
+            !e.contains(SENTINEL),
+            "must not echo input bytes; risk of log injection"
+        );
+
+        let bad = format!("{SENTINEL}{}", "x".repeat(70));
+        let e = validate_instance_id(&bad).unwrap_err().to_string();
+        assert!(e.contains("too long"));
+        assert!(
+            !e.contains(SENTINEL),
+            "must not echo input bytes from oversize branch"
         );
     }
 }

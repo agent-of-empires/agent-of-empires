@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -12,6 +13,7 @@ interface Props {
   diffCollapsed: boolean;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
+  onStartTutorial: () => void;
   onLogout: () => void;
   loginRequired: boolean;
   isOffline: boolean;
@@ -34,26 +36,28 @@ export function TopBar({
   diffCollapsed,
   onOpenHelp,
   onOpenAbout,
+  onStartTutorial,
   onLogout,
   loginRequired,
   isOffline,
   isDevBuild,
   onGoDashboard,
 }: Props) {
-  const repoName =
-    activeWorkspace?.projectPath.split("/").filter(Boolean).pop() ?? null;
-
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
       { label: "Help", onClick: onOpenHelp },
+      { label: "Show tutorial", onClick: onStartTutorial },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
 
   return (
-    <header className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2">
+    <header
+      {...tourAnchor(TOUR_ANCHORS.topbar)}
+      className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2"
+    >
       {/* LEFT ZONE */}
       <div className="flex items-center gap-2 min-w-0 shrink-0">
         <button
@@ -85,25 +89,6 @@ export function TopBar({
           <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm" />
           <span className="font-mono text-xs leading-none">aoe</span>
         </button>
-
-        {/* Breadcrumb (hidden on mobile). Suppress the workspace crumb when it
-            equals the repo name to avoid "/ foo / foo" duplication. */}
-        {(repoName || activeWorkspace) && (
-          <div className="hidden sm:flex items-center gap-1.5 min-w-0 text-xs font-mono">
-            <span className="text-text-dim">/</span>
-            {repoName && (
-              <span className="text-text-muted truncate max-w-[140px]">{repoName}</span>
-            )}
-            {activeWorkspace && activeWorkspace.displayName !== repoName && (
-              <>
-                <span className="text-text-dim">/</span>
-                <span className="text-accent-600 truncate max-w-[200px]">
-                  {activeWorkspace.displayName}
-                </span>
-              </>
-            )}
-          </div>
-        )}
       </div>
 
       {/* CENTER ZONE — palette trigger */}
@@ -159,7 +144,7 @@ export function TopBar({
           </button>
         )}
 
-        <OverflowMenu items={overflowItems} />
+        <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />
       </div>
     </header>
   );

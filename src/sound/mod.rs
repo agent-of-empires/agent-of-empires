@@ -10,7 +10,7 @@
 //!   alarm.wav, start.wav
 //!
 //! Layout:
-//!   - `config`    — `SoundConfig`, overrides, volume helpers
+//!   - `config`    — `SoundConfig`, `SoundMode`, volume helpers
 //!   - `discovery` — sounds directory + available-files probing
 //!   - `bundled`   — GitHub-hosted default sound pack installer
 //!   - `playback`  — afplay / paplay / aplay dispatch
@@ -22,10 +22,7 @@ mod discovery;
 mod playback;
 
 pub use bundled::install_bundled_sounds;
-pub use config::{
-    apply_sound_overrides, volume_from_option, volume_options, volume_to_index, SoundConfig,
-    SoundConfigOverride, SoundMode,
-};
+pub use config::{volume_from_option, volume_options, volume_to_index, SoundConfig, SoundMode};
 pub use discovery::{get_sounds_dir, list_available_sounds, validate_sound_exists};
 pub use playback::{play_sound, play_sound_blocking};
 

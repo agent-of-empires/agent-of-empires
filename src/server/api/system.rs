@@ -7,10 +7,11 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
+use super::validate_profile_name;
 use super::AppState;
-use super::{
-    validate_profile_name, ALLOWED_GLOBAL_SETTINGS_SECTIONS, ALLOWED_PROFILE_SETTINGS_SECTIONS,
-    SESSION_BLOCKED_FIELDS,
+use crate::server::auth::AuthenticatedSession;
+use crate::session::settings_schema::{
+    clear_path, strip_local_only, validate_patch, PatchRejection, Scope,
 };
 
 // --- Agents ---
@@ -23,9 +24,55 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
+    /// True when this agent can run in the structured acp UI: a
+    /// built-in with an ACP adapter, or a custom agent that declares a
+    /// valid `agent_acp_cmd`. The web wizard reads this to decide
+    /// whether a session created for the agent runs in acp or tmux.
+    pub acp_capable: bool,
+    /// The ACP command a built-in agent launches in acp, e.g.
+    /// `claude-agent-acp` for claude or `opencode` for opencode. This is
+    /// the registry command (post `${aoe_data_dir}` substitution), which
+    /// can differ from `binary`; the wizard previews it so the user sees
+    /// the real launch command before starting. Omitted for custom
+    /// agents, whose command values are never serialized here (see the
+    /// custom-agent serialization tests below).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_command: Option<String>,
+    /// The registry args appended to `acp_command` (e.g. `["acp"]`
+    /// for opencode, `["--acp"]` for gemini). Empty when there are none
+    /// or for custom agents.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acp_args: Vec<String>,
 }
 
-fn build_custom_agent_infos(custom_agents: &HashMap<String, String>) -> Vec<AgentInfo> {
+/// Resolve the acp launch command + args for a built-in agent from
+/// its registry spec, substituting `${aoe_data_dir}` so the preview
+/// matches what `supervisor::spawn_inner` actually runs. Returns
+/// `(None, [])` for agents without a registry entry.
+fn acp_command_fields(
+    spec: Option<&crate::acp::AgentSpec>,
+    data_dir: Option<&std::path::Path>,
+) -> (Option<String>, Vec<String>) {
+    let substitute = |value: &str| match data_dir {
+        Some(dir) if value.contains("${aoe_data_dir}") => {
+            value.replace("${aoe_data_dir}", &dir.to_string_lossy())
+        }
+        _ => value.to_string(),
+    };
+    match spec {
+        Some(spec) => {
+            let command = substitute(&spec.command);
+            let args = spec.args.iter().map(|arg| substitute(arg)).collect();
+            (Some(command), args)
+        }
+        None => (None, Vec::new()),
+    }
+}
+
+fn build_custom_agent_infos(
+    custom_agents: &HashMap<String, String>,
+    agent_acp_cmd: &HashMap<String, String>,
+) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
         .iter()
         .filter(|(name, command)| {
@@ -40,6 +87,13 @@ fn build_custom_agent_infos(custom_agents: &HashMap<String, String>) -> Vec<Agen
             host_only: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
+            acp_capable: agent_acp_cmd
+                .get(name)
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+            // Custom agents' command values are deliberately never
+            // serialized here; they can hold hostnames or secrets.
+            acp_command: None,
+            acp_args: Vec::new(),
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -51,20 +105,30 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
+        let agent_acp_cmd = config.session.agent_acp_cmd;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
+        let acp_registry = crate::acp::AgentRegistry::with_defaults();
+        let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
-            .map(|a| AgentInfo {
-                kind: "builtin".to_string(),
-                name: a.name.to_string(),
-                binary: a.binary.to_string(),
-                host_only: a.host_only,
-                installed: available.iter().any(|s| s == a.name),
-                install_hint: a.install_hint.to_string(),
+            .map(|a| {
+                let (acp_command, acp_args) =
+                    acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
+                AgentInfo {
+                    kind: "builtin".to_string(),
+                    name: a.name.to_string(),
+                    binary: a.binary.to_string(),
+                    host_only: a.host_only,
+                    installed: available.iter().any(|s| s == a.name),
+                    install_hint: a.install_hint.to_string(),
+                    acp_capable: acp_registry.get(a.name).is_some(),
+                    acp_command,
+                    acp_args,
+                }
             })
             .collect::<Vec<_>>();
-        agents.extend(build_custom_agent_infos(&custom_agents));
+        agents.extend(build_custom_agent_infos(&custom_agents, &agent_acp_cmd));
         agents
     })
     .await
@@ -114,6 +178,18 @@ pub async fn get_settings(
     }
 }
 
+/// Map a schema [`PatchRejection`] to the HTTP response shape the dashboard
+/// expects. `elevation_required` mirrors the path-shape gate's 403 so the web
+/// client's interceptor fires the passphrase prompt unchanged.
+fn reject_response(rej: PatchRejection) -> axum::response::Response {
+    let status = StatusCode::from_u16(rej.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
+    (
+        status,
+        Json(serde_json::json!({"error": rej.error_code(), "message": rej.message()})),
+    )
+        .into_response()
+}
+
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -127,44 +203,27 @@ pub async fn update_settings(
         )
             .into_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Validate that only allowed sections are being updated. Use the
-    // narrower global allowlist here (no `description`, which is profile-only).
-    if let Some(obj) = body.as_object() {
-        for key in obj.keys() {
-            if !ALLOWED_GLOBAL_SETTINGS_SECTIONS.contains(&key.as_str()) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "validation_failed",
-                        "message": format!("Settings section '{}' is not allowed via the web API.", key)
-                    })),
-                )
-                    .into_response();
-            }
-        }
+    // Strip host-execution surfaces (`local_only`: node_path, agent
+    // argv/command, status-hook commands) before anything else, so a bundled
+    // or echoed-back patch keeps its safe leaves and silently drops the
+    // local-only ones (#1692). They can never reach disk from the web.
+    strip_local_only(&mut body);
+    // Validate every remaining leaf against the schema (single source of
+    // truth): unknown section/field -> 400, bad value -> 400. `PATCH
+    // /api/settings` is already elevation-gated by the auth middleware, so any
+    // field reaching here is treated as elevated.
+    if let Err(rej) = validate_patch(&body, Scope::Global, true) {
+        return reject_response(rej);
     }
 
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load_or_warn();
         let mut current = serde_json::to_value(&config)?;
-        if let (Some(current_obj), Some(update_obj)) = (current.as_object_mut(), body.as_object()) {
-            for (key, value) in update_obj {
-                let mut value = value.clone();
-                // Strip blocked fields from session section
-                if key == "session" {
-                    if let Some(session_obj) = value.as_object_mut() {
-                        for blocked in SESSION_BLOCKED_FIELDS {
-                            session_obj.remove(*blocked);
-                        }
-                    }
-                }
-                current_obj.insert(key.clone(), value);
-            }
-        }
+        crate::session::settings_schema::merge_json(&mut current, &body);
         let config: crate::session::Config = serde_json::from_value(current)?;
         crate::session::save_config(&config)?;
         Ok::<_, anyhow::Error>(config)
@@ -174,7 +233,7 @@ pub async fn update_settings(
     match result {
         Ok(Ok(config)) => {
             // Settings touched [logging]? Apply the new filter live to
-            // the daemon + persist runtime_filter so cockpit runners pick
+            // the daemon + persist runtime_filter so acp runners pick
             // it up via the notify watcher.
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
@@ -205,6 +264,70 @@ pub async fn update_settings(
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings update panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/settings/schema` returns the flat list of settings field
+/// descriptors (the single source of truth, see #1692). The web dashboard
+/// renders a generic field component from this list instead of hand-written
+/// per-field JSX, so a new config field appears on the web automatically. No
+/// secrets: descriptors are pure metadata (labels, widgets, validation, write
+/// policy), so this needs no elevation, only normal authentication.
+pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+    Json(crate::session::settings_schema::schema())
+}
+
+/// Marks the web dashboard's first-run tour as seen for this server.
+///
+/// Single-purpose write so the cosmetic flag never widens the
+/// `PATCH /api/settings` surface (which carries security-sensitive
+/// sections like `sandbox`/`worktree` and the `app_state`
+/// hooks-acknowledgement field). Deliberately exempt from the
+/// elevation/passphrase wall: it flips one cosmetic bool, grants no
+/// capability, and `read_only` still blocks it. Uses `Config::load()`
+/// (not `load_or_warn`) so a corrupt config is not silently replaced
+/// with defaults just to persist this flag.
+pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.has_seen_web_tour = true;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"has_seen_web_tour": true})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -531,39 +654,33 @@ pub struct ServerAbout {
     pub read_only: bool,
     pub behind_tunnel: bool,
     pub profile: String,
-    /// Live value of the `cockpit.enabled` master switch. The settings
-    /// UI binds its toggle to this and updates it via
-    /// `PATCH /api/cockpit/master`. When true, new sessions for ACP-
-    /// capable tools default to cockpit mode; when false, every new
-    /// session is tmux.
-    pub cockpit_master_enabled: bool,
-    /// Resolved value of `cockpit.show_tool_durations` from the active
+    /// Resolved value of `acp.show_tool_durations` from the active
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
-    pub cockpit_show_tool_durations: bool,
-    /// Resolved value of `cockpit.queue_drain_mode` from the active
+    pub acp_show_tool_durations: bool,
+    /// Resolved value of `acp.queue_drain_mode` from the active
     /// profile's config. Selects how the web composer drains client-side
     /// queued prompts on Stopped: `combined` (default) joins them with
     /// blank lines into a single follow-up; `serial` fires them one at a
     /// time. Cross-device since it lives in config.toml. See #1031.
-    pub cockpit_queue_drain_mode: String,
-    /// Resolved value of `cockpit.max_concurrent_resumes` from the
-    /// active profile's config. Upper bound on parallel cockpit worker
+    pub acp_queue_drain_mode: String,
+    /// Resolved value of `acp.max_concurrent_resumes` from the
+    /// active profile's config. Upper bound on parallel acp worker
     /// spawns/attaches the reconciler runs on `aoe serve` cold start.
     /// Surfaced so the settings UI shows the current value. See #1088.
-    pub cockpit_max_concurrent_resumes: u32,
-    /// Resolved value of `cockpit.force_end_turn_threshold_secs` from
+    pub acp_max_concurrent_resumes: u32,
+    /// Resolved value of `acp.force_end_turn_threshold_secs` from
     /// the active profile's config. Seconds of streaming inactivity
-    /// after which the cockpit web UI offers a "Force end turn" button
+    /// after which the acp web UI offers a "Force end turn" button
     /// to unstick a missed-Stopped spinner. See #1100.
-    pub cockpit_force_end_turn_threshold_secs: u32,
-    /// Resolved value of `cockpit.replay_events` from the active
-    /// profile's config. Per-session retention cap on the cockpit
+    pub acp_force_end_turn_threshold_secs: u32,
+    /// Resolved value of `acp.replay_events` from the active
+    /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
     /// its in-memory activity buffer so the rendered transcript
     /// honours the user's chosen ceiling instead of clipping at a
     /// hard-coded constant. See #1111.
-    pub cockpit_replay_events: u32,
+    pub acp_replay_events: u32,
     /// `"debug"` when built with `debug_assertions`, `"release"`
     /// otherwise. The web UI renders a "DEV" badge in the topbar
     /// when this is `"debug"` so users can tell concurrently-running
@@ -576,23 +693,14 @@ pub struct ServerAbout {
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
     let auth_required = !state.token_manager.is_no_auth().await;
     let passphrase_enabled = state.login_manager.is_enabled();
-    let auth_mode = if auth_required {
-        "token"
-    } else if passphrase_enabled {
-        "passphrase"
-    } else {
-        "none"
-    };
-    let cockpit_master_enabled = state
-        .cockpit_master_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let cockpit_cfg =
-        crate::session::profile_config::resolve_config_or_warn(&state.profile).cockpit;
-    let cockpit_show_tool_durations = cockpit_cfg.show_tool_durations;
-    let cockpit_queue_drain_mode = cockpit_cfg.queue_drain_mode.as_str().to_string();
-    let cockpit_max_concurrent_resumes = cockpit_cfg.max_concurrent_resumes;
-    let cockpit_force_end_turn_threshold_secs = cockpit_cfg.force_end_turn_threshold_secs;
-    let cockpit_replay_events = cockpit_cfg.replay_events;
+    let auth_mode =
+        crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
+    let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let acp_show_tool_durations = acp_cfg.show_tool_durations;
+    let acp_queue_drain_mode = acp_cfg.queue_drain_mode.as_str().to_string();
+    let acp_max_concurrent_resumes = acp_cfg.max_concurrent_resumes;
+    let acp_force_end_turn_threshold_secs = acp_cfg.force_end_turn_threshold_secs;
+    let acp_replay_events = acp_cfg.replay_events;
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
@@ -601,12 +709,11 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         profile: state.profile.clone(),
-        cockpit_master_enabled,
-        cockpit_show_tool_durations,
-        cockpit_queue_drain_mode,
-        cockpit_max_concurrent_resumes,
-        cockpit_force_end_turn_threshold_secs,
-        cockpit_replay_events,
+        acp_show_tool_durations,
+        acp_queue_drain_mode,
+        acp_max_concurrent_resumes,
+        acp_force_end_turn_threshold_secs,
+        acp_replay_events,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -922,6 +1029,7 @@ pub async fn get_profile_settings(
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -933,7 +1041,7 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
@@ -944,21 +1052,32 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
-    // Validate allowed sections. Use the per-profile allowlist here, which
-    // is the global list plus `description` (a profile-only field).
-    if let Some(obj) = body.as_object() {
-        for key in obj.keys() {
-            if !ALLOWED_PROFILE_SETTINGS_SECTIONS.contains(&key.as_str()) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "validation_failed",
-                        "message": format!("Settings section '{}' is not allowed via the web API.", key)
-                    })),
-                )
-                    .into_response();
+    // Strip host-execution surfaces (`local_only`) before validation + merge,
+    // so a bundled patch keeps its safe leaves and silently drops the
+    // local-only ones; they can never become a profile override (#1692).
+    strip_local_only(&mut body);
+    // Resolve elevation up front. With login disabled (single-user local) the
+    // caller is always treated as elevated; with login enabled, only an
+    // elevated session may write a requires-elevation field.
+    let elevated = if state.login_manager.is_enabled() {
+        match session.as_ref() {
+            Some(axum::Extension(AuthenticatedSession(id))) => {
+                state.login_manager.is_elevated(id).await
             }
+            None => false,
         }
+    } else {
+        true
+    };
+
+    // Validate every remaining leaf against the schema (single source of
+    // truth, #1692): unknown section/field -> 400, requires-elevation without
+    // elevation -> 403 elevation_required (mirrors the path-shape gate's
+    // payload so web/src/lib/fetchInterceptor.ts fires the passphrase prompt
+    // unchanged, see #1510), bad value -> 400. `description` is accepted here
+    // (a profile-only field) but rejected on the global endpoint.
+    if let Err(rej) = validate_patch(&body, Scope::Profile, elevated) {
+        return reject_response(rej);
     }
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1001,32 +1120,38 @@ pub async fn update_profile_settings(
 
         let config = crate::session::load_profile_config(&name).unwrap_or_default();
         let mut current = serde_json::to_value(&config)?;
-        if let (Some(current_obj), Some(update_obj)) = (current.as_object_mut(), body.as_object()) {
+        // Apply each validated leaf onto the sparse override object. A null
+        // clears the override (revert to inheriting the global); anything else
+        // sets it. Sections are created lazily so a single-field patch never
+        // wipes its siblings. `description` is a top-level string, handled the
+        // same way (set, or removed on null).
+        if let Some(update_obj) = body.as_object() {
             for (key, value) in update_obj {
-                let mut value = value.clone();
-                if key == "session" {
-                    if let Some(session_obj) = value.as_object_mut() {
-                        for blocked in SESSION_BLOCKED_FIELDS {
-                            session_obj.remove(*blocked);
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        for (field, fval) in fields {
+                            if fval.is_null() {
+                                clear_path(&mut current, key, field);
+                            } else if let Some(root) = current.as_object_mut() {
+                                let section = root
+                                    .entry(key.clone())
+                                    .or_insert_with(|| serde_json::json!({}));
+                                if let Some(sec) = section.as_object_mut() {
+                                    sec.insert(field.clone(), fval.clone());
+                                }
+                            }
                         }
                     }
-                }
-                // Deep merge within sections so that sending a single field
-                // (e.g. {"session": {"yolo_mode_default": true}}) only sets
-                // that field as a profile override, preserving other existing
-                // overrides instead of replacing the entire section.
-                if let Some(existing) = current_obj.get_mut(key) {
-                    if let (Some(existing_obj), Some(new_obj)) =
-                        (existing.as_object_mut(), value.as_object())
-                    {
-                        for (k, v) in new_obj {
-                            existing_obj.insert(k.clone(), v.clone());
+                    serde_json::Value::Null => {
+                        if let Some(root) = current.as_object_mut() {
+                            root.remove(key);
                         }
-                    } else {
-                        current_obj.insert(key.clone(), value);
                     }
-                } else {
-                    current_obj.insert(key.clone(), value);
+                    other => {
+                        if let Some(root) = current.as_object_mut() {
+                            root.insert(key.clone(), other.clone());
+                        }
+                    }
                 }
             }
         }
@@ -1064,7 +1189,7 @@ pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
 }
 
-/// Serve a sound file by name so the cockpit's browser-side approval
+/// Serve a sound file by name so the acp's browser-side approval
 /// player can fetch it from the same origin as the dashboard. The name
 /// is validated against `list_available_sounds()` to block path
 /// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
@@ -1133,10 +1258,10 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_use_safe_placeholders() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-claude",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
 
         assert_eq!(entries.len(), 1);
         let agent = &entries[0];
@@ -1146,14 +1271,16 @@ mod tests {
         assert!(!agent.host_only);
         assert!(agent.installed);
         assert_eq!(agent.install_hint, "Configured custom agent");
+        // No agent_acp_cmd configured, so it is tmux-only.
+        assert!(!agent.acp_capable);
     }
 
     #[test]
     fn custom_agent_entries_never_serialize_command_values() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-agent",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
 
         let json = serde_json::to_string(&entries).unwrap();
         assert!(json.contains("remote-agent"));
@@ -1164,10 +1291,10 @@ mod tests {
 
     #[test]
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
-        let entries = build_custom_agent_infos(&custom_agents(&[(
-            "remote-agent",
-            "ssh -t prod.example claude",
-        )]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
+        );
         let value = serde_json::to_value(&entries).unwrap();
 
         assert_eq!(value[0]["kind"], "custom");
@@ -1185,14 +1312,17 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_filter_empty_values_and_builtin_collisions() {
-        let entries = build_custom_agent_infos(&custom_agents(&[
-            ("", "codex"),
-            ("empty-command", ""),
-            ("   ", "codex"),
-            ("whitespace-command", "   "),
-            ("claude", "ssh -t prod.example claude"),
-            ("remote-codex", "ssh -t prod.example codex"),
-        ]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[
+                ("", "codex"),
+                ("empty-command", ""),
+                ("   ", "codex"),
+                ("whitespace-command", "   "),
+                ("claude", "ssh -t prod.example claude"),
+                ("remote-codex", "ssh -t prod.example codex"),
+            ]),
+            &HashMap::new(),
+        );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["remote-codex"]);
@@ -1201,14 +1331,80 @@ mod tests {
 
     #[test]
     fn custom_agent_entries_are_sorted_by_name() {
-        let entries = build_custom_agent_infos(&custom_agents(&[
-            ("zeta", "zeta-cmd"),
-            ("alpha", "alpha-cmd"),
-            ("middle", "middle-cmd"),
-        ]));
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[
+                ("zeta", "zeta-cmd"),
+                ("alpha", "alpha-cmd"),
+                ("middle", "middle-cmd"),
+            ]),
+            &HashMap::new(),
+        );
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    #[test]
+    fn custom_agent_acp_capable_tracks_agent_acp_cmd() {
+        let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("plain", "ssh host claude")]);
+        let acp = custom_agents(&[
+            ("oc-sp", "ocp run sp acp"),
+            // An entry whose command is malformed must not flip capability on.
+            ("broken", "ocp run \"unterminated"),
+        ]);
+        let entries = build_custom_agent_infos(&custom, &acp);
+
+        let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
+        assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
+        let plain = entries.iter().find(|e| e.name == "plain").unwrap();
+        assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
+    }
+
+    #[test]
+    fn acp_command_fields_resolve_registry_command_and_args() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
+
+        let (cmd, args) = acp_command_fields(registry.get("opencode"), None);
+        assert_eq!(cmd.as_deref(), Some("opencode"));
+        assert_eq!(args, vec!["acp".to_string()]);
+
+        let (cmd, args) = acp_command_fields(registry.get("gemini"), None);
+        assert_eq!(cmd.as_deref(), Some("gemini"));
+        assert_eq!(args, vec!["--acp".to_string()]);
+
+        let (cmd, args) = acp_command_fields(registry.get("claude"), None);
+        assert_eq!(cmd.as_deref(), Some("claude-agent-acp"));
+        assert!(args.is_empty());
+
+        let (cmd, args) = acp_command_fields(None, None);
+        assert_eq!(cmd, None);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn acp_command_fields_substitute_data_dir() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let dir = std::path::Path::new("/tmp/aoe-data");
+        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
+        let cmd = cmd.expect("aoe-agent has a registry command");
+        assert!(
+            !cmd.contains("${aoe_data_dir}"),
+            "placeholder must be substituted"
+        );
+        assert!(cmd.starts_with("/tmp/aoe-data/"));
+    }
+
+    #[test]
+    fn custom_agent_entries_omit_acp_command_fields() {
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("oc-sp", "ocp run sp")]),
+            &custom_agents(&[("oc-sp", "ocp run sp acp")]),
+        );
+        let value = serde_json::to_value(&entries).unwrap();
+        assert!(value[0].get("acp_command").is_none());
+        assert!(value[0].get("acp_args").is_none());
+        // The custom acp command must not leak via the new fields.
+        assert!(!value.to_string().contains("ocp run sp"));
     }
 
     #[tokio::test]

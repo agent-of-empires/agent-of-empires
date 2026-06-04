@@ -10,7 +10,39 @@
 // branch logic.
 
 import { describe, expect, it } from "vitest";
-import { resolveSelectedProfile } from "../SettingsView";
+import { buildSidebar, resolveSelectedProfile } from "../SettingsView";
+
+// Story #1: the web sidebar divider/tab order mirrors the TUI grouping
+// (categories_for_scope() in src/tui/settings/mod.rs) so muscle memory carries
+// across surfaces. Asserting the pure config is more robust than querying the
+// DOM, which renders the same list twice (mobile strip + desktop nav).
+describe("buildSidebar", () => {
+  it("matches the TUI grouping order", () => {
+    expect(buildSidebar()).toEqual([
+      { kind: "divider", label: "Appearance" },
+      { kind: "tab", id: "theme", label: "Theme" },
+      { kind: "tab", id: "diff", label: "Diff" },
+      { kind: "divider", label: "Sessions" },
+      { kind: "tab", id: "session", label: "Session" },
+      { kind: "tab", id: "structured-view", label: "Structured view" },
+      { kind: "divider", label: "Environment" },
+      { kind: "tab", id: "sandbox", label: "Sandbox" },
+      { kind: "tab", id: "worktree", label: "Worktree" },
+      { kind: "tab", id: "tmux", label: "Tmux" },
+      { kind: "divider", label: "Notifications" },
+      { kind: "tab", id: "sound", label: "Sound" },
+      { kind: "tab", id: "notifications", label: "Notifications" },
+      { kind: "divider", label: "Web Dashboard" },
+      { kind: "tab", id: "terminal", label: "Terminal" },
+      { kind: "tab", id: "security", label: "Security" },
+      { kind: "tab", id: "devices", label: "Devices" },
+      { kind: "divider", label: "System" },
+      { kind: "tab", id: "updates", label: "Updates" },
+      { kind: "tab", id: "telemetry", label: "Telemetry" },
+      { kind: "tab", id: "logging", label: "Logging" },
+    ]);
+  });
+});
 
 describe("resolveSelectedProfile", () => {
   it("preserves the current selection when it still exists in the profile list", () => {

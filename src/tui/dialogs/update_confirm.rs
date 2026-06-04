@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::hover::HoverState;
 use crate::tui::styles::Theme;
 use crate::update::install::InstallMethod;
 
@@ -15,6 +16,11 @@ pub struct UpdateConfirmDialog {
     pub latest_version: String,
     pub needs_sudo: bool,
     selected: bool, // true = Yes, false = No
+    yes_button_area: Rect,
+    no_button_area: Rect,
+    /// Which Yes/No button the mouse is over, for the hover highlight.
+    /// Visual only; never changes `selected`.
+    hover: HoverState,
 }
 
 impl UpdateConfirmDialog {
@@ -36,7 +42,29 @@ impl UpdateConfirmDialog {
             latest_version,
             needs_sudo,
             selected: false,
+            yes_button_area: Rect::default(),
+            no_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if self.yes_button_area.contains(pos) {
+            return Some(DialogResult::Submit(()));
+        }
+        if self.no_button_area.contains(pos) {
+            return Some(DialogResult::Cancel);
+        }
+        None
+    }
+
+    /// Highlight the Yes/No button under the cursor without changing
+    /// `selected`. See `ConfirmDialog::handle_hover` for the rationale.
+    /// Returns `true` when the highlighted button changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover
+            .update(col, row, &[self.yes_button_area, self.no_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -66,7 +94,7 @@ impl UpdateConfirmDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let height = if self.needs_sudo { 11 } else { 10 };
         let dialog_area = super::centered_rect(area, 60, height);
 
@@ -92,7 +120,9 @@ impl UpdateConfirmDialog {
             Paragraph::new(self.prompt_block.as_str()).style(Style::default().fg(theme.text));
         frame.render_widget(body, chunks[0]);
 
-        render_yes_no(frame, chunks[1], theme, self.selected);
+        let (yes, no) = render_yes_no(frame, chunks[1], theme, self.selected, self.hover.current());
+        self.yes_button_area = yes;
+        self.no_button_area = no;
     }
 }
 

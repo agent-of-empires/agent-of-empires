@@ -15,22 +15,31 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
 import { TopBar } from "../TopBar";
+import type { SessionResponse, Workspace } from "../../lib/types";
 
 afterEach(() => {
   cleanup();
 });
 
-function renderTopBar(overrides: { isDevBuild?: boolean; isOffline?: boolean } = {}) {
+function renderTopBar(
+  overrides: {
+    isDevBuild?: boolean;
+    isOffline?: boolean;
+    activeWorkspace?: Workspace;
+    activeSession?: SessionResponse | null;
+  } = {},
+) {
   return render(
     <TopBar
-      activeWorkspace={undefined}
-      activeSession={null}
+      activeWorkspace={overrides.activeWorkspace}
+      activeSession={overrides.activeSession ?? null}
       onToggleSidebar={vi.fn()}
       onOpenPalette={vi.fn()}
       onToggleDiff={vi.fn()}
       diffCollapsed={true}
       onOpenHelp={vi.fn()}
       onOpenAbout={vi.fn()}
+      onStartTutorial={vi.fn()}
       onLogout={vi.fn()}
       loginRequired={false}
       isOffline={overrides.isOffline ?? false}
@@ -52,6 +61,27 @@ describe("TopBar", () => {
     const { queryByLabelText, queryByText } = renderTopBar({ isDevBuild: false });
     expect(queryByLabelText("Debug build")).toBeNull();
     expect(queryByText("DEV")).toBeNull();
+  });
+
+  it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {
+    const workspace = {
+      id: "ws-1",
+      branch: null,
+      projectPath: "/home/user/breadcrumb-repo",
+      displayName: "breadcrumb-feature",
+      agents: [],
+      primaryAgent: "claude",
+      status: "idle",
+      sessions: [],
+    } as unknown as Workspace;
+    const { queryByText } = renderTopBar({
+      activeWorkspace: workspace,
+      activeSession: {} as SessionResponse,
+    });
+    // The old breadcrumb rendered the repo name (last path segment) and the
+    // workspace display name; both must be gone now that #1456 removed it.
+    expect(queryByText("breadcrumb-repo")).toBeNull();
+    expect(queryByText("breadcrumb-feature")).toBeNull();
   });
 
   it("renders the offline badge independent of the DEV badge", () => {

@@ -4,7 +4,7 @@ import {
   humanizeServer,
   humanizeVerb,
 } from "./mcpClassify";
-import type { ToolCall } from "./cockpitTypes";
+import type { ToolCall } from "./acpTypes";
 
 function tool(name: string, args: Record<string, unknown> = {}): ToolCall {
   return {

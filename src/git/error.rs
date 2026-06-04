@@ -9,6 +9,9 @@ pub enum GitError {
     #[error("Worktree already exists at {}", .0.display())]
     WorktreeAlreadyExists(PathBuf),
 
+    #[error("Branch '{0}' is already in use by another worktree")]
+    BranchAlreadyCheckedOut(String),
+
     #[error("Worktree not found at {}", .0.display())]
     WorktreeNotFound(PathBuf),
 

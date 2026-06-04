@@ -56,6 +56,7 @@ impl HomeView {
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
+            scratch: data.scratch,
         };
 
         let build_result = builder::build_instance(
@@ -84,6 +85,14 @@ impl HomeView {
         self.save()?;
 
         self.reload()?;
+        // Same rationale as the async branch in apply_creation_results:
+        // reload()'s restore-previous-selection fallback lands the cursor
+        // on whichever flat_items index is closest to the previously-
+        // selected row, which in project-grouped layouts is often the
+        // new session's group folder. Pin selection here so the caller
+        // (Action::AttachAfterCreate) sees the new session as the
+        // visible row and the user's not staring at the wrong preview.
+        self.select_and_reveal_session(&session_id);
         Ok(session_id)
     }
 
@@ -93,9 +102,14 @@ impl HomeView {
     /// Guards (apply to bare `e` / `E` / `F5` and dialog-submitted restarts):
     /// - No selection: no-op.
     /// - Transient lifecycle (`Creating` / `Deleting`): drop.
-    /// - Sunk rows (`is_archived`, `is_snoozed`, `pane_dead_observed`):
-    ///   drop. Archive's contract is "do not auto-revive"; the user must
-    ///   unarchive or send first. Dead panes have a dedicated revive path.
+    /// - Sunk rows: archived and pane-dead always drop (archive's contract
+    ///   is "do not auto-revive"; dead panes have a dedicated revive path).
+    ///   Snoozed rows drop only when `sort_order == Attention`; in other
+    ///   sort modes the snooze surface is hidden, so silently swallowing
+    ///   the press would leave the user staring at a row that looks
+    ///   restartable but isn't. Outside Attention we clear the snooze flag
+    ///   and let the restart proceed so behavior matches what the user
+    ///   sees on screen.
     /// - Spam-debounce: if the same session was restarted within the last
     ///   1.5s, the press is dropped. Without this guard rapid `e` presses
     ///   would each spawn a wake-up worker AND tear down the still-booting
@@ -133,14 +147,18 @@ impl HomeView {
 
         // Skip transient + sunk rows. Pull the snapshot details we need on
         // the worker thread in the same borrow so we don't re-look up the
-        // instance under different conditions later.
-        let (skip, title, tool) = match self.get_instance(&id) {
+        // instance under different conditions later. Snoozed rows only
+        // skip when the user is in Attention sort; see method doc.
+        let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
+        let (skip, wake_snooze, title, tool) = match self.get_instance(&id) {
             Some(inst) => {
+                let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
                     || inst.is_archived()
-                    || inst.is_snoozed()
+                    || (snoozed && in_attention)
                     || inst.pane_dead_observed;
-                (skip, inst.title.clone(), inst.tool.clone())
+                let wake_snooze = snoozed && !in_attention;
+                (skip, wake_snooze, inst.title.clone(), inst.tool.clone())
             }
             None => return Ok(()),
         };
@@ -157,6 +175,15 @@ impl HomeView {
             }
         }
         self.restart_cooldown_at.insert(id.clone(), now);
+
+        // Outside Attention sort, restart on a snoozed row clears the
+        // snooze flag so the persisted state matches what the user sees
+        // after the wake-up (a Running row, no snooze badge). Sequenced
+        // after the debounce so a press dropped by the cooldown doesn't
+        // clear snooze without restarting.
+        if wake_snooze {
+            self.mutate_instance(&id, |inst| inst.unsnooze());
+        }
 
         // Apply tool swap before restart so the new binary starts on the
         // next launch.
@@ -193,11 +220,24 @@ impl HomeView {
                     self.storages
                         .insert(target_profile.to_string(), Storage::new(target_profile)?);
                 }
-                let group_path = self
+                if !self.group_trees.contains_key(target_profile) {
+                    self.group_trees.insert(
+                        target_profile.to_string(),
+                        GroupTree::new_with_groups(&[], &[]),
+                    );
+                }
+                // Capture the moved row's old group_path before the move so
+                // we can prune the source profile's now-empty copy after.
+                // Without the prune, the source profile retains an empty
+                // group header with the same name as the one the row appears
+                // under in the target profile, which reads as a duplicate
+                // group in unified view.
+                let old_group_path = self
                     .get_instance(&id)
                     .map(|i| i.group_path.clone())
                     .unwrap_or_default();
-                self.move_to_profile(&id, target_profile, group_path)?;
+                self.move_to_profile(&id, target_profile, old_group_path.clone())?;
+                self.prune_empty_group(&current_profile, &old_group_path);
                 self.rebuild_group_trees();
                 // Rebuild the visible row list too; otherwise the row still
                 // renders under the old profile until the next reload, and
@@ -297,6 +337,7 @@ impl HomeView {
                     delete_sandbox: options.delete_sandbox,
                     force_delete: options.force_delete,
                     detach_hooks: true,
+                    keep_scratch: options.keep_scratch,
                 };
                 self.deletion_poller.request_deletion(request);
             }
@@ -394,6 +435,10 @@ impl HomeView {
                         delete_sandbox,
                         force_delete: options.force_delete_worktrees,
                         detach_hooks: true,
+                        // Group-delete UX doesn't have a per-session
+                        // keep-scratch toggle; scratch dirs in a group
+                        // delete are removed unconditionally.
+                        keep_scratch: false,
                     };
                     self.deletion_poller.request_deletion(request);
                 }
@@ -413,10 +458,28 @@ impl HomeView {
         Ok(())
     }
 
-    /// Force-remove a session from storage without any cleanup.
-    /// Used for sessions stuck in the Deleting state where the background
-    /// deletion thread never returned a result.
+    /// Force-remove a session from storage. Worktree, branch, and
+    /// container cleanup are skipped (the original deletion already
+    /// attempted them); tmux teardown is fired off-thread so a hung
+    /// tmux call cannot block the storage update on the TUI input
+    /// thread. Used for sessions stuck in the Deleting state where
+    /// the background deletion thread never returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if let Some(inst) = self.instances.iter().find(|i| i.id == session_id) {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "force_remove tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
+            });
+        }
         self.remove_instance(session_id);
         self.rebuild_group_trees();
         self.save()?;
@@ -573,6 +636,56 @@ impl HomeView {
             }
         }
 
+        self.save()?;
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Edit the selected session's worktree workdir name: move the worktree
+    /// directory and, optionally, rename its git branch. Persists the new
+    /// `project_path` (and branch) through `apply_user_action`. See #1723.
+    pub(super) fn set_worktree_name_for_selected(
+        &mut self,
+        new_name: &str,
+        rename_branch: bool,
+    ) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let snapshot = self
+            .get_instance(&id)
+            .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
+        let Some((worktree_info, status, project_path)) = snapshot else {
+            anyhow::bail!("Session not found");
+        };
+        let Some(worktree_info) = worktree_info else {
+            anyhow::bail!("Session does not use a worktree");
+        };
+        if status.blocks_worktree_edit() {
+            anyhow::bail!("Stop the session before editing its workdir name");
+        }
+
+        let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &worktree_info,
+                current_path: std::path::Path::new(&project_path),
+                new_name,
+                rename_branch,
+            },
+        )?;
+        let new_path = outcome.new_path.to_string_lossy().to_string();
+        let new_branch = outcome.new_branch.clone();
+
+        self.apply_user_action(&id, |inst| {
+            inst.project_path = new_path.clone();
+            if let Some(branch) = &new_branch {
+                if let Some(wt) = inst.worktree_info.as_mut() {
+                    wt.branch = branch.clone();
+                }
+            }
+        })?;
+
+        self.rebuild_group_trees();
         self.save()?;
         self.reload()?;
         Ok(())

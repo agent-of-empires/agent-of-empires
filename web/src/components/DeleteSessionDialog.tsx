@@ -7,6 +7,7 @@ interface Props {
   branchName: string | null;
   hasManagedWorktree: boolean;
   isSandboxed: boolean;
+  isScratch: boolean;
   cleanupDefaults: CleanupDefaults;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onCancel: () => void;
@@ -17,6 +18,7 @@ export function DeleteSessionDialog({
   branchName,
   hasManagedWorktree,
   isSandboxed,
+  isScratch,
   cleanupDefaults,
   onConfirm,
   onCancel,
@@ -25,11 +27,14 @@ export function DeleteSessionDialog({
   const [forceDelete, setForceDelete] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(hasManagedWorktree && cleanupDefaults.delete_branch);
   const [deleteSandbox, setDeleteSandbox] = useState(isSandboxed && cleanupDefaults.delete_sandbox);
+  // Scratch sessions default to remove. The user opts in to keep when they
+  // realize mid-delete they want to rescue the files.
+  const [keepScratch, setKeepScratch] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  const hasOptions = hasManagedWorktree || isSandboxed;
+  const hasOptions = hasManagedWorktree || isSandboxed || isScratch;
 
   const handleConfirm = useCallback(async () => {
     setDeleting(true);
@@ -39,11 +44,12 @@ export function DeleteSessionDialog({
         delete_branch: deleteBranch,
         delete_sandbox: deleteSandbox,
         force_delete: forceDelete,
+        keep_scratch: isScratch ? keepScratch : undefined,
       });
     } catch {
       setDeleting(false);
     }
-  }, [onConfirm, deleteWorktree, deleteBranch, deleteSandbox, forceDelete]);
+  }, [onConfirm, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
 
   // Capture the previously focused element on mount and restore focus on
   // unmount so keyboard users return to the trigger (the sidebar row /
@@ -154,6 +160,15 @@ export function DeleteSessionDialog({
                   testId="delete-session-checkbox-sandbox"
                 />
               )}
+              {isScratch && (
+                <Checkbox
+                  checked={keepScratch}
+                  onChange={setKeepScratch}
+                  label="Keep scratch directory"
+                  detail="Leaves the scratch directory on disk; session record is still removed"
+                  testId="delete-session-checkbox-keep-scratch"
+                />
+              )}
             </div>
           )}
         </div>
@@ -206,9 +221,24 @@ function Checkbox({
       data-testid={testId}
       data-checked={checked ? "true" : "false"}
     >
+      {/*
+        Native checkbox input drives state so the control is reachable
+        by Tab and toggles with Space, matching the platform contract
+        for "Keep scratch directory" and the other checkboxes here.
+        The visible square below is a styled affordance that mirrors
+        the input's checked state via Tailwind's `peer` selector; the
+        input itself is visually hidden but not aria-hidden.
+      */}
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        aria-label={label}
+        className="peer sr-only"
+      />
       <span
-        onClick={() => onChange(!checked)}
-        className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
+        aria-hidden="true"
+        className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-status-error ${
           checked
             ? "bg-status-error border-status-error"
             : "border-surface-600 group-hover:border-surface-500"

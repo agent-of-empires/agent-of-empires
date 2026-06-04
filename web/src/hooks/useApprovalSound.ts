@@ -1,6 +1,6 @@
-// Browser-side approval sound for the cockpit.
+// Browser-side approval sound for the structured view.
 //
-// When the cockpit transitions from "no pending approvals" to "at least
+// When the structured view transitions from "no pending approvals" to "at least
 // one pending approval", play the configured sound (from `[sound]` in
 // the daemon's config) in the browser. The host-side sound module only
 // fires on session-status transitions and runs on the server host, so
@@ -39,13 +39,13 @@ const SETTINGS_TTL_MS = 30_000;
 let cachedSound: CachedSound | null = null;
 
 /** Grace window after mount during which 0->>=1 transitions are
- *  swallowed. The cockpit WS replays every stored event for the
+ *  swallowed. The structured view WS replays every stored event for the
  *  session on connect, so a fresh page load on a session with pending
  *  approvals would otherwise ring the chime even though nothing new
  *  happened. The OS push only fires on the live broadcast edge in the
  *  supervisor (no replay path), so the two channels stay consistent.
  *
- *  Reconnects do not unmount `CockpitView`, so this gate only swallows
+ *  Reconnects do not unmount `StructuredView`, so this gate only swallows
  *  the initial-load case; new approvals that arrive while the socket
  *  is offline still chime after the reducer applies them on reconnect. */
 const REPLAY_QUIET_MS = 1500;

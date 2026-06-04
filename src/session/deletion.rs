@@ -19,6 +19,11 @@ pub struct DeletionRequest {
     /// terminal (TUI/web). When `false`, hooks inherit stdin/stdout so
     /// interactive prompts work (CLI).
     pub detach_hooks: bool,
+    /// When `true` AND `instance.scratch` is `true`, the scratch directory
+    /// is left on disk instead of being removed. The kept path is logged at
+    /// info level and surfaced in the deletion result's messages. Has no
+    /// effect on non-scratch sessions.
+    pub keep_scratch: bool,
 }
 
 #[derive(Debug)]
@@ -61,10 +66,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     // first, container second, tmux last), which raced the in-container
     // agent and produced flaky deletions on Docker + worktree sessions.
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "tmux_kill", "perform_deletion: stage");
-    let _ = request.instance.kill();
-    let _ = request.instance.kill_terminal();
-    let _ = request.instance.kill_container_terminal();
-    crate::tmux::kill_all_tool_sessions_for_id(&request.session_id);
+    request.instance.kill_all_tmux_sessions();
 
     let is_sandboxed = request
         .instance
@@ -149,6 +151,9 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
                 messages.push("Container removed".to_string());
             }
         }
+        // Remove named ignore volumes even if the container is already gone — volumes created
+        // with volume_ignores_strategy = "named" outlive the container and need explicit cleanup.
+        container.remove_named_ignore_volumes(&request.instance.id);
     }
 
     // Stage 4: worktree cleanup. Container is gone, agent is gone, no
@@ -311,6 +316,85 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
         }
     }
 
+    // Scratch directory cleanup. Runs unconditionally for scratch sessions
+    // regardless of `request.delete_worktree`, since the scratch directory
+    // is the entire reason the session has any on-disk state. Skipped when
+    // the user opted in to keeping the directory via `request.keep_scratch`.
+    // Guarded by `is_scratch_path` to refuse to follow a tampered or
+    // corrupted `project_path` (e.g. JSON edited by hand to claim
+    // `scratch: true` while pointing at `/etc`).
+    if request.instance.scratch {
+        let path = PathBuf::from(&request.instance.project_path);
+        // keep_scratch + tampered project_path used to surface
+        // "Scratch directory kept at: /etc" which implied AoE was
+        // intentionally leaving a path it never owned. Gate the
+        // keep-scratch message on the same `is_scratch_path` guard
+        // the remove branch uses so the message only fires for
+        // paths AoE actually controls.
+        let guard_ok = path.exists() && super::scratch::is_scratch_path(&path);
+        if request.keep_scratch && guard_ok {
+            tracing::info!(
+                target: "session.delete",
+                session_id = %request.session_id,
+                path = %path.display(),
+                "keep-scratch opted in; leaving scratch directory on disk"
+            );
+            messages.push(format!("Scratch directory kept at: {}", path.display()));
+        } else if request.keep_scratch {
+            // Tampered or missing path with keep_scratch on: still nothing
+            // to remove, but we cannot claim ownership of the path either.
+            tracing::warn!(
+                target: "session.delete",
+                session_id = %request.session_id,
+                path = %path.display(),
+                "keep-scratch requested but project_path failed the guard or is missing"
+            );
+        } else if !path.exists() {
+            // Already gone (user removed it manually, FS hiccup, prior
+            // partial cleanup). Nothing to do, and we must not reach the
+            // guard branch: a canonicalized `is_scratch_path` rejects
+            // missing paths and would otherwise surface this as a guard
+            // refusal even though it is not a tampering case.
+            tracing::debug!(
+                target: "session.delete",
+                session_id = %request.session_id,
+                path = %path.display(),
+                "scratch dir already gone before deletion ran"
+            );
+        } else if super::scratch::is_scratch_path(&path) {
+            tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "scratch_remove", "perform_deletion: stage");
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => messages.push("Scratch directory removed".to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(target: "session.delete",
+                        session_id = %request.session_id,
+                        path = %path.display(),
+                        "perform_deletion: scratch dir already gone, treating as success"
+                    );
+                }
+                Err(e) => {
+                    errors.push(format!("Scratch directory: {}", e));
+                }
+            }
+        } else {
+            // Tampered `project_path` (e.g. JSON edited by hand to claim
+            // `scratch: true` while pointing outside the scratch root)
+            // is the only path that reaches this branch in normal use.
+            // The session record will still be deleted, so callers need
+            // a visible signal that on-disk cleanup was skipped.
+            tracing::warn!(
+                target: "session.delete",
+                session_id = %request.session_id,
+                path = %path.display(),
+                "scratch flag set but project_path failed the guard; refusing to remove"
+            );
+            errors.push(format!(
+                "Scratch directory: refused to remove {} (path failed scratch guard)",
+                path.display()
+            ));
+        }
+    }
+
     // Stage 6: hook status cleanup
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "hook_status_cleanup", "perform_deletion: stage");
     crate::hooks::cleanup_hook_status_dir(&request.instance.id);
@@ -426,6 +510,7 @@ mod tests {
             delete_sandbox: false,
             force_delete: false,
             detach_hooks: true,
+            keep_scratch: false,
         };
 
         let result = perform_deletion(&request);
@@ -446,6 +531,7 @@ mod tests {
             delete_sandbox: false,
             force_delete: false,
             detach_hooks: true,
+            keep_scratch: false,
         };
 
         let result = perform_deletion(&request);
@@ -467,6 +553,7 @@ mod tests {
             delete_sandbox: false,
             force_delete: false,
             detach_hooks: true,
+            keep_scratch: false,
         };
 
         let result = perform_deletion(&request);
@@ -613,6 +700,7 @@ mod tests {
                 delete_sandbox: true,
                 force_delete: false,
                 detach_hooks: true,
+                keep_scratch: false,
             };
 
             let stages = run_with_capture(|| {
@@ -720,6 +808,7 @@ mod tests {
                 delete_sandbox: false,
                 force_delete: false,
                 detach_hooks: true,
+                keep_scratch: false,
             };
 
             let result = perform_deletion(&request);
@@ -814,6 +903,7 @@ mod tests {
                 delete_sandbox: false,
                 force_delete: false,
                 detach_hooks: true,
+                keep_scratch: false,
             };
             let result = perform_deletion(&req_no_force);
             assert!(
@@ -834,6 +924,7 @@ mod tests {
                 delete_sandbox: false,
                 force_delete: true,
                 detach_hooks: true,
+                keep_scratch: false,
             };
             let result = perform_deletion(&req_force);
             assert!(
@@ -931,6 +1022,7 @@ mod tests {
                 delete_sandbox: true,
                 force_delete: false,
                 detach_hooks: true,
+                keep_scratch: false,
             };
 
             // Stage assertions: preclean must not run when dirty.
@@ -1001,6 +1093,7 @@ mod tests {
                 delete_sandbox: false,
                 force_delete: true,
                 detach_hooks: true,
+                keep_scratch: false,
             };
 
             let stages = run_with_capture(|| {
@@ -1038,6 +1131,7 @@ mod tests {
                 delete_sandbox: false,
                 force_delete: false,
                 detach_hooks: true,
+                keep_scratch: false,
             };
 
             let stages = run_with_capture(|| {
@@ -1054,6 +1148,215 @@ mod tests {
                 "unsandboxed deletion must not emit sandbox preclean stage: stages={:?}",
                 stages
             );
+        }
+    }
+
+    mod scratch_cleanup {
+        use super::*;
+        use serial_test::serial;
+        use std::fs;
+
+        fn isolate_app_dir() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().expect("create temp home for scratch deletion tests");
+            std::env::set_var("HOME", tmp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            tmp
+        }
+
+        fn scratch_instance() -> (Instance, PathBuf) {
+            let id = format!("delete-test-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::scratch::provision_scratch_dir(&id)
+                .expect("provision scratch dir for test");
+            let mut instance = Instance::new("Scratch", dir.to_str().unwrap());
+            instance.scratch = true;
+            (instance, dir)
+        }
+
+        #[test]
+        #[serial]
+        fn scratch_session_removes_dir() {
+            let _tmp = isolate_app_dir();
+            let (instance, dir) = scratch_instance();
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let result = perform_deletion(&request);
+            assert!(result.success, "deletion errors: {:?}", result.errors);
+            assert!(
+                !dir.exists(),
+                "scratch directory must be gone after perform_deletion"
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("Scratch directory removed")),
+                "expected scratch-removed message, got {:?}",
+                result.messages
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn scratch_session_with_missing_dir_still_succeeds() {
+            let _tmp = isolate_app_dir();
+            let (instance, dir) = scratch_instance();
+            // Simulate the "directory already gone" race (user deleted
+            // manually, FS hiccup, etc.). Deletion must not fail.
+            fs::remove_dir_all(&dir).unwrap();
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "missing scratch dir must not fail deletion: {:?}",
+                result.errors
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn tampered_project_path_does_not_get_removed() {
+            // Defense against an edited or corrupted session JSON that
+            // sets `scratch: true` while pointing project_path at something
+            // the guard would reject. The directory must survive deletion.
+            let _tmp = isolate_app_dir();
+            let bystander =
+                std::env::temp_dir().join(format!("important-data-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&bystander).expect("create bystander");
+            fs::write(bystander.join("file.txt"), b"keep me").unwrap();
+
+            let mut instance = Instance::new("Tampered", bystander.to_str().unwrap());
+            instance.scratch = true;
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+
+            assert!(
+                bystander.exists(),
+                "guard must refuse to remove a path outside the scratch root"
+            );
+            assert!(
+                bystander.join("file.txt").exists(),
+                "bystander contents must survive"
+            );
+            // The guard refusal must also surface as an error on the
+            // deletion result, so callers can report the partial
+            // cleanup instead of silently treating it as a clean
+            // delete.
+            assert!(
+                result.errors.iter().any(|e| e.contains("scratch guard")),
+                "guard refusal must be reported in result.errors, got: {:?}",
+                result.errors
+            );
+            let _ = fs::remove_dir_all(&bystander);
+        }
+
+        #[test]
+        #[serial]
+        fn keep_scratch_leaves_dir_on_disk_and_reports_path() {
+            // The --keep-scratch escape hatch. Session record still gets
+            // removed (caller's responsibility), but the scratch directory
+            // stays put and the deletion result calls out the kept path.
+            let _tmp = isolate_app_dir();
+            let (instance, dir) = scratch_instance();
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: true,
+            };
+
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "keep-scratch deletion errors: {:?}",
+                result.errors
+            );
+            assert!(
+                dir.exists(),
+                "keep-scratch must leave the directory on disk"
+            );
+            let kept_msg = result
+                .messages
+                .iter()
+                .find(|m| m.contains("Scratch directory kept at:"));
+            assert!(
+                kept_msg.is_some(),
+                "expected kept-path message, got {:?}",
+                result.messages
+            );
+            assert!(
+                kept_msg.unwrap().contains(dir.to_str().unwrap()),
+                "kept-path message must include the actual path; got: {}",
+                kept_msg.unwrap()
+            );
+            // Clean up the leftover dir so the next test starts clean.
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        #[serial]
+        fn non_scratch_session_under_app_dir_is_untouched() {
+            // A regular session whose project_path happens to live under
+            // the app dir (e.g. a test fixture) must not be removed.
+            let _tmp = isolate_app_dir();
+            let dir = crate::session::get_app_dir()
+                .unwrap()
+                .join(format!("non-scratch-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&dir).expect("create non-scratch test dir");
+
+            let instance = Instance::new("Regular", dir.to_str().unwrap());
+            // scratch is false by default.
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let _ = perform_deletion(&request);
+
+            assert!(
+                dir.exists(),
+                "non-scratch session must never trip the scratch cleanup branch"
+            );
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }

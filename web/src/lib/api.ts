@@ -1,14 +1,17 @@
+import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
   RichDiffFilesResponse,
   RichFileDiffResponse,
   AgentInfo,
   ProfileInfo,
+  ProfileSettingsResponse,
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  SettingsFieldDescriptor,
 } from "./types";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -127,12 +130,22 @@ export interface SettingsResponse {
   theme?: {
     idle_decay_minutes?: number;
   };
+  app_state?: {
+    has_seen_web_tour?: boolean;
+  };
   [key: string]: unknown;
 }
 
 export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
+}
+
+/** Fetch the settings schema (single source of truth, #1692). The generic
+ *  settings renderer builds form rows from these descriptors instead of
+ *  hand-written per-field JSX. */
+export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
+  return fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema");
 }
 
 export async function updateSettings(
@@ -143,6 +156,24 @@ export async function updateSettings(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Marks the first-run dashboard tour as seen for this server. Single-purpose
+ * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
+ * passphrase/elevation wall. Returns false on read-only servers (403) or
+ * network failure; callers treat that as nonfatal and suppress the tour in
+ * memory for the current page.
+ */
+export async function markWebTourSeen(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-tour-seen", {
+      method: "POST",
     });
     return res.ok;
   } catch {
@@ -210,16 +241,53 @@ export async function setDefaultProfile(name: string): Promise<boolean> {
 
 export function getProfileSettings(
   name: string,
-): Promise<Record<string, unknown> | null> {
-  return fetchJson<Record<string, unknown>>(
+): Promise<ProfileSettingsResponse | null> {
+  return fetchJson<ProfileSettingsResponse>(
     `/api/profiles/${encodeURIComponent(name)}/settings`,
   );
 }
+
+/** Profile-settings sections the dashboard is allowed to PATCH. Mirror of
+ *  the server's `ALLOWED_PROFILE_SETTINGS_SECTIONS` (src/server/api/mod.rs).
+ *  Sections NOT listed here, notably `hooks` plus the agent-command and
+ *  env fields, are remote-code-execution surfaces blocked server-side with
+ *  a pinned regression test (mod.rs tests module). We reject them client
+ *  side too as defense in depth. Keep this in sync with the Rust constant
+ *  by hand: there is no automated cross-language pin. */
+export const PROFILE_WRITABLE_SECTIONS = [
+  "theme",
+  "session",
+  "tmux",
+  "updates",
+  "sound",
+  "sandbox",
+  "worktree",
+  "web",
+  "logging",
+  "acp",
+  "description",
+] as const;
+
+const PROFILE_WRITABLE_SECTION_SET: ReadonlySet<string> = new Set(
+  PROFILE_WRITABLE_SECTIONS,
+);
 
 export async function updateProfileSettings(
   name: string,
   updates: Record<string, unknown>,
 ): Promise<boolean> {
+  for (const key of Object.keys(updates)) {
+    if (!PROFILE_WRITABLE_SECTION_SET.has(key)) {
+      // Refuse loudly rather than silently dropping the key. A blocked
+      // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
+      // server would 400 it anyway. Failing here keeps a buggy caller
+      // from reporting a partial save as success.
+      console.error(
+        `updateProfileSettings: refusing to send blocked profile section "${key}"`,
+      );
+      return false;
+    }
+  }
   try {
     const res = await fetch(
       `/api/profiles/${encodeURIComponent(name)}/settings`,
@@ -265,7 +333,7 @@ export async function fetchSounds(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/sounds")) ?? [];
 }
 
-/** Fetch a sound file as a Blob so the cockpit's browser-side approval
+/** Fetch a sound file as a Blob so the acp's browser-side approval
  *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
  *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
  *  on every request; an `<audio src="...">` element does not, so a
@@ -295,45 +363,57 @@ export interface ServerAbout {
   read_only: boolean;
   behind_tunnel: boolean;
   profile: string;
-  /** Live value of the cockpit master switch (`config.cockpit.enabled`).
-   *  Toggleable from the web settings via PATCH /api/cockpit/master.
-   *  When true, new sessions for ACP-capable tools default to cockpit
-   *  mode; when false, every new session is tmux. */
-  cockpit_master_enabled: boolean;
-  /** Resolved `cockpit.show_tool_durations` from the active profile's
-   *  config. Drives the per-tool elapsed-time label in the cockpit
+  /** Resolved `acp.show_tool_durations` from the active profile's
+   *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
-  cockpit_show_tool_durations: boolean;
-  /** Resolved `cockpit.queue_drain_mode` from the active profile's
+  acp_show_tool_durations: boolean;
+  /** Resolved `acp.queue_drain_mode` from the active profile's
    *  config. Selects how the composer drains client-side queued
    *  follow-up prompts on Stopped: `combined` (default) joins them
    *  with blank lines into a single prompt; `serial` fires one entry
    *  at a time. See #1031. */
-  cockpit_queue_drain_mode: "combined" | "serial";
-  /** Resolved `cockpit.max_concurrent_resumes` from the active
-   *  profile's config. Upper bound on parallel cockpit worker
+  acp_queue_drain_mode: "combined" | "serial";
+  /** Resolved `acp.max_concurrent_resumes` from the active
+   *  profile's config. Upper bound on parallel acp worker
    *  spawns/attaches the reconciler runs on `aoe serve` cold start.
    *  See #1088. */
-  cockpit_max_concurrent_resumes: number;
-  /** Resolved `cockpit.force_end_turn_threshold_secs` from the active
+  acp_max_concurrent_resumes: number;
+  /** Resolved `acp.force_end_turn_threshold_secs` from the active
    *  profile's config. Seconds of streaming inactivity after which
-   *  the cockpit web UI offers a "Force end turn" button. See #1100. */
-  cockpit_force_end_turn_threshold_secs: number;
-  /** Resolved `cockpit.replay_events` from the active profile's
-   *  config. Per-session retention cap on the cockpit event log;
+   *  the acp web UI offers a "Force end turn" button. See #1100. */
+  acp_force_end_turn_threshold_secs: number;
+  /** Resolved `acp.replay_events` from the active profile's
+   *  config. Per-session retention cap on the acp event log;
    *  0 means unlimited. Mirrored onto the in-memory activity buffer
    *  so the rendered transcript matches the user's chosen ceiling
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
-  cockpit_replay_events: number;
+  acp_replay_events: number;
   build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
 }
 
-export async function setCockpitMaster(
+export function fetchAbout(): Promise<ServerAbout | null> {
+  return fetchJson<ServerAbout>("/api/about");
+}
+
+export interface TelemetryStatus {
+  enabled: boolean;
+  responded: boolean;
+  do_not_track: boolean;
+}
+
+export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
+  return fetchJson<TelemetryStatus>("/api/telemetry/status");
+}
+
+/// Set the opt-in state. The daemon owns the anonymous install id; the
+/// browser never posts to the telemetry backend itself. Returns the updated
+/// status, or null on failure.
+export async function setTelemetryConsent(
   enabled: boolean,
-): Promise<{ master_enabled: boolean } | null> {
+): Promise<TelemetryStatus | null> {
   try {
-    const res = await fetch("/api/cockpit/master", {
-      method: "PATCH",
+    const res = await fetch("/api/telemetry/consent", {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
     });
@@ -344,8 +424,41 @@ export async function setCockpitMaster(
   }
 }
 
-export function fetchAbout(): Promise<ServerAbout | null> {
-  return fetchJson<ServerAbout>("/api/about");
+/// Allowlisted usage-signal names the daemon accepts on `/api/telemetry/seen`.
+/// Mirrors `USAGE_SIGNALS` in `src/telemetry/usage_signals.rs`; an off-list
+/// name is rejected with a 400 server-side. `web` / `structured_view` are whole-UI
+/// opens; the rest are feature-level opens within the dashboard (#1881).
+export type TelemetrySignal =
+  | "web"
+  | "structured_view"
+  | "diff_panel"
+  | "diff_comments"
+  | "web_terminal";
+
+/// Tell the daemon an allowlisted surface or feature was opened, so its next
+/// opt-in snapshot can carry the `usage_seen` open-count map plus the coarse
+/// client form-factor class (#1883). Best-effort; the daemon only forwards the
+/// count when the install is opted in. The browser never posts to the telemetry
+/// backend; it pings the local daemon, which folds both into its own snapshot.
+export function reportTelemetrySeen(surface: TelemetrySignal): void {
+  void fetch("/api/telemetry/seen", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ surface, form_factor: clientFormFactor() }),
+  }).catch(() => {});
+}
+
+/// Report an acp interaction the daemon cannot observe itself, so its next
+/// opt-in snapshot can fold it in. Today the only kind is a queued prompt: the
+/// prompt queue lives entirely in client state, so the browser is the one
+/// surface that can report it. Best-effort; the daemon only counts when the
+/// user is opted in.
+export function reportAcpInteraction(kind: "prompt_queued"): void {
+  void fetch("/api/telemetry/structured-interaction", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  }).catch(() => {});
 }
 
 /** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
@@ -390,7 +503,7 @@ export function fetchBranches(
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
-// --- Cockpit context primer ---
+// --- Acp context primer ---
 
 export interface ContextPrimerResponse {
   primer: string;
@@ -407,23 +520,23 @@ export interface ContextPrimerResponse {
   unprocessed_prompt?: string | null;
 }
 
-// --- Cockpit ACP registry ---
+// --- Acp ACP registry ---
 
-export interface CockpitAgentInfo {
+export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
 }
 
-/** List ACP registry entries the cockpit supervisor knows about.
+/** List ACP registry entries the acp supervisor knows about.
  *  Distinct from `/api/agents` (session-tool agents for the wizard);
- *  this is the *cockpit* registry used by the rate-limit recovery
+ *  this is the *acp* registry used by the rate-limit recovery
  *  modal to populate the handoff target list. See #1282. */
-export async function fetchCockpitAgents(): Promise<CockpitAgentInfo[]> {
-  return (await fetchJson<CockpitAgentInfo[]>("/api/cockpit/agents")) ?? [];
+export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
+  return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
 }
 
-// --- Cockpit switch agent ---
+// --- Acp switch agent ---
 
 export interface SwitchAgentResponse {
   session_id: string;
@@ -438,20 +551,24 @@ export interface SwitchAgentResponse {
   status: string;
 }
 
-/** Hand off a cockpit session from its current ACP backend to
+/** Hand off an acp session from its current ACP backend to
  *  `target` (registry key, e.g. "codex"). Backend stops the old
  *  worker, spawns the new one, persists the agent change, and emits
  *  an AgentSwitched event. On failure (unknown target, spawn error)
- *  the instance is left untouched. See #1282. */
-export async function switchCockpitAgent(
+ *  the instance is left untouched. `reason` is recorded on the event
+ *  and shown in the transcript divider: "rate_limited" for the
+ *  recovery flow, "manual" for an explicit user switch. See #1282. */
+export async function switchAcpAgent(
   sessionId: string,
   target: string,
   model?: string | null,
+  reason?: string | null,
 ): Promise<SwitchAgentResponse | null> {
-  const body: { target: string; model?: string } = { target };
+  const body: { target: string; model?: string; reason?: string } = { target };
   if (model) body.model = model;
+  if (reason) body.reason = reason;
   return fetchJson<SwitchAgentResponse>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/switch-agent`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -471,7 +588,7 @@ export function fetchContextPrimer(
 ): Promise<ContextPrimerResponse | null> {
   const params = new URLSearchParams({ before_seq: String(beforeSeq) });
   return fetchJson<ContextPrimerResponse>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/context-primer?${params.toString()}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/context-primer?${params.toString()}`,
     signal ? { signal } : undefined,
   );
 }
@@ -532,6 +649,7 @@ export async function createProject(body: {
   name?: string;
   scope?: "global" | "profile";
   allow_override?: boolean;
+  default_base_branch?: string;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {
@@ -574,6 +692,37 @@ export async function deleteProject(
       }
     }
     return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Update a project's default base branch. Pass `null` to clear it. */
+export async function updateProject(
+  name: string,
+  scope: "global" | "profile",
+  defaultBaseBranch: string | null,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
+  try {
+    const res = await fetch(
+      `/api/projects/${encodeURIComponent(name)}?scope=${scope}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
+      },
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return { ok: false, error: data.message || `Server error (${res.status})` };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
@@ -659,7 +808,7 @@ export interface LoginStatus {
   required: boolean;
   authenticated: boolean;
   /** Whether the session currently sits inside the 15-minute step-up
-   *  window. Sensitive routes (terminal attach, cockpit prompt /
+   *  window. Sensitive routes (terminal attach, acp prompt /
    *  approval / file mutations) only execute while this is true.
    *  See #1131. */
   elevated: boolean;
@@ -735,7 +884,7 @@ export async function login(
 
 /**
  * Re-verify the passphrase to open a fresh 15-minute elevation
- * window. Required before the cockpit/terminal can perform
+ * window. Required before the acp/terminal can perform
  * SSH-equivalent actions when the prior window has lapsed. See
  * #1131.
  *
@@ -836,6 +985,57 @@ export async function renameSession(
   }
 }
 
+/**
+ * Edit a managed worktree session's workdir name: move the worktree
+ * directory and, optionally, rename its git branch. The session must not be
+ * running. Returns the server's validation message on failure so the caller
+ * can surface it. See #1723.
+ */
+export async function setWorktreeName(
+  id: string,
+  name: string,
+  renameBranch: boolean,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/worktree-name`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, rename_branch: renameBranch }),
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Move an existing session to another group, create a new group by
+ *  passing a path that does not exist yet, or clear the group with an
+ *  empty string (the ungroup sentinel, matching session creation and the
+ *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
+export async function updateSessionGroup(
+  id: string,
+  group: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Three-preset helper for the sidebar context menu:
  *  - "off":     set all three overrides to false (silence this session)
  *  - "default": clear all three overrides (inherit server defaults)
@@ -883,16 +1083,88 @@ export async function setSessionDiffBase(
   }
 }
 
+/** Toggle the web-only "pin" marker on a session. Pinned workspaces sink
+ *  to the top of the sidebar in all sort modes (manual and lastActivity).
+ *  Distinct from the TUI favorite signal. See #1581. */
+export async function setSessionPin(
+  id: string,
+  pinned: boolean,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/pin`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Archive or unarchive a session. On archive, the server kills the tmux
+ *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
+ *  and shuts down the acp worker for acp-mode sessions; the
+ *  reconciler will not respawn it because archived sessions are excluded
+ *  from the resume target list. Sending a message via the dashboard
+ *  auto-unarchives via the existing `touch_last_accessed` invariant in
+ *  the send handler. See #1581. */
+export async function setSessionArchive(
+  id: string,
+  archived: boolean,
+  killPane = true,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/archive`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
+ *  number of minutes between 1 and 43200 (30 days) to snooze. The server
+ *  validates against the shared `validate_snooze_duration` so the bounds
+ *  match the TUI dialog presets and the CLI's `aoe session snooze`. See
+ *  #1581. */
+export async function setSessionSnooze(
+  id: string,
+  minutes: number | null,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/snooze`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ minutes }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 export interface DeleteSessionOptions {
   delete_worktree?: boolean;
   delete_branch?: boolean;
   delete_sandbox?: boolean;
   force_delete?: boolean;
+  /** For scratch sessions, keep the scratch directory on disk instead of
+   *  removing it. The session record is still deleted. No effect on
+   *  non-scratch sessions. */
+  keep_scratch?: boolean;
 }
 
 export interface DeleteSessionResult {
   ok: boolean;
   error?: string;
+  messages?: string[];
 }
 
 export async function deleteSession(
@@ -912,7 +1184,8 @@ export async function deleteSession(
         error: data.message || `Server error (${res.status})`,
       };
     }
-    return { ok: true };
+    const data = (await res.json().catch(() => ({}))) as { messages?: string[] };
+    return { ok: true, messages: data.messages };
   } catch (e) {
     return {
       ok: false,

@@ -1,7 +1,9 @@
 import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../../lib/acpCapableTools";
+import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { resolveLaunchCommand } from "../../../lib/launchCommand";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
   tool: string;
@@ -18,6 +20,7 @@ interface WizardData {
   customInstruction: string;
   extraArgs: string;
   commandOverride: string;
+  useStructuredView: boolean;
   [key: string]: unknown;
 }
 
@@ -27,61 +30,90 @@ interface Props {
   agents: AgentInfo[];
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
-  onApplyProfileDefaults: (defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => void;
-  /** Live value of the cockpit master switch. When true, sessions
-   *  the user creates here run in cockpit mode automatically (for
-   *  tools with an ACP adapter); when false, every session is tmux.
-   *  No per-session picker; the master switch is the opt-in. */
-  cockpitMasterEnabled: boolean;
+  onApplyProfileDefaults: (defaults: {
+    yoloMode: boolean;
+    sandboxEnabled: boolean;
+    tool: string;
+    extraEnv: string[];
+    agentModel?: string;
+    agentEffort?: string;
+    commandMaps?: CommandMaps;
+  }) => void;
+  /** Profile-resolved override / custom-agent maps, used to preview the
+   *  exact launch command. Sourced from the settings the wizard already
+   *  fetched, so this step issues no extra request. See #1911. */
+  commandMaps?: CommandMaps;
 }
 
-function SubstrateNotice({
+/** Read-only callout when the selected tool cannot run in the structured view. This
+ *  includes built-in tools without ACP support and custom agents that do
+ *  not provide `agent_acp_cmd`. ACP-capable tools render
+ *  `ViewPickerCard` instead. */
+function ViewNotice({
   tool,
-  acpCapable,
   customAgent,
-  sandboxEnabled,
 }: {
   tool: string;
-  acpCapable: boolean;
   customAgent: boolean;
-  sandboxEnabled: boolean;
 }) {
-  const sandboxedCockpit = acpCapable && sandboxEnabled;
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold text-text-primary">
-          {acpCapable ? "Cockpit" : "Terminal"}
-        </span>
-        <span
-          className={`rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide ${
-            acpCapable
-              ? "bg-brand-700/40 text-brand-400"
-              : "bg-surface-700 text-text-dim"
-          }`}
-        >
-          {acpCapable ? "Beta" : "Fallback"}
+        <span className="text-sm font-semibold text-text-primary">Terminal</span>
+        <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
+          Fallback
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {sandboxedCockpit
-          ? "Cockpit + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts."
-          : customAgent
-          ? "Custom agents run in the terminal. Cockpit is available for built-in agents with ACP support."
-          : acpCapable
-          ? "Cockpit is enabled, so this session will run in the structured cockpit UI. Switch to terminal substrate from the session view if needed."
-          : `${tool} has no ACP adapter yet, so this session falls back to the tmux terminal. Pick a tool with cockpit support (e.g. claude, opencode, gemini) to use the structured UI.`}
+        {customAgent
+          ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
+          : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
       </p>
     </div>
   );
 }
 
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+/** Interactive view picker shown when the selected tool is ACP-capable.
+ *  Defaults on (the structured view is the default); turning it off launches a
+ *  terminal-view session instead (see #1580). */
+function ViewPickerCard({
+  checked,
+  onChange,
+  sandboxEnabled,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  sandboxEnabled: boolean;
+}) {
+  const sandboxedStructuredView = checked && sandboxEnabled;
+  return (
+    <div className="mb-5 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-text-primary">Structured view</span>
+          </div>
+          <p className="mt-1 text-xs text-text-dim leading-snug">
+            {sandboxedStructuredView
+              ? "Structured view + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts. Turn off to run this session in the terminal view instead."
+              : checked
+              ? "Renders the agent's plan, tool calls, and diffs in the structured view. Turn off to run this session in the terminal view instead."
+              : "This session will run in the terminal view (raw tmux). Turn on to use the structured view; you can also switch views from the session later."}
+          </p>
+        </div>
+        <Toggle checked={checked} onChange={onChange} label="Use structured view" />
+      </div>
+    </div>
+  );
+}
+
+function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => !disabled && onChange(!checked)}
       className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
@@ -97,15 +129,32 @@ function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (
   );
 }
 
-export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled }: Props) {
+export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectableAgents = agents.filter(
     (agent) => agent.kind === "custom" || agent.installed,
   );
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
+  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
+
+  // Mirror SessionWizard.handleSubmit / ReviewStep so the preview shows
+  // the view the session will actually launch with (#1580).
+  const willUseStructuredView = acpCapable && data.useStructuredView;
+  const resolvedCommand = resolveLaunchCommand({
+    tool: data.tool,
+    useStructuredView: willUseStructuredView,
+    binary: selectedAgent?.binary,
+    acpCommand: selectedAgent?.acp_command,
+    acpArgs: selectedAgent?.acp_args,
+    extraArgs: data.extraArgs,
+    manualOverride: data.commandOverride,
+    agentCommandOverride: commandMaps.agentCommandOverride,
+    customAgents: commandMaps.customAgents,
+  }).full;
+  const extraArgsIgnored = willUseStructuredView && data.extraArgs.trim().length > 0;
 
   const handleProfileChange = useCallback(async (profileName: string) => {
     // If user had manual edits, confirm before overwriting
@@ -130,11 +179,17 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         const env = Array.isArray(sandbox?.environment)
           ? (sandbox.environment as unknown[]).filter((v): v is string => typeof v === "string")
           : [];
+        const defaultTool = (session?.default_tool as string) || data.tool;
+        const acpDefaults = session?.acp_defaults as Record<string, unknown> | undefined;
+        const acpDefault = acpDefaults?.[defaultTool] as Record<string, unknown> | undefined;
         onApplyProfileDefaults({
           yoloMode: (session?.yolo_mode_default as boolean) ?? false,
           sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
-          tool: (session?.default_tool as string) || data.tool,
+          tool: defaultTool,
           extraEnv: env,
+          agentModel: typeof acpDefault?.model === "string" ? acpDefault.model : "",
+          agentEffort: typeof acpDefault?.effort === "string" ? acpDefault.effort : "",
+          commandMaps: commandMapsFromSettings(settings),
         });
       }
     } catch {
@@ -190,21 +245,19 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         ))}
       </div>
 
-      {/* Substrate notice. Cockpit mode is auto-selected for ACP-capable
-          tools when the master switch is on; non-ACP tools fall back to
-          tmux silently. The notice tells the user which one they'll get
-          without giving them a per-session toggle (the master switch is
-          the opt-in, and the session view has a post-creation switch if
-          they need to flip). When the master switch is off, every new
-          session is tmux and no notice is shown. */}
-      {cockpitMasterEnabled && (
-        <SubstrateNotice
-          tool={data.tool}
-          acpCapable={ACP_CAPABLE_TOOLS.has(data.tool)}
-          customAgent={selectedCustomAgent}
-          sandboxEnabled={data.sandboxEnabled}
-        />
-      )}
+      {/* View picker. ACP-capable tools get a per-session structured-view toggle
+          (default on, see #1580) so they can opt down to a terminal-view
+          session. Tools that are not ACP-capable show a read-only fallback
+          notice instead. */}
+      {(acpCapable ? (
+          <ViewPickerCard
+            checked={data.useStructuredView}
+            onChange={(v) => onChange("useStructuredView", v)}
+            sandboxEnabled={data.sandboxEnabled}
+          />
+        ) : (
+          <ViewNotice tool={data.tool} customAgent={selectedCustomAgent} />
+        ))}
 
       {/* Profile selector. We render a card list (rather than a native
           <select>) so each profile can carry a short description beneath
@@ -328,7 +381,7 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
                   type="text"
                   value={data.sandboxImage}
                   onChange={(e) => onChange("sandboxImage", e.target.value)}
-                  placeholder="ghcr.io/njbrake/aoe-sandbox:latest"
+                  placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
                 />
               </div>
@@ -383,6 +436,12 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="e.g. --port 8080"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {extraArgsIgnored && (
+              <p className="mt-1.5 text-xs text-status-warning" data-testid="extra-args-ignored">
+                Extra args are ignored for structured-view sessions; use the command
+                override to change the launch command.
+              </p>
+            )}
           </div>
 
           {/* Command override */}
@@ -395,6 +454,17 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="Override the agent launch command"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {resolvedCommand && (
+              <p
+                className="mt-1.5 text-xs text-text-dim"
+                data-testid="resolved-launch-command"
+              >
+                Resolved launch command:{" "}
+                <code className="font-mono text-text-secondary">
+                  {resolvedCommand}
+                </code>
+              </p>
+            )}
           </div>
         </div>
       )}

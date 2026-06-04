@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { NotificationSettings } from "./NotificationSettings";
@@ -7,13 +7,15 @@ import { TerminalSettings } from "./TerminalSettings";
 import {
   fetchProfiles,
   fetchSettings,
-  setCockpitMaster,
+  getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
   type ServerAbout,
 } from "../lib/api";
-import type { ProfileInfo } from "../lib/types";
+import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
+import { SchemaSection } from "./settings/SchemaSection";
 import {
+  CollapsibleSection,
   ListField,
   NumberField,
   SelectField,
@@ -21,48 +23,66 @@ import {
   ToggleField,
 } from "./settings/FormFields";
 import { ThemeSettings } from "./settings/ThemeSettings";
+import { DiffSettings } from "./settings/DiffSettings";
 import { SoundSettings } from "./settings/SoundSettings";
 import { UpdateSettings } from "./settings/UpdateSettings";
+import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { TmuxSettings } from "./settings/TmuxSettings";
 import { LoggingSettings } from "./settings/LoggingSettings";
-import { ProfileSelector } from "./settings/ProfileSelector";
+import { SettingsHeader } from "./settings/SettingsHeader";
 
 type TabId =
   | "session"
   | "sandbox"
   | "worktree"
   | "theme"
+  | "diff"
   | "sound"
   | "tmux"
   | "updates"
+  | "telemetry"
   | "notifications"
   | "terminal"
   | "security"
   | "devices"
-  | "cockpit"
+  | "structured-view"
   | "logging";
 
 type SidebarItem =
   | { kind: "tab"; id: TabId; label: string }
   | { kind: "divider"; label: string };
 
-function buildSidebar(): SidebarItem[] {
+// Sidebar groups mirror the TUI Settings layout (Appearance / Sessions /
+// Environment / Notifications / Web Dashboard / System) so muscle memory
+// carries across surfaces. The TUI source of truth is
+// `categories_for_scope()` in src/tui/settings/mod.rs. Web-only tabs with no
+// TUI equivalent (Notifications push, Terminal, Security, Devices) live under
+// a "Web Dashboard" divider; TUI-only categories (Agents, Interaction, Hooks,
+// StatusHooks) are intentionally not surfaced here. Exported for unit testing
+// the exact divider/tab order without fighting the duplicated mobile + desktop
+// tab strips in the DOM.
+export function buildSidebar(): SidebarItem[] {
   return [
-    { kind: "divider", label: "General" },
+    { kind: "divider", label: "Appearance" },
+    { kind: "tab", id: "theme", label: "Theme" },
+    { kind: "tab", id: "diff", label: "Diff" },
+    { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
+    { kind: "tab", id: "structured-view", label: "Structured view" },
+    { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
-    { kind: "tab", id: "theme", label: "Theme" },
-    { kind: "tab", id: "sound", label: "Sound" },
     { kind: "tab", id: "tmux", label: "Tmux" },
-    { kind: "tab", id: "updates", label: "Updates" },
-    { kind: "divider", label: "Web Dashboard" },
+    { kind: "divider", label: "Notifications" },
+    { kind: "tab", id: "sound", label: "Sound" },
     { kind: "tab", id: "notifications", label: "Notifications" },
+    { kind: "divider", label: "Web Dashboard" },
     { kind: "tab", id: "terminal", label: "Terminal" },
     { kind: "tab", id: "security", label: "Security" },
     { kind: "tab", id: "devices", label: "Devices" },
-    { kind: "tab", id: "cockpit", label: "Cockpit" },
-    { kind: "divider", label: "Diagnostics" },
+    { kind: "divider", label: "System" },
+    { kind: "tab", id: "updates", label: "Updates" },
+    { kind: "tab", id: "telemetry", label: "Telemetry" },
     { kind: "tab", id: "logging", label: "Logging" },
   ];
 }
@@ -73,6 +93,12 @@ interface Props {
   onSelectTab: (tab: TabId) => void;
   serverAbout: ServerAbout | null;
   onServerAboutRefresh: () => Promise<void> | void;
+  /** Profile to preselect, sourced from the `?profile=` query so the
+   *  Profiles page can deep-link into a specific profile's section. */
+  profile?: string | null;
+  /** Notifies the host when the profile changes via the header dropdown,
+   *  so it can keep `?profile=` in sync for shareable/refreshable URLs. */
+  onSelectProfile?: (profile: string) => void;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -80,14 +106,16 @@ const ALL_TAB_IDS = new Set<TabId>([
   "sandbox",
   "worktree",
   "theme",
+  "diff",
   "sound",
   "tmux",
   "updates",
+  "telemetry",
   "notifications",
   "terminal",
   "security",
   "devices",
-  "cockpit",
+  "structured-view",
   "logging",
 ]);
 
@@ -110,12 +138,33 @@ export function resolveSelectedProfile(
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
+function formatJsonSetting(value: unknown): string {
+  if (!value || typeof value !== "object") return "{}";
+  return JSON.stringify(value, null, 2);
+}
+
+function parseJsonObjectSetting(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function SettingsView({
   onClose,
   tab,
   onSelectTab,
   serverAbout,
   onServerAboutRefresh,
+  profile,
+  onSelectProfile,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(
@@ -133,13 +182,38 @@ export function SettingsView({
   // setSettings could race ahead of an optimistic user edit and
   // clobber it. See #1383 (profile-settings-isolation / settings-
   // tmux-* flakes).
-  const [selectedProfile, setSelectedProfile] = useState("");
+  // Seed from the `?profile=` query (deep-link from the Profiles page) when
+  // present, else empty (see the note above on why not "default").
+  const [selectedProfile, setSelectedProfile] = useState(profile ?? "");
+  // Bumped only on a user-initiated profile switch (the header picker), never
+  // on the mount-time fetchProfiles resolution that flips selectedProfile from
+  // its "" seed to the default. The content fieldset keys its remount on this
+  // epoch (plus activeTab), so resolving the initial profile no longer remounts
+  // mid-interaction and collapses a just-expanded "Advanced" fold. Genuine
+  // profile switches still remount (reset folds, clear half-typed drafts, break
+  // sibling-tab reconciliation), which is what user story #4 wants.
+  const [profileEpoch, setProfileEpoch] = useState(0);
+  const handleSelectProfile = useCallback(
+    (next: string) => {
+      setSelectedProfile(next);
+      setProfileEpoch((e) => e + 1);
+      // Keep ?profile= in sync so the URL stays shareable/refreshable.
+      onSelectProfile?.(next);
+    },
+    [onSelectProfile],
+  );
   const sidebar = buildSidebar();
   const tabs = sidebar.filter(
     (s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab",
   );
   const activeTab: TabId = isTabId(tab) ? tab : "session";
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  // Settings schema (single source of truth, #1692). The generic SchemaSection
+  // renderer builds sandbox/worktree from this; empty until the one-shot fetch
+  // resolves, at which point those tabs populate.
+  const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
+  const [schemaLoading, setSchemaLoading] = useState(true);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -148,6 +222,33 @@ export function SettingsView({
     });
   }, []);
 
+  const loadSchema = useCallback(async () => {
+    setSchemaLoading(true);
+    setSchemaError(null);
+    try {
+      const s = await getSettingsSchema();
+      if (!s) {
+        setSchemaError("Failed to load settings schema.");
+        return;
+      }
+      setSchema(s);
+    } catch {
+      setSchemaError("Failed to load settings schema.");
+    } finally {
+      setSchemaLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSchema();
+  }, [loadSchema]);
+
+  // Follow `?profile=` when it changes after mount (e.g. a second deep-link
+  // from the Profiles page while Settings stays mounted).
+  useEffect(() => {
+    if (profile) setSelectedProfile(profile);
+  }, [profile]);
+
   const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
 
   const handleSetDefault = async (name: string) => {
@@ -155,11 +256,22 @@ export function SettingsView({
     if (ok) fetchProfiles().then(setProfiles);
   };
 
+  // Guard against a slow fetch for a previously-selected profile landing
+  // after a fast switch and clobbering the current profile's settings. The
+  // Profiles page deep-links raise the odds of rapid profile changes.
+  const loadSeq = useRef(0);
   const loadSettings = useCallback(() => {
     if (!selectedProfile) return;
-    fetchSettings(selectedProfile).then((s) => {
-      if (s) setSettings(s);
-    });
+    const seq = ++loadSeq.current;
+    fetchSettings(selectedProfile)
+      .then((s) => {
+        if (seq !== loadSeq.current) return;
+        if (s) setSettings(s);
+      })
+      .catch(() => {
+        if (seq !== loadSeq.current) return;
+        setSettings(null);
+      });
   }, [selectedProfile]);
 
   useEffect(() => {
@@ -167,8 +279,8 @@ export function SettingsView({
   }, [loadSettings]);
 
   const sendSave = useCallback(
-    async (section: string, data: Record<string, unknown>) => {
-      if (!selectedProfile) return;
+    async (section: string, data: Record<string, unknown>): Promise<boolean> => {
+      if (!selectedProfile) return false;
       setSaving(true);
       setSaveError(null);
       const ok = await updateProfileSettings(selectedProfile, { [section]: data });
@@ -177,6 +289,7 @@ export function SettingsView({
         setSaveError("Failed to save, please try again");
         loadSettings();
       }
+      return ok;
     },
     [selectedProfile, loadSettings],
   );
@@ -198,21 +311,21 @@ export function SettingsView({
     sectionData: Record<string, unknown>,
     field: string,
     value: unknown,
-  ) => {
+  ): Promise<boolean> => {
     updateLocal({ [section]: { ...sectionData, [field]: value } });
-    sendSave(section, { [field]: value });
+    return sendSave(section, { [field]: value });
   };
 
   const saveSubField = useCallback(
-    (section: string, field: string, value: unknown) => {
+    (section: string, field: string, value: unknown): Promise<boolean> => {
       const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
-      saveField(section, sectionData, field, value);
+      return saveField(section, sectionData, field, value);
     },
     [settings, selectedProfile, sendSave, loadSettings],
   );
 
   const renderTabContent = () => {
-    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "cockpit") {
+    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "structured-view" && activeTab !== "telemetry") {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 
@@ -252,6 +365,29 @@ export function SettingsView({
               checked={(session.agent_status_hooks as boolean) ?? true}
               onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
             />
+            <TextField
+              label="Structured view defaults"
+              description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              value={formatJsonSetting(session.acp_defaults)}
+              onChange={(v) => {
+                const parsed = parseJsonObjectSetting(v);
+                if (parsed) void saveField("session", session, "acp_defaults", parsed);
+              }}
+              placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              mono
+              multiline
+            />
+            <NumberField
+              label="Auto-stop idle sessions (s)"
+              description="Seconds a plain tmux session may sit Idle before it is auto-stopped (its tmux session and any sandbox container are killed, leaving a restartable Stopped row). 0 disables (default). A session with an attached tmux client, or used more recently than the threshold, is spared. Checked about once a minute, so the stop can lag by up to a minute. Acp workers use the separate acp setting. Persists to config.toml as session.auto_stop_idle_secs; cross-device. See #1690."
+              value={
+                typeof session.auto_stop_idle_secs === "number"
+                  ? (session.auto_stop_idle_secs as number)
+                  : 0
+              }
+              min={0}
+              onChange={(v) => saveField("session", session, "auto_stop_idle_secs", v)}
+            />
           </div>
         );
 
@@ -268,7 +404,7 @@ export function SettingsView({
               label="Default container image"
               value={(sandbox.default_image as string) ?? ""}
               onChange={(v) => saveField("sandbox", sandbox, "default_image", v)}
-              placeholder="ghcr.io/njbrake/aoe-sandbox:latest"
+              placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
               mono
             />
             <SelectField
@@ -289,18 +425,6 @@ export function SettingsView({
                 { value: "apple_container", label: "Apple Container" },
               ]}
             />
-            <TextField
-              label="CPU limit"
-              value={(sandbox.cpu_limit as string) ?? ""}
-              onChange={(v) => saveField("sandbox", sandbox, "cpu_limit", v || null)}
-              placeholder="e.g. 4"
-            />
-            <TextField
-              label="Memory limit"
-              value={(sandbox.memory_limit as string) ?? ""}
-              onChange={(v) => saveField("sandbox", sandbox, "memory_limit", v || null)}
-              placeholder="e.g. 8g"
-            />
             <ToggleField
               label="Mount SSH keys"
               description="Mount ~/.ssh into sandbox containers"
@@ -313,120 +437,115 @@ export function SettingsView({
               checked={(sandbox.auto_cleanup as boolean) ?? true}
               onChange={(v) => saveField("sandbox", sandbox, "auto_cleanup", v)}
             />
-            <TextField
-              label="Custom instruction"
-              description="Text appended to the agent system prompt in sandboxed sessions"
-              value={(sandbox.custom_instruction as string) ?? ""}
-              onChange={(v) => saveField("sandbox", sandbox, "custom_instruction", v || null)}
-              placeholder="Additional instructions for the agent..."
-              multiline
-            />
-            <ListField
-              label="Environment variables"
-              description="Variables passed to sandbox containers (KEY or KEY=VALUE)"
-              items={(sandbox.environment as string[]) ?? []}
-              onChange={(items) => saveField("sandbox", sandbox, "environment", items)}
-              placeholder="KEY or KEY=VALUE"
-              validate={(v) => {
-                if (!/^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v))
-                  return "Must be KEY or KEY=VALUE (letters, digits, underscores)";
-                return null;
-              }}
-            />
-            <ListField
-              label="Extra volumes"
-              description="Additional volume mounts (host:container[:ro])"
-              items={(sandbox.extra_volumes as string[]) ?? []}
-              onChange={(items) => saveField("sandbox", sandbox, "extra_volumes", items)}
-              placeholder="/host/path:/container/path"
-              validate={(v) => {
-                if (!v.includes(":")) return "Must contain ':' (host:container)";
-                return null;
-              }}
-            />
-            <ListField
-              label="Port mappings"
-              description="Port forwarding (host:container)"
-              items={(sandbox.port_mappings as string[]) ?? []}
-              onChange={(items) => saveField("sandbox", sandbox, "port_mappings", items)}
-              placeholder="3000:3000"
-              validate={(v) => {
-                if (!/^\d+:\d+$/.test(v)) return "Must be port:port (e.g. 3000:3000)";
-                return null;
-              }}
-            />
-            <ListField
-              label="Volume ignores"
-              description="Directories excluded from host bind mount"
-              items={(sandbox.volume_ignores as string[]) ?? []}
-              onChange={(items) => saveField("sandbox", sandbox, "volume_ignores", items)}
-              placeholder="node_modules"
-            />
+            <CollapsibleSection
+              title="Advanced"
+              subtitle="Resource limits, custom instructions, environment, volumes, and ports."
+            >
+              <TextField
+                label="CPU limit"
+                value={(sandbox.cpu_limit as string) ?? ""}
+                onChange={(v) => saveField("sandbox", sandbox, "cpu_limit", v || null)}
+                placeholder="e.g. 4"
+              />
+              <TextField
+                label="Memory limit"
+                value={(sandbox.memory_limit as string) ?? ""}
+                onChange={(v) => saveField("sandbox", sandbox, "memory_limit", v || null)}
+                placeholder="e.g. 8g"
+              />
+              <TextField
+                label="Custom instruction"
+                description="Text appended to the agent system prompt in sandboxed sessions"
+                value={(sandbox.custom_instruction as string) ?? ""}
+                onChange={(v) => saveField("sandbox", sandbox, "custom_instruction", v || null)}
+                placeholder="Additional instructions for the agent..."
+                multiline
+              />
+              <ListField
+                label="Environment variables"
+                description="Variables passed to sandbox containers (KEY or KEY=VALUE)"
+                items={(sandbox.environment as string[]) ?? []}
+                onChange={(items) => saveField("sandbox", sandbox, "environment", items)}
+                placeholder="KEY or KEY=VALUE"
+                validate={(v) => {
+                  if (!/^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v))
+                    return "Must be KEY or KEY=VALUE (letters, digits, underscores)";
+                  return null;
+                }}
+              />
+              <ListField
+                label="Extra volumes"
+                description="Additional volume mounts (host:container[:ro])"
+                items={(sandbox.extra_volumes as string[]) ?? []}
+                onChange={(items) => saveField("sandbox", sandbox, "extra_volumes", items)}
+                placeholder="/host/path:/container/path"
+                validate={(v) => {
+                  if (!v.includes(":")) return "Must contain ':' (host:container)";
+                  return null;
+                }}
+              />
+              <ListField
+                label="Port mappings"
+                description="Port forwarding (host:container)"
+                items={(sandbox.port_mappings as string[]) ?? []}
+                onChange={(items) => saveField("sandbox", sandbox, "port_mappings", items)}
+                placeholder="3000:3000"
+                validate={(v) => {
+                  if (!/^\d+:\d+$/.test(v)) return "Must be port:port (e.g. 3000:3000)";
+                  return null;
+                }}
+              />
+              <ListField
+                label="Volume ignores"
+                description="Directories excluded from host bind mount"
+                items={(sandbox.volume_ignores as string[]) ?? []}
+                onChange={(items) => saveField("sandbox", sandbox, "volume_ignores", items)}
+                placeholder="node_modules"
+              />
+            </CollapsibleSection>
           </div>
         );
 
       case "worktree":
+        if (schemaLoading) {
+          return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        }
+        if (schemaError) {
+          return (
+            <div className="space-y-3">
+              <div className="text-sm text-status-error">{schemaError}</div>
+              <button
+                type="button"
+                onClick={() => void loadSchema()}
+                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
+              >
+                Retry
+              </button>
+            </div>
+          );
+        }
         return (
-          <div className="space-y-4">
-            <ToggleField
-              label="Worktrees enabled"
-              description="Create git worktrees for new sessions"
-              checked={(worktree.enabled as boolean) ?? false}
-              onChange={(v) => saveField("worktree", worktree, "enabled", v)}
-            />
-            <TextField
-              label="Path template"
-              description="Template for worktree directories in regular repos ({repo-name}, {branch})"
-              value={(worktree.path_template as string) ?? ""}
-              onChange={(v) => saveField("worktree", worktree, "path_template", v)}
-              placeholder="../{repo-name}-worktrees/{branch}"
-              mono
-            />
-            <TextField
-              label="Bare repo path template"
-              description="Template for worktree directories in bare repos ({branch})"
-              value={(worktree.bare_repo_path_template as string) ?? ""}
-              onChange={(v) => saveField("worktree", worktree, "bare_repo_path_template", v)}
-              placeholder="./{branch}"
-              mono
-            />
-            <TextField
-              label="Workspace path template"
-              description="Template for multi-repo workspace directories ({branch}, {session-id})"
-              value={(worktree.workspace_path_template as string) ?? ""}
-              onChange={(v) => saveField("worktree", worktree, "workspace_path_template", v)}
-              placeholder="../{branch}-workspace-{session-id}"
-              mono
-            />
-            <ToggleField
-              label="Auto cleanup"
-              description="Delete worktrees when sessions are removed"
-              checked={(worktree.auto_cleanup as boolean) ?? true}
-              onChange={(v) => saveField("worktree", worktree, "auto_cleanup", v)}
-            />
-            <ToggleField
-              label="Delete branch on cleanup"
-              description="Also delete the git branch when cleaning up a worktree"
-              checked={(worktree.delete_branch_on_cleanup as boolean) ?? false}
-              onChange={(v) => saveField("worktree", worktree, "delete_branch_on_cleanup", v)}
-            />
-            <ToggleField
-              label="Init submodules"
-              description="Run `git submodule update --init --recursive` after creating a worktree"
-              checked={(worktree.init_submodules as boolean) ?? true}
-              onChange={(v) => saveField("worktree", worktree, "init_submodules", v)}
-            />
-          </div>
+          <SchemaSection
+            section="worktree"
+            schema={schema}
+            values={worktree}
+            onSaveField={saveSubField}
+            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+          />
         );
 
       case "theme":
         return <ThemeSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "diff":
+        return <DiffSettings />;
       case "sound":
         return <SoundSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
       case "tmux":
         return <TmuxSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
       case "updates":
         return <UpdateSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "telemetry":
+        return <TelemetrySettings />;
       case "logging":
         return <LoggingSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
 
@@ -477,13 +596,13 @@ export function SettingsView({
         return <SecuritySettings />;
       case "devices":
         return <ConnectedDevices />;
-      case "cockpit": {
-        const cockpit = (settings?.cockpit ?? {}) as Record<string, unknown>;
+      case "structured-view": {
+        const acp = (settings?.acp ?? {}) as Record<string, unknown>;
         return (
-          <CockpitSettings
+          <AcpSettings
             serverAbout={serverAbout}
             onRefresh={onServerAboutRefresh}
-            cockpit={cockpit}
+            acp={acp}
             onSaveField={saveSubField}
           />
         );
@@ -495,28 +614,13 @@ export function SettingsView({
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-surface-900">
-      {/* Header */}
-      <div className="h-12 bg-surface-850 border-b border-surface-700 flex items-center px-4 shrink-0">
-        <button
-          onClick={onClose}
-          className="text-brand-500 mr-3 cursor-pointer text-sm"
-        >
-          &larr; Back
-        </button>
-        <span className="text-sm font-semibold text-text-bright">Settings</span>
-        {saving && (
-          <span className="ml-2 text-xs text-text-dim">Saving...</span>
-        )}
-        {saveError && (
-          <span className="ml-2 text-xs text-red-400">{saveError}</span>
-        )}
-        <div className="flex-1 flex justify-center">
-          <ProfileSelector
-            selectedProfile={selectedProfile}
-            onSelect={setSelectedProfile}
-          />
-        </div>
-      </div>
+      <SettingsHeader
+        onClose={onClose}
+        saving={saving}
+        saveError={saveError}
+        selectedProfile={selectedProfile}
+        onSelectProfile={handleSelectProfile}
+      />
 
       {/* Mobile tabs (horizontal scroll) */}
       <div className="md:hidden border-b border-surface-700 bg-surface-850 overflow-x-auto">
@@ -579,7 +683,19 @@ export function SettingsView({
                 {OFFLINE_TITLE}: toggles will not save while disconnected.
               </div>
             )}
+            {/* Keying on tab + profileEpoch remounts the content subtree on a
+                tab switch or a user-initiated profile switch, which resets every
+                component-local <CollapsibleSection> "Advanced" fold back to
+                collapsed (user story #4) and clears any half-typed field draft so
+                it cannot blur-commit into the wrong profile. It also breaks React
+                reconciliation between sibling tabs that share the same root
+                element shape, e.g. sandbox and worktree both rendering <div
+                className="space-y-4">. profileEpoch (not selectedProfile) is used
+                so the mount-time fetchProfiles resolution that flips
+                selectedProfile from its "" seed to the default does not remount
+                mid-interaction and collapse a just-expanded fold. */}
             <fieldset
+              key={`${activeTab}-${profileEpoch}`}
               disabled={offline}
               className="space-y-5 disabled:opacity-50 border-0 m-0 p-0 min-w-0"
             >
@@ -592,130 +708,39 @@ export function SettingsView({
   );
 }
 
-function CockpitSettings({
+function AcpSettings({
   serverAbout,
   onRefresh,
-  cockpit,
+  acp,
   onSaveField,
 }: {
   serverAbout: ServerAbout | null;
   onRefresh: () => Promise<void> | void;
-  cockpit: Record<string, unknown>;
+  acp: Record<string, unknown>;
   onSaveField: (section: string, field: string, value: unknown) => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const masterEnabled = !!serverAbout?.cockpit_master_enabled;
-  // Local mirror so the toggle reflects optimistically while the
-  // backend save + /api/about re-fetch propagate.
   const showToolDurations =
-    typeof cockpit.show_tool_durations === "boolean"
-      ? (cockpit.show_tool_durations as boolean)
-      : (serverAbout?.cockpit_show_tool_durations ?? true);
+    typeof acp.show_tool_durations === "boolean"
+      ? (acp.show_tool_durations as boolean)
+      : (serverAbout?.acp_show_tool_durations ?? true);
   const queueDrainMode: "combined" | "serial" =
-    cockpit.queue_drain_mode === "serial" || cockpit.queue_drain_mode === "combined"
-      ? (cockpit.queue_drain_mode as "combined" | "serial")
-      : (serverAbout?.cockpit_queue_drain_mode ?? "combined");
+    acp.queue_drain_mode === "serial" || acp.queue_drain_mode === "combined"
+      ? (acp.queue_drain_mode as "combined" | "serial")
+      : (serverAbout?.acp_queue_drain_mode ?? "combined");
   const maxConcurrentResumes =
-    typeof cockpit.max_concurrent_resumes === "number"
-      ? (cockpit.max_concurrent_resumes as number)
-      : (serverAbout?.cockpit_max_concurrent_resumes ?? 4);
-
-  const onToggle = async (next: boolean) => {
-    setBusy(true);
-    setError(null);
-    const res = await setCockpitMaster(next);
-    setBusy(false);
-    if (!res) {
-      setError("Failed to update; check server logs");
-      return;
-    }
-    await onRefresh();
-  };
+    typeof acp.max_concurrent_resumes === "number"
+      ? (acp.max_concurrent_resumes as number)
+      : (serverAbout?.acp_max_concurrent_resumes ?? 4);
 
   return (
     <div className="space-y-4">
-      <div className="rounded border border-surface-700 bg-surface-800/40 p-3 text-xs text-text-dim space-y-1">
-        <div>
-          <span className="text-text-muted">Status:</span>{" "}
-          {masterEnabled ? (
-            <span className="text-emerald-400">Cockpit available for new sessions</span>
-          ) : (
-            <span className="text-amber-400">Cockpit disabled</span>
-          )}
-        </div>
-        <div>
-          <span className="text-text-muted">cockpit.enabled:</span>{" "}
-          <code className="rounded bg-surface-900 px-1">{masterEnabled ? "true" : "false"}</code>
-        </div>
-      </div>
-
-      <div className="flex items-start justify-between gap-3 py-1">
-        <div>
-          <div className="text-sm text-text-bright">Cockpit master switch</div>
-          <div className="text-xs text-text-dim mt-0.5">
-            Persists to <code>config.toml</code> as <code>cockpit.enabled</code>; takes effect immediately.
-          </div>
-        </div>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => onToggle(!masterEnabled)}
-          className={`shrink-0 rounded px-3 py-1 text-xs font-medium transition-colors ${
-            masterEnabled
-              ? "bg-brand-500 text-white hover:bg-brand-400"
-              : "bg-surface-700 text-text-secondary hover:bg-surface-600"
-          } ${busy ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
-        >
-          {masterEnabled ? "Enabled" : "Disabled"}
-        </button>
-      </div>
-
-      <div className="border-t border-surface-800 pt-3">
-        <NumberField
-          label="History cap (events)"
-          description="Per-session retention cap on cockpit events. 0 = unlimited (default); set a non-zero value to bound disk usage on long-running sessions. Persists to config.toml as cockpit.replay_events; cross-device."
-          value={
-            typeof cockpit.replay_events === "number"
-              ? (cockpit.replay_events as number)
-              : 0
-          }
-          min={0}
-          onChange={(v) => onSaveField("cockpit", "replay_events", v)}
-        />
-      </div>
-
-      <div className="border-t border-surface-800 pt-3">
-        <NumberField
-          label="Replay buffer bytes"
-          description="Per-session byte cap on the in-memory replay buffer. Persists to config.toml as cockpit.replay_bytes; cross-device."
-          value={
-            typeof cockpit.replay_bytes === "number"
-              ? (cockpit.replay_bytes as number)
-              : 0
-          }
-          min={0}
-          onChange={(v) => onSaveField("cockpit", "replay_bytes", v)}
-        />
-      </div>
-
-      <div className="border-t border-surface-800 pt-3">
-        <NumberField
-          label="Max concurrent resumes"
-          description="Upper bound on parallel cockpit worker spawns/attaches the reconciler runs on `aoe serve` cold start. Default 4 keeps Node.js bootup memory bounded for laptops/Pis (each claude-agent-acp is ~50-80 MB transient). Bounded at runtime by `min(this, max_concurrent_workers).max(1)`. Persists to config.toml as cockpit.max_concurrent_resumes; cross-device."
-          value={maxConcurrentResumes}
-          min={1}
-          onChange={(v) => onSaveField("cockpit", "max_concurrent_resumes", v)}
-        />
-      </div>
-
       <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
         <div>
           <div className="text-sm text-text-bright">Show tool-call durations</div>
           <div className="text-xs text-text-dim mt-0.5">
             Persists to <code>config.toml</code> as{" "}
-            <code>cockpit.show_tool_durations</code>; cross-device. Renders the elapsed-time label on every
-            cockpit tool card. The underlying measurement is currently imprecise on{" "}
+            <code>acp.show_tool_durations</code>; cross-device. Renders the elapsed-time label on every
+            acp tool card. The underlying measurement is currently imprecise on{" "}
             <code>claude-agent-acp</code> (no <code>status: in_progress</code> signal); durations include
             stream-arrival skew rather than just runtime, so for example a parallel{" "}
             <code>sleep 1</code> can read as ~3 s. Turn off if the inflated numbers are more confusing than
@@ -728,7 +753,7 @@ function CockpitSettings({
           aria-label="Show tool-call durations"
           onClick={async () => {
             const next = !showToolDurations;
-            onSaveField("cockpit", "show_tool_durations", next);
+            onSaveField("acp", "show_tool_durations", next);
             await onRefresh();
           }}
           className={`shrink-0 rounded px-3 py-1 text-xs font-medium transition-colors cursor-pointer ${
@@ -742,30 +767,11 @@ function CockpitSettings({
       </div>
 
       <div className="border-t border-surface-800 pt-3">
-        <NumberField
-          label="Silent-orphan grace (s)"
-          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as cockpit.silent_orphan_grace_secs; cross-device. See #1240."
-          value={
-            typeof cockpit.silent_orphan_grace_secs === "number"
-              ? (cockpit.silent_orphan_grace_secs as number)
-              : 60
-          }
-          min={0}
-          onChange={(v) => onSaveField("cockpit", "silent_orphan_grace_secs", v)}
-        />
-      </div>
-
-      <div className="border-t border-surface-800 pt-3">
-        <NumberField
-          label="Silent-orphan fast grace (s)"
-          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as cockpit.silent_orphan_fast_grace_secs; cross-device. See #1240."
-          value={
-            typeof cockpit.silent_orphan_fast_grace_secs === "number"
-              ? (cockpit.silent_orphan_fast_grace_secs as number)
-              : 20
-          }
-          min={0}
-          onChange={(v) => onSaveField("cockpit", "silent_orphan_fast_grace_secs", v)}
+        <ToggleField
+          label="Auto-resume after rate limit"
+          description="When an acp worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as acp.rate_limit_auto_resume; cross-device. See #1722."
+          checked={(acp.rate_limit_auto_resume as boolean) ?? false}
+          onChange={(v) => onSaveField("acp", "rate_limit_auto_resume", v)}
         />
       </div>
 
@@ -774,7 +780,7 @@ function CockpitSettings({
           <div className="text-sm text-text-bright">Queue drain mode</div>
           <div className="text-xs text-text-dim mt-0.5">
             Persists to <code>config.toml</code> as{" "}
-            <code>cockpit.queue_drain_mode</code>; cross-device. Controls how follow-up prompts queued
+            <code>acp.queue_drain_mode</code>; cross-device. Controls how follow-up prompts queued
             while the agent is busy get dispatched once the current turn ends. <strong>Combined</strong>{" "}
             (default) joins every queued entry with a blank line and sends them as a single prompt; one
             response covers the whole batch. <strong>Serial</strong> fires one entry at a time and waits
@@ -789,7 +795,7 @@ function CockpitSettings({
               aria-pressed={queueDrainMode === opt}
               onClick={async () => {
                 if (queueDrainMode === opt) return;
-                onSaveField("cockpit", "queue_drain_mode", opt);
+                onSaveField("acp", "queue_drain_mode", opt);
                 await onRefresh();
               }}
               className={`rounded px-2.5 py-1 transition-colors cursor-pointer ${
@@ -804,7 +810,87 @@ function CockpitSettings({
         </div>
       </div>
 
-      {error && <div className="text-xs text-rose-400">{error}</div>}
+      <CollapsibleSection
+        title="Advanced"
+        subtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
+      >
+        <NumberField
+          label="History cap (events)"
+          description="Per-session retention cap on acp events. 0 = unlimited (default); set a non-zero value to bound disk usage on long-running sessions. Persists to config.toml as acp.replay_events; cross-device."
+          value={
+            typeof acp.replay_events === "number"
+              ? (acp.replay_events as number)
+              : 0
+          }
+          min={0}
+          onChange={(v) => onSaveField("acp", "replay_events", v)}
+        />
+        <NumberField
+          label="Replay buffer bytes"
+          description="Per-session byte cap on the in-memory replay buffer. Persists to config.toml as acp.replay_bytes; cross-device."
+          value={
+            typeof acp.replay_bytes === "number"
+              ? (acp.replay_bytes as number)
+              : 0
+          }
+          min={0}
+          onChange={(v) => onSaveField("acp", "replay_bytes", v)}
+        />
+        <NumberField
+          label="Max concurrent resumes"
+          description="Upper bound on parallel acp worker spawns/attaches the reconciler runs on `aoe serve` cold start. Default 4 keeps Node.js bootup memory bounded for laptops/Pis (each claude-agent-acp is ~50-80 MB transient). Bounded at runtime by `min(this, max_concurrent_workers).max(1)`. Persists to config.toml as acp.max_concurrent_resumes; cross-device."
+          value={maxConcurrentResumes}
+          min={1}
+          onChange={(v) => onSaveField("acp", "max_concurrent_resumes", v)}
+        />
+        <NumberField
+          label="Silent-orphan grace (s)"
+          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as acp.silent_orphan_grace_secs; cross-device. See #1240."
+          value={
+            typeof acp.silent_orphan_grace_secs === "number"
+              ? (acp.silent_orphan_grace_secs as number)
+              : 60
+          }
+          min={0}
+          onChange={(v) => onSaveField("acp", "silent_orphan_grace_secs", v)}
+        />
+        <NumberField
+          label="Silent-orphan fast grace (s)"
+          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as acp.silent_orphan_fast_grace_secs; cross-device. See #1240."
+          value={
+            typeof acp.silent_orphan_fast_grace_secs === "number"
+              ? (acp.silent_orphan_fast_grace_secs as number)
+              : 20
+          }
+          min={0}
+          onChange={(v) => onSaveField("acp", "silent_orphan_fast_grace_secs", v)}
+        />
+        <NumberField
+          label="Auto-stop idle workers (s)"
+          description="Seconds of inactivity (no acp events, no in-flight turn) after which the daemon stops an idle acp worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Acp workers only. Persists to config.toml as acp.auto_stop_idle_secs; cross-device. See #1689."
+          value={
+            typeof acp.auto_stop_idle_secs === "number"
+              ? (acp.auto_stop_idle_secs as number)
+              : 0
+          }
+          min={0}
+          onChange={(v) => onSaveField("acp", "auto_stop_idle_secs", v)}
+        />
+        <NumberField
+          label="Auto-resume grace (s)"
+          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as acp.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
+          value={
+            typeof acp.rate_limit_auto_resume_grace_secs === "number"
+              ? (acp.rate_limit_auto_resume_grace_secs as number)
+              : 15
+          }
+          min={0}
+          onChange={(v) =>
+            onSaveField("acp", "rate_limit_auto_resume_grace_secs", v)
+          }
+        />
+      </CollapsibleSection>
+
     </div>
   );
 }

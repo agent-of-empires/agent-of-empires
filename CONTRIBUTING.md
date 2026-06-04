@@ -99,7 +99,7 @@ Routine maintenance is intentionally hidden:
 - `docs:`, `style:`
 - `refactor:`, `test:`
 
-For web-dashboard changes, scope visibility via the prefix: `feat(web): ...` / `fix(web): ...` show up; `refactor(web):` / `chore(web):` / `test(web):` stay out. Same pattern for `cockpit`, `serve`, `tui`.
+For web-dashboard changes, scope visibility via the prefix: `feat(web): ...` / `fix(web): ...` show up; `refactor(web):` / `chore(web):` / `test(web):` stay out. Same pattern for `acp`, `serve`, `tui`.
 
 A non-conventional PR title no longer disappears silently from the changelog: `cliff.toml`'s catch-all parser routes anything without a recognized prefix into a generic "Other" group, and the release workflow fails if git-cliff still flags a parse-error skip. Even so, the **PR Title Check** workflow runs on every PR and refuses to pass until the title parses as `<type>(<scope>)?: <subject>` with a lowercase subject, so "Other" should only ever catch direct pushes to `main`. Reword titles like "Fix stuff" to `fix: <thing>` before merging.
 

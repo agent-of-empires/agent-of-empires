@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { reclassifyBash } from "./toolReclassify";
-import type { ToolCall } from "./cockpitTypes";
+import type { ToolCall } from "./acpTypes";
 
 function bash(command: string, kind = "execute"): ToolCall {
   return {

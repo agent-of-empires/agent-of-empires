@@ -95,4 +95,61 @@ describe("ThemeSettings contract", () => {
       expect(onSaveField).toHaveBeenCalledWith("theme", "color_mode", mode);
     }
   });
+
+  // Regression for #1510: when the PATCH fails (elevation missing,
+  // read-only, network), the picker event must NOT fire. The previous
+  // code dispatched the repaint synchronously, so a failed save left
+  // the dashboard chrome painted with a theme that did not match what
+  // the server returned on the next reload.
+  it("does not dispatch picker event when onSaveField resolves false", async () => {
+    const onSaveField = vi
+      .fn<(s: string, f: string, v: unknown) => Promise<boolean>>()
+      .mockResolvedValue(false);
+    const onUpdate = vi.fn();
+    const { container } = render(
+      <ThemeSettings
+        settings={{ theme: { name: "default", color_mode: "truecolor" } }}
+        onSaveField={onSaveField}
+        onUpdate={onUpdate}
+      />,
+    );
+    await waitFor(() => {
+      const opts = container.querySelectorAll("select")[0].querySelectorAll(
+        "option",
+      );
+      expect(opts.length).toBeGreaterThan(1);
+    });
+    const themeSelect = container.querySelectorAll("select")[0];
+    fireEvent.change(themeSelect, { target: { value: "modus-vivendi" } });
+    // Settle the promise queue so the await inside save() runs.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onSaveField).toHaveBeenCalledWith("theme", "name", "modus-vivendi");
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
+  it("dispatches picker event after onSaveField resolves true", async () => {
+    const onSaveField = vi
+      .fn<(s: string, f: string, v: unknown) => Promise<boolean>>()
+      .mockResolvedValue(true);
+    const onUpdate = vi.fn();
+    const { container } = render(
+      <ThemeSettings
+        settings={{ theme: { name: "default", color_mode: "truecolor" } }}
+        onSaveField={onSaveField}
+        onUpdate={onUpdate}
+      />,
+    );
+    await waitFor(() => {
+      const opts = container.querySelectorAll("select")[0].querySelectorAll(
+        "option",
+      );
+      expect(opts.length).toBeGreaterThan(1);
+    });
+    const themeSelect = container.querySelectorAll("select")[0];
+    fireEvent.change(themeSelect, { target: { value: "modus-vivendi" } });
+    await waitFor(() => {
+      expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi");
+    });
+  });
 });

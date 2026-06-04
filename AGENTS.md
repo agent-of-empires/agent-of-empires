@@ -42,12 +42,51 @@
 - Stack: React 19, TypeScript, Vite, Tailwind v4, xterm.js v6. Installable as a PWA ("Install Agent of Empires" in Chrome; "Add to Home Screen" on iOS).
 - Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
-- Frontend dev: `cd web && npm run dev` for Vite HMR; the Rust server must also be running for API/WebSocket requests.
+- Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
 - TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
 
 ## Settings & Configuration
 
-Every configurable field must be editable in the settings TUI. When adding one to `SandboxConfig`, `WorktreeConfig`, etc., also: add a `FieldKey` in `src/tui/settings/fields.rs`; add a `SettingField` entry in the matching `build_*_fields()`; wire `apply_field_to_global()` + `apply_field_to_profile()`; add a `clear_profile_override()` case in `src/tui/settings/input.rs`; include the field in the `*ConfigOverride` struct in `profile_config.rs` with merge logic in `merge_configs()`.
+Settings are single-source (#1692): a field is declared once on its `Config`
+sub-struct and every surface derives from that declaration. Adding a setting is
+one edit, the `#[setting(...)]` annotation on the field:
+
+```rust
+/// Doc comment becomes the field's description on every surface.
+#[serde(default)]
+#[setting(label = "My Setting", widget = "toggle")]
+pub my_setting: bool,
+```
+
+`#[derive(SettingsSection)]` (the `aoe-settings-derive` crate) turns each
+annotated field into a `FieldDescriptor` in `settings_schema::schema()`. From
+there everything is automatic:
+
+- **TUI** builds its rows from the schema (`src/tui/settings/fields.rs`); reads
+  and writes go through the serialized `Config` JSON and the generic
+  `merge_json` / `clear_path`. No `FieldKey`, `build_*_fields`, or
+  `apply_field_*` to touch.
+- **Web** fetches `GET /api/settings/schema` and renders generic FormFields
+  (`web/src/components/settings/SchemaSection.tsx`). (Migration is incremental;
+  some sections are still hand-written and consume the schema as they move
+  over.)
+- **Server** validates each PATCH leaf against the schema's `web_write` policy
+  and `validation` rule (`settings_schema::validate_patch`); no hand-kept
+  allowlist.
+- **Profile/repo overrides** are stored as sparse JSON and merged generically,
+  so there is no `*ConfigOverride` struct or merge arm to extend.
+
+Attribute keys: `label`, `desc` (defaults to the doc comment), `widget`
+(`toggle` / `text` / `optional_text` / `number` / `slider` / `select` /
+`list` / `custom:<id>`), `options` (for `select`, `value:Label,...`),
+`min` / `max` / `step`, `validate` (`range:MIN[:MAX]` / `nonempty` /
+`memory_limit` / `volume_list`), `web` (`elevation:<reason>` /
+`local_only:<reason>`; omit for plain allow), `category` (override the
+section's default tab), `advanced` (group under an Advanced fold), `global_only`
+(shown but not profile-overridable), and `skip` (exclude from the schema). The
+section itself is declared with `#[setting_section(name = "...", category =
+"...")]`. A `custom:<id>` widget keeps a bespoke control: register the id in the
+TUI custom-widget map (and, when the web renders that section, the web one too).
 
 ## Coding Style & Naming Conventions
 
@@ -72,6 +111,8 @@ Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) 
 
 The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`; all use `#[serial]` for tmux isolation.
 
+Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
+
 Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
 
 ### Web Dashboard Playwright Tests
@@ -79,11 +120,11 @@ Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` 
 Two suites under `web/`:
 
 - **Mocked**: `web/tests/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.config.ts`. Uses `page.route()` to stub `/api/*` responses; serves the production Vite bundle through `vite preview` on port 4173. Fast and deterministic; for UI logic that does not depend on real backend state.
-- **Live**: `web/tests/live/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.live.config.ts`. Each test spawns a real `aoe serve` subprocess against an isolated `HOME` via the harness in `web/tests/helpers/aoeServe.ts`. Two workers, `workerIndex`-based port allocation, `TMUX_TMPDIR` per test. For flows that depend on backend persistence, auth, sessions, tmux, git, read-only, or cockpit.
+- **Live**: `web/tests/live/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.live.config.ts`. Each test spawns a real `aoe serve` subprocess against an isolated `HOME` via the harness in `web/tests/helpers/aoeServe.ts`. Two workers, `workerIndex`-based port allocation, `TMUX_TMPDIR` per test. For flows that depend on backend persistence, auth, sessions, tmux, git, read-only, or structured view.
 
 When deciding which suite to use:
 
-- Backend, persistence, auth, session, tmux, git, read-only, or cockpit round-trip flows belong in **live Playwright**.
+- Backend, persistence, auth, session, tmux, git, read-only, or structured-view round-trip flows belong in **live Playwright**.
 - Request-payload permutations (does control X emit the right JSON keys) belong in **Vitest + RTL + MSW** under `web/src/**/__tests__/`. See `web/src/components/settings/__tests__/SoundSettings.test.tsx` as the canonical example.
 - Browser-specific behavior not practical in Vitest (focus, keyboard, drag-drop, modal escape, mobile viewport, touch events) belongs in **mocked Playwright**.
 
@@ -112,7 +153,7 @@ Full recipe, harness API, and fake-ACP-agent details live in `docs/development/p
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or cockpit).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 
@@ -125,9 +166,9 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
 - **`codecov/patch`** (target: 75%). The lines your PR adds or changes must hit 75% coverage. This is the strict gate, sized so a small frontend PR with one missed line still passes.
 - **`codecov/project`** (target: auto). Overall repo coverage must not drop below `main`'s current level by more than the 1% threshold.
 
-**Per-component checks (`codecov/project/<Component>`, e.g. App Shell, Auth, Cockpit UI) target 90% and currently report FAIL on every PR by design.** The baseline sits well below 90% and is being lifted by the foundation follow-ups (#1217–#1224, threshold enforcement tracked in #1225). They surface where each user-facing surface stands today; they are not merge blockers right now. Do not chase them on unrelated PRs. When you touch one of those surfaces, add tests that improve its number.
+**Components show up in the PR comment, not as status checks.** `codecov.yml` sets `component_management.default_rules.statuses: []`, so the per-component slices (App Shell, Auth, Structured View UI, etc.) appear under the components table in the Codecov PR comment but never post a separate GitHub status. The repo-wide `codecov/patch` and `codecov/project` checks are the only Codecov gates on the merge box. The component baselines are still being lifted by the foundation follow-ups (#1217 through #1224, threshold enforcement tracked in #1225); when you touch one of those surfaces, add tests that improve its number, but don't chase the comment-only component numbers on unrelated PRs.
 
-**Rust-only PRs.** Patch coverage is reported against `web/src/**` paths only, so a Rust-only diff is N/A for patch coverage and inherits the previous flag value via `carryforward: true`. The per-component checks still display FAIL for the same baseline reason described above; the aggregate `codecov/patch` and `codecov/project` checks pass.
+**Rust-only PRs.** Patch coverage is reported against `web/src/**` paths only, so a Rust-only diff is N/A for patch coverage and inherits the previous flag value via `carryforward: true`. The aggregate `codecov/patch` and `codecov/project` checks pass.
 
 ## Git Configuration
 
@@ -138,7 +179,8 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
 
 - Runtime config/data location:
   - **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/` (defaults to `~/.config/agent-of-empires/`)
-  - **macOS/Windows**: `~/.agent-of-empires/`
+  - **macOS**: `~/.agent-of-empires/` by default, or `$XDG_CONFIG_HOME/agent-of-empires/` when `XDG_CONFIG_HOME` is set or that dir already exists (issue #1948). Resolution is `get_app_dir_path` -> `macos_app_dir`; nothing is moved automatically, so an existing `~/.agent-of-empires/` keeps being used.
+  - **Windows**: `~/.agent-of-empires/`
 - Keep user data out of commits. For repo-local experiments, use ignored paths like `./.agent-of-empires/`, `.env`, and `.mcp.json`.
 - `aoe serve` writes several files to the app dir while running. All are owner-only (0600) where they contain secrets. The daemon cleans them up on shutdown; `daemon_pid()`'s stale-PID check sweeps them otherwise.
   - `serve.pid`: daemon PID for `--stop` and reattach detection.
@@ -147,7 +189,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
   - `serve.passphrase`: plaintext Tunnel passphrase, so the TUI can show it on reopen across restarts.
   - `serve.last_mode`, `serve.last_port`: picker defaults across launches.
 
-Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and cockpit runners; see `docs/development/logging.md` for sinks and rotation.
+Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and structured-view runners; see `docs/development/logging.md` for sinks and rotation.
 
 ## Data Migrations
 

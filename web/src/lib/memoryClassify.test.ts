@@ -4,7 +4,7 @@ import {
   isMemoryPath,
   parseMemoryFrontmatter,
 } from "./memoryClassify";
-import type { ToolCall } from "./cockpitTypes";
+import type { ToolCall } from "./acpTypes";
 
 function tool(
   name: string,

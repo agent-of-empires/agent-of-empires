@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
@@ -39,8 +39,8 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-      # tests/cockpit_acp_smoke.rs spawns the Node ACP shim under
-      # cockpit-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
+      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
+      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
       # so its deps must be installed before `cargo test --features serve`
       # runs. The shim itself auto-skips if node is missing, but on a
       # GitHub runner node is always present; without the install step
@@ -49,7 +49,7 @@ jobs:
       # exercised there and we can skip the install.
       - name: Install ACP shim deps
         if: runner.os == 'Linux'
-        working-directory: cockpit-worker/test-shim
+        working-directory: acp-worker/test-shim
         run: npm ci
       # `--features serve` is a strict superset of the default-feature
       # suite (1759 -> 2269 unit tests, 67 -> 72 e2e), so a single run
@@ -90,9 +90,18 @@ jobs:
         run: sed -i 's|^SF:src/|SF:web/src/|' web/coverage/vitest/lcov.info
       - name: Upload to Codecov (vitest flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          # The codecov-action's `files` input is additive, not restrictive:
+          # with `disable_search: false` (the default), the CLI also walks
+          # the workspace and uploads anything that looks like a coverage
+          # report. That picks up web/tests/coverage-matrix.json and
+          # coverage-matrix.exempt.json (our test-mapping metadata, not
+          # coverage data) and ships them to Codecov on every run.
+          # `disable_search: true` restricts the upload to the explicit
+          # `files:` list.
+          disable_search: true
           files: web/coverage/vitest/lcov.info
           flags: vitest
           name: vitest
@@ -150,9 +159,14 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-mocked flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          # See the matching comment in the vitest upload step: without
+          # disable_search the action also picks up the coverage-matrix
+          # JSON files under web/tests/ and ships them as if they were
+          # coverage reports.
+          disable_search: true
           files: web/coverage/merged/lcov.info
           flags: playwright-mocked
           name: playwright-mocked
@@ -178,7 +192,7 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
@@ -231,9 +245,14 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-live flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          # See the matching comment in the vitest upload step: without
+          # disable_search the action also picks up the coverage-matrix
+          # JSON files under web/tests/ and ships them as if they were
+          # coverage reports.
+          disable_search: true
           files: web/coverage/merged/lcov.info
           flags: playwright-live
           name: playwright-live

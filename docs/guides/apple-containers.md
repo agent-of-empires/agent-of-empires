@@ -49,7 +49,7 @@ To switch your sandbox runtime from Docker (default) to Apple Container, update 
 ```toml
 [sandbox]
 container_runtime = "apple_container"
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
 ```
 
 ### Profile-Specific Runtime
@@ -112,5 +112,5 @@ container system status
 Apple Container uses its own local image store, separate from Docker Desktop. If you have an image in Docker, you must pull or build it again for Apple Container:
 
 ```bash
-container image pull ghcr.io/njbrake/aoe-sandbox:latest
+container image pull ghcr.io/agent-of-empires/aoe-sandbox:latest
 ```

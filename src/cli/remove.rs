@@ -25,6 +25,13 @@ pub struct RemoveArgs {
     /// Keep container instead of deleting it (default: delete per config)
     #[arg(long = "keep-container")]
     keep_container: bool,
+
+    /// For scratch sessions, keep the scratch directory on disk instead of
+    /// removing it. The session record is still deleted; the kept path is
+    /// logged so you can find the files later. No effect on non-scratch
+    /// sessions.
+    #[arg(long = "keep-scratch")]
+    keep_scratch: bool,
 }
 
 fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
@@ -73,6 +80,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             delete_sandbox,
             force_delete: args.force,
             detach_hooks: false,
+            keep_scratch: args.keep_scratch,
         });
 
     for msg in &result.messages {

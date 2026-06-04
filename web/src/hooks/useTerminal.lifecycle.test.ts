@@ -37,6 +37,7 @@ const { captured } = vi.hoisted(() => ({
     proposedDimensions: { cols: 100, rows: 30 } as
       | { cols: number; rows: number }
       | undefined,
+    oscHandlers: {} as Record<number, (data: string) => boolean>,
   },
 }));
 
@@ -89,6 +90,15 @@ vi.mock("@xterm/xterm", () => {
     attachCustomWheelEventHandler(fn: (e: WheelEvent) => boolean): void {
       captured.customWheel = fn;
     }
+    parser = {
+      registerOscHandler(
+        id: number,
+        cb: (data: string) => boolean,
+      ): { dispose: () => void } {
+        captured.oscHandlers[id] = cb;
+        return { dispose: () => {} };
+      },
+    };
     resize(cols: number, rows: number): void {
       this.cols = cols;
       this.rows = rows;
@@ -203,6 +213,7 @@ beforeEach(() => {
   captured.selection = "";
   captured.resizeObserverCallback = undefined;
   captured.proposedDimensions = { cols: 100, rows: 30 };
+  captured.oscHandlers = {};
   originalWebSocket = global.WebSocket;
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   originalResizeObserver = global.ResizeObserver;
@@ -662,6 +673,141 @@ describe("useTerminal lifecycle", () => {
       // for the next session.
       expect(captured.disposed).toBe(true);
       expect(sockets.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("session change nulls the old socket's handlers before close (no ghost retry)", async () => {
+    // Regression for #1455: a session change must detach the previous
+    // socket's onopen/onmessage/onclose/onerror BEFORE close(), otherwise
+    // the still-bound onclose closure runs after cleanup and schedules a
+    // setTimeout that calls connect() on the OLD sessionId, dialing a
+    // ghost socket and overwriting wsRef.current for the new session.
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { rerender } = renderHook(
+        (props: { id: string | null }) => {
+          const term = useTerminal(props.id, "ws", false, false);
+          if (term.containerRef && !term.containerRef.current) {
+            (
+              term.containerRef as unknown as {
+                current: HTMLDivElement | null;
+              }
+            ).current = div;
+          }
+          return term;
+        },
+        { initialProps: { id: "s-old" } },
+      );
+      await flushAsync();
+      const oldWs = sockets[0]!;
+      expect(oldWs.url).toContain("/sessions/s-old/ws");
+      expect(oldWs.onclose).not.toBeNull();
+
+      // Switch sessions. Cleanup should detach handlers before close().
+      rerender({ id: "s-new" });
+      await flushAsync();
+
+      // All four lifecycle handlers must be cleared on the orphaned socket.
+      expect(oldWs.onopen).toBeNull();
+      expect(oldWs.onmessage).toBeNull();
+      expect(oldWs.onclose).toBeNull();
+      expect(oldWs.onerror).toBeNull();
+
+      // Even if the browser had a queued close event for the old socket,
+      // with onclose nulled it cannot schedule a setTimeout retry. Advance
+      // past every retry delay and confirm no third (ghost) socket was
+      // dialed for the OLD sessionId.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(12_000);
+      });
+      await flushAsync();
+      const ghostForOldSession = sockets
+        .slice(1)
+        .find((s) => s.url.includes("/sessions/s-old/ws"));
+      expect(ghostForOldSession).toBeUndefined();
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("server close code 1011 falls through to the standard retry path", async () => {
+    // Regression for #1455: the server now sends 1011 <reason> close
+    // frames on openpty/spawn/clone-reader/take-writer failures instead
+    // of opaque 1006. The client must treat 1011 as a regular retryable
+    // failure (not the 4001 short-circuit).
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { result } = renderHook(() => {
+        const term = useTerminal("s-1011", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+        ws.onclose?.({
+          code: 1011,
+          reason: "openpty_failed",
+          wasClean: false,
+        } as CloseEvent);
+      });
+      await flushAsync();
+      expect(result.current.state.reconnecting).toBe(true);
+      expect(result.current.state.retryCount).toBe(1);
+      expect(result.current.state.retryCount).toBeLessThan(
+        result.current.maxRetries,
+      );
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("server close code 1013 (tmux_not_ready) falls through to the standard retry path", async () => {
+    // Regression for #1455: server's pane-readiness poll closes with
+    // 1013 tmux_not_ready when the bounded wait elapses. Client must
+    // retry on the fast-start ladder, NOT short-circuit to exhausted.
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { result } = renderHook(() => {
+        const term = useTerminal("s-1013", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+        ws.onclose?.({
+          code: 1013,
+          reason: "tmux_not_ready",
+          wasClean: false,
+        } as CloseEvent);
+      });
+      await flushAsync();
+      expect(result.current.state.reconnecting).toBe(true);
+      expect(result.current.state.retryCount).toBe(1);
+      // The next retry must fire on the fast-start ladder, not on the
+      // old 1s+ exponential delay.
+      const before = sockets.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      await flushAsync();
+      expect(sockets.length).toBeGreaterThan(before);
     } finally {
       div.remove();
     }
@@ -1370,182 +1516,401 @@ describe("useTerminal lifecycle", () => {
     }
   });
 
-  it("terminal copy events write the selected terminal text to clipboardData", async () => {
+});
+
+// Mobile soft-keyboard Backspace autorepeat handler (#1450). The hook
+// intercepts `beforeinput` on xterm's hidden textarea and emits one DEL
+// (0x7f) per `deleteContentBackward` tick, gated to coarse-pointer devices
+// without a fine pointer. jsdom lets us drive every branch deterministically:
+// matchMedia controls the gate, the FakeSocket's readyState the open guard.
+describe("useTerminal mobile backspace autorepeat", () => {
+  function stubPointer(coarse: boolean, anyFine: boolean): void {
+    vi.stubGlobal(
+      "matchMedia",
+      (q: string) =>
+        ({
+          matches:
+            q === "(pointer: coarse)"
+              ? coarse
+              : q === "(any-pointer: fine)"
+                ? anyFine
+                : false,
+        }) as MediaQueryList,
+    );
+  }
+
+  // Mount the hook, attach a container, and drive the socket to OPEN so the
+  // beforeinput handler's `ws.readyState === OPEN` guard passes. Returns the
+  // textarea xterm's mock created and the live FakeSocket.
+  async function mountOpen(): Promise<{
+    div: HTMLDivElement;
+    ws: FakeSocket;
+    ta: HTMLTextAreaElement;
+  }> {
     const div = document.createElement("div");
     document.body.appendChild(div);
-    try {
-      renderHook(() => {
-        const term = useTerminal("s-copy-event", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-
-      captured.selection = "selected terminal text";
-      const clipboardData = {
-        setData: vi.fn(),
-      };
-      const event = new Event("copy", {
-        bubbles: true,
-        cancelable: true,
-      });
-      Object.defineProperty(event, "clipboardData", {
-        value: clipboardData,
-      });
-      const xtermEl = div.querySelector(".xterm") as HTMLDivElement;
-      expect(xtermEl.dispatchEvent(event)).toBe(false);
-
-      expect(clipboardData.setData).toHaveBeenCalledWith(
-        "text/plain",
-        "selected terminal text",
-      );
-    } finally {
-      div.remove();
-    }
-  });
-
-  it("terminal copy events fall back to browser selection text", async () => {
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    const originalGetSelection = window.getSelection;
-    Object.defineProperty(window, "getSelection", {
-      configurable: true,
-      value: vi.fn(() => ({ toString: () => "browser selected text" })),
+    renderHook(() => {
+      const term = useTerminal("s-bksp", "ws", false, false);
+      if (term.containerRef && !term.containerRef.current) {
+        (
+          term.containerRef as unknown as { current: HTMLDivElement | null }
+        ).current = div;
+      }
+      return term;
     });
-    try {
-      renderHook(() => {
-        const term = useTerminal("s-copy-browser-selection", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-
-      captured.selection = "";
-      const clipboardData = {
-        setData: vi.fn(),
-      };
-      const event = new Event("copy", {
-        bubbles: true,
-        cancelable: true,
-      });
-      Object.defineProperty(event, "clipboardData", {
-        value: clipboardData,
-      });
-      const xtermEl = div.querySelector(".xterm") as HTMLDivElement;
-      expect(xtermEl.dispatchEvent(event)).toBe(false);
-
-      expect(clipboardData.setData).toHaveBeenCalledWith(
-        "text/plain",
-        "browser selected text",
-      );
-    } finally {
-      Object.defineProperty(window, "getSelection", {
-        configurable: true,
-        value: originalGetSelection,
-      });
-      div.remove();
-    }
-  });
-
-  it("Ctrl+C copies selected terminal text instead of sending an interrupt", async () => {
-    const originalExecCommand = document.execCommand;
-    const execCommand = vi.fn(() => true);
-    Object.defineProperty(document, "execCommand", {
-      configurable: true,
-      value: execCommand,
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.(new Event("open"));
     });
-    const div = document.createElement("div");
-    document.body.appendChild(div);
-    try {
-      renderHook(() => {
-        const term = useTerminal("s-copy-selection", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
+    await flushAsync();
+    const ta = div.querySelector("textarea") as HTMLTextAreaElement;
+    return { div, ws, ta };
+  }
+
+  function fireDelete(
+    ta: HTMLTextAreaElement,
+    count: number,
+    opts: { inputType?: string; isComposing?: boolean } = {},
+  ): void {
+    const inputType = opts.inputType ?? "deleteContentBackward";
+    act(() => {
+      for (let i = 0; i < count; i++) {
+        const e = new InputEvent("beforeinput", {
+          inputType,
+          bubbles: true,
+          cancelable: true,
+        });
+        if (opts.isComposing) {
+          Object.defineProperty(e, "isComposing", { get: () => true });
         }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
+        ta.dispatchEvent(e);
+      }
+    });
+  }
 
-      captured.selection = "selected terminal text";
-      const before = ws.sent.length;
-      const event = new KeyboardEvent("keydown", {
-        bubbles: true,
-        cancelable: true,
-        code: "KeyC",
-        ctrlKey: true,
-      });
-      const handled = captured.customKey?.(event);
+  function delBytes(ws: FakeSocket): number {
+    return ws.sent.filter(
+      (m) => typeof m !== "string" && m.length === 1 && m[0] === 0x7f,
+    ).length;
+  }
 
-      expect(handled).toBe(false);
-      expect(execCommand).toHaveBeenCalledWith("copy");
-      const ctrlC = ws.sent.slice(before).find((m) => {
-        if (typeof m === "string") return false;
-        return m.length === 1 && m[0] === 0x03;
-      });
-      expect(ctrlC).toBeUndefined();
+  it("emits one DEL per tick on a coarse pointer", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(3);
     } finally {
-      Object.defineProperty(document, "execCommand", {
-        configurable: true,
-        value: originalExecCommand,
-      });
       div.remove();
     }
   });
 
-  it("Ctrl+C remains available as interrupt when no terminal text is selected", async () => {
+  it("emits exactly one DEL for a single tick (no double-delete)", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 1);
+      expect(delBytes(ws)).toBe(1);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does nothing on a fine pointer", async () => {
+    stubPointer(false, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does nothing when a fine pointer is also present (iPad + keyboard)", async () => {
+    stubPointer(true, true);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("ignores non-delete input types", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3, { inputType: "insertText" });
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("leaves composition deletes to xterm", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3, { isComposing: true });
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does not send while the socket is not open", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+      });
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+});
+
+// OSC 52 clipboard handling. tmux emits OSC 52 on copy (set-clipboard on);
+// before #1499 xterm.js had no handler so select-to-copy silently failed.
+// The hook now registers a handler that decodes the base64 payload and
+// writes it to the system clipboard. These tests drive the captured handler
+// directly; the full drag -> tmux -> OSC 52 round-trip is covered by the
+// live Playwright spec.
+describe("useTerminal OSC 52 clipboard", () => {
+  let writeText: ReturnType<typeof vi.fn>;
+  let originalClipboard: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    writeText = vi.fn().mockResolvedValue(undefined);
+    originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    if (originalClipboard) {
+      Object.defineProperty(navigator, "clipboard", originalClipboard);
+    } else {
+      delete (navigator as unknown as { clipboard?: unknown }).clipboard;
+    }
+  });
+
+  async function mountHook(): Promise<HTMLDivElement> {
     const div = document.createElement("div");
     document.body.appendChild(div);
+    renderHook(() => {
+      const term = useTerminal("s-osc52", "ws", false, false);
+      if (term.containerRef && !term.containerRef.current) {
+        (
+          term.containerRef as unknown as { current: HTMLDivElement | null }
+        ).current = div;
+      }
+      return term;
+    });
+    await flushAsync();
+    return div;
+  }
+
+  it("registers an OSC 52 handler on open", async () => {
+    const div = await mountHook();
     try {
-      renderHook(() => {
-        const term = useTerminal("s-copy-empty", "ws", false, false);
-        if (term.containerRef && !term.containerRef.current) {
-          (
-            term.containerRef as unknown as { current: HTMLDivElement | null }
-          ).current = div;
-        }
-        return term;
-      });
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.(new Event("open"));
-      });
-      await flushAsync();
+      expect(typeof captured.oscHandlers[52]).toBe("function");
+    } finally {
+      div.remove();
+    }
+  });
 
-      const event = new KeyboardEvent("keydown", {
+  it("decodes a base64 payload and writes it to the clipboard", async () => {
+    const div = await mountHook();
+    try {
+      // "c;<base64>" where base64("hello world") = "aGVsbG8gd29ybGQ=".
+      captured.oscHandlers[52]!("c;aGVsbG8gd29ybGQ=");
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledWith("hello world");
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("swallows a rejected clipboard write", async () => {
+    writeText.mockRejectedValueOnce(new Error("no gesture"));
+    const div = await mountHook();
+    try {
+      expect(() => captured.oscHandlers[52]!("c;aGVsbG8=")).not.toThrow();
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledWith("hello");
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("ignores an OSC 52 paste query (no clipboard write)", async () => {
+    const div = await mountHook();
+    try {
+      captured.oscHandlers[52]!("c;?");
+      await flushAsync();
+      expect(writeText).not.toHaveBeenCalled();
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("ignores an undecodable payload without throwing", async () => {
+    const div = await mountHook();
+    try {
+      expect(() => captured.oscHandlers[52]!("c;!!!not base64!!!")).not.toThrow();
+      await flushAsync();
+      expect(writeText).not.toHaveBeenCalled();
+    } finally {
+      div.remove();
+    }
+  });
+
+  // base64("hi") === "aGk=".
+  const HI_OSC = "c;aGk=";
+
+  // Stand-in for the browser ClipboardItem. A real ClipboardItem consumes
+  // the promise value (it awaits it to perform the write), so it never leaks
+  // an unhandled rejection when the hook's timeout rejects the pending blob.
+  // The fake must do the same or the timeout tests trip Vitest's
+  // unhandled-rejection guard (process exits non-zero even with all tests
+  // green).
+  class FakeClipboardItem {
+    constructor(public data: Record<string, Promise<Blob>>) {
+      for (const v of Object.values(data)) void Promise.resolve(v).catch(() => {});
+    }
+  }
+
+  function fireDrag(
+    viewport: HTMLElement,
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+  ): void {
+    viewport.dispatchEvent(
+      new MouseEvent("mousedown", {
+        button: 0,
+        clientX: from.x,
+        clientY: from.y,
         bubbles: true,
-        cancelable: true,
-        code: "KeyC",
-        ctrlKey: true,
-      });
-      expect(captured.customKey?.(event)).toBe(true);
+      }),
+    );
+    window.dispatchEvent(
+      new MouseEvent("mouseup", {
+        button: 0,
+        clientX: to.x,
+        clientY: to.y,
+        bubbles: true,
+      }),
+    );
+  }
 
-      const before = ws.sent.length;
-      act(() => {
-        captured.onData?.("\x03");
+  it("arms a ClipboardItem on drag release and resolves it from the OSC 52 payload", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText, write },
+      configurable: true,
+    });
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    const div = await mountHook();
+    try {
+      const viewport = div.querySelector(".xterm") as HTMLElement;
+      fireDrag(viewport, { x: 10, y: 10 }, { x: 120, y: 90 });
+      // The gesture pre-arms a promise-valued clipboard write.
+      expect(write).toHaveBeenCalledTimes(1);
+      // The OSC 52 escape resolves that pending write; the direct writeText
+      // fallback is not used on the ClipboardItem path.
+      captured.oscHandlers[52]!(HI_OSC);
+      await flushAsync();
+      expect(writeText).not.toHaveBeenCalled();
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does not arm on a plain click (below the drag threshold)", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText, write },
+      configurable: true,
+    });
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    const div = await mountHook();
+    try {
+      const viewport = div.querySelector(".xterm") as HTMLElement;
+      fireDrag(viewport, { x: 10, y: 10 }, { x: 11, y: 11 });
+      expect(write).not.toHaveBeenCalled();
+      // An unarmed OSC 52 (e.g. the agent ran a copy itself) still writes.
+      captured.oscHandlers[52]!(HI_OSC);
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledWith("hi");
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("falls back to writeText when promise ClipboardItem is unavailable", async () => {
+    vi.stubGlobal("ClipboardItem", undefined);
+    const div = await mountHook();
+    try {
+      const viewport = div.querySelector(".xterm") as HTMLElement;
+      fireDrag(viewport, { x: 10, y: 10 }, { x: 120, y: 90 });
+      captured.oscHandlers[52]!(HI_OSC);
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledWith("hi");
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("clears the armed ClipboardItem write when no OSC 52 arrives in time", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText, write },
+      configurable: true,
+    });
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    const div = await mountHook();
+    try {
+      const viewport = div.querySelector(".xterm") as HTMLElement;
+      fireDrag(viewport, { x: 10, y: 10 }, { x: 120, y: 90 });
+      expect(write).toHaveBeenCalledTimes(1);
+      // No OSC 52 lands: the timeout fires and disarms.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(600);
       });
-      const ctrlC = ws.sent.slice(before).find((m) => {
-        if (typeof m === "string") return false;
-        return m.length === 1 && m[0] === 0x03;
+      // A late OSC 52 no longer resolves the (expired) item; it writes direct.
+      captured.oscHandlers[52]!(HI_OSC);
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledWith("hi");
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("disarms the writeText fallback after its timeout", async () => {
+    vi.stubGlobal("ClipboardItem", undefined);
+    const div = await mountHook();
+    try {
+      const viewport = div.querySelector(".xterm") as HTMLElement;
+      fireDrag(viewport, { x: 10, y: 10 }, { x: 120, y: 90 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(600);
       });
-      expect(ctrlC).toBeDefined();
+      // After the timeout the fallback resolver is cleared; a later OSC 52
+      // takes the direct-write path exactly once.
+      captured.oscHandlers[52]!(HI_OSC);
+      await flushAsync();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith("hi");
     } finally {
       div.remove();
     }

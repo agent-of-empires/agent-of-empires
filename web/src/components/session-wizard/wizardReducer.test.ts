@@ -120,6 +120,70 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
     expect(next.data.profileDirty).toBe(false);
   });
 
+  it("enabling scratch clears path, extraRepoPaths, and useWorktree", () => {
+    // Mutual exclusion: switching to scratch must not leave stale
+    // path/useWorktree state that would otherwise leak into the submit
+    // payload (the server would 400 on scratch + worktree_branch, and
+    // the UI would render an empty path next to a "real" project marker).
+    const seeded = makeState({
+      data: {
+        ...initialData,
+        path: "/Users/me/old-project",
+        extraRepoPaths: ["/Users/me/lib-a", "/Users/me/lib-b"],
+        useWorktree: true,
+      },
+    });
+    const next = reducer(seeded, {
+      type: "SET_FIELD",
+      field: "scratch",
+      value: true,
+    });
+    expect(next.data.scratch).toBe(true);
+    expect(next.data.path).toBe("");
+    expect(next.data.extraRepoPaths).toEqual([]);
+    expect(next.data.useWorktree).toBe(false);
+  });
+
+  it("setting a real path clears scratch (bidirectional reset)", () => {
+    const seeded = makeState({
+      data: { ...initialData, scratch: true, path: "" },
+    });
+    const next = reducer(seeded, {
+      type: "SET_FIELD",
+      field: "path",
+      value: "/Users/me/picked-project",
+    });
+    expect(next.data.scratch).toBe(false);
+    expect(next.data.path).toBe("/Users/me/picked-project");
+  });
+
+  it("setting extraRepoPaths to a non-empty array clears scratch", () => {
+    const seeded = makeState({
+      data: { ...initialData, scratch: true },
+    });
+    const next = reducer(seeded, {
+      type: "SET_FIELD",
+      field: "extraRepoPaths",
+      value: ["/Users/me/lib"],
+    });
+    expect(next.data.scratch).toBe(false);
+  });
+
+  it("setting scratch to false does NOT clear an existing path", () => {
+    // A redundant SET_FIELD scratch=false (e.g. user toggles off and
+    // then back to a real project) must not wipe whatever path the
+    // user just picked.
+    const seeded = makeState({
+      data: { ...initialData, scratch: false, path: "/Users/me/keep-me" },
+    });
+    const next = reducer(seeded, {
+      type: "SET_FIELD",
+      field: "scratch",
+      value: false,
+    });
+    expect(next.data.path).toBe("/Users/me/keep-me");
+  });
+
   it("marks dirty on user toggles even without a profile selected", () => {
     // The dirty guard initially only fired when state.data.profile was
     // truthy, which left no-prefill / no-active-profile users exposed
@@ -146,5 +210,59 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
     });
     expect(late).toBe(fresh);
     expect(late.data.yoloMode).toBe(true);
+  });
+});
+
+describe("SessionWizard reducer / useStructuredView (#1580)", () => {
+  it("defaults useStructuredView to true so ACP-capable tools use the structured view by default", () => {
+    expect(initialData.useStructuredView).toBe(true);
+  });
+
+  it("SET_FIELD useStructuredView updates the flag", () => {
+    const next = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    expect(next.data.useStructuredView).toBe(false);
+  });
+
+  it("toggling useStructuredView does NOT mark profileDirty", () => {
+    // useStructuredView is deliberately excluded from the dirty-tracking list:
+    // the mount-time APPLY_PROFILE_DEFAULTS seeder uses skipIfDirty, so
+    // marking dirty on a structured view toggle would suppress the profile's
+    // tool/yolo/sandbox/env defaults even though structured view is unrelated.
+    const next = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    expect(next.data.profileDirty).toBe(false);
+
+    // A late profile-defaults fetch must still apply (not be skipped).
+    const late = reducer(next, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: true,
+      sandboxEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
+    expect(late.data.yoloMode).toBe(true);
+  });
+
+  it("switching tool preserves the user's useStructuredView choice", () => {
+    const optedOut = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "useStructuredView",
+      value: false,
+    });
+    const next = reducer(optedOut, {
+      type: "SET_FIELD",
+      field: "tool",
+      value: "opencode",
+    });
+    expect(next.data.tool).toBe("opencode");
+    expect(next.data.useStructuredView).toBe(false);
   });
 });

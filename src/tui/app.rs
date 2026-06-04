@@ -3,7 +3,7 @@
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -103,11 +103,24 @@ pub struct App {
     /// it back on when the surface dismisses. Default true to match the
     /// startup `EnableMouseCapture` in `tui::run`.
     mouse_captured: bool,
-    /// Set by `Action::OpenCockpit` so the async main loop can pick it
-    /// up and enter the cockpit view (which needs `event_stream` access
+    /// Whether the resolved config permits xterm mouse tracking (the
+    /// `session.mouse_capture` field plus the `AOE_MOUSE_CAPTURE` backstop).
+    /// This is permission, not live state: `mouse_captured` tracks whether
+    /// tracking is actually engaged right now. Refreshed from disk on the
+    /// periodic reload so toggling Settings > Interaction > Mouse Capture takes
+    /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
+    /// tracking off entirely.
+    mouse_capture_allowed: bool,
+    /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
+    /// xterm mouse-tracking escapes, so `tui::run` skips the startup
+    /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
+    /// tracking mid-session either.
+    mosh_active: bool,
+    /// Set by `Action::OpenStructuredView` so the async main loop can pick it
+    /// up and enter the acp view (which needs `event_stream` access
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
-    pending_cockpit_open: Option<String>,
+    pending_structured_view_open: Option<String>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
     /// `last_installed_version_in_session` on confirmed success in
@@ -171,10 +184,52 @@ impl App {
         }
     }
 
+    /// Peel a trailing Enter off a paste burst so plain-Enter Submit
+    /// semantics survive when the user types or dictates fast enough to
+    /// pump everything through the burst path.
+    ///
+    /// Without this peel, an "hi<Enter>" with sub-5ms key gaps
+    /// (fast typing, clipboard paste with trailing newline, VoiceInk
+    /// dictation that punctuates with a return) lands as a single
+    /// burst `[h, i, Enter]` whose string is `"hi\n"`. The current
+    /// code forwards that whole string through `handle_paste`, which
+    /// inserts `\n` as a literal newline in the textarea, so the
+    /// `Enter` never reaches the dialog's Submit branch and the
+    /// message never sends.
+    ///
+    /// The fix preserves embedded `\n` (mid-burst sentence breaks from
+    /// Mosh-stripped voice paste; the original reason Enter was added
+    /// to `is_burst_candidate`) and only peels the trailing Enter,
+    /// which is intent-to-submit, not data.
+    ///
+    /// Returns `(paste_text, trailing_enter)`:
+    ///   * `paste_text`: the string to forward to `handle_paste` with
+    ///     any trailing `\n` removed.
+    ///   * `trailing_enter`: `Some(KeyEvent)` to replay via
+    ///     `handle_key` after `handle_paste` runs, so the dialog's
+    ///     plain-Enter Submit branch fires; `None` if the burst did
+    ///     not end on Enter.
+    fn split_trailing_enter(
+        burst_str: &str,
+        burst_keys: &[KeyEvent],
+    ) -> (String, Option<KeyEvent>) {
+        match burst_keys.last() {
+            Some(last) if last.code == KeyCode::Enter => {
+                let trimmed = burst_str
+                    .strip_suffix('\n')
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| burst_str.to_string());
+                (trimmed, Some(*last))
+            }
+            _ => (burst_str.to_string(), None),
+        }
+    }
+
     pub fn new(
         profile: &str,
         available_tools: AvailableTools,
         suppress_first_run_dialogs: bool,
+        mosh_active: bool,
     ) -> Result<Self> {
         let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
@@ -209,7 +264,7 @@ impl App {
             // changelog so the warning is what the user sees first, and avoid
             // overwriting a malformed config.toml with defaults via save_config.
         } else if !config.app_state.has_seen_welcome {
-            home.show_welcome();
+            home.show_intro(theme_name);
             config.app_state.has_seen_welcome = true;
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
@@ -218,6 +273,15 @@ impl App {
             home.show_changelog(config.app_state.last_seen_version.clone());
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
+        } else if !config.app_state.has_responded_to_telemetry {
+            // Existing users who finished the walkthrough before telemetry
+            // existed get a one-time opt-in popup. Gated behind the changelog
+            // branch above (mutually exclusive in this if/else chain), so it
+            // never co-renders with the changelog; and because it is a modal
+            // dialog, the version update modal (opened only by an explicit
+            // keypress) can't open on top of it while it is up. No save here:
+            // the dialog's response handler persists the answer.
+            home.show_telemetry_consent();
         }
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
@@ -233,11 +297,15 @@ impl App {
             update_status_rx: None,
             dismissed_update_version,
             event_stream: Some(EventStream::new()),
-            // Initial state matches whatever `tui::run` did at startup;
-            // capture is on by default, off only if AOE_MOUSE_CAPTURE=0.
-            mouse_captured: crate::tui::mouse_capture_requested(),
+            // Initial state matches whatever `tui::run` did at startup: capture
+            // is requested by default, but Mosh suppresses the actual escape, so
+            // `mouse_captured` (live state) also factors in `mosh_active`.
+            // `mouse_capture_allowed` is permission only and ignores Mosh.
+            mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
+            mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
+            mosh_active,
             #[cfg(feature = "serve")]
-            pending_cockpit_open: None,
+            pending_structured_view_open: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -254,14 +322,17 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        // Mouse capture is on by default; AOE_MOUSE_CAPTURE=0 opts out so
-        // iOS Mosh + Termius/Blink use the terminal app's native scrollback
-        // for touch-scroll (Mosh doesn't reliably forward mouse-tracking
-        // escapes to mobile clients).
-        if !crate::tui::mouse_capture_requested() {
-            return Ok(());
-        }
-        let desired = !self.home.wants_text_selection();
+        // Mouse capture is on by default; the Mouse Capture setting (or the
+        // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
+        // use the terminal app's native scrollback for touch-scroll (Mosh
+        // doesn't reliably forward mouse-tracking escapes to mobile clients).
+        // Folding `mouse_capture_allowed` into `desired` (rather than an early
+        // return) means flipping the setting off mid-session disables tracking
+        // on the next sync instead of leaving it stuck on. `mosh_active` is
+        // folded in too so a mid-session enable never emits the escape under
+        // Mosh, matching the startup gate in `tui::run`.
+        let desired =
+            self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
         if desired == self.mouse_captured {
             return Ok(());
         }
@@ -289,7 +360,7 @@ impl App {
         )?;
         let draw_result = (|| -> Result<()> {
             crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
-            terminal.draw(|f| self.render(f)).map(|_| ())?;
+            terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
         let end_result = crossterm::execute!(
@@ -318,7 +389,7 @@ impl App {
             crossterm::terminal::LeaveAlternateScreen,
             DisableBracketedPaste,
         )?;
-        if crate::tui::mouse_capture_requested() {
+        if self.mouse_captured {
             crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
         }
         crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Show)?;
@@ -345,8 +416,8 @@ impl App {
         )?;
         // Defer mouse-capture restore to sync_mouse_capture so we don't
         // briefly enable it only to disable again when the user returned
-        // to the serve view. sync_mouse_capture itself respects the
-        // AOE_MOUSE_CAPTURE opt-out.
+        // to the serve view. sync_mouse_capture itself respects the Mouse
+        // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
@@ -403,9 +474,10 @@ impl App {
         // wrap estimation under-counts when Paragraph word-wraps mid-line.
         let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
         // Warnings preempt onboarding dialogs so the user sees the problem
-        // before the welcome screen.
-        self.home.welcome_dialog = None;
+        // before the intro walkthrough.
+        self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
+        self.home.telemetry_consent_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
         self.home.info_dialog =
             Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
@@ -437,6 +509,11 @@ impl App {
     ) -> Result<()> {
         // Initial render
         terminal.clear()?;
+        // Sync mouse capture before the first paint so any onboarding
+        // surface that wants native drag-to-select (intro Welcome page,
+        // changelog, info dialog) gets capture turned off on frame 1.
+        // Otherwise the user would have to press a key first.
+        self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
 
         // Refresh tmux session cache
@@ -474,12 +551,40 @@ impl App {
             (hup.ok(), term.ok())
         };
 
-        let mut refresh_interval = tokio::time::interval(Duration::from_millis(50));
+        // 33ms ticker (~30fps) is the steady-state refresh in live-send.
+        // 16ms (60fps) was tried but produced visible tearing on
+        // terminals that don't support synchronized-update escapes
+        // (notably macOS Terminal.app); back-to-back ticker + post-key
+        // wakes within ~1ms also doubled-up frame writes. 33ms gives
+        // each frame's writes enough time to land before the next
+        // frame starts, while remaining responsive enough that
+        // animation looks fluid. The post-key wake below covers the
+        // typing-echo case where 33ms would feel laggy.
+        let mut refresh_interval = tokio::time::interval(Duration::from_millis(33));
         refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // After any keystroke routed to live-send, schedule one extra
+        // refresh ~15ms later (roughly the `tmux send-keys` fork plus
+        // agent-echo time) so the resulting capture catches the echo
+        // deterministically instead of waiting up to one full ticker
+        // interval. Cleared when the wake fires; re-armed by each
+        // subsequent key.
+        let mut last_live_key_at: Option<std::time::Instant> = None;
+        const POST_KEY_WAKE_DELAY: Duration = Duration::from_millis(15);
+        // Track when the last refresh fired so the ticker arm can
+        // back off if a post-key wake just ran. Without this, a key
+        // pressed ~10ms before a ticker tick produces two refreshes
+        // back-to-back (post-key wake at +15ms, ticker at +16ms),
+        // which on a non-sync-update terminal looks like tearing:
+        // the first frame's per-cell writes are still landing when
+        // the second frame starts overwriting them.
+        let mut last_refresh_at: Option<std::time::Instant> = None;
+        const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
+        let mut last_presence_refresh = std::time::Instant::now();
+        let mut last_session_idle_reap = std::time::Instant::now();
         // Throttle for how often the periodic block re-reads settings;
         // without this, the inner guards would re-fire on every loop
         // iteration once any time has passed, hitting the config file at
@@ -490,10 +595,37 @@ impl App {
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+        // How often to recount live TUIs for the footer indicator. Cheap dir
+        // listing (a handful of entries), so a tight-ish cadence keeps the
+        // "another instance appeared/left" signal responsive without disk I/O
+        // on the hot render path.
+        const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+        // How often the standalone TUI evaluates plain tmux sessions for idle
+        // auto-stop (`session.auto_stop_idle_secs`, #1690). Matches the serve
+        // daemon's cadence; both reapers claim under the storage lock so they
+        // never double-stop a session when run side by side.
+        const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+        // A presence file counts as live while its mtime is within this window.
+        // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
+        // brief stall) don't drop an instance; matches the push consumer.
+        const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
         // Signal that the TUI is active so the web push consumer can
-        // suppress notifications while the user is watching the dashboard.
+        // suppress notifications while the user is watching the dashboard, and
+        // so other TUIs can count this instance.
         crate::session::write_tui_heartbeat();
+        self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+
+        // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
+        // send an initial snapshot, then refresh it periodically and once more
+        // on graceful exit. All sends are detached and swallow errors. The
+        // periodic interval carries bounded jitter (4h + up to 30m) so installs
+        // that boot together don't snapshot in lockstep; the boot snapshot above
+        // stays immediate.
+        let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
+        crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
+        self.emit_telemetry_snapshot();
+        let mut last_telemetry_snapshot = std::time::Instant::now();
 
         loop {
             // Force full redraw if needed (e.g., after returning from tmux).
@@ -504,6 +636,18 @@ impl App {
                 self.needs_redraw = false;
             }
 
+            // Compute the post-key wake deadline once per iteration so
+            // the select! arm doesn't have to dance with the Option.
+            // `None` here becomes `pending` inside the arm.
+            let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
+            let mut woke_via_post_key = false;
+            // The capture worker notifies this when it has fresh, changed
+            // pane content; the arm below wakes the loop so the new preview
+            // paints without busy-polling. Cloned per iteration so the
+            // select! arm doesn't borrow `self`.
+            let preview_wake = self.home.preview_wake.clone();
+            let mut woke_via_preview = false;
+
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
             // defect 1), and that EOF from a dead tty is detected (defect 2).
@@ -511,6 +655,17 @@ impl App {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
                     match event {
                         Some(Ok(Event::Key(key))) => {
+                            // Only act on key-down / auto-repeat. Terminals that
+                            // report release events (Windows console always does;
+                            // kitty-protocol terminals do when enhancement flags are
+                            // on) would otherwise deliver a Release for every press
+                            // and double-fire every handler, so a toggle like `i`
+                            // (hide the info header) nets to zero and "won't hide".
+                            // The acp and remote-home loops already filter this;
+                            // the home loop has to as well.
+                            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                continue;
+                            }
                             // Paste-burst detector for VoiceInk + Mosh ergonomics.
                             // Mosh strips bracketed-paste markers, so pasted
                             // dictation arrives as a stream of individual KeyEvents
@@ -543,6 +698,15 @@ impl App {
                                         self.event_stream.as_mut().expect("event_stream missing").next(),
                                     ).await;
                                     match next {
+                                        // Ignore key-release / non-press events mid-burst, same
+                                        // gate as the arm entry. On terminals that report releases
+                                        // they would otherwise be taken as burst chars (doubling the
+                                        // pasted text) or stashed as the deferred key.
+                                        Ok(Some(Ok(Event::Key(k))))
+                                            if !matches!(
+                                                k.kind,
+                                                KeyEventKind::Press | KeyEventKind::Repeat
+                                            ) => {}
                                         Ok(Some(Ok(Event::Key(k)))) if Self::is_burst_candidate(&k) => {
                                             if let Some(c) = Self::burst_char_for(&k) {
                                                 burst_str.push(c);
@@ -557,11 +721,25 @@ impl App {
                                     }
                                 }
                                 if burst_keys.len() >= PASTE_BURST_MIN_LEN {
-                                    tracing::debug!(target: "tui.input",
-                                        "paste-burst: routed {} chars via handle_paste (chars={:?})",
-                                        burst_str.len(), burst_str
-                                    );
-                                    self.home.handle_paste(&burst_str);
+                                    // Peel a trailing Enter so the dialog's
+                                    // plain-Enter Submit branch still fires.
+                                    // Embedded mid-burst Enters stay as '\n'
+                                    // in the paste text (the original reason
+                                    // Enter is a burst candidate).
+                                    let (paste_text, trailing_enter) =
+                                        Self::split_trailing_enter(&burst_str, &burst_keys);
+                                    if !paste_text.is_empty() {
+                                        tracing::debug!(target: "tui.input",
+                                            "paste-burst: routed {} chars via handle_paste (chars={:?})",
+                                            paste_text.len(), paste_text
+                                        );
+                                        self.home.handle_paste(&paste_text);
+                                    }
+                                    if let Some(enter) = trailing_enter {
+                                        if !self.should_quit {
+                                            self.handle_key(enter, terminal).await?;
+                                        }
+                                    }
                                 } else {
                                     for k in burst_keys {
                                         self.handle_key(k, terminal).await?;
@@ -594,7 +772,25 @@ impl App {
                                                     // draining keystrokes). A user double-clicking
                                                     // during dictation can click again after the burst
                                                     // ends.
-                                                    MouseEventKind::Down(MouseButton::Left) if hit_list => { let _ = self.home.handle_click(mouse.column, mouse.row); }
+                                                    MouseEventKind::Down(MouseButton::Left) => {
+                                                        if self.home.handle_context_menu_click(mouse.column, mouse.row) {
+                                                            // Click consumed by the context menu
+                                                            // (item dispatched, kept open, or
+                                                            // dismissed on outside-click).
+                                                        } else if self.home.handle_dialog_click(mouse.column, mouse.row) {
+                                                            // A modal (e.g. the telemetry consent
+                                                            // popup) swallowed the click. Mirrors the
+                                                            // non-burst path so dialog buttons are
+                                                            // clickable even when a mouse event lands
+                                                            // right after a paste/dictation burst.
+                                                        } else if hit_list {
+                                                            let action = self.home.handle_click(mouse.column, mouse.row);
+                                                            if action.is_none() {
+                                                                let _ = self.home.handle_empty_list_click(mouse.column, mouse.row);
+                                                            }
+                                                        }
+                                                    }
+                                                    MouseEventKind::Down(MouseButton::Right) if hit_list => { self.home.handle_right_click(mouse.column, mouse.row); }
                                                     MouseEventKind::Moved => { self.home.handle_hover(mouse.column, mouse.row); }
                                                     _ => {}
                                                 }
@@ -621,11 +817,39 @@ impl App {
                             self.handle_key(key, terminal).await?;
                             self.sync_mouse_capture(terminal)?;
 
-                            // Skip the draw when returning from tmux attach.
-                            // needs_redraw triggers a clear + stale event drain
-                            // on the next iteration; drawing before that drain
-                            // wastes a frame and can flicker.
-                            if !self.needs_redraw {
+                            // Arm the post-key wake when the key was
+                            // routed into live-send. We don't have an
+                            // explicit signal from handle_key for that
+                            // (it returns ()), but `live_send.is_some()`
+                            // after the call is a good proxy: a key
+                            // that EXITS live-send won't arm a wake,
+                            // and keys outside live-send leave it None
+                            // anyway since we never set it.
+                            let live_after = self.home.live_send.is_some();
+                            if live_after {
+                                last_live_key_at = Some(std::time::Instant::now());
+                            }
+
+                            // Skip the immediate draw when:
+                            //   - We're returning from tmux attach
+                            //     (`needs_redraw` triggers a clear +
+                            //     stale event drain on the next
+                            //     iteration; drawing before the drain
+                            //     wastes a frame and can flicker), OR
+                            //   - We're inside live-send. The key was
+                            //     queued to the worker but has NOT been
+                            //     dispatched to tmux yet, so the home
+                            //     view's preview cache is still stale.
+                            //     Drawing now produces a frame
+                            //     identical to the previous one
+                            //     (ratatui's diff is empty) and then
+                            //     the post-key wake fires ~15ms later
+                            //     with fresh post-echo content.
+                            //     Skipping the immediate draw avoids a
+                            //     no-op paint that on non-sync-update
+                            //     terminals can still emit cursor-move
+                            //     bytes mid-frame.
+                            if !self.needs_redraw && !live_after {
                                 self.draw(terminal)?;
                             }
 
@@ -649,19 +873,42 @@ impl App {
                             // before dispatching the action.
                             //
                             // Priority order for `Down(Left)`:
-                            //   1. modal dialog click (e.g. delete Yes/No)
-                            //   2. divider drag-start (between list/preview)
-                            //   3. preview-pane click (open Send Message)
+                            //   1. context menu outside-click (close it)
+                            //   2. modal dialog click (e.g. delete Yes/No)
+                            //   3. drag-start (divider, or preview text
+                            //      selection)
                             //   4. list row click (existing select/activate)
-                            // Earlier branches short-circuit so a click on
-                            // the divider never opens a dialog, and a
-                            // click on the preview never selects a row.
+                            // A bare press on the preview seeds a 1x1
+                            // PreviewSelect; `handle_drag_end` collapses it
+                            // back to no selection on release if the cursor
+                            // never moved.
                             let click_action = if matches!(
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Left)
                             ) {
-                                if self.home.handle_dialog_click(mouse.column, mouse.row)
+                                if self
+                                    .home
+                                    .handle_context_menu_click(mouse.column, mouse.row)
                                 {
+                                    // Click consumed by the context menu:
+                                    // either dispatched an item (Rename /
+                                    // Delete), kept the menu open (border
+                                    // hit), or dismissed it (click outside).
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self.home.handle_dialog_click(mouse.column, mouse.row)
+                                {
+                                    // A modal swallowed the click — drop any
+                                    // leftover preview highlight so it doesn't
+                                    // linger behind / through the dialog.
+                                    let _ = self.home.clear_preview_selection();
+                                    // Intro dialog can queue a live theme
+                                    // preview or a final pick on click; apply
+                                    // it before redrawing so the next frame
+                                    // already reflects the choice.
+                                    if let Some(name) = self.home.take_pending_intro_theme() {
+                                        self.set_theme(&name);
+                                    }
                                     self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
@@ -669,20 +916,41 @@ impl App {
                                     .home
                                     .handle_drag_start(mouse.column, mouse.row)
                                 {
-                                    None
-                                } else if hit_preview {
-                                    if self.home.handle_preview_click() {
-                                        self.sync_mouse_capture(terminal)?;
-                                        self.draw(terminal)?;
+                                    // handle_drag_start already overwrote the
+                                    // selection if it started a PreviewSelect;
+                                    // a fresh ListDivider drag is unrelated to
+                                    // the highlight and should drop it.
+                                    if !self.home.is_preview_select_dragging() {
+                                        let _ = self.home.clear_preview_selection();
                                     }
                                     None
                                 } else if hit_list {
+                                    let _ = self.home.clear_preview_selection();
                                     let action = self
                                         .home
                                         .handle_click(mouse.column, mouse.row);
+                                    // A click inside the list area that
+                                    // didn't resolve to a row (empty space
+                                    // below the last session) opens the
+                                    // new-session dialog, mirroring `n`.
+                                    if action.is_none() {
+                                        let _ = self
+                                            .home
+                                            .handle_empty_list_click(mouse.column, mouse.row);
+                                    }
                                     self.draw(terminal)?;
                                     action
+                                } else if hit_diff {
+                                    // The diff view file-list panel
+                                    // accepts clicks to select files,
+                                    // matching j/k navigation. Other
+                                    // diff regions are no-op.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.home.handle_diff_click(mouse.column, mouse.row);
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
+                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -699,10 +967,24 @@ impl App {
                                 // is a no-op inside the handler; we don't
                                 // need a separate guard here.
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    self.home.handle_drag_move(mouse.column)
+                                    self.home.handle_drag_move(mouse.column, mouse.row)
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
+                                    // Finalize the drag here, but defer the
+                                    // clipboard write until after the next
+                                    // draw: the renderer captures cell text
+                                    // while the buffer is still populated
+                                    // (ratatui resets the back buffer on
+                                    // every frame, so reading post-draw
+                                    // sees empty cells).
                                     self.home.handle_drag_end()
+                                }
+                                // Right-click opens the sidebar context menu
+                                // (Rename / Delete) for the clicked row.
+                                // hit_list is the only place it makes sense
+                                // today; other surfaces fall through.
+                                MouseEventKind::Down(MouseButton::Right) if hit_list => {
+                                    self.home.handle_right_click(mouse.column, mouse.row)
                                 }
                                 // Moved events are dispatched unconditionally
                                 // (no `hit_list` guard) so the handler can
@@ -710,26 +992,54 @@ impl App {
                                 // cursor leaves the list, even when the new
                                 // position lands on the preview or border.
                                 MouseEventKind::Moved => {
-                                    self.home.handle_hover(mouse.column, mouse.row)
+                                    // Route hover to the diff view's
+                                    // file list when one is open AND
+                                    // the mouse is over it; that's an
+                                    // OR with the home view's own hover
+                                    // (which already covers list +
+                                    // overlay dialogs).
+                                    let mut changed =
+                                        self.home.handle_hover(mouse.column, mouse.row);
+                                    if hit_diff {
+                                        changed |= self
+                                            .home
+                                            .handle_diff_hover(mouse.column, mouse.row);
+                                    }
+                                    changed
                                 }
                                 _ => false,
                             };
                             if handled {
                                 self.draw(terminal)?;
                             }
+                            // After the draw that paints a freshly-finalized
+                            // preview selection, the renderer has captured
+                            // the cell text into `preview_copy_text`. Drain
+                            // it and write to the user's clipboard.
+                            if let Some(text) = self.home.take_preview_copy_text() {
+                                crate::tui::clipboard::copy_to_clipboard(&text);
+                            }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
-                                // Mirror the handle_key path: Action::OpenCockpit
-                                // only stashes the id in `pending_cockpit_open`
-                                // because the cockpit view needs async
+                                // Mirror the handle_key path: Action::OpenStructuredView
+                                // only stashes the id in `pending_structured_view_open`
+                                // because the acp view needs async
                                 // EventStream access that the sync
                                 // `execute_action` can't lend. Drain here so a
-                                // double-click on a cockpit session actually
+                                // double-click on an acp session actually
                                 // opens it.
                                 #[cfg(feature = "serve")]
-                                if let Some(session_id) = self.pending_cockpit_open.take() {
-                                    self.run_cockpit_view(&session_id, terminal).await?;
+                                if let Some(session_id) = self.pending_structured_view_open.take() {
+                                    self.run_structured_view(&session_id, terminal).await?;
                                 }
+                            }
+                            // Drain any Action stashed by a modal-dialog
+                            // click (e.g. clicking `[Yes]` on a stop or
+                            // quit confirm). The keyboard path returns
+                            // these through handle_key; the click path
+                            // can't, so it stashes them here.
+                            if let Some(action) = self.home.pending_dialog_click_action.take() {
+                                self.execute_action(action, terminal)?;
                             }
                             continue;
                         }
@@ -771,6 +1081,23 @@ impl App {
                     }
                 }
                 _ = refresh_interval.tick() => {}
+                _ = preview_wake.notified() => {
+                    // The capture worker produced fresh content. Repaint so
+                    // it shows; an idle pane never fires this, so the home
+                    // view stays as quiet as before when nothing changes.
+                    woke_via_preview = true;
+                }
+                _ = async {
+                    match post_key_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Targeted refresh ~15ms after a live-send key,
+                    // catching the agent's echo before the next ticker.
+                    woke_via_post_key = true;
+                    last_live_key_at = None;
+                }
                 _ = async {
                     #[cfg(unix)]
                     match sighup {
@@ -799,18 +1126,35 @@ impl App {
                 }
             }
 
-            // Check for update result (non-blocking)
+            // Periodic refreshes (only when no input pending).
+            //
+            // `needs_full_refresh` separately tracks whether anything
+            // other than the live-send ticker/post-key wake wants a
+            // refresh; on those flags the cool-down at the bottom of
+            // the loop is bypassed so deterministic signals (status
+            // updates, dialog ticks) get painted right away.
+            let mut refresh_needed = false;
+            let mut needs_full_refresh = false;
+
+            // Update-check / install-status polls can flip the
+            // bottom-of-screen update bar (banner or transient toast)
+            // on or off, which shifts the home view's layout. If a
+            // live-send wake fires on the same iteration, the
+            // preview-only fast path would paint a stale snapshot
+            // whose preview rect no longer lines up with the new
+            // layout. Treat any banner state change as full-refresh
+            // work so the slow path rebuilds the layout AND the
+            // snapshot.
             if self.poll_update_check() {
                 self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
-
-            // Check for in-progress update completion
             if self.poll_update_status() {
                 self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
-
-            // Periodic refreshes (only when no input pending)
-            let mut refresh_needed = false;
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
@@ -819,38 +1163,94 @@ impl App {
 
             if self.home.apply_status_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_deletion_results() {
                 refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_stop_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
+                last_session_idle_reap = std::time::Instant::now();
+                if self.reap_idle_sessions() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
             }
 
             if self.home.apply_session_id_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_recovery_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if let Some(session_id) = self.home.apply_creation_results() {
-                self.attach_session(&session_id, terminal)?;
+                self.dispatch_new_session_attach(&session_id, terminal)?;
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.tick_dialog() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
-            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
+            // Defer the 5s disk reload while the user is in live-send.
+            // The reload is on the UI thread and rebuilds the sidebar
+            // tree from disk, which causes a visible hitch in the
+            // preview. The user can't change session config from inside
+            // live mode anyway. Leaving `last_disk_refresh` un-advanced
+            // when we skip means the first tick outside live-send
+            // re-checks the interval and reloads immediately if it's
+            // been ≥5s since the last successful reload (so a change
+            // on disk during a long live-send session is picked up on
+            // exit instead of sitting stale for another 5s window).
+            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
+            {
                 self.home.reload()?;
+                // Pick up a Settings > Interaction > Mouse Capture toggle from
+                // disk and apply it now, so capture turns on/off within the
+                // reload window instead of waiting for a restart.
+                let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                let mouse_capture_allowed = crate::session::resolve_config(profile)
+                    .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                    .unwrap_or(self.mouse_capture_allowed);
+                if mouse_capture_allowed != self.mouse_capture_allowed {
+                    self.mouse_capture_allowed = mouse_capture_allowed;
+                    self.sync_mouse_capture(terminal)?;
+                }
                 last_disk_refresh = std::time::Instant::now();
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
                 last_heartbeat = std::time::Instant::now();
+            }
+
+            if last_telemetry_snapshot.elapsed() >= telemetry_snapshot_interval {
+                last_telemetry_snapshot = std::time::Instant::now();
+                self.emit_telemetry_snapshot();
+            }
+
+            if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
+                last_presence_refresh = std::time::Instant::now();
+                let count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+                if count != self.home.active_tui_count {
+                    self.home.active_tui_count = count;
+                    refresh_needed = true;
+                }
             }
 
             // Periodic update re-check (#1471). The startup spawn only fires
@@ -872,17 +1272,80 @@ impl App {
                 }
             }
 
-            // Animated spinners (rattles) need periodic redraws, but only at
-            // the spinner frame rate to avoid unnecessary widget tree rebuilds
+            // Animated spinners (rattles) need periodic redraws, but only
+            // at the spinner frame rate to avoid unnecessary widget tree
+            // rebuilds. Skip in live-send: the spinner lives in the
+            // sidebar (which the user isn't looking at) and forcing a
+            // full HomeView render every 120ms inside live mode wakes
+            // the loop eight times a second to repaint a region the
+            // user can't see, which only adds load on top of the
+            // already-busy preview refresh.
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
                 && self.home.has_animated_sessions()
+                && self.home.live_send.is_none()
             {
                 last_spinner_redraw = std::time::Instant::now();
                 refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // In live-send, the 33ms ticker is the steady-state
+            // refresh source; treat every tick as a refresh. The
+            // post-key wake (`woke_via_post_key`) is the same signal
+            // but on a deterministic ~15ms delay after each keystroke
+            // so typing-echo latency doesn't have to wait for ticker
+            // phase. Outside live-send, only the periodic checks
+            // above and the capture-worker wake (`woke_via_preview`,
+            // fired only when pane content actually changed) trigger a
+            // refresh.
+            if self.home.live_send.is_some() || woke_via_post_key || woke_via_preview {
+                refresh_needed = true;
+            }
+
+            // Cool-down guard against double-painting in live-send.
+            // The post-key wake and the ticker can fire within 1ms of
+            // each other (key pressed 14ms before a ticker tick: post-
+            // key wake fires at +15ms, ticker tick fires at +16ms),
+            // which doubles up frame writes and produces visible
+            // tearing on terminals without synchronized-update
+            // support. Skip ticker-driven refreshes inside the
+            // cool-down window unless this refresh was specifically
+            // requested by something else (status update, post-key
+            // wake, or the capture-worker wake). Preview wakes carry
+            // genuinely new pane content (the worker dedups and only
+            // fires on change), so they're a real frame to paint, not a
+            // redundant repaint, and must bypass the cool-down like the
+            // post-key wake does or live-send echo stalls to the ticker.
+            if refresh_needed
+                && self.home.live_send.is_some()
+                && !woke_via_post_key
+                && !woke_via_preview
+                && !needs_full_refresh
+                && last_refresh_at
+                    .map(|t| t.elapsed() < REFRESH_COOLDOWN)
+                    .unwrap_or(false)
+            {
+                refresh_needed = false;
             }
 
             if refresh_needed {
+                // Always do a full draw in live-send. The
+                // `draw_preview_only` snapshot-painting fast path was
+                // landed in #1495 to cheapen `%output` wakes, but
+                // (a) `%output` wakes no longer exist (control-mode
+                // is gone), and (b) on terminals that don't support
+                // synchronized-update escapes (Apple Terminal.app,
+                // Mosh-with-prediction), the snapshot-then-overlay
+                // pattern produced visible "drag" (the previous
+                // frame's preview cells stayed on screen for a beat
+                // while ratatui's diff caught up). Always-full-draw is
+                // ~2-3ms more CPU per frame (rebuilding the sidebar
+                // widget tree) but is uniformly clean across
+                // terminals. Outside live-send the same path runs
+                // when `refresh_needed`, so this is just collapsing
+                // the conditional branch.
                 self.draw(terminal)?;
+                last_refresh_at = Some(std::time::Instant::now());
             }
 
             if self.should_quit {
@@ -897,7 +1360,41 @@ impl App {
             tracing::error!(target: "tui.input", "Failed to save on quit: {}", e);
         }
 
+        // Best-effort final snapshot on graceful exit, bounded so a dead
+        // endpoint can't delay quit. Deduped against the boot/periodic snapshot
+        // so a launch-then-quit with unchanged sessions doesn't post the same
+        // counts twice within seconds.
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+        }
+
         Ok(())
+    }
+
+    /// Build a `usage_snapshot` from the current session list, or `None` when
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
+    /// `usage_seen` map is reported zeroed (a stable full key set), the
+    /// per-client form-factor maps stay empty (and so omitted), the create-trend
+    /// counter is left at 0, and the structured-interaction counts are empty (the
+    /// `aoe serve` daemon is the surface that tracks all of those).
+    fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+        crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Tui,
+            self.home.instances(),
+            crate::telemetry::usage_signals::zeroed(),
+            0,
+            // The TUI hosts no server, so it has no auth or exposure mode.
+            None,
+            None,
+            &crate::telemetry::StructuredInteractionCounts::default(),
+        )
+    }
+
+    /// Build and send a snapshot, detached. No-op when not opted in.
+    fn emit_telemetry_snapshot(&self) {
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::spawn_snapshot(snapshot);
+        }
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -906,6 +1403,10 @@ impl App {
             self.update_status = None;
         }
         let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Reset before the render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero capture/parse rather
+        // than leaking the previous frame's durations.
+        self.home.preview_timings = Default::default();
         self.home.render(
             frame,
             frame.area(),
@@ -913,19 +1414,30 @@ impl App {
             self.update_info.as_ref(),
             status_text,
         );
-        // Sampled / slow-frame only: full-frame trace would dominate the
-        // log at `default_level = trace`. Only emit when a frame breaks the
-        // 16ms budget (60fps), which is the diagnostic case worth tracing.
+        // Sampled trace for frame-budget diagnostics. A full-frame trace on
+        // every paint would dominate the log at `default_level = trace`, so
+        // we only emit for (a) frames that break the 16ms / 60fps budget and
+        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
+        // is the latency we're profiling and individual frames usually stay
+        // under 16ms. `capture_us` / `parse_us` break the frame down into the
+        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
+        // minus those two) is the widget build + ratatui diff.
         let elapsed = start.elapsed();
-        if elapsed.as_millis() > 16
+        let in_live = self.home.live_send.is_some();
+        if (elapsed.as_millis() > 16 || in_live)
             && tracing::enabled!(target: "tui.render", tracing::Level::TRACE)
         {
+            let timings = self.home.preview_timings;
             tracing::trace!(
                 target: "tui.render",
                 frame_ms = elapsed.as_millis() as u64,
+                frame_us = elapsed.as_micros() as u64,
+                capture_us = timings.capture.as_micros() as u64,
+                parse_us = timings.parse.as_micros() as u64,
+                live = in_live,
                 width = frame.area().width,
                 height = frame.area().height,
-                "slow frame",
+                "render frame sample",
             );
         }
     }
@@ -1261,6 +1773,38 @@ fn poll_update_receiver(
     }
 }
 
+/// What a `q` key press at the home screen should do. Factored out of the
+/// key handler so the quit policy is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitIntent {
+    /// Don't quit. Ctrl+Q lands here: it's reserved for exiting live-send
+    /// mode and must never close aoe from the home view (#1569).
+    Ignore,
+    /// A session is mid-creation; confirm before cancelling it.
+    ConfirmDuringCreation,
+    /// Confirm-before-quit is enabled; show the quit confirmation.
+    Confirm,
+    /// Quit immediately.
+    Quit,
+}
+
+fn quit_intent(
+    modifiers: KeyModifiers,
+    creation_pending: bool,
+    confirm_before_quit: bool,
+) -> QuitIntent {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return QuitIntent::Ignore;
+    }
+    if creation_pending {
+        return QuitIntent::ConfirmDuringCreation;
+    }
+    if confirm_before_quit {
+        return QuitIntent::Confirm;
+    }
+    QuitIntent::Quit
+}
+
 impl App {
     async fn handle_key(
         &mut self,
@@ -1281,12 +1825,23 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (KeyCode::Char('q'), _) if !self.home.has_dialog() => {
-                if self.home.is_creation_pending() {
-                    self.home.show_quit_during_creation_confirm();
-                    return Ok(());
+            (KeyCode::Char('q'), modifiers) if !self.home.has_dialog() => {
+                match quit_intent(
+                    modifiers,
+                    self.home.is_creation_pending(),
+                    self.home.confirm_before_quit(),
+                ) {
+                    QuitIntent::Ignore => {}
+                    QuitIntent::ConfirmDuringCreation => {
+                        self.home.show_quit_during_creation_confirm();
+                    }
+                    QuitIntent::Confirm => {
+                        self.home.show_quit_confirm();
+                    }
+                    QuitIntent::Quit => {
+                        self.should_quit = true;
+                    }
                 }
-                self.should_quit = true;
                 return Ok(());
             }
             // Ctrl+x dismisses the update bar / status toast. Gated on
@@ -1321,20 +1876,20 @@ impl App {
         }
 
         #[cfg(feature = "serve")]
-        if let Some(session_id) = self.pending_cockpit_open.take() {
-            self.run_cockpit_view(&session_id, terminal).await?;
+        if let Some(session_id) = self.pending_structured_view_open.take() {
+            self.run_structured_view(&session_id, terminal).await?;
         }
 
         Ok(())
     }
 
     #[cfg(feature = "serve")]
-    async fn run_cockpit_view(
+    async fn run_structured_view(
         &mut self,
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        // The cockpit view borrows the EventStream so it can drive its
+        // The acp view borrows the EventStream so it can drive its
         // own tokio::select! loop. Pull it out for the duration of the
         // call; restore on return.
         let mut stream = match self.event_stream.take() {
@@ -1342,16 +1897,87 @@ impl App {
             None => return Ok(()),
         };
         let result =
-            crate::tui::cockpit_view::run(terminal, &mut stream, &self.theme, session_id).await;
+            crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
         // Forcing a full redraw on return so the home screen redraws
-        // any cells the cockpit view painted over.
+        // any cells the acp view painted over.
         self.needs_redraw = true;
         terminal.clear()?;
         if let Err(e) = result {
-            self.update_status = Some(UpdateStatus::transient(format!("cockpit closed: {e}")));
+            self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
         Ok(())
+    }
+
+    /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
+    /// (#1690). Runs on a 60s gate from the main loop. Each candidate is
+    /// claimed under the per-profile storage lock (so a co-running `aoe serve`
+    /// cannot double-stop it), marked `Stopped` in memory, then handed to the
+    /// background `StopPoller`; the result is reconciled by `apply_stop_results`
+    /// like a manual stop. Returns true if any session was reaped.
+    fn reap_idle_sessions(&mut self) -> bool {
+        // Live attach state; on a tmux query failure skip this pass rather
+        // than risk reaping a session the user is attached to.
+        let Ok(attached) = crate::tmux::attached_session_names() else {
+            return false;
+        };
+        let now = chrono::Utc::now();
+        let candidates = crate::session::idle_reap::idle_reap_candidates(
+            self.home.instances(),
+            now,
+            &attached,
+            |profile| {
+                crate::session::profile_config::resolve_config_or_warn(profile)
+                    .session
+                    .auto_stop_idle_secs
+            },
+        );
+        let mut reaped = false;
+        for cand in candidates {
+            match crate::session::idle_reap::claim_idle_stop(
+                &cand.profile,
+                &cand.session_id,
+                now,
+                cand.threshold_secs,
+            ) {
+                Ok(Some(instance)) => {
+                    // Mirror Action::StopSession: the claim already persisted
+                    // `Stopped`; reassert it in memory and run the kill off the
+                    // UI thread so a sandbox `docker stop` cannot freeze the TUI.
+                    self.home
+                        .set_instance_status(&cand.session_id, crate::session::Status::Stopped);
+                    self.home
+                        .stop_poller
+                        .request_stop(crate::tui::stop_poller::StopRequest {
+                            session_id: cand.session_id.clone(),
+                            instance,
+                        });
+                    tracing::info!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        profile = %cand.profile,
+                        threshold_secs = cand.threshold_secs,
+                        "auto-stopped idle tmux session",
+                    );
+                    reaped = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        error = %e,
+                        "idle auto-stop claim failed",
+                    );
+                }
+            }
+        }
+        if reaped {
+            if let Err(e) = self.home.save() {
+                tracing::error!(target: "tui.idle_reap", "failed to save after idle reap: {e}");
+            }
+        }
+        reaped
     }
 
     fn execute_action(
@@ -1364,6 +1990,9 @@ impl App {
             Action::AttachSession(id) => {
                 self.attach_session(&id, terminal)?;
             }
+            Action::AttachAfterCreate(id) => {
+                self.dispatch_new_session_attach(&id, terminal)?;
+            }
             Action::AttachTerminal(id, mode) => {
                 self.attach_terminal(&id, mode, terminal)?;
             }
@@ -1372,28 +2001,21 @@ impl App {
             }
             Action::StopSession(id) => {
                 if let Some(inst) = self.home.get_instance(&id) {
-                    let inst_clone = inst.clone();
-                    // Set Stopped immediately so the status poller won't
-                    // override to Error while stop() blocks (docker stop
-                    // can take up to 10s).
+                    // Run the stop on a background thread: `inst.stop()` calls
+                    // `docker stop` for sandboxed sessions, which can block for
+                    // the container's grace period (~10s) and would otherwise
+                    // freeze the TUI (issue #1496). Set Stopped immediately so
+                    // the status poller won't override to Error while the stop
+                    // is in flight; the result is applied in the main loop via
+                    // `apply_stop_results`.
+                    let request = crate::tui::stop_poller::StopRequest {
+                        session_id: id.clone(),
+                        instance: inst.clone(),
+                    };
                     self.home
                         .set_instance_status(&id, crate::session::Status::Stopped);
-                    match inst_clone.stop() {
-                        Ok(()) => {
-                            crate::tmux::refresh_session_cache();
-                            self.home.reload()?;
-                            self.home
-                                .set_instance_status(&id, crate::session::Status::Stopped);
-                            self.home.save()?;
-                        }
-                        Err(e) => {
-                            tracing::error!(target: "tui.input", "Failed to stop session: {}", e);
-                            self.home.set_instance_error(&id, Some(e.to_string()));
-                            self.home
-                                .set_instance_status(&id, crate::session::Status::Error);
-                            self.home.save()?;
-                        }
-                    }
+                    self.home.save()?;
+                    self.home.stop_poller.request_stop(request);
                 }
             }
             Action::SetTheme(name) => {
@@ -1433,19 +2055,83 @@ impl App {
                     }
                 }
             }
+            Action::EnterLiveSend(id) => {
+                // Same revive flow as SendMessage so cold-start (Docker,
+                // agent splash) gives the user "Reviving..." feedback.
+                // After the pane is ready, install the live-send state on
+                // HomeView so the next key event routes through the live
+                // handler instead of the normal action dispatch.
+                self.home
+                    .set_instance_status(&id, crate::session::Status::Starting);
+                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
+                self.draw(terminal)?;
+                let outcome = self.home.prepare_live_send(&id);
+                // Settle the toast to its final state BEFORE the sync resize
+                // and redraw, so HomeView's cached `preview_pane_area`
+                // matches the geometry the user will see for the next
+                // several frames. Otherwise the toast row that was on screen
+                // during `prepare_live_send` would make the preview pane one
+                // row shorter than post-toast, the sync resize would target
+                // the smaller pane, and the first capture would render
+                // shifted up.
+                self.update_status = match &outcome {
+                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
+                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
+                    ))),
+                    // On clean ready, drop the toast entirely. On Err the
+                    // info_dialog already carries the failure detail, so the
+                    // transient toast just gets in the way.
+                    Ok(None) | Err(()) => None,
+                };
+                if outcome.is_ok() {
+                    self.draw(terminal)?;
+                    self.home.finalize_live_send_resize();
+                }
+            }
             Action::AttachToolSession(id, tool_name) => {
                 self.attach_tool_session(&id, &tool_name, terminal)?;
             }
             #[cfg(feature = "serve")]
-            Action::OpenCockpit(id) => {
-                // Stash for the async main loop. The cockpit view needs
+            Action::OpenStructuredView(id) => {
+                // Stash for the async main loop. The acp view needs
                 // `event_stream` access that this sync handler can't
-                // lend; the loop picks `pending_cockpit_open` up after
+                // lend; the loop picks `pending_structured_view_open` up after
                 // we return.
-                self.pending_cockpit_open = Some(id);
+                self.pending_structured_view_open = Some(id);
             }
         }
         Ok(())
+    }
+
+    /// Route a freshly-created session through the user's
+    /// `new_session_attach_mode` setting. Shared by both creation paths
+    /// (synchronous `Action::AttachAfterCreate` and the async branch in
+    /// the main loop's `apply_creation_results` handler) so the setting
+    /// applies regardless of which one fired.
+    ///
+    /// Acp sessions return `None` from the resolver and fall through
+    /// to `attach_session`, which already no-ops for acp. Same for
+    /// missing-instance race conditions: better to do the tmux-attach
+    /// fallback than silently swallow the new session.
+    fn dispatch_new_session_attach(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let mode = self.home.new_session_attach_mode(session_id);
+        tracing::debug!(target: "tui.input",
+            session_id = %session_id,
+            mode = ?mode,
+            "new session created; dispatching attach mode"
+        );
+        match mode {
+            Some(crate::session::NewSessionAttachMode::LiveSend) => {
+                self.execute_action(Action::EnterLiveSend(session_id.to_string()), terminal)
+            }
+            Some(crate::session::NewSessionAttachMode::Tmux) | None => {
+                self.attach_session(session_id, terminal)
+            }
+        }
     }
 
     fn attach_session(
@@ -1458,13 +2144,13 @@ impl App {
             None => return Ok(()),
         };
 
-        // Cockpit-mode sessions are not backed by tmux. The Enter
+        // Acp-mode sessions are not backed by tmux. The Enter
         // handler in `home::input` already short-circuits with a
         // transient toast pointing the user at the web dashboard;
         // this function still gets called from `apply_creation_results`
         // after `aoe add --launch`, so guard here too. Falling through
         // would attempt a tmux attach against a non-existent pane.
-        if instance.is_cockpit_mode() {
+        if instance.is_structured() {
             let _ = terminal;
             return Ok(());
         }
@@ -1580,6 +2266,14 @@ impl App {
             Some(inst) => inst.tmux_session()?,
             None => return Ok(()),
         };
+        // The non-live preview may have left the window pinned to manual
+        // sizing at the (smaller) preview dimensions. Restore `window-size
+        // latest` so the attaching client resizes it to the full terminal,
+        // and drop the preview-resize dedup so the next render re-asserts the
+        // preview geometry against the now-grown window instead of leaving the
+        // top clipped.
+        tmux_session.reset_size_to_latest_client();
+        self.home.clear_preview_pane_sync();
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 
@@ -1833,20 +2527,78 @@ pub enum Action {
     /// can render a "Reviving..." status before the potentially-slow
     /// ensure_pane_ready call.
     SendMessage(String, String),
+    /// Enter live-send mode on a session. Same revive-and-stage pattern
+    /// as `SendMessage`: the deferred action lets the app loop render the
+    /// "Reviving..." toast before `ensure_pane_ready` runs, then the home
+    /// view flips into the live-send capture state for subsequent keys.
+    EnterLiveSend(String),
+    /// Attach to a session that was just created via the synchronous
+    /// create path (no sandbox, no hooks, no worktree). Routes through
+    /// the same `new_session_attach_mode` dispatch as the async path's
+    /// `apply_creation_results` so the user's "live mode by default"
+    /// setting applies in both cases. `AttachSession` deliberately
+    /// bypasses the setting because pressing Enter on a session row is
+    /// the user's explicit ask for a tmux attach.
+    AttachAfterCreate(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),
-    /// Open the native cockpit view for `session_id`. The action handler
-    /// stashes the id in `pending_cockpit_open`; the main loop drains it
-    /// after `execute_action` returns and runs the async cockpit loop
+    /// Open the native acp view for `session_id`. The action handler
+    /// stashes the id in `pending_structured_view_open`; the main loop drains it
+    /// after `execute_action` returns and runs the async acp loop
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
-    OpenCockpit(String),
+    OpenStructuredView(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_q_never_quits() {
+        // The whole point of #1569: Ctrl+Q is a live-mode-exit habit and
+        // must not close aoe from the home view, regardless of the other
+        // flags.
+        for creation_pending in [false, true] {
+            for confirm in [false, true] {
+                assert_eq!(
+                    quit_intent(KeyModifiers::CONTROL, creation_pending, confirm),
+                    QuitIntent::Ignore,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_q_quits_when_confirm_disabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, false),
+            QuitIntent::Quit,
+        );
+    }
+
+    #[test]
+    fn plain_q_confirms_when_enabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, true),
+            QuitIntent::Confirm,
+        );
+    }
+
+    #[test]
+    fn creation_pending_confirms_before_anything_else() {
+        // Creation-in-progress takes precedence over the quit confirm so
+        // the user is warned the hook will be cancelled.
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, true),
+            QuitIntent::ConfirmDuringCreation,
+        );
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, false),
+            QuitIntent::ConfirmDuringCreation,
+        );
+    }
 
     #[test]
     fn test_action_enum() {
@@ -2130,5 +2882,97 @@ mod tests {
             Some('\n'),
             "Enter must map to \\n so embedded sentence-breaks land in the burst"
         );
+    }
+
+    #[test]
+    fn split_trailing_enter_peels_terminating_enter() {
+        // Regression: typing "hi<Enter>" with <5ms key gaps used to land
+        // as a single burst whose string `"hi\n"` was forwarded to
+        // handle_paste, so the textarea inserted `\n` as data and the
+        // dialog's Submit branch never fired. Peel the trailing Enter
+        // so handle_paste sees `"hi"` and we replay Enter for Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n", &burst_keys);
+        assert_eq!(paste, "hi");
+        assert!(enter.is_some());
+        assert_eq!(enter.unwrap().code, KeyCode::Enter);
+    }
+
+    #[test]
+    fn split_trailing_enter_preserves_embedded_newlines() {
+        // Voice/dictation pastes with sentence breaks land embedded
+        // Enters in the burst. Those are data, not intent-to-submit.
+        // Only the trailing Enter is peeled.
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("a\nb\n", &burst_keys);
+        assert_eq!(paste, "a\nb");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_keeps_mid_burst_enter_when_burst_ends_on_char() {
+        // Burst ends on a printable char, so there is no trailing Enter to peel.
+        // The embedded Enter stays in the paste text.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('t'), KeyModifiers::NONE),
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            key(KeyCode::Char('r'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\nthere", &burst_keys);
+        assert_eq!(paste, "hi\nthere");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_no_enter_at_all() {
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("abc", &burst_keys);
+        assert_eq!(paste, "abc");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_single_enter_yields_empty_paste() {
+        // Pathological: burst is just an Enter. paste_text is empty;
+        // caller skips handle_paste and only replays the Enter so
+        // Submit fires on whatever is in the textarea.
+        let burst_keys = vec![key(KeyCode::Enter, KeyModifiers::NONE)];
+        let (paste, enter) = App::split_trailing_enter("\n", &burst_keys);
+        assert_eq!(paste, "");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_consecutive_trailing_enters_only_peels_last() {
+        // Two trailing Enters: keep the first as data (the user's
+        // intentional blank-line break) and peel only the last for
+        // Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
+        assert_eq!(paste, "hi\n");
+        assert!(enter.is_some());
     }
 }

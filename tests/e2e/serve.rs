@@ -10,13 +10,12 @@
 //! ```
 #![cfg(feature = "serve")]
 
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{pick_free_port, require_tmux, wait_for_port, TuiTestHarness};
 
 /// Resolve the daemon's PID file inside the harness's isolated home.
 /// Mirrors `crate::session::get_app_dir`'s platform split.
@@ -24,32 +23,10 @@ fn daemon_pid_path(h: &TuiTestHarness) -> PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("serve.pid")
 }
 
-/// Bind a TCP listener to an ephemeral port, drop it, and return the port.
-/// Tiny TOCTOU window before the daemon binds, but acceptable for a serial
-/// test.
-fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().expect("local_addr").port()
-}
-
-/// Poll until the daemon accepts a TCP connection on `port`. The parent
-/// `aoe serve --daemon` returns as soon as it has spawned the child, so a
-/// successful exit doesn't prove the child bound the port; this is the
-/// real signal that the daemon is up.
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", port).parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+/// Resolve the daemon's persisted launch-state file inside the harness's
+/// isolated home.
+fn daemon_launch_path(h: &TuiTestHarness) -> PathBuf {
+    crate::harness::app_dir_in(h.home_path()).join("serve.launch")
 }
 
 /// True iff the kernel still has a process with this PID.
@@ -167,6 +144,90 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
     );
 }
 
+/// `aoe serve --restart` must stop the running daemon and spawn a fresh
+/// one from the persisted launch state: a new PID, the old one gone, the
+/// same port rebound, and `serve.launch` rewritten. Locks in #1794's
+/// restart primitive end to end.
+#[test]
+#[serial]
+fn cli_serve_restart_replays_launch_state() {
+    let h = TuiTestHarness::new("serve_restart_replays");
+    let port = pick_free_port();
+    let port_s = port.to_string();
+
+    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(
+        start.status.success(),
+        "initial --daemon failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let pid_path = daemon_pid_path(&h);
+    let launch_path = daemon_launch_path(&h);
+    let pid1: i32 = std::fs::read_to_string(&pid_path)
+        .expect("serve.pid after start")
+        .trim()
+        .parse()
+        .expect("serve.pid holds an integer");
+    assert!(
+        launch_path.exists(),
+        "serve.launch should be written on daemon start, missing at {}",
+        launch_path.display()
+    );
+
+    let restart = h.run_cli(&["serve", "--restart"]);
+    assert!(
+        restart.status.success(),
+        "aoe serve --restart failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&restart.stdout),
+        String::from_utf8_lossy(&restart.stderr),
+    );
+
+    // The replacement child rebinds the same persisted port.
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "restarted daemon never rebound port {port}"
+    );
+
+    // serve.pid now names a different, live process; the old one is gone.
+    let pid2: i32 = std::fs::read_to_string(&pid_path)
+        .expect("serve.pid after restart")
+        .trim()
+        .parse()
+        .expect("serve.pid holds an integer");
+    assert_ne!(pid1, pid2, "restart should spawn a new daemon PID");
+    assert!(
+        pid_alive(pid2),
+        "restarted daemon PID {pid2} should be alive"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_alive(pid1) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !pid_alive(pid1),
+        "old daemon PID {pid1} still alive after restart"
+    );
+    assert!(
+        launch_path.exists(),
+        "serve.launch should be rewritten by the restart"
+    );
+
+    let stop = h.run_cli(&["serve", "--stop"]);
+    assert!(
+        stop.status.success(),
+        "--stop after restart failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
 /// Regression guard for the sink consolidation (issue #1124): the daemon
 /// must write its tracing stream to the configured `debug.log`, and the
 /// retired `serve.log` must not reappear. Without this guard, a future
@@ -214,13 +275,17 @@ fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
 /// branch is locked in CI rather than relying on manual smoke tests.
 ///
 /// Flow:
-///   1. GET `/api/about` without a session  -> 401 `login_required`
-///      (proves the wall actually blocks API traffic).
+///   1. GET `/api/about` from a simulated non-loopback caller (loopback
+///      socket + `X-Forwarded-For: 10.0.0.5`, which `resolve_client_ip`
+///      trusts because the socket itself is loopback) -> 401
+///      `login_required`. Proves the wall still blocks remote API
+///      traffic after the #1525 loopback bypass landed.
 ///   2. POST `/api/login` with the correct passphrase + a fresh
 ///      device-binding secret -> 200 with `Set-Cookie: aoe_session=`.
 ///   3. GET `/api/about` carrying the session cookie + binding header
-///      -> 200, body has `"auth_mode":"passphrase"` (proves both the
-///      wall handoff and the `/api/about` mode-derivation surface).
+///      (no XFF so the caller is loopback) -> 200, body has
+///      `"auth_mode":"passphrase"`. Proves both the wall handoff and
+///      the `/api/about` mode-derivation surface.
 #[test]
 #[serial]
 fn cli_serve_auth_passphrase_login_round_trip() {
@@ -267,9 +332,14 @@ fn cli_serve_auth_passphrase_login_round_trip() {
             .build()
             .map_err(|e| format!("build client: {e}"))?;
 
-        // 1. Unauthenticated GET must come back with 401 + login_required body.
+        // 1. Unauthenticated GET from a simulated remote caller must
+        //    come back with 401 + login_required body. The daemon
+        //    binds loopback, so `resolve_client_ip` trusts XFF; we
+        //    pin a non-loopback last-hop IP so the #1525 loopback
+        //    bypass does not fire.
         let about_unauth = client
             .get(format!("{base}/api/about"))
+            .header("x-forwarded-for", "10.0.0.5")
             .send()
             .await
             .map_err(|e| format!("GET /api/about (unauth): {e}"))?;
@@ -349,6 +419,109 @@ fn cli_serve_auth_passphrase_login_round_trip() {
 
     // Always tear the daemon down before asserting, so a failed assert
     // doesn't leak a process that owns the test port.
+    let _ = h.run_cli(&["serve", "--stop"]);
+
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}
+
+/// Regression test for #1525. With `--auth=passphrase` the daemon used
+/// to route loopback callers through the passphrase wall, breaking the
+/// local TUI structured view attach: it had no session cookie + device binding
+/// to present so `/api/sessions/{id}/structured view/replay` and the structured view ws
+/// upgrade always 401'd. The fix mirrors the token-auth path's #1168
+/// carve-out and treats loopback as fs-trusted.
+///
+/// Flow:
+///   1. Start `aoe serve --daemon --auth=passphrase`.
+///   2. GET `/api/about` from 127.0.0.1 with no session cookie, no
+///      device binding, no XFF -> 200 with `"auth_mode":"passphrase"`.
+///      Without the bypass this would 401 `login_required`.
+///   3. GET `/api/sessions` from 127.0.0.1 -> 200 (proves the bypass
+///      covers the structured view REST surface, not just `/api/about`).
+#[test]
+#[serial]
+fn cli_serve_auth_passphrase_loopback_bypass() {
+    let h = TuiTestHarness::new("serve_auth_passphrase_loopback");
+    let port = pick_free_port();
+    let port_s = port.to_string();
+
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+    ]);
+    assert!(
+        start.status.success(),
+        "aoe serve --daemon --auth=passphrase failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {}",
+        port
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result: Result<(), String> = rt.block_on(async {
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+
+        // No cookie, no device binding, no XFF: the loopback bypass
+        // (#1525) lets the request through. Pre-fix this would have
+        // returned 401 login_required.
+        let about = client
+            .get(format!("{base}/api/about"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /api/about (loopback bypass): {e}"))?;
+        if !about.status().is_success() {
+            let s = about.status();
+            let b = about.text().await.unwrap_or_default();
+            return Err(format!(
+                "loopback /api/about should 200 under --auth=passphrase, got status={s} body={b}"
+            ));
+        }
+        let body: serde_json::Value = about
+            .json()
+            .await
+            .map_err(|e| format!("decode about body: {e}"))?;
+        if body.get("auth_mode").and_then(|v| v.as_str()) != Some("passphrase") {
+            return Err(format!(
+                "expected auth_mode=passphrase on loopback bypass, got {body}"
+            ));
+        }
+
+        // The structured view REST surface lives under the same wall, so the
+        // bypass must extend to it. A successful 200 on `/api/sessions`
+        // from loopback without a session is what unblocks the local
+        // TUI structured view attach in the issue report.
+        let sessions = client
+            .get(format!("{base}/api/sessions"))
+            .send()
+            .await
+            .map_err(|e| format!("GET /api/sessions (loopback bypass): {e}"))?;
+        if !sessions.status().is_success() {
+            let s = sessions.status();
+            let b = sessions.text().await.unwrap_or_default();
+            return Err(format!(
+                "loopback /api/sessions should 200 under --auth=passphrase, got status={s} body={b}"
+            ));
+        }
+
+        Ok(())
+    });
+
     let _ = h.run_cli(&["serve", "--stop"]);
 
     if let Err(e) = result {

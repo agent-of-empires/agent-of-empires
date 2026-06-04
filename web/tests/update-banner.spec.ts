@@ -46,7 +46,7 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/njbrake/agent-of-empires/releases/tag/v0.6.0",
+      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -59,7 +59,7 @@ test.describe("Update banner (#984, #1140)", () => {
     await expect(banner).toContainText("v0.6.0");
     await expect(banner.getByRole("link", { name: "Release notes" })).toHaveAttribute(
       "href",
-      "https://github.com/njbrake/agent-of-empires/releases/tag/v0.6.0",
+      "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
     );
   });
 
@@ -87,7 +87,7 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/njbrake/agent-of-empires/releases/tag/v0.6.0",
+      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -105,7 +105,7 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.6.0",
       latest_version: "0.6.0",
       update_available: false,
-      release_url: "https://github.com/njbrake/agent-of-empires/releases/tag/v0.6.0",
+      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -123,7 +123,7 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/njbrake/agent-of-empires/releases/tag/v0.6.0",
+      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -150,7 +150,7 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.5.0",
       latest_version: "0.7.0",
       update_available: true,
-      release_url: "https://github.com/njbrake/agent-of-empires/releases/tag/v0.7.0",
+      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.7.0",
       web_poll_interval_minutes: 60,
       error: null,
     });

@@ -17,6 +17,8 @@ export function CollapsibleSection({
   return (
     <div className="border border-surface-700/40 rounded-lg overflow-hidden">
       <button
+        type="button"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         className="flex items-center justify-between w-full px-4 py-3 bg-surface-850 hover:bg-surface-800 cursor-pointer transition-colors text-left"
       >

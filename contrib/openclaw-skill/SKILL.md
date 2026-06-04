@@ -7,7 +7,7 @@ metadata:
       bins:
         - aoe
         - tmux
-    homepage: https://github.com/njbrake/agent-of-empires
+    homepage: https://github.com/agent-of-empires/agent-of-empires
 ---
 
 # Agent of Empires (aoe) Skill
@@ -77,14 +77,18 @@ aoe list --all
   {
     "id": "a1b2c3d4-...",
     "title": "my feature",
-    "project_path": "/home/user/project",
-    "group_path": "backend",
+    "path": "/home/user/project",
+    "group": "backend",
     "tool": "claude",
-    "status": "running",
-    "profile": "default"
+    "command": "claude",
+    "profile": "default",
+    "created_at": "2025-01-01T00:00:00Z",
+    "workspace_repos": []
   }
 ]
 ```
+
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
 
 ### Session lifecycle
 
@@ -140,12 +144,12 @@ aoe status -q   # just the waiting count (for scripting)
 **JSON output shape** (`aoe status --json`):
 ```json
 {
-  "total": 5,
-  "running": 2,
   "waiting": 1,
+  "running": 2,
   "idle": 1,
   "stopped": 1,
-  "sessions": [...]
+  "error": 0,
+  "total": 5
 }
 ```
 

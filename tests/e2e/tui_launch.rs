@@ -28,7 +28,15 @@ fn test_tui_quit_with_q() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    // `q` opens the quit confirmation (on by default, #1569); it does not
+    // exit on its own anymore.
     h.send_keys("q");
+    h.wait_for("Quit Agent of Empires");
+    // Confirm to actually exit.
+    h.send_keys("y");
     h.wait_for_exit(Duration::from_secs(5));
-    assert!(!h.session_alive(), "session should have exited after 'q'");
+    assert!(
+        !h.session_alive(),
+        "session should have exited after confirming quit"
+    );
 }

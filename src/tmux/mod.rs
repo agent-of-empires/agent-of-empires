@@ -27,7 +27,7 @@ pub mod test_support {
     };
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -185,6 +185,52 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     result
 }
 
+/// Names of aoe tmux sessions that currently have at least one attached
+/// client, from a single `tmux list-sessions` call.
+///
+/// Used by the idle auto-stop reapers (#1690) to spare a session the user is
+/// reading. Returns `Err` when the underlying tmux call fails to spawn or
+/// exits non-zero: callers MUST treat `Err` as "don't know, skip this reap
+/// pass" rather than "nothing attached", so a transient tmux glitch cannot
+/// kill a pane the user is sitting in.
+pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut attached = HashSet::new();
+            for line in stdout.lines() {
+                if let Some((name, flag)) = line.split_once(FIELD_SEP) {
+                    // `#{session_attached}` is the attached client count; any
+                    // non-zero value means a client is attached.
+                    if name.starts_with(SESSION_PREFIX) && flag.trim() != "0" {
+                        attached.insert(name.to_string());
+                    }
+                }
+            }
+            Ok(attached)
+        }
+        Ok(out) => {
+            tracing::warn!(
+                target: "tmux.cache",
+                status = ?out.status,
+                "list-sessions (attached) returned non-zero",
+            );
+            Err(anyhow::anyhow!(
+                "tmux list-sessions returned non-zero status: {:?}",
+                out.status
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(target: "tmux.cache", error = %e, "list-sessions (attached) spawn failed");
+            Err(anyhow::anyhow!("tmux list-sessions spawn failed: {}", e))
+        }
+    }
+}
+
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
 /// Filters to aoe sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
@@ -228,6 +274,22 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     map
 }
 
+/// Test-only: inject a synthetic session name into the cache so
+/// callers of `session_exists_from_cache` see it as present. Used
+/// by live-send tests that install a fake `LiveSendState` without a
+/// real tmux pane; without this the per-keystroke drift check
+/// (which calls `session_exists_from_cache`) trips in CI runs that
+/// have already populated the cache via the e2e suite, causing the
+/// drift detector to flag the fake session as gone.
+#[cfg(test)]
+pub fn test_inject_session_into_cache(name: &str) {
+    if let Ok(mut cache) = SESSION_CACHE.write() {
+        let map = cache.data.get_or_insert_with(HashMap::new);
+        map.insert(name.to_string(), 0);
+        cache.time = Some(Instant::now());
+    }
+}
+
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
@@ -262,27 +324,37 @@ pub fn is_tmux_available() -> bool {
     Command::new("tmux").arg("-V").output().is_ok()
 }
 
+/// True when `binary` resolves on the user's PATH. An absolute or relative
+/// path is checked for existence; a bare name is looked up with `which`,
+/// falling back to a login shell so version-manager PATHs (NVM, etc.) are
+/// loaded. Shared by `is_agent_available` and the `aoe add` override
+/// availability check so both honor the same detection. See #1910.
+pub(crate) fn is_binary_on_path(binary: &str) -> bool {
+    if binary.contains('/') || binary.contains('\\') {
+        return std::path::Path::new(binary).exists();
+    }
+    // First try direct `which` (fast path).
+    let direct = Command::new("which")
+        .arg(binary)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if direct {
+        return true;
+    }
+    // Fall back to a login shell so version-manager PATHs (NVM, etc.) are loaded.
+    let shell = crate::session::user_shell();
+    Command::new(&shell)
+        .args(["-lc", &format!("which {}", shell_words::quote(binary))])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
     use crate::agents::DetectionMethod;
     match &agent.detection {
-        DetectionMethod::Which(binary) => {
-            // First try direct `which` (fast path).
-            let direct = Command::new("which")
-                .arg(binary)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if direct {
-                return true;
-            }
-            // Fall back to a login shell so version-manager PATHs (NVM, etc.) are loaded.
-            let shell = crate::session::user_shell();
-            Command::new(&shell)
-                .args(["-lc", &format!("which {}", binary)])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
+        DetectionMethod::Which(binary) => is_binary_on_path(binary),
         DetectionMethod::RunWithArg(binary, arg) => {
             if Command::new(binary)
                 .arg(arg)

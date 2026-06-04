@@ -30,143 +30,95 @@ const SMALL_VIEWPORT_WIDTH: u16 = 40;
 /// Same idea for height: drop top/bottom margin below this.
 const SMALL_VIEWPORT_HEIGHT: u16 = 16;
 
-fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
-    if strict {
-        vec![
-            (
-                "Navigation",
-                vec![
-                    ("j/↓", "Move down"),
-                    ("k/↑", "Move up"),
-                    ("h/←", "Collapse group"),
-                    ("l/→", "Expand group"),
-                    ("Home/End/G", "Go to top / bottom"),
-                    ("PgUp/Dn", "Move 10 (also Shift+↑/↓, { })"),
-                ],
-            ),
-            (
-                "Actions (strict mode)",
-                vec![
-                    ("Enter", "Attach to session"),
-                    ("Ctrl+T", "Attach to terminal"),
-                    (";", "Open tool session"),
-                    ("N", "New session"),
-                    ("Ctrl+N", "New from selection"),
-                    ("X", "Stop session"),
-                    ("D", "Delete session/group"),
-                    ("R", "Rename session/group"),
-                    ("M", "Send message to agent"),
-                    ("E", "Restart session (also F5)"),
-                ],
-            ),
-            (
-                "Attention",
-                vec![
-                    ("w", "Jump to next waiting/idle"),
-                    ("F", "Toggle favorite"),
-                    ("H", "Snooze (toggle)"),
-                    ("Z", "Archive (toggle)"),
-                ],
-            ),
-            (
-                "Views",
-                vec![
-                    ("T", "Toggle Agent/Terminal view"),
-                    ("C", "Toggle container/host (sandbox)"),
-                    ("Ctrl+D", "Diff view (git changes)"),
-                    ("< >", "Resize list panel"),
-                    ("I", "Toggle preview info header"),
-                    ("O", "Cycle sort forward"),
-                    ("Ctrl+O", "Cycle sort backward"),
-                    ("Ctrl+G", "Toggle group by project"),
-                ],
-            ),
-            (
-                "Other",
-                vec![
-                    ("/", "Search"),
-                    ("n/N", "Next/prev match"),
-                    ("S", "Settings"),
-                    ("P", "Profiles"),
-                    ("Ctrl+R", "Serve (LAN / Tunnel)"),
-                    ("u", "Update aoe (when available)"),
-                    ("Ctrl+x", "Dismiss update bar (this session)"),
-                    ("Shift+drag", "Select text in preview"),
-                    ("Ctrl+K", "Command palette"),
-                    ("?", "Toggle help"),
-                    ("Q", "Quit"),
-                ],
-            ),
-        ]
+fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(String, String)>)> {
+    use crate::tui::home::bindings::{self, HelpSection as Sec};
+
+    let (enter_desc, tab_desc) = if live_on_enter {
+        ("Live mode (send keys to agent)", "Attach to tmux session")
     } else {
-        vec![
-            (
-                "Navigation",
-                vec![
-                    ("j/↓", "Move down"),
-                    ("k/↑", "Move up"),
-                    ("←", "Collapse group"),
-                    ("l/→", "Expand group"),
-                    ("Home/End/G", "Go to top / bottom"),
-                    ("PgUp/Dn", "Move 10 (also Shift+↑/↓, { })"),
-                ],
-            ),
-            (
-                "Actions",
-                vec![
-                    ("Enter", "Attach to session"),
-                    ("T", "Attach to terminal"),
-                    (";", "Open tool session"),
-                    ("n", "New session"),
-                    ("N", "New from selection"),
-                    ("x", "Stop session"),
-                    ("d", "Delete session/group"),
-                    ("r", "Rename session/group"),
-                    ("m", "Send message to agent"),
-                    ("e", "Restart session (also F5)"),
-                ],
-            ),
-            (
-                "Attention",
-                vec![
-                    ("w", "Jump to next waiting/idle"),
-                    ("f", "Toggle favorite"),
-                    ("h", "Snooze (toggle)"),
-                    ("z", "Archive (toggle)"),
-                ],
-            ),
-            (
-                "Views",
-                vec![
-                    ("t", "Toggle Agent/Terminal view"),
-                    ("c", "Toggle container/host (sandbox)"),
-                    ("D", "Diff view (git changes)"),
-                    ("< >", "Resize list panel"),
-                    ("i", "Toggle preview info header"),
-                    ("o", "Cycle sort forward"),
-                    ("Ctrl+o", "Cycle sort backward"),
-                    ("g", "Toggle group by project"),
-                ],
-            ),
-            (
-                "Other",
-                vec![
-                    ("/", "Search"),
-                    ("n/N", "Next/prev match"),
-                    ("s", "Settings"),
-                    ("P", "Profiles"),
-                    ("p", "Projects"),
-                    ("R", "Serve (LAN / Tunnel)"),
-                    ("u", "Update aoe (when available)"),
-                    ("Ctrl+x", "Dismiss update bar (this session)"),
-                    ("Shift+drag", "Select text in preview"),
-                    ("Ctrl+K", "Command palette"),
-                    ("?", "Toggle help"),
-                    ("q", "Quit"),
-                ],
-            ),
-        ]
+        ("Attach to tmux session", "Live mode (send keys to agent)")
+    };
+
+    // Action rows are generated from the shared keybinding registry, bucketed
+    // by section in table order, so the help labels can never drift from the
+    // actual bindings. `label` formats each chord for the active mode; an
+    // action with no binding in this mode (only NextWaiting, in strict) falls
+    // back to its non-strict label so it stays discoverable.
+    let mut actions: Vec<(String, String)> = Vec::new();
+    let mut attention: Vec<(String, String)> = Vec::new();
+    let mut views: Vec<(String, String)> = Vec::new();
+    let mut other: Vec<(String, String)> = Vec::new();
+    for b in bindings::BINDINGS {
+        let Some(help) = &b.help else { continue };
+        let mut label = bindings::label(b.id, strict);
+        if label.is_empty() {
+            label = bindings::label(b.id, false);
+        }
+        if label.is_empty() {
+            continue;
+        }
+        let row = (label, help.desc.to_string());
+        match help.section {
+            Sec::Actions => actions.push(row),
+            Sec::Attention => attention.push(row),
+            Sec::Views => views.push(row),
+            Sec::Other => other.push(row),
+        }
     }
+
+    // Enter / Tab are structural keys (not relocatable registry actions); they
+    // lead the Actions section and swap descriptions with the attach mode.
+    let mut actions_rows = vec![
+        ("Enter".to_string(), enter_desc.to_string()),
+        ("Tab".to_string(), tab_desc.to_string()),
+    ];
+    actions_rows.append(&mut actions);
+
+    // Non-action rows with no single registry binding.
+    views.push(("< >".to_string(), "Resize list panel".to_string()));
+    other.push(("n/N".to_string(), "Next/prev match".to_string()));
+    other.push((
+        "Ctrl+x".to_string(),
+        "Dismiss update bar (this session)".to_string(),
+    ));
+    other.push((
+        "Shift+drag".to_string(),
+        "Select text in preview".to_string(),
+    ));
+    other.push((
+        "Drag".to_string(),
+        "Select + copy preview (live mode)".to_string(),
+    ));
+    other.push(("Ctrl+K".to_string(), "Command palette".to_string()));
+
+    // Navigation is mode-invariant except the collapse row: in non-strict mode
+    // bare `h` is the contextual snooze key, so only `<-` is advertised for
+    // collapse; in strict mode `h` always collapses.
+    let nav_collapse = if strict { "h/\u{2190}" } else { "\u{2190}" };
+    let navigation = vec![
+        ("j/\u{2193}".to_string(), "Move down".to_string()),
+        ("k/\u{2191}".to_string(), "Move up".to_string()),
+        (nav_collapse.to_string(), "Collapse group".to_string()),
+        ("l/\u{2192}".to_string(), "Expand group".to_string()),
+        ("Home/End/G".to_string(), "Go to top / bottom".to_string()),
+        (
+            "PgUp/Dn".to_string(),
+            "Move 10 (also Shift+\u{2191}/\u{2193}, { })".to_string(),
+        ),
+    ];
+
+    let actions_title = if strict {
+        "Actions (strict mode)"
+    } else {
+        "Actions"
+    };
+    vec![
+        ("Navigation", navigation),
+        (actions_title, actions_rows),
+        ("Attention (Attention sort only, except Archive)", attention),
+        ("Views", views),
+        ("Other", other),
+    ]
 }
 
 struct HelpSection {
@@ -174,15 +126,12 @@ struct HelpSection {
     rows: Vec<(String, String)>,
 }
 
-fn build_sections(strict: bool, sort_order: SortOrder) -> Vec<HelpSection> {
-    let raw = shortcuts(strict);
+fn build_sections(strict: bool, sort_order: SortOrder, live_on_enter: bool) -> Vec<HelpSection> {
+    let raw = shortcuts(strict, live_on_enter);
     let sort_label = format!("(current sort: {})", sort_order.label());
     raw.into_iter()
         .map(|(title, keys)| {
-            let mut rows: Vec<(String, String)> = keys
-                .into_iter()
-                .map(|(k, d)| (k.to_string(), d.to_string()))
-                .collect();
+            let mut rows: Vec<(String, String)> = keys;
             if title == "Views" {
                 rows.push((String::new(), sort_label.clone()));
             }
@@ -337,6 +286,7 @@ impl HelpOverlay {
         theme: &Theme,
         sort_order: SortOrder,
         strict_hotkeys: bool,
+        live_on_enter: bool,
         scroll: &mut u16,
     ) {
         if area.width == 0 || area.height == 0 {
@@ -345,7 +295,7 @@ impl HelpOverlay {
         let dialog_area = compute_dialog_area(area);
         frame.render_widget(Clear, dialog_area);
 
-        let sections = build_sections(strict_hotkeys, sort_order);
+        let sections = build_sections(strict_hotkeys, sort_order, live_on_enter);
 
         let version = format!(" Agent of Empires v{} ", env!("CARGO_PKG_VERSION"));
         let block = Block::default()
@@ -431,7 +381,7 @@ mod tests {
     #[test]
     fn help_contains_resize_shortcut() {
         for strict in [false, true] {
-            let all = shortcuts(strict);
+            let all = shortcuts(strict, false);
             let views_section = all.iter().find(|(name, _)| *name == "Views");
             assert!(views_section.is_some(), "Views section should exist");
             let (_, keys) = views_section.unwrap();
@@ -443,15 +393,45 @@ mod tests {
     }
 
     #[test]
+    fn help_shows_corrected_labels_for_relocated_actions() {
+        // The six strict-mode relocations must surface with their corrected
+        // chords in the `?` overlay, not the pre-fix labels. (bindings.rs
+        // `labels_match_mode` pins `label()`; this pins that the overlay
+        // actually renders those labels in both modes.)
+        // Format: (desc substring, non-strict key, strict key).
+        let cases = [
+            ("Diff view", "D", "Ctrl+D"),
+            ("Serve", "R", "Ctrl+R"),
+            ("Attach to terminal", "T", "Ctrl+T"),
+            ("New from selection", "N", "Ctrl+N"),
+            ("Projects", "p", "P"),
+            ("Profiles", "P", "Ctrl+P"),
+        ];
+        for (desc_sub, non_strict_key, strict_key) in cases {
+            for (strict, expected_key) in [(false, non_strict_key), (true, strict_key)] {
+                let all = shortcuts(strict, false);
+                let found = all.iter().any(|(_, keys)| {
+                    keys.iter()
+                        .any(|(k, desc)| k == expected_key && desc.contains(desc_sub))
+                });
+                assert!(
+                    found,
+                    "help overlay (strict={strict}) should list '{expected_key}' for '{desc_sub}'"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn help_lists_snooze() {
         // PR #1084 introduced the snooze primitive (H in strict mode, h in
         // non-strict) but did not advertise it in the help overlay. Lock the
         // listing in so a future binding rename keeps the docs honest.
         for (strict, expected_key) in [(false, "h"), (true, "H")] {
-            let all = shortcuts(strict);
+            let all = shortcuts(strict, false);
             let attention = all
                 .iter()
-                .find(|(name, _)| *name == "Attention")
+                .find(|(name, _)| name.starts_with("Attention"))
                 .expect("Attention section should exist");
             let (_, keys) = attention;
             assert!(
@@ -468,10 +448,10 @@ mod tests {
         // so users see them together instead of scattered across Navigation
         // and Actions.
         for strict in [false, true] {
-            let all = shortcuts(strict);
+            let all = shortcuts(strict, false);
             let attention = all
                 .iter()
-                .find(|(name, _)| *name == "Attention")
+                .find(|(name, _)| name.starts_with("Attention"))
                 .expect("Attention section should exist");
             let (_, keys) = attention;
             for needle in ["favorite", "Snooze", "Archive", "waiting"] {
@@ -500,7 +480,7 @@ mod tests {
         // Asserts both keymaps surface the Ctrl+K command palette entry in
         // their "Other" section so users can discover the palette from `?`.
         for strict in [false, true] {
-            let all = shortcuts(strict);
+            let all = shortcuts(strict, false);
             let other = all
                 .iter()
                 .find(|(name, _)| *name == "Other")
@@ -511,6 +491,55 @@ mod tests {
                     .any(|(k, desc)| *k == "Ctrl+K" && desc.contains("Command palette")),
                 "Other section should contain Ctrl+K Command palette (strict={strict})"
             );
+        }
+    }
+
+    #[test]
+    fn enter_and_tab_swap_descriptions_with_default_attach_mode() {
+        // Enter and Tab are complements: whichever Enter doesn't do,
+        // Tab does. The help overlay has to reflect the user's current
+        // `default_attach_mode` so the two rows aren't lying.
+        for strict in [false, true] {
+            for live_on_enter in [false, true] {
+                let all = shortcuts(strict, live_on_enter);
+                let actions_name = if strict {
+                    "Actions (strict mode)"
+                } else {
+                    "Actions"
+                };
+                let (_, keys) = all
+                    .iter()
+                    .find(|(n, _)| *n == actions_name)
+                    .expect("Actions section should exist");
+                let enter = keys
+                    .iter()
+                    .find(|(k, _)| *k == "Enter")
+                    .expect("Enter entry");
+                let tab = keys.iter().find(|(k, _)| *k == "Tab").expect("Tab entry");
+                if live_on_enter {
+                    assert!(
+                        enter.1.contains("Live mode"),
+                        "live_on_enter=true → Enter should say Live mode, got {:?}",
+                        enter.1
+                    );
+                    assert!(
+                        tab.1.contains("tmux"),
+                        "live_on_enter=true → Tab should say tmux, got {:?}",
+                        tab.1
+                    );
+                } else {
+                    assert!(
+                        enter.1.contains("tmux"),
+                        "live_on_enter=false → Enter should say tmux, got {:?}",
+                        enter.1
+                    );
+                    assert!(
+                        tab.1.contains("Live mode"),
+                        "live_on_enter=false → Tab should say Live mode, got {:?}",
+                        tab.1
+                    );
+                }
+            }
         }
     }
 
@@ -570,7 +599,7 @@ mod tests {
         // Sanity check: the chosen 4 → 3 split keeps max column height
         // below the naive [1, 3, 0] alternative that would happen if we
         // pushed all extras to one column.
-        let sections = build_sections(false, SortOrder::Newest);
+        let sections = build_sections(false, SortOrder::Newest, false);
         let heights: Vec<usize> = sections.iter().map(section_height).collect();
         let cols = distribute_sections(sections.len(), 3);
         let max_h = cols
@@ -598,7 +627,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                HelpOverlay::render(frame, area, &theme, SortOrder::Newest, false, scroll);
+                HelpOverlay::render(frame, area, &theme, SortOrder::Newest, false, false, scroll);
             })
             .unwrap();
         terminal.backend().buffer().clone()

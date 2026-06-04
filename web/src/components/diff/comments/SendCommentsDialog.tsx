@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
-import { buildCommentsMarkdown, buildFullPrompt } from "./buildPrompt";
+import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
+import { reportTelemetrySeen } from "../../../lib/api";
 
 interface Props {
   sessionId: string;
   comments: DiffComment[];
   isMultiRepo: boolean;
   /** Same gate as the banner Send button. Reflects
-   *  `cockpit_mode && cockpit_worker_state === "running"`. False
+   *  `structured_view && acp_worker_state === "running"`. False
    *  disables the Send button so prompts don't sink when the worker
    *  isn't ready. */
   sendEnabled: boolean;
@@ -63,16 +64,16 @@ export function SendCommentsDialog({
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
     setError(null);
-    const body = buildFullPrompt(comments, introDraft, outroDraft, {
+    const built = buildDiffCommentsPrompt(comments, introDraft, outroDraft, {
       isMultiRepo,
     });
     try {
       const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt`,
+        `/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt/diff-comments`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: body }),
+          body: JSON.stringify(built),
         },
       );
       if (!res.ok) {
@@ -82,6 +83,9 @@ export function SendCommentsDialog({
         }
         return;
       }
+      // Count each successful diff-comments send (a low-frequency action, so a
+      // count is more useful than a boolean). Only on a confirmed 2xx.
+      reportTelemetrySeen("diff_comments");
       onSent();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Network error";

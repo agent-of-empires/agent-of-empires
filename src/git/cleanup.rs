@@ -624,6 +624,7 @@ fn try_sandbox_dir_cleanup(
     let container = DockerContainer::from_session_id(&instance.id);
     let rm_result = container.remove(true);
     tracing::debug!(target: "git.worktree", ?rm_result, "container force-removed");
+    container.remove_named_ignore_volumes(&instance.id);
 
     match remove_worktree_dir(worktree_path, main_repo, true) {
         Ok(()) => true,

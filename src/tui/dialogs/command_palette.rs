@@ -1,10 +1,11 @@
 //! Command palette dialog: fuzzy-searchable list of named TUI actions.
 //!
 //! Mirrors the web UI's `CommandPalette` (web/src/components/command-palette/).
-//! Activated with Ctrl+K. Each entry maps to either a synthesized `KeyEvent`
-//! that the existing input dispatcher consumes (so the palette is additive,
-//! not a parallel command implementation), or a "jump to cursor" payload for
-//! the dynamic session/group entries.
+//! Activated with Ctrl+K. Built-in entries are generated from the shared
+//! keybinding registry and carry an [`ActionId`] that `HomeView::run_action`
+//! executes directly (so the palette is additive, not a parallel command
+//! implementation, and can't drift from the keyboard). Dynamic session/group
+//! entries use a "jump to cursor" payload instead.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
@@ -15,6 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::DialogResult;
 use crate::tui::components::set_prefixed_input_cursor_position;
+use crate::tui::home::bindings::{self, ActionId};
 use crate::tui::styles::Theme;
 
 /// Group buckets, rendered in this order. Mirrors `web/src/components/command-palette/groups.ts`.
@@ -51,10 +53,17 @@ impl PaletteGroup {
 
 /// What the dialog asks the input handler to do when the user picks an entry.
 pub enum PaletteAction {
-    /// Synthesize a key event and run it through the normal action dispatcher.
-    /// Bypasses strict-hotkey normalization, so palette entries should encode
-    /// the lowercase / non-strict form of the binding (e.g. `n` not `N`).
-    Key(KeyEvent),
+    /// Run a registry action directly via `HomeView::run_action`. This is the
+    /// canonical path: it never synthesizes a keypress, so it can't misfire in
+    /// strict mode (where a synthesized bare letter would hit the typing-guard
+    /// or a relocated arm).
+    Invoke(ActionId),
+    /// Activate the selected session (the `Enter` action; not a relocatable
+    /// keybinding, so it's not in the registry).
+    Activate,
+    /// Enter live-send mode on the selected session (the `Tab` action; likewise
+    /// not a relocatable keybinding).
+    LiveSend,
     /// Move the cursor to a position in `flat_items` (used for session/group jump items).
     JumpToCursor(usize),
     /// Open a tool session by name (lazygit, yazi, etc.)
@@ -68,226 +77,61 @@ pub struct PaletteCommand {
     pub group: PaletteGroup,
     pub keywords: Vec<&'static str>,
     /// Human-readable hotkey shown on the right (e.g. "n", "Ctrl+D"). Empty if no binding.
-    pub hotkey: &'static str,
+    pub hotkey: String,
     pub payload: PaletteAction,
 }
 
-/// Pick the right hotkey label for a binding given the strict-hotkeys setting.
-/// In strict mode, plain action letters require Shift; relocated bindings use
-/// Ctrl. The mapping mirrors `normalize_strict_key` in `home/input.rs` and the
-/// labels in `components/help.rs`.
-fn hotkey_label(non_strict: &'static str, strict: &'static str, strict_mode: bool) -> &'static str {
-    if strict_mode {
-        strict
-    } else {
-        non_strict
-    }
-}
-
-/// Built-in named commands. Excludes pure-navigation keys (j/k, arrows,
-/// PageUp/PageDown, h/l for collapse) since those don't belong in a palette.
-/// `strict_hotkeys` controls only the displayed hotkey label; the synthesized
-/// payload bypasses strict-mode normalization either way.
+/// Built-in named commands, generated from the shared keybinding registry so
+/// the palette's hotkey labels and dispatched actions can never drift from the
+/// keyboard dispatcher. Pure-navigation keys (j/k, arrows, h/l) are excluded.
+/// `Enter` (attach) and `Tab` (live-send) aren't relocatable keybindings, so
+/// they're appended explicitly rather than pulled from the registry.
 pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<PaletteCommand> {
-    let mut cmds = vec![
-        PaletteCommand {
-            id: "new-session",
-            title: "New session".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["create", "add", "spawn"],
-            hotkey: hotkey_label("n", "N", strict_hotkeys),
-            payload: PaletteAction::Key(key('n')),
-        },
-        PaletteCommand {
-            id: "new-from-selection",
-            title: "New session from selection".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["create", "duplicate", "clone"],
-            hotkey: hotkey_label("N", "Ctrl+N", strict_hotkeys),
-            payload: PaletteAction::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
-        },
-        PaletteCommand {
-            id: "attach",
-            title: "Attach to selected session".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["open", "enter"],
-            hotkey: "Enter",
-            payload: PaletteAction::Key(key_code(KeyCode::Enter)),
-        },
-        PaletteCommand {
-            id: "attach-terminal",
-            title: "Attach to paired terminal".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["shell", "host"],
-            hotkey: hotkey_label("T", "Ctrl+T", strict_hotkeys),
-            payload: PaletteAction::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
-        },
-        PaletteCommand {
-            id: "send-message",
-            title: "Send message to agent".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["prompt", "tell", "say"],
-            hotkey: hotkey_label("m", "M", strict_hotkeys),
-            payload: PaletteAction::Key(key('m')),
-        },
-        PaletteCommand {
-            id: "stop",
-            title: "Stop session".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["kill", "end", "halt"],
-            hotkey: hotkey_label("x", "X", strict_hotkeys),
-            payload: PaletteAction::Key(key('x')),
-        },
-        PaletteCommand {
-            id: "delete",
-            title: "Delete session or group".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["remove", "trash"],
-            hotkey: hotkey_label("d", "D", strict_hotkeys),
-            payload: PaletteAction::Key(key('d')),
-        },
-        PaletteCommand {
-            id: "rename",
-            title: "Rename or move to group".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["title", "label", "move", "regroup"],
-            hotkey: hotkey_label("r", "R", strict_hotkeys),
-            payload: PaletteAction::Key(key('r')),
-        },
-        PaletteCommand {
-            id: "favorite",
-            title: "Toggle favorite".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["star", "pin", "fav"],
-            hotkey: hotkey_label("f", "F", strict_hotkeys),
-            payload: PaletteAction::Key(key('f')),
-        },
-        PaletteCommand {
-            id: "archive",
-            title: "Toggle archive".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["park", "stash", "done", "zzz"],
-            hotkey: hotkey_label("z", "Z", strict_hotkeys),
-            payload: PaletteAction::Key(key('z')),
-        },
-        PaletteCommand {
-            id: "snooze",
-            title: "Toggle snooze".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["later", "defer", "wait"],
-            hotkey: hotkey_label("h", "H", strict_hotkeys),
-            payload: PaletteAction::Key(key('h')),
-        },
-        PaletteCommand {
-            id: "restart",
-            title: "Restart session".to_string(),
-            group: PaletteGroup::Actions,
-            keywords: vec!["reload", "respawn", "reset"],
-            hotkey: hotkey_label("e", "E", strict_hotkeys),
-            payload: PaletteAction::Key(key('e')),
-        },
-        PaletteCommand {
-            id: "diff",
-            title: "Open diff view".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["git", "changes"],
-            hotkey: hotkey_label("D", "Ctrl+D", strict_hotkeys),
-            payload: PaletteAction::Key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
-        },
-        PaletteCommand {
-            id: "toggle-view",
-            title: "Toggle Agent / Terminal view".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["switch", "shell"],
-            hotkey: hotkey_label("t", "T", strict_hotkeys),
-            payload: PaletteAction::Key(key('t')),
-        },
-        PaletteCommand {
-            id: "cycle-sort",
-            title: "Cycle sort order".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["order", "sort"],
-            hotkey: hotkey_label("o", "O", strict_hotkeys),
-            payload: PaletteAction::Key(key('o')),
-        },
-        PaletteCommand {
-            id: "cycle-group-by",
-            title: "Cycle group by".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["group", "project"],
-            hotkey: hotkey_label("g", "Ctrl+G", strict_hotkeys),
-            payload: PaletteAction::Key(key('g')),
-        },
-        PaletteCommand {
-            id: "next-waiting",
-            title: "Jump to next waiting / idle session".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["jump", "next", "waiting", "idle"],
-            hotkey: "w",
-            payload: PaletteAction::Key(key('w')),
-        },
-        PaletteCommand {
-            id: "toggle-preview-info",
-            title: "Toggle preview info header".to_string(),
-            group: PaletteGroup::Views,
-            keywords: vec!["hide", "show", "info", "header", "preview"],
-            hotkey: hotkey_label("i", "I", strict_hotkeys),
-            payload: PaletteAction::Key(key('i')),
-        },
-        PaletteCommand {
-            id: "settings",
-            title: "Open settings".to_string(),
-            group: PaletteGroup::Settings,
-            keywords: vec!["preferences", "config"],
-            hotkey: hotkey_label("s", "S", strict_hotkeys),
-            payload: PaletteAction::Key(key('s')),
-        },
-        PaletteCommand {
-            id: "profiles",
-            title: "Switch profile".to_string(),
-            group: PaletteGroup::Settings,
-            keywords: vec!["account", "switch"],
-            hotkey: "P",
-            payload: PaletteAction::Key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)),
-        },
-        PaletteCommand {
-            id: "projects",
-            title: "Manage projects".to_string(),
-            group: PaletteGroup::Settings,
-            keywords: vec!["registry", "repos", "multi-repo", "workspace"],
-            hotkey: "p",
-            payload: PaletteAction::Key(key('p')),
-        },
-        PaletteCommand {
-            id: "help",
-            title: "Show keyboard shortcuts".to_string(),
-            group: PaletteGroup::Settings,
-            keywords: vec!["keys", "shortcuts"],
-            hotkey: "?",
-            payload: PaletteAction::Key(key('?')),
-        },
-    ];
+    let mut cmds: Vec<PaletteCommand> = bindings::BINDINGS
+        .iter()
+        .filter_map(|b| {
+            let meta = b.palette.as_ref()?;
+            if meta.serve_only && !serve_enabled {
+                return None;
+            }
+            Some(PaletteCommand {
+                id: bindings::palette_id(b.id),
+                title: meta.title.to_string(),
+                group: meta.group,
+                keywords: meta.keywords.to_vec(),
+                hotkey: bindings::label(b.id, strict_hotkeys),
+                payload: PaletteAction::Invoke(b.id),
+            })
+        })
+        .collect();
 
-    if serve_enabled {
-        cmds.push(PaletteCommand {
-            id: "serve",
-            title: "Open serve (LAN / Tunnel)".to_string(),
-            group: PaletteGroup::Settings,
-            keywords: vec!["web", "remote", "phone", "tunnel"],
-            hotkey: hotkey_label("R", "Ctrl+R", strict_hotkeys),
-            payload: PaletteAction::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
-        });
-    }
+    cmds.push(PaletteCommand {
+        id: "attach",
+        title: "Attach to selected session".to_string(),
+        group: PaletteGroup::Actions,
+        keywords: vec!["open", "enter"],
+        hotkey: "Enter".to_string(),
+        payload: PaletteAction::Activate,
+    });
+    cmds.push(PaletteCommand {
+        id: "live-send",
+        title: "Live send: pass keys straight to the agent".to_string(),
+        group: PaletteGroup::Actions,
+        keywords: vec![
+            "live",
+            "passthrough",
+            "attach",
+            "keys",
+            "escape",
+            "arrow",
+            "tab",
+            "interrupt",
+        ],
+        hotkey: "Tab".to_string(),
+        payload: PaletteAction::LiveSend,
+    });
 
     cmds
-}
-
-fn key(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-}
-
-fn key_code(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 pub struct CommandPaletteDialog {
@@ -298,6 +142,14 @@ pub struct CommandPaletteDialog {
     matches: Vec<usize>,
     /// Cursor within `matches`.
     selected: usize,
+    /// Captured by `render`: the screen row of each visible (non-header)
+    /// item along with its `matches` index. Drives click + hover routing
+    /// without having to re-derive the scroll math.
+    visible_item_rows: Vec<(u16, usize)>,
+    /// Rect of the rendered dialog frame. Used by click routing to
+    /// distinguish "inside dialog but missed a row" (no-op) from
+    /// "outside dialog" (cancel).
+    dialog_area: Rect,
 }
 
 impl CommandPaletteDialog {
@@ -307,9 +159,54 @@ impl CommandPaletteDialog {
             entries,
             matches: Vec::new(),
             selected: 0,
+            visible_item_rows: Vec::new(),
+            dialog_area: Rect::default(),
         };
         dialog.recompute_matches();
         dialog
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<PaletteAction> {
+        if !self
+            .dialog_area
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            return DialogResult::Cancel;
+        }
+        // Hit-test the visible item rows.
+        let Some(display_idx) = self
+            .visible_item_rows
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, idx)| *idx)
+        else {
+            return DialogResult::Continue;
+        };
+        self.selected = display_idx;
+        let Some(&entry_idx) = self.matches.get(self.selected) else {
+            return DialogResult::Continue;
+        };
+        let cmd = self.entries.swap_remove(entry_idx);
+        DialogResult::Submit(cmd.payload)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if col == 0 && row == 0 {
+            return false;
+        }
+        let Some(display_idx) = self
+            .visible_item_rows
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, idx)| *idx)
+        else {
+            return false;
+        };
+        if self.selected == display_idx {
+            return false;
+        }
+        self.selected = display_idx;
+        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PaletteAction> {
@@ -391,10 +288,12 @@ impl CommandPaletteDialog {
         self.selected = 0;
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.visible_item_rows.clear();
         let dialog_width: u16 = area.width.saturating_sub(8).clamp(40, 70);
         let dialog_height: u16 = area.height.saturating_sub(6).clamp(10, 20);
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);
 
@@ -446,12 +345,16 @@ impl CommandPaletteDialog {
         let visible = list_area.height as usize;
 
         let mut lines: Vec<Line> = Vec::new();
+        // Parallel to `lines`: None for a group-header line, Some(idx)
+        // for an item line where idx is the `matches` index.
+        let mut line_to_display_idx: Vec<Option<usize>> = Vec::new();
         let mut selected_line: usize = 0;
         if self.matches.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No matches",
                 Style::default().fg(theme.dimmed),
             )));
+            line_to_display_idx.push(None);
         } else {
             let mut last_group: Option<PaletteGroup> = None;
             for (display_idx, &entry_idx) in self.matches.iter().enumerate() {
@@ -465,6 +368,7 @@ impl CommandPaletteDialog {
                         cmd.group.label(),
                         Style::default().fg(theme.accent).bold(),
                     )));
+                    line_to_display_idx.push(None);
                     last_group = Some(cmd.group);
                 }
 
@@ -500,13 +404,24 @@ impl CommandPaletteDialog {
                     Span::raw(padding),
                 ];
                 if !cmd.hotkey.is_empty() {
-                    spans.push(Span::styled(cmd.hotkey, Style::default().fg(theme.hint)));
+                    spans.push(Span::styled(
+                        cmd.hotkey.clone(),
+                        Style::default().fg(theme.hint),
+                    ));
                 }
                 lines.push(Line::from(spans));
+                line_to_display_idx.push(Some(display_idx));
             }
         }
         let start = selected_line.saturating_sub(visible.saturating_sub(1));
         let end = (start + visible).min(lines.len());
+        // Capture screen rows for visible item lines so a click can map
+        // directly back to the `matches` display index.
+        for (i, line_idx) in (start..end).enumerate() {
+            if let Some(idx) = line_to_display_idx.get(line_idx).copied().flatten() {
+                self.visible_item_rows.push((list_area.y + i as u16, idx));
+            }
+        }
         frame.render_widget(Paragraph::new(lines[start..end].to_vec()), list_area);
 
         // Hint footer
@@ -567,7 +482,7 @@ fn sort_indices_by_group(entries: &[PaletteCommand]) -> Vec<usize> {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     fn ke(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -602,6 +517,50 @@ mod tests {
     }
 
     #[test]
+    fn live_send_entry_is_bound_to_tab_with_dedicated_payload() {
+        // Regression guard: the live-send palette entry must keep its
+        // hotkey label and dedicated payload variant. A future rebinding
+        // (e.g., moving Tab elsewhere) or accidentally regressing the
+        // payload to `Key(Tab)` would break strict-mode users who reach
+        // live-send only through the palette.
+        let cmds = builtin_commands(false, false);
+        let entry = cmds
+            .iter()
+            .find(|c| c.id == "live-send")
+            .expect("builtin commands must include 'live-send'");
+        assert_eq!(entry.hotkey, "Tab");
+        assert!(
+            matches!(&entry.payload, PaletteAction::LiveSend),
+            "live-send entry must dispatch PaletteAction::LiveSend"
+        );
+    }
+
+    #[test]
+    fn picker_entries_invoke_their_actions() {
+        // The sort and group picker palette entries route through
+        // `Invoke(ActionId::…)` so `run_action` opens the picker directly.
+        // Previously these synthesized `Key('o')` / `Key('g')`, which the
+        // strict-mode typing-guard would have swallowed.
+        let cmds = builtin_commands(false, true);
+        let sort = cmds
+            .iter()
+            .find(|c| c.id == "pick-sort")
+            .expect("builtin commands must include 'pick-sort'");
+        assert!(
+            matches!(&sort.payload, PaletteAction::Invoke(ActionId::SortPicker)),
+            "sort-picker entry must Invoke(SortPicker)"
+        );
+        let group = cmds
+            .iter()
+            .find(|c| c.id == "pick-group-by")
+            .expect("builtin commands must include 'pick-group-by'");
+        assert!(
+            matches!(&group.payload, PaletteAction::Invoke(ActionId::GroupBy)),
+            "group-picker entry must Invoke(GroupBy)"
+        );
+    }
+
+    #[test]
     fn keywords_match_searches() {
         // "Move session to group" complaint from issue #889: searching for
         // "move" should surface the rename entry via its keyword.
@@ -623,10 +582,10 @@ mod tests {
         }
         let result = dialog.handle_key(ke(KeyCode::Enter));
         match result {
-            DialogResult::Submit(PaletteAction::Key(synth)) => {
-                assert_eq!(synth.code, KeyCode::Char('s'));
+            DialogResult::Submit(PaletteAction::Invoke(id)) => {
+                assert_eq!(id, ActionId::Settings);
             }
-            _ => panic!("expected Submit(Key)"),
+            _ => panic!("expected Submit(Invoke(Settings))"),
         }
     }
 
@@ -719,7 +678,7 @@ mod tests {
             title: "Jump to my-session".to_string(),
             group: PaletteGroup::Sessions,
             keywords: vec!["session"],
-            hotkey: "",
+            hotkey: String::new(),
             payload: PaletteAction::JumpToCursor(7),
         }];
         let mut dialog = CommandPaletteDialog::new(entries);
@@ -730,117 +689,80 @@ mod tests {
         }
     }
 
-    /// Char-class single-key bindings in `home/input.rs` that intentionally
-    /// don't get a palette entry. Pure navigation, dismissal, and meta keys.
-    /// Compared case-insensitively against the chars scanned out of input.rs,
-    /// so listing the lowercase form covers both `j`/`J`, `q`/`Q`, etc.
-    ///
-    /// If you add a new home-view hotkey that shouldn't appear in the palette
-    /// (vim-style nav, search-state-only, modal dismiss), add the lowercase
-    /// char here with a one-line note. Otherwise add a PaletteCommand to
-    /// `builtin_commands` above and the drift test will pass automatically.
-    const PALETTE_EXEMPT: &[(char, &str)] = &[
-        ('j', "vim-style move down"),
-        ('k', "vim-style move up"),
-        ('l', "vim-style move right / expand"),
-        ('q', "quit; Esc and the global quit path cover this"),
-        ('u', "update-banner dismiss; meta key, not an action"),
-        (';', "Tool view escape; only meaningful while in Tool view"),
-        ('/', "search activation; modal trigger, not an action"),
-        ('c', "host/container terminal mode toggle; only valid on a sandboxed session in Terminal view"),
-        ('{', "vim-style page-up (10 rows); pure navigation"),
-        ('}', "vim-style page-down (10 rows); pure navigation"),
-        ('<', "shrink list pane width; layout tweak, not an action"),
-        ('>', "grow list pane width; layout tweak, not an action"),
+    /// Registry actions that intentionally have no palette command. Anything
+    /// not listed here must carry palette metadata in the registry; the palette
+    /// is generated from that metadata, so this is the one place "added an
+    /// action, forgot the palette" can still slip through.
+    const PALETTE_EXEMPT: &[(ActionId, &str)] = &[
+        (
+            ActionId::Quit,
+            "intentionally excluded from the palette; q is quick-exit, doesn't need discovery",
+        ),
+        (
+            ActionId::ToolPicker,
+            "Tool-view toggle; tool sessions get dynamic palette entries instead",
+        ),
+        (
+            ActionId::SearchStart,
+            "search activation; modal trigger, not an action",
+        ),
+        (
+            ActionId::Update,
+            "update-banner action; meta key, surfaced via the banner",
+        ),
+        (
+            ActionId::ToggleContainer,
+            "only valid on a sandboxed session in Terminal view",
+        ),
+        (
+            ActionId::SearchNext,
+            "search-cycle; only meaningful while a search is active",
+        ),
+        (
+            ActionId::SearchPrev,
+            "search-cycle; only meaningful while a search is active",
+        ),
     ];
 
-    /// Scan `home/input.rs` for `KeyCode::Char('X')` patterns and return the
-    /// case-folded set of bound chars. Shared by the two drift tests below.
-    /// The test module at the bottom of input.rs constructs synthetic
-    /// KeyEvents in assertions, which would inflate the set with chars that
-    /// aren't real bindings, so we truncate at the first `#[cfg(test)]`.
-    fn home_input_bound_chars() -> HashSet<char> {
-        let src = include_str!("../home/input.rs");
-        let scan_region = match src.find("#[cfg(test)]") {
-            Some(idx) => &src[..idx],
-            None => src,
-        };
-
-        let pat = b"KeyCode::Char('";
-        let bytes = scan_region.as_bytes();
-        let mut bound = HashSet::new();
-        let mut i = 0;
-        while i + pat.len() + 2 <= bytes.len() {
-            if &bytes[i..i + pat.len()] == pat {
-                let c = bytes[i + pat.len()];
-                let close = bytes[i + pat.len() + 1];
-                if close == b'\'' && c.is_ascii_graphic() {
-                    bound.insert((c as char).to_ascii_lowercase());
-                }
-                i += pat.len();
-            } else {
-                i += 1;
-            }
-        }
-        bound
-    }
-
-    /// Guard against the palette drifting from the input dispatcher. Asserts
-    /// every char bound in `home/input.rs` is either covered by a palette
-    /// entry or in `PALETTE_EXEMPT`. Catches the "added a hotkey and forgot
-    /// the palette" failure mode at test time instead of at user-bug-report
-    /// time.
+    /// Drift guard. The palette is generated from `bindings::BINDINGS`, so a
+    /// binding either exposes palette metadata (and thus a command) or is on
+    /// the exempt list. Catches "added an action, forgot to decide whether it
+    /// belongs in the palette."
     #[test]
-    fn home_view_hotkeys_appear_in_palette_or_exempt() {
-        let bound = home_input_bound_chars();
-
-        // Build palette char set with serve toggled on so serve-only commands
-        // still count as covered.
-        let mut palette_chars: HashSet<char> = HashSet::new();
-        for cmd in builtin_commands(true, false) {
-            if let PaletteAction::Key(ke) = cmd.payload {
-                if let KeyCode::Char(c) = ke.code {
-                    palette_chars.insert(c.to_ascii_lowercase());
-                }
-            }
-        }
-
-        let exempt: HashMap<char, &str> = PALETTE_EXEMPT.iter().copied().collect();
-
-        let missing: Vec<char> = bound
+    fn registry_actions_have_palette_or_are_exempt() {
+        let exempt: HashSet<ActionId> = PALETTE_EXEMPT.iter().map(|(id, _)| *id).collect();
+        let missing: Vec<ActionId> = bindings::BINDINGS
             .iter()
-            .filter(|c| !palette_chars.contains(c) && !exempt.contains_key(c))
-            .copied()
+            .filter(|b| b.palette.is_none() && !exempt.contains(&b.id))
+            .map(|b| b.id)
             .collect();
-
         assert!(
             missing.is_empty(),
-            "Hotkeys bound in src/tui/home/input.rs but missing from the command palette \
-             (and not in PALETTE_EXEMPT):\n  {:?}\n\n\
-             Either add a PaletteCommand to builtin_commands() in command_palette.rs, \
-             or add the key to PALETTE_EXEMPT in this test with a note explaining \
-             why it shouldn't appear in the palette.",
+            "registry actions with no palette metadata and not in PALETTE_EXEMPT: {:?}\n\
+             Add a PaletteMeta to the binding in home/bindings.rs, or add the action to \
+             PALETTE_EXEMPT here with a note.",
             missing
         );
     }
 
-    /// Catch the reverse drift: a PALETTE_EXEMPT entry that's no longer bound
-    /// anywhere in input.rs. Without this, stale exemptions silently mask new
-    /// real bindings that happen to reuse the same key.
+    /// Reverse drift: an exempt action that no longer exists or that gained
+    /// palette metadata (so the exemption is now stale/contradictory).
     #[test]
-    fn palette_exempt_entries_are_still_bound() {
-        let bound = home_input_bound_chars();
-
-        let stale: Vec<char> = PALETTE_EXEMPT
+    fn palette_exempt_entries_are_still_exempt() {
+        let stale: Vec<ActionId> = PALETTE_EXEMPT
             .iter()
-            .map(|(c, _)| *c)
-            .filter(|c| !bound.contains(c))
+            .map(|(id, _)| *id)
+            .filter(|id| {
+                bindings::BINDINGS
+                    .iter()
+                    .find(|b| b.id == *id)
+                    .is_none_or(|b| b.palette.is_some())
+            })
             .collect();
-
         assert!(
             stale.is_empty(),
-            "PALETTE_EXEMPT lists keys no longer bound in src/tui/home/input.rs: {:?}. \
-             Remove them from PALETTE_EXEMPT.",
+            "PALETTE_EXEMPT lists actions that no longer exist or now have palette \
+             metadata: {:?}. Remove them from PALETTE_EXEMPT.",
             stale
         );
     }

@@ -55,6 +55,18 @@ impl CheckboxStyle {
             focused_underline: Some(UnderlineScope::Row),
         }
     }
+
+    /// Style used by the quit confirmation's "don't warn me again"
+    /// checkbox: a single always-toggleable opt-in that reads as a normal
+    /// control (accent when ticked), not a destructive one.
+    pub fn confirm(theme: &Theme) -> Self {
+        Self {
+            focused_color: theme.accent,
+            checked_color: theme.accent,
+            focused_glyph_bold: false,
+            focused_underline: None,
+        }
+    }
 }
 
 /// Build a single checkbox row.

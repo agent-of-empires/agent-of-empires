@@ -2,16 +2,16 @@
   "name": "agent-of-empires-website",
   "type": "module",
   "scripts": {
-    "copy-assets": "cp ../assets/logo.svg ../assets/logo.png ../assets/logo-youtube.png ../assets/social-preview.png public/assets/ && cp ../docs/assets/*.gif ../docs/assets/*.png public/assets/",
+    "copy-assets": "cp ../assets/logo.svg ../assets/logo.png ../assets/logo-youtube.png ../assets/social-preview.png public/assets/ && cp ../docs/assets/*.gif ../docs/assets/*.png public/assets/ && mkdir -p public/assets/structured-view public/assets/web && cp ../docs/assets/structured-view/*.png public/assets/structured-view/ && cp ../docs/assets/web/*.png public/assets/web/",
     "sync-docs": "node scripts/sync-docs.mjs",
     "dev": "npm run copy-assets && npm run sync-docs && astro dev",
     "build": "npm run copy-assets && npm run sync-docs && astro build",
     "preview": "astro preview"
   },
   "dependencies": {
-    "@astrojs/sitemap": "3.7.2",
-    "@tailwindcss/postcss": "^4.2.4",
-    "astro": "^6.1.3",
+    "@astrojs/sitemap": "3.7.3",
+    "@tailwindcss/postcss": "^4.3.0",
+    "astro": "^6.3.8",
     "tailwindcss": "^4.2.4"
   }
 }

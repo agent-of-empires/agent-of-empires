@@ -19,12 +19,20 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 use crate::update::{get_cached_releases, ReleaseInfo};
 
 pub struct ChangelogDialog {
     scroll_offset: usize,
     display_lines: Vec<DisplayLine>,
+    dialog_area: Rect,
+    /// Rect of the `[Got it]` button, captured during `render`. A click
+    /// anywhere dismisses, but the button is the call to action, so it
+    /// picks up the hover highlight to read as clickable.
+    got_it_button_area: Rect,
+    /// Whether the cursor is over `[Got it]`, for the hover highlight.
+    hover: HoverState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +97,33 @@ impl ChangelogDialog {
         Self {
             scroll_offset: 0,
             display_lines,
+            dialog_area: Rect::default(),
+            got_it_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    /// A click anywhere inside the changelog dialog dismisses it,
+    /// matching the keyboard's "any of Enter/Esc/q/Space submits"
+    /// model. Returns None for clicks outside so the caller can decide
+    /// whether to swallow them.
+    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<()>> {
+        if self
+            .dialog_area
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            Some(DialogResult::Submit(()))
+        } else {
+            None
+        }
+    }
+
+    /// Highlight the `[Got it]` button when the cursor is over it. A
+    /// click anywhere still dismisses via `handle_click`; this only
+    /// signals the call to action. Returns `true` when the highlight
+    /// changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        self.hover.update(col, row, &[self.got_it_button_area])
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -129,10 +163,11 @@ impl ChangelogDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 80 / 100).clamp(60, 100);
         let dialog_height = (area.height * 80 / 100).clamp(16, 40);
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);
 
@@ -178,14 +213,31 @@ impl ChangelogDialog {
             "  j/k scroll".to_string()
         };
 
+        const GOT_IT_WIDTH: u16 = 8; // "[Got it]"
+        let button_area = chunks[1];
+        // The button line is "[Got it]" + scroll_hint, centered as one
+        // unit; mirror that centering to capture just the "[Got it]"
+        // cells for the hover highlight.
+        let line_width = GOT_IT_WIDTH + scroll_hint.chars().count() as u16;
+        self.got_it_button_area = if button_area.width >= line_width {
+            let got_it_x = button_area.x + (button_area.width - line_width) / 2;
+            Rect::new(got_it_x, button_area.y, GOT_IT_WIDTH, 1)
+        } else {
+            Rect::default()
+        };
+
         let button = Line::from(vec![
             Span::styled("[Got it]", Style::default().fg(theme.accent).bold()),
             Span::styled(scroll_hint, Style::default().fg(theme.dimmed)),
         ]);
         frame.render_widget(
             Paragraph::new(button).alignment(Alignment::Center),
-            chunks[1],
+            button_area,
         );
+
+        if let Some(rect) = self.hover.current_in(&[self.got_it_button_area]) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -497,7 +549,24 @@ mod tests {
         ChangelogDialog {
             scroll_offset: 0,
             display_lines: lines,
+            dialog_area: Rect::default(),
+            got_it_button_area: Rect::default(),
+            hover: HoverState::default(),
         }
+    }
+
+    #[test]
+    fn hover_highlights_got_it_button() {
+        let mut dialog = dialog_with(vec![DisplayLine::NoReleases]);
+        dialog.got_it_button_area = Rect::new(10, 20, 8, 1);
+
+        // Over [Got it]: highlight it.
+        assert!(dialog.handle_hover(12, 20));
+        assert_eq!(dialog.hover.current(), Some(dialog.got_it_button_area));
+
+        // Off the button clears the highlight.
+        assert!(dialog.handle_hover(0, 0));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]
@@ -593,16 +662,16 @@ mod tests {
 
     #[test]
     fn strip_bold_scope_prefix_extracts_scope() {
-        let (scope, rest) = strip_bold_scope_prefix("**cockpit:** Restore something");
-        assert_eq!(scope.as_deref(), Some("cockpit"));
+        let (scope, rest) = strip_bold_scope_prefix("**acp:** Restore something");
+        assert_eq!(scope.as_deref(), Some("acp"));
         assert_eq!(rest, "Restore something");
     }
 
     #[test]
     fn strip_bold_scope_prefix_handles_multi_part_scope() {
         let (scope, rest) =
-            strip_bold_scope_prefix("**cockpit/ws:** Restore drop-cancels-reader semantics");
-        assert_eq!(scope.as_deref(), Some("cockpit/ws"));
+            strip_bold_scope_prefix("**acp/ws:** Restore drop-cancels-reader semantics");
+        assert_eq!(scope.as_deref(), Some("acp/ws"));
         assert_eq!(rest, "Restore drop-cancels-reader semantics");
     }
 

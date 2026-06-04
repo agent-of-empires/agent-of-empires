@@ -20,7 +20,7 @@ export function SoundSettings({ settings, onSaveField, onUpdate }: Props) {
     <div className="space-y-4">
       <p className="text-xs text-text-dim">
         Status-change alerts (start, waiting, idle, error) play on the
-        server host machine. Cockpit approval chimes play in your
+        server host machine. Structured view approval chimes play in your
         browser, where the dashboard is open.
       </p>
       <ToggleField
@@ -83,7 +83,7 @@ export function SoundSettings({ settings, onSaveField, onUpdate }: Props) {
           />
           <TextField
             label="On approval"
-            description="Cockpit only. Played in the browser when a session needs permission."
+            description="Structured view only. Played in the browser when a session needs permission."
             value={(sound.on_approval as string) ?? ""}
             onChange={(v) => save("on_approval", v || null)}
             placeholder="e.g. approval.wav"

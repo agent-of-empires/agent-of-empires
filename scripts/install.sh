@@ -1,15 +1,38 @@
 #!/bin/bash
 set -e
 
-REPO="njbrake/agent-of-empires"
+REPO="agent-of-empires/agent-of-empires"
 DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 BINARY_NAME="aoe"
+
+# Matches the manylinux_2_28 container the release workflow builds in
+# (.github/workflows/release.yml, env.LINUX_GLIBC_FLOOR). Bump together.
+MIN_GLIBC="2.28"
 
 info() { printf "\033[34m[info]\033[0m %s\n" "$1"; }
 success() { printf "\033[32m[ok]\033[0m %s\n" "$1"; }
 warn() { printf "\033[33m[warn]\033[0m %s\n" "$1"; }
 error() { printf "\033[31m[error]\033[0m %s\n" "$1" >&2; exit 1; }
+
+# Fail fast if the system's glibc is older than the released binary needs.
+# Without this, the download "succeeds" and the user only finds out at the
+# first `aoe` invocation that libc.so.6 doesn't have GLIBC_2.xx. Skips
+# silently when we can't tell (non-Linux, no ldd, unparseable version).
+check_glibc() {
+    [ "$(uname -s)" = "Linux" ] || return 0
+    command -v ldd >/dev/null 2>&1 || return 0
+    local sys_glibc
+    sys_glibc=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$sys_glibc" ] || return 0
+    if [ "$(printf '%s\n%s\n' "$MIN_GLIBC" "$sys_glibc" | sort -V | head -1)" != "$MIN_GLIBC" ]; then
+        error "Your system's glibc ($sys_glibc) is older than this binary requires ($MIN_GLIBC).
+Options:
+  - Use a newer distro (Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2/2023)
+  - Install via Homebrew: brew install aoe
+  - Build from source: https://www.agent-of-empires.com/docs/installation/#build-from-source"
+    fi
+}
 
 detect_platform() {
     local os arch
@@ -58,6 +81,8 @@ main() {
     info "Detecting platform..."
     platform=$(detect_platform)
     success "Platform: $platform"
+
+    check_glibc
 
     info "Fetching latest version..."
     version=$(get_latest_version)
@@ -131,7 +156,7 @@ main() {
     echo ""
     success "Run 'aoe' to get started!"
     echo ""
-    info "For shell completions, run: aoe completion --help"
+    info "For shell completions, see: https://www.agent-of-empires.com/guides/shell-completions/"
 }
 
 main "$@"

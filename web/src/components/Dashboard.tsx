@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { SessionResponse } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 
 interface Props {
   sessions: SessionResponse[];
@@ -153,6 +154,7 @@ export function Dashboard({
             onClick={onNewSession}
             icon="folder"
             featured
+            dataTour={TOUR_ANCHORS.dashboardNewSession}
           />
           <ActionPane
             title="Clone URL"
@@ -190,6 +192,7 @@ function ActionPane({
   href,
   icon,
   featured,
+  dataTour,
 }: {
   title: string;
   subtitle: string;
@@ -197,6 +200,7 @@ function ActionPane({
   href?: string;
   icon: "folder" | "git" | "book";
   featured?: boolean;
+  dataTour?: TourAnchorId;
 }) {
   const iconSvg = {
     folder: (
@@ -264,6 +268,7 @@ function ActionPane({
         href={href}
         target="_blank"
         rel="noopener noreferrer"
+        data-tour={dataTour}
         className={classes}
       >
         {iconSvg[icon]}
@@ -278,7 +283,7 @@ function ActionPane({
   }
 
   return (
-    <button onClick={onClick} className={`text-left ${classes}`}>
+    <button onClick={onClick} data-tour={dataTour} className={`text-left ${classes}`}>
       {iconSvg[icon]}
       <div>
         <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>

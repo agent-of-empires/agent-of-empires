@@ -1,10 +1,10 @@
 #!/bin/bash
 #
 # GitHub Release Download Metrics Report
-# Analyzes download statistics for njbrake/agent-of-empires releases
+# Analyzes download statistics for agent-of-empires/agent-of-empires releases
 #
 
-REPO="njbrake/agent-of-empires"
+REPO="agent-of-empires/agent-of-empires"
 API_URL="https://api.github.com/repos/${REPO}/releases"
 
 echo "Fetching release data from GitHub..."

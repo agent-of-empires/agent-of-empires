@@ -16,7 +16,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 """
 body = """
 {% if version %}\
-## [{{ version | trim_start_matches(pat="v") }}](https://github.com/njbrake/agent-of-empires/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/agent-of-empires/agent-of-empires/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
 ## [Unreleased]
 {% endif %}
@@ -26,8 +26,8 @@ body = """
 
 {% for commit in commits %}\
 - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
-{% if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}](https://github.com/njbrake/agent-of-empires/pull/{{ commit.remote.pr_number }}){% endif %}\
-{% if commit.remote.username %} by [@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/njbrake/agent-of-empires/commit/{{ commit.id }}))
+{% if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}](https://github.com/agent-of-empires/agent-of-empires/pull/{{ commit.remote.pr_number }}){% endif %}\
+{% if commit.remote.username %} by [@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/agent-of-empires/agent-of-empires/commit/{{ commit.id }}))
 {% endfor %}
 {% endfor %}
 {%- if github.contributors | filter(attribute="is_first_time", value=true) | length > 0 %}
@@ -35,19 +35,19 @@ body = """
 ### New Contributors
 
 {% for contributor in github.contributors | filter(attribute="is_first_time", value=true) -%}
-- [@{{ contributor.username }}](https://github.com/{{ contributor.username }}) made their first contribution in [#{{ contributor.pr_number }}](https://github.com/njbrake/agent-of-empires/pull/{{ contributor.pr_number }})
+- [@{{ contributor.username }}](https://github.com/{{ contributor.username }}) made their first contribution in [#{{ contributor.pr_number }}](https://github.com/agent-of-empires/agent-of-empires/pull/{{ contributor.pr_number }})
 {% endfor %}
 {%- endif %}
 {% if previous and previous.version and version -%}
 
-**Full Changelog**: https://github.com/njbrake/agent-of-empires/compare/{{ previous.version }}...{{ version }}
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/{{ previous.version }}...{{ version }}
 {% endif %}
 """
 trim = true
 footer = ""
 
 [remote.github]
-owner = "njbrake"
+owner = "agent-of-empires"
 repo = "agent-of-empires"
 
 [git]

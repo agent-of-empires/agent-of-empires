@@ -33,15 +33,6 @@ where
     deserializer.deserialize_any(Visitor)
 }
 
-/// Like `string_or_vec` but wraps the result in `Some(...)`.
-/// For `Option<Vec<String>>` fields: absent = `None`, present = `Some(vec)`.
-pub(crate) fn option_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    string_or_vec(deserializer).map(Some)
-}
-
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -50,16 +41,6 @@ mod tests {
     struct TestRequired {
         #[serde(deserialize_with = "super::string_or_vec")]
         items: Vec<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct TestOptional {
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "super::option_string_or_vec"
-        )]
-        items: Option<Vec<String>>,
     }
 
     #[test]
@@ -72,23 +53,5 @@ mod tests {
     fn string_or_vec_with_array() {
         let t: TestRequired = toml::from_str(r#"items = ["a", "b"]"#).unwrap();
         assert_eq!(t.items, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn option_string_or_vec_with_string() {
-        let t: TestOptional = toml::from_str(r#"items = "hello""#).unwrap();
-        assert_eq!(t.items, Some(vec!["hello".to_string()]));
-    }
-
-    #[test]
-    fn option_string_or_vec_with_array() {
-        let t: TestOptional = toml::from_str(r#"items = ["a", "b"]"#).unwrap();
-        assert_eq!(t.items, Some(vec!["a".to_string(), "b".to_string()]));
-    }
-
-    #[test]
-    fn option_string_or_vec_absent() {
-        let t: TestOptional = toml::from_str("").unwrap();
-        assert_eq!(t.items, None);
     }
 }

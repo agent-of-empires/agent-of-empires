@@ -164,9 +164,10 @@ fn test_parallel_launch_unique_session_ids() {
         );
     }
 
-    // In a tight parallel race, threads may see the same (empty) exclusion set
-    // and pick the same candidate. This is inherent to the optimistic approach.
-    // The sequential test below validates strict uniqueness.
+    // Strict uniqueness is not asserted: agents that discover their session
+    // id post-launch (vibe/codex/etc.) can produce duplicates when racing
+    // pollers observe an empty exclusion set. Per-agent capture tests cover
+    // the agent-specific paths.
     let unique: HashSet<String> = captured.into_iter().flatten().collect();
     assert!(!unique.is_empty(), "No session IDs were captured at all");
 }

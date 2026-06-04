@@ -29,24 +29,31 @@
 //! where both sides observe "no daemon running" and both decide they own
 //! recovery.
 //!
-//! # Hung-hook caveat (cross-process consequence)
+//! # Bounded on_launch hook execution
 //!
-//! `restart_with_size_opts` runs the agent's `on_launch` hooks (`npm install`,
-//! `nvm use`, env setup, etc.) inline. If a hook hangs (interactive prompt,
-//! deadlocked subprocess), the recovery worker's `spawn_blocking` thread
-//! cannot be cancelled (`tokio::time::timeout` on the `JoinHandle` does not
-//! interrupt the underlying OS thread), so the worker holds its semaphore
-//! permit indefinitely AND the cross-process file lock above is never
-//! released. A peer process started after the hang is locked out of recovery
-//! for the entire daemon uptime; the only mitigation today is "hooks must be
-//! non-interactive and complete in <30s". Hardening is tracked as a follow-up
-//! (graceful timeout + force-kill path on the cascade).
+//! Recovery installs a [`HookTimeoutScope`] before entering the cascade.
+//! `repo_config::run_hooks_captured` reads the scope and bounds each
+//! `on_launch` command by [`RECOVERY_HOOK_TIMEOUT`] (30 s, debug-overridable
+//! via `AOE_RECOVERY_HOOK_TIMEOUT_MS`); on expiry the child tree is killed
+//! through [`crate::process::kill_process_tree`] (SIGTERM, 100 ms grace,
+//! then SIGKILL). An `N`-command list releases the lock within
+//! `N * (RECOVERY_HOOK_TIMEOUT + kill_grace)` per worker, with up to
+//! [`STARTUP_RECOVERY_CONCURRENCY`] workers concurrent.
+//!
+//! Caveats: `execute_hooks_in_container` kills the host-side
+//! `docker`/`podman exec` child, not the in-container process; signal
+//! propagation depends on the runtime. Hooks that daemonize (own `setsid`
+//! plus reparent to PID 1) escape `kill_process_tree`'s descendant walk;
+//! the lock still releases when the direct child exits, but the orphan is
+//! the operator's to reap.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "serve")]
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "serve")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use fs2::FileExt;
@@ -102,23 +109,26 @@ fn recovery_lock_path() -> Result<PathBuf> {
 }
 
 /// Pure predicate: should this instance go through the startup recovery
-/// cascade? Excludes cockpit-mode sessions (handled by `cockpit_reconciler`),
+/// cascade? Excludes structured view-mode sessions (handled by `acp_reconciler`),
 /// sessions whose agent has `ResumeStrategy::Unsupported`, sessions without
-/// a valid `agent_session_id`, and sunk rows (archived or currently snoozed).
-/// Live tmux panes are filtered separately by the caller using
-/// `Instance::has_live_tmux_pane()`.
+/// a valid `agent_session_id`, and sunk rows (archived, currently snoozed, or
+/// explicitly stopped). Live tmux panes are filtered separately by the caller
+/// using `Instance::has_live_tmux_pane()`.
 ///
-/// Archive and snooze are explicit "leave this session alone" signals; the
-/// archive path actively kills the tmux pane, so without this guard the next
-/// TUI launch (or daemon startup) would observe a dead pane on a resumable
-/// agent and respawn the row the user just dismissed. Snooze shares the
-/// guard because `is_snoozed()` returns false once the timer expires, so the
-/// row naturally re-enters recovery eligibility on its own schedule rather
-/// than the moment a pane goes missing.
+/// Archive, snooze, and stop are explicit "leave this session alone" signals;
+/// each of them kills the tmux pane, so without this guard the next TUI
+/// launch (or daemon startup) would observe a dead pane on a resumable agent
+/// and respawn the row the user just dismissed. Snooze flips back to
+/// recoverable on its own schedule (`is_snoozed()` returns false once the
+/// timer expires). Stop only flips back to recoverable when the user
+/// explicitly reopens the session (Enter / send-message / live-send), which
+/// transitions `Status::Stopped` to `Status::Starting` before recovery is
+/// consulted.
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
-    !inst.is_cockpit_mode()
+    !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
+        && inst.status != super::Status::Stopped
         && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
 }
 
@@ -234,19 +244,80 @@ pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     }
 }
 
-/// Run the recovery cascade for one instance. Thin wrapper around
-/// `restart_with_size_opts(None, false)`.
+/// Run the recovery cascade for one instance. Wraps
+/// `restart_with_size_opts(None, false)` in a [`HookTimeoutScope`] so a
+/// hung `on_launch` hook cannot pin the recovery lock (#1265).
 ///
-/// `skip_on_launch=false` is mandatory: `on_launch` hooks (npm install, env
-/// setup) must run on the first start after a reboot, conceptually identical
-/// to a fresh launch. The Tier-2 retry inside `start_with_resume_fallback`
-/// hardcodes `true` internally to prevent double-firing on the same restart.
+/// `skip_on_launch=false` is mandatory: hooks must run on the first start
+/// after a reboot. The Tier-2 retry in `start_with_resume_fallback`
+/// hardcodes `true` internally to prevent double-firing.
 ///
-/// Blocks until the cascade returns (up to ~7s on the fallback path); callers
-/// must invoke it off the main/event-loop thread (`spawn_blocking` or a
-/// dedicated worker).
+/// Blocks; callers must invoke it off the main event-loop thread. Worst
+/// case is `N_hooks * RECOVERY_HOOK_TIMEOUT + ~7 s` fallback latency.
 pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
+    let _scope = HookTimeoutScope::for_recovery();
     inst.restart_with_size_opts(None, false)
+}
+
+/// 30 s default; the operational guidance for non-interactive on_launch
+/// hooks (#1265).
+pub const RECOVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Lower bound on `AOE_RECOVERY_HOOK_TIMEOUT_MS` so a misconfigured test
+/// cannot race fork+exec and trip the timeout before the child spawns.
+#[cfg(debug_assertions)]
+const RECOVERY_HOOK_TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
+
+/// Resolve the recovery hook timeout. Release builds always return
+/// [`RECOVERY_HOOK_TIMEOUT`]; debug builds honor `AOE_RECOVERY_HOOK_TIMEOUT_MS`
+/// for tests, clamped to [`RECOVERY_HOOK_TIMEOUT_FLOOR`].
+pub fn recovery_hook_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_RECOVERY_HOOK_TIMEOUT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return Duration::from_millis(ms).max(RECOVERY_HOOK_TIMEOUT_FLOOR);
+        }
+    }
+    RECOVERY_HOOK_TIMEOUT
+}
+
+thread_local! {
+    static HOOK_TIMEOUT_STACK: RefCell<Vec<(u64, Duration)>> =
+        const { RefCell::new(Vec::new()) };
+    static NEXT_SLOT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Top of the current thread's [`HookTimeoutScope`] stack, if any.
+pub(crate) fn current_hook_timeout() -> Option<Duration> {
+    HOOK_TIMEOUT_STACK.with(|s| s.borrow().last().map(|(_, t)| *t))
+}
+
+/// Slot-keyed RAII guard for per-thread on_launch hook deadlines; non-LIFO
+/// drop safe.
+pub struct HookTimeoutScope {
+    slot: u64,
+}
+
+impl HookTimeoutScope {
+    pub fn new(timeout: Duration) -> Self {
+        let slot = NEXT_SLOT.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            n
+        });
+        HOOK_TIMEOUT_STACK.with(|s| s.borrow_mut().push((slot, timeout)));
+        Self { slot }
+    }
+
+    pub fn for_recovery() -> Self {
+        Self::new(recovery_hook_timeout())
+    }
+}
+
+impl Drop for HookTimeoutScope {
+    fn drop(&mut self) {
+        HOOK_TIMEOUT_STACK.with(|s| s.borrow_mut().retain(|(slot, _)| *slot != self.slot));
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +388,33 @@ mod tests {
         assert!(
             is_recovery_candidate(&inst),
             "unarchive must restore recovery eligibility"
+        );
+    }
+
+    /// Regression for #1583: pressing `x` in the session picker stops a
+    /// session, which sets `Status::Stopped` and kills the tmux pane. The
+    /// next TUI launch (or daemon startup) sees a dead pane on a resume-
+    /// capable agent; without a Stopped guard, the cascade respawns the row
+    /// the user just stopped. Only an explicit user action (Enter / send /
+    /// live-send) transitions Stopped to Starting, which is consulted before
+    /// recovery runs.
+    #[test]
+    fn stopped_instance_is_not_recovery_candidate() {
+        let mut inst = Instance::new("stopped", "/tmp/test");
+        inst.agent_session_id = Some("33333333-3333-4333-8333-333333333333".into());
+        assert!(
+            is_recovery_candidate(&inst),
+            "baseline: claude + valid sid is a recovery candidate"
+        );
+        inst.status = super::super::Status::Stopped;
+        assert!(
+            !is_recovery_candidate(&inst),
+            "stopped sessions must be excluded from startup recovery"
+        );
+        inst.status = super::super::Status::Starting;
+        assert!(
+            is_recovery_candidate(&inst),
+            "transitioning off Stopped (e.g. user reopens) must restore recovery eligibility"
         );
     }
 

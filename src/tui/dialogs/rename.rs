@@ -45,6 +45,9 @@ pub struct RenameDialog {
     group_ghost: Option<GroupGhostCompletion>,
     /// Inline validation error shown in Group mode when a duplicate name is entered.
     validation_error: Option<String>,
+    /// Hit rect per focusable field (title / group / profile), set by
+    /// `render`. Drives click + hover routing.
+    focusable_rects: Vec<(usize, Rect)>,
 }
 
 impl RenameDialog {
@@ -78,6 +81,7 @@ impl RenameDialog {
             group_picker: ListPicker::new("Select Group"),
             group_ghost: None,
             validation_error: None,
+            focusable_rects: Vec::new(),
         }
     }
 
@@ -106,6 +110,7 @@ impl RenameDialog {
             group_picker: ListPicker::new("Select Group"),
             group_ghost: None,
             validation_error: None,
+            focusable_rects: Vec::new(),
         }
     }
 
@@ -113,6 +118,56 @@ impl RenameDialog {
         match self.mode {
             RenameMode::Session => 3, // title, group, profile
             RenameMode::Group => 2,   // group, profile
+        }
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RenameData>> {
+        // Group picker overlay wins when active so a click can pick a
+        // group row without dropping the dialog underneath.
+        if self.group_picker.is_active() {
+            match self.group_picker.handle_click(col, row) {
+                ListPickerResult::Continue => return Some(DialogResult::Continue),
+                ListPickerResult::Cancelled => return Some(DialogResult::Continue),
+                ListPickerResult::Selected(value) => {
+                    self.new_group = Input::new(value);
+                    // Mirror the keyboard picker path: the ghost
+                    // autocomplete state goes stale once the user
+                    // commits to a value via the picker, so drop it.
+                    self.group_ghost = None;
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
+        let pos = ratatui::layout::Position::from((col, row));
+        let hit = self
+            .focusable_rects
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(f, _)| *f)?;
+        self.focused_field = hit;
+        // Cycle the profile chip on click; text fields just take focus.
+        if self.is_profile_field() && !self.available_profiles.is_empty() {
+            self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
+        }
+        Some(DialogResult::Continue)
+    }
+
+    /// Hover only updates the group-picker overlay highlight (menu-style
+    /// behavior the user expects). It deliberately does NOT move focus
+    /// between the title / group / profile rows: stealing focus from the
+    /// field the user is typing into just because the mouse cursor
+    /// drifts across the dialog is jarring. Click still sets focus.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.group_picker.is_active() {
+            return self.group_picker.handle_hover(col, row);
+        }
+        false
+    }
+
+    fn is_profile_field(&self) -> bool {
+        match self.mode {
+            RenameMode::Session => self.focused_field == 2,
+            RenameMode::Group => self.focused_field == 1,
         }
     }
 
@@ -134,13 +189,6 @@ impl RenameDialog {
         match self.mode {
             RenameMode::Session => self.focused_field == 1,
             RenameMode::Group => self.focused_field == 0,
-        }
-    }
-
-    fn is_profile_field(&self) -> bool {
-        match self.mode {
-            RenameMode::Session => self.focused_field == 2,
-            RenameMode::Group => self.focused_field == 1,
         }
     }
 
@@ -330,14 +378,15 @@ impl RenameDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         match self.mode {
             RenameMode::Session => self.render_session(frame, area, theme),
             RenameMode::Group => self.render_group(frame, area, theme),
         }
     }
 
-    fn render_session(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_session(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.focusable_rects.clear();
         let dialog_width = 50;
         let dialog_area = super::centered_rect(area, dialog_width, 15);
 
@@ -392,12 +441,15 @@ impl RenameDialog {
             None,
             theme,
         );
+        self.focusable_rects.push((0, chunks[4]));
 
         // New group field
         self.render_group_field(frame, chunks[5], theme);
+        self.focusable_rects.push((1, chunks[5]));
 
         // Profile selector
         self.render_profile_selector(frame, chunks[6], theme);
+        self.focusable_rects.push((2, chunks[6]));
 
         // Hint
         self.render_hints(frame, chunks[8], theme);
@@ -408,7 +460,8 @@ impl RenameDialog {
         }
     }
 
-    fn render_group(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_group(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.focusable_rects.clear();
         let dialog_width = 50;
         let has_error = self.validation_error.is_some();
         let dialog_height = if has_error { 16 } else { 13 };
@@ -452,9 +505,11 @@ impl RenameDialog {
 
         // New group field
         self.render_group_field(frame, chunks[3], theme);
+        self.focusable_rects.push((0, chunks[3]));
 
         // Profile selector
         self.render_profile_selector(frame, chunks[4], theme);
+        self.focusable_rects.push((1, chunks[4]));
 
         if has_error {
             // Validation error (two lines, one sentence each)

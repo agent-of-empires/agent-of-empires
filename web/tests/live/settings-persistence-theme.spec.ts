@@ -3,9 +3,16 @@
 // PATCH /api/settings -> GET /api/settings returns the new value; reload
 // the dashboard and the value still applies. Proves the live server
 // persists settings to disk (not just in-memory) and the frontend reads
-// them back on every page load.
+// them back on every page load. The user-story covers #1217.
+//
+// The second test (#1510) is the user-observable form: the dashboard
+// picker drives the change, the dashboard chrome repaints, and the
+// new theme survives both a page reload and an `aoe serve` restart
+// without any passphrase prompt firing (no-auth mode).
 
 import { test, expect } from "../helpers/liveTest";
+
+const SWITCH_TO = "dracula";
 
 test("theme setting persists through PATCH + reload", async ({
   serve,
@@ -40,4 +47,87 @@ test("theme setting persists through PATCH + reload", async ({
     return r.json();
   }, serve.baseUrl);
   expect(fetched?.theme?.name).toBe(newTheme);
+});
+
+test("theme picker repaints, persists across reload and serve restart (#1510)", async ({
+  serve,
+  page,
+}) => {
+  // The dashboard's `selectedProfile` resolves to whichever profile
+  // GET /api/profiles flags `is_default`. On a fresh `aoe serve` that
+  // is "main" (bootstrap profile), not "default", so we cannot
+  // hard-code the path; query the server and use whatever name it
+  // hands back.
+  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(
+    `${serve.baseUrl}/api/profiles`,
+  ).then((r) => r.json());
+  const defaultProfile =
+    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
+
+  // Drive the picker through the actual settings UI, not the REST
+  // endpoint, so the regression that landed the dispatch-before-PATCH
+  // bug would re-fail this test. Lands on /settings/theme directly
+  // (App.tsx routes settings tabs by URL) and waits for the dropdown.
+  await page.goto(`${serve.baseUrl}/settings/theme`);
+  const themeSelect = page
+    .locator("label", { hasText: /^Theme$/ })
+    .locator("..")
+    .locator("select");
+  await expect(themeSelect).toBeVisible({ timeout: 10_000 });
+
+  // Make sure the picker has the candidate option (themes fetched
+  // asynchronously from /api/themes).
+  await expect
+    .poll(
+      async () =>
+        await themeSelect.evaluate((sel: HTMLSelectElement, target) =>
+          Array.from(sel.options).some((o) => o.value === target),
+        SWITCH_TO),
+      { timeout: 5_000 },
+    )
+    .toBe(true);
+
+  await themeSelect.selectOption(SWITCH_TO);
+
+  // Server-side: PATCH landed and the profile config reflects the pick.
+  await expect(async () => {
+    const after = await fetch(profileUrl).then((r) => r.json());
+    expect(after?.theme?.name).toBe(SWITCH_TO);
+  }).toPass({ timeout: 5_000 });
+
+  // Client-side repaint: the picker dispatches aoe:theme-picker-changed
+  // only after the PATCH resolves, so --color-surface-900 must end up
+  // at dracula's value (#282a36) without us nudging the event ourselves.
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() =>
+          document.documentElement.style.getPropertyValue("--color-surface-900").trim(),
+        ),
+      { timeout: 5_000, intervals: [100, 200, 400] },
+    )
+    .toBe("#282a36");
+
+  // No passphrase / elevation prompt fired (the daemon does not have a
+  // passphrase configured in the `serve` fixture). The elevation prompt
+  // is a role=dialog with the "Confirm passphrase" header (no
+  // accessible name; locate by role + text).
+  await expect(
+    page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i }),
+  ).toHaveCount(0);
+
+  // Persistence across page reload.
+  await page.reload();
+  const afterReload = await page.evaluate(async (url) => {
+    const r = await fetch(url);
+    return r.json();
+  }, profileUrl);
+  expect(afterReload?.theme?.name).toBe(SWITCH_TO);
+
+  // Persistence across `aoe serve` restart (process exits, config.toml
+  // is what survives). The restart() helper reuses the same port.
+  await serve.restart();
+  const afterRestart = await fetch(profileUrl).then((r) => r.json());
+  expect(afterRestart?.theme?.name).toBe(SWITCH_TO);
 });

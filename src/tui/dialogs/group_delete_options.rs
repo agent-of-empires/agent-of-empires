@@ -6,6 +6,7 @@ use ratatui::widgets::*;
 
 use super::DialogResult;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
 #[derive(Clone, Debug, Default)]
@@ -24,6 +25,12 @@ pub struct GroupDeleteOptionsDialog {
     has_containers: bool,
     options: GroupDeleteOptions,
     focused_field: usize,
+    /// Captured rect per focusable field, populated by `render`.
+    /// Drives both click (set focus + toggle) and the hover highlight.
+    focusable_rects: Vec<(usize, Rect)>,
+    /// Which field row the mouse is over, for the hover highlight.
+    /// Visual only; never moves keyboard `focused_field`.
+    hover: HoverState,
 }
 
 impl GroupDeleteOptionsDialog {
@@ -40,6 +47,62 @@ impl GroupDeleteOptionsDialog {
             has_containers,
             options: GroupDeleteOptions::default(),
             focused_field: 0,
+            focusable_rects: Vec::new(),
+            hover: HoverState::default(),
+        }
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<GroupDeleteOptions>> {
+        let pos = ratatui::layout::Position::from((col, row));
+        let hit = self
+            .focusable_rects
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(field, _)| *field)?;
+        self.focused_field = hit;
+        self.toggle_focused_field();
+        Some(DialogResult::Continue)
+    }
+
+    /// Highlight the field row under the cursor without moving keyboard
+    /// `focused_field`. See `ConfirmDialog::handle_hover` for the
+    /// rationale; click still moves focus and toggles state. Returns
+    /// `true` when the highlighted row changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let rects: Vec<Rect> = self.focusable_rects.iter().map(|(_, r)| *r).collect();
+        self.hover.update(col, row, &rects)
+    }
+
+    /// Mirror the Space-key branch's per-field toggle / radio logic so a
+    /// click produces byte-identical state changes.
+    fn toggle_focused_field(&mut self) {
+        match self.focused_field {
+            0 => {
+                self.options.delete_sessions = false;
+                self.options.delete_worktrees = false;
+                self.options.force_delete_worktrees = false;
+                self.options.delete_branches = false;
+                self.options.delete_containers = false;
+            }
+            1 => {
+                self.options.delete_sessions = true;
+            }
+            f if Some(f) == self.worktree_field_index() => {
+                self.options.delete_worktrees = !self.options.delete_worktrees;
+                if !self.options.delete_worktrees {
+                    self.options.force_delete_worktrees = false;
+                }
+            }
+            f if Some(f) == self.force_field_index() => {
+                self.options.force_delete_worktrees = !self.options.force_delete_worktrees;
+            }
+            f if Some(f) == self.branch_field_index() => {
+                self.options.delete_branches = !self.options.delete_branches;
+            }
+            f if Some(f) == self.container_field_index() => {
+                self.options.delete_containers = !self.options.delete_containers;
+            }
+            _ => {}
         }
     }
 
@@ -125,34 +188,7 @@ impl GroupDeleteOptionsDialog {
                 DialogResult::Continue
             }
             KeyCode::Char(' ') => {
-                match self.focused_field {
-                    0 => {
-                        self.options.delete_sessions = false;
-                        self.options.delete_worktrees = false;
-                        self.options.force_delete_worktrees = false;
-                        self.options.delete_branches = false;
-                        self.options.delete_containers = false;
-                    }
-                    1 => {
-                        self.options.delete_sessions = true;
-                    }
-                    f if Some(f) == self.worktree_field_index() => {
-                        self.options.delete_worktrees = !self.options.delete_worktrees;
-                        if !self.options.delete_worktrees {
-                            self.options.force_delete_worktrees = false;
-                        }
-                    }
-                    f if Some(f) == self.force_field_index() => {
-                        self.options.force_delete_worktrees = !self.options.force_delete_worktrees;
-                    }
-                    f if Some(f) == self.branch_field_index() => {
-                        self.options.delete_branches = !self.options.delete_branches;
-                    }
-                    f if Some(f) == self.container_field_index() => {
-                        self.options.delete_containers = !self.options.delete_containers;
-                    }
-                    _ => {}
-                }
+                self.toggle_focused_field();
                 DialogResult::Continue
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -172,7 +208,8 @@ impl GroupDeleteOptionsDialog {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.focusable_rects.clear();
         let show_worktree_option = self.options.delete_sessions && self.has_managed_worktrees;
         let show_force_option = show_worktree_option && self.options.delete_worktrees;
         let show_container_option = self.options.delete_sessions && self.has_containers;
@@ -261,6 +298,7 @@ impl GroupDeleteOptionsDialog {
             Span::styled(" Move sessions to default group", move_style),
         ]);
         frame.render_widget(Paragraph::new(move_line), chunks[2]);
+        self.focusable_rects.push((0, chunks[2]));
 
         // Delete sessions option
         let delete_focused = self.focused_field == 1;
@@ -278,6 +316,7 @@ impl GroupDeleteOptionsDialog {
             Span::styled(" Delete all sessions", delete_style),
         ]);
         frame.render_widget(Paragraph::new(delete_line), chunks[3]);
+        self.focusable_rects.push((1, chunks[3]));
 
         // Track current chunk index for optional checkboxes
         let mut next_chunk = 4;
@@ -297,6 +336,9 @@ impl GroupDeleteOptionsDialog {
                 style,
             );
             frame.render_widget(Paragraph::new(wt_line), chunks[next_chunk]);
+            if let Some(idx) = self.worktree_field_index() {
+                self.focusable_rects.push((idx, chunks[next_chunk]));
+            }
             next_chunk += 1;
 
             if show_force_option {
@@ -311,6 +353,9 @@ impl GroupDeleteOptionsDialog {
                     style,
                 );
                 frame.render_widget(Paragraph::new(fc_line), chunks[next_chunk]);
+                if let Some(idx) = self.force_field_index() {
+                    self.focusable_rects.push((idx, chunks[next_chunk]));
+                }
                 next_chunk += 1;
             }
 
@@ -326,6 +371,9 @@ impl GroupDeleteOptionsDialog {
                 style,
             );
             frame.render_widget(Paragraph::new(br_line), chunks[next_chunk]);
+            if let Some(idx) = self.branch_field_index() {
+                self.focusable_rects.push((idx, chunks[next_chunk]));
+            }
             next_chunk += 1;
         }
 
@@ -342,6 +390,9 @@ impl GroupDeleteOptionsDialog {
                 style,
             );
             frame.render_widget(Paragraph::new(ct_line), chunks[next_chunk]);
+            if let Some(idx) = self.container_field_index() {
+                self.focusable_rects.push((idx, chunks[next_chunk]));
+            }
             next_chunk += 1;
         }
 
@@ -357,6 +408,14 @@ impl GroupDeleteOptionsDialog {
             Span::raw(" cancel"),
         ]);
         frame.render_widget(Paragraph::new(hints), chunks[next_chunk]);
+
+        // Paint the hover highlight last so it sits behind a row that
+        // still exists this frame (the row set shrinks when "Move" is
+        // selected, so a stale rect from a previous layout is dropped).
+        let rows: Vec<Rect> = self.focusable_rects.iter().map(|(_, r)| *r).collect();
+        if let Some(rect) = self.hover.current_in(&rows) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
     }
 }
 
@@ -708,6 +767,23 @@ mod tests {
         assert!(!dialog.options.force_delete_worktrees);
         assert!(!dialog.options.delete_branches);
         assert!(!dialog.options.delete_containers);
+    }
+
+    #[test]
+    fn hover_highlights_row_without_moving_focus() {
+        // Stage focusable rects manually; the real ones come from render().
+        let mut dialog = dialog();
+        dialog.focusable_rects = vec![(0, Rect::new(2, 4, 40, 1)), (1, Rect::new(2, 5, 40, 1))];
+        dialog.focused_field = 0;
+
+        // Over the delete row: highlight it, focus unchanged.
+        assert!(dialog.handle_hover(5, 5));
+        assert_eq!(dialog.hover.current(), Some(Rect::new(2, 5, 40, 1)));
+        assert_eq!(dialog.focused_field, 0, "hover must not move focus");
+
+        // Off all rows clears the highlight.
+        assert!(dialog.handle_hover(99, 99));
+        assert_eq!(dialog.hover.current(), None);
     }
 
     #[test]

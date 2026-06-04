@@ -4,10 +4,9 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
-import { SwitchSubstrateAction } from "./cockpit/SwitchSubstrateAction";
-import { ViewportFullscreenFab } from "./ViewportFullscreenFab";
+import { SwitchViewAction } from "./acp/SwitchViewAction";
 import { ensureSession } from "../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../lib/acpCapableTools";
+import { isAcpCapable } from "../lib/acpCapableTools";
 import { safeSetItem } from "../lib/safeStorage";
 import type { SessionResponse } from "../lib/types";
 import {
@@ -21,10 +20,9 @@ import "@xterm/xterm/css/xterm.css";
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** When false (the default) the switch-to-cockpit pill is hidden
-   *  entirely so users with the master switch off aren't tempted
-   *  by a button that the server will reject. */
-  cockpitMasterEnabled?: boolean;
+  /** When false (the default) the switch-to-structured view pill is hidden
+   *  entirely so it only shows where switching to the structured view is
+   *  actually offered. */
 }
 
 const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
@@ -33,7 +31,6 @@ const SCROLL_HINT_TIMEOUT_MS = 8000;
 export function TerminalView({
   session,
   active = true,
-  cockpitMasterEnabled = false,
 }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
     "pending",
@@ -57,25 +54,13 @@ export function TerminalView({
     session.claude_fullscreen,
     active,
   );
-  const { isMobile, keyboardOpen, keyboardHeight, reservedKeyboardHeight } =
-    useMobileKeyboard();
+  const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
-  // Default behavior on mobile: pad the viewport by reservedKeyboardHeight
-  // so the terminal container stays the same size whether the soft
-  // keyboard is up or not. Toggle this on (via the FAB) to release the
-  // reservation and use the full viewport. Each toggle is one explicit
-  // PTY resize.
-  const [viewportFullscreen, setViewportFullscreen] = useState(false);
-  const toggleViewportFullscreen = useCallback(() => {
-    setViewportFullscreen((v) => !v);
-  }, []);
-  // The actual padding applied. On desktop reservedKeyboardHeight stays 0
-  // and this is a no-op. On mobile in fullscreen mode it's also 0.
-  // Otherwise we apply the latched reservation.
-  const appliedKeyboardPadding = viewportFullscreen
-    ? 0
-    : reservedKeyboardHeight;
+  // On mobile, pad the viewport by the live keyboard occlusion so the
+  // terminal pane shrinks while the soft keyboard is up and grows back when
+  // it dismisses. On desktop keyboardOcclusion stays 0 and this is a no-op.
+  const appliedKeyboardPadding = keyboardOcclusion;
 
   // Sync React state → hook ref in an effect. The mobile toolbar toggles
   // `ctrlActive` but the onData callback reads the ref to decide whether
@@ -236,12 +221,10 @@ export function TerminalView({
     );
   }
 
-  // Pad the viewport by the latched reservation, not the live keyboard
-  // height. The pane stays the "keyboard is here" size whether the
-  // keyboard is currently up or not, so showing/hiding it stops sending
-  // SIGWINCH and stops claude from re-rendering into the scrollback.
-  // The fullscreen FAB releases the reservation when the user wants the
-  // full viewport (one explicit resize per toggle).
+  // Pad the viewport by the live keyboard occlusion so the pane tracks the
+  // soft keyboard: it shrinks when the keyboard opens and grows back when it
+  // closes. The hook debounces the occlusion so one open/close is one PTY
+  // resize, not a storm during the keyboard animation.
   const rootStyle = {
     paddingBottom:
       appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
@@ -251,16 +234,15 @@ export function TerminalView({
       className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5"
       style={rootStyle}
     >
-      {/* Top-right substrate switch — discreet pill that lets the
-          user flip this session into cockpit mode. Only rendered
-          when the cockpit master switch is on, and only enabled
+      {/* Top-right view switch, a discreet pill that lets the
+          user flip this session into structured view mode. Only enabled
           for tools whose ACP adapter we ship. */}
-      {session?.id && cockpitMasterEnabled && (
+      {session?.id && (
         <div className="absolute right-2 top-2 z-10">
-          <SwitchSubstrateAction
+          <SwitchViewAction
             sessionId={session.id}
-            cockpitMode={false}
-            acpCapable={ACP_CAPABLE_TOOLS.has(session.tool)}
+            structuredView={false}
+            acpCapable={isAcpCapable(session.tool, session.acp_capable)}
             variant="icon"
           />
         </div>
@@ -328,21 +310,14 @@ export function TerminalView({
         {isMobile && state.connected && (
           <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />
         )}
-
-        {isMobile && state.connected && reservedKeyboardHeight > 0 && (
-          <ViewportFullscreenFab
-            fullscreen={viewportFullscreen}
-            onToggle={toggleViewportFullscreen}
-          />
-        )}
       </div>
 
       {isMobile && state.connected && (
         <MobileTerminalToolbar
           sendData={sendData}
           termRef={termRef}
-          keyboardHeight={keyboardHeight}
-          reservedKeyboardHeight={reservedKeyboardHeight}
+          keyboardOpen={keyboardOpen}
+          parentHandlesKeyboardInset
           ctrlActive={ctrlActive}
           onCtrlToggle={() => setCtrlActive((v) => !v)}
         />

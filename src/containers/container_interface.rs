@@ -8,6 +8,13 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// A named Docker/Podman volume mounted at a specific container path.
+/// Used by `volume_ignores_strategy = "named"` to bypass VirtioFS shadowing on macOS.
+pub struct NamedVolumeMount {
+    pub volume_name: String,
+    pub container_path: String,
+}
+
 /// An environment variable entry for a container.
 ///
 /// `Inherit` entries use Docker's `-e KEY` form (no value in argv), which reads
@@ -79,14 +86,21 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
     (argv, inherit)
 }
 
+#[derive(Default)]
 pub struct ContainerConfig {
     pub working_dir: String,
     pub volumes: Vec<VolumeMount>,
     pub anonymous_volumes: Vec<String>,
+    /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
+    pub named_ignore_volumes: Vec<NamedVolumeMount>,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
     pub port_mappings: Vec<String>,
+    /// Append the SELinux relabel flag (`:z`) to host bind mounts so the container
+    /// can access them on SELinux-enforcing hosts (Fedora, RHEL). Set from
+    /// `sandbox.selinux_relabel`; only emitted for runtimes that support it.
+    pub selinux_relabel: bool,
 }
 
 pub trait ContainerRuntimeInterface {

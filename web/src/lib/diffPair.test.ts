@@ -93,3 +93,31 @@ describe("diffPair hunk shape", () => {
     });
   });
 });
+
+describe("diffPair CRLF line endings", () => {
+  it("strips the carriage return from identical CRLF content", () => {
+    const r = diffPair("a\r\nb\r\nc", "a\r\nb\r\nc");
+    expect(r.hunk.lines).toEqual([
+      { type: "equal", old_line_num: 1, new_line_num: 1, content: "a" },
+      { type: "equal", old_line_num: 2, new_line_num: 2, content: "b" },
+      { type: "equal", old_line_num: 3, new_line_num: 3, content: "c" },
+    ]);
+  });
+
+  it("strips the carriage return from changed CRLF content", () => {
+    const r = diffPair("a\r\nb\r\nc", "a\r\nB\r\nc");
+    expect(r.hunk.lines).toEqual([
+      { type: "equal", old_line_num: 1, new_line_num: 1, content: "a" },
+      { type: "delete", old_line_num: 2, new_line_num: null, content: "b" },
+      { type: "add", old_line_num: null, new_line_num: 2, content: "B" },
+      { type: "equal", old_line_num: 3, new_line_num: 3, content: "c" },
+    ]);
+  });
+
+  it("leaves no stray carriage returns in any line content", () => {
+    const r = diffPair("x\r\ny\r\nz", "x\r\ny2\r\nz");
+    for (const line of r.hunk.lines) {
+      expect(line.content).not.toContain("\r");
+    }
+  });
+});

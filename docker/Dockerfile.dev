@@ -3,7 +3,7 @@
 # Note: Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI,
 # Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, and Qwen Code are inherited from the base image
 
-ARG BASE_IMAGE=ghcr.io/njbrake/aoe-sandbox:latest
+ARG BASE_IMAGE=ghcr.io/agent-of-empires/aoe-sandbox:latest
 FROM ${BASE_IMAGE}
 
 USER root

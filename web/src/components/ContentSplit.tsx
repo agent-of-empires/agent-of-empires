@@ -97,34 +97,14 @@ export function ContentSplit({
             className="hidden md:block w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75"
           />
 
-          {/* Right pane: inline on desktop, overlay on mobile */}
+          {/* Right pane (inline). ContentSplit only renders at the md
+              breakpoint and up; below md the mobile picker promotes the
+              chosen view into the single full-viewport pane instead (#1452). */}
           <div
             style={{ width: diffWidth }}
-            className="hidden md:flex shrink-0 flex-col min-h-0 overflow-hidden"
+            className="flex shrink-0 flex-col min-h-0 overflow-hidden"
           >
             {right}
-          </div>
-
-          {/* Mobile: slide-in panel from right with backdrop (mirrors left sidebar pattern) */}
-          <div
-            className="md:hidden fixed top-12 inset-x-0 bottom-0 bg-black/50 z-30"
-            onClick={onToggleCollapse}
-          />
-          <div className="md:hidden fixed top-12 bottom-0 right-0 z-40 w-[85vw] max-w-sm flex flex-col bg-surface-900">
-            <div className="h-10 flex items-center px-3 border-b border-surface-700/20 shrink-0">
-              <span className="text-sm text-text-muted flex-1">
-                Diff & Shell
-              </span>
-              <button
-                onClick={onToggleCollapse}
-                className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors"
-              >
-                &times;
-              </button>
-            </div>
-            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-              {right}
-            </div>
           </div>
         </>
       )}

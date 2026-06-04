@@ -34,13 +34,19 @@ pub enum SessionCommands {
     /// Rename a session
     Rename(RenameArgs),
 
+    /// Edit a managed worktree session's workdir directory name (and,
+    /// optionally, its git branch). Moves the worktree directory in place;
+    /// the session must not be running. See #1723.
+    SetWorktreeName(SetWorktreeNameArgs),
+
     /// Capture tmux pane output
     Capture(CaptureArgs),
 
     /// Auto-detect current session
     Current(CurrentArgs),
 
-    /// Set agent session ID for a session
+    /// Set the resume target for a session (pin a conversation or force a
+    /// one-shot fresh start)
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -138,6 +144,20 @@ pub struct RenameArgs {
 }
 
 #[derive(Args)]
+pub struct SetWorktreeNameArgs {
+    /// Session ID or title (optional, auto-detects in tmux)
+    identifier: Option<String>,
+
+    /// New workdir (worktree directory) name
+    #[arg(long)]
+    name: String,
+
+    /// Also rename the underlying git branch to match the new name
+    #[arg(long)]
+    rename_branch: bool,
+}
+
+#[derive(Args)]
 pub struct ShowArgs {
     /// Session ID or title (optional, auto-detects in tmux)
     identifier: Option<String>,
@@ -190,7 +210,9 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Agent session ID to set (pass empty string to clear)
+    /// Resume target: a UUID/sid pins the next launches to that
+    /// conversation; an empty string forces a one-shot fresh start (after
+    /// which the system reverts to auto-resume).
     session_id: String,
 }
 
@@ -232,6 +254,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Show(args) => show_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
+        SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
         SessionCommands::SetBase(args) => set_base(profile, args).await,
@@ -367,7 +390,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // instances always come back blank.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "start")?;
+    bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -404,31 +427,31 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Cockpit-mode sessions are not backed by tmux; their ACP worker is owned
+/// Acp-mode sessions are not backed by tmux; their ACP worker is owned
 /// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
 ///
-/// `cockpit_mode` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in cockpit
+/// `structured_view` is gated behind the `serve` feature; without it the
+/// field doesn't exist on `Instance` and no session can be in structured view
 /// mode, so this is a no-op shim.
 #[cfg(feature = "serve")]
-fn bail_if_cockpit(inst: &crate::session::Instance, verb: &str) -> Result<()> {
-    if inst.cockpit_mode {
+fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
+    if inst.is_structured() {
         bail!(
-            "cockpit sessions are managed by `aoe serve`; \
+            "structured view sessions are managed by `aoe serve`; \
              cannot `aoe session {verb}` from the CLI.\n\
-             The ACP worker is auto-spawned within ~2s of `aoe add --cockpit` \
+             The ACP worker is auto-spawned within ~2s of an structured-view session \
              while serve is running, or on next `aoe serve` startup.\n\
-             To control a cockpit session, use the web dashboard or the REST API."
+             To control an structured-view session, use the web dashboard or the REST API."
         );
     }
     Ok(())
 }
 
 #[cfg(not(feature = "serve"))]
-fn bail_if_cockpit(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
+fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
@@ -439,7 +462,7 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "stop")?;
+    bail_if_acp(inst, "stop")?;
     let session_id = inst.id.clone();
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -642,7 +665,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 }
 
 /// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Cockpit-mode sessions are skipped
+/// would race the deletion/boot path. Acp-mode sessions are skipped
 /// because their lifecycle is owned by `aoe serve`'s supervisor, not
 /// tmux: a CLI-side restart would no-op silently and (with the explicit
 /// bail in `restart_session`) flood `--all` with per-session errors.
@@ -656,7 +679,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
         .filter(|_i| {
             #[cfg(feature = "serve")]
             {
-                !_i.cockpit_mode
+                !_i.is_structured()
             }
             #[cfg(not(feature = "serve"))]
             {
@@ -674,7 +697,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // rehydrate `source_profile` for config resolution.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "restart")?;
+    bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -790,7 +813,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "attach")?;
+    bail_if_acp(inst, "attach")?;
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     if !tmux_session.exists() {
@@ -1040,6 +1063,83 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     Ok(())
 }
 
+async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
+    let storage = Storage::new(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let inst = if let Some(id) = &args.identifier {
+        super::resolve_session(id, &instances)?
+    } else {
+        let current_session = std::env::var("TMUX_PANE")
+            .ok()
+            .and_then(|_| crate::tmux::get_current_session_name());
+        if let Some(session_name) = current_session {
+            instances
+                .iter()
+                .find(|i| {
+                    let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                    tmux_name == session_name
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                })?
+        } else {
+            bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
+        }
+    };
+
+    let id = inst.id.clone();
+    let current_path = inst.project_path.clone();
+    let Some(worktree_info) = inst.worktree_info.clone() else {
+        bail!("Session does not use a worktree");
+    };
+    // Persisted status can lag the real tmux pane, and moving the worktree of
+    // a still-running session is unsafe. Recompute from live tmux state before
+    // enforcing the guard.
+    let mut live = inst.clone();
+    crate::tmux::refresh_session_cache();
+    live.update_status();
+    if live.status.blocks_worktree_edit() {
+        bail!("Cannot edit the workdir name while the session is active; stop it first");
+    }
+
+    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+        crate::session::worktree_edit::WorktreeEditRequest {
+            worktree_info: &worktree_info,
+            current_path: std::path::Path::new(&current_path),
+            new_name: args.name.trim(),
+            rename_branch: args.rename_branch,
+        },
+    )?;
+    let new_path = outcome.new_path.to_string_lossy().to_string();
+    let new_branch = outcome.new_branch.clone();
+
+    storage
+        .update(|instances, _groups| {
+            let inst = instances
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+            inst.project_path = new_path.clone();
+            if let Some(branch) = &new_branch {
+                if let Some(wt) = inst.worktree_info.as_mut() {
+                    wt.branch = branch.clone();
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
+            )
+        })?;
+
+    println!("✓ Worktree moved to: {}", new_path);
+    if let Some(branch) = &new_branch {
+        println!("  Branch renamed to: {}", branch);
+    }
+    Ok(())
+}
+
 async fn current_session(args: CurrentArgs) -> Result<()> {
     // Auto-detect profile and session from tmux
     let current_session = std::env::var("TMUX_PANE")
@@ -1088,8 +1188,8 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
 }
 
 async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
-    let new_id = if args.session_id.trim().is_empty() {
-        None
+    let new_intent = if args.session_id.trim().is_empty() {
+        crate::session::ResumeIntent::Cleared
     } else {
         let trimmed = args.session_id.trim().to_string();
         if !crate::session::is_valid_session_id(&trimmed) {
@@ -1098,20 +1198,27 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 trimmed
             );
         }
-        Some(trimmed)
+        crate::session::ResumeIntent::Use(trimmed)
     };
 
     let storage = Storage::new(profile)?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
-            inst.agent_session_id = new_id.clone();
+            #[cfg(feature = "serve")]
+            if inst.is_structured() {
+                anyhow::bail!(
+                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
+                    inst.title
+                );
+            }
+            inst.resume_intent = new_intent.clone();
             Ok((inst.title.clone(), inst.tool.clone()))
         })
     })?;
 
-    match new_id {
-        Some(ref id) => {
-            println!("✓ Set session ID for '{}': {}", title, id);
+    match &new_intent {
+        crate::session::ResumeIntent::Use(id) => {
+            println!("✓ Set resume target for '{}': {}", title, id);
             if let Some(agent) = crate::agents::get_agent(&tool) {
                 if matches!(
                     agent.resume_strategy,
@@ -1121,7 +1228,13 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 }
             }
         }
-        None => println!("✓ Cleared session ID for '{}'", title),
+        crate::session::ResumeIntent::Cleared => {
+            println!(
+                "✓ Cleared resume intent for '{}' (next launches will be fresh)",
+                title
+            );
+        }
+        crate::session::ResumeIntent::Default => unreachable!(),
     }
     Ok(())
 }
@@ -1347,6 +1460,67 @@ mod stale_history_suffix_tests {
             line,
             "  · alpha (resume failed for sid 22222222-2222-2222-2222-222222222222; \
              started fresh, prior history not loaded)"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "serve"))]
+mod acp_reject_tests {
+    use super::{set_session_id, SetSessionIdArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    #[serial]
+    async fn set_session_id_rejects_structured_view_session() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let storage = Storage::new("acp-reject").unwrap();
+        let mut inst = Instance::new("acp_session", "/tmp/x");
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let result = set_session_id(
+            "acp-reject",
+            SetSessionIdArgs {
+                identifier: id.clone(),
+                session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            },
+        )
+        .await;
+
+        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("acp"),
+            "error must mention structured view: {}",
+            msg
+        );
+
+        let loaded = storage.load().unwrap();
+        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(
+            inst_disk.resume_intent,
+            crate::session::ResumeIntent::Default,
+            "rejected call must not mutate intent",
+        );
+        assert_eq!(
+            inst_disk.agent_session_id, None,
+            "rejected call must not mutate sid",
         );
     }
 }

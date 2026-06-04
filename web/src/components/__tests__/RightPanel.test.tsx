@@ -44,7 +44,8 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
     isMobile: false,
     keyboardOpen: false,
     keyboardHeight: 0,
-    reservedKeyboardHeight: 0,
+    keyboardOcclusion: 0,
+    stableViewportHeight: 0,
   }),
 }));
 

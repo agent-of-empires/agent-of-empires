@@ -204,7 +204,6 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
       document.addEventListener("securitypolicyviolation", (ev) => {
         // Surface as console.error so the .on("console") listener
         // above catches it.
-        // eslint-disable-next-line no-console
         console.error(
           "CSP violation:",
           (ev as SecurityPolicyViolationEvent).violatedDirective,

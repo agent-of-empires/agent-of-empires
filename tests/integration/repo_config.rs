@@ -41,13 +41,11 @@ default_tool = "claude"
         .unwrap()
         .unwrap();
 
-    let hooks = config.hooks.unwrap();
+    let hooks = config.hooks().unwrap();
     assert_eq!(hooks.on_create, vec!["echo setup"]);
     assert_eq!(hooks.on_launch, vec!["echo start"]);
-    assert_eq!(
-        config.session.unwrap().default_tool,
-        Some("claude".to_string())
-    );
+    let ov = serde_json::to_value(&config).unwrap();
+    assert_eq!(ov["session"]["default_tool"], serde_json::json!("claude"));
 }
 
 #[test]
@@ -64,8 +62,8 @@ fn test_load_repo_config_comments_only() {
         .unwrap()
         .unwrap();
     // All-commented template should parse as empty config
-    assert!(config.hooks.is_none());
-    assert!(config.session.is_none());
+    assert!(config.hooks().is_none());
+    assert!(!config.overrides.contains_key("session"));
 }
 
 #[test]
@@ -333,7 +331,7 @@ on_create = ["echo legacy"]
         .unwrap()
         .unwrap();
 
-    let hooks = config.hooks.unwrap();
+    let hooks = config.hooks().unwrap();
     assert_eq!(hooks.on_create, vec!["echo legacy"]);
 }
 
@@ -369,7 +367,7 @@ on_create = ["echo legacy"]
         .unwrap()
         .unwrap();
 
-    let hooks = config.hooks.unwrap();
+    let hooks = config.hooks().unwrap();
     assert_eq!(
         hooks.on_create,
         vec!["echo new"],

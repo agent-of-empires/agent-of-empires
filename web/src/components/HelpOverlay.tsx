@@ -1,5 +1,11 @@
 import { useWebSettings } from "../hooks/useWebSettings";
-import type { ProjectStripShortcut } from "../hooks/useWebSettings";
+import {
+  IS_MAC,
+  SHORTCUTS,
+  SHORTCUTS_BY_ID,
+  formatHelpShortcut,
+} from "../lib/shortcuts";
+import type { ProjectStripShortcut } from "../lib/shortcuts";
 
 interface Props {
   onClose: () => void;
@@ -19,24 +25,16 @@ const MOBILE_GESTURES = [
   { key: "Hold session", desc: "Long-press a session to rename it" },
 ];
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-
 export function HelpOverlay({ onClose }: Props) {
   const { settings } = useWebSettings();
-  const modKey = IS_MAC ? "⌘" : "Ctrl";
-
-  const optKey = IS_MAC ? "⌥" : "Alt";
   const projectShortcutLabel = formatProjectShortcut(
     settings.projectStripShortcut,
   );
-
   const shortcuts = [
-    { key: `${modKey}K`, desc: "Open command palette" },
-    { key: `${modKey}B`, desc: "Toggle left sidebar" },
-    { key: `${modKey}${optKey}B`, desc: "Toggle right panel" },
-    { key: `${modKey}\``, desc: "Toggle agent / shell terminal focus" },
+    ...SHORTCUTS.map((s) => ({
+      key: formatHelpShortcut(s.chord, IS_MAC),
+      desc: s.description,
+    })),
     ...(projectShortcutLabel
       ? [
           {
@@ -45,11 +43,6 @@ export function HelpOverlay({ onClose }: Props) {
           },
         ]
       : []),
-    { key: "n", desc: "New session" },
-    { key: "D", desc: "Toggle diff panel" },
-    { key: "s", desc: "Toggle settings" },
-    { key: "Esc", desc: "Close dialog" },
-    { key: "?", desc: "Toggle this help" },
   ];
 
   return (
@@ -127,7 +120,8 @@ export function HelpOverlay({ onClose }: Props) {
 
         <div className="px-5 py-3 border-t border-surface-700">
           <p className="text-sm text-text-dim">
-            Single-key shortcuts are disabled when typing in inputs. {modKey}K works
+            Single-key shortcuts are disabled when typing in inputs.{" "}
+            {formatHelpShortcut(SHORTCUTS_BY_ID.palette.chord, IS_MAC)} works
             everywhere.
           </p>
         </div>

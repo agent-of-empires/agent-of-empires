@@ -1,8 +1,86 @@
 fn main() {
     check_stale_build_cache();
+    emit_build_version();
 
     #[cfg(feature = "serve")]
     build_frontend();
+}
+
+/// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
+/// worker record so the daemon can tell whether a surviving worker is
+/// running the current binary or an older one (see issue #1754).
+///
+/// `CARGO_PKG_VERSION` alone is insufficient: it stays constant across
+/// many local rebuilds, so a dev who rebuilds and restarts the daemon
+/// would silently re-adopt a worker on stale code. We append a git
+/// commit identity so dev rebuilds across commits are distinguishable.
+///
+/// Source order (first hit wins):
+///   1. `AOE_BUILD_VERSION` env override (release packaging, reproducible
+///      builds, downstream packagers).
+///   2. `GITHUB_SHA` (CI builds where `.git` may be a shallow checkout).
+///   3. Local `git rev-parse` + a coarse dirty flag.
+///   4. `CARGO_PKG_VERSION` alone (source tarball without `.git`).
+///
+/// The dirty flag is intentionally coarse (a boolean suffix, not a
+/// content hash): two different uncommitted edits at the same commit read
+/// as equal. This is a respawn gate, not a cryptographic binary hash, and
+/// a content hash would force a recompile on every source save.
+fn emit_build_version() {
+    use std::process::Command;
+
+    // Re-run when the committed revision changes or an override toggles.
+    // `.git/HEAD` moves on checkout/commit; `.git/index` moves on stage.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-env-changed=AOE_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+
+    let build_version = if let Ok(explicit) = std::env::var("AOE_BUILD_VERSION") {
+        explicit
+    } else if let Ok(sha) = std::env::var("GITHUB_SHA") {
+        let short: String = sha.chars().take(12).collect();
+        format!("{pkg_version}+g{short}")
+    } else if let Some(short) = git_short_sha(&mut Command::new("git")) {
+        let dirty = git_is_dirty(&mut Command::new("git"));
+        format!(
+            "{pkg_version}+g{short}{}",
+            if dirty { "-dirty" } else { "" }
+        )
+    } else {
+        pkg_version
+    };
+
+    println!("cargo:rustc-env=AOE_BUILD_VERSION={build_version}");
+}
+
+/// Short (12-char) HEAD commit hash, or `None` when git is unavailable or
+/// this is not a git checkout (e.g. a source tarball).
+fn git_short_sha(cmd: &mut std::process::Command) -> Option<String> {
+    let out = cmd
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Coarse working-tree dirty check: any tracked or untracked change makes
+/// `git status --porcelain` print at least one line.
+fn git_is_dirty(cmd: &mut std::process::Command) -> bool {
+    match cmd.args(["status", "--porcelain"]).output() {
+        Ok(out) => out.status.success() && !out.stdout.is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Detect stale build caches by tracking Cargo.lock content hash.

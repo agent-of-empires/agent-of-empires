@@ -115,6 +115,10 @@ aoe add /path/to/primary --repo /literal/path --project registered -w branch -b
 
 `aoe list --json` includes a `workspace_repos` array for each session; the array is empty for single-repo sessions.
 
+## TUI
+
+From the home view, press `b` (or `B` with strict hotkeys) to open a filterable picker over the merged registry. Selecting a project opens the new-session dialog pre-filled with that project's path. The same action is available from the `Ctrl+K` command palette ("New session from saved project"). With no registered projects, the picker is replaced by a "No Projects" prompt pointing at `aoe project add`.
+
 ## Web Dashboard
 
 The Projects page (folder icon in the sidebar footer) is full CRUD over the registry: add, remove, switch scope, opt into `allow_override`. Read-only servers (`aoe serve --read-only`) hide the destructive controls.

@@ -22,6 +22,8 @@ pub struct ProjectResponse {
     pub name: String,
     pub path: String,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_base_branch: Option<String>,
 }
 
 impl From<Project> for ProjectResponse {
@@ -30,6 +32,7 @@ impl From<Project> for ProjectResponse {
             name: p.name,
             path: p.path,
             scope: p.scope.as_str().to_string(),
+            default_base_branch: p.default_base_branch,
         }
     }
 }
@@ -97,6 +100,11 @@ pub struct CreateProjectBody {
     /// otherwise return 409.
     #[serde(default)]
     pub allow_override: bool,
+    /// Default base branch for new worktree branches created against this
+    /// project, whether it is the launch repo or an extra repo in a multi-repo
+    /// workspace. Empty/whitespace is treated as unset.
+    #[serde(default)]
+    pub default_base_branch: Option<String>,
 }
 
 #[tracing::instrument(
@@ -168,7 +176,8 @@ pub async fn create_project(
             .unwrap_or_else(|| "project".to_string())
     });
 
-    let project = Project::new(name, canonical.to_string_lossy(), scope);
+    let project = Project::new(name, canonical.to_string_lossy(), scope)
+        .with_base_branch(body.default_base_branch);
     match projects::add(&state.profile, scope, project, body.allow_override) {
         Ok(saved) => {
             tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
@@ -270,5 +279,141 @@ pub async fn delete_project(
             )
                 .into_response()
         }
+    }
+}
+
+/// Extract the new `default_base_branch` from a PATCH body. The key is
+/// required: a plain `Option<String>` field can't enforce that because serde
+/// deserializes a missing field to `None`, indistinguishable from an explicit
+/// `null`, so a `{}` body would silently clear the stored value. Inspect the
+/// raw JSON instead. `Ok(None)` clears, `Ok(Some(_))` sets, `Err((code, msg))`
+/// is a malformed request. Empty/whitespace is normalized to unset downstream.
+fn parse_base_branch_update(
+    body: &serde_json::Value,
+) -> Result<Option<String>, (&'static str, &'static str)> {
+    match body.get("default_base_branch") {
+        None => Err((
+            "missing_field",
+            "default_base_branch is required (use null to clear)",
+        )),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(("bad_field", "default_base_branch must be a string or null")),
+    }
+}
+
+#[tracing::instrument(target = "http.api.projects", skip_all, fields(name = %name, scope = q.scope.as_deref().unwrap_or("global")))]
+pub async fn update_project(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteQuery>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected update");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let scope = match q.scope.as_deref() {
+        Some("profile") => ProjectScope::Profile,
+        Some("global") | None => ProjectScope::Global,
+        Some(other) => {
+            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_scope",
+                    "message": format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let base = match parse_base_branch_update(&body) {
+        Ok(base) => base,
+        Err((err, msg)) => {
+            tracing::warn!(target: "http.api.projects", reason = err, "rejected update");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err, "message": msg })),
+            )
+                .into_response();
+        }
+    };
+
+    match projects::update_base_branch(&state.profile, scope, &name, base) {
+        Ok(updated) => {
+            tracing::info!(target: "http.api.projects", name = %updated.name, path = %updated.path, scope = updated.scope.as_str(), "updated project");
+            (StatusCode::OK, Json(ProjectResponse::from(updated))).into_response()
+        }
+        Err(RegistryError::NotFound(msg)) => {
+            tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected update");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found", "message": msg})),
+            )
+                .into_response()
+        }
+        Err(RegistryError::Conflict(msg)) => {
+            tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected update");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "conflict", "message": msg})),
+            )
+                .into_response()
+        }
+        Err(RegistryError::Other(e)) => {
+            tracing::error!(target: "http.api.projects", error = %e, "update_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_base_branch_update;
+    use serde_json::json;
+
+    #[test]
+    fn base_branch_update_requires_the_key() {
+        // A missing key is a malformed request, not an intent to clear: this is
+        // the guard that stops a `{}` body from silently wiping the default.
+        assert_eq!(
+            parse_base_branch_update(&json!({})),
+            Err((
+                "missing_field",
+                "default_base_branch is required (use null to clear)"
+            ))
+        );
+        // null and string both parse; null/empty clears downstream, a value sets.
+        assert_eq!(
+            parse_base_branch_update(&json!({"default_base_branch": null})),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_base_branch_update(&json!({"default_base_branch": "develop"})),
+            Ok(Some("develop".to_string()))
+        );
+        // Wrong type is rejected.
+        assert_eq!(
+            parse_base_branch_update(&json!({"default_base_branch": 42})),
+            Err(("bad_field", "default_base_branch must be a string or null"))
+        );
     }
 }

@@ -54,6 +54,28 @@ impl DiffView {
         self.handle_normal_key(key)
     }
 
+    /// Route a left-click. Currently only the file-list panel accepts
+    /// click input (select the clicked file). Clicks elsewhere are
+    /// swallowed by the modal but no-op.
+    pub fn handle_click(&mut self, col: u16, row: u16) {
+        let pos = ratatui::layout::Position::from((col, row));
+        if self.file_list_inner.contains(pos) {
+            let row_in_list = (row - self.file_list_inner.y) as usize;
+            if row_in_list < self.files.len() && self.selected_file != row_in_list {
+                self.selected_file = row_in_list;
+                self.scroll_offset = 0;
+            }
+        }
+    }
+
+    /// Hover does not move the file-list selection. Otherwise pressing
+    /// j/k after a stray mouse drift would jump to whichever file the
+    /// cursor last crossed instead of advancing from the actually
+    /// selected one. Click still selects.
+    pub fn handle_hover(&mut self, _col: u16, _row: u16) -> bool {
+        false
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) -> DiffAction {
         match (key.code, key.modifiers) {
             // Close view
@@ -115,6 +137,19 @@ impl DiffView {
                 if let Err(e) = self.refresh_files() {
                     self.error_message = Some(format!("Failed to refresh: {}", e));
                 }
+                DiffAction::Continue
+            }
+
+            // Copy the selected file's repo-relative path to the clipboard
+            (KeyCode::Char('y'), _) => {
+                self.copy_selected_path();
+                DiffAction::Continue
+            }
+
+            // Toggle side-by-side (split) layout
+            (KeyCode::Char('s'), _) => {
+                self.split_view = !self.split_view;
+                self.persist_split_view();
                 DiffAction::Continue
             }
 
@@ -227,5 +262,93 @@ mod tests {
         // 'q' should close the view when no dialog
         let action = view.handle_key(key(KeyCode::Char('q')));
         assert!(matches!(action, DiffAction::Close));
+    }
+
+    fn diff_file(path: &str) -> crate::git::diff::DiffFile {
+        crate::git::diff::DiffFile {
+            path: std::path::PathBuf::from(path),
+            old_path: None,
+            status: crate::git::diff::FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn selected_path_string_returns_the_selected_file_path() {
+        let mut view = make_diff_view_no_warning();
+        view.files = vec![diff_file("src/app/foo.rs"), diff_file("README.md")];
+        view.selected_file = 1;
+        assert_eq!(view.selected_path_string().as_deref(), Some("README.md"));
+    }
+
+    #[test]
+    fn selected_path_string_is_none_without_files() {
+        let view = make_diff_view_no_warning();
+        assert_eq!(view.selected_path_string(), None);
+    }
+
+    #[test]
+    fn y_key_is_wired_and_continues() {
+        // Empty file list: the handler short-circuits before touching the
+        // clipboard, so this asserts the binding without a real clipboard write.
+        let mut view = make_diff_view_no_warning();
+        let action = view.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(action, DiffAction::Continue));
+    }
+
+    #[test]
+    fn y_key_sets_copied_confirmation() {
+        // Exercises the message path the empty-list test skips. This goes
+        // through the best-effort clipboard helper: a no-op in CI without a
+        // clipboard tool, and a local `cargo test` briefly writes the path to
+        // the system clipboard.
+        let mut view = make_diff_view_no_warning();
+        view.files = vec![diff_file("src/app/foo.rs")];
+        view.selected_file = 0;
+        let action = view.handle_key(key(KeyCode::Char('y')));
+        assert!(matches!(action, DiffAction::Continue));
+        assert_eq!(
+            view.success_message.as_deref(),
+            Some("Copied src/app/foo.rs")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn s_key_toggles_split_view() {
+        // Restore HOME/XDG on drop (even on panic) so later serial tests don't
+        // inherit a temp HOME pointing at a since-deleted directory.
+        struct EnvGuard {
+            home: Option<std::ffi::OsString>,
+            xdg: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.xdg.take() {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+        let _env = EnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg: std::env::var_os("XDG_CONFIG_HOME"),
+        };
+
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let mut view = make_diff_view_no_warning();
+        let before = view.split_view;
+        let action = view.handle_key(key(KeyCode::Char('s')));
+        assert!(matches!(action, DiffAction::Continue));
+        assert_eq!(view.split_view, !before);
     }
 }

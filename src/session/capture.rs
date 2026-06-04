@@ -79,20 +79,30 @@ fn encode_claude_project_path(project_path: &str) -> String {
 /// falling back to `~/.claude.json` if the dir scan result is stale.
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
-pub(crate) fn capture_claude_session_id(project_path: &str) -> Result<String> {
+pub(crate) fn capture_claude_session_id(
+    project_path: &str,
+    known_session_id: Option<&str>,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
     let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude")?;
     let canonical = canonicalize_or_raw(project_path);
 
-    // Source 1: most recently modified .jsonl in the project dir
-    if let Some((id, modified)) = scan_claude_project_dir(&claude_home, &canonical)? {
+    if let Some((id, modified)) =
+        scan_claude_project_dir(&claude_home, &canonical, known_session_id, exclusion)?
+    {
         let age = modified.elapsed().unwrap_or(Duration::from_secs(u64::MAX));
         if age <= Duration::from_secs(5 * 60) {
             return Ok(id);
         }
     }
 
-    // Source 2: lastSessionId from ~/.claude.json (same staleness threshold)
     if let Some(id) = read_claude_json_session_id(&canonical) {
+        if exclusion.contains(&id) {
+            return Err(anyhow::anyhow!(
+                "claude.json lastSessionId {} is excluded (claimed by another instance)",
+                id
+            ));
+        }
         let claude_json = dirs::home_dir()
             .map(|h| h.join(".claude.json"))
             .and_then(|p| std::fs::metadata(&p).ok())
@@ -108,11 +118,20 @@ pub(crate) fn capture_claude_session_id(project_path: &str) -> Result<String> {
     anyhow::bail!("No active Claude session found for {}", project_path)
 }
 
-/// Scan `~/.claude/projects/{encoded-path}/` for the most recently modified
-/// UUID-named `.jsonl` file.
+/// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
+///
+/// Tie-break:
+/// 1. anchor stale or absent → return `best` (most-recent unexcluded jsonl).
+/// 2. `best` exists, fresh, and strictly newer than the anchor → return
+///    `best`. The caller promotes `last_known` so the poller adopts the new
+///    UUID after `/clear` / `/new` / `--fork-session` mints a new jsonl.
+/// 3. otherwise → return the anchor (covers steady-state and the case where
+///    a sibling's most-recent write was filtered out by `exclusion`).
 fn scan_claude_project_dir(
     claude_home: &Path,
     project_path: &Path,
+    known: Option<&str>,
+    exclusion: &HashSet<String>,
 ) -> Result<Option<(String, std::time::SystemTime)>> {
     let dir_name = encode_claude_project_path(&project_path.to_string_lossy());
     let project_dir = claude_home.join("projects").join(&dir_name);
@@ -122,6 +141,7 @@ fn scan_claude_project_dir(
     }
 
     let mut best: Option<(String, std::time::SystemTime)> = None;
+    let mut known_hit: Option<(String, std::time::SystemTime)> = None;
 
     for entry in resilient_read_dir(&project_dir)? {
         let path = entry.path();
@@ -141,9 +161,37 @@ fn scan_claude_project_dir(
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
+        if known == Some(stem) && !exclusion.contains(stem) {
+            known_hit = Some((stem.to_string(), modified));
+        }
+
+        if exclusion.contains(stem) {
+            continue;
+        }
+
         if best.as_ref().is_none_or(|(_, t)| modified > *t) {
             best = Some((stem.to_string(), modified));
         }
+    }
+
+    if let Some((kid, kmt)) = known_hit {
+        let known_fresh = kmt
+            .elapsed()
+            .map(|age| age <= Duration::from_secs(5 * 60))
+            .unwrap_or(false);
+        if !known_fresh {
+            return Ok(best);
+        }
+        if let Some((_, bmt)) = best.as_ref() {
+            let best_fresh = bmt
+                .elapsed()
+                .map(|age| age <= Duration::from_secs(5 * 60))
+                .unwrap_or(false);
+            if best_fresh && *bmt > kmt {
+                return Ok(best);
+            }
+        }
+        return Ok(Some((kid, kmt)));
     }
 
     Ok(best)
@@ -172,115 +220,184 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 
 /// Polling closure for Claude Code session tracking on the host filesystem.
 ///
-/// Unlike other agents' poll factories, this closure does not take an
-/// `extra_excludes` set. Claude is protected from re-importing the sid
-/// `start_with_resume_fallback` just cleared by a layered chain:
-///
-/// 1. `acquire_session_id` mints a fresh UUID for Claude and assigns it
-///    to `agent_session_id` BEFORE `maybe_start_poller` runs, so the
-///    poller's `initial_known` is the new UUID, not the stale one.
-/// 2. The poller's `last_known` dedupes once Claude writes
-///    `<new_uuid>.jsonl` and the disk scan returns it.
-/// 3. The defense-in-depth guard in `apply_session_id_updates`
-///    (`tui/home/mod.rs`) drops any poller report whose sid is in
-///    `retroactive_capture_excludes`. The cascade pre-loads that set
-///    before respawning, so a race where the immediate first poll fires
-///    before Claude writes the new `.jsonl` (and therefore returns the
-///    still-fresh stale `<stale_sid>.jsonl`) is caught here.
-///
-/// The 5-minute mtime check inside `capture_claude_session_id` is an
-/// upper bound on staleness, not a stale-sid filter; a just-crashed
-/// `<stale_sid>.jsonl` has a fresh mtime and passes that check.
-///
-/// Serve-only mode never drains `result_rx` (the only consumer of
-/// `try_recv_session_update` is the TUI tick path), so the stale sid
-/// cannot reach in-memory `agent_session_id` or `sessions.json` via the
-/// poller in that mode either. The only residual effect is that
-/// `on_change` may briefly write the stale sid into the tmux env's
-/// `AOE_CAPTURED_SESSION_ID_KEY`; the next poll cycle overwrites it.
-///
-/// If you ever add a second consumer of the poller channel that
-/// bypasses `apply_session_id_updates`, replicate the
-/// `retroactive_capture_excludes` filter at the consumer or thread an
-/// `extra_excludes` set into this closure mirroring the other agents.
-pub(crate) fn claude_poll_fn(project_path: String) -> impl Fn() -> Option<String> + Send + 'static {
+/// Per tick, in order:
+/// 1. Read `/tmp/aoe-hooks/<instance_id>/session_id` (written by Claude's
+///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
+///    old, return it and skip the disk scan.
+/// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
+///    `compose_exclusion(instance_id, extra_excludes)` to skip UUIDs claimed
+///    by peers via tmux env, and the `last_known` mutex to anchor this
+///    closure to its own session even when a peer's jsonl is more recent.
+///    Each successful capture promotes `last_known` so subsequent ticks see
+///    the new anchor.
+pub(crate) fn claude_poll_fn(
+    project_path: String,
+    known_session_id: Option<String>,
+    instance_id: String,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    let last_known = std::sync::Mutex::new(known_session_id);
     move || {
-        capture_claude_session_id(&project_path)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Claude disk scan failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        // Sidecar reads are scoped per-instance: the file lives under
+        // `/tmp/aoe-hooks/<instance_id>/` so a sibling instance's hook
+        // writes cannot reach this path, which is why the read skips
+        // `compose_exclusion`. `extra_excludes` is still honored so a
+        // sidecar value matching one of this instance's cleared sids does
+        // not leak through.
+        if let Some(id) = crate::hooks::read_hook_session_id(&instance_id) {
+            if !extra_excludes.contains(&id) {
+                if let Some(validated) = validated_session_id(id) {
+                    if let Ok(mut guard) = last_known.lock() {
+                        *guard = Some(validated.clone());
+                    }
+                    return Some(validated);
+                }
+            }
+        }
+
+        let current_known = last_known.lock().ok().and_then(|g| g.clone());
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let captured = capture_claude_session_id(
+            &project_path,
+            current_known.as_deref(),
+            &exclusion,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Claude disk scan failed: {}", e))
+        .ok()
+        .and_then(validated_session_id);
+
+        if let Some(id) = captured.as_ref() {
+            if let Ok(mut guard) = last_known.lock() {
+                *guard = Some(id.clone());
+            }
+        }
+
+        captured
     }
 }
 
 /// Capture Claude Code session ID inside a Docker container.
 ///
-/// Claude in a sandboxed AoE session writes its `.jsonl` files to the
-/// container's `~/.claude/projects/{encoded-cwd}/` directory, not the host's.
-/// This shells `docker exec` into the running container to find the most
-/// recently modified UUID-named jsonl in that directory, with a 5-minute
-/// staleness guard.
+/// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
+/// `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/` newest-first via
+/// `docker exec`, wrapped in [`run_with_timeout`] (5 s) so a hung exec
+/// cannot block the poller thread, then delegates per-pane attribution to
+/// [`select_claude_session_in_container`].
 pub(crate) fn capture_claude_session_id_in_container(
     container_name: &str,
     container_cwd: &str,
+    exclusion: &HashSet<String>,
+    known_session_id: Option<&str>,
 ) -> Result<String> {
     let dir_name = encode_claude_project_path(container_cwd);
 
-    // Shell snippet:
-    //   - resolve $CLAUDE_CONFIG_DIR or $HOME/.claude
-    //   - walk projects/<encoded>/ for *.jsonl files
-    //   - keep ones with mtime within 5 minutes
-    //   - emit basename (without .jsonl) of the most recent
-    //
-    // Using POSIX `find -mmin -5` and `ls -t` to avoid GNU-only `printf '%T@ %f'`.
     let snippet = format!(
         r#"
 CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
 DIR="$CLAUDE_HOME/projects/{dir_name}"
 [ -d "$DIR" ] || exit 0
-NEWEST=$(ls -t "$DIR"/*.jsonl 2>/dev/null | head -1)
-[ -z "$NEWEST" ] && exit 0
-[ -n "$(find "$NEWEST" -mmin -5 2>/dev/null)" ] || exit 0
-basename "$NEWEST" .jsonl
+for f in $(ls -t "$DIR"/*.jsonl 2>/dev/null); do
+  [ -n "$(find "$f" -mmin -5 2>/dev/null)" ] || continue
+  basename "$f" .jsonl
+done
 "#
     );
 
-    let output = std::process::Command::new("docker")
-        .args(["exec", container_name, "sh", "-c", &snippet])
-        .output()
-        .map_err(|e| anyhow::anyhow!("docker exec failed: {}", e))?;
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["exec", container_name, "sh", "-c", &snippet]);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("docker exec returned non-zero: {}", stderr.trim());
+    let stdout_bytes = run_with_timeout(
+        cmd,
+        Duration::from_secs(5),
+        "docker exec sh (claude jsonl scan)",
+    )
+    .map_err(|e| anyhow::anyhow!("{} (container {})", e, container_name))?;
+
+    select_claude_session_in_container(&stdout_bytes, exclusion, known_session_id)
+        .map_err(|e| anyhow::anyhow!("{} (container {})", e, container_name))
+}
+
+/// Pick the active Claude session UUID from the container shell snippet's
+/// stdout.
+///
+/// Stdout is UUID basenames in newest-first order. Tie-break (mirrors
+/// [`scan_claude_project_dir`]):
+/// 1. anchor absent → return first unexcluded.
+/// 2. anchor present, an unexcluded candidate appears before it → return
+///    that candidate (active newer wins).
+/// 3. otherwise → return the anchor.
+fn select_claude_session_in_container(
+    stdout_bytes: &[u8],
+    exclusion: &HashSet<String>,
+    known: Option<&str>,
+) -> Result<String> {
+    let text = String::from_utf8_lossy(stdout_bytes);
+    let candidates: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && Uuid::parse_str(l).is_ok())
+        .map(String::from)
+        .collect();
+
+    if candidates.is_empty() {
+        anyhow::bail!("No active Claude session found in container");
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let id = stdout.trim();
-    if id.is_empty() {
-        anyhow::bail!(
-            "No active Claude session found in container {}",
-            container_name
-        );
-    }
-    if Uuid::parse_str(id).is_err() {
-        anyhow::bail!("Container returned non-UUID session ID: {:?}", id);
-    }
+    let known_pos = known.and_then(|k| {
+        if exclusion.contains(k) {
+            None
+        } else {
+            candidates.iter().position(|c| c == k)
+        }
+    });
+    let best_pos = candidates.iter().position(|c| !exclusion.contains(c));
 
-    Ok(id.to_string())
+    match (known_pos, best_pos) {
+        (None, None) => {
+            anyhow::bail!("All Claude session candidates in container are excluded")
+        }
+        (None, Some(p)) => Ok(candidates[p].clone()),
+        (Some(kp), Some(bp)) if bp < kp => Ok(candidates[bp].clone()),
+        (Some(kp), _) => Ok(candidates[kp].clone()),
+    }
 }
 
 /// Polling closure for sandboxed (Docker) Claude Code session tracking.
+///
+/// Mirrors [`claude_poll_fn`] but does not read the host hook sidecar (the
+/// in-container hook would write to the container's `/tmp/aoe-hooks/`,
+/// which the host poller cannot see without bind-mounting). Sandboxed
+/// `/clear` adoption therefore takes ≤ 1 poll tick.
 pub(crate) fn claude_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
+    known_session_id: Option<String>,
+    instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
+    let last_known = std::sync::Mutex::new(known_session_id);
     move || {
-        capture_claude_session_id_in_container(&container_name, &container_cwd)
-            .map_err(|e| tracing::debug!(target: "session.capture", "Claude container scan failed: {}", e))
-            .ok()
-            .and_then(validated_session_id)
+        let current_known = last_known.lock().ok().and_then(|g| g.clone());
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let captured = capture_claude_session_id_in_container(
+            &container_name,
+            &container_cwd,
+            &exclusion,
+            current_known.as_deref(),
+        )
+        .map_err(
+            |e| tracing::debug!(target: "session.capture", "Claude container scan failed: {}", e),
+        )
+        .ok()
+        .and_then(validated_session_id);
+
+        if let Some(id) = captured.as_ref() {
+            if let Ok(mut guard) = last_known.lock() {
+                *guard = Some(id.clone());
+            }
+        }
+
+        captured
     }
 }
 
@@ -2047,8 +2164,142 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_claude_session_prefers_known_when_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_b = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{uuid_a}.jsonl")), "a\n").unwrap();
+        let a_time = std::time::SystemTime::now() - Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_a}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(a_time))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_b}.jsonl")), "b\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", None, &HashSet::new()).unwrap(),
+            uuid_b
+        );
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new()).unwrap(),
+            uuid_b
+        );
+
+        let exclusion: HashSet<String> = std::iter::once(uuid_b.to_string()).collect();
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &exclusion).unwrap(),
+            uuid_a
+        );
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_b), &HashSet::new()).unwrap(),
+            uuid_b
+        );
+
+        let absent = "99999999-9999-9999-9999-999999999999";
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new()).unwrap(),
+            uuid_b
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_claude_session_known_but_stale_falls_back() {
+        // If our own session's file went stale (>5min), adopt the fresh
+        // most-recent rather than clinging to a dead anchor.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_known = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_fresh = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{uuid_known}.jsonl")), "k\n").unwrap();
+        let stale = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_known}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_fresh}.jsonl")), "f\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new()).unwrap(),
+            uuid_fresh
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_poll_fn_promotes_last_known_across_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_startup = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_post_fork = "11111111-2222-3333-4444-555555555555";
+        let uuid_sibling = "99999999-8888-7777-6666-555555555555";
+
+        std::fs::write(project_dir.join(format!("{uuid_startup}.jsonl")), "s\n").unwrap();
+        let stale = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_startup}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_post_fork}.jsonl")), "f\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        let extra_excludes: HashSet<String> = std::iter::once(uuid_sibling.to_string()).collect();
+        let poll = claude_poll_fn(
+            "/tmp/myproject".to_string(),
+            Some(uuid_startup.to_string()),
+            "test-instance-promote-last-known".to_string(),
+            extra_excludes,
+        );
+
+        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
+
+        std::fs::write(project_dir.join(format!("{uuid_sibling}.jsonl")), "x\n").unwrap();
+
+        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -2072,7 +2323,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert!(result.is_err(), "Agent files should not be picked up");
 
         match old_val {
@@ -2104,7 +2355,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert!(result.is_err(), "Stale session file should be rejected");
         assert!(
             result
@@ -2130,7 +2381,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert!(result.is_err(), "Empty dir should return error");
 
         match old_val {
@@ -2144,6 +2395,8 @@ mod tests {
         let result = capture_claude_session_id_in_container(
             "aoe-test-nonexistent-container-xyz",
             "/workspace/test",
+            &HashSet::new(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -3850,6 +4103,186 @@ mod tests {
         match old_xdg {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_anchor_at_position_zero() {
+        let uuid_a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_b = "11111111-2222-3333-4444-555555555555";
+        let stdout = format!("{uuid_a}\n{uuid_b}\n");
+        let id =
+            select_claude_session_in_container(stdout.as_bytes(), &HashSet::new(), Some(uuid_a))
+                .unwrap();
+        assert_eq!(id, uuid_a);
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_active_newer_wins_over_anchor() {
+        let uuid_anchor = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_newer = "11111111-2222-3333-4444-555555555555";
+        let stdout = format!("{uuid_newer}\n{uuid_anchor}\n");
+        let id = select_claude_session_in_container(
+            stdout.as_bytes(),
+            &HashSet::new(),
+            Some(uuid_anchor),
+        )
+        .unwrap();
+        assert_eq!(id, uuid_newer);
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_excluded_newest_falls_to_anchor() {
+        let uuid_anchor = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_sibling = "11111111-2222-3333-4444-555555555555";
+        let stdout = format!("{uuid_sibling}\n{uuid_anchor}\n");
+        let exclusion: HashSet<String> = std::iter::once(uuid_sibling.to_string()).collect();
+        let id =
+            select_claude_session_in_container(stdout.as_bytes(), &exclusion, Some(uuid_anchor))
+                .unwrap();
+        assert_eq!(id, uuid_anchor);
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_no_candidates_errors() {
+        let result = select_claude_session_in_container(b"", &HashSet::new(), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_all_candidates_excluded_errors() {
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let exclusion: HashSet<String> = std::iter::once(uuid.to_string()).collect();
+        let stdout = format!("{uuid}\n");
+        let result = select_claude_session_in_container(stdout.as_bytes(), &exclusion, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_no_anchor_picks_first_unexcluded() {
+        let uuid_a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_b = "11111111-2222-3333-4444-555555555555";
+        let exclusion: HashSet<String> = std::iter::once(uuid_a.to_string()).collect();
+        let stdout = format!("{uuid_a}\n{uuid_b}\n");
+        let id = select_claude_session_in_container(stdout.as_bytes(), &exclusion, None).unwrap();
+        assert_eq!(id, uuid_b);
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_ignores_non_uuid_lines() {
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let stdout = format!("\n  \nnot-a-uuid\n{uuid}\nstill-not-a-uuid\n");
+        let id =
+            select_claude_session_in_container(stdout.as_bytes(), &HashSet::new(), None).unwrap();
+        assert_eq!(id, uuid);
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_poll_fn_reads_hook_sidecar_first() {
+        let instance_id = "test_sidecar_first_path";
+        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let sidecar_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        std::fs::write(hook_dir.join("session_id"), sidecar_uuid).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let disk_uuid = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{disk_uuid}.jsonl")), "d\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        let poll = claude_poll_fn(
+            "/tmp/myproject".to_string(),
+            None,
+            instance_id.to_string(),
+            HashSet::new(),
+        );
+        assert_eq!(poll().as_deref(), Some(sidecar_uuid));
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        std::fs::remove_dir_all(&hook_dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
+        let instance_id = "test_sidecar_stale_falls_through";
+        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let stale_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let sidecar_path = hook_dir.join("session_id");
+        std::fs::write(&sidecar_path, stale_uuid).unwrap();
+        let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let disk_uuid = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{disk_uuid}.jsonl")), "d\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        let poll = claude_poll_fn(
+            "/tmp/myproject".to_string(),
+            None,
+            instance_id.to_string(),
+            HashSet::new(),
+        );
+        assert_eq!(poll().as_deref(), Some(disk_uuid));
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        std::fs::remove_dir_all(&hook_dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_claude_session_active_newer_wins_over_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_anchor = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_active = "11111111-2222-3333-4444-555555555555";
+
+        std::fs::write(project_dir.join(format!("{uuid_anchor}.jsonl")), "k\n").unwrap();
+        let anchor_time = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_anchor}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(anchor_time))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_active}.jsonl")), "a\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new())
+                .unwrap(),
+            uuid_active
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
     }
 }

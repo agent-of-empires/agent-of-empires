@@ -221,7 +221,7 @@ hotkey = "Alt+t"
     // animated spinner, every 5s on disk refresh, or on any key event).
     h.wait_for(MARKER);
 
-    // Esc returns to the agent view.
+    // Esc returns to the structured view.
     h.send_keys("Escape");
     h.wait_for_absent("Tool: echotool", Duration::from_secs(5));
 
@@ -239,8 +239,11 @@ hotkey = "Alt+t"
     );
 
     // Quit the TUI so the removal CLI can write sessions.json without
-    // racing the TUI's poller.
+    // racing the TUI's poller. `q` opens the quit confirmation (#1569),
+    // so confirm with `y` to actually exit.
     h.send_keys("q");
+    h.wait_for("Quit Agent of Empires");
+    h.send_keys("y");
     h.wait_for_exit(Duration::from_secs(5));
 
     // Remove the agent session. `perform_deletion` invokes

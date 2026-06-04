@@ -23,6 +23,7 @@ function setup(overrides?: {
   onCancel?: () => void;
   hasManagedWorktree?: boolean;
   isSandboxed?: boolean;
+  isScratch?: boolean;
 }) {
   const onConfirm = overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
   const onCancel = overrides?.onCancel ?? vi.fn();
@@ -32,6 +33,7 @@ function setup(overrides?: {
       branchName="feature/foo"
       hasManagedWorktree={overrides?.hasManagedWorktree ?? true}
       isSandboxed={overrides?.isSandboxed ?? false}
+      isScratch={overrides?.isScratch ?? false}
       cleanupDefaults={cleanupDefaults}
       onConfirm={onConfirm}
       onCancel={onCancel}
@@ -267,6 +269,69 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       delete_sandbox: false,
       force_delete: false,
     });
+  });
+
+  it("scratch session shows a Keep scratch directory checkbox that omits the field by default", () => {
+    // The checkbox is only meaningful for scratch sessions; non-scratch
+    // confirms must not carry a stray `keep_scratch` key.
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+    setup({
+      onConfirm,
+      hasManagedWorktree: false,
+      isSandboxed: false,
+      isScratch: true,
+    });
+
+    const keepCheckbox = document.querySelector(
+      '[data-testid="delete-session-checkbox-keep-scratch"]',
+    );
+    expect(keepCheckbox).toBeTruthy();
+    expect(keepCheckbox?.getAttribute("data-checked")).toBe("false");
+
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    const body = onConfirm.mock.calls[0][0];
+    expect(body.keep_scratch).toBe(false);
+  });
+
+  it("checking Keep scratch directory sends keep_scratch=true in the confirm body", () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+    setup({
+      onConfirm,
+      hasManagedWorktree: false,
+      isSandboxed: false,
+      isScratch: true,
+    });
+
+    const keepCheckbox = document.querySelector(
+      '[data-testid="delete-session-checkbox-keep-scratch"] span',
+    ) as HTMLElement;
+    expect(keepCheckbox).toBeTruthy();
+    fireEvent.click(keepCheckbox);
+
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm.mock.calls[0][0]).toMatchObject({
+      delete_worktree: false,
+      delete_branch: false,
+      delete_sandbox: false,
+      force_delete: false,
+      keep_scratch: true,
+    });
+  });
+
+  it("non-scratch session does NOT include keep_scratch in the confirm body", () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+    setup({
+      onConfirm,
+      hasManagedWorktree: false,
+      isSandboxed: false,
+      isScratch: false,
+    });
+
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm.mock.calls[0][0].keep_scratch).toBeUndefined();
   });
 
   it("restores focus to the previously focused element when the dialog unmounts", () => {
