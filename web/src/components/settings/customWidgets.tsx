@@ -39,7 +39,11 @@ async function didSave(result: Promise<boolean> | unknown): Promise<boolean> {
 export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) {
   const [themes, setThemes] = useState<string[]>([]);
   useEffect(() => {
-    fetchThemes().then(setThemes);
+    // Degrade to an empty list if the theme fetch fails; never leave an
+    // unhandled rejection.
+    fetchThemes()
+      .then(setThemes)
+      .catch(() => setThemes([]));
   }, []);
   return (
     <SelectField
