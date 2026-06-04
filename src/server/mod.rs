@@ -2043,6 +2043,16 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     #[cfg(feature = "serve")]
     let mut last_rate_limit_reap: Option<std::time::Instant> = None;
+    // Per-session reconciler respawn budget + crash-loop park set (#1945).
+    // Owned by the loop so they persist across ticks, swept against live
+    // sessions inside the reconciler.
+    #[cfg(feature = "serve")]
+    let mut acp_respawn_history: std::collections::HashMap<
+        String,
+        Vec<std::time::Instant>,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "serve")]
+    let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         interval.tick().await;
 
@@ -2176,6 +2186,8 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 &mut attempted_acp_spawns,
                 &mut last_idle_reap,
                 &mut last_rate_limit_reap,
+                &mut acp_respawn_history,
+                &mut acp_parked,
             )
             .await;
 

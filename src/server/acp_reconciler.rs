@@ -18,16 +18,54 @@
 //! lazy-install race never bites; every subsequent spawn for that
 //! agent runs in parallel. See #1088.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use super::AppState;
+
+/// Reconciler-side respawn budget. The reconciler is the only respawner
+/// for sessions with no live in-memory handle (fresh spawns and
+/// reattach-after-restart). Its sole anti-loop guard used to be the
+/// `attempted` set, which the `RetryAfterAttachTimeout` arm clears every
+/// tick, so a session stuck "registry-live-but-handshake-times-out" (or a
+/// worker that crashes seconds after a fresh spawn) respawned forever with
+/// no backoff and no visible error. We bound it the same way the
+/// supervisor's in-memory drain watchdog does (`restart_history` +
+/// `RESTART_WINDOW`): at most `RECONCILER_MAX_RESPAWNS_IN_WINDOW` resume
+/// attempts per session inside `RECONCILER_RESPAWN_WINDOW`, then park the
+/// session (publish one `AgentStartupError`) until an explicit retry. The
+/// budget is deliberately looser than the supervisor's 3/60s: the
+/// reconciler counts at the decision-to-act point (before the outcome is
+/// known), so a healthy daemon restart plus one transient blip can spend
+/// two attempts without being a loop. See #1945.
+const RECONCILER_MAX_RESPAWNS_IN_WINDOW: usize = 5;
+const RECONCILER_RESPAWN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Record a reconciler resume attempt for `id` at `now`, pruning entries
+/// older than `RECONCILER_RESPAWN_WINDOW`, and report whether the session
+/// has exhausted its respawn budget and should be parked. When the budget
+/// is already spent the attempt is not recorded (the history stays pinned
+/// at the cap and ages out naturally once the session is unparked). Pure
+/// so the policy is unit-testable without a live daemon. See #1945.
+fn record_and_check_respawn_budget(
+    history: &mut HashMap<String, Vec<Instant>>,
+    id: &str,
+    now: Instant,
+) -> bool {
+    let entry = history.entry(id.to_string()).or_default();
+    entry.retain(|t| now.duration_since(*t) < RECONCILER_RESPAWN_WINDOW);
+    if entry.len() >= RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+        return true;
+    }
+    entry.push(now);
+    false
+}
 
 /// Per-target resume outcome. Drives whether the reconciler should
 /// retry on the next tick or leave `attempted` set so the same target
@@ -36,9 +74,10 @@ use super::AppState;
 enum ResumeOutcome {
     /// Reattach succeeded; nothing else to do for this id.
     Attached,
-    /// Reattach timed out; the orphan registry entry was swept and the
-    /// reconciler should drop the id from `attempted` so the next tick
-    /// can try a fresh spawn cleanly.
+    /// Reattach timed out; the orphan registry entry was swept. The next
+    /// tick may try a fresh spawn cleanly, so the id is dropped from
+    /// `attempted`, but only while the session is under its respawn budget
+    /// (a parked session keeps the guard). See #1945.
     RetryAfterAttachTimeout,
     /// Fresh spawn finished, with or without error. `attempted` stays
     /// populated; a permanently-failing spawn (e.g. missing
@@ -86,6 +125,8 @@ pub async fn reconcile_acp_workers(
     attempted: &mut HashSet<String>,
     last_idle_reap: &mut Option<std::time::Instant>,
     last_rate_limit_reap: &mut Option<std::time::Instant>,
+    respawn_history: &mut HashMap<String, Vec<Instant>>,
+    parked: &mut HashSet<String>,
 ) {
     // Respawn build-stale workers that were adopted to drain an in-flight
     // turn (see #1754) and have since gone idle. Runs BEFORE
@@ -108,6 +149,10 @@ pub async fn reconcile_acp_workers(
     let restart_pending = state.acp_supervisor.reap_user_stopped().await;
     for id in &restart_pending {
         attempted.remove(id);
+        // `aoe acp restart` is an explicit user retry: wipe the respawn
+        // budget so a session that was crash-loop-parked gets a clean slate.
+        parked.remove(id);
+        respawn_history.remove(id);
     }
 
     // Idle auto-stop (#1689). Cadence-gated to IDLE_REAP_INTERVAL so the
@@ -170,6 +215,10 @@ pub async fn reconcile_acp_workers(
 
     let live: HashSet<&String> = raw_targets.iter().map(|t| &t.0).collect();
     attempted.retain(|id| live.contains(id));
+    // Sweep budget state for sessions that no longer exist so the maps
+    // don't grow unbounded and a recreated id starts with a clean budget.
+    parked.retain(|id| live.contains(id));
+    respawn_history.retain(|id, _| live.contains(id));
 
     // ORDERING INVARIANT: this orphan sweep MUST run before the
     // resume scheduling pass below. The capacity check counts both
@@ -204,7 +253,24 @@ pub async fn reconcile_acp_workers(
         if state.acp_supervisor.is_running(&id).await {
             // A REST-triggered spawn (POST /api/sessions or
             // /api/acp/sessions/:id/enable) already owns the worker;
-            // record the id so we don't poll is_running every tick.
+            // record the id so we don't poll is_running every tick. A live
+            // worker is also the self-healing signal for a crash-loop-parked
+            // session: the user retried via the dashboard, so wipe the
+            // budget and un-park.
+            parked.remove(&id);
+            respawn_history.remove(&id);
+            attempted.insert(id);
+            continue;
+        }
+        // Crash-loop park (#1945): a session whose worker keeps failing to
+        // come online is held parked, with the `attempted` insert below as a
+        // secondary per-tick guard. `parked` is authoritative because the
+        // restart / rate-limit reapers clear `attempted` and would otherwise
+        // un-park unintentionally. The park is released by the `is_running`
+        // branch above (explicit user retry) or when the session leaves the
+        // live set. Lost on daemon restart, which gives a genuinely-broken
+        // session one more bounded burst before re-parking; acceptable.
+        if parked.contains(&id) {
             attempted.insert(id);
             continue;
         }
@@ -234,6 +300,34 @@ pub async fn reconcile_acp_workers(
                 attempted.insert(id);
                 continue;
             }
+        }
+        // Respawn-budget gate (#1945). Count this resume decision before we
+        // know its outcome: that catches both the reattach-timeout loop and
+        // the fresh-spawn-then-crash loop (where the worker dies seconds
+        // later and re-enters once `attempted` is cleared). Over budget,
+        // park the session, surface one `AgentStartupError`, and skip.
+        if record_and_check_respawn_budget(respawn_history, &id, Instant::now()) {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                max_respawns = RECONCILER_MAX_RESPAWNS_IN_WINDOW,
+                window_secs = RECONCILER_RESPAWN_WINDOW.as_secs(),
+                "structured-view worker respawn budget exhausted; parking session"
+            );
+            if parked.insert(id.clone()) {
+                state.acp_supervisor.publish_startup_error(
+                    &id,
+                    format!(
+                        "Structured view worker failed to stay up after {} restart attempts in {}s; \
+                         auto-respawn paused. Retry from the dashboard once the underlying \
+                         issue is fixed.",
+                        RECONCILER_MAX_RESPAWNS_IN_WINDOW,
+                        RECONCILER_RESPAWN_WINDOW.as_secs(),
+                    ),
+                );
+            }
+            attempted.insert(id);
+            continue;
         }
         let store = Arc::clone(&state.acp_event_store);
         let id_owned = id.clone();
@@ -308,7 +402,13 @@ pub async fn reconcile_acp_workers(
     while let Some(result) = set.join_next().await {
         match result {
             Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
-                attempted.remove(&id);
+                // Only re-arm a retry while the session is under budget; a
+                // parked session keeps its `attempted` guard so the loop
+                // can't restart. The budget gate already counted this
+                // attempt before the task ran. See #1945.
+                if !parked.contains(&id) {
+                    attempted.remove(&id);
+                }
             }
             Ok((_, ResumeOutcome::Attached)) | Ok((_, ResumeOutcome::SpawnFinished)) => {}
             Err(e) => {
@@ -1219,6 +1319,54 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     const HOUR_MS: i64 = 3_600_000;
+
+    // --- reconciler respawn budget (#1945) ---
+
+    /// A session that keeps needing a respawn trips the budget after the
+    /// cap, stops re-arming while over budget, and self-heals once the
+    /// window elapses. This is the guard that breaks the silent crash loop.
+    #[test]
+    fn respawn_budget_parks_after_cap_and_recovers_after_window() {
+        use super::{record_and_check_respawn_budget, RECONCILER_MAX_RESPAWNS_IN_WINDOW};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let mut history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let id = "sess-loop";
+        let now = Instant::now();
+
+        // The first MAX attempts are allowed (under budget).
+        for i in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+            assert!(
+                !record_and_check_respawn_budget(&mut history, id, now),
+                "attempt {i} should be under budget"
+            );
+        }
+        // The next attempt trips the budget (park).
+        assert!(
+            record_and_check_respawn_budget(&mut history, id, now),
+            "attempt past the cap should be over budget"
+        );
+        // Over-budget calls do not record, so the window stays pinned at
+        // the cap rather than growing every tick while parked.
+        assert_eq!(history[id].len(), RECONCILER_MAX_RESPAWNS_IN_WINDOW);
+
+        // Once the window fully elapses the stale attempts prune and the
+        // session is allowed to retry again.
+        let later = now + Duration::from_secs(120);
+        assert!(
+            !record_and_check_respawn_budget(&mut history, id, later),
+            "after the window elapses the budget should reset"
+        );
+        assert_eq!(history[id].len(), 1);
+
+        // A different session shares no budget.
+        assert!(!record_and_check_respawn_budget(
+            &mut history,
+            "other-sess",
+            now
+        ));
+    }
 
     // --- build-version respawn policy (#1754) ---
 
