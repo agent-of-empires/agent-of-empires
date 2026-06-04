@@ -530,6 +530,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     void fetchAbout().then((about) => {
       if (!active) return;
       if (about) setServerAbout(about);
+      setServerAboutLoaded(true);
       reportTelemetrySeen("web");
     });
     void fetchTelemetryStatus().then((status) => {
