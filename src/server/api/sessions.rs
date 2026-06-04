@@ -3270,6 +3270,10 @@ struct DiffContext {
     /// CLI, or the TUI diff view's `b` keybind). Wins over the
     /// profile-level default and the auto-detected ref. See #970.
     base_branch_override: Option<String>,
+    /// The branch the worktree was created from, recorded at creation
+    /// time. Slots below the explicit override but above the profile
+    /// default and auto-detection. See #1951.
+    base_from_worktree: Option<String>,
 }
 
 /// Expand a session into the list of repos whose diffs the sidebar
@@ -3306,18 +3310,27 @@ async fn resolve_diff_repos(
     Ok(DiffContext {
         repos,
         base_branch_override: inst.base_branch_override.clone(),
+        base_from_worktree: inst
+            .worktree_info
+            .as_ref()
+            .and_then(|w| w.base_branch.clone()),
     })
 }
 
 /// Resolve the diff base for one repo path. Override (per-session)
-/// wins over the profile's `DiffConfig.default_branch`, which wins
-/// over auto-detection (`get_default_base_ref`). See #970.
+/// wins over the worktree's recorded base, which wins over the
+/// profile's `DiffConfig.default_branch`, which wins over
+/// auto-detection (`get_default_base_ref`). See #970, #1951.
 fn resolve_diff_base(
     override_value: Option<&str>,
+    worktree_base: Option<&str>,
     config_default: Option<&str>,
     repo_path: &std::path::Path,
 ) -> String {
     if let Some(v) = override_value.map(str::trim).filter(|v| !v.is_empty()) {
+        return v.to_string();
+    }
+    if let Some(v) = worktree_base.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
     if let Some(v) = config_default.map(str::trim).filter(|v| !v.is_empty()) {
@@ -3350,6 +3363,7 @@ pub async fn session_diff_files(
             let path = std::path::Path::new(&repo.path);
             let base_branch = resolve_diff_base(
                 ctx.base_branch_override.as_deref(),
+                ctx.base_from_worktree.as_deref(),
                 config_default.as_deref(),
                 path,
             );
@@ -3463,6 +3477,7 @@ pub async fn session_diff_file(
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
     let base_branch_override = ctx.base_branch_override.clone();
+    let base_from_worktree = ctx.base_from_worktree.clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<RichFileDiffResponse, DiffFileError> {
@@ -3478,6 +3493,7 @@ pub async fn session_diff_file(
                 .clone();
             let base_branch = resolve_diff_base(
                 base_branch_override.as_deref(),
+                base_from_worktree.as_deref(),
                 config_default.as_deref(),
                 repo_path,
             );
@@ -3801,26 +3817,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_diff_base_prefers_override_then_config_then_auto() {
+    fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
         let tmp = tempfile::tempdir().unwrap();
         // Override wins over everything.
         assert_eq!(
-            resolve_diff_base(Some("release-1.2"), Some("develop"), tmp.path()),
+            resolve_diff_base(Some("release-1.2"), None, Some("develop"), tmp.path()),
             "release-1.2"
         );
-        // Config wins when no override; empty / whitespace override falls
-        // through to the next layer.
+        // Worktree base wins after override; whitespace override falls through.
         assert_eq!(
-            resolve_diff_base(Some("   "), Some("develop"), tmp.path()),
+            resolve_diff_base(
+                Some("   "),
+                Some("worktree-base"),
+                Some("develop"),
+                tmp.path()
+            ),
+            "worktree-base"
+        );
+        // Config wins when no override and no worktree base.
+        assert_eq!(
+            resolve_diff_base(None, None, Some("develop"), tmp.path()),
             "develop"
         );
-        assert_eq!(
-            resolve_diff_base(None, Some("develop"), tmp.path()),
-            "develop"
-        );
-        // Auto-detect when neither is set. The tmp dir is not a repo so
+        // Auto-detect when nothing is set. The tmp dir is not a repo so
         // `get_default_base_ref` returns Err -> "main" fallback.
-        assert_eq!(resolve_diff_base(None, None, tmp.path()), "main");
+        assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
     }
 
     #[test]
