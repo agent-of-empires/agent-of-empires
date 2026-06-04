@@ -352,14 +352,27 @@ impl Session {
         let line_count = text.lines().count();
         let max_line = text.lines().map(str::len).max().unwrap_or(0);
 
-        // Long or multi-line messages go through the tmux paste-buffer path
-        // (load-buffer over stdin, then paste-buffer with bracketed-paste
+        // Non-trivial or multi-line messages go through the tmux paste-buffer
+        // path (load-buffer over stdin, then paste-buffer with bracketed-paste
         // markers). The per-line `send-keys -l` + ESC+CR path encodes
         // newlines as Shift+Enter, which is brittle compared to the
         // bracketed-paste contract claude-code (and most agents in raw mode)
-        // are designed to ingest; the byte threshold is a conservative cap
-        // so very long single-line payloads also take the safer path.
-        const PASTE_BYTE_THRESHOLD: usize = 2048;
+        // are designed to ingest.
+        //
+        // The threshold is intentionally small: bracketed paste is also what
+        // prevents the receiving agent's input-burst detector from treating
+        // the trailing Enter as part of the keystroke stream and inserting a
+        // newline instead of submitting. Empirically, on Mosh sessions
+        // (bracketed-paste stripped end-to-end) a single-line ~365-byte
+        // VoiceInk dictation that took the `send-keys -l` path was followed
+        // by `tmux send-keys Enter` at 0ms and the agent rendered the text
+        // but never submitted, because the Enter arrived inside the burst
+        // window. Routing anything beyond a handful of characters through
+        // the bracketed-paste path frames it as a paste, after which the
+        // trailing Enter reliably submits. See gemini-cli#26114 for
+        // independent confirmation that claude-code handles paste correctly
+        // only when bracketed-paste markers are present.
+        const PASTE_BYTE_THRESHOLD: usize = 16;
         let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
 
         tracing::debug!(target: "tmux.command",
