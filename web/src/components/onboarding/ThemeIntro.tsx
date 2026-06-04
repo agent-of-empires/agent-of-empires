@@ -6,7 +6,7 @@ const PANEL = "hidden lg:flex lg:w-64 lg:flex-col gap-2 bg-surface-900/40 p-4";
 const PANEL_LABEL =
   "text-[10px] font-medium uppercase tracking-wide text-text-muted";
 
-/** Static cockpit-style preview: a couple of turns plus the composer. Built
+/** Static acp-style preview: a couple of turns plus the composer. Built
  *  from the same theme tokens the real surfaces use, so it repaints with the
  *  selected theme and shows the user what a session looks like. Decorative and
  *  aria-hidden; the live theme grid is the only interactive control. */

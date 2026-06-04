@@ -3,12 +3,12 @@
 //! Provides an embedded axum web server that serves a responsive dashboard
 //! for monitoring and interacting with agent sessions from any browser.
 
+#[cfg(feature = "serve")]
+pub mod acp_reconciler;
+#[cfg(feature = "serve")]
+pub mod acp_ws;
 pub mod api;
 pub mod auth;
-#[cfg(feature = "serve")]
-pub mod cockpit_reconciler;
-#[cfg(feature = "serve")]
-pub mod cockpit_ws;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -31,14 +31,14 @@ use tracing::{info, Instrument};
 use self::push::{PushState, StatusChange, STATUS_CHANNEL_CAPACITY};
 
 #[cfg(feature = "serve")]
-const COCKPIT_CHANNEL_CAPACITY: usize = 256;
+const ACP_CHANNEL_CAPACITY: usize = 256;
 
-/// Re-export of the broadcast frame defined in `crate::cockpit::protocol`,
+/// Re-export of the broadcast frame defined in `crate::acp::protocol`,
 /// kept under `crate::server::` so existing supervisor/WS call sites keep
 /// resolving without churn. The canonical definition lives in protocol.rs
 /// so the daemon and any client share a single source of truth.
 #[cfg(feature = "serve")]
-pub use crate::cockpit::protocol::CockpitBroadcastFrame;
+pub use crate::acp::protocol::AcpBroadcastFrame;
 
 use crate::session::Instance;
 use crate::session::Status;
@@ -297,32 +297,24 @@ pub struct AppState {
     /// Snapshot of the resolved WebConfig at startup. Consumed by the
     /// push consumer task to evaluate per-event-type defaults.
     pub web_config: crate::session::config::WebConfig,
-    /// Broadcasts cockpit events to subscribed WebSocket clients. The
+    /// Broadcasts acp events to subscribed WebSocket clients. The
     /// channel carries `(session_id, serialized event JSON)` frames so
     /// clients can filter by session. Empty when no clients are
     /// connected; senders never need to check before emitting.
     #[cfg(feature = "serve")]
-    pub cockpit_events_tx: broadcast::Sender<CockpitBroadcastFrame>,
-    /// Disk-backed cockpit event log. The single source of truth for
+    pub acp_events_tx: broadcast::Sender<AcpBroadcastFrame>,
+    /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
-    /// WS-on-connect drain reads from here, the `/cockpit/replay` REST
+    /// WS-on-connect drain reads from here, the `/acp/replay` REST
     /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
     /// from here at startup so a fresh publish gets `max_seq + 1`
     /// rather than 1.
     #[cfg(feature = "serve")]
-    pub cockpit_event_store: Arc<crate::cockpit::event_store::EventStore>,
-    /// Mirror of `config.cockpit.enabled`. Initialized at startup from
-    /// `config.toml`; the `PATCH /api/cockpit/master` endpoint persists
-    /// to disk and updates this atomic so the reconciler and REST gates
-    /// pick up the new value without an `aoe serve` restart. When false,
-    /// the reconciler skips auto-spawn and every cockpit-spawning REST
-    /// path refuses with 503.
-    #[cfg(feature = "serve")]
-    pub cockpit_master_enabled: std::sync::atomic::AtomicBool,
+    pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Owns the per-session ACP agent subprocesses.
     #[cfg(feature = "serve")]
-    pub cockpit_supervisor:
-        Arc<crate::cockpit::supervisor::Supervisor<crate::cockpit::supervisor::ChannelSink>>,
+    pub acp_supervisor:
+        Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     /// Per-tmux-session primary WebSocket client. Maps tmux session name
     /// to the client ID that most recently sent keyboard input. Only the
     /// primary client's resize messages are applied to its PTY, preventing
@@ -341,7 +333,7 @@ pub struct AppState {
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
     /// Allowlisted usage-signal counters: per-signal counts of browser reports
-    /// that a surface (web dashboard / cockpit web UI) was opened, so the next
+    /// that a surface (web dashboard / acp web UI) was opened, so the next
     /// opt-in telemetry snapshot can carry the `usage_seen` map. Monotonic
     /// counters rather than flags so the snapshot loop can decrement by exactly
     /// what it reported (like the create counter): an open that lands during an
@@ -350,21 +342,21 @@ pub struct AppState {
     /// daemon (`POST /api/telemetry/seen`), which folds the count in here.
     /// Instrumenting a new surface is one entry in `telemetry::usage_signals`.
     pub telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters,
-    /// Per-form-factor open counts for the web dashboard / cockpit, layered on
+    /// Per-form-factor open counts for the web dashboard / acp, layered on
     /// the `usage_seen` registry counts above so the snapshot can report which
     /// client classes (desktop / mobile / PWA) used each surface. The registry
     /// counts the open; a classified open additionally bumps the matching class
     /// here. An unclassified open (older frontend, no `form_factor`) is counted
     /// only by the registry. See `telemetry::form_factor` and #1883.
     pub telemetry_web_clients: FormFactorCounters,
-    pub telemetry_cockpit_clients: FormFactorCounters,
+    pub telemetry_structured_clients: FormFactorCounters,
     /// Sessions created since the last opt-in telemetry snapshot. Feeds the
     /// `session_creates_since_last_snapshot` trend counter so short-lived sessions
     /// that start and end between two snapshots are still counted. Decremented (by
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
     pub telemetry_session_creates: std::sync::atomic::AtomicU32,
-    /// Aggregate cockpit-interaction tallies for the next opt-in snapshot
+    /// Aggregate structured-interaction tallies for the next opt-in snapshot
     /// (approvals decision mix, agent/substrate switches, plan-mode, queued
     /// prompts). Same monotonic-counter, decrement-by-reported discipline as
     /// the `telemetry_*_seen` counters, so an interaction that lands during an
@@ -373,14 +365,14 @@ pub struct AppState {
     /// a partial window on a rare daemon crash is acceptable, and durability
     /// would be a deliberate cross-cutting change for all telemetry counters,
     /// not a per-feature one.
-    pub telemetry_cockpit: CockpitTelemetryCounters,
+    pub telemetry_structured: StructuredTelemetryCounters,
     /// What the most recent serve snapshot reported, held until its send is
     /// confirmed so the originating signals (the `usage_seen` counts and the
     /// create counter) are cleared only on success. The telemetry loop is the
     /// sole reader/writer, so it never overlaps an in-flight build.
     telemetry_last_reported: std::sync::Mutex<Option<ReportedServeSignals>>,
     /// Resolved when the daemon receives SIGINT/SIGTERM/SIGHUP. Long-lived
-    /// handlers (cockpit WS, terminal WS) clone this and `select!` on
+    /// handlers (acp WS, terminal WS) clone this and `select!` on
     /// `cancelled()` so they exit promptly instead of holding axum's
     /// graceful drain open until the browser tab decides to disconnect.
     /// See #1198.
@@ -595,43 +587,36 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     };
 
     #[cfg(feature = "serve")]
-    let cockpit_events_tx = broadcast::channel(COCKPIT_CHANNEL_CAPACITY).0;
+    let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     #[cfg(feature = "serve")]
-    let cockpit_master_enabled = std::sync::atomic::AtomicBool::new(config.cockpit.enabled);
-    #[cfg(feature = "serve")]
-    let cockpit_event_store = {
-        let app_dir =
-            crate::session::get_app_dir().context("cockpit event store: resolve app dir")?;
-        let db_path = app_dir.join("cockpit_events.db");
+    let acp_event_store = {
+        let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
+        let db_path = app_dir.join("acp_events.db");
         Arc::new(
-            crate::cockpit::event_store::EventStore::open(
-                &db_path,
-                config.cockpit.replay_events as usize,
-            )
-            .context("cockpit event store: open")?,
+            crate::acp::event_store::EventStore::open(&db_path, config.acp.replay_events as usize)
+                .context("acp event store: open")?,
         )
     };
     #[cfg(feature = "serve")]
-    let cockpit_supervisor = {
-        // Approval pushes are dispatched from `cockpit_event_listener`,
+    let acp_supervisor = {
+        // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
         // feeds and has `Arc<AppState>` in scope without a closure
         // dance through the supervisor. See #1038.
-        let sink = std::sync::Arc::new(crate::cockpit::supervisor::ChannelSink {
-            tx: cockpit_events_tx.clone(),
-            event_store: cockpit_event_store.clone(),
+        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
+            tx: acp_events_tx.clone(),
+            event_store: acp_event_store.clone(),
         });
-        let supervisor =
-            std::sync::Arc::new(crate::cockpit::supervisor::Supervisor::with_capacity(
-                sink,
-                config.cockpit.max_concurrent_workers,
-            ));
+        let supervisor = std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(
+            sink,
+            config.acp.max_concurrent_workers,
+        ));
         // Seed the seq counter from disk so fresh publishes don't
         // collide with restored history. Without this, after a
         // restart the first publish would be seq=1 — duplicate of
         // the row already on disk — and INSERT OR IGNORE would
         // silently drop it.
-        supervisor.hydrate_seqs(cockpit_event_store.all_session_seqs());
+        supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
 
@@ -857,42 +842,39 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
         #[cfg(feature = "serve")]
-        cockpit_events_tx: cockpit_events_tx.clone(),
+        acp_events_tx: acp_events_tx.clone(),
         #[cfg(feature = "serve")]
-        cockpit_event_store: cockpit_event_store.clone(),
+        acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
-        cockpit_master_enabled,
-        #[cfg(feature = "serve")]
-        cockpit_supervisor: cockpit_supervisor.clone(),
+        acp_supervisor: acp_supervisor.clone(),
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
-        telemetry_cockpit_clients: FormFactorCounters::default(),
+        telemetry_structured_clients: FormFactorCounters::default(),
         telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
-        telemetry_cockpit: CockpitTelemetryCounters::default(),
+        telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
     });
 
     let app = build_router(state.clone());
 
-    // Cockpit workers for persisted sessions get auto-spawned by the
+    // Acp workers for persisted sessions get auto-spawned by the
     // reconciler in `status_poll_loop`. The poll interval's first tick
     // fires immediately, so on cold startup this is equivalent to the
     // old in-place loop here, while also covering sessions added via
-    // `aoe add --cockpit` while serve is already running. The
-    // reconciler short-circuits when `cockpit.enabled = false`.
+    // `aoe add --acp` while serve is already running.
 
-    // Seed cockpit sessions' status from the on-disk event log before
+    // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
-    // `state.instances` and the cockpit_event_listener only sees
+    // `state.instances` and the acp_event_listener only sees
     // live transitions, so a session that was mid-turn when the
     // previous daemon died otherwise renders Idle until the next
     // lifecycle event arrives. See #1103.
-    seed_cockpit_statuses(state.clone()).await;
+    seed_acp_statuses(state.clone()).await;
 
     // Two-phase startup recovery. Phase A runs synchronously (acquire
     // lock, snapshot candidates, mark them in `recently_restarted`) so
@@ -905,7 +887,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
     // resolved (so the first, immediate tick reports the real `serve_mode` and a
-    // daemon whose tunnel failed to start emits nothing) and after cockpit
+    // daemon whose tunnel failed to start emits nothing) and after acp
     // status seeding plus the synchronous recovery marking (so that first tick's
     // session counts reflect the restored state rather than a half-loaded one).
     spawn_serve_snapshot_loop(state.clone());
@@ -956,8 +938,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         },
     );
 
-    // Cockpit broadcast listener: a single subscriber that handles
-    // every in-process consumer of cockpit events. Status mirroring
+    // Acp broadcast listener: a single subscriber that handles
+    // every in-process consumer of acp events. Status mirroring
     // (sidebar dot, push-notification source) and ACP-session-id
     // persistence (so `session/load` works across restart) used to be
     // two separate subscribers, which doubled the broadcast clone
@@ -966,10 +948,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     {
         let listener_state = state.clone();
         crate::task_util::spawn_supervised(
-            "server.cockpit_event_listener",
+            "server.acp_event_listener",
             crate::task_util::PanicPolicy::Log,
             async move {
-                cockpit_event_listener(listener_state).await;
+                acp_event_listener(listener_state).await;
             },
         );
     }
@@ -1088,7 +1070,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // kills the process immediately, skipping PID/URL file cleanup.
     //
     // After the signal fires the future:
-    //   1. Cancels `state.shutdown` so long-lived WS handlers (cockpit +
+    //   1. Cancels `state.shutdown` so long-lived WS handlers (acp +
     //      terminal) wake from their `select!` and close cleanly,
     //      letting `axum::serve` return promptly instead of blocking
     //      on the open WebSockets the browser hasn't disconnected.
@@ -1137,7 +1119,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 "graceful shutdown exceeded grace window, forcing exit"
             );
             // Force-exit skips the post-`axum::serve` cleanup block below
-            // (cockpit detach, tunnel SIGTERM of cloudflared, removal of
+            // (acp detach, tunnel SIGTERM of cloudflared, removal of
             // serve.passphrase). The PID file is swept by `daemon_pid`'s
             // stale-PID check on the next start, but a leftover cloudflared
             // subprocess and residual passphrase file may survive a forced
@@ -1154,12 +1136,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 
-    // Detach (but do NOT kill) every cockpit ACP worker. The per-session
-    // `aoe __cockpit-runner` shims outlive this daemon: a fresh
+    // Detach (but do NOT kill) every acp ACP worker. The per-session
+    // `aoe __acp-runner` shims outlive this daemon: a fresh
     // `aoe serve` reattaches via the reconciler on startup, so in-flight
     // turns survive `aoe serve --stop`. To actually terminate workers,
-    // use `aoe cockpit stop [--all]`.
-    cockpit_supervisor.detach_all().await;
+    // use `aoe acp stop [--all]`.
+    acp_supervisor.detach_all().await;
 
     // Clean up tunnel (cancels health monitor, then sends SIGTERM to cloudflared)
     if let Some(handle) = tunnel_handle {
@@ -1296,8 +1278,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         .route(
-            "/api/telemetry/cockpit-interaction",
-            post(api::post_telemetry_cockpit_interaction),
+            "/api/telemetry/structured-interaction",
+            post(api::post_telemetry_structured_interaction),
         )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
@@ -1309,74 +1291,58 @@ fn build_router(state: Arc<AppState>) -> Router {
 
     #[cfg(feature = "serve")]
     let app = app
-        .route("/sessions/{id}/cockpit/ws", get(cockpit_ws::cockpit_ws))
-        .route("/api/sessions/{id}/cockpit/spawn", post(api::spawn_cockpit))
-        .route("/api/sessions/{id}/cockpit", delete(api::shutdown_cockpit))
+        .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
+        .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
+        .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
-            "/api/sessions/{id}/cockpit/switch-agent",
-            post(api::switch_cockpit_agent),
+            "/api/sessions/{id}/acp/switch-agent",
+            post(api::switch_acp_agent),
         )
         .route(
-            "/api/sessions/{id}/cockpit/prompt",
+            "/api/sessions/{id}/acp/prompt",
             // Prompt bodies carry inline base64 attachments, which blow
             // past the global 1 MiB cap. Raise the limit on this route
             // only; the server-side decoded-size caps in
             // `validate_attachments` are the real guard. 28 MiB leaves
             // headroom for the 20 MiB total decoded cap plus base64's
             // ~33% overhead and JSON framing. See #1000 / #965.
-            post(api::cockpit_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+            post(api::acp_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
         )
         .route(
-            "/api/sessions/{id}/cockpit/attachments/{attachment_id}",
-            get(api::cockpit_attachment),
+            "/api/sessions/{id}/acp/attachments/{attachment_id}",
+            get(api::acp_attachment),
         )
         .route(
-            "/api/sessions/{id}/cockpit/prompt/diff-comments",
-            post(api::cockpit_prompt_diff_comments),
+            "/api/sessions/{id}/acp/prompt/diff-comments",
+            post(api::acp_prompt_diff_comments),
         )
+        .route("/api/sessions/{id}/acp/cancel", post(api::acp_cancel))
         .route(
-            "/api/sessions/{id}/cockpit/cancel",
-            post(api::cockpit_cancel),
+            "/api/sessions/{id}/acp/force_end_turn",
+            post(api::acp_force_end_turn),
         )
+        .route("/api/sessions/{id}/acp/files", get(api::acp_files))
         .route(
-            "/api/sessions/{id}/cockpit/force_end_turn",
-            post(api::cockpit_force_end_turn),
+            "/api/sessions/{id}/acp/worker-log",
+            get(api::acp_worker_log),
         )
-        .route("/api/sessions/{id}/cockpit/files", get(api::cockpit_files))
+        .route("/api/sessions/{id}/acp/replay", get(api::acp_replay))
         .route(
-            "/api/sessions/{id}/cockpit/worker-log",
-            get(api::cockpit_worker_log),
+            "/api/sessions/{id}/acp/context-primer",
+            get(api::acp_context_primer),
         )
+        .route("/api/sessions/{id}/acp/mode", post(api::acp_set_mode))
         .route(
-            "/api/sessions/{id}/cockpit/replay",
-            get(api::cockpit_replay),
+            "/api/sessions/{id}/acp/config-option",
+            post(api::acp_set_config_option),
         )
+        .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
+        .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
         .route(
-            "/api/sessions/{id}/cockpit/context-primer",
-            get(api::cockpit_context_primer),
-        )
-        .route(
-            "/api/sessions/{id}/cockpit/mode",
-            post(api::cockpit_set_mode),
-        )
-        .route(
-            "/api/sessions/{id}/cockpit/config-option",
-            post(api::cockpit_set_config_option),
-        )
-        .route(
-            "/api/sessions/{id}/cockpit/enable",
-            post(api::cockpit_enable),
-        )
-        .route(
-            "/api/sessions/{id}/cockpit/disable",
-            post(api::cockpit_disable),
-        )
-        .route(
-            "/api/sessions/{id}/cockpit/approvals/{nonce}",
+            "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
-        .route("/api/cockpit/master", patch(api::set_cockpit_master))
-        .route("/api/cockpit/agents", get(api::list_cockpit_agents));
+        .route("/api/acp/agents", get(api::list_acp_agents));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -1790,7 +1756,7 @@ fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     });
 }
 
-/// Per-form-factor open counters for one web surface (dashboard or cockpit).
+/// Per-form-factor open counters for one web surface (dashboard or acp).
 /// A fixed, lock-free set over the closed [`crate::telemetry::WebClientFormFactor`]
 /// allowlist: the seen endpoint increments the matching class, the snapshot
 /// reads exact counts, and a confirmed send decrements by exactly what it
@@ -1894,7 +1860,7 @@ impl FormFactorCounts {
     }
 }
 
-/// Daemon-side cockpit-interaction tallies for the next opt-in snapshot. Each
+/// Daemon-side structured-interaction tallies for the next opt-in snapshot. Each
 /// is a monotonic `AtomicU32` consumed with the same decrement-by-reported
 /// discipline as `telemetry_*_seen`, so an interaction that lands during an
 /// in-flight send rolls into the next snapshot instead of being dropped.
@@ -1903,12 +1869,12 @@ impl FormFactorCounts {
 /// snapshot reports the boolean `count > 0`, but consuming it by subtracting
 /// the reported amount keeps a plan-mode entry that arrived mid-send.
 #[derive(Default)]
-pub struct CockpitTelemetryCounters {
+pub struct StructuredTelemetryCounters {
     pub approvals_allow: std::sync::atomic::AtomicU32,
     pub approvals_allow_always: std::sync::atomic::AtomicU32,
     pub approvals_deny: std::sync::atomic::AtomicU32,
     pub agent_switches: std::sync::atomic::AtomicU32,
-    pub substrate_toggles: std::sync::atomic::AtomicU32,
+    pub view_toggles: std::sync::atomic::AtomicU32,
     pub plan_mode_seen: std::sync::atomic::AtomicU32,
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
@@ -1919,9 +1885,9 @@ pub struct CockpitTelemetryCounters {
 struct ReportedServeSignals {
     usage_seen: std::collections::BTreeMap<String, u32>,
     web_clients: FormFactorCounts,
-    cockpit_clients: FormFactorCounts,
+    structured_clients: FormFactorCounts,
     session_creates: u32,
-    cockpit: ReportedCockpitCounts,
+    acp: ReportedAcpCounts,
 }
 
 /// The raw `AtomicU32` values a snapshot folded in, kept so each can be
@@ -1929,12 +1895,12 @@ struct ReportedServeSignals {
 /// is the raw count (not the reported boolean) so a plan-mode entry that
 /// arrived mid-send is preserved rather than wiped.
 #[derive(Default, Clone, Copy)]
-struct ReportedCockpitCounts {
+struct ReportedAcpCounts {
     approvals_allow: u32,
     approvals_allow_always: u32,
     approvals_deny: u32,
     agent_switches: u32,
-    substrate_toggles: u32,
+    view_toggles: u32,
     plan_mode: u32,
     prompts_queued: u32,
 }
@@ -1948,7 +1914,7 @@ struct ReportedCockpitCounts {
 /// The live read is also folded into `aggregator` as the flush-moment sample,
 /// then the window's peak concurrency and distinct-sessions-seen maps override
 /// the point-in-time defaults `build_usage_snapshot` produced (#1870). The
-/// point-in-time `session_total` and status/sandbox/yolo/cockpit counts keep
+/// point-in-time `session_total` and status/sandbox/yolo/acp counts keep
 /// their instant-of-flush meaning.
 async fn build_serve_snapshot(
     state: &AppState,
@@ -1957,26 +1923,26 @@ async fn build_serve_snapshot(
     use std::sync::atomic::Ordering;
     let usage_seen = state.telemetry_usage_seen.snapshot();
     let web_clients = state.telemetry_web_clients.read();
-    let cockpit_clients = state.telemetry_cockpit_clients.read();
+    let structured_clients = state.telemetry_structured_clients.read();
     let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
-    let c = &state.telemetry_cockpit;
-    let reported_cockpit = ReportedCockpitCounts {
+    let c = &state.telemetry_structured;
+    let reported_acp = ReportedAcpCounts {
         approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
         approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
         approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
         agent_switches: c.agent_switches.load(Ordering::Relaxed),
-        substrate_toggles: c.substrate_toggles.load(Ordering::Relaxed),
+        view_toggles: c.view_toggles.load(Ordering::Relaxed),
         plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
         prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
     };
-    let cockpit = crate::telemetry::CockpitInteractionCounts {
-        approvals_allow: reported_cockpit.approvals_allow,
-        approvals_allow_always: reported_cockpit.approvals_allow_always,
-        approvals_deny: reported_cockpit.approvals_deny,
-        agent_switches: reported_cockpit.agent_switches,
-        substrate_toggles: reported_cockpit.substrate_toggles,
-        plan_mode_seen: reported_cockpit.plan_mode > 0,
-        prompts_queued: reported_cockpit.prompts_queued,
+    let acp = crate::telemetry::StructuredInteractionCounts {
+        approvals_allow: reported_acp.approvals_allow,
+        approvals_allow_always: reported_acp.approvals_allow_always,
+        approvals_deny: reported_acp.approvals_deny,
+        agent_switches: reported_acp.agent_switches,
+        view_toggles: reported_acp.view_toggles,
+        plan_mode_seen: reported_acp.plan_mode > 0,
+        prompts_queued: reported_acp.prompts_queued,
     };
     let instances = state.instances.read().await.clone();
     aggregator.sample(&instances);
@@ -1987,22 +1953,22 @@ async fn build_serve_snapshot(
         session_creates,
         Some(state.auth_mode),
         Some(state.serve_mode),
-        &cockpit,
+        &acp,
     )?;
     // Layer the per-form-factor was-seen maps onto the snapshot. They are serve
     // only (the browser surfaces), so the pure builder leaves them empty and the
     // daemon fills them here from its client counters.
     snapshot.web_clients_seen = web_clients.seen_map();
-    snapshot.cockpit_clients_seen = cockpit_clients.seen_map();
+    snapshot.structured_clients_seen = structured_clients.seen_map();
     snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
     snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
     snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
         usage_seen,
         web_clients,
-        cockpit_clients,
+        structured_clients,
         session_creates,
-        cockpit: reported_cockpit,
+        acp: reported_acp,
     });
     Some(snapshot)
 }
@@ -2024,23 +1990,23 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
     state.telemetry_usage_seen.decrement(&reported.usage_seen);
     state.telemetry_web_clients.decrement(&reported.web_clients);
     state
-        .telemetry_cockpit_clients
-        .decrement(&reported.cockpit_clients);
+        .telemetry_structured_clients
+        .decrement(&reported.structured_clients);
     decrement_reported_count(&state.telemetry_session_creates, reported.session_creates);
-    let c = &state.telemetry_cockpit;
-    let rc = reported.cockpit;
+    let c = &state.telemetry_structured;
+    let rc = reported.acp;
     decrement_reported_count(&c.approvals_allow, rc.approvals_allow);
     decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
     decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
     decrement_reported_count(&c.agent_switches, rc.agent_switches);
-    decrement_reported_count(&c.substrate_toggles, rc.substrate_toggles);
+    decrement_reported_count(&c.view_toggles, rc.view_toggles);
     decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
     decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }
 
 /// Decrement a reported telemetry counter by exactly `reported`, never by more.
 /// Subtracting the reported amount rather than `swap(0)` preserves any
-/// increments (a create, or a web/cockpit open, or a cockpit interaction) that
+/// increments (a create, or a web/acp open, or an acp interaction) that
 /// landed between the snapshot build and the confirmed send, so they roll into
 /// the next snapshot instead of being dropped. A no-op when nothing was
 /// reported.
@@ -2069,7 +2035,7 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
 async fn status_poll_loop(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     #[cfg(feature = "serve")]
-    let mut attempted_cockpit_spawns: std::collections::HashSet<String> =
+    let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     #[cfg(feature = "serve")]
     let mut last_idle_reap: Option<std::time::Instant> = None;
@@ -2124,15 +2090,15 @@ async fn status_poll_loop(state: Arc<AppState>) {
 
         if let Ok(mut instances) = updated {
             // The poll loop refreshes from disk every tick, but the
-            // cockpit_status_listener's status writes are in-memory only
+            // acp_status_listener's status writes are in-memory only
             // (status is derived from live ACP events, not persisted
             // per-event). Without re-applying them here the disk reload
-            // would silently revert cockpit sessions to whatever Status
+            // would silently revert acp sessions to whatever Status
             // was last persisted (typically Idle from spawn) and the
             // sidebar dot would never turn green after a prompt.
             #[cfg(feature = "serve")]
             {
-                type CockpitStatusOverlay = std::collections::HashMap<
+                type AcpStatusOverlay = std::collections::HashMap<
                     String,
                     (
                         Status,
@@ -2140,11 +2106,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
                         Option<chrono::DateTime<chrono::Utc>>,
                     ),
                 >;
-                let overlay: CockpitStatusOverlay = {
+                let overlay: AcpStatusOverlay = {
                     let state_instances = state.instances.read().await;
                     state_instances
                         .iter()
-                        .filter(|i| i.cockpit_mode)
+                        .filter(|i| i.is_structured())
                         .map(|i| {
                             (
                                 i.id.clone(),
@@ -2154,7 +2120,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                         .collect()
                 };
                 for inst in &mut instances {
-                    if !inst.cockpit_mode {
+                    if !inst.is_structured() {
                         continue;
                     }
                     if let Some((status, last_accessed, idle_entered)) = overlay.get(&inst.id) {
@@ -2205,9 +2171,9 @@ async fn status_poll_loop(state: Arc<AppState>) {
             }
 
             #[cfg(feature = "serve")]
-            cockpit_reconciler::reconcile_cockpit_workers(
+            acp_reconciler::reconcile_acp_workers(
                 &state,
-                &mut attempted_cockpit_spawns,
+                &mut attempted_acp_spawns,
                 &mut last_idle_reap,
                 &mut last_rate_limit_reap,
             )
@@ -2220,7 +2186,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
 }
 
 /// How often the serve daemon evaluates plain tmux sessions for idle
-/// auto-stop. Mirrors the cockpit reaper's cadence so a 2s status tick does
+/// auto-stop. Mirrors the acp reaper's cadence so a 2s status tick does
 /// not drive a storage + tmux sweep on every iteration.
 #[cfg(feature = "serve")]
 const SESSION_IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2231,7 +2197,7 @@ const SESSION_IDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::fro
 #[cfg(feature = "serve")]
 const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 
-/// Auto-stop plain (non-cockpit) tmux sessions that have been `Idle` past
+/// Auto-stop plain (non-acp) tmux sessions that have been `Idle` past
 /// their per-profile `session.auto_stop_idle_secs` (#1690). Gated to run at
 /// most once per [`SESSION_IDLE_REAP_INTERVAL`]. Each candidate is claimed
 /// under the per-profile storage lock (so a concurrently running TUI cannot
@@ -2259,7 +2225,7 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
     // map directly here would block the poll loop.
     let profiles: Vec<String> = instances
         .iter()
-        .filter(|inst| !inst.is_cockpit_mode())
+        .filter(|inst| !inst.is_structured())
         .map(|inst| inst.effective_profile())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -2487,7 +2453,7 @@ async fn daemon_startup_recovery_cascade(
             // Re-check both `is_recovery_candidate` AND tmux liveness after
             // acquiring the lock: between the snapshot and this point a
             // REST handler (e.g. ensure_session) could have toggled
-            // `cockpit_mode` OR brought the tmux pane back. Without the
+            // `structured view` OR brought the tmux pane back. Without the
             // tmux re-check, recovery would `kill_clean` a freshly-started
             // pane the user just attached to. The lock + this re-check
             // serialise against any other AoE writer.
@@ -2674,8 +2640,8 @@ async fn daemon_startup_recovery_cascade(
 /// `state.instances` once per event instead of twice for the events
 /// (e.g. `AcpSessionAssigned`) that both consumers care about.
 #[cfg(feature = "serve")]
-async fn cockpit_event_listener(state: Arc<AppState>) {
-    let mut rx = state.cockpit_events_tx.subscribe();
+async fn acp_event_listener(state: Arc<AppState>) {
+    let mut rx = state.acp_events_tx.subscribe();
     loop {
         let frame = match rx.recv().await {
             Ok(f) => f,
@@ -2686,7 +2652,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             // continue than to exit the listener entirely.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
-                    target: "cockpit.event_listener",
+                    target: "acp.event_listener",
                     skipped,
                     "broadcast lagged; status and acp_session_id may briefly desync"
                 );
@@ -2695,7 +2661,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             // Closed: AppState dropped (shutdown). Exit cleanly.
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::debug!(
-                    target: "cockpit.event_listener",
+                    target: "acp.event_listener",
                     "broadcast channel closed; listener exiting"
                 );
                 return;
@@ -2709,10 +2675,10 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
         // See #1091.
         if matches!(
             frame.event.as_ref(),
-            crate::cockpit::state::Event::UserPromptSent { .. }
+            crate::acp::state::Event::UserPromptSent { .. }
         ) {
             match state
-                .cockpit_event_store
+                .acp_event_store
                 .fired_wakeup_for_prompt(&frame.session_id, frame.seq)
             {
                 Some((at, reason)) => {
@@ -2726,7 +2692,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
                         .map(|i| i.title.clone())
                         .unwrap_or_default();
                     tracing::info!(
-                        target: "cockpit.wakeup",
+                        target: "acp.wakeup",
                         session = %session_id,
                         prompt_seq = frame.seq,
                         wake_at = %at,
@@ -2746,7 +2712,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
                 }
                 None => {
                     tracing::trace!(
-                        target: "cockpit.wakeup",
+                        target: "acp.wakeup",
                         session = %frame.session_id,
                         prompt_seq = frame.seq,
                         "UserPromptSent: no fired-wake match (regular follow-up)"
@@ -2762,13 +2728,13 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
         // the TUI/web active-session suppression; the service worker
         // still routes focused clients to an in-app toast via the
         // existing `aoe-push` postMessage path. See #1038.
-        if let crate::cockpit::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
+        if let crate::acp::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
             tokio::spawn(async move {
-                cockpit_ws::trigger_approval_push(
+                acp_ws::trigger_approval_push(
                     &state_for_push,
                     &session_id,
                     &approval_title,
@@ -2778,7 +2744,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             });
         }
 
-        let status_intent = derive_cockpit_status(frame.event.as_ref());
+        let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {
             continue;
@@ -2791,7 +2757,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
             };
-            if !inst.cockpit_mode {
+            if !inst.is_structured() {
                 continue;
             }
 
@@ -2799,7 +2765,7 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref())
         };
 
-        // Persist `cockpit_acp_session_id` to disk if the field changed.
+        // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
         if let Some(profile) = profile_to_save {
@@ -2826,14 +2792,14 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
-                        target: "cockpit.event_listener",
+                        target: "acp.event_listener",
                         session = %session_id_for_log,
                         "save after acp_session_id update: {e}"
                     );
                 }
                 Err(join_err) => {
                     tracing::warn!(
-                        target: "cockpit.event_listener",
+                        target: "acp.event_listener",
                         session = %session_id_for_log,
                         "spawn_blocking join error during acp_session_id save: {join_err}"
                     );
@@ -2843,32 +2809,32 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
     }
 }
 
-/// Seed each cockpit-enabled session's `Instance.status` from the most
+/// Seed each acp-enabled session's `Instance.status` from the most
 /// recent lifecycle event in the on-disk event log. Runs once at
-/// daemon startup, before the status poll loop and the cockpit event
+/// daemon startup, before the status poll loop and the acp event
 /// listener start, so a session that was mid-turn when the previous
 /// daemon died doesn't render Idle until the next live event arrives.
 /// Acts via the same `apply_status_intent` path as the live listener
 /// so push subscribers and the broadcast channel see the seeded
 /// transitions as ordinary StatusChange events. See #1103 (B).
 #[cfg(feature = "serve")]
-pub(crate) async fn seed_cockpit_statuses(state: Arc<AppState>) {
-    let cockpit_ids: Vec<String> = state
+pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
+    let acp_ids: Vec<String> = state
         .instances
         .read()
         .await
         .iter()
-        .filter(|i| i.cockpit_mode)
+        .filter(|i| i.is_structured())
         .map(|i| i.id.clone())
         .collect();
-    if cockpit_ids.is_empty() {
+    if acp_ids.is_empty() {
         return;
     }
-    for id in cockpit_ids {
-        let Some(event) = state.cockpit_event_store.latest_status_event(&id) else {
+    for id in acp_ids {
+        let Some(event) = state.acp_event_store.latest_status_event(&id) else {
             continue;
         };
-        let intent = derive_cockpit_status(&event);
+        let intent = derive_acp_status(&event);
         if intent.is_none() {
             continue;
         }
@@ -2890,7 +2856,7 @@ pub(crate) fn apply_status_intent(
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
     let Some(intent) = intent else { return };
-    // Don't fight terminal lifecycle states. Cockpit events keep
+    // Don't fight terminal lifecycle states. Acp events keep
     // arriving for a few ticks after a Stop/Delete, and we don't
     // want the spinner to flicker back to Running.
     if matches!(
@@ -2934,7 +2900,7 @@ pub(crate) fn apply_status_intent(
 
 /// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
 /// owning profile when sessions.json needs to be re-saved (so the new
-/// `cockpit_acp_session_id` survives daemon restart), or `None` if the
+/// `acp_session_id` survives daemon restart), or `None` if the
 /// change was a no-op or no change was emitted.
 #[cfg(feature = "serve")]
 fn apply_acp_session_change(
@@ -2944,26 +2910,26 @@ fn apply_acp_session_change(
 ) -> Option<String> {
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            if inst.cockpit_acp_session_id.as_deref() == Some(new_id.as_str()) {
+            if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
                 // Same id — already on disk, no need to rewrite.
                 return None;
             }
             tracing::info!(
-                target: "cockpit.event_listener",
+                target: "acp.event_listener",
                 session = %session_id,
                 acp_session_id = %new_id,
                 "persisting agent-assigned ACP session id"
             );
-            inst.cockpit_acp_session_id = Some(new_id.clone());
+            inst.acp_session_id = Some(new_id.clone());
         }
         AcpSessionChange::Reset(reason) => {
             tracing::info!(
-                target: "cockpit.event_listener",
+                target: "acp.event_listener",
                 session = %session_id,
                 %reason,
                 "clearing stored ACP session id after session/load failure"
             );
-            inst.cockpit_acp_session_id = None;
+            inst.acp_session_id = None;
         }
     }
     Some(inst.source_profile.clone())
@@ -2980,8 +2946,8 @@ enum AcpSessionChange {
 }
 
 #[cfg(feature = "serve")]
-fn derive_acp_session_change(event: &crate::cockpit::Event) -> Option<AcpSessionChange> {
-    use crate::cockpit::Event;
+fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChange> {
+    use crate::acp::Event;
     match event {
         Event::AcpSessionAssigned { acp_session_id } => {
             Some(AcpSessionChange::Assigned(acp_session_id.clone()))
@@ -2991,7 +2957,7 @@ fn derive_acp_session_change(event: &crate::cockpit::Event) -> Option<AcpSession
     }
 }
 
-/// What a cockpit event implies for the sidebar status. `Set` is an
+/// What an acp event implies for the sidebar status. `Set` is an
 /// unconditional transition; `HealError` only takes effect if the
 /// current status is `Error` (used to recover the sidebar from a
 /// sticky `AgentStartupError` banner after a successful respawn
@@ -3004,8 +2970,8 @@ pub(crate) enum StatusIntent {
 }
 
 #[cfg(feature = "serve")]
-pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<StatusIntent> {
-    use crate::cockpit::Event;
+pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
+    use crate::acp::Event;
     match event {
         Event::UserPromptSent { .. } | Event::ApprovalResolved { .. } => {
             Some(StatusIntent::Set(Status::Running))
@@ -3038,7 +3004,7 @@ mod tests {
     use super::*;
 
     // #1874 / #1875: a confirmed snapshot clears a reported telemetry counter
-    // (the create counter and the web/cockpit open counts all share this path)
+    // (the create counter and the web/acp open counts all share this path)
     // by exactly the value it reported, so an increment that arrives during the
     // in-flight send survives into the next snapshot instead of being reset away.
     #[test]
@@ -3101,11 +3067,11 @@ mod tests {
         );
     }
 
-    // #1888: the same decrement path carries the cockpit-interaction counters,
+    // #1888: the same decrement path carries the structured-interaction counters,
     // so an interaction that lands mid-send must survive the clear (the plan
     // mode counter shown here, which the snapshot reports as the bool count>0).
     #[test]
-    fn reported_count_decrement_preserves_concurrent_cockpit_interaction() {
+    fn reported_count_decrement_preserves_concurrent_structured_interaction() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let plan_mode = AtomicU32::new(2);
         let reported = plan_mode.load(Ordering::Relaxed);
@@ -3127,11 +3093,11 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn derive_cockpit_status_maps_terminal_events() {
-        use crate::cockpit::approvals::{ApprovalDecision, Nonce};
-        use crate::cockpit::permissions::build_approval;
-        use crate::cockpit::state::ToolCall;
-        use crate::cockpit::Event;
+    fn derive_acp_status_maps_terminal_events() {
+        use crate::acp::approvals::{ApprovalDecision, Nonce};
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
         let tool_call = ToolCall {
             id: "t".into(),
             name: "shell".into(),
@@ -3143,27 +3109,27 @@ mod tests {
             diffs: Vec::new(),
         };
         assert_eq!(
-            derive_cockpit_status(&Event::UserPromptSent {
+            derive_acp_status(&Event::UserPromptSent {
                 text: "hi".into(),
                 attachments: Vec::new(),
             }),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_cockpit_status(&Event::ApprovalRequested {
+            derive_acp_status(&Event::ApprovalRequested {
                 approval: build_approval(tool_call.clone()),
             }),
             Some(StatusIntent::Set(Status::Waiting))
         );
         assert_eq!(
-            derive_cockpit_status(&Event::ApprovalResolved {
+            derive_acp_status(&Event::ApprovalResolved {
                 nonce: Nonce("x".into()),
                 decision: ApprovalDecision::Allow,
             }),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_cockpit_status(&Event::Stopped {
+            derive_acp_status(&Event::Stopped {
                 reason: "prompt_complete".into()
             }),
             Some(StatusIntent::Set(Status::Idle))
@@ -3171,13 +3137,13 @@ mod tests {
         // Rate-limit park: NOT an error; sidebar stays grey, the
         // dedicated RateLimit banner carries the reset time. See #1281.
         assert_eq!(
-            derive_cockpit_status(&Event::Stopped {
+            derive_acp_status(&Event::Stopped {
                 reason: "rate_limited".into()
             }),
             Some(StatusIntent::Set(Status::Idle))
         );
         assert_eq!(
-            derive_cockpit_status(&Event::AgentStartupError {
+            derive_acp_status(&Event::AgentStartupError {
                 message: "boom".into()
             }),
             Some(StatusIntent::Set(Status::Error))
@@ -3185,7 +3151,7 @@ mod tests {
         // AcpSessionAssigned heals an Error banner only — never
         // clobbers an in-progress Running/Waiting turn.
         assert_eq!(
-            derive_cockpit_status(&Event::AcpSessionAssigned {
+            derive_acp_status(&Event::AcpSessionAssigned {
                 acp_session_id: "uuid".into()
             }),
             Some(StatusIntent::HealError)
@@ -3194,7 +3160,7 @@ mod tests {
         // the worker is coming back, so clear a sticky error without
         // clobbering an in-progress turn. See #1722.
         assert_eq!(
-            derive_cockpit_status(&Event::RateLimitAutoResumed {
+            derive_acp_status(&Event::RateLimitAutoResumed {
                 resets_at: chrono::Utc::now()
             }),
             Some(StatusIntent::HealError)
@@ -3204,7 +3170,7 @@ mod tests {
     #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_assigned_id() {
-        use crate::cockpit::Event;
+        use crate::acp::Event;
         let ev = Event::AcpSessionAssigned {
             acp_session_id: "uuid-1234".into(),
         };
@@ -3217,7 +3183,7 @@ mod tests {
     #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_reset_reason() {
-        use crate::cockpit::Event;
+        use crate::acp::Event;
         let ev = Event::SessionContextReset {
             reason: "session/load failed: bad id".into(),
         };
@@ -3232,7 +3198,7 @@ mod tests {
     #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_ignores_unrelated_events() {
-        use crate::cockpit::Event;
+        use crate::acp::Event;
         assert_eq!(
             derive_acp_session_change(&Event::AgentMessageChunk { text: "x".into() }),
             None
@@ -3248,15 +3214,15 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn derive_cockpit_status_ignores_streaming_and_string_events() {
-        use crate::cockpit::Event;
+    fn derive_acp_status_ignores_streaming_and_string_events() {
+        use crate::acp::Event;
         // Mid-turn events that shouldn't move the session out of Running.
         assert_eq!(
-            derive_cockpit_status(&Event::AgentMessageChunk { text: "x".into() }),
+            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }),
             None
         );
-        assert_eq!(derive_cockpit_status(&Event::ThinkingStarted), None);
-        assert_eq!(derive_cockpit_status(&Event::ThinkingEnded), None);
+        assert_eq!(derive_acp_status(&Event::ThinkingStarted), None);
+        assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
     }
 
     #[test]

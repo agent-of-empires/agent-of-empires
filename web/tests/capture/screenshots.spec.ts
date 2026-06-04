@@ -1,8 +1,8 @@
 // Documentation screenshot capture (NOT a behavior test).
 //
-// Drives a seeded `aoe serve` (and, for cockpit, a scripted fake ACP
+// Drives a seeded `aoe serve` (and, for structured view, a scripted fake ACP
 // agent) through the live harness and writes hero PNGs into
-// docs/assets/web/ and docs/assets/cockpit/. The docs reference these
+// docs/assets/web/ and docs/assets/acp/. The docs reference these
 // images; this spec is how they are regenerated.
 //
 // Run via scripts/dev/capture-web-screenshots.sh, or directly:
@@ -25,7 +25,7 @@ import {
   seedSessionViaAoeAdd,
 } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
-import { waitForCockpitView, enableCockpitAndWait } from "../helpers/cockpit";
+import { waitForStructuredView, enableStructuredViewAndWait } from "../helpers/acp";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -43,7 +43,7 @@ async function shot(page: Page, rel: string): Promise<void> {
   console.log(`captured ${rel}`);
 }
 
-// One non-cockpit serve seeded with three sessions; one of them carries
+// One non-structured view serve seeded with three sessions; one of them carries
 // uncommitted changes so the diff panel renders real hunks.
 base("web dashboard surfaces", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -144,9 +144,9 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
   }
 });
 
-// Cockpit overview + interface, driven by a scripted fake ACP agent that
+// Structured view overview + interface, driven by a scripted fake ACP agent that
 // emits a plan, agent text, and a few tool-call cards.
-const COCKPIT_SCRIPT = {
+const ACP_SCRIPT = {
   turns: [
     {
       updates: [
@@ -200,14 +200,14 @@ const COCKPIT_SCRIPT = {
   ],
 };
 
-base("cockpit surfaces", async ({ page }, testInfo) => {
-  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-cap-cockpit-"));
+base("structured view surfaces", async ({ page }, testInfo) => {
+  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-cap-acp-"));
   const scriptPath = join(scriptDir, "script.json");
-  writeFileSync(scriptPath, JSON.stringify(COCKPIT_SCRIPT));
+  writeFileSync(scriptPath, JSON.stringify(ACP_SCRIPT));
 
   const serve = await spawnAoeServe({
     authMode: "none",
-    cockpit: true,
+    acp: true,
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
@@ -221,10 +221,10 @@ base("cockpit surfaces", async ({ page }, testInfo) => {
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "wire-auth");
     if (!seeded) throw new Error("seeded session 'wire-auth' missing");
-    await enableCockpitAndWait(serve.baseUrl, seeded.id);
+    await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
-    await waitForCockpitView(page);
+    await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message|Queue a follow-up/i });
     await composer.fill("Wire auth into login() and add a health route.");
@@ -235,23 +235,23 @@ base("cockpit surfaces", async ({ page }, testInfo) => {
       .getByText(/tests pass/i)
       .first()
       .waitFor({ timeout: 20_000 });
-    await shot(page, "cockpit/overview.png");
+    await shot(page, "structured view/overview.png");
 
     // Mobile framing for the interface page (composer + cards on a phone).
     // Reload at the phone width so the layout mounts in mobile mode with
     // the sidebar collapsed, rather than mid-switch with the drawer open.
     await page.setViewportSize(MOBILE);
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
-    await waitForCockpitView(page);
+    await waitForStructuredView(page);
     // The mobile drawer mounts open; tap the content area to the right of
-    // it (the backdrop) so it slides away and the cockpit view is clear.
+    // it (the backdrop) so it slides away and the structured view is clear.
     const projects = page.getByText("Projects", { exact: true });
     if (await projects.isVisible().catch(() => false)) {
       await page.mouse.click(340, 450);
       await projects.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => {});
     }
     await page.waitForTimeout(600);
-    await shot(page, "cockpit/interface.png");
+    await shot(page, "structured view/interface.png");
   } finally {
     await serve.stop();
     rmSync(scriptDir, { recursive: true, force: true });
@@ -286,14 +286,14 @@ const APPROVAL_SCRIPT = {
   ],
 };
 
-base("cockpit approval card", async ({ page }, testInfo) => {
+base("structured view approval card", async ({ page }, testInfo) => {
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-cap-approval-"));
   const scriptPath = join(scriptDir, "script.json");
   writeFileSync(scriptPath, JSON.stringify(APPROVAL_SCRIPT));
 
   const serve = await spawnAoeServe({
     authMode: "none",
-    cockpit: true,
+    acp: true,
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
@@ -307,10 +307,10 @@ base("cockpit approval card", async ({ page }, testInfo) => {
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "approve-push");
     if (!seeded) throw new Error("seeded session 'approve-push' missing");
-    await enableCockpitAndWait(serve.baseUrl, seeded.id);
+    await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
-    await waitForCockpitView(page);
+    await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message|Queue a follow-up/i });
     await composer.fill("push my changes");
@@ -322,7 +322,7 @@ base("cockpit approval card", async ({ page }, testInfo) => {
       .first()
       .waitFor({ timeout: 20_000 });
     await page.waitForTimeout(400);
-    await shot(page, "cockpit/approval.png");
+    await shot(page, "structured view/approval.png");
   } finally {
     await serve.stop();
     rmSync(scriptDir, { recursive: true, force: true });

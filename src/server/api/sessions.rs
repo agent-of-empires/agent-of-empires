@@ -99,23 +99,24 @@ pub struct SessionResponse {
     pub notify_on_waiting: Option<bool>,
     pub notify_on_idle: Option<bool>,
     pub notify_on_error: Option<bool>,
-    /// True when this session uses ACP cockpit rendering instead of a
-    /// tmux-backed PTY. The web dashboard branches on this to pick
-    /// between the cockpit panels and the terminal view.
+    /// How this session is rendered: `structured` (ACP native rendering) or
+    /// `terminal` (tmux-backed PTY). The web dashboard branches on this to
+    /// pick the structured panels vs the terminal view.
     #[cfg(feature = "serve")]
-    pub cockpit_mode: bool,
-    /// Live cockpit worker lifecycle. `absent` for tmux sessions or
-    /// cockpit sessions whose worker has not been spawned/attached
+    #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
+    pub view: crate::session::View,
+    /// Live structured view worker lifecycle. `absent` for tmux sessions or
+    /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
     /// `running` once the supervisor holds a live worker. Drives the
     /// sidebar `Resuming…` chip and the per-session banner in the
-    /// cockpit view. See #1088.
+    /// structured view. See #1088.
     #[cfg(feature = "serve")]
-    pub cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
-    /// True when this session's agent can run in cockpit: a built-in
+    pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+    /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
-    /// declares a valid `agent_cockpit_cmd`. The web terminal view reads
-    /// this to decide whether the "switch to cockpit" affordance is
+    /// declares a valid `agent_acp_cmd`. The web terminal view reads
+    /// this to decide whether the "switch to structured view" affordance is
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
@@ -136,12 +137,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
-    /// cockpit sessions whose agent has emitted a Plan (directly via
+    /// structured view sessions whose agent has emitted a Plan (directly via
     /// ACP `SessionUpdate::Plan` or indirectly via the ExitPlanMode
     /// bridge in `acp_client::map_update_to_events`). See #1061.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_summary: Option<PlanSummary>,
-    /// Absolute RFC3339 timestamp at which the cockpit session's
+    /// Absolute RFC3339 timestamp at which the structured view session's
     /// `ScheduleWakeup` tool will fire (i.e. the next turn is expected
     /// to start). Cleared once a `UserPromptSent` lands after the
     /// scheduling tool call; the /loop skill's self-firing emits that
@@ -194,7 +195,7 @@ impl SessionResponse {
             claude_fullscreen,
             None,
             #[cfg(feature = "serve")]
-            crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            crate::acp::supervisor::AcpWorkerState::Absent,
             None,
             None,
         )
@@ -202,13 +203,12 @@ impl SessionResponse {
 
     /// Build a response with the per-session plan snapshot. Called from
     /// the REST sessions endpoint after a single bulk read of the
-    /// cockpit event store; see #1061.
+    /// structured view event store; see #1061.
     pub fn from_instance_with_plan(
         inst: &Instance,
         claude_fullscreen: bool,
         plan_summary: Option<PlanSummary>,
-        #[cfg(feature = "serve")]
-        cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
+        #[cfg(feature = "serve")] acp_worker_state: crate::acp::supervisor::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
     ) -> Self {
@@ -268,9 +268,9 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             #[cfg(feature = "serve")]
-            cockpit_mode: inst.cockpit_mode,
+            view: inst.view,
             #[cfg(feature = "serve")]
-            cockpit_worker_state,
+            acp_worker_state,
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
@@ -278,7 +278,7 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_capable: {
                 let resolved = inst
-                    .cockpit_agent
+                    .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(inst.tool.as_str());
@@ -310,8 +310,8 @@ impl SessionResponse {
 /// Project a stored `Plan` into the lightweight `PlanSummary` shape the
 /// sidebar consumes. Current step is the first non-Done entry; counts
 /// reflect the persisted step state from the agent's last PlanUpdated.
-fn plan_summary_from_plan(plan: crate::cockpit::state::Plan) -> PlanSummary {
-    use crate::cockpit::state::PlanStepStatus;
+fn plan_summary_from_plan(plan: crate::acp::state::Plan) -> PlanSummary {
+    use crate::acp::state::PlanStepStatus;
     let total = plan.steps.len() as u32;
     let completed = plan
         .steps
@@ -354,22 +354,22 @@ pub struct SessionsEnvelope {
 /// `SessionResponse.acp_capable` for built-in agents without allocating
 /// a registry per response row.
 #[cfg(feature = "serve")]
-fn builtin_acp_registry() -> &'static crate::cockpit::AgentRegistry {
-    static REG: std::sync::OnceLock<crate::cockpit::AgentRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(crate::cockpit::AgentRegistry::with_defaults)
+fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
+    static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
-/// True iff this custom agent declares a valid `agent_cockpit_cmd` in the
+/// True iff this custom agent declares a valid `agent_acp_cmd` in the
 /// given profile-resolved map. Built-in capability is handled separately
 /// in the constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
 fn custom_agent_acp_capable(
-    agent_cockpit_cmd: &std::collections::HashMap<String, String>,
+    agent_acp_cmd: &std::collections::HashMap<String, String>,
     tool: &str,
 ) -> bool {
-    agent_cockpit_cmd
+    agent_acp_cmd
         .get(tool)
-        .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(tool, cmd).is_ok())
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
@@ -378,20 +378,20 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
-    let worker_states = state.cockpit_supervisor.worker_states_snapshot().await;
+    let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     let mut sessions: Vec<SessionResponse> = instances
         .iter()
         .map(|inst| {
-            let plan_summary = if inst.cockpit_mode {
+            let plan_summary = if inst.is_structured() {
                 state
-                    .cockpit_event_store
+                    .acp_event_store
                     .latest_plan(&inst.id)
                     .map(plan_summary_from_plan)
             } else {
                 None
             };
-            let (next_wakeup_at, next_wakeup_reason) = if inst.cockpit_mode {
-                match state.cockpit_event_store.latest_pending_wakeup(&inst.id) {
+            let (next_wakeup_at, next_wakeup_reason) = if inst.is_structured() {
+                match state.acp_event_store.latest_pending_wakeup(&inst.id) {
                     Some((at, reason)) => (Some(at.to_rfc3339()), reason),
                     None => (None, None),
                 }
@@ -399,16 +399,16 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 (None, None)
             };
             #[cfg(feature = "serve")]
-            let cockpit_worker_state = worker_states
+            let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
-                .unwrap_or(crate::cockpit::supervisor::CockpitWorkerState::Absent);
+                .unwrap_or(crate::acp::supervisor::AcpWorkerState::Absent);
             SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
                 plan_summary,
                 #[cfg(feature = "serve")]
-                cockpit_worker_state,
+                acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
             )
@@ -417,25 +417,24 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
     // constructor). Cache by (profile, project_path) since repo-local
-    // config can override agent_cockpit_cmd, so each distinct pair is
+    // config can override agent_acp_cmd, so each distinct pair is
     // resolved at most once.
     #[cfg(feature = "serve")]
     {
         use std::collections::HashMap;
-        let mut cockpit_cmd_cache: HashMap<(String, String), HashMap<String, String>> =
-            HashMap::new();
+        let mut acp_cmd_cache: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             if resp.acp_capable {
                 continue;
             }
             let key = (inst.source_profile.clone(), inst.project_path.clone());
-            let map = cockpit_cmd_cache.entry(key).or_insert_with(|| {
+            let map = acp_cmd_cache.entry(key).or_insert_with(|| {
                 crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &inst.source_profile,
                     std::path::Path::new(&inst.project_path),
                 )
                 .session
-                .agent_cockpit_cmd
+                .agent_acp_cmd
             });
             resp.acp_capable = custom_agent_acp_capable(map, &inst.tool);
         }
@@ -1398,7 +1397,7 @@ pub async fn update_session_diff_base(
 // shape: read-only 403, in-memory write under `state.instance_lock`,
 // persist via `Storage::update` matching the notifications and diff-base
 // precedent above. Archive additionally tears down the tmux pane and (for
-// cockpit sessions) the supervisor's worker so the row is genuinely
+// structured view sessions) the supervisor's worker so the row is genuinely
 // parked. Mutual-exclusion invariants (e.g. archive clears pin/favorite,
 // pin clears archive+snooze) live in the `Instance` methods, so the
 // handlers never set fields directly. See #1581.
@@ -1532,7 +1531,7 @@ pub async fn update_session_archive(
 
     // Read the profile without mutating memory yet. Persisting first means
     // a storage failure returns 500 with disk and memory still in
-    // agreement, and the tmux/cockpit teardown below never fires on a write
+    // agreement, and the tmux/acp teardown below never fires on a write
     // that did not land. See #1589.
     let profile = {
         let instances = state.instances.read().await;
@@ -1566,7 +1565,7 @@ pub async fn update_session_archive(
     // Disk is durable; apply to memory and snapshot what the side effects
     // need. Clone the instance once so we can call its `kill()` method
     // outside the lock without re-borrowing.
-    let (was_cockpit_mode, inst_clone, kill_pane) = {
+    let (was_structured_view, inst_clone, kill_pane) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             tracing::error!(
@@ -1583,28 +1582,28 @@ pub async fn update_session_archive(
         }
         let response =
             SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-        let cockpit;
+        let structured_view;
         #[cfg(feature = "serve")]
         {
-            cockpit = inst.cockpit_mode;
+            structured_view = inst.is_structured();
         }
         #[cfg(not(feature = "serve"))]
         {
-            cockpit = false;
+            structured_view = false;
         }
         let inst_snap = inst.clone();
         drop(instances);
 
-        // Stash the cockpit flag + clone + response and break out to do
+        // Stash the structured-view flag + clone + response and break out to do
         // the side effects below. Return early on the non-archive path
         // because we have no work left to do; the kill_pane=false case
-        // is NOT a short-circuit because cockpit shutdown still has to
-        // run for cockpit-mode sessions (kill_pane is a tmux-only
+        // is NOT a short-circuit because structured view shutdown still has to
+        // run for structured view-mode sessions (kill_pane is a tmux-only
         // switch, per the request-body documentation).
         if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
-        (cockpit, inst_snap, body.kill_pane)
+        (structured_view, inst_snap, body.kill_pane)
     };
 
     // Best-effort tmux pane teardown for tmux-backed sessions. Mirrors
@@ -1613,8 +1612,8 @@ pub async fn update_session_archive(
     // because the on-disk archived flag is the source of truth. The
     // kill_pane=false body opt-out applies only here, so a caller can
     // archive a tmux session without killing its pane while still
-    // unconditionally stopping a cockpit worker on the other branch.
-    if !was_cockpit_mode {
+    // unconditionally stopping a structured view worker on the other branch.
+    if !was_structured_view {
         if kill_pane {
             let inst_for_kill = inst_clone.clone();
             match tokio::task::spawn_blocking(move || inst_for_kill.kill()).await {
@@ -1630,18 +1629,18 @@ pub async fn update_session_archive(
             }
         }
     } else {
-        // Cockpit sessions: shut down the worker so the supervisor's
+        // Acp sessions: shut down the worker so the supervisor's
         // reconciler does not race to respawn it. The reconciler also
-        // skips archived sessions (see cockpit_reconciler.rs), but
+        // skips archived sessions (see acp_reconciler.rs), but
         // shutting down here gives an immediate teardown rather than
         // waiting for the next poll tick. `shutdown` preserves the
         // agent transcript (no session/delete), so unarchiving resumes
         // the conversation instead of resetting it (#1710).
         #[cfg(feature = "serve")]
-        match state.cockpit_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
-                target: "cockpit.supervisor",
+                target: "acp.supervisor",
                 session = %id,
                 "shutdown during archive failed: {e}"
             ),
@@ -1707,7 +1706,7 @@ pub async fn update_session_snooze(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (was_cockpit_mode, profile) = {
+    let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1716,22 +1715,22 @@ pub async fn update_session_snooze(
             )
                 .into_response();
         };
-        let cockpit;
+        let structured_view;
         #[cfg(feature = "serve")]
         {
-            cockpit = inst.cockpit_mode;
+            structured_view = inst.is_structured();
         }
         #[cfg(not(feature = "serve"))]
         {
-            cockpit = false;
+            structured_view = false;
         }
-        (cockpit, inst.source_profile.clone())
+        (structured_view, inst.source_profile.clone())
     };
 
     let minutes = body.minutes;
 
     // Persist first; only mutate memory once disk is durable, and only fire
-    // the cockpit teardown below on a write that landed. See #1589.
+    // the structured view teardown below on a write that landed. See #1589.
     let persist_id = id.clone();
     if persist_session_update(profile, "snooze update", move |instances| {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
@@ -1763,9 +1762,9 @@ pub async fn update_session_snooze(
         }
     }
 
-    // For cockpit-mode sessions, snoozing tears down the worker the
+    // For structured view-mode sessions, snoozing tears down the worker the
     // same way archive does. Snooze is a "temporary archive" in the
-    // data model and the cockpit worker (claude-agent-acp subprocess)
+    // data model and the structured view worker (claude-agent-acp subprocess)
     // is heavy enough that keeping it idle while the row is sunk is a
     // resource hog. The reconciler skips snoozed sessions, so the
     // worker stays down until the snooze expires; the next reconciler
@@ -1775,18 +1774,18 @@ pub async fn update_session_snooze(
     // that respawn resumes the conversation instead of resetting it
     // (#1710).
     #[cfg(feature = "serve")]
-    if was_cockpit_mode && minutes.is_some() {
-        match state.cockpit_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+    if was_structured_view && minutes.is_some() {
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
-                target: "cockpit.supervisor",
+                target: "acp.supervisor",
                 session = %id,
                 "shutdown during snooze failed: {e}"
             ),
         }
     }
     #[cfg(not(feature = "serve"))]
-    let _ = was_cockpit_mode;
+    let _ = was_structured_view;
 
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -1866,20 +1865,20 @@ pub async fn delete_session(
         }
     }
 
-    // Tear down the cockpit worker FIRST so the ACP subprocess + its
+    // Tear down the structured view worker FIRST so the ACP subprocess + its
     // claude-agent-acp child don't leak past the session delete. The
     // supervisor's shutdown is best-effort: sessions without a worker
-    // (tmux-mode, or cockpit sessions whose worker never spawned)
+    // (tmux-mode, or structured view sessions whose worker never spawned)
     // return UnknownSession, which we ignore.
     #[cfg(feature = "serve")]
-    if instance.cockpit_mode {
+    if instance.is_structured() {
         // Permanent removal: release the agent's persisted transcript
         // too, since the session is going away for good. See #1710.
-        match state.cockpit_supervisor.shutdown_and_delete(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+        match state.acp_supervisor.shutdown_and_delete(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => {
                 tracing::warn!(
-                    target: "cockpit.supervisor",
+                    target: "acp.supervisor",
                     session = %id,
                     "shutdown during delete failed: {e}"
                 );
@@ -1888,12 +1887,12 @@ pub async fn delete_session(
         // Drop the per-session seq counter so a recreated session
         // with the same id (rare, but possible) starts cleanly from
         // seq=1.
-        state.cockpit_supervisor.forget_session(&id);
+        state.acp_supervisor.forget_session(&id);
         // On-disk history is the durable mirror; without this purge a
         // recreated session with the same id would inherit the deleted
         // session's transcript and the seq=1 first publish would
         // collide with a row already in the store.
-        state.cockpit_event_store.delete_session(&id);
+        state.acp_event_store.delete_session(&id);
     }
 
     // Run deletion on a blocking thread (may do git/docker/tmux operations)
@@ -2058,25 +2057,24 @@ pub struct CreateSessionBody {
     #[serde(default)]
     pub custom_instruction: Option<String>,
     pub profile: Option<String>,
-    /// Whether the new session should run in cockpit mode. The
-    /// bundled wizard always sends an explicit value (true for ACP-
-    /// capable tools when the master switch is on, false otherwise);
-    /// other API callers may omit the field, in which case it
-    /// defaults to false. Either way the value is re-gated by the
-    /// master switch below before being persisted, so a tampered
-    /// request can't escalate cockpit on past the master switch.
+    /// How the new session should render: `structured` or `terminal`. The
+    /// bundled wizard sends an explicit value (`structured` for ACP-capable
+    /// tools, `terminal` otherwise); other API callers may omit it, in which
+    /// case it defaults to `terminal`. The value is re-validated against real
+    /// ACP capability below before being persisted, so a tampered request
+    /// can't force the structured view on a non-ACP tool.
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_mode: bool,
+    pub view: crate::session::View,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_agent: Option<String>,
+    pub agent_name: Option<String>,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_model: Option<String>,
+    pub agent_model: Option<String>,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_effort: Option<String>,
+    pub agent_effort: Option<String>,
     /// Scratch session: server provisions a fresh directory under
     /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
     /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
@@ -2291,14 +2289,6 @@ pub async fn create_session(
         .collect();
     drop(instances);
 
-    // Snapshot the master-kill flag before moving into spawn_blocking
-    // so the post-spawn write path (which still needs `state`) keeps
-    // its handle.
-    #[cfg(feature = "serve")]
-    let cockpit_master_enabled = state
-        .cockpit_master_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
@@ -2375,15 +2365,15 @@ pub async fn create_session(
             }
         }
 
-        // Apply cockpit fields from the request body. cockpit_mode is
-        // silently downgraded to tmux when the master switch is off
-        // (`cockpit.enabled = false` in config.toml).
+        // Apply structured-view fields from the request body. structured_view is
+        // re-validated below against real ACP capability; non-ACP tools
+        // fall back to terminal view rather than erroring at spawn time.
         #[cfg(feature = "serve")]
-        let cockpit_effort = {
-            instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
-            instance.cockpit_agent = body.cockpit_agent;
-            let cockpit_agent_key = instance
-                .cockpit_agent
+        let agent_effort = {
+            instance.view = body.view;
+            instance.agent_name = body.agent_name;
+            let agent_key = instance
+                .agent_name
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(instance.tool.as_str())
@@ -2392,25 +2382,23 @@ pub async fn create_session(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
-            let defaults = resolved_config
-                .session
-                .cockpit_defaults_for(&cockpit_agent_key);
-            instance.cockpit_model = body
-                .cockpit_model
+            let defaults = resolved_config.session.acp_defaults_for(&agent_key);
+            instance.agent_model = body
+                .agent_model
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.model.clone()));
-            let mut cockpit_effort = body
-                .cockpit_effort
+            let mut agent_effort = body
+                .agent_effort
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.effort.clone()));
             // Don't trust the client's capability decision. Re-resolve
-            // whether this agent can actually run in cockpit; a custom
-            // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
+            // whether this agent can actually run in structured view; a custom
+            // agent without an `agent_acp_cmd` (or any non-ACP tool)
             // falls back to tmux here rather than erroring at spawn time.
-            if instance.cockpit_mode {
-                let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+            if instance.is_structured() {
+                let acp_registry = crate::acp::AgentRegistry::with_defaults();
                 let resolved = instance
-                    .cockpit_agent
+                    .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
@@ -2420,19 +2408,23 @@ pub async fn create_session(
                         std::path::Path::new(&instance.project_path),
                     )
                     .session
-                    .agent_cockpit_cmd
+                    .agent_acp_cmd
                     .get(&instance.tool)
                     .is_some_and(|cmd| {
-                        crate::cockpit::AgentSpec::from_cockpit_cmd(&instance.tool, cmd).is_ok()
+                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
                     });
-                instance.cockpit_mode = capable;
+                instance.view = if capable {
+                    crate::session::View::Structured
+                } else {
+                    crate::session::View::Terminal
+                };
             }
 
-            if !instance.cockpit_mode {
-                cockpit_effort = None;
+            if !instance.is_structured() {
+                agent_effort = None;
             }
 
-            cockpit_effort
+            agent_effort
         };
 
         // Anything that fails between here and the final `Ok(..)`
@@ -2450,12 +2442,12 @@ pub async fn create_session(
                 Ok(())
             })?;
 
-            // Cockpit-mode sessions are not backed by tmux; the cockpit
+            // Acp-mode sessions are not backed by tmux; the structured view
             // supervisor spawns the ACP agent on demand. Skip the tmux
             // `start()` to avoid creating an empty pane that no one will
             // attach to.
             #[cfg(feature = "serve")]
-            let skip_tmux_start = instance.cockpit_mode;
+            let skip_tmux_start = instance.is_structured();
             #[cfg(not(feature = "serve"))]
             let skip_tmux_start = false;
             if !skip_tmux_start {
@@ -2489,7 +2481,7 @@ pub async fn create_session(
         return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
-            cockpit_effort,
+            agent_effort,
         ));
 
         #[cfg(not(feature = "serve"))]
@@ -2499,30 +2491,30 @@ pub async fn create_session(
 
     match result {
         #[cfg(feature = "serve")]
-        Ok(Ok((instance, warnings, cockpit_effort))) => {
+        Ok(Ok((instance, warnings, agent_effort))) => {
             let mut resp = SessionResponse::from_instance(
                 &instance,
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
             if !resp.acp_capable {
-                let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
                     std::path::Path::new(&instance.project_path),
                 )
                 .session
-                .agent_cockpit_cmd;
-                resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
+                .agent_acp_cmd;
+                resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
             }
-            let cockpit_spawn_target = if instance.cockpit_mode {
+            let acp_spawn_target = if instance.is_structured() {
                 Some((
                     instance.id.clone(),
                     instance.tool.clone(),
-                    instance.cockpit_agent.clone(),
-                    instance.cockpit_model.clone(),
-                    cockpit_effort,
+                    instance.agent_name.clone(),
+                    instance.agent_model.clone(),
+                    agent_effort,
                     instance.project_path.clone(),
-                    instance.cockpit_acp_session_id.clone(),
+                    instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.command.clone(),
@@ -2552,10 +2544,10 @@ pub async fn create_session(
                 source_profile,
                 yolo_mode,
                 command,
-            )) = cockpit_spawn_target
+            )) = acp_spawn_target
             {
                 let agent = state
-                    .cockpit_supervisor
+                    .acp_supervisor
                     .pick_agent_for_tool(
                         &tool,
                         agent_override.as_deref(),
@@ -2564,13 +2556,13 @@ pub async fn create_session(
                     )
                     .await;
                 let command_override =
-                    crate::server::cockpit_reconciler::command_override_for_spawn(&tool, &command);
+                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
-                let supervisor = state.cockpit_supervisor.clone();
+                let supervisor = state.acp_supervisor.clone();
                 let state_for_check = state.clone();
                 tokio::spawn(async move {
                     let inst_lock = state_for_check.instance_lock(&id).await;
-                    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+                    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
                         &state_for_check.instances,
                         &inst_lock,
                         &id,
@@ -2582,7 +2574,7 @@ pub async fn create_session(
                         Err(e) => {
                             let message = format!("sandbox container ensure failed: {e}");
                             tracing::warn!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create failed: {message}"
                             );
@@ -2592,7 +2584,7 @@ pub async fn create_session(
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
-                        .spawn(crate::cockpit::supervisor::SpawnRequest {
+                        .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),
                             agent: agent.clone(),
                             cwd,
@@ -2614,17 +2606,18 @@ pub async fn create_session(
                             .await
                             .iter()
                             .any(|i| i.id == id);
-                        let message = format!("Failed to start cockpit agent {agent:?}: {e}");
+                        let message =
+                            format!("Failed to start structured view agent {agent:?}: {e}");
                         if still_present {
                             tracing::warn!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create failed: {message}"
                             );
                             supervisor.publish_startup_error(&id, message);
                         } else {
                             tracing::debug!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create error after session removed (ignored): {message}"
                             );
@@ -4457,9 +4450,9 @@ mod tests {
     fn step(
         id: &str,
         title: &str,
-        status: crate::cockpit::state::PlanStepStatus,
-    ) -> crate::cockpit::state::PlanStep {
-        crate::cockpit::state::PlanStep {
+        status: crate::acp::state::PlanStepStatus,
+    ) -> crate::acp::state::PlanStep {
+        crate::acp::state::PlanStep {
             id: id.into(),
             title: title.into(),
             detail: None,
@@ -4469,8 +4462,8 @@ mod tests {
 
     #[test]
     fn plan_summary_counts_done_steps_only() {
-        use crate::cockpit::state::PlanStepStatus::*;
-        let plan = crate::cockpit::state::Plan {
+        use crate::acp::state::PlanStepStatus::*;
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![
@@ -4488,10 +4481,10 @@ mod tests {
 
     #[test]
     fn plan_summary_current_step_skips_done_picks_first_non_done() {
-        use crate::cockpit::state::PlanStepStatus::*;
+        use crate::acp::state::PlanStepStatus::*;
         // First non-Done is the first Pending; InProgress later doesn't
         // override (matches the helper's `find(..)` semantics).
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![
@@ -4506,8 +4499,8 @@ mod tests {
 
     #[test]
     fn plan_summary_none_when_all_done() {
-        use crate::cockpit::state::PlanStepStatus::*;
-        let plan = crate::cockpit::state::Plan {
+        use crate::acp::state::PlanStepStatus::*;
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![step("a", "alpha", Done), step("b", "beta", Done)],
@@ -4520,9 +4513,9 @@ mod tests {
 
     #[test]
     fn plan_summary_truncates_long_current_step_title() {
-        use crate::cockpit::state::PlanStepStatus::*;
+        use crate::acp::state::PlanStepStatus::*;
         let long_title: String = "x".repeat(120);
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![step("a", &long_title, Pending)],
@@ -4535,7 +4528,7 @@ mod tests {
 
     #[test]
     fn plan_summary_empty_steps_yields_zero_total() {
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![],
@@ -4692,7 +4685,7 @@ fn default_revive() -> bool {
 enum SendKeysError {
     NotRunning,
     Transient(Status),
-    CockpitMode,
+    StructuredView,
     Tmux(anyhow::Error),
 }
 
@@ -4768,7 +4761,7 @@ pub async fn send_message(
                 Err(e) => {
                     let mapped = match e {
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
-                        EnsureReadyError::CockpitMode => SendKeysError::CockpitMode,
+                        EnsureReadyError::StructuredView => SendKeysError::StructuredView,
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
                     // ensure_pane_ready did not mutate user-visible
@@ -4780,7 +4773,7 @@ pub async fn send_message(
                     // post-cascade (Tier-2 bail: mutations committed).
                     // The Tmux outer arm syncs unconditionally and
                     // covers both shapes; the others (Transient /
-                    // CockpitMode) bail before any mutation.
+                    // StructuredView) bail before any mutation.
                     return Err(Box::new((
                         inst_owned,
                         EnsureReadyOutcome::AlreadyAlive,
@@ -4904,9 +4897,9 @@ pub async fn send_message(
                     })),
                 )
                     .into_response(),
-                SendKeysError::CockpitMode => (
+                SendKeysError::StructuredView => (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
+                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
                 )
                     .into_response(),
                 SendKeysError::Tmux(e) => {
@@ -5093,9 +5086,9 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             #[cfg(feature = "serve")]
-            cockpit_mode: false,
+            view: crate::session::View::Terminal,
             #[cfg(feature = "serve")]
-            cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             #[cfg(feature = "serve")]
             acp_capable: false,
             claude_fullscreen: false,

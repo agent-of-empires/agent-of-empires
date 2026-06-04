@@ -8,10 +8,9 @@ const PROFILES = [{ name: "main", is_default: true }];
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
-    Promise.resolve({ cockpit: {}, sandbox: {}, worktree: {} }),
+    Promise.resolve({ acp: {}, sandbox: {}, worktree: {} }),
   ),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
-  setCockpitMaster: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),

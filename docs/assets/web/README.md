@@ -1,6 +1,6 @@
-# Web dashboard & cockpit screenshots
+# Web dashboard & structured-view screenshots
 
-The PNGs in `docs/assets/web/` and `docs/assets/cockpit/` are generated,
+The PNGs in `docs/assets/web/` and `docs/assets/structured-view/` are generated,
 not hand-edited. They are captured by:
 
 ```bash
@@ -8,7 +8,7 @@ scripts/dev/capture-web-screenshots.sh
 ```
 
 which drives a seeded `aoe serve` (and a scripted fake ACP agent for the
-cockpit shots) through the live Playwright harness
+structured-view shots) through the live Playwright harness
 (`web/tests/capture/screenshots.spec.ts`, run via
 `web/playwright.capture.config.ts`).
 
@@ -34,6 +34,6 @@ cockpit shots) through the live Playwright harness
 - `web/terminal.png`: a session's agent terminal in the desktop split.
 - `web/diff.png`: the web diff view with a changed file open.
 - `web/settings.png`: the settings view and its tab groups.
-- `cockpit/overview.png`: a cockpit turn with plan, tool-call cards, agent text.
-- `cockpit/interface.png`: the cockpit composer and cards on a phone viewport.
-- `cockpit/approval.png`: a destructive-action approval card.
+- `structured-view/overview.png`: an structured-view turn with plan, tool-call cards, agent text.
+- `structured-view/interface.png`: the structured-view composer and cards on a phone viewport.
+- `structured-view/approval.png`: a destructive-action approval card.

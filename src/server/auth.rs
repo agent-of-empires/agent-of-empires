@@ -226,7 +226,7 @@ fn extract_ws_protocols(request: &Request) -> Vec<String> {
 }
 
 /// Strip a possible trailing slash from a path so suffix matches are
-/// not bypassed by `/api/sessions/123/cockpit/prompt/` (axum routes
+/// not bypassed by `/api/sessions/123/acp/prompt/` (axum routes
 /// both forms to the same handler). Cheap and explicit.
 fn normalize_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
@@ -381,7 +381,7 @@ fn log_loopback_bypass_token(client_ip: IpAddr, path: &str) {
 ///
 /// Scope is intentionally narrow: only persistent-config writes that
 /// can plant code for the owner's next session spawn. Daily-use
-/// surfaces (cockpit prompt, terminal attach, session lifecycle,
+/// surfaces (structured view prompt, terminal attach, session lifecycle,
 /// approval resolution) rely on the session cookie + device binding
 /// alone, matching the SSH model the user wanted. See discussion on
 /// #1137. The protected attack class is the persisted-tamper pattern:
@@ -624,11 +624,11 @@ pub async fn auth_middleware(
 ) -> Response {
     let client_ip = resolve_client_ip(addr, request.headers());
 
-    // Trace cockpit ws specifically so we can see whether the
-    // browser ever reached the server when the cockpit live updates
+    // Trace structured view ws specifically so we can see whether the
+    // browser ever reached the server when the structured view live updates
     // get stuck. Other ws paths (terminal) are not as load-bearing
     // for diagnostics today.
-    if request.uri().path().contains("/cockpit/ws") {
+    if request.uri().path().contains("/acp/ws") {
         let token_sources: Vec<&'static str> = extract_tokens(&request)
             .iter()
             .map(|(_, src)| match src {
@@ -644,7 +644,7 @@ pub async fn auth_middleware(
             ip = %client_ip,
             token_sources = ?token_sources,
             ws_protocol_count = ws_protocols.len(),
-            "auth_middleware entered for cockpit ws"
+            "auth_middleware entered for structured view ws"
         );
     }
 
@@ -1176,7 +1176,7 @@ mod tests {
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", loopback),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback),
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
@@ -1192,7 +1192,7 @@ mod tests {
             PassphraseWallEntryAction::Continue
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", remote),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", remote),
             PassphraseWallEntryAction::Continue
         );
 
@@ -1411,9 +1411,7 @@ mod tests {
 
         // Non-exempt: must refresh (sliding window).
         assert!(should_refresh_session_cookie("/api/sessions"));
-        assert!(should_refresh_session_cookie(
-            "/api/sessions/abc/cockpit/ws"
-        ));
+        assert!(should_refresh_session_cookie("/api/sessions/abc/acp/ws"));
         assert!(should_refresh_session_cookie("/api/settings"));
         // /api/login/elevate is gated by the session check (not
         // exempt), so its response should slide the window.
@@ -1535,21 +1533,18 @@ mod tests {
             &Method::GET,
             "/api/sessions/abc/ws-readonly"
         ));
+        assert!(!requires_elevation(&Method::GET, "/sessions/abc/acp/ws"));
         assert!(!requires_elevation(
-            &Method::GET,
-            "/sessions/abc/cockpit/ws"
+            &Method::POST,
+            "/api/sessions/abc/acp/prompt"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/prompt"
+            "/api/sessions/abc/acp/cancel"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/cancel"
-        ));
-        assert!(!requires_elevation(
-            &Method::POST,
-            "/api/sessions/abc/cockpit/approvals/nonce1"
+            "/api/sessions/abc/acp/approvals/nonce1"
         ));
         assert!(!requires_elevation(&Method::POST, "/api/sessions"));
         assert!(!requires_elevation(&Method::DELETE, "/api/sessions/abc"));

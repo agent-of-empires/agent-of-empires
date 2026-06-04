@@ -101,20 +101,17 @@ pub struct AddArgs {
     #[arg(long)]
     cmd_override: Option<String>,
 
-    /// Use cockpit mode (ACP-based native rendering) for this session.
-    /// Overrides the default-for-claude setting in cockpit config.
+    /// Render this session in the structured view (ACP-based native
+    /// rendering) instead of the default terminal view. `aoe add` defaults
+    /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
+    /// (or `--agent`) to opt into the structured rendering. Ignored for
+    /// tools with no ACP adapter.
     #[cfg(feature = "serve")]
-    #[arg(long, conflicts_with = "no_cockpit")]
-    cockpit: bool,
+    #[arg(long = "structured-view")]
+    structured_view: bool,
 
-    /// Force terminal/PTY mode for this session, overriding the
-    /// default-for-claude cockpit setting.
-    #[cfg(feature = "serve")]
-    #[arg(long = "no-cockpit", conflicts_with = "cockpit")]
-    no_cockpit: bool,
-
-    /// Pick a specific cockpit agent (e.g., aoe-agent, claude-code).
-    /// Implies --cockpit.
+    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
+    /// claude-code).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
@@ -581,121 +578,127 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Cockpit mode: explicit --cockpit overrides config; --no-cockpit
-    // forces terminal mode; otherwise honor the config default for
-    // claude on supported platforms.
-    //
-    // `cockpit.enabled = false` in config.toml is the master switch
-    // that gates `--cockpit`. The toggle lives in the web settings.
+    // View selection. The terminal view (raw tmux/PTY) is the default so the
+    // CLI matches the TUI; the web wizard is the surface that defaults to
+    // structured. `--structured-view` (or `--agent`, which names a specific
+    // ACP agent) opts into the structured rendering; a non-ACP tool always
+    // runs in the terminal view.
     #[cfg(feature = "serve")]
     {
-        let user_picked_cockpit = args.cockpit || args.agent.is_some();
-        let user_forced_terminal = args.no_cockpit;
-        if user_picked_cockpit && !config.cockpit.enabled {
+        // `--agent` is an explicit structured-view choice: the user named a
+        // specific ACP agent, so a missing adapter is a hard error rather
+        // than a silent downgrade.
+        let user_picked_agent = args.agent.is_some();
+        let user_wants_structured = args.structured_view || user_picked_agent;
+        instance.agent_name = args.agent.clone();
+        instance.agent_model = args.model.clone();
+
+        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let agent_name = pick_acp_agent_name(
+            &registry,
+            &config.session,
+            &instance.tool,
+            instance.agent_name.as_deref(),
+        );
+        // Capability is judged against the explicit `--agent` (or, with none,
+        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
+        // otherwise every tool would look ACP-capable via the bundled default
+        // and `--structured-view` could never be rejected for a non-ACP tool
+        // (it would silently substitute aoe-agent). Mirrors the server create
+        // path in `src/server/api/sessions.rs`.
+        let capability_key = instance
+            .agent_name
+            .as_deref()
+            .unwrap_or(instance.tool.as_str());
+        let acp_capable = registry.get(capability_key).is_some()
+            || config.session.agent_acp_cmd.contains_key(capability_key)
+            || config.session.agent_acp_cmd.contains_key(&instance.tool);
+
+        if user_picked_agent && !acp_capable {
             bail!(
-                "Cockpit is disabled by config (`cockpit.enabled = false` in config.toml). \
-                 Toggle it on (e.g. via the web settings) and try again, or omit --cockpit \
-                 for a tmux session."
+                "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
+                 `[session.agent_acp_cmd]` command.\n\
+                 Run `aoe acp doctor` to see configured agents, or omit --agent for a \
+                 terminal-view session."
             );
         }
-        instance.cockpit_mode = if user_forced_terminal {
-            false
-        } else if user_picked_cockpit {
-            true
-        } else {
-            config.cockpit.enabled && config.cockpit.default_for_claude && instance.tool == "claude"
-        };
-        instance.cockpit_agent = args.agent.clone();
-        instance.cockpit_model = args.model.clone();
 
-        // Precondition: cockpit sessions are only usable if the resolved
-        // ACP adapter binary is on PATH. Persisting a session whose
-        // adapter is missing produces a silent failure mode where the
-        // dashboard shows the session, the supervisor's reconciler
-        // tries to spawn, AcpClient::spawn fails with "No such file
-        // or directory", and the user sees a 404 on their first
-        // prompt. Bail at add-time with the install hint instead.
-        // `--no-cockpit` and the implicit-default branch don't trip
-        // this — only sessions the user explicitly opted into cockpit
-        // for, where missing tooling is a hard error rather than a
-        // silent fallback to tmux.
-        if instance.cockpit_mode && user_picked_cockpit {
-            // A custom agent explicitly opted into cockpit must declare an
-            // ACP command; otherwise we'd silently fall back to aoe-agent
-            // and launch the wrong thing. Fail loudly instead.
-            let has_override = instance
-                .cockpit_agent
-                .as_deref()
-                .is_some_and(|s| !s.is_empty());
-            let is_custom = config.session.custom_agents.contains_key(&instance.tool);
-            if is_custom
-                && !has_override
-                && !config
-                    .session
-                    .agent_cockpit_cmd
-                    .contains_key(&instance.tool)
-            {
-                bail!(
-                    "custom agent `{tool}` has no `agent_cockpit_cmd`, so it can't run in cockpit.\n\
-                     Add an ACP launch command under `[session.agent_cockpit_cmd]`, e.g.\n\
-                     {tool} = \"ocp run sp acp\"\n\
-                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                    tool = instance.tool
-                );
-            }
-            let registry = crate::cockpit::agent_registry::AgentRegistry::with_defaults();
-            let agent_name = pick_cockpit_agent_name(
-                &registry,
-                &config.session,
-                &instance.tool,
-                instance.cockpit_agent.as_deref(),
+        if args.structured_view && !acp_capable {
+            bail!(
+                "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
+                 Run `aoe acp doctor` to see configured agents, or drop --structured-view \
+                 for a terminal-view session.",
+                instance.tool
             );
-            // Resolve the spec from the registry (built-in) or the custom
-            // agent's configured ACP command, then verify the binary is on
-            // PATH. A missing adapter is a hard error at add-time rather
-            // than a silent 404 on the first prompt.
+        }
+
+        instance.view = if user_wants_structured && acp_capable {
+            crate::session::View::Structured
+        } else {
+            crate::session::View::Terminal
+        };
+
+        // Precondition: the structured view needs the resolved ACP adapter
+        // binary on PATH. A missing adapter would otherwise surface as a
+        // silent 404 on the first prompt. When the user explicitly named
+        // an agent (--agent) we bail; otherwise (the default path) we fall
+        // back to the terminal view with a warning so `aoe add` still
+        // succeeds on a machine without the adapter installed.
+        if instance.is_structured() {
             let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
                 Some(spec) => (spec.clone(), true),
-                None => match config.session.agent_cockpit_cmd.get(&agent_name) {
+                None => match config.session.agent_acp_cmd.get(&agent_name) {
                     Some(cmd) => (
-                        crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                        crate::acp::AgentSpec::from_acp_cmd(&agent_name, cmd)
                             .map_err(|e| anyhow::anyhow!(e))?,
                         false,
                     ),
-                    None => bail!(
-                        "cockpit agent `{agent_name}` is not in the registry.\n\
-                         Run `aoe cockpit doctor` to see configured agents."
-                    ),
+                    None => match config.session.agent_acp_cmd.get(&instance.tool) {
+                        Some(cmd) => (
+                            crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd)
+                                .map_err(|e| anyhow::anyhow!(e))?,
+                            false,
+                        ),
+                        None => unreachable!("acp_capable implies a resolvable spec"),
+                    },
                 },
             };
-            // Overlay session.agent_command_override the same way the cockpit
-            // spawn path does, so the precondition checks the binary that will
-            // actually launch (e.g. opencode-plannotator), not the bare
-            // registry binary. Without this, a user who installed only the
-            // override binary gets a false "not installed" bail. See #1910.
-            if let Some(ovr) = crate::server::cockpit_reconciler::command_override_for_spawn(
+            // Overlay session.agent_command_override the same way the agent
+            // spawn path does, so the precondition checks the binary that
+            // will actually launch (e.g. opencode-plannotator), not the
+            // bare registry binary. See #1910.
+            if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
                 &instance.command,
             ) {
-                crate::cockpit::supervisor::apply_agent_command_override(
+                crate::acp::supervisor::apply_agent_command_override(
                     &agent_name,
                     spec_from_registry,
                     &ovr,
                     &mut spec,
                 )?;
             }
-            if !crate::cli::cockpit::command_present(&spec.command) {
-                let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
+            if !crate::cli::acp::command_present(&spec.command) {
+                let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                     .unwrap_or("install via your package manager and re-run");
-                bail!(
-                    "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
-                     Install: {}\n\
-                     Or run: aoe cockpit doctor --fix\n\
-                     Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
-                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                    spec.command,
-                    hint
+                if user_picked_agent {
+                    bail!(
+                        "ACP adapter `{}` is not installed or not on $PATH.\n\
+                         Install: {}\n\
+                         Or run: aoe acp doctor --fix\n\
+                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
+                         Or use the terminal view: drop --agent / --structured-view.",
+                        spec.command,
+                        hint
+                    );
+                }
+                eprintln!(
+                    "warning: ACP adapter `{}` is not installed; this session will use the \
+                     terminal view. Install it ({}) or run `aoe acp doctor --fix`, then \
+                     switch the session to the structured view.",
+                    spec.command, hint
                 );
+                instance.view = crate::session::View::Terminal;
             }
         }
     }
@@ -910,12 +913,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     #[cfg(feature = "serve")]
-    let is_cockpit = instance.cockpit_mode;
+    let is_acp = instance.is_structured();
     #[cfg(not(feature = "serve"))]
-    let is_cockpit = false;
+    let is_acp = false;
 
-    if is_cockpit {
-        // Cockpit sessions aren't backed by tmux: their ACP worker is
+    if is_acp {
+        // Acp sessions aren't backed by tmux: their ACP worker is
         // owned by `aoe serve`'s supervisor, which the
         // status_poll_loop reconciler auto-spawns within ~2s of the
         // session appearing on disk. `--launch` and the
@@ -928,7 +931,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if args.launch {
             println!();
             println!(
-                "(--launch is a no-op for cockpit sessions; \
+                "(--launch is a no-op for structured view sessions; \
                  lifecycle is managed by `aoe serve`.)"
             );
         }
@@ -1067,11 +1070,11 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_cockpit_cmd` → legacy
+/// registry entry → custom agent with `agent_acp_cmd` → legacy
 /// (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
-fn pick_cockpit_agent_name(
-    registry: &crate::cockpit::agent_registry::AgentRegistry,
+fn pick_acp_agent_name(
+    registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,
     tool: &str,
     explicit_override: Option<&str>,
@@ -1084,7 +1087,7 @@ fn pick_cockpit_agent_name(
     if registry.get(tool).is_some() {
         return tool.to_string();
     }
-    if session.agent_cockpit_cmd.contains_key(tool) {
+    if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
     }
     if tool == "claude" {

@@ -2,9 +2,9 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
-import { clearCockpitCache } from "./hooks/useCockpit";
-import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
-import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
+import { clearAcpCache } from "./hooks/useAcpSession";
+import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
+import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
@@ -61,14 +61,14 @@ import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
-// Lazy-load the cockpit surface so non-cockpit users never download
+// Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
 // for the (currently default) tmux-only flow. The Suspense fallback
 // below covers the brief load while the chunk arrives.
-const CockpitView = lazy(() =>
-  import("./components/cockpit/CockpitView").then((m) => ({
-    default: m.CockpitView,
+const StructuredView = lazy(() =>
+  import("./components/acp/StructuredView").then((m) => ({
+    default: m.StructuredView,
   })),
 );
 import { RightPanel } from "./components/RightPanel";
@@ -238,7 +238,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const workspaces = useWorkspaces(sessions);
 
   // One-shot orphan-draft sweep once useSessions has settled its first
-  // fetch (success or null). Catches cockpit:draft:<id> keys left behind
+  // fetch (success or null). Catches acp:draft:<id> keys left behind
   // by deletions that happened in another tab or on another device since
   // the last load (#1358). The local-tab delete path calls clearDraft
   // directly so it does not need to wait for this. Gating on
@@ -378,16 +378,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     refresh: refreshDiffFiles,
   } = useDiffFiles(activeSessionId, diffPanelActive);
 
-  // Diff-viewer comments (#928). Cockpit-only and session-scoped. The
+  // Diff-viewer comments (#928). Acp-only and session-scoped. The
   // banner lives in RightPanel while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
-  const commentsEnabled = !!activeSession?.cockpit_mode;
+  const commentsEnabled = activeSession?.view === "structured";
   const commentSendEnabled =
-    commentsEnabled && activeSession?.cockpit_worker_state === "running";
+    commentsEnabled && activeSession?.acp_worker_state === "running";
   const commentSendDisabledReason = !commentsEnabled
-    ? "Diff comments require a cockpit session"
-    : "Cockpit worker is not running";
+    ? "Diff comments require an acp session"
+    : "Acp worker is not running";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 
@@ -458,7 +458,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Selecting a session in the sidebar should land focus on its canonical
   // "type here" target so the user can start typing without a second click:
-  // the cockpit composer in cockpit mode, the xterm textarea otherwise. See
+  // the acp composer in acp mode, the xterm textarea otherwise. See
   // requestSessionInputFocus for the dispatch/latch and coarse-pointer rules.
   const isCoarse = useIsCoarsePointer();
   const focusAgentInput = useCallback(
@@ -557,9 +557,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     };
   }, [serverAboutLoaded, serverAbout?.read_only]);
 
-  // Telemetry: report that the cockpit web UI was opened, folded into the
-  // daemon's next opt-in snapshot under the `usage_seen` map's `cockpit` key.
-  // `activeSession` drives both the desktop and mobile cockpit mounts, so this
+  // Telemetry: report that the acp web UI was opened, folded into the
+  // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
+  // `activeSession` drives both the desktop and mobile acp mounts, so this
   // single effect covers both layouts. Same guard as the `"web"` ping above:
   // skip until `serverAbout` loads, skip read-only servers (which can't
   // persist). The backend folds repeated pings into a monotonic open-count
@@ -567,9 +567,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // session switch are harmless. See #1882.
   useEffect(() => {
     if (!serverAboutLoaded || serverAbout?.read_only) return;
-    if (!activeSession?.cockpit_mode) return;
-    reportTelemetrySeen("cockpit");
-  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.cockpit_mode]);
+    if (activeSession?.view !== "structured") return;
+    reportTelemetrySeen("structured_view");
+  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.view]);
 
   const handleTelemetryConsent = useCallback((enabled: boolean) => {
     setTelemetryConsentNeeded(false);
@@ -606,10 +606,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    // Drop the per-session cockpit cache so a recreated session with
+    // Drop the per-session acp cache so a recreated session with
     // the same id doesn't briefly show the prior transcript on
     // remount before fetchReplay clears it.
-    clearCockpitCache(sessionId);
+    clearAcpCache(sessionId);
     // Drop the persisted composer draft for the deleted session so its
     // localStorage key doesn't linger (#1358). Cross-tab / cross-device
     // deletes go through the startup sweep instead.
@@ -665,7 +665,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [],
   );
 
-  // Open a local file reference cited in a cockpit transcript (Codex
+  // Open a local file reference cited in an acp transcript (Codex
   // `path:line` markdown links). Resolve the absolute path back to a
   // repo-relative path for the active session and open it in the in-app
   // diff/file viewer, keeping the current session route. A path outside
@@ -851,7 +851,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
         // wizard, settings, help, file viewer). Never wire this to
-        // cockpit.cancelPrompt; Claude Code CLI does that and stray
+        // acp.cancelPrompt; Claude Code CLI does that and stray
         // Escape presses kill in-flight turns the user didn't mean to
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
@@ -953,7 +953,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
     // Refresh on `/session/<id>` paints once with `sessions === []` before
     // the first poll resolves. Without this guard the lookup misses, the
-    // dashboard fallback renders, and the cockpit/terminal view only
+    // dashboard fallback renders, and the acp/terminal view only
     // reappears once the fetch lands. Hold the minimal pre-auth shell
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
@@ -991,7 +991,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
           sessions={sessions}
-          serverAbout={serverAbout}
           webSettings={webSettings}
           selectedFilePath={selectedFilePath}
           selectedRepoName={selectedRepoName}
@@ -1031,12 +1030,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                     : "flex-1 flex flex-col min-h-0 overflow-hidden"
                 }
               >
-                {activeSession?.cockpit_mode ? (
-                  <Suspense fallback={<CockpitLoadingFallback />}>
-                    <CockpitView
+                {activeSession?.view === "structured" ? (
+                  <Suspense fallback={<AcpLoadingFallback />}>
+                    <StructuredView
                       key={activeSessionId}
                       sessionId={activeSessionId!}
-                      cockpitWorkerState={activeSession.cockpit_worker_state ?? "absent"}
+                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                       tool={activeSession.tool}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
@@ -1046,10 +1045,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                 ) : (
                   <TerminalSessionStack
                     activeSessionId={activeSessionId!}
-                    sessions={sessions.filter((session) => !session.cockpit_mode)}
-                    cockpitMasterEnabled={
-                      !!serverAbout?.cockpit_master_enabled
-                    }
+                    sessions={sessions.filter((session) => session.view !== "structured")}
                     persistent={webSettings.persistentTerminals}
                     maxPersistentTerminals={
                       webSettings.maxPersistentTerminals
@@ -1113,7 +1109,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                 diffComments.setOutroDraft("");
               }
               setSendDialogOpen(false);
-              // Close the diff viewer so the cockpit transcript is in
+              // Close the diff viewer so the acp transcript is in
               // view: the user just dispatched feedback and wants to
               // see the agent's response. They can re-open any file
               // from the right-panel list afterwards.
@@ -1134,15 +1130,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // the single thing that resizes the terminal, so the keyboard behaves the
   // same way on every platform (and not double-shrink on the shrinking ones).
   //
-  // Cockpit substrate doesn't host xterm.js, so the SIGWINCH concern
-  // doesn't apply; leaving the pin on for cockpit traps the composer
+  // Acp substrate doesn't host xterm.js, so the SIGWINCH concern
+  // doesn't apply; leaving the pin on for acp traps the composer
   // below the keyboard on Android Chrome PWA (#1177). Drop the pin when
-  // the active session is cockpit so `h-dvh` plus the viewport meta's
+  // the active session is acp so `h-dvh` plus the viewport meta's
   // `interactive-widget=resizes-content` shrink the container with the
   // keyboard and lift the composer back into view.
   //
   // Exception: when the single-pane paired shell is the active mobile view,
-  // an xterm.js terminal owns the viewport even on a cockpit session, so it
+  // an xterm.js terminal owns the viewport even on an acp session, so it
   // needs the pin (plus the reservation in PairedTerminal) for the same
   // reason the agent terminal does (#1452).
   const { isMobile, stableViewportHeight } = useMobileKeyboard();
@@ -1150,32 +1146,32 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const pinRootHeight =
     isMobile &&
     stableViewportHeight > 0 &&
-    (!activeSession?.cockpit_mode || pairedFullViewport);
+    (activeSession?.view !== "structured" || pairedFullViewport);
   const rootStyle = pinRootHeight
     ? { height: `${stableViewportHeight}px` }
     : undefined;
 
-  const cockpitPrefs = useMemo(
+  const acpPrefs = useMemo(
     () => ({
-      showToolDurations: serverAbout?.cockpit_show_tool_durations ?? true,
-      queueDrainMode: serverAbout?.cockpit_queue_drain_mode ?? "combined",
+      showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
+      queueDrainMode: serverAbout?.acp_queue_drain_mode ?? "combined",
       forceEndTurnThresholdSecs:
-        serverAbout?.cockpit_force_end_turn_threshold_secs ?? 30,
-      replayEvents: serverAbout?.cockpit_replay_events ?? 0,
+        serverAbout?.acp_force_end_turn_threshold_secs ?? 30,
+      replayEvents: serverAbout?.acp_replay_events ?? 0,
     }),
     [
-      serverAbout?.cockpit_show_tool_durations,
-      serverAbout?.cockpit_queue_drain_mode,
-      serverAbout?.cockpit_force_end_turn_threshold_secs,
-      serverAbout?.cockpit_replay_events,
+      serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_queue_drain_mode,
+      serverAbout?.acp_force_end_turn_threshold_secs,
+      serverAbout?.acp_replay_events,
     ],
   );
 
   const tourScope: TourScope =
     !activeWorkspace || !activeSession
       ? "dashboard"
-      : activeSession.cockpit_mode
-        ? "cockpit"
+      : activeSession.view === "structured"
+        ? "structured-view"
         : "session";
   // First-run tour "seen" state, sourced from the backend (app_state) so it
   // follows the user across browsers and devices. `tourSeenKnown` stays false
@@ -1248,7 +1244,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   });
 
   return (
-    <CockpitPrefsProvider value={cockpitPrefs}>
+    <AcpPrefsProvider value={acpPrefs}>
     <div
       className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
       style={rootStyle}
@@ -1319,9 +1315,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             setWizardPrefill(undefined);
           }}
           prefill={wizardPrefill}
-          cockpitMasterEnabled={
-            !!serverAbout?.cockpit_master_enabled
-          }
         />
       )}
 
@@ -1372,15 +1365,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         style={{ top: -9999, left: -9999 }}
       />
     </div>
-    </CockpitPrefsProvider>
+    </AcpPrefsProvider>
   );
 }
 
-function CockpitLoadingFallback() {
+function AcpLoadingFallback() {
   return (
     <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
       <div className="text-xs font-mono uppercase tracking-wide">
-        Loading cockpit…
+        Loading acp…
       </div>
     </div>
   );

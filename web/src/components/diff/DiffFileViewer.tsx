@@ -28,7 +28,7 @@ interface Props {
   /** Called when the user wants to return to the terminal view. */
   onClose?: () => void;
   /** When true, the in-diff comment UI ("+" gutter buttons, inline
-   *  cards/forms, stale block) is enabled. False for non-cockpit
+   *  cards/forms, stale block) is enabled. False for non-structured view
    *  sessions where prompts can't be sent. */
   commentsEnabled?: boolean;
   /** Session-scoped comments store. Required when `commentsEnabled`. */

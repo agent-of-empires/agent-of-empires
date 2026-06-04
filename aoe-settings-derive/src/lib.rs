@@ -9,12 +9,12 @@
 //!
 //! Section attribute (required):
 //! ```ignore
-//! #[setting_section(name = "cockpit", category = "Cockpit")]
+//! #[setting_section(name = "acp", category = "Acp")]
 //! ```
 //!
 //! Per-field attribute:
 //! ```ignore
-//! #[setting(label = "Cockpit enabled", widget = "toggle")]
+//! #[setting(label = "Acp enabled", widget = "toggle")]
 //! #[setting(label = "Node path", web = "local_only:host binary execution surface")]
 //! #[setting(skip)]   // not a user-facing setting
 //! ```

@@ -41,7 +41,7 @@ The clear is one-shot: the next launch starts fresh, after which the system reve
 
 If the cascade detects that a pinned conversation is no longer valid (the agent fails to resume it), the pin is automatically downgraded so the next launch is fresh.
 
-`set-session-id` rejects cockpit-mode sessions: cockpit manages its own conversation lifecycle through ACP, and a CLI-set intent would be ignored. Toggle the session out of cockpit mode first, or set the resume target through the cockpit UI.
+`set-session-id` rejects structured-view sessions: structured view manages its own conversation lifecycle through ACP, and a CLI-set intent would be ignored. Toggle the session out of structured view first, or set the resume target through the structured view UI.
 
 The persist after a successful launch is crash-safe: the new session ID and the one-shot `Cleared` auto-promote land in a single atomic flock, so a daemon crash mid-finalize cannot freeze disk in a state that would orphan the conversation just created. If a peer CLI write to `resume_intent` lands during the launch window, the peer's value is preserved (sid persisted, intent left as written) and the next launch follows the peer's pin.
 

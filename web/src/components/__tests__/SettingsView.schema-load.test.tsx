@@ -36,7 +36,6 @@ vi.mock("../../lib/api", () => ({
     return vi.fn(() => Promise.resolve(calls++ === 0 ? null : WORKTREE_SCHEMA));
   })(),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
-  setCockpitMaster: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -44,10 +43,9 @@ vi.mock("../../lib/api", () => ({
 }));
 
 const SERVER_ABOUT = {
-  cockpit_master_enabled: true,
-  cockpit_show_tool_durations: true,
-  cockpit_queue_drain_mode: "combined" as const,
-  cockpit_max_concurrent_resumes: 4,
+  acp_show_tool_durations: true,
+  acp_queue_drain_mode: "combined" as const,
+  acp_max_concurrent_resumes: 4,
 };
 
 function renderView(tab: string) {

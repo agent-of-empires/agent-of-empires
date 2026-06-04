@@ -8,8 +8,8 @@ import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
-interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useCockpit: boolean; [key: string]: unknown; }
-interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; cockpitMasterEnabled: boolean; commandMaps?: CommandMaps; }
+interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useStructuredView: boolean; [key: string]: unknown; }
+interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; commandMaps?: CommandMaps; }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
@@ -113,7 +113,7 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
 
 /** Click-to-edit row for the resolved launch command. Only the command
  *  prefix is editable; it is written back to the per-session command
- *  override. The arg suffix (cockpit registry args or tmux extra args) is
+ *  override. The arg suffix (structured view registry args or tmux extra args) is
  *  always-appended and rendered read-only, so editing can never duplicate
  *  it (e.g. "opencode acp" never becomes "opencode acp acp"). See #1911. */
 function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
@@ -198,7 +198,7 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
   );
 }
 
-export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
+export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const hasStep = (id: StepId) => steps.some((s) => s.id === id);
   const offline = useServerDown();
   // Scratch sessions intentionally carry no path until the server
@@ -210,12 +210,11 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
   const selectedAgent = agents.find((agent) => agent.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
   // Mirror the submit-path computation in SessionWizard.handleSubmit so
-  // the review reflects the substrate the session will actually launch
+  // the review reflects the view the session will actually launch
   // with, including the per-session opt-out (#1580).
-  const willUseCockpit =
-    cockpitMasterEnabled &&
+  const willUseStructuredView =
     isAcpCapable(data.tool, selectedAgent?.acp_capable) &&
-    data.useCockpit;
+    data.useStructuredView;
 
   // Resolve the exact launch command the session will run, so the user
   // can confirm (and edit) it before starting. Mirrors the backend
@@ -223,10 +222,10 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
   // edit only touches the command override (#1911).
   const resolved = resolveLaunchCommand({
     tool: data.tool,
-    useCockpit: willUseCockpit,
+    useStructuredView: willUseStructuredView,
     binary: selectedAgent?.binary,
-    cockpitCommand: selectedAgent?.cockpit_command,
-    cockpitArgs: selectedAgent?.cockpit_args,
+    acpCommand: selectedAgent?.acp_command,
+    acpArgs: selectedAgent?.acp_args,
     extraArgs: data.extraArgs,
     manualOverride: data.commandOverride,
     agentCommandOverride: commandMaps.agentCommandOverride,
@@ -295,8 +294,8 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
           stepId="agent"
           onJumpTo={onJumpTo}
         />
-        {cockpitMasterEnabled && (
-          <Row label="Interface" value={willUseCockpit ? "Cockpit" : "Terminal"} stepId="agent" onJumpTo={onJumpTo} />
+        {(
+          <Row label="Interface" value={willUseStructuredView ? "Structured view" : "Terminal"} stepId="agent" onJumpTo={onJumpTo} />
         )}
         {data.profile && (
           <Row label="Profile" value={data.profileDirty ? `${data.profile} (Custom)` : data.profile} stepId="agent" onJumpTo={onJumpTo} accent />
@@ -315,9 +314,9 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
             onChangePrefix={(v) => onChange("commandOverride", v)}
           />
         )}
-        {willUseCockpit && data.extraArgs.trim() && (
+        {willUseStructuredView && data.extraArgs.trim() && (
           <p className="pt-2 text-xs text-status-warning" data-testid="extra-args-ignored-review">
-            Extra args are ignored for cockpit sessions.
+            Extra args are ignored for structured view sessions.
           </p>
         )}
       </div>

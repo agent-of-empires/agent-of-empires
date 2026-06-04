@@ -264,7 +264,7 @@ export const PROFILE_WRITABLE_SECTIONS = [
   "worktree",
   "web",
   "logging",
-  "cockpit",
+  "acp",
   "description",
 ] as const;
 
@@ -333,7 +333,7 @@ export async function fetchSounds(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/sounds")) ?? [];
 }
 
-/** Fetch a sound file as a Blob so the cockpit's browser-side approval
+/** Fetch a sound file as a Blob so the acp's browser-side approval
  *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
  *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
  *  on every request; an `<audio src="...">` element does not, so a
@@ -363,53 +363,32 @@ export interface ServerAbout {
   read_only: boolean;
   behind_tunnel: boolean;
   profile: string;
-  /** Live value of the cockpit master switch (`config.cockpit.enabled`).
-   *  Toggleable from the web settings via PATCH /api/cockpit/master.
-   *  When true, new sessions for ACP-capable tools default to cockpit
-   *  mode; when false, every new session is tmux. */
-  cockpit_master_enabled: boolean;
-  /** Resolved `cockpit.show_tool_durations` from the active profile's
-   *  config. Drives the per-tool elapsed-time label in the cockpit
+  /** Resolved `acp.show_tool_durations` from the active profile's
+   *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
-  cockpit_show_tool_durations: boolean;
-  /** Resolved `cockpit.queue_drain_mode` from the active profile's
+  acp_show_tool_durations: boolean;
+  /** Resolved `acp.queue_drain_mode` from the active profile's
    *  config. Selects how the composer drains client-side queued
    *  follow-up prompts on Stopped: `combined` (default) joins them
    *  with blank lines into a single prompt; `serial` fires one entry
    *  at a time. See #1031. */
-  cockpit_queue_drain_mode: "combined" | "serial";
-  /** Resolved `cockpit.max_concurrent_resumes` from the active
-   *  profile's config. Upper bound on parallel cockpit worker
+  acp_queue_drain_mode: "combined" | "serial";
+  /** Resolved `acp.max_concurrent_resumes` from the active
+   *  profile's config. Upper bound on parallel acp worker
    *  spawns/attaches the reconciler runs on `aoe serve` cold start.
    *  See #1088. */
-  cockpit_max_concurrent_resumes: number;
-  /** Resolved `cockpit.force_end_turn_threshold_secs` from the active
+  acp_max_concurrent_resumes: number;
+  /** Resolved `acp.force_end_turn_threshold_secs` from the active
    *  profile's config. Seconds of streaming inactivity after which
-   *  the cockpit web UI offers a "Force end turn" button. See #1100. */
-  cockpit_force_end_turn_threshold_secs: number;
-  /** Resolved `cockpit.replay_events` from the active profile's
-   *  config. Per-session retention cap on the cockpit event log;
+   *  the acp web UI offers a "Force end turn" button. See #1100. */
+  acp_force_end_turn_threshold_secs: number;
+  /** Resolved `acp.replay_events` from the active profile's
+   *  config. Per-session retention cap on the acp event log;
    *  0 means unlimited. Mirrored onto the in-memory activity buffer
    *  so the rendered transcript matches the user's chosen ceiling
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
-  cockpit_replay_events: number;
+  acp_replay_events: number;
   build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
-}
-
-export async function setCockpitMaster(
-  enabled: boolean,
-): Promise<{ master_enabled: boolean } | null> {
-  try {
-    const res = await fetch("/api/cockpit/master", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
@@ -447,11 +426,11 @@ export async function setTelemetryConsent(
 
 /// Allowlisted usage-signal names the daemon accepts on `/api/telemetry/seen`.
 /// Mirrors `USAGE_SIGNALS` in `src/telemetry/usage_signals.rs`; an off-list
-/// name is rejected with a 400 server-side. `web` / `cockpit` are whole-UI
+/// name is rejected with a 400 server-side. `web` / `structured_view` are whole-UI
 /// opens; the rest are feature-level opens within the dashboard (#1881).
 export type TelemetrySignal =
   | "web"
-  | "cockpit"
+  | "structured_view"
   | "diff_panel"
   | "diff_comments"
   | "web_terminal";
@@ -469,13 +448,13 @@ export function reportTelemetrySeen(surface: TelemetrySignal): void {
   }).catch(() => {});
 }
 
-/// Report a cockpit interaction the daemon cannot observe itself, so its next
+/// Report an acp interaction the daemon cannot observe itself, so its next
 /// opt-in snapshot can fold it in. Today the only kind is a queued prompt: the
 /// prompt queue lives entirely in client state, so the browser is the one
 /// surface that can report it. Best-effort; the daemon only counts when the
 /// user is opted in.
-export function reportCockpitInteraction(kind: "prompt_queued"): void {
-  void fetch("/api/telemetry/cockpit-interaction", {
+export function reportAcpInteraction(kind: "prompt_queued"): void {
+  void fetch("/api/telemetry/structured-interaction", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ kind }),
@@ -524,7 +503,7 @@ export function fetchBranches(
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
-// --- Cockpit context primer ---
+// --- Acp context primer ---
 
 export interface ContextPrimerResponse {
   primer: string;
@@ -541,23 +520,23 @@ export interface ContextPrimerResponse {
   unprocessed_prompt?: string | null;
 }
 
-// --- Cockpit ACP registry ---
+// --- Acp ACP registry ---
 
-export interface CockpitAgentInfo {
+export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
 }
 
-/** List ACP registry entries the cockpit supervisor knows about.
+/** List ACP registry entries the acp supervisor knows about.
  *  Distinct from `/api/agents` (session-tool agents for the wizard);
- *  this is the *cockpit* registry used by the rate-limit recovery
+ *  this is the *acp* registry used by the rate-limit recovery
  *  modal to populate the handoff target list. See #1282. */
-export async function fetchCockpitAgents(): Promise<CockpitAgentInfo[]> {
-  return (await fetchJson<CockpitAgentInfo[]>("/api/cockpit/agents")) ?? [];
+export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
+  return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
 }
 
-// --- Cockpit switch agent ---
+// --- Acp switch agent ---
 
 export interface SwitchAgentResponse {
   session_id: string;
@@ -572,14 +551,14 @@ export interface SwitchAgentResponse {
   status: string;
 }
 
-/** Hand off a cockpit session from its current ACP backend to
+/** Hand off an acp session from its current ACP backend to
  *  `target` (registry key, e.g. "codex"). Backend stops the old
  *  worker, spawns the new one, persists the agent change, and emits
  *  an AgentSwitched event. On failure (unknown target, spawn error)
  *  the instance is left untouched. `reason` is recorded on the event
  *  and shown in the transcript divider: "rate_limited" for the
  *  recovery flow, "manual" for an explicit user switch. See #1282. */
-export async function switchCockpitAgent(
+export async function switchAcpAgent(
   sessionId: string,
   target: string,
   model?: string | null,
@@ -589,7 +568,7 @@ export async function switchCockpitAgent(
   if (model) body.model = model;
   if (reason) body.reason = reason;
   return fetchJson<SwitchAgentResponse>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/switch-agent`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -609,7 +588,7 @@ export function fetchContextPrimer(
 ): Promise<ContextPrimerResponse | null> {
   const params = new URLSearchParams({ before_seq: String(beforeSeq) });
   return fetchJson<ContextPrimerResponse>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/context-primer?${params.toString()}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/context-primer?${params.toString()}`,
     signal ? { signal } : undefined,
   );
 }
@@ -798,7 +777,7 @@ export interface LoginStatus {
   required: boolean;
   authenticated: boolean;
   /** Whether the session currently sits inside the 15-minute step-up
-   *  window. Sensitive routes (terminal attach, cockpit prompt /
+   *  window. Sensitive routes (terminal attach, acp prompt /
    *  approval / file mutations) only execute while this is true.
    *  See #1131. */
   elevated: boolean;
@@ -874,7 +853,7 @@ export async function login(
 
 /**
  * Re-verify the passphrase to open a fresh 15-minute elevation
- * window. Required before the cockpit/terminal can perform
+ * window. Required before the acp/terminal can perform
  * SSH-equivalent actions when the prior window has lapsed. See
  * #1131.
  *
@@ -1095,7 +1074,7 @@ export async function setSessionPin(
 
 /** Archive or unarchive a session. On archive, the server kills the tmux
  *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the cockpit worker for cockpit-mode sessions; the
+ *  and shuts down the acp worker for acp-mode sessions; the
  *  reconciler will not respawn it because archived sessions are excluded
  *  from the resume target list. Sending a message via the dashboard
  *  auto-unarchives via the existing `touch_last_accessed` invariant in

@@ -571,9 +571,7 @@ impl SettingsView {
                                 Some(validate_custom_agent_entry(&text))
                             }
                             ListItemValidation::DetectAs => Some(validate_detect_as_entry(&text)),
-                            ListItemValidation::CockpitCmd => {
-                                Some(validate_cockpit_cmd_entry(&text))
-                            }
+                            ListItemValidation::AcpCmd => Some(validate_acp_cmd_entry(&text)),
                             ListItemValidation::None | ListItemValidation::EnvEntry => None,
                         };
                         if let Some(Err(msg)) = validation_result {
@@ -850,10 +848,10 @@ fn validate_custom_agent_entry(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate an agent_cockpit_cmd entry: name=command. The command is the
+/// Validate an agent_acp_cmd entry: name=command. The command is the
 /// ACP launch line, split with shell-word rules into argv, so it must be
 /// non-empty and have balanced quoting.
-fn validate_cockpit_cmd_entry(text: &str) -> Result<(), String> {
+fn validate_acp_cmd_entry(text: &str) -> Result<(), String> {
     let Some((key, value)) = text.split_once('=') else {
         return Err(
             "Must be in name=command format (e.g. oc-superpowers=ocp run sp acp)".to_string(),
@@ -864,7 +862,7 @@ fn validate_cockpit_cmd_entry(text: &str) -> Result<(), String> {
     }
     if crate::agents::get_agent(key).is_some() {
         return Err(format!(
-            "'{}' is a built-in agent, which already has a cockpit adapter.",
+            "'{}' is a built-in agent, which already has an acp adapter.",
             key
         ));
     }

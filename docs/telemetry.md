@@ -35,7 +35,7 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   daemon. It is a point-in-time summary of the current install, never a stream
   of actions:
   - how many sessions exist and how many are running / idle / errored,
-  - how many use a sandbox, the cockpit, or yolo mode,
+  - how many use a sandbox, the structured view, or yolo mode,
   - the peak concurrent session count seen across the window since the last
     snapshot (point-in-time on the TUI, which does not aggregate),
   - how many sessions are currently pinned, snoozed, or archived (a
@@ -61,8 +61,8 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   - which opt-in features are turned on (see "Feature flags" below),
   - which surfaces were opened since the last snapshot, as a `usage_seen` map
     of allowlisted signal name to open-count (see "Usage signals" below). For
-    the web dashboard and cockpit, a coarse client form-factor class is also
-    reported per surface (`web_clients_seen` / `cockpit_clients_seen`, each a
+    the web dashboard and structured view, a coarse client form-factor class is also
+    reported per surface (`web_clients_seen` / `structured_clients_seen`, each a
     was-seen flag over `desktop` / `desktop_pwa` / `mobile` / `mobile_pwa`) so
     desktop, mobile, and installed-PWA usage can be told apart. It is never a
     per-device id: the snapshot's `os` / `arch` describe the daemon host, not
@@ -70,13 +70,13 @@ closed, versioned schema (see `src/telemetry/events.rs`):
     like a desktop client. Only the coarse class is derived (from display-mode,
     pointer type, and viewport width); no user-agent string, screen size, or
     device model is read or sent,
-  - coarse cockpit-interaction counts since the last snapshot, so we can tell
+  - coarse acp-interaction counts since the last snapshot, so we can tell
     "opened" from "actually used" (populated by `aoe serve`; the TUI reports
     zero). All are counts or a closed decision-key map, never content:
     - how many approvals were resolved and the decision mix (`allow`,
       `allow_always`, `deny`; the synthetic daemon-restart cancellation is not
       counted),
-    - how many mid-session agent switches and cockpit/terminal toggles happened
+    - how many mid-session agent switches and acp/terminal toggles happened
       (only real toggles, not no-op re-applies),
     - whether any session entered plan mode,
     - how many prompts were queued (parked because the agent was busy),
@@ -168,7 +168,7 @@ in here, per-session usage is reported separately by the session counts above.
 
 The snapshot also includes a `usage_seen` map (allowlisted signal name ->
 open-count) so we can see which surfaces and features installs actually use
-within a window, for example `{web: 3, cockpit: 1, diff_panel: 2}`. It is driven
+within a window, for example `{web: 3, structured_view: 1, diff_panel: 2}`. It is driven
 by a registry in `src/telemetry/usage_signals.rs`: instrumenting a new surface
 is one entry there (its short name), not a schema change. The key set is fixed
 and the values are counts, so a signal can never carry a path or free text, and
@@ -176,7 +176,7 @@ the gateway forwards only this allowlisted shape. The web dashboard reports an
 open by pinging `POST /api/telemetry/seen`; an unregistered name is rejected.
 The TUI never hosts the web surfaces, so it reports the map zeroed.
 
-The allowlisted signals are whole-UI opens (`web`, `cockpit`) plus dashboard
+The allowlisted signals are whole-UI opens (`web`, `structured_view`) plus dashboard
 feature opens: `diff_panel` (the git diff panel was opened for a session),
 `diff_comments` (a count of diff-comment prompts sent to the agent), and
 `web_terminal` (the xterm.js terminal was opened). Scratch-session usage is not
@@ -242,7 +242,7 @@ until delivery is confirmed, so a failed send does not silently drop them:
   to once per hour so a down endpoint cannot make every `aoe` invocation
   re-send), and a transient failure never drops a window of commands;
 - the serve `usage_seen` open counts, the per-form-factor client maps, the
-  session-create counter, and the cockpit-interaction counts are cleared only
+  session-create counter, and the acp-interaction counts are cleared only
   after a confirmed snapshot send, each decremented by exactly the reported
   amount (so an interaction that lands mid-send rolls into the next snapshot),
   so a failed snapshot keeps that window's signal instead of losing it.
@@ -269,7 +269,7 @@ the install id and does all sending.
 `src/telemetry/events.rs`, mirrored by the gateway. New fields must be counts,
 booleans, or short identifier-like strings (and the allowlisted bucket maps:
 per-agent, per-model-family, per-substrate, the `usage_seen` open counts, and the
-`web_clients_seen` / `cockpit_clients_seen` form-factor maps, all keyed by short
+`web_clients_seen` / `structured_clients_seen` form-factor maps, all keyed by short
 identifiers with numeric or boolean values); the gateway drops free text, paths,
 branch-name-like strings, and any nested object, so anything richer than a count
 or flag will not survive ingest.

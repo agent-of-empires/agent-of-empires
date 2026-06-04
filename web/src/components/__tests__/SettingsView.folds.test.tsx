@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // Behavioral coverage for the Settings "Advanced" folds (#1515):
-//   Story #2 - advanced cockpit knobs are hidden behind a default-collapsed
+//   Story #2 - advanced structured-view knobs are hidden behind a default-collapsed
 //              fold while high-level controls stay visible.
 //   Story #4 - the fold collapses back to default when the user changes tabs
 //              or switches profiles (component-local state, not persisted).
@@ -45,11 +45,10 @@ const WORKTREE_SCHEMA = [
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
-    Promise.resolve({ cockpit: {}, sandbox: {}, worktree: {} }),
+    Promise.resolve({ acp: {}, sandbox: {}, worktree: {} }),
   ),
   getSettingsSchema: vi.fn(() => Promise.resolve(WORKTREE_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
-  setCockpitMaster: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -57,10 +56,9 @@ vi.mock("../../lib/api", () => ({
 }));
 
 const SERVER_ABOUT = {
-  cockpit_master_enabled: true,
-  cockpit_show_tool_durations: true,
-  cockpit_queue_drain_mode: "combined" as const,
-  cockpit_max_concurrent_resumes: 4,
+  acp_show_tool_durations: true,
+  acp_queue_drain_mode: "combined" as const,
+  acp_max_concurrent_resumes: 4,
 };
 
 function renderView(tab: string) {
@@ -152,11 +150,10 @@ describe("Settings Advanced fold", () => {
     vi.clearAllMocks();
   });
 
-  it("hides cockpit advanced knobs until the fold is expanded (#2)", async () => {
-    const { container } = renderView("cockpit");
+  it("hides structured-view advanced knobs until the fold is expanded (#2)", async () => {
+    const { container } = renderView("structured-view");
 
     // High-level controls are always visible.
-    expect(screen.getByText("Cockpit master switch")).toBeTruthy();
     expect(screen.getByText("Show tool-call durations")).toBeTruthy();
     expect(screen.getByText("Queue drain mode")).toBeTruthy();
 
@@ -207,8 +204,8 @@ describe("Settings Advanced fold", () => {
     expect(screen.queryByText("CPU limit")).toBeNull();
   });
 
-  it("saves every cockpit advanced knob through the normal path", async () => {
-    const { container } = renderView("cockpit");
+  it("saves every structured-view advanced knob through the normal path", async () => {
+    const { container } = renderView("structured-view");
     await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
 
     expandAdvanced(container);
@@ -232,22 +229,22 @@ describe("Settings Advanced fold", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
         "main",
-        { cockpit: { replay_bytes: 4096 } },
+        { acp: { replay_bytes: 4096 } },
       ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      cockpit: { silent_orphan_fast_grace_secs: 30 },
+      acp: { silent_orphan_fast_grace_secs: 30 },
     });
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      cockpit: { auto_stop_idle_secs: 28800 },
+      acp: { auto_stop_idle_secs: 28800 },
     });
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      cockpit: { rate_limit_auto_resume_grace_secs: 20 },
+      acp: { rate_limit_auto_resume_grace_secs: 20 },
     });
   });
 
-  it("exercises the cockpit high-level toggles outside the fold", async () => {
-    const { container } = renderView("cockpit");
+  it("exercises the structured-view high-level toggles outside the fold", async () => {
+    const { container } = renderView("structured-view");
     await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
 
     const durations = container.querySelector(
@@ -266,11 +263,11 @@ describe("Settings Advanced fold", () => {
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        cockpit: { queue_drain_mode: "serial" },
+        acp: { queue_drain_mode: "serial" },
       }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      cockpit: { rate_limit_auto_resume: true },
+      acp: { rate_limit_auto_resume: true },
     });
   });
 
@@ -336,7 +333,7 @@ describe("Settings Advanced fold", () => {
   // from its "" seed to the default. That transition must NOT remount the
   // content fieldset, or a fold expanded during the load window collapses out
   // from under the user. This is the deterministic mirror of the live flake in
-  // tests/live/settings-advanced-fold.spec.ts (the cockpit "Advanced" fold
+  // tests/live/settings-advanced-fold.spec.ts (the structured view "Advanced" fold
   // vanishing right after a click).
   it("keeps an expanded fold open when the initial profile resolves", async () => {
     let resolveProfiles!: (p: typeof PROFILES) => void;
@@ -347,9 +344,9 @@ describe("Settings Advanced fold", () => {
         }),
     );
 
-    const { container } = renderView("cockpit");
+    const { container } = renderView("structured-view");
 
-    // Cockpit renders without waiting on profiles/settings, so the fold is
+    // Structured view renders without waiting on profiles/settings, so the fold is
     // interactive during the load window. Open it before profiles resolve.
     expandAdvanced(container);
     expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
@@ -367,7 +364,7 @@ describe("Settings Advanced fold", () => {
   });
 
   it("collapses the fold when switching profiles (#4)", async () => {
-    const { container } = renderView("cockpit");
+    const { container } = renderView("structured-view");
     await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
 
     expandAdvanced(container);

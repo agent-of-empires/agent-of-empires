@@ -57,7 +57,7 @@ export function loadComments(sessionId: string): DiffCommentsStorageV1 {
  *  is ignored: it defaults to true and a lone non-default toggle on an
  *  otherwise-empty session is inert until a comment exists (at which point
  *  the state is no longer empty and persists). Treating it as empty matches
- *  user intent (nothing to send) and the cockpit-drafts precedent (#1358). */
+ *  user intent (nothing to send) and the acp-drafts precedent (#1358). */
 export function isEmptyState(s: DiffCommentsStorageV1): boolean {
   return s.comments.length === 0 && s.introDraft === "" && s.outroDraft === "";
 }
@@ -79,7 +79,7 @@ export function saveComments(
 
 // Drop the persisted diff-comments for a single session id. Convenience
 // over saveComments(id, EMPTY_STORAGE); intended for session-delete paths
-// (mirrors clearDraft for cockpit composer drafts). Cross-tab / cross-device
+// (mirrors clearDraft for structured view composer drafts). Cross-tab / cross-device
 // deletes still fall to sweepOrphanComments on the next mount.
 export function clearStoredComments(sessionId: string): void {
   safeRemoveItem(storageKey(sessionId));

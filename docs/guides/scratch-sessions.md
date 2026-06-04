@@ -127,7 +127,7 @@ silently drop the other repos.
 
 ## Compatibility
 
-* **Cockpit mode**: scratch sessions work with `--cockpit` and the
+* **Structured view**: scratch sessions use the structured view (the default) with the
   bundled ACP agents. The ACP worker spawns with the scratch
   directory as its current working directory.
 * **Sandboxes**: scratch sessions can run in a container sandbox

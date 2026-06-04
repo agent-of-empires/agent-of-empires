@@ -24,12 +24,12 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
-    /// True when this agent can run in the structured cockpit UI: a
+    /// True when this agent can run in the structured acp UI: a
     /// built-in with an ACP adapter, or a custom agent that declares a
-    /// valid `agent_cockpit_cmd`. The web wizard reads this to decide
-    /// whether a session created for the agent runs in cockpit or tmux.
+    /// valid `agent_acp_cmd`. The web wizard reads this to decide
+    /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// The ACP command a built-in agent launches in cockpit, e.g.
+    /// The ACP command a built-in agent launches in acp, e.g.
     /// `claude-agent-acp` for claude or `opencode` for opencode. This is
     /// the registry command (post `${aoe_data_dir}` substitution), which
     /// can differ from `binary`; the wizard previews it so the user sees
@@ -37,20 +37,20 @@ pub struct AgentInfo {
     /// agents, whose command values are never serialized here (see the
     /// custom-agent serialization tests below).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cockpit_command: Option<String>,
-    /// The registry args appended to `cockpit_command` (e.g. `["acp"]`
+    pub acp_command: Option<String>,
+    /// The registry args appended to `acp_command` (e.g. `["acp"]`
     /// for opencode, `["--acp"]` for gemini). Empty when there are none
     /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cockpit_args: Vec<String>,
+    pub acp_args: Vec<String>,
 }
 
-/// Resolve the cockpit launch command + args for a built-in agent from
+/// Resolve the acp launch command + args for a built-in agent from
 /// its registry spec, substituting `${aoe_data_dir}` so the preview
 /// matches what `supervisor::spawn_inner` actually runs. Returns
 /// `(None, [])` for agents without a registry entry.
-fn cockpit_command_fields(
-    spec: Option<&crate::cockpit::AgentSpec>,
+fn acp_command_fields(
+    spec: Option<&crate::acp::AgentSpec>,
     data_dir: Option<&std::path::Path>,
 ) -> (Option<String>, Vec<String>) {
     let substitute = |value: &str| match data_dir {
@@ -71,7 +71,7 @@ fn cockpit_command_fields(
 
 fn build_custom_agent_infos(
     custom_agents: &HashMap<String, String>,
-    agent_cockpit_cmd: &HashMap<String, String>,
+    agent_acp_cmd: &HashMap<String, String>,
 ) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
         .iter()
@@ -87,13 +87,13 @@ fn build_custom_agent_infos(
             host_only: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
-            acp_capable: agent_cockpit_cmd
+            acp_capable: agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(name, cmd).is_ok()),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
-            cockpit_command: None,
-            cockpit_args: Vec::new(),
+            acp_command: None,
+            acp_args: Vec::new(),
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -105,16 +105,16 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
-        let agent_cockpit_cmd = config.session.agent_cockpit_cmd;
+        let agent_acp_cmd = config.session.agent_acp_cmd;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
-        let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+        let acp_registry = crate::acp::AgentRegistry::with_defaults();
         let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
             .map(|a| {
-                let (cockpit_command, cockpit_args) =
-                    cockpit_command_fields(acp_registry.get(a.name), data_dir.as_deref());
+                let (acp_command, acp_args) =
+                    acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
                 AgentInfo {
                     kind: "builtin".to_string(),
                     name: a.name.to_string(),
@@ -123,12 +123,12 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     acp_capable: acp_registry.get(a.name).is_some(),
-                    cockpit_command,
-                    cockpit_args,
+                    acp_command,
+                    acp_args,
                 }
             })
             .collect::<Vec<_>>();
-        agents.extend(build_custom_agent_infos(&custom_agents, &agent_cockpit_cmd));
+        agents.extend(build_custom_agent_infos(&custom_agents, &agent_acp_cmd));
         agents
     })
     .await
@@ -233,7 +233,7 @@ pub async fn update_settings(
     match result {
         Ok(Ok(config)) => {
             // Settings touched [logging]? Apply the new filter live to
-            // the daemon + persist runtime_filter so cockpit runners pick
+            // the daemon + persist runtime_filter so acp runners pick
             // it up via the notify watcher.
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
@@ -654,39 +654,33 @@ pub struct ServerAbout {
     pub read_only: bool,
     pub behind_tunnel: bool,
     pub profile: String,
-    /// Live value of the `cockpit.enabled` master switch. The settings
-    /// UI binds its toggle to this and updates it via
-    /// `PATCH /api/cockpit/master`. When true, new sessions for ACP-
-    /// capable tools default to cockpit mode; when false, every new
-    /// session is tmux.
-    pub cockpit_master_enabled: bool,
-    /// Resolved value of `cockpit.show_tool_durations` from the active
+    /// Resolved value of `acp.show_tool_durations` from the active
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
-    pub cockpit_show_tool_durations: bool,
-    /// Resolved value of `cockpit.queue_drain_mode` from the active
+    pub acp_show_tool_durations: bool,
+    /// Resolved value of `acp.queue_drain_mode` from the active
     /// profile's config. Selects how the web composer drains client-side
     /// queued prompts on Stopped: `combined` (default) joins them with
     /// blank lines into a single follow-up; `serial` fires them one at a
     /// time. Cross-device since it lives in config.toml. See #1031.
-    pub cockpit_queue_drain_mode: String,
-    /// Resolved value of `cockpit.max_concurrent_resumes` from the
-    /// active profile's config. Upper bound on parallel cockpit worker
+    pub acp_queue_drain_mode: String,
+    /// Resolved value of `acp.max_concurrent_resumes` from the
+    /// active profile's config. Upper bound on parallel acp worker
     /// spawns/attaches the reconciler runs on `aoe serve` cold start.
     /// Surfaced so the settings UI shows the current value. See #1088.
-    pub cockpit_max_concurrent_resumes: u32,
-    /// Resolved value of `cockpit.force_end_turn_threshold_secs` from
+    pub acp_max_concurrent_resumes: u32,
+    /// Resolved value of `acp.force_end_turn_threshold_secs` from
     /// the active profile's config. Seconds of streaming inactivity
-    /// after which the cockpit web UI offers a "Force end turn" button
+    /// after which the acp web UI offers a "Force end turn" button
     /// to unstick a missed-Stopped spinner. See #1100.
-    pub cockpit_force_end_turn_threshold_secs: u32,
-    /// Resolved value of `cockpit.replay_events` from the active
-    /// profile's config. Per-session retention cap on the cockpit
+    pub acp_force_end_turn_threshold_secs: u32,
+    /// Resolved value of `acp.replay_events` from the active
+    /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
     /// its in-memory activity buffer so the rendered transcript
     /// honours the user's chosen ceiling instead of clipping at a
     /// hard-coded constant. See #1111.
-    pub cockpit_replay_events: u32,
+    pub acp_replay_events: u32,
     /// `"debug"` when built with `debug_assertions`, `"release"`
     /// otherwise. The web UI renders a "DEV" badge in the topbar
     /// when this is `"debug"` so users can tell concurrently-running
@@ -701,16 +695,12 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let cockpit_master_enabled = state
-        .cockpit_master_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let cockpit_cfg =
-        crate::session::profile_config::resolve_config_or_warn(&state.profile).cockpit;
-    let cockpit_show_tool_durations = cockpit_cfg.show_tool_durations;
-    let cockpit_queue_drain_mode = cockpit_cfg.queue_drain_mode.as_str().to_string();
-    let cockpit_max_concurrent_resumes = cockpit_cfg.max_concurrent_resumes;
-    let cockpit_force_end_turn_threshold_secs = cockpit_cfg.force_end_turn_threshold_secs;
-    let cockpit_replay_events = cockpit_cfg.replay_events;
+    let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let acp_show_tool_durations = acp_cfg.show_tool_durations;
+    let acp_queue_drain_mode = acp_cfg.queue_drain_mode.as_str().to_string();
+    let acp_max_concurrent_resumes = acp_cfg.max_concurrent_resumes;
+    let acp_force_end_turn_threshold_secs = acp_cfg.force_end_turn_threshold_secs;
+    let acp_replay_events = acp_cfg.replay_events;
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
@@ -719,12 +709,11 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         profile: state.profile.clone(),
-        cockpit_master_enabled,
-        cockpit_show_tool_durations,
-        cockpit_queue_drain_mode,
-        cockpit_max_concurrent_resumes,
-        cockpit_force_end_turn_threshold_secs,
-        cockpit_replay_events,
+        acp_show_tool_durations,
+        acp_queue_drain_mode,
+        acp_max_concurrent_resumes,
+        acp_force_end_turn_threshold_secs,
+        acp_replay_events,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -1200,7 +1189,7 @@ pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
 }
 
-/// Serve a sound file by name so the cockpit's browser-side approval
+/// Serve a sound file by name so the acp's browser-side approval
 /// player can fetch it from the same origin as the dashboard. The name
 /// is validated against `list_available_sounds()` to block path
 /// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
@@ -1282,7 +1271,7 @@ mod tests {
         assert!(!agent.host_only);
         assert!(agent.installed);
         assert_eq!(agent.install_hint, "Configured custom agent");
-        // No agent_cockpit_cmd configured, so it is tmux-only.
+        // No agent_acp_cmd configured, so it is tmux-only.
         assert!(!agent.acp_capable);
     }
 
@@ -1356,50 +1345,47 @@ mod tests {
     }
 
     #[test]
-    fn custom_agent_acp_capable_tracks_agent_cockpit_cmd() {
+    fn custom_agent_acp_capable_tracks_agent_acp_cmd() {
         let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("plain", "ssh host claude")]);
-        let cockpit = custom_agents(&[
+        let acp = custom_agents(&[
             ("oc-sp", "ocp run sp acp"),
             // An entry whose command is malformed must not flip capability on.
             ("broken", "ocp run \"unterminated"),
         ]);
-        let entries = build_custom_agent_infos(&custom, &cockpit);
+        let entries = build_custom_agent_infos(&custom, &acp);
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
-        assert!(
-            oc_sp.acp_capable,
-            "agent with a valid cockpit cmd is capable"
-        );
+        assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
-        assert!(!plain.acp_capable, "agent with no cockpit cmd is tmux-only");
+        assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
     }
 
     #[test]
-    fn cockpit_command_fields_resolve_registry_command_and_args() {
-        let registry = crate::cockpit::AgentRegistry::with_defaults();
+    fn acp_command_fields_resolve_registry_command_and_args() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
 
-        let (cmd, args) = cockpit_command_fields(registry.get("opencode"), None);
+        let (cmd, args) = acp_command_fields(registry.get("opencode"), None);
         assert_eq!(cmd.as_deref(), Some("opencode"));
         assert_eq!(args, vec!["acp".to_string()]);
 
-        let (cmd, args) = cockpit_command_fields(registry.get("gemini"), None);
+        let (cmd, args) = acp_command_fields(registry.get("gemini"), None);
         assert_eq!(cmd.as_deref(), Some("gemini"));
         assert_eq!(args, vec!["--acp".to_string()]);
 
-        let (cmd, args) = cockpit_command_fields(registry.get("claude"), None);
+        let (cmd, args) = acp_command_fields(registry.get("claude"), None);
         assert_eq!(cmd.as_deref(), Some("claude-agent-acp"));
         assert!(args.is_empty());
 
-        let (cmd, args) = cockpit_command_fields(None, None);
+        let (cmd, args) = acp_command_fields(None, None);
         assert_eq!(cmd, None);
         assert!(args.is_empty());
     }
 
     #[test]
-    fn cockpit_command_fields_substitute_data_dir() {
-        let registry = crate::cockpit::AgentRegistry::with_defaults();
+    fn acp_command_fields_substitute_data_dir() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
         let dir = std::path::Path::new("/tmp/aoe-data");
-        let (cmd, _) = cockpit_command_fields(registry.get("aoe-agent"), Some(dir));
+        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
         let cmd = cmd.expect("aoe-agent has a registry command");
         assert!(
             !cmd.contains("${aoe_data_dir}"),
@@ -1409,15 +1395,15 @@ mod tests {
     }
 
     #[test]
-    fn custom_agent_entries_omit_cockpit_command_fields() {
+    fn custom_agent_entries_omit_acp_command_fields() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("oc-sp", "ocp run sp")]),
             &custom_agents(&[("oc-sp", "ocp run sp acp")]),
         );
         let value = serde_json::to_value(&entries).unwrap();
-        assert!(value[0].get("cockpit_command").is_none());
-        assert!(value[0].get("cockpit_args").is_none());
-        // The custom cockpit command must not leak via the new fields.
+        assert!(value[0].get("acp_command").is_none());
+        assert!(value[0].get("acp_args").is_none());
+        // The custom acp command must not leak via the new fields.
         assert!(!value.to_string().contains("ocp run sp"));
     }
 

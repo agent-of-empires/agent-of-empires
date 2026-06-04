@@ -7,13 +7,12 @@ import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
 import type { RightPanelView } from "../lib/rightPanelView";
-import type { ServerAbout } from "../lib/api";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { FileRef } from "../lib/fileRef";
 
-const CockpitView = lazy(() =>
-  import("./cockpit/CockpitView").then((m) => ({ default: m.CockpitView })),
+const StructuredView = lazy(() =>
+  import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })),
 );
 
 interface Props {
@@ -23,7 +22,6 @@ interface Props {
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
   sessions: SessionResponse[];
-  serverAbout: ServerAbout | null;
   webSettings: { persistentTerminals: boolean; maxPersistentTerminals: number };
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
@@ -64,7 +62,6 @@ export function MobileMainPane({
   activeSession,
   activeSessionId,
   sessions,
-  serverAbout,
   webSettings,
   selectedFilePath,
   selectedRepoName,
@@ -105,12 +102,12 @@ export function MobileMainPane({
       )}
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={layerClass(view === "agent")} inert={view !== "agent"}>
-          {activeSession?.cockpit_mode ? (
+          {activeSession?.view === "structured" ? (
             <Suspense fallback={null}>
-              <CockpitView
+              <StructuredView
                 key={activeSessionId}
                 sessionId={activeSessionId!}
-                cockpitWorkerState={activeSession.cockpit_worker_state ?? "absent"}
+                acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                 tool={activeSession.tool}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
@@ -120,8 +117,7 @@ export function MobileMainPane({
           ) : (
             <TerminalSessionStack
               activeSessionId={activeSessionId!}
-              sessions={sessions.filter((session) => !session.cockpit_mode)}
-              cockpitMasterEnabled={!!serverAbout?.cockpit_master_enabled}
+              sessions={sessions.filter((session) => session.view !== "structured")}
               persistent={webSettings.persistentTerminals}
               maxPersistentTerminals={webSettings.maxPersistentTerminals}
             />

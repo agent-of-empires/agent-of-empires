@@ -24,8 +24,8 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ansi-to-tui = "8.0"
 ratatui-textarea = "0.9"
 tui-input = "0.15"
-# Markdown parsing for the cockpit transcript. We map events to ratatui
-# Lines ourselves (see src/tui/cockpit_view/render.rs) so raw markers are
+# Markdown parsing for the structured view transcript. We map events to ratatui
+# Lines ourselves (see src/tui/structured_view/render.rs) so raw markers are
 # stripped and styling tracks the app theme; default-features = false
 # drops the unused HTML renderer.
 pulldown-cmark = { version = "0.13", default-features = false }
@@ -147,24 +147,24 @@ aes-gcm = { version = "0.10", optional = true }
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
-# Agent Client Protocol — drives the cockpit surface bundled with `serve`.
+# Agent Client Protocol — drives the structured view surface bundled with `serve`.
 agent-client-protocol = { version = "0.11", optional = true, features = ["unstable_session_usage"] }
 agent-client-protocol-tokio = { version = "0.11", optional = true }
 
-# Semver parsing for ACP adapter compatibility checks (see src/cockpit/agent_compat.rs).
+# Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = { version = "1", optional = true }
 
-# Node tarball download + extraction for the cockpit's bundled-Node
+# Node tarball download + extraction for the structured view's bundled-Node
 # fallback. xz2 needs the system liblzma; we use it for tar.xz
 # extraction. The `tar` crate handles the tarball stream. Hex used
-# for nonce display lives in the cockpit/approvals module's local
+# for nonce display lives in the structured view/approvals module's local
 # hex helper, no crate needed.
 tar = { version = "0.4", optional = true }
 xz2 = { version = "0.1", optional = true }
 
-# WebSocket client for the cockpit-in-TUI view: subscribes to the daemon's
-# `/sessions/{id}/cockpit/ws` stream and pumps frames into the local reducer.
-# Folded into the `serve` feature alongside the rest of the cockpit surface;
+# WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
+# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer.
+# Folded into the `serve` feature alongside the rest of the structured view surface;
 # the daemon itself uses axum's built-in WS support and never pulls this in.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
 
@@ -188,12 +188,12 @@ serve = [
     "jsonwebtoken",
     "getrandom",
     "webbrowser",
-    # Cockpit (ACP-based structured rendering of agent state) ships
+    # Structured view (ACP-based structured rendering of agent state) ships
     # alongside the web dashboard — the two share state, REST routes,
     # and the WebSocket fanout. Folded into `serve` so building the
-    # dashboard always includes the cockpit surface; pulling them
-    # apart later is straightforward (cockpit code lives entirely
-    # under src/cockpit/).
+    # dashboard always includes the structured view surface; pulling them
+    # apart later is straightforward (structured view code lives entirely
+    # under src/acp/).
     "agent-client-protocol",
     "agent-client-protocol-tokio",
     "semver",

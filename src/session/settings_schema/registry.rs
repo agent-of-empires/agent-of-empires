@@ -4,7 +4,7 @@
 
 use super::FieldDescriptor;
 use crate::session::config::{
-    CockpitConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, TelemetryConfig,
+    AcpConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, TelemetryConfig,
     ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
 };
 use crate::sound::SoundConfig;
@@ -23,7 +23,7 @@ pub fn schema() -> Vec<FieldDescriptor> {
     out.extend(SoundConfig::settings_descriptors());
     out.extend(StatusHookConfig::settings_descriptors());
     out.extend(WebConfig::settings_descriptors());
-    out.extend(CockpitConfig::settings_descriptors());
+    out.extend(AcpConfig::settings_descriptors());
     out.extend(DiffConfig::settings_descriptors());
     out.extend(LoggingConfig::settings_descriptors());
     out
@@ -51,16 +51,14 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_section_is_complete() {
-        let cockpit: Vec<_> = schema()
+    fn acp_section_is_complete() {
+        let acp: Vec<_> = schema()
             .into_iter()
-            .filter(|d| d.section == "cockpit")
+            .filter(|d| d.section == "acp")
             .map(|d| d.field)
             .collect();
-        // Every CockpitConfig field that is a user setting must appear.
+        // Every AcpConfig field that is a user setting must appear.
         for expected in [
-            "enabled",
-            "default_for_claude",
             "default_agent",
             "max_concurrent_workers",
             "replay_events",
@@ -74,15 +72,15 @@ mod tests {
             "silent_orphan_fast_grace_secs",
         ] {
             assert!(
-                cockpit.iter().any(|f| f == expected),
-                "cockpit.{expected} missing from schema"
+                acp.iter().any(|f| f == expected),
+                "acp.{expected} missing from schema"
             );
         }
     }
 
     #[test]
-    fn cockpit_node_path_is_local_only() {
-        let d = descriptor("cockpit", "node_path").expect("node_path descriptor");
+    fn acp_node_path_is_local_only() {
+        let d = descriptor("acp", "node_path").expect("node_path descriptor");
         assert!(
             matches!(d.web_write, WebWritePolicy::LocalOnly { .. }),
             "node_path must stay local-only: it is a host binary execution surface"
@@ -91,8 +89,8 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_queue_drain_is_select_with_options() {
-        let d = descriptor("cockpit", "queue_drain_mode").expect("queue_drain_mode");
+    fn acp_queue_drain_is_select_with_options() {
+        let d = descriptor("acp", "queue_drain_mode").expect("queue_drain_mode");
         match d.widget {
             WidgetKind::Select { options } => {
                 let values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
@@ -139,10 +137,10 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_advanced_grouping() {
-        let d = descriptor("cockpit", "max_concurrent_workers").unwrap();
+    fn acp_advanced_grouping() {
+        let d = descriptor("acp", "max_concurrent_workers").unwrap();
         assert!(d.advanced);
-        let d = descriptor("cockpit", "enabled").unwrap();
+        let d = descriptor("acp", "default_agent").unwrap();
         assert!(!d.advanced);
     }
 }

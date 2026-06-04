@@ -7,8 +7,8 @@
 //! the live tmux attach state, then ask this predicate per session and claim
 //! the stop through `Storage::update` so concurrent reapers cannot double-stop.
 //!
-//! The cockpit substrate has its own reaper (`server::cockpit_reconciler`,
-//! #1689) with dormancy and seamless respawn; this is the tmux-substrate analog
+//! The structured view has its own reaper (`server::acp_reconciler`,
+//! #1689) with dormancy and seamless respawn; this is the tmux-view analog
 //! where a stop kills the pane and leaves a restartable `Stopped` row.
 
 use std::collections::HashSet;
@@ -27,7 +27,7 @@ pub struct IdleReapCandidate {
     pub threshold_secs: u32,
 }
 
-/// Select the plain (non-cockpit) sessions eligible for idle auto-stop.
+/// Select the plain (non-structured view) sessions eligible for idle auto-stop.
 ///
 /// Shared by the TUI main loop and the serve `status_poll_loop` so both apply
 /// identical policy. `attached` is the set of tmux session names with a live
@@ -42,7 +42,7 @@ pub fn idle_reap_candidates(
 ) -> Vec<IdleReapCandidate> {
     let mut candidates = Vec::new();
     for inst in instances {
-        if inst.is_cockpit_mode() {
+        if inst.is_structured() {
             continue;
         }
         let profile = inst.effective_profile();
@@ -72,7 +72,7 @@ pub fn idle_reap_candidates(
     candidates
 }
 
-/// Decide whether a plain (non-cockpit) session should be auto-stopped for
+/// Decide whether a plain (non-structured view) session should be auto-stopped for
 /// inactivity.
 ///
 /// Eligible only when all hold:
@@ -144,10 +144,10 @@ pub fn claim_idle_stop(
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);
         };
-        // Defense in depth: never stop a cockpit row through the plain-session
+        // Defense in depth: never stop a structured view row through the plain-session
         // path, even if a caller reached here without going through
-        // `idle_reap_candidates` (which already excludes cockpit sessions).
-        if inst.is_cockpit_mode() {
+        // `idle_reap_candidates` (which already excludes structured view sessions).
+        if inst.is_structured() {
             return Ok(None);
         }
         let eligible = should_auto_stop_session(

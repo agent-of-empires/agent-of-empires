@@ -213,28 +213,28 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
   });
 });
 
-describe("SessionWizard reducer / useCockpit (#1580)", () => {
-  it("defaults useCockpit to true so the master switch keeps its current behavior", () => {
-    expect(initialData.useCockpit).toBe(true);
+describe("SessionWizard reducer / useStructuredView (#1580)", () => {
+  it("defaults useStructuredView to true so ACP-capable tools use the structured view by default", () => {
+    expect(initialData.useStructuredView).toBe(true);
   });
 
-  it("SET_FIELD useCockpit updates the flag", () => {
+  it("SET_FIELD useStructuredView updates the flag", () => {
     const next = reducer(makeState(), {
       type: "SET_FIELD",
-      field: "useCockpit",
+      field: "useStructuredView",
       value: false,
     });
-    expect(next.data.useCockpit).toBe(false);
+    expect(next.data.useStructuredView).toBe(false);
   });
 
-  it("toggling useCockpit does NOT mark profileDirty", () => {
-    // useCockpit is deliberately excluded from the dirty-tracking list:
+  it("toggling useStructuredView does NOT mark profileDirty", () => {
+    // useStructuredView is deliberately excluded from the dirty-tracking list:
     // the mount-time APPLY_PROFILE_DEFAULTS seeder uses skipIfDirty, so
-    // marking dirty on a cockpit toggle would suppress the profile's
-    // tool/yolo/sandbox/env defaults even though cockpit is unrelated.
+    // marking dirty on a structured view toggle would suppress the profile's
+    // tool/yolo/sandbox/env defaults even though structured view is unrelated.
     const next = reducer(makeState(), {
       type: "SET_FIELD",
-      field: "useCockpit",
+      field: "useStructuredView",
       value: false,
     });
     expect(next.data.profileDirty).toBe(false);
@@ -251,10 +251,10 @@ describe("SessionWizard reducer / useCockpit (#1580)", () => {
     expect(late.data.yoloMode).toBe(true);
   });
 
-  it("switching tool preserves the user's useCockpit choice", () => {
+  it("switching tool preserves the user's useStructuredView choice", () => {
     const optedOut = reducer(makeState(), {
       type: "SET_FIELD",
-      field: "useCockpit",
+      field: "useStructuredView",
       value: false,
     });
     const next = reducer(optedOut, {
@@ -263,6 +263,6 @@ describe("SessionWizard reducer / useCockpit (#1580)", () => {
       value: "opencode",
     });
     expect(next.data.tool).toBe("opencode");
-    expect(next.data.useCockpit).toBe(false);
+    expect(next.data.useStructuredView).toBe(false);
   });
 });

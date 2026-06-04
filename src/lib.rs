@@ -1,11 +1,11 @@
 //! Agent of Empires library - Core functionality for the terminal session manager
 
+#[cfg(feature = "serve")]
+pub mod acp;
 pub mod agents;
 pub mod build_info;
 pub mod claude_settings;
 pub mod cli;
-#[cfg(feature = "serve")]
-pub mod cockpit;
 pub mod containers;
 pub mod file_watch;
 pub mod git;

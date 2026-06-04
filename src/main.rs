@@ -43,8 +43,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // If the user passed --daemon-url, mirror the value into the env
-    // var so the cockpit::client::discovery layer (used by both the
-    // remote TUI home and the `aoe cockpit *` verbs) picks it up
+    // var so the acp::client::discovery layer (used by both the
+    // remote TUI home and the `aoe acp *` verbs) picks it up
     // through the same code path the env-only path uses. This avoids a
     // second "is the flag set?" check in every callsite.
     if let Some(url) = &cli.daemon_url {
@@ -299,9 +299,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "serve")]
         Some(Commands::Url(args)) => cli::url::run(args),
         #[cfg(feature = "serve")]
-        Some(Commands::Cockpit { command }) => cli::cockpit::run(command).await,
+        Some(Commands::Acp { command }) => cli::acp::run(command).await,
         #[cfg(feature = "serve")]
-        Some(Commands::CockpitRunner(args)) => agent_of_empires::cockpit::runner::run(*args).await,
+        Some(Commands::AcpRunner(args)) => agent_of_empires::acp::runner::run(*args).await,
         None => {
             // Fold the drift notice into the existing startup-warning channel
             // so the TUI surfaces both (debug-log + drift, if both fire) in a

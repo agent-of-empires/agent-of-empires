@@ -47,19 +47,18 @@ export interface WizardData {
    *  `scratch` clears `path`/`useWorktree`/`extraRepoPaths`; setting any
    *  of those back to a non-empty value clears `scratch`. */
   scratch: boolean;
-  /** Per-session opt-in to cockpit rendering for ACP-capable tools.
-   *  Defaults true so the cockpit master switch (`cockpit.enabled`)
-   *  keeps its current "ACP tools run in cockpit" behavior; the user
-   *  can turn it off in AgentStep to launch a tmux/terminal session
-   *  even while the master switch is on. The submit path only sends
-   *  `cockpit_mode: true` when the master switch is on, the tool is
-   *  ACP-capable, and this flag is set; the server re-checks the
-   *  master switch (src/server/api/sessions.rs). Intentionally not
+  /** Per-session opt-in to structured view rendering for ACP-capable tools.
+   *  Defaults true so ACP-capable tools render in the structured view by
+   *  default ("ACP tools run in structured view" behavior); the user
+   *  can turn it off in AgentStep to launch a tmux/terminal session. The
+   *  submit path sends `view: "structured"` only when the tool is
+   *  ACP-capable and this flag is set; the server re-validates
+   *  capability (src/server/api/sessions.rs). Intentionally not
    *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
-   *  remembered opt-out would silently defeat the master switch. */
-  useCockpit: boolean;
-  cockpitModel: string;
-  cockpitEffort: string;
+   *  remembered opt-out would silently override the per-session default. */
+  useStructuredView: boolean;
+  agentModel: string;
+  agentEffort: string;
   [key: string]: unknown;
 }
 
@@ -90,8 +89,8 @@ export type Action =
       sandboxEnabled: boolean;
       tool: string;
       extraEnv: string[];
-      cockpitModel?: string;
-      cockpitEffort?: string;
+      agentModel?: string;
+      agentEffort?: string;
       /** When true, skip the apply if the user has already edited an
        *  agent-step field. The picker-driven path always sets this false
        *  (the user has already confirmed the overwrite); the mount-time
@@ -109,9 +108,9 @@ export const initialData: WizardData = {
   advancedEnabled: false, profileDirty: false,
   customInstruction: "", extraArgs: "", commandOverride: "",
   scratch: false,
-  useCockpit: true,
-  cockpitModel: "",
-  cockpitEffort: "",
+  useStructuredView: true,
+  agentModel: "",
+  agentEffort: "",
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -153,7 +152,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "cockpitModel", "cockpitEffort"].includes(action.field)) {
+      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "agentModel", "agentEffort"].includes(action.field)) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };
@@ -188,8 +187,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
           sandboxEnabled: action.sandboxEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
-          cockpitModel: action.cockpitModel ?? "",
-          cockpitEffort: action.cockpitEffort ?? "",
+          agentModel: action.agentModel ?? "",
+          agentEffort: action.agentEffort ?? "",
           profileDirty: false,
         },
       };

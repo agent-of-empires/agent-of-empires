@@ -53,15 +53,15 @@ export const docsNav: NavSection[] = [
     ],
   },
   {
-    title: "Cockpit",
+    title: "Structured View",
     items: [
-      { title: "Overview", href: "/docs/cockpit/" },
-      { title: "Setup", href: "/docs/cockpit/setup/" },
-      { title: "Interface", href: "/docs/cockpit/interface/" },
-      { title: "Modes, Approvals & Models", href: "/docs/cockpit/controls/" },
-      { title: "Persistence & Recovery", href: "/docs/cockpit/persistence/" },
-      { title: "Troubleshooting", href: "/docs/cockpit/troubleshooting/" },
-      { title: "Multi-Agent Support", href: "/docs/cockpit/multi-agent/" },
+      { title: "Overview", href: "/docs/structured-view/" },
+      { title: "Setup", href: "/docs/structured-view/setup/" },
+      { title: "Interface", href: "/docs/structured-view/interface/" },
+      { title: "Modes, Approvals & Models", href: "/docs/structured-view/controls/" },
+      { title: "Persistence & Recovery", href: "/docs/structured-view/persistence/" },
+      { title: "Troubleshooting", href: "/docs/structured-view/troubleshooting/" },
+      { title: "Multi-Agent Support", href: "/docs/structured-view/multi-agent/" },
     ],
   },
   {

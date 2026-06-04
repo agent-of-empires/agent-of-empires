@@ -54,7 +54,7 @@ Copy a changed file's repo-relative path to the clipboard:
 
 The path is relative to the file's repository root, so it pastes straight into commands or comments.
 
-## Commenting on the diff (web only, cockpit sessions)
+## Commenting on the diff (web only, structured view sessions)
 
 The web dashboard lets you annotate lines in the diff and send the
 comments to the agent as a single prompt (#928).
@@ -77,7 +77,7 @@ comments to the agent as a single prompt (#928).
   its captured code snippet so the agent can act without re-reading
   the file), and an editable outro textarea (default "Please
   address these comments."). Send fires `POST
-  /api/sessions/:id/cockpit/prompt`. Comments are cleared on
+  /api/sessions/:id/acp/prompt`. Comments are cleared on
   success unless you uncheck "Clear comments after sending".
 - Comments persist in `localStorage`, scoped per session. They
   survive page reloads but are browser-local.
@@ -85,8 +85,8 @@ comments to the agent as a single prompt (#928).
   edited the file), the comment moves to a "stale comments" block
   at the top of the file view with a `[stale]` chip; the captured
   snippet still goes through to the agent in the prompt.
-- The feature is hidden for non-cockpit sessions (tmux/PTY). The
-  Send button is also disabled while the cockpit worker isn't
+- The feature is hidden for non-structured view sessions (tmux/PTY). The
+  Send button is also disabled while the structured view worker isn't
   running.
 
 ## Per-session base override

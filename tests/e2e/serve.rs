@@ -428,8 +428,8 @@ fn cli_serve_auth_passphrase_login_round_trip() {
 
 /// Regression test for #1525. With `--auth=passphrase` the daemon used
 /// to route loopback callers through the passphrase wall, breaking the
-/// local TUI cockpit attach: it had no session cookie + device binding
-/// to present so `/api/sessions/{id}/cockpit/replay` and the cockpit ws
+/// local TUI structured view attach: it had no session cookie + device binding
+/// to present so `/api/sessions/{id}/structured view/replay` and the structured view ws
 /// upgrade always 401'd. The fix mirrors the token-auth path's #1168
 /// carve-out and treats loopback as fs-trusted.
 ///
@@ -439,7 +439,7 @@ fn cli_serve_auth_passphrase_login_round_trip() {
 ///      device binding, no XFF -> 200 with `"auth_mode":"passphrase"`.
 ///      Without the bypass this would 401 `login_required`.
 ///   3. GET `/api/sessions` from 127.0.0.1 -> 200 (proves the bypass
-///      covers the cockpit REST surface, not just `/api/about`).
+///      covers the structured view REST surface, not just `/api/about`).
 #[test]
 #[serial]
 fn cli_serve_auth_passphrase_loopback_bypass() {
@@ -502,10 +502,10 @@ fn cli_serve_auth_passphrase_loopback_bypass() {
             ));
         }
 
-        // The cockpit REST surface lives under the same wall, so the
+        // The structured view REST surface lives under the same wall, so the
         // bypass must extend to it. A successful 200 on `/api/sessions`
         // from loopback without a session is what unblocks the local
-        // TUI cockpit attach in the issue report.
+        // TUI structured view attach in the issue report.
         let sessions = client
             .get(format!("{base}/api/sessions"))
             .send()

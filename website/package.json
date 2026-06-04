@@ -2,7 +2,7 @@
   "name": "agent-of-empires-website",
   "type": "module",
   "scripts": {
-    "copy-assets": "cp ../assets/logo.svg ../assets/logo.png ../assets/logo-youtube.png ../assets/social-preview.png public/assets/ && cp ../docs/assets/*.gif ../docs/assets/*.png public/assets/ && mkdir -p public/assets/cockpit public/assets/web && cp ../docs/assets/cockpit/*.png public/assets/cockpit/ && cp ../docs/assets/web/*.png public/assets/web/",
+    "copy-assets": "cp ../assets/logo.svg ../assets/logo.png ../assets/logo-youtube.png ../assets/social-preview.png public/assets/ && cp ../docs/assets/*.gif ../docs/assets/*.png public/assets/ && mkdir -p public/assets/structured-view public/assets/web && cp ../docs/assets/structured-view/*.png public/assets/structured-view/ && cp ../docs/assets/web/*.png public/assets/web/",
     "sync-docs": "node scripts/sync-docs.mjs",
     "dev": "npm run copy-assets && npm run sync-docs && astro dev",
     "build": "npm run copy-assets && npm run sync-docs && astro build",

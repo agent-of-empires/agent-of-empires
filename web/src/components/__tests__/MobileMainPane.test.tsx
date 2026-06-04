@@ -2,7 +2,7 @@
 //
 // Covers the mobile single-pane container (#1452): the back header, the
 // agent / paired / diff layers with their inert + visibility toggling, the
-// cockpit vs terminal agent branch, the diff list vs viewer branch, and the
+// structured view vs terminal agent branch, the diff list vs viewer branch, and the
 // send-comments dialog. Heavy children are stubbed; this asserts the
 // container's own branching, which the Playwright suite then exercises live.
 
@@ -34,8 +34,8 @@ vi.mock("../diff/comments/SendCommentsDialog", () => ({
     </button>
   ),
 }));
-vi.mock("../cockpit/CockpitView", () => ({
-  CockpitView: () => <div data-testid="cockpit-view" />,
+vi.mock("../acp/StructuredView", () => ({
+  StructuredView: () => <div data-testid="acp-view" />,
 }));
 
 import { MobileMainPane } from "../MobileMainPane";
@@ -118,16 +118,16 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
 }
 
 describe("MobileMainPane", () => {
-  it("shows the agent terminal and no back header in agent view", () => {
+  it("shows the agent terminal and no back header in structured view", () => {
     setup({ view: "agent" });
     expect(screen.getByTestId("agent-terminal")).toBeDefined();
     expect(screen.queryByTestId("mobile-back-to-agent")).toBeNull();
   });
 
-  it("renders the cockpit view for cockpit sessions", async () => {
-    setup({ view: "agent", activeSession: session({ cockpit_mode: true }) });
-    // CockpitView is lazy-loaded behind Suspense, so await its resolution.
-    expect(await screen.findByTestId("cockpit-view")).toBeDefined();
+  it("renders the structured view for structured view sessions", async () => {
+    setup({ view: "agent", activeSession: session({ view: "structured" }) });
+    // StructuredView is lazy-loaded behind Suspense, so await its resolution.
+    expect(await screen.findByTestId("acp-view")).toBeDefined();
   });
 
   it("shows the back header and returns to agent on click", () => {

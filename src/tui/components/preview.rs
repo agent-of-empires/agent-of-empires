@@ -164,7 +164,7 @@ impl Preview {
         // One source of truth for the header / banner / output split. Compact
         // viewports and the hidden-header toggle both collapse to "output owns
         // the whole area" inside `PreviewLayout::compute`, symmetric with the
-        // Agent view's `render_with_cache`.
+        // Structured view's `render_with_cache`.
         let layout =
             PreviewLayout::compute(area, compact, show_info, terminal_info_height(instance));
 

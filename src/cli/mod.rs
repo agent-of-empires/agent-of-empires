@@ -1,9 +1,9 @@
 //! CLI command implementations
 
+#[cfg(feature = "serve")]
+pub mod acp;
 pub mod add;
 pub mod agents;
-#[cfg(feature = "serve")]
-pub mod cockpit;
 pub mod definition;
 pub mod extract_session_id;
 pub mod group;

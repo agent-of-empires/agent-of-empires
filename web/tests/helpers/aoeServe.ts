@@ -49,7 +49,7 @@ export interface SpawnOptions {
    * When true and `authMode === "passphrase"`, the harness POSTs
    * `/api/login` itself after boot to mint a session cookie + record
    * the device binding secret. Useful for fixtures that need a
-   * pre-authed browser context (e.g. a future cockpit-under-passphrase
+   * pre-authed browser context (e.g. a future acp-under-passphrase
    * spec). Defaults to false: specs that drive LoginPage end-to-end
    * (the `auth-login-passphrase` spec) want to start with no cookie
    * so the LoginPage actually renders.
@@ -70,15 +70,15 @@ export interface SpawnOptions {
   tokenGraceSecs?: number;
   /**
    * When true, install `fakeAcpAgent.mjs` as the `claude` / `aoe-agent`
-   * shim instead of the tail-f-dev-null stub, and flip the cockpit
-   * master enable flag via `PATCH /api/cockpit/master` after the server
+   * shim instead of the tail-f-dev-null stub, and flip the structured view
+   * master enable flag via `PATCH /api/acp/master` after the server
    * boots.
    */
-  cockpit?: boolean;
-  /** Optional path to a FAKE_ACP_SCRIPT for cockpit tests. */
+  acp?: boolean;
+  /** Optional path to a FAKE_ACP_SCRIPT for structured view tests. */
   fakeAcpScript?: string;
   /** Extra environment variables exported in the fake-ACP shim. Lets
-   *  cockpit tests toggle behavior on the fake agent (e.g. force a
+   *  structured view tests toggle behavior on the fake agent (e.g. force a
    *  rejection of session/set_config_option) without writing a full
    *  scripted turn file. */
   extraEnv?: Record<string, string>;
@@ -152,7 +152,7 @@ export interface ServeHandle {
    * back. The captured port is reused after the dead listener releases
    * it on `exit`. Token-mode reads the freshly written `serve.token`
    * and updates `handle.authToken`. Does NOT re-run passphrase
-   * `preloginViaHarness` or cockpit master enable; specs that need
+   * `preloginViaHarness` or structured view master enable; specs that need
    * those across a restart should call `spawnAoeServe` again.
    */
   restart(): Promise<void>;
@@ -332,7 +332,7 @@ async function waitForServer(
 
 function writeFakeClaudeShim(binDir: string): void {
   // Dashboard tracer specs only need the tmux pane to stay open with a
-  // long-running process. Cockpit specs swap this for the ACP agent shim
+  // long-running process. Structured view specs swap this for the ACP agent shim
   // via `writeFakeAcpShim`. Install shims for the built-in agents the
   // wizard UI surfaces (claude / codex / gemini); the agent picker
   // filters by `which <binary>` (src/tmux/mod.rs::is_agent_available),
@@ -352,13 +352,13 @@ function writeFakeAcpShim(
   fakeAcpDebugLog: string,
   extraEnv: Record<string, string> | undefined,
 ): void {
-  // The cockpit supervisor resolves the agent through `AgentRegistry`
-  // (src/cockpit/agent_registry.rs): the `claude` tool key maps to
+  // The structured view supervisor resolves the agent through `AgentRegistry`
+  // (src/acp/agent_registry.rs): the `claude` tool key maps to
   // command `claude-agent-acp`, not `claude`. `resolve_agent_command`
   // walks $PATH and node-version dirs, so without a `claude-agent-acp`
   // entry in the shim dir the supervisor falls through to the real
   // installed adapter, which then surfaces "Authentication required"
-  // on the first prompt. Shim every name a cockpit test can land on.
+  // on the first prompt. Shim every name a structured view test can land on.
   //
   // The shim also re-exports diagnostic env vars (FAKE_ACP_SCRIPT,
   // FAKE_ACP_DEBUG_LOG) so they reach the node child even when the
@@ -382,30 +382,6 @@ function writeFakeAcpShim(
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
-  }
-}
-
-async function enableCockpitMaster(
-  baseUrl: string,
-  sessionCookie?: { name: string; value: string },
-): Promise<void> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (sessionCookie) {
-    // Required when authMode === "passphrase"; loopback bypass kicks in
-    // for token+loopback callers, but PATCH /api/cockpit/master predates
-    // any browser navigation, so the SPA hasn't yet seeded the cookie
-    // into a Playwright context. Include it on the harness's own request.
-    headers.Cookie = `${sessionCookie.name}=${sessionCookie.value}`;
-  }
-  const res = await fetch(`${baseUrl}/api/cockpit/master`, {
-    method: "PATCH",
-    headers,
-    body: JSON.stringify({ enabled: true }),
-  });
-  if (!res.ok) {
-    throw new Error(
-      `PATCH /api/cockpit/master failed: ${res.status} ${await res.text()}`,
-    );
   }
 }
 
@@ -449,7 +425,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   //
   // Use `/tmp/...` as the base instead of `tmpdir()`. On macOS,
   // `tmpdir()` resolves to `/private/var/folders/<hash>/T/...` (~95
-  // chars). After we append `/.agent-of-empires-dev/cockpit-workers/
+  // chars). After we append `/.agent-of-empires-dev/acp-workers/
   // <session_id>.sock` (~60 chars) we blow past the 104-byte
   // `sun_path` limit on Darwin unix sockets and the runner's
   // `UnixListener::bind` fails with ENAMETOOLONG. Because the runner
@@ -475,7 +451,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const fakeAcpDebugLog = join(home, "fake-acp.log");
-  if (opts.cockpit) {
+  if (opts.acp) {
     writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
   } else {
     writeFakeClaudeShim(shimBin);
@@ -491,15 +467,15 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     TMUX_TMPDIR: tmuxTmp,
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Lift the runner-socket appearance deadline. The `aoe
-    // __cockpit-runner` shim re-execs the debug `aoe` binary, which
+    // __acp-runner` shim re-execs the debug `aoe` binary, which
     // under v8 coverage + 3 parallel workers + tmux + a fake-ACP node
     // subprocess can take >10s to bind its unix listener on a
     // contended runner. The production 10s default in
     // `runner_socket_deadline()` covers cold caches; tests need
-    // headroom or `cockpit_enable` fails with `runner socket … did
+    // headroom or `acp_enable` fails with `runner socket … did
     // not appear within 10s` (deterministic on slower local + CI
     // machines, never on hot caches). Honored only in debug builds.
-    AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS: "60000",
+    AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS: "60000",
     // FAKE_ACP_DEBUG_LOG is *also* re-exported by the shim itself
     // (see writeFakeAcpShim) because the daemon -> runner -> node
     // spawn chain on CI Linux did not propagate this env var from
@@ -695,7 +671,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
         if (proc) await killProc(proc);
       } finally {
         // Best-effort: kill any tmux server bound to the isolated socket
-        // before deleting the dir. Cockpit specs leave tmux child
+        // before deleting the dir. Structured view specs leave tmux child
         // processes around that hold open file descriptors and trip
         // ENOTEMPTY on rmSync if not cleaned up first.
         try {
@@ -731,9 +707,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     handle.deviceBindingSecret = deviceBindingSecret;
   }
 
-  if (opts.cockpit) {
-    await enableCockpitMaster(baseUrl, handle.sessionCookie);
-  }
+  // The structured view is the default for ACP-capable agents now (the master
+  // switch was removed), so the harness no longer enables anything here.
+  // `opts.structured view` is accepted for source compatibility and ignored.
+  void opts.acp;
 
   return handle;
 }

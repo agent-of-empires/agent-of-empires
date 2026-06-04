@@ -21,8 +21,8 @@ AOE_LOG_LEVEL=trace cargo run        # Pick the log level explicitly
 AOE_ACP_TRACE=1 cargo run            # Plus raw ACP JSON-RPC firehose; useful for
                                      # verifying sub-agent linkage
                                      # (`_meta.claudeCode.parentToolUseId` round-trip)
-                                     # and other adapter-side _meta fields. Cockpit
-                                     # also logs a `cockpit.acp` debug line whenever
+                                     # and other adapter-side _meta fields. Structured view
+                                     # also logs a `acp.protocol.tool_dispatch` debug line whenever
                                      # it links a child tool call to a parent Task.
 AOE_TERMINAL_TRACE=1 cargo run       # Plus per-message bytes for the web terminal WS (spammy)
 aoe logs                       # View debug.log via lnav/bat/less (auto-detects)

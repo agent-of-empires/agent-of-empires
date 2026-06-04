@@ -134,7 +134,7 @@ pub enum ValidationKind {
 /// without lifetime juggling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDescriptor {
-    /// Top-level config section, e.g. `"cockpit"`. Matches the `[section]`
+    /// Top-level config section, e.g. `"acp"`. Matches the `[section]`
     /// table in `config.toml` and the override key in a profile.
     pub section: String,
     /// Field name within the section, e.g. `"max_concurrent_workers"`.

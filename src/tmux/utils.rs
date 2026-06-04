@@ -253,11 +253,14 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
-/// Run `tmux kill-session -t <name>`. The `can't find session` stderr (in
-/// C locale) is treated as success: callers commonly kill the pane's
-/// process tree first, which can cause tmux to tear down the session
-/// before this call lands. Any other tmux failure returns `Err`. Caller
-/// is responsible for `refresh_session_cache` after a successful kill.
+/// Run `tmux kill-session -t <name>`. A missing session is treated as
+/// success, since the goal is "this session is not present": `can't find
+/// session` (the session is gone, e.g. callers commonly kill the pane's
+/// process tree first, which can tear the session down before this lands)
+/// and `no server running` (no tmux server at all, so no session exists)
+/// are both swallowed in the C locale. Any other tmux failure returns
+/// `Err`. Caller is responsible for `refresh_session_cache` after a
+/// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = Command::new("tmux")
         .env("LC_ALL", "C")
@@ -265,7 +268,10 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("can't find session") {
+        let absent = stderr.contains("can't find session")
+            || stderr.contains("no server running")
+            || stderr.contains("error connecting");
+        if !absent {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }
     }

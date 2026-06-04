@@ -1,5 +1,5 @@
 // Embedded inline diff renderer for an `(old_string, new_string)`
-// pair. Used inside the cockpit Edit/Write card; reuses the same
+// pair. Used inside the structured view Edit/Write card; reuses the same
 // `DiffLine` row and `useHighlightedLines` token grid as the branch
 // diff viewer so the two surfaces look the same. See #1073.
 

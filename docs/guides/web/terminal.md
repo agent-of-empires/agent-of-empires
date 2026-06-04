@@ -4,8 +4,8 @@ For tmux-backed sessions the dashboard renders a real terminal in the
 page: the agent's pane streamed over a WebSocket PTY relay, plus an
 optional paired shell. This page covers both terminals, how reconnect
 behaves, and the close codes you may see when a connection fails. For
-the structured cockpit rendering used by ACP sessions, see the
-[Cockpit overview](../../cockpit.md).
+the structured view rendering used by ACP sessions, see the
+[Structured view overview](../../structured-view.md).
 
 ![The agent terminal rendered in the browser via the PTY relay](../../assets/web/terminal.png)
 

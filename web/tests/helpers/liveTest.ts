@@ -43,12 +43,12 @@ type LiveFixtures = {
    */
   serveToken: ServeHandle;
   /**
-   * Cockpit fixture. Only supported with `authMode: "none"` today; the
-   * harness calls `PATCH /api/cockpit/master` without a session cookie.
-   * If you need passphrase + cockpit, call `spawnAoeServe` directly and
+   * Structured view fixture. Only supported with `authMode: "none"` today; the
+   * harness calls `PATCH /api/acp/master` without a session cookie.
+   * If you need passphrase + structured view, call `spawnAoeServe` directly and
    * pass the `sessionCookie` through to the master-enable request.
    */
-  serveCockpit: ServeHandle;
+  serveAcp: ServeHandle;
 };
 
 /**
@@ -128,10 +128,10 @@ export const test = base.extend<LiveFixtures>({
     await use(h);
     await h.stop();
   },
-  serveCockpit: async ({}, use, testInfo) => {
+  serveAcp: async ({}, use, testInfo) => {
     const h = await spawnAoeServe({
       authMode: "none",
-      cockpit: true,
+      acp: true,
       // Specs that want a custom script set `FAKE_ACP_SCRIPT` themselves
       // through testInfo.use() overrides or call `spawnAoeServe` directly.
       fakeAcpScript: process.env.FAKE_ACP_SCRIPT,

@@ -18,7 +18,7 @@ async function mockWizardApis(page: Page, agents: unknown[]) {
     route.fulfill({ json: {} }),
   );
   await page.route("**/api/about", (route) =>
-    route.fulfill({ json: { cockpit_master_enabled: true } }),
+    route.fulfill({ json: {} }),
   );
   await page.route("**/api/docker/status", (route) =>
     route.fulfill({ json: { available: false, runtime: null } }),
@@ -75,7 +75,7 @@ test.describe("wizard custom agent picker", () => {
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({
     page,
   }) => {
-    let captured: { tool?: string; cockpit_mode?: boolean } | null = null;
+    let captured: { tool?: string; view?: "structured" | "terminal" } | null = null;
     await mockWizardApis(page, [
       {
         name: "claude",
@@ -140,7 +140,7 @@ test.describe("wizard custom agent picker", () => {
     await page.getByRole("button", { name: /remote-helper/ }).click();
     await expect(
       page.getByText(
-        /Custom agents run in the terminal unless they define agent_cockpit_cmd/,
+        /Custom agents run in the terminal unless they define agent_acp_cmd/,
       ),
     ).toBeVisible();
     await expect(page.locator("body")).not.toContainText(hiddenBinary);
@@ -159,7 +159,7 @@ test.describe("wizard custom agent picker", () => {
     await page.getByRole("button", { name: /Launch session/ }).click();
 
     await expect.poll(() => captured?.tool).toBe(customAgentName);
-    expect(captured?.cockpit_mode).toBe(false);
+    expect(captured?.view === "structured").toBe(false);
     await expect(page.locator("body")).not.toContainText(hiddenBinary);
     await expect(page.locator("body")).not.toContainText(hiddenCommand);
     await expect(page.locator("body")).not.toContainText(hiddenDetectAs);

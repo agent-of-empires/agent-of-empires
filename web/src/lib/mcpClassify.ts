@@ -1,5 +1,5 @@
 // Recognise MCP-server tool calls (Anthropic's `mcp__<server>__<verb>`
-// namespacing) so the cockpit can render them in a dedicated card
+// namespacing) so the structured view can render them in a dedicated card
 // instead of the generic-tool fallback. The adapter (claude-agent-acp)
 // ships these calls through as `kind: "other"` with the raw underscore
 // name as the title; the frontend reclassifies on title alone. The
@@ -7,8 +7,8 @@
 // adapters with different naming conventions can be added without
 // touching every classifier.
 
-import type { ToolCall } from "./cockpitTypes";
-import { parseJsonObject, pickStr } from "./cockpitArgs";
+import type { ToolCall } from "./acpTypes";
+import { parseJsonObject, pickStr } from "./acpArgs";
 import type { AgentProfile } from "./agentProfiles";
 
 /** Default MCP prefix list used when no profile is passed in. Mirrors
@@ -26,7 +26,7 @@ export interface NotMcp {
 }
 
 /** Pull the canonical name out of a tool call: prefer the wire `name`
- *  field, but fall back to `_aoe_title` from args (the cockpit runtime
+ *  field, but fall back to `_aoe_title` from args (the structured view runtime
  *  forwards the ACP title there when it's distinct from the kind). */
 function nameOf(tool: ToolCall): string {
   if (tool.name) return tool.name;

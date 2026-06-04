@@ -116,11 +116,11 @@ pub struct App {
     /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
     /// tracking mid-session either.
     mosh_active: bool,
-    /// Set by `Action::OpenCockpit` so the async main loop can pick it
-    /// up and enter the cockpit view (which needs `event_stream` access
+    /// Set by `Action::OpenStructuredView` so the async main loop can pick it
+    /// up and enter the acp view (which needs `event_stream` access
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
-    pending_cockpit_open: Option<String>,
+    pending_structured_view_open: Option<String>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
     /// `last_installed_version_in_session` on confirmed success in
@@ -264,7 +264,7 @@ impl App {
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
             mosh_active,
             #[cfg(feature = "serve")]
-            pending_cockpit_open: None,
+            pending_structured_view_open: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         })
@@ -620,7 +620,7 @@ impl App {
                             // on) would otherwise deliver a Release for every press
                             // and double-fire every handler, so a toggle like `i`
                             // (hide the info header) nets to zero and "won't hide".
-                            // The cockpit and remote-home loops already filter this;
+                            // The acp and remote-home loops already filter this;
                             // the home loop has to as well.
                             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                 continue;
@@ -966,16 +966,16 @@ impl App {
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
-                                // Mirror the handle_key path: Action::OpenCockpit
-                                // only stashes the id in `pending_cockpit_open`
-                                // because the cockpit view needs async
+                                // Mirror the handle_key path: Action::OpenStructuredView
+                                // only stashes the id in `pending_structured_view_open`
+                                // because the acp view needs async
                                 // EventStream access that the sync
                                 // `execute_action` can't lend. Drain here so a
-                                // double-click on a cockpit session actually
+                                // double-click on an acp session actually
                                 // opens it.
                                 #[cfg(feature = "serve")]
-                                if let Some(session_id) = self.pending_cockpit_open.take() {
-                                    self.run_cockpit_view(&session_id, terminal).await?;
+                                if let Some(session_id) = self.pending_structured_view_open.take() {
+                                    self.run_structured_view(&session_id, terminal).await?;
                                 }
                             }
                             // Drain any Action stashed by a modal-dialog
@@ -1320,7 +1320,7 @@ impl App {
     /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
     /// `usage_seen` map is reported zeroed (a stable full key set), the
     /// per-client form-factor maps stay empty (and so omitted), the create-trend
-    /// counter is left at 0, and the cockpit-interaction counts are empty (the
+    /// counter is left at 0, and the structured-interaction counts are empty (the
     /// `aoe serve` daemon is the surface that tracks all of those).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         crate::telemetry::build_usage_snapshot(
@@ -1331,7 +1331,7 @@ impl App {
             // The TUI hosts no server, so it has no auth or exposure mode.
             None,
             None,
-            &crate::telemetry::CockpitInteractionCounts::default(),
+            &crate::telemetry::StructuredInteractionCounts::default(),
         )
     }
 
@@ -1821,20 +1821,20 @@ impl App {
         }
 
         #[cfg(feature = "serve")]
-        if let Some(session_id) = self.pending_cockpit_open.take() {
-            self.run_cockpit_view(&session_id, terminal).await?;
+        if let Some(session_id) = self.pending_structured_view_open.take() {
+            self.run_structured_view(&session_id, terminal).await?;
         }
 
         Ok(())
     }
 
     #[cfg(feature = "serve")]
-    async fn run_cockpit_view(
+    async fn run_structured_view(
         &mut self,
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        // The cockpit view borrows the EventStream so it can drive its
+        // The acp view borrows the EventStream so it can drive its
         // own tokio::select! loop. Pull it out for the duration of the
         // call; restore on return.
         let mut stream = match self.event_stream.take() {
@@ -1842,14 +1842,14 @@ impl App {
             None => return Ok(()),
         };
         let result =
-            crate::tui::cockpit_view::run(terminal, &mut stream, &self.theme, session_id).await;
+            crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
         // Forcing a full redraw on return so the home screen redraws
-        // any cells the cockpit view painted over.
+        // any cells the acp view painted over.
         self.needs_redraw = true;
         terminal.clear()?;
         if let Err(e) = result {
-            self.update_status = Some(UpdateStatus::transient(format!("cockpit closed: {e}")));
+            self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
         Ok(())
     }
@@ -2037,12 +2037,12 @@ impl App {
                 self.attach_tool_session(&id, &tool_name, terminal)?;
             }
             #[cfg(feature = "serve")]
-            Action::OpenCockpit(id) => {
-                // Stash for the async main loop. The cockpit view needs
+            Action::OpenStructuredView(id) => {
+                // Stash for the async main loop. The acp view needs
                 // `event_stream` access that this sync handler can't
-                // lend; the loop picks `pending_cockpit_open` up after
+                // lend; the loop picks `pending_structured_view_open` up after
                 // we return.
-                self.pending_cockpit_open = Some(id);
+                self.pending_structured_view_open = Some(id);
             }
         }
         Ok(())
@@ -2054,8 +2054,8 @@ impl App {
     /// the main loop's `apply_creation_results` handler) so the setting
     /// applies regardless of which one fired.
     ///
-    /// Cockpit sessions return `None` from the resolver and fall through
-    /// to `attach_session`, which already no-ops for cockpit. Same for
+    /// Acp sessions return `None` from the resolver and fall through
+    /// to `attach_session`, which already no-ops for acp. Same for
     /// missing-instance race conditions: better to do the tmux-attach
     /// fallback than silently swallow the new session.
     fn dispatch_new_session_attach(
@@ -2089,13 +2089,13 @@ impl App {
             None => return Ok(()),
         };
 
-        // Cockpit-mode sessions are not backed by tmux. The Enter
+        // Acp-mode sessions are not backed by tmux. The Enter
         // handler in `home::input` already short-circuits with a
         // transient toast pointing the user at the web dashboard;
         // this function still gets called from `apply_creation_results`
         // after `aoe add --launch`, so guard here too. Falling through
         // would attempt a tmux attach against a non-existent pane.
-        if instance.is_cockpit_mode() {
+        if instance.is_structured() {
             let _ = terminal;
             return Ok(());
         }
@@ -2488,12 +2488,12 @@ pub enum Action {
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),
-    /// Open the native cockpit view for `session_id`. The action handler
-    /// stashes the id in `pending_cockpit_open`; the main loop drains it
-    /// after `execute_action` returns and runs the async cockpit loop
+    /// Open the native acp view for `session_id`. The action handler
+    /// stashes the id in `pending_structured_view_open`; the main loop drains it
+    /// after `execute_action` returns and runs the async acp loop
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
-    OpenCockpit(String),
+    OpenStructuredView(String),
 }
 
 #[cfg(test)]

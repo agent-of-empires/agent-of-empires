@@ -6,7 +6,7 @@
 //   - AgentStep selects both kind="custom" entries and `installed`
 //     built-ins for the picker grid.
 //   - AgentStep renders a "Custom" badge for kind="custom".
-//   - AgentStep's SubstrateNotice branches to a custom-agent string
+//   - AgentStep's ViewNotice branches to a custom-agent string
 //     when the selected agent's kind is "custom".
 //   - ReviewStep's AgentReviewValue renders just the name for built-in
 //     agents but adds a "Custom" badge for kind="custom".
@@ -50,9 +50,9 @@ const custom: AgentInfo = {
   acp_capable: false,
 };
 
-// A custom agent with an agent_cockpit_cmd configured: the server marks
-// it acp_capable, so the wizard offers cockpit instead of the terminal.
-const cockpitCustom: AgentInfo = {
+// A custom agent with an agent_acp_cmd configured: the server marks
+// it acp_capable, so the wizard offers structured view instead of the terminal.
+const acpCustom: AgentInfo = {
   kind: "custom",
   name: "oc-superpowers",
   binary: "oc-superpowers",
@@ -75,7 +75,6 @@ const uninstalledBuiltin: AgentInfo = {
 function renderAgentStep(overrides: {
   tool?: string;
   agents?: AgentInfo[];
-  cockpitMasterEnabled?: boolean;
 }) {
   const onChange = vi.fn();
   const utils = render(
@@ -86,7 +85,6 @@ function renderAgentStep(overrides: {
       profiles={[] as ProfileInfo[]}
       dockerAvailable={false}
       onApplyProfileDefaults={() => {}}
-      cockpitMasterEnabled={overrides.cockpitMasterEnabled ?? true}
     />,
   );
   return { onChange, ...utils };
@@ -117,34 +115,34 @@ describe("AgentStep custom-agent selection (#1252)", () => {
     expect(queryByText("No agents installed")).toBeNull();
   });
 
-  it("renders the terminal-fallback notice for a custom agent with no agent_cockpit_cmd", () => {
+  it("renders the terminal-fallback notice for a custom agent with no agent_acp_cmd", () => {
     const { getByText } = renderAgentStep({
       tool: "remote-helper",
       agents: [builtin, custom],
     });
-    expect(getByText(/Custom agents run in the terminal unless they define agent_cockpit_cmd/)).toBeTruthy();
+    expect(getByText(/Custom agents run in the terminal unless they define agent_acp_cmd/)).toBeTruthy();
   });
 
-  it("renders the cockpit substrate card for a custom agent that is acp_capable", () => {
-    // A custom agent with agent_cockpit_cmd (acp_capable=true) must offer
-    // cockpit, not the terminal fallback.
+  it("renders the structured view card for a custom agent that is acp_capable", () => {
+    // A custom agent with agent_acp_cmd (acp_capable=true) must offer
+    // structured view, not the terminal fallback.
     const { getByRole, getByText, queryByText } = renderAgentStep({
       tool: "oc-superpowers",
-      agents: [builtin, cockpitCustom],
+      agents: [builtin, acpCustom],
     });
-    expect(getByRole("switch", { name: "Use cockpit" })).toBeTruthy();
+    expect(getByRole("switch", { name: "Use structured view" })).toBeTruthy();
     expect(getByText(/Renders the agent's plan, tool calls, and diffs/)).toBeTruthy();
     expect(queryByText(/Custom agents run in the terminal/)).toBeNull();
   });
 
-  it("renders the interactive cockpit toggle when the selected agent is a built-in with ACP support", () => {
+  it("renders the interactive structured view toggle when the selected agent is a built-in with ACP support", () => {
     const { getByRole, getByText } = renderAgentStep({
       tool: "claude",
       agents: [builtin, custom],
     });
-    // The ACP-capable case now renders CockpitSubstrateCard (an
+    // The ACP-capable case now renders ViewPickerCard (an
     // interactive switch defaulting on) rather than a read-only notice.
-    expect(getByRole("switch", { name: "Use cockpit" })).toBeTruthy();
+    expect(getByRole("switch", { name: "Use structured view" })).toBeTruthy();
     expect(getByText(/Renders the agent's plan/)).toBeTruthy();
   });
 
@@ -173,7 +171,6 @@ describe("AgentStep profile description (#949)", () => {
         profiles={profiles}
         dockerAvailable={false}
         onApplyProfileDefaults={onApplyProfileDefaults}
-        cockpitMasterEnabled={false}
       />,
     );
     return { onChange, onApplyProfileDefaults, ...utils };
@@ -308,7 +305,6 @@ describe("ReviewStep agent row (#1252)", () => {
         onSubmit={() => {}}
         onJumpTo={() => {}}
         steps={[{ id: "agent", label: "Agent" }] as Parameters<typeof ReviewStep>[0]["steps"]}
-        cockpitMasterEnabled={false}
       />,
     );
   }

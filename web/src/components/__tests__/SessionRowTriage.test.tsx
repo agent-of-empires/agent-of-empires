@@ -254,9 +254,9 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).toContain("Snooze…");
   });
 
-  it("shows Switch agent for a cockpit row", () => {
-    const ws = workspace("w-cockpit", [
-      session({ id: "sess-cockpit", cockpit_mode: true }),
+  it("shows Switch agent for a structured view row", () => {
+    const ws = workspace("w-structured view", [
+      session({ id: "sess-structured view", view: "structured" }),
     ]);
     render(
       <Wrap>
@@ -269,8 +269,8 @@ describe("SessionRow context menu", () => {
     ).not.toBeNull();
   });
 
-  it("hides Switch agent for a non-cockpit (tmux) row", () => {
-    const ws = workspace("w-tmux", [session({ cockpit_mode: false })]);
+  it("hides Switch agent for a non-structured view (tmux) row", () => {
+    const ws = workspace("w-tmux", [session({ view: "terminal" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -283,9 +283,9 @@ describe("SessionRow context menu", () => {
   });
 
   it("hides the triage section in read-only mode", () => {
-    // cockpit_mode is set so the Switch agent gate is also exercised:
-    // it must stay hidden in read-only even on a cockpit row.
-    const ws = workspace("w-live", [session({ cockpit_mode: true })]);
+    // structured_view is set so the Switch agent gate is also exercised:
+    // it must stay hidden in read-only even on a structured view row.
+    const ws = workspace("w-live", [session({ view: "structured" })]);
     render(
       <Wrap>
         <Row ws={ws} readOnly />
@@ -469,8 +469,8 @@ describe("SessionRow triage actions", () => {
   });
 
   it("Switch agent click navigates to the session and requests the dialog", () => {
-    const ws = workspace("w-cockpit", [
-      session({ id: "sess-switch-it", cockpit_mode: true }),
+    const ws = workspace("w-structured view", [
+      session({ id: "sess-switch-it", view: "structured" }),
     ]);
     const opened: string[] = [];
     const switched: string[] = [];

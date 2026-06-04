@@ -14,7 +14,7 @@ interface Props {
   payload: DiffCommentsCardPayload;
 }
 
-/** Rich rendering of a diff-comments prompt in the cockpit user-message
+/** Rich rendering of a diff-comments prompt in the structured view user-message
  *  slot. Built from the typed `UserDiffCommentsPrompt` event (carried on
  *  the assistant-ui message metadata) or, for legacy prompts, from the
  *  decoded sentinel payload. Falls back to raw text rendering upstream
@@ -64,7 +64,7 @@ export function DiffCommentsUserCard({ payload }: Props) {
   );
 }
 
-/** Shiki-backed snippet renderer matching the cockpit Markdown code
+/** Shiki-backed snippet renderer matching the structured view Markdown code
  *  block style. Loads the language module on demand and falls back to
  *  plain `<pre>` while loading or when the language can't be resolved.
  *  See `lib/highlighter.ts`. */
@@ -113,7 +113,7 @@ function HighlightedSnippet({
     // Shiki HTML-escapes the user-supplied `code` before tokenizing, so
     // the only attacker-controlled values reach the DOM as text nodes
     // inside `<span>` tags with locally-generated style attributes.
-    // Same trust boundary as the cockpit Markdown renderer's code blocks.
+    // Same trust boundary as the structured view Markdown renderer's code blocks.
     return (
       <div
         className="overflow-x-auto border-b border-surface-700/40 bg-surface-950 px-3 py-2 text-[12px] [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"

@@ -28,7 +28,6 @@ pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
     let mut features = BTreeMap::new();
     features.insert("worktree".to_string(), config.worktree.enabled);
     features.insert("sandbox".to_string(), config.sandbox.enabled_by_default);
-    features.insert("cockpit".to_string(), config.cockpit.enabled);
     features.insert(
         "auto_update".to_string(),
         matches!(config.updates.update_check_mode, UpdateCheckMode::Auto),
@@ -52,6 +51,5 @@ mod tests {
         // Defaults stay false, but the keys are always present so the gateway
         // sees a stable, fixed key set.
         assert_eq!(features.get("sandbox"), Some(&false));
-        assert_eq!(features.get("cockpit"), Some(&false));
     }
 }

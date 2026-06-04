@@ -109,7 +109,7 @@ fn recovery_lock_path() -> Result<PathBuf> {
 }
 
 /// Pure predicate: should this instance go through the startup recovery
-/// cascade? Excludes cockpit-mode sessions (handled by `cockpit_reconciler`),
+/// cascade? Excludes structured view-mode sessions (handled by `acp_reconciler`),
 /// sessions whose agent has `ResumeStrategy::Unsupported`, sessions without
 /// a valid `agent_session_id`, and sunk rows (archived, currently snoozed, or
 /// explicitly stopped). Live tmux panes are filtered separately by the caller
@@ -125,7 +125,7 @@ fn recovery_lock_path() -> Result<PathBuf> {
 /// transitions `Status::Stopped` to `Status::Starting` before recovery is
 /// consulted.
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
-    !inst.is_cockpit_mode()
+    !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
         && inst.status != super::Status::Stopped

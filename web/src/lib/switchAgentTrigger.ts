@@ -1,6 +1,6 @@
-// Cross-component trigger for the cockpit "Switch agent" dialog.
+// Cross-component trigger for the structured view "Switch agent" dialog.
 //
-// The dialog itself lives inside the cockpit Composer (it prefills the
+// The dialog itself lives inside the structured view Composer (it prefills the
 // composer with a handoff recap on confirm), so the only thing that
 // relocates when the trigger moves out of the composer toolbar and into
 // the sidebar row context menu is the open signal. The sidebar requests
@@ -10,7 +10,7 @@
 // Mirrors the dispatch + pending-latch shape of `terminalFocus.ts`: the
 // target Composer may not be mounted yet when the user picks the menu
 // item on a session that is not currently open (selecting it navigates,
-// and the cockpit view mounts a tick later). The caller stashes the
+// and the structured view mounts a tick later). The caller stashes the
 // intent here; the Composer consumes it on mount. When the row is already
 // the open session the dispatched event is handled immediately.
 
@@ -34,7 +34,7 @@ export function requestSwitchAgent(sessionId: string): void {
 
 // Returns true (and clears the latch) when the stashed request targets
 // this session. The Composer calls it on mount so a navigation-then-open
-// request lands once the target session's cockpit view is ready.
+// request lands once the target session's structured view is ready.
 export function consumePendingSwitchAgent(sessionId: string): boolean {
   if (pendingSwitchAgent === sessionId) {
     pendingSwitchAgent = null;

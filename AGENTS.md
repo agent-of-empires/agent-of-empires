@@ -111,7 +111,7 @@ Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) 
 
 The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`; all use `#[serial]` for tmux isolation.
 
-Cockpit live-daemon e2e (`tests/e2e/cockpit_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI cockpit view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
+Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
 
 Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
 
@@ -120,11 +120,11 @@ Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` 
 Two suites under `web/`:
 
 - **Mocked**: `web/tests/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.config.ts`. Uses `page.route()` to stub `/api/*` responses; serves the production Vite bundle through `vite preview` on port 4173. Fast and deterministic; for UI logic that does not depend on real backend state.
-- **Live**: `web/tests/live/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.live.config.ts`. Each test spawns a real `aoe serve` subprocess against an isolated `HOME` via the harness in `web/tests/helpers/aoeServe.ts`. Two workers, `workerIndex`-based port allocation, `TMUX_TMPDIR` per test. For flows that depend on backend persistence, auth, sessions, tmux, git, read-only, or cockpit.
+- **Live**: `web/tests/live/*.spec.ts`, run via `cd web && npx playwright test --config=playwright.live.config.ts`. Each test spawns a real `aoe serve` subprocess against an isolated `HOME` via the harness in `web/tests/helpers/aoeServe.ts`. Two workers, `workerIndex`-based port allocation, `TMUX_TMPDIR` per test. For flows that depend on backend persistence, auth, sessions, tmux, git, read-only, or structured view.
 
 When deciding which suite to use:
 
-- Backend, persistence, auth, session, tmux, git, read-only, or cockpit round-trip flows belong in **live Playwright**.
+- Backend, persistence, auth, session, tmux, git, read-only, or structured-view round-trip flows belong in **live Playwright**.
 - Request-payload permutations (does control X emit the right JSON keys) belong in **Vitest + RTL + MSW** under `web/src/**/__tests__/`. See `web/src/components/settings/__tests__/SoundSettings.test.tsx` as the canonical example.
 - Browser-specific behavior not practical in Vitest (focus, keyboard, drag-drop, modal escape, mobile viewport, touch events) belongs in **mocked Playwright**.
 
@@ -153,7 +153,7 @@ Full recipe, harness API, and fake-ACP-agent details live in `docs/development/p
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or cockpit).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 
@@ -166,7 +166,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
 - **`codecov/patch`** (target: 75%). The lines your PR adds or changes must hit 75% coverage. This is the strict gate, sized so a small frontend PR with one missed line still passes.
 - **`codecov/project`** (target: auto). Overall repo coverage must not drop below `main`'s current level by more than the 1% threshold.
 
-**Components show up in the PR comment, not as status checks.** `codecov.yml` sets `component_management.default_rules.statuses: []`, so the per-component slices (App Shell, Auth, Cockpit UI, etc.) appear under the components table in the Codecov PR comment but never post a separate GitHub status. The repo-wide `codecov/patch` and `codecov/project` checks are the only Codecov gates on the merge box. The component baselines are still being lifted by the foundation follow-ups (#1217 through #1224, threshold enforcement tracked in #1225); when you touch one of those surfaces, add tests that improve its number, but don't chase the comment-only component numbers on unrelated PRs.
+**Components show up in the PR comment, not as status checks.** `codecov.yml` sets `component_management.default_rules.statuses: []`, so the per-component slices (App Shell, Auth, Structured View UI, etc.) appear under the components table in the Codecov PR comment but never post a separate GitHub status. The repo-wide `codecov/patch` and `codecov/project` checks are the only Codecov gates on the merge box. The component baselines are still being lifted by the foundation follow-ups (#1217 through #1224, threshold enforcement tracked in #1225); when you touch one of those surfaces, add tests that improve its number, but don't chase the comment-only component numbers on unrelated PRs.
 
 **Rust-only PRs.** Patch coverage is reported against `web/src/**` paths only, so a Rust-only diff is N/A for patch coverage and inherits the previous flag value via `carryforward: true`. The aggregate `codecov/patch` and `codecov/project` checks pass.
 
@@ -188,7 +188,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
   - `serve.passphrase`: plaintext Tunnel passphrase, so the TUI can show it on reopen across restarts.
   - `serve.last_mode`, `serve.last_port`: picker defaults across launches.
 
-Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and cockpit runners; see `docs/development/logging.md` for sinks and rotation.
+Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and structured-view runners; see `docs/development/logging.md` for sinks and rotation.
 
 ## Data Migrations
 

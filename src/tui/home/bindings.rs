@@ -704,7 +704,7 @@ mod tests {
 
     fn ctx() -> Ctx {
         Ctx {
-            view_mode: ViewMode::Agent,
+            view_mode: ViewMode::Structured,
             sort_order: SortOrder::Newest,
             has_search: false,
         }

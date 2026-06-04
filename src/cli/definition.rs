@@ -6,9 +6,9 @@
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
-use super::add::AddArgs;
 #[cfg(feature = "serve")]
-use super::cockpit::CockpitCommands;
+use super::acp::AcpCommands;
+use super::add::AddArgs;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -50,7 +50,7 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
-    /// Attach to a remote cockpit daemon instead of using the local
+    /// Attach to a remote agent daemon instead of using the local
     /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
     /// `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the
     /// no-subcommand `aoe` invocation (the TUI dashboard); ignored
@@ -159,19 +159,19 @@ pub enum Commands {
     #[cfg(feature = "serve")]
     Url(UrlArgs),
 
-    /// Cockpit (ACP-based native agent rendering) management.
+    /// Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...).
     #[cfg(feature = "serve")]
-    Cockpit {
+    Acp {
         #[command(subcommand)]
-        command: CockpitCommands,
+        command: AcpCommands,
     },
 
-    /// Internal: per-cockpit-worker shim spawned by `aoe serve`. Owns the
+    /// Internal: per-acp-worker shim spawned by `aoe serve`. Owns the
     /// agent subprocess and outlives the daemon so workers survive
     /// `aoe serve --stop`. Hidden from help.
     #[cfg(feature = "serve")]
-    #[command(name = "__cockpit-runner", hide = true)]
-    CockpitRunner(Box<crate::cockpit::runner::CockpitRunnerArgs>),
+    #[command(name = "__acp-runner", hide = true)]
+    AcpRunner(Box<crate::acp::runner::AcpRunnerArgs>),
 
     /// Internal: extract Claude's `session_id` from a hook stdin payload
     /// and write it to the sidecar file. Spawned by the host-side
@@ -197,7 +197,7 @@ pub enum Commands {
 /// allowlist when building the `cli_usage` telemetry event: any key loaded from
 /// a hand-edited or corrupt `telemetry.json` that is not in this set is dropped
 /// before sending, so the wire payload can only ever carry these tokens. The
-/// `serve` / `url` / `cockpit` / `log_level` names are listed unconditionally
+/// `serve` / `url` / `acp` / `log_level` names are listed unconditionally
 /// even though their variants are `serve`-feature-gated; in a TUI-only build
 /// those commands cannot run, so the extra allowlist entries are simply never
 /// matched. Keep in sync with [`command_name`]; the unit test asserts every
@@ -223,7 +223,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "telemetry",
     "serve",
     "url",
-    "cockpit",
+    "acp",
     "uninstall",
     "update",
     "completion",
@@ -231,7 +231,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
 
 /// The canonical, telemetry-safe name of a CLI subcommand, or `None` for the
 /// hidden internal commands that are machine-spawned rather than user-invoked
-/// (`__cockpit-runner`, `__extract-session-id`) and must never be counted.
+/// (`__acp-runner`, `__extract-session-id`) and must never be counted.
 ///
 /// This is an exhaustive match with **no catch-all**: adding a [`Commands`]
 /// variant fails to compile until it is named here, so the telemetry vocabulary
@@ -265,10 +265,10 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::Url(_) => "url",
         #[cfg(feature = "serve")]
-        Commands::Cockpit { .. } => "cockpit",
+        Commands::Acp { .. } => "acp",
         // Internal, machine-spawned commands: never a user action, never counted.
         #[cfg(feature = "serve")]
-        Commands::CockpitRunner(_) => return None,
+        Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",

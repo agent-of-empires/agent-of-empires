@@ -6,24 +6,24 @@
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Path to the Node ACP test shim used by cockpit_* integration tests.
+/// Path to the Node ACP test shim used by acp_* integration tests.
 ///
 /// Gated on `feature = "serve"` because its only consumers are the
-/// cockpit modules, which themselves only compile under that feature.
+/// structured view modules, which themselves only compile under that feature.
 /// Without the gate, `cargo clippy --all-targets` builds the integration
 /// suite WITHOUT serve and these helpers register as dead code.
 #[cfg(feature = "serve")]
 pub fn shim_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("cockpit-worker")
+        .join("acp-worker")
         .join("test-shim")
         .join("shim.mjs")
 }
 
-/// Returns `Ok(())` if the cockpit shim can be spawned (node on PATH, shim
+/// Returns `Ok(())` if the structured view shim can be spawned (node on PATH, shim
 /// file present, shim deps installed). Otherwise returns a short reason
 /// that callers print before skipping. CI installs deps via `npm ci` in
-/// `cockpit-worker/test-shim/` before running the integration leg; local
+/// `acp-worker/test-shim/` before running the integration leg; local
 /// runs need the same one-shot setup, which the message points at.
 #[cfg(feature = "serve")]
 pub fn shim_ready() -> Result<(), String> {
@@ -42,7 +42,7 @@ pub fn shim_ready() -> Result<(), String> {
     let node_modules = shim.parent().unwrap().join("node_modules");
     if !node_modules.exists() {
         return Err(
-            "shim deps not installed; run `cd cockpit-worker/test-shim && npm ci` first".into(),
+            "shim deps not installed; run `cd acp-worker/test-shim && npm ci` first".into(),
         );
     }
     Ok(())

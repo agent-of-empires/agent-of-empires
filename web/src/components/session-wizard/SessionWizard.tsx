@@ -23,7 +23,7 @@ import {
  *  ACP_CAPABLE_TOOLS on read so an outdated value (or one written by a
  *  different aoe install with extra agents registered) doesn't crash
  *  the wizard. See #1133 thread 7 / #1135. */
-const LAST_USED_TOOL_KEY = "aoe-cockpit-last-tool";
+const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
 
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
@@ -45,11 +45,11 @@ function buildInitialData(): WizardData {
   return { ...initialData, tool: loadLastUsedTool() };
 }
 
-function cockpitDefaultsFor(
+function acpDefaultsFor(
   session: Record<string, unknown> | undefined,
   tool: string,
 ): { model: string; effort: string } {
-  const defaults = session?.cockpit_defaults as Record<string, unknown> | undefined;
+  const defaults = session?.acp_defaults as Record<string, unknown> | undefined;
   const entry = defaults?.[tool] as Record<string, unknown> | undefined;
   return {
     model: typeof entry?.model === "string" ? entry.model : "",
@@ -89,13 +89,9 @@ interface Props {
   onClose: () => void;
   onCreated: (session?: SessionResponse) => void;
   prefill?: WizardPrefill;
-  /** Live value of the cockpit master switch (`config.cockpit.enabled`).
-   *  When true, ACP-capable tools create cockpit sessions automatically;
-   *  when false, every new session is tmux. */
-  cockpitMasterEnabled: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnabled }: Props) {
+export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   const baseInitial = buildInitialData();
   const prefillData: WizardData = prefill
     ? {
@@ -176,7 +172,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             )
           : [];
         const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
-        const cockpitDefaults = cockpitDefaultsFor(session, defaultTool || state.data.tool);
+        const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
@@ -191,8 +187,8 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             ((sandbox?.enabled_by_default as boolean) ?? false),
           tool: defaultTool,
           extraEnv: env,
-          cockpitModel: cockpitDefaults.model,
-          cockpitEffort: cockpitDefaults.effort,
+          agentModel: acpDefaults.model,
+          agentEffort: acpDefaults.effort,
           skipIfDirty: true,
         });
       });
@@ -212,8 +208,8 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     sandboxEnabled: boolean;
     tool: string;
     extraEnv: string[];
-    cockpitModel?: string;
-    cockpitEffort?: string;
+    agentModel?: string;
+    agentEffort?: string;
     commandMaps?: CommandMaps;
   }) => {
     const { commandMaps: maps, ...rest } = defaults;
@@ -259,25 +255,23 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Cockpit runs only when the master switch is on, the agent is
-      // ACP-capable, and the user kept the per-session toggle on
-      // (default). Capability comes from the server's per-agent
+      // Structured view runs when the agent is ACP-capable and the user
+      // kept the per-session toggle on (default). Capability comes from
+      // the server's per-agent
       // `acp_capable` flag (including custom agents with an
-      // `agent_cockpit_cmd`) with hardcoded fallback while loading. The
-      // server re-resolves capability and re-applies the master switch
-      // (see src/server/api/sessions.rs), so a tampered request can't
-      // escalate cockpit on for a non-capable agent.
-      cockpit_mode:
-        cockpitMasterEnabled &&
-        selectedAgentAcpCapable &&
-        d.useCockpit,
-      cockpit_model:
-        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitModel
-          ? d.cockpitModel
+      // `agent_acp_cmd`) with hardcoded fallback while loading. The
+      // server re-resolves capability (see src/server/api/sessions.rs),
+      // so a tampered request can't escalate structured view on for a
+      // non-capable agent.
+      view:
+        selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
+      agent_model:
+        selectedAgentAcpCapable && d.useStructuredView && d.agentModel
+          ? d.agentModel
           : undefined,
-      cockpit_effort:
-        cockpitMasterEnabled && selectedAgentAcpCapable && d.useCockpit && d.cockpitEffort
-          ? d.cockpitEffort
+      agent_effort:
+        selectedAgentAcpCapable && d.useStructuredView && d.agentEffort
+          ? d.agentEffort
           : undefined,
       scratch: d.scratch || undefined,
     };
@@ -312,12 +306,11 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             profiles={state.profiles}
             dockerAvailable={state.dockerAvailable}
             onApplyProfileDefaults={handleApplyProfileDefaults}
-            cockpitMasterEnabled={cockpitMasterEnabled}
             commandMaps={commandMaps}
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} cockpitMasterEnabled={cockpitMasterEnabled} commandMaps={commandMaps} />;
+        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} commandMaps={commandMaps} />;
       default:
         return null;
     }

@@ -104,7 +104,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await openPicker(page);
     await page.getByTestId("mobile-right-panel-pick-diff").click();
     await expect(page.getByTestId("mobile-right-panel-picker")).toHaveCount(0);
-    // The non-agent views carry a persistent back affordance.
+    // The non-structured views carry a persistent back affordance.
     const back = page.getByTestId("mobile-back-to-agent");
     await expect(back).toBeVisible();
 
@@ -159,9 +159,9 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
   });
 });
 
-async function setupCockpitSession(page: Page) {
+async function setupAcpSession(page: Page) {
   await mockTerminalApis(page);
-  // Override the session as a running cockpit session and stub the cockpit
+  // Override the session as a running structured view session and stub the structured view
   // panel endpoints; the paired shell still uses the terminal WS, which
   // mockTerminalApis already routes.
   await page.route("**/api/sessions", (r) => {
@@ -171,8 +171,8 @@ async function setupCockpitSession(page: Page) {
         sessions: [
           {
             id: "pinch-test",
-            title: "cockpit-mobile",
-            project_path: "/tmp/cockpit-mobile",
+            title: "acp-mobile",
+            project_path: "/tmp/acp-mobile",
             group_path: "/tmp",
             tool: "claude",
             status: "Running",
@@ -186,32 +186,32 @@ async function setupCockpitSession(page: Page) {
             has_terminal: true,
             profile: "default",
             workspace_repos: [],
-            cockpit_mode: true,
-            cockpit_worker_state: "running",
+            view: "structured",
+            acp_worker_state: "running",
           },
         ],
         workspace_ordering: [],
       },
     });
   });
-  await page.route("**/api/sessions/*/cockpit/**", (r) =>
+  await page.route("**/api/sessions/*/acp/**", (r) =>
     r.fulfill({ json: {} }),
   );
   await page.goto("/");
   await openMobileSidebar(page);
-  await clickSidebarSession(page, "cockpit-mobile");
-  // Cockpit sessions render no xterm in the agent view; wait for the
+  await clickSidebarSession(page, "acp-mobile");
+  // Structured view sessions render no xterm in the structured view; wait for the
   // right-panel toggle, which only appears once a session is active.
   await page
     .getByRole("button", { name: "Toggle diff panel" })
     .waitFor({ state: "visible", timeout: 10_000 });
 }
 
-test.describe("Mobile picker on a cockpit session (#1452)", () => {
-  test("promotes the paired shell over a cockpit session and survives the keyboard", async ({
+test.describe("Mobile picker on a structured view session (#1452)", () => {
+  test("promotes the paired shell over a structured view session and survives the keyboard", async ({
     page,
   }) => {
-    await setupCockpitSession(page);
+    await setupAcpSession(page);
     await openPicker(page);
 
     await page.getByTestId("mobile-right-panel-pick-paired").click();
@@ -219,16 +219,16 @@ test.describe("Mobile picker on a cockpit session (#1452)", () => {
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
 
-    // The root is pinned for the paired view even on a cockpit session, so
+    // The root is pinned for the paired view even on a structured view session, so
     // the terminal stays tall under the keyboard rather than collapsing.
     await simulateKeyboardOpen(page, 300);
     await expect
       .poll(async () => (await paired.boundingBox())?.height ?? 0, {
-        message: "paired terminal collapsed on a cockpit session",
+        message: "paired terminal collapsed on a structured view session",
       })
       .toBeGreaterThan(150);
 
-    // Back to the cockpit agent view.
+    // Back to the structured view.
     await page.getByTestId("mobile-back-to-agent").click();
     await expect(page.getByTestId("mobile-back-to-agent")).toHaveCount(0);
   });

@@ -1,12 +1,12 @@
-// Recognise Claude memory-system file ops so the cockpit can render them
+// Recognise Claude memory-system file ops so the structured view can render them
 // as a dedicated MemoryCard rather than a generic Read/Edit/Write card.
 //
 // Memory lives under `~/.claude/projects/<slug>/memory/*.md` and is
 // touched via the standard Read/Edit/Write tools, so the file path is
 // the only reliable signal. See issue #1071.
 
-import { parseJsonObject, pickFirst, pickStr } from "./cockpitArgs";
-import type { ToolCall } from "./cockpitTypes";
+import { parseJsonObject, pickFirst, pickStr } from "./acpArgs";
+import type { ToolCall } from "./acpTypes";
 
 export type MemoryVerb = "recalled" | "saved" | "updated";
 

@@ -152,7 +152,7 @@ export function useTour({
   }, [autoLaunchReady, seenKnown, seen, scope, isDesktop, begin]);
 
   // Navigating to a different surface mid-tour cancels it without marking seen,
-  // so a returning user can still get the cockpit steps on a later re-trigger.
+  // so a returning user can still get the structured view steps on a later re-trigger.
   useEffect(() => {
     if (prevScopeRef.current !== scope) {
       prevScopeRef.current = scope;

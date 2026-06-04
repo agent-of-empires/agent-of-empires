@@ -1,6 +1,6 @@
 # Logging
 
-Agent of Empires uses the [`tracing`](https://docs.rs/tracing) crate. The TUI, the `aoe serve` daemon, the cockpit runner subprocesses, and env-overridden one-shot CLI invocations all share `src/logging.rs` so they agree on env-var resolution, default filter construction, the reloadable subscriber handle, and the sink resolver. Every process appends to the same configured log file (`~/.agent-of-empires/debug.log` by default) so a single tail covers an entire session.
+Agent of Empires uses the [`tracing`](https://docs.rs/tracing) crate. The TUI, the `aoe serve` daemon, the structured view runner subprocesses, and env-overridden one-shot CLI invocations all share `src/logging.rs` so they agree on env-var resolution, default filter construction, the reloadable subscriber handle, and the sink resolver. Every process appends to the same configured log file (`~/.agent-of-empires/debug.log` by default) so a single tail covers an entire session.
 
 ## Targets
 
@@ -11,7 +11,7 @@ Only a small set of sub-targets is enumerated in the settings dropdown (see `KNO
 | Root | What lands here |
 |------|-----------------|
 | `agent_of_empires` | Default crate target. General library code emitting without `target:`. |
-| `cockpit` | ACP transport, supervisor, event store, runner shim, per-tool-call entry/exit. |
+| `acp` | ACP transport, supervisor, event store, runner shim, per-tool-call entry/exit. |
 | `terminal` | Web terminal WS relay + per-byte firehose (trace). |
 | `auth` | Token rotate, middleware accept/reject, rate-limit, login flow. |
 | `process` | Signal sends, process-tree walks, survivor reap, ppid resolution. |
@@ -60,7 +60,7 @@ One sink resolver (`logging::resolve_sink`) picks where each process writes base
 | `aoe serve` (foreground) | `ServeForeground` | yes | configured file |
 | `aoe serve --daemon` child | `ServeDaemonChild` | no (coerced to file) | configured file |
 | TUI (`aoe` with no subcommand) | `Tui` | no (coerced to file) | configured file |
-| Cockpit runner subprocess | `Runner` | no (coerced to file) | configured file |
+| Structured view runner subprocess | `Runner` | no (coerced to file) | configured file |
 | Other one-shot CLI, no env | — | n/a | no subscriber |
 
 The TUI, daemon child, and runner coerce because their stdout would corrupt the alt-screen, be detached to /dev/null, or be unreachable. Coercion surfaces a `log.runtime` warning at startup so users see why their `output = "stdout"` didn't apply.
@@ -90,20 +90,20 @@ keep_count = 5
 show_spans = false
 
 [logging.targets]
-"cockpit.acp" = "trace"
+"acp.protocol" = "trace"
 "auth.middleware" = "debug"
 "process.signal" = "warn"
 ```
 
 `default_level` is the baseline; entries in `targets` override per target. The list of targets surfaced as dropdowns mirrors `KNOWN_SUB_TARGETS` in `src/logging.rs`. Anything else can still be set via raw EnvFilter syntax through the runtime endpoint or CLI.
 
-**Hot-swap vs restart:** `default_level` and `targets` hot-swap through the same `FilterController` that powers `aoe log-level`, including propagation to cockpit runners via the `runtime_filter` notify watcher. No daemon restart needed for filter changes. The sink-shape fields (`output`, `file_path`, `rotation`, `max_size_mib`, `keep_count`) are set once at process startup and require a restart to take effect; the settings UI labels them accordingly.
+**Hot-swap vs restart:** `default_level` and `targets` hot-swap through the same `FilterController` that powers `aoe log-level`, including propagation to structured view runners via the `runtime_filter` notify watcher. No daemon restart needed for filter changes. The sink-shape fields (`output`, `file_path`, `rotation`, `max_size_mib`, `keep_count`) are set once at process startup and require a restart to take effect; the settings UI labels them accordingly.
 
 ## Rotation
 
 When `rotation = "size"`, the writer rotates the live file whenever it crosses `max_size_mib`. The rename chain shifts `debug.log.N-1 → .N` down to `keep_count`, then renames the current `debug.log → debug.log.1` and opens a fresh `debug.log`. Older files (`> keep_count`) are dropped.
 
-**Multi-process safety.** The TUI + daemon + cockpit runners + env-overridden CLI invocations may all append to the same `debug.log` concurrently. The writer uses three mechanisms to keep that safe:
+**Multi-process safety.** The TUI + daemon + structured view runners + env-overridden CLI invocations may all append to the same `debug.log` concurrently. The writer uses three mechanisms to keep that safe:
 
 1. **`fs2` advisory exclusive lock** on a sidecar `{path}.lock` file serializes the rename chain. The OS releases the lock on process exit, so a crashed rotater never wedges future rotations.
 2. **Inode tracking + reopen.** Each writer remembers the file's inode at open time and re-stats every 16 KiB. If another process rotated the file out from under us, the inode mismatch triggers a reopen so subsequent writes land in the new `debug.log` rather than the archived `.1`.
@@ -152,7 +152,7 @@ Examples:
 
 ```sh
 aoe log-level debug
-aoe log-level --filter cockpit.acp=trace,info
+aoe log-level --filter acp.protocol=trace,info
 aoe log-level --filter auth.rate_limit=debug,warn
 aoe log-level --get
 ```
@@ -161,7 +161,7 @@ The CLI reads the daemon URL from `serve.url` and authenticates via the token in
 
 ## Runner propagation
 
-When you `PATCH /api/log-level`, the daemon writes the new directive atomically to `~/.agent-of-empires/runtime_filter` (0600). Each cockpit runner subprocess uses `notify` to watch the file and applies updates to its own `FilterController`. Both daemon and runners stay in lockstep without restart, which is the point: you can pull from `info` to `trace` mid-incident without losing in-flight agent state.
+When you `PATCH /api/log-level`, the daemon writes the new directive atomically to `~/.agent-of-empires/runtime_filter` (0600). Each structured view runner subprocess uses `notify` to watch the file and applies updates to its own `FilterController`. Both daemon and runners stay in lockstep without restart, which is the point: you can pull from `info` to `trace` mid-incident without losing in-flight agent state.
 
 Edge cases:
 
@@ -183,11 +183,11 @@ Not captured (intentional, v1): `console.error`. Wrapping it produces noisy dupl
 
 | Path | When it's written |
 |------|-------------------|
-| `<configured file_path>` (default `~/.agent-of-empires/debug.log`) | Every process that installs a tracing subscriber (TUI, foreground / daemon `aoe serve`, cockpit runner, env-overridden CLI). The daemon's stdout/stderr is also redirected here at the OS level for panic backtrace capture. |
+| `<configured file_path>` (default `~/.agent-of-empires/debug.log`) | Every process that installs a tracing subscriber (TUI, foreground / daemon `aoe serve`, structured view runner, env-overridden CLI). The daemon's stdout/stderr is also redirected here at the OS level for panic backtrace capture. |
 | `<configured>.1` ... `<configured>.<keep_count>` | Rotated files, oldest at the highest number. |
 | `<configured>.lock` | Idle `fs2` advisory lock file used to serialize rotation across processes. Always present after the first rotation; do not delete while any aoe process is running. |
 | `~/.agent-of-empires/runtime_filter` | Atomically written on every successful `aoe log-level` swap; consumed by runner watchers. |
-| `~/.agent-of-empires/cockpit-workers/<session-id>.log` | Touched for compatibility; structured tracing lands in the shared configured log file. |
+| `~/.agent-of-empires/acp-workers/<session-id>.log` | Touched for compatibility; structured tracing lands in the shared configured log file. |
 | `~/.agent-of-empires/serve.log.legacy` | One-shot rename of the pre-consolidation `serve.log` by migration v007. Safe to delete once you've extracted any data you needed. |
 
 On Linux, replace `~/.agent-of-empires` with `$XDG_CONFIG_HOME/agent-of-empires`. Debug builds use `~/.agent-of-empires-dev` to avoid colliding with an installed release.

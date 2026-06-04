@@ -119,7 +119,7 @@ test.describe("URL routing", () => {
     await page.route("**/api/sessions/*/terminal", (r) =>
       r.fulfill({ status: 200, body: "" }),
     );
-    await page.routeWebSocket(/\/sessions\/.*\/(ws|cockpit-ws)$/, () => {});
+    await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {});
 
     await page.goto("/session/known-session");
     await expect(page).toHaveURL("/session/known-session");

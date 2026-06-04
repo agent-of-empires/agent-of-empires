@@ -1,5 +1,5 @@
-// Per-agent classifier profiles for the cockpit's frontend tool-card
-// dispatch. Mirrors src/cockpit/agent_profiles.rs (server-side gates);
+// Per-agent classifier profiles for the structured view's frontend tool-card
+// dispatch. Mirrors src/acp/agent_profiles.rs (server-side gates);
 // this side covers the React presentation: which tool names map to
 // which cards, which specialised cards (TodoWrite, Skill, Schedule)
 // should fire for this agent, which MCP prefixes to recognise.
@@ -8,7 +8,7 @@
 // hasn't been verified hands-on, the entry is omitted rather than
 // guessed; the user sees a generic tool card instead of the wrong
 // specialised one. Adding a new agent: append an entry below, mirror
-// in src/cockpit/agent_profiles.rs, document in docs/cockpit/multi-agent.md.
+// in src/acp/agent_profiles.rs, document in docs/structured-view/multi-agent.md.
 
 /** Card categories the renderer dispatches to. Keep aligned with the
  *  switch in `ToolCards.renderToolCard`. */
@@ -50,9 +50,9 @@ export interface AgentProfile {
   };
   /** `_meta.<namespace>.parentToolUseId` lookup order for subagent
    *  child linkage. Empty when the agent's parent-child linkage isn't
-   *  verified; the cockpit doesn't guess a namespace. */
+   *  verified; the structured view doesn't guess a namespace. */
   parentMetaNamespaces: string[];
-  /** MCP tool-name prefixes the cockpit recognises. Claude-agent-acp
+  /** MCP tool-name prefixes the structured view recognises. Claude-agent-acp
    *  wraps MCP calls as `mcp__server__verb`; other adapters may use
    *  the same convention or not advertise MCP at all. */
   mcpPrefixes: string[];
@@ -206,7 +206,7 @@ export function resolveAgentProfile(
 /** True when `text`'s trimmed body matches one of `aliases`, either as
  *  the entire prompt or as a `<alias> <args>` invocation. Mirror of the
  *  server-side `AgentProfile::is_clear_command` in
- *  `src/cockpit/agent_profiles.rs` so the cockpit's combined-mode drain
+ *  `src/acp/agent_profiles.rs` so the structured view's combined-mode drain
  *  splits at exactly the same boundary the server detects as a session
  *  clear (#1356). */
 export function isClearAlias(

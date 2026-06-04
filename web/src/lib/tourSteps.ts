@@ -21,20 +21,20 @@ export const TOUR_ANCHORS = {
   sidebarSettings: "sidebar-settings",
   dashboardNewSession: "dashboard-new-session",
   rightPanel: "right-panel",
-  composer: "cockpit-composer",
-  modePicker: "cockpit-mode-picker",
-  queueSend: "cockpit-queue-send",
+  composer: "acp-composer",
+  modePicker: "acp-mode-picker",
+  queueSend: "acp-queue-send",
 } as const;
 
 export type TourAnchorId = (typeof TOUR_ANCHORS)[keyof typeof TOUR_ANCHORS];
 
 /**
- * The dashboard, a terminal session, and a cockpit session mount mutually
+ * The dashboard, a terminal session, and a structured view session mount mutually
  * exclusive UI. A step declares which scopes it belongs to; the resolver never
  * shows a step outside its scope, so a missing anchor is only ever "legitimately
  * absent on this view", never a silently swallowed regression.
  */
-export type TourScope = "dashboard" | "session" | "cockpit";
+export type TourScope = "dashboard" | "session" | "structured-view";
 
 /**
  * A tour shortcut hint references a registered shortcut by id (so the rendered
@@ -79,7 +79,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "topbar",
     anchor: TOUR_ANCHORS.topbar,
-    scopes: ["dashboard", "session", "cockpit"],
+    scopes: ["dashboard", "session", "structured-view"],
     title: "Command bar",
     body: "Jump anywhere from the command palette: switch sessions, open settings, toggle panels.",
     shortcutHints: [{ id: "palette", verb: "opens the palette" }],
@@ -87,9 +87,9 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "sidebar",
     anchor: TOUR_ANCHORS.sidebar,
-    scopes: ["dashboard", "session", "cockpit"],
+    scopes: ["dashboard", "session", "structured-view"],
     title: "Workspaces and sessions",
-    body: "Your sessions are grouped by workspace here. Pick one to open its terminal or cockpit.",
+    body: "Your sessions are grouped by workspace here. Pick one to open its terminal or structured view.",
     shortcutHints: [{ id: "sidebar", verb: "toggles the sidebar" }],
   },
   {
@@ -107,7 +107,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "settings",
     anchor: TOUR_ANCHORS.sidebarSettings,
-    scopes: ["dashboard", "session", "cockpit"],
+    scopes: ["dashboard", "session", "structured-view"],
     title: "Settings and profiles",
     body: "Tune sandboxing, worktrees, sounds, devices, and per-profile overrides here.",
     shortcutHints: [{ id: "settings", verb: "opens settings" }],
@@ -115,7 +115,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "right-panel",
     anchor: TOUR_ANCHORS.rightPanel,
-    scopes: ["session", "cockpit"],
+    scopes: ["session", "structured-view"],
     title: "Diff and review",
     body: "Review the agent's file changes and send comments back without leaving the session.",
     shortcutHints: [
@@ -127,28 +127,28 @@ export const TOUR_STEPS: readonly TourStep[] = [
   {
     id: "composer",
     anchor: TOUR_ANCHORS.composer,
-    scopes: ["cockpit"],
+    scopes: ["structured-view"],
     title: "Composer",
     body: "Write instructions to the agent here. Type / for commands and @ to reference files.",
   },
   {
     id: "mode-picker",
     anchor: TOUR_ANCHORS.modePicker,
-    scopes: ["cockpit"],
+    scopes: ["structured-view"],
     title: "Agent mode",
     body: "Switch the agent's mode (plan, accept edits, and so on) before you send.",
   },
   {
     id: "queue-send",
     anchor: TOUR_ANCHORS.queueSend,
-    scopes: ["cockpit"],
+    scopes: ["structured-view"],
     title: "Send and queue",
     body: "Send a message, or queue follow-ups while the agent is still working on the last one.",
   },
   {
     id: "topbar-more",
     anchor: TOUR_ANCHORS.topbarMore,
-    scopes: ["dashboard", "session", "cockpit"],
+    scopes: ["dashboard", "session", "structured-view"],
     title: "Replay this tour any time",
     body: "Reopen this walkthrough whenever you like from here: More, then Show tutorial.",
   },

@@ -38,7 +38,7 @@ For API/WebSocket requests, run the Rust server simultaneously:
 cargo run --features serve -- serve
 ```
 
-To work on the frontend against a "production" backend instead of a local build, set `VITE_PROXY` (shell env or `web/.env`) to that `aoe serve` origin, including a non-cargo install on a custom port, and the dev server forwards `/api` and `/sessions/*/ws` (terminal + cockpit) there:
+To work on the frontend against a "production" backend instead of a local build, set `VITE_PROXY` (shell env or `web/.env`) to that `aoe serve` origin, including a non-cargo install on a custom port, and the dev server forwards `/api` and `/sessions/*/ws` (terminal + structured view) there:
 
 ```bash
 VITE_PROXY=http://localhost:50106 npm run dev

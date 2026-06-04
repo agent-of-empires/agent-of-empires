@@ -15,10 +15,9 @@ const PROFILES = [{ name: "main", is_default: true }];
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
-    Promise.resolve({ session: {}, cockpit: {}, sandbox: {}, worktree: {} }),
+    Promise.resolve({ session: {}, acp: {}, sandbox: {}, worktree: {} }),
   ),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
-  setCockpitMaster: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -26,10 +25,9 @@ vi.mock("../../lib/api", () => ({
 }));
 
 const SERVER_ABOUT = {
-  cockpit_master_enabled: true,
-  cockpit_show_tool_durations: true,
-  cockpit_queue_drain_mode: "combined" as const,
-  cockpit_max_concurrent_resumes: 4,
+  acp_show_tool_durations: true,
+  acp_queue_drain_mode: "combined" as const,
+  acp_max_concurrent_resumes: 4,
 };
 
 function numberInputByLabel(
@@ -70,7 +68,7 @@ describe("Session tab auto-stop idle field", () => {
     // the empty-settings default here to isolate tests that override it.
     vi.mocked(api.fetchSettings).mockResolvedValue({
       session: {},
-      cockpit: {},
+      acp: {},
       sandbox: {},
       worktree: {},
     } as never);
@@ -79,7 +77,7 @@ describe("Session tab auto-stop idle field", () => {
   it("renders the persisted auto_stop_idle_secs value into the field", async () => {
     vi.mocked(api.fetchSettings).mockResolvedValue({
       session: { auto_stop_idle_secs: 1800 },
-      cockpit: {},
+      acp: {},
       sandbox: {},
       worktree: {},
     } as never);
@@ -123,7 +121,7 @@ describe("Session tab auto-stop idle field", () => {
     );
   });
 
-  it("persists session.cockpit_defaults through the profile path", async () => {
+  it("persists session.acp_defaults through the profile path", async () => {
     const { container } = render(
       <SettingsView
         onClose={() => {}}
@@ -133,17 +131,17 @@ describe("Session tab auto-stop idle field", () => {
         onServerAboutRefresh={() => {}}
       />,
     );
-    await screen.findByText("Cockpit defaults");
+    await screen.findByText("Structured view defaults");
 
     commitTextarea(
-      textareaByLabel(container, "Cockpit defaults"),
+      textareaByLabel(container, "Structured view defaults"),
       '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}',
     );
 
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: {
-          cockpit_defaults: {
+          acp_defaults: {
             opencode: { model: "openai/gpt-5.5", effort: "high" },
           },
         },

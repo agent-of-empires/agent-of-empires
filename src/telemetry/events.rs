@@ -16,7 +16,7 @@ use serde::Serialize;
 /// v3 (#1886): added `sessions_by_substrate`, a mutually-exclusive
 /// per-substrate census of live sessions.
 /// v4 (#1931): added `session_pinned` / `session_snoozed` / `session_archived`.
-/// v5 (#1880): replaced the `web_seen` / `cockpit_seen` booleans with the
+/// v5 (#1880): replaced the `web_seen` / `acp_seen` booleans with the
 /// allowlisted `usage_seen` count map.
 /// v6 (#1933): added the [`CliUsage`] event and retired the `cli`-surface
 /// [`ProcessStart`] in favor of it.
@@ -24,12 +24,12 @@ use serde::Serialize;
 /// `update_status`, `update_releases_behind`) to every event.
 /// v8 (#1873): added a per-event `uuid` idempotency key to `process_start`
 /// and `usage_snapshot`.
-/// v9 (#1883): added the `web_clients_seen` / `cockpit_clients_seen`
+/// v9 (#1883): added the `web_clients_seen` / `structured_clients_seen`
 /// per-form-factor maps alongside the `usage_seen` open counts.
 /// v10 (#1870): added serve windowed fields `peak_concurrent_sessions` and the
 /// `distinct_sessions_by_agent` / `distinct_sessions_by_model_bucket` maps.
-/// v11 (#1888): added the cockpit-interaction aggregates (`approvals_resolved`,
-/// `approvals_by_decision`, `agent_switches`, `substrate_toggles`,
+/// v11 (#1888): added the structured-interaction aggregates (`approvals_resolved`,
+/// `approvals_by_decision`, `agent_switches`, `view_toggles`,
 /// `plan_mode_seen`, `prompts_queued`).
 pub const SCHEMA_VERSION: u32 = 11;
 
@@ -41,7 +41,7 @@ pub enum Surface {
     Cli,
     /// The interactive terminal UI.
     Tui,
-    /// The `aoe serve` daemon (web dashboard / cockpit host).
+    /// The `aoe serve` daemon (web dashboard / acp host).
     Serve,
 }
 
@@ -153,7 +153,7 @@ pub struct UsageSnapshot {
     pub session_running: u32,
     pub session_idle: u32,
     pub session_error: u32,
-    pub session_cockpit: u32,
+    pub session_structured: u32,
     pub session_sandboxed: u32,
     pub session_yolo: u32,
 
@@ -225,9 +225,9 @@ pub struct UsageSnapshot {
     /// web client, e.g. the TUI. See `telemetry::form_factor`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub web_clients_seen: BTreeMap<String, bool>,
-    /// Same per-class was-seen map for the cockpit web UI.
+    /// Same per-class was-seen map for the acp web UI.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub cockpit_clients_seen: BTreeMap<String, bool>,
+    pub structured_clients_seen: BTreeMap<String, bool>,
 
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).
@@ -247,7 +247,7 @@ pub struct UsageSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_mode: Option<String>,
 
-    /// Cockpit approvals the user resolved since the last snapshot. The sum of
+    /// Structured view approvals the user resolved since the last snapshot. The sum of
     /// [`Self::approvals_by_decision`]; the synthetic daemon-restart
     /// `Cancelled` decision is never counted (it is not a user choice).
     pub approvals_resolved: u32,
@@ -258,34 +258,34 @@ pub struct UsageSnapshot {
     pub approvals_by_decision: BTreeMap<String, u32>,
     /// Mid-session agent switches since the last snapshot.
     pub agent_switches: u32,
-    /// Cockpit/terminal substrate toggles since the last snapshot. Only real
-    /// transitions count; an enable on an already-cockpit session (or a disable
+    /// Structured-view/terminal view toggles since the last snapshot. Only real
+    /// transitions count; an enable on an already-structured session (or a disable
     /// on an already-terminal session) is a no-op and is not counted.
-    pub substrate_toggles: u32,
+    pub view_toggles: u32,
     /// A session entered plan mode at least once since the last snapshot.
     pub plan_mode_seen: bool,
-    /// Prompts the web cockpit queued (parked because the agent was busy)
+    /// Prompts the web structured view queued (parked because the agent was busy)
     /// since the last snapshot. Reported by the browser, the only surface that
     /// owns the prompt queue; the daemon never sees the queue directly.
     pub prompts_queued: u32,
 }
 
-/// Resolved cockpit-interaction counts for one snapshot window, the input the
-/// daemon folds into a [`UsageSnapshot`]. Surfaces without a cockpit (the TUI)
+/// Resolved structured-interaction counts for one snapshot window, the input the
+/// daemon folds into a [`UsageSnapshot`]. Surfaces without a structured view (the TUI)
 /// pass [`Default`] (all zero). Counts only, plus a closed decision key set, so
 /// nothing here can carry free-form content past [`super::sanitize`].
 #[derive(Debug, Clone, Default)]
-pub struct CockpitInteractionCounts {
+pub struct StructuredInteractionCounts {
     pub approvals_allow: u32,
     pub approvals_allow_always: u32,
     pub approvals_deny: u32,
     pub agent_switches: u32,
-    pub substrate_toggles: u32,
+    pub view_toggles: u32,
     pub plan_mode_seen: bool,
     pub prompts_queued: u32,
 }
 
-impl CockpitInteractionCounts {
+impl StructuredInteractionCounts {
     /// Total user-resolved approvals (the three real decisions; `Cancelled`
     /// is never accumulated here).
     pub fn approvals_resolved(&self) -> u32 {
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn approvals_resolved_sums_the_three_real_decisions() {
-        let counts = CockpitInteractionCounts {
+        let counts = StructuredInteractionCounts {
             approvals_allow: 2,
             approvals_allow_always: 1,
             approvals_deny: 1,
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn approvals_by_decision_omits_zero_keys() {
-        let counts = CockpitInteractionCounts {
+        let counts = StructuredInteractionCounts {
             approvals_allow: 2,
             approvals_deny: 1,
             ..Default::default()
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn empty_counts_produce_an_empty_decision_map() {
-        let counts = CockpitInteractionCounts::default();
+        let counts = StructuredInteractionCounts::default();
         assert_eq!(counts.approvals_resolved(), 0);
         assert!(counts.approvals_by_decision().is_empty());
     }

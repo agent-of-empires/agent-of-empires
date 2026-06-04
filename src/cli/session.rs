@@ -390,7 +390,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // instances always come back blank.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "start")?;
+    bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -427,31 +427,31 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Cockpit-mode sessions are not backed by tmux; their ACP worker is owned
+/// Acp-mode sessions are not backed by tmux; their ACP worker is owned
 /// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
 ///
-/// `cockpit_mode` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in cockpit
+/// `structured_view` is gated behind the `serve` feature; without it the
+/// field doesn't exist on `Instance` and no session can be in structured view
 /// mode, so this is a no-op shim.
 #[cfg(feature = "serve")]
-fn bail_if_cockpit(inst: &crate::session::Instance, verb: &str) -> Result<()> {
-    if inst.cockpit_mode {
+fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
+    if inst.is_structured() {
         bail!(
-            "cockpit sessions are managed by `aoe serve`; \
+            "structured view sessions are managed by `aoe serve`; \
              cannot `aoe session {verb}` from the CLI.\n\
-             The ACP worker is auto-spawned within ~2s of `aoe add --cockpit` \
+             The ACP worker is auto-spawned within ~2s of an structured-view session \
              while serve is running, or on next `aoe serve` startup.\n\
-             To control a cockpit session, use the web dashboard or the REST API."
+             To control an structured-view session, use the web dashboard or the REST API."
         );
     }
     Ok(())
 }
 
 #[cfg(not(feature = "serve"))]
-fn bail_if_cockpit(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
+fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
@@ -462,7 +462,7 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "stop")?;
+    bail_if_acp(inst, "stop")?;
     let session_id = inst.id.clone();
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -665,7 +665,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 }
 
 /// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Cockpit-mode sessions are skipped
+/// would race the deletion/boot path. Acp-mode sessions are skipped
 /// because their lifecycle is owned by `aoe serve`'s supervisor, not
 /// tmux: a CLI-side restart would no-op silently and (with the explicit
 /// bail in `restart_session`) flood `--all` with per-session errors.
@@ -679,7 +679,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
         .filter(|_i| {
             #[cfg(feature = "serve")]
             {
-                !_i.cockpit_mode
+                !_i.is_structured()
             }
             #[cfg(not(feature = "serve"))]
             {
@@ -697,7 +697,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // rehydrate `source_profile` for config resolution.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "restart")?;
+    bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -813,7 +813,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "attach")?;
+    bail_if_acp(inst, "attach")?;
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     if !tmux_session.exists() {
@@ -1205,9 +1205,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             #[cfg(feature = "serve")]
-            if inst.cockpit_mode {
+            if inst.is_structured() {
                 anyhow::bail!(
-                    "cannot set resume target on cockpit-mode session '{}'; cockpit manages its own conversation lifecycle via ACP",
+                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
                     inst.title
                 );
             }
@@ -1465,7 +1465,7 @@ mod stale_history_suffix_tests {
 }
 
 #[cfg(all(test, feature = "serve"))]
-mod cockpit_reject_tests {
+mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, Storage};
     use serial_test::serial;
@@ -1473,15 +1473,15 @@ mod cockpit_reject_tests {
 
     #[tokio::test]
     #[serial]
-    async fn set_session_id_rejects_cockpit_mode_session() {
+    async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
         #[cfg(target_os = "linux")]
         std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-        let storage = Storage::new("cockpit-reject").unwrap();
-        let mut inst = Instance::new("cockpit_session", "/tmp/x");
-        inst.cockpit_mode = true;
+        let storage = Storage::new("acp-reject").unwrap();
+        let mut inst = Instance::new("acp_session", "/tmp/x");
+        inst.view = crate::session::View::Structured;
         let id = inst.id.clone();
         let on_disk = inst.clone();
         storage
@@ -1495,7 +1495,7 @@ mod cockpit_reject_tests {
             .unwrap();
 
         let result = set_session_id(
-            "cockpit-reject",
+            "acp-reject",
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "11111111-1111-1111-1111-111111111111".to_string(),
@@ -1503,11 +1503,11 @@ mod cockpit_reject_tests {
         )
         .await;
 
-        let err = result.expect_err("set-session-id must reject cockpit-mode sessions");
+        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
         let msg = format!("{:#}", err);
         assert!(
-            msg.contains("cockpit"),
-            "error must mention cockpit: {}",
+            msg.contains("acp"),
+            "error must mention structured view: {}",
             msg
         );
 

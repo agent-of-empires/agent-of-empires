@@ -8,7 +8,6 @@ import {
   fetchProfiles,
   fetchSettings,
   getSettingsSchema,
-  setCockpitMaster,
   setDefaultProfile,
   updateProfileSettings,
   type ServerAbout,
@@ -46,7 +45,7 @@ type TabId =
   | "terminal"
   | "security"
   | "devices"
-  | "cockpit"
+  | "structured-view"
   | "logging";
 
 type SidebarItem =
@@ -69,7 +68,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "tab", id: "diff", label: "Diff" },
     { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
-    { kind: "tab", id: "cockpit", label: "Cockpit" },
+    { kind: "tab", id: "structured-view", label: "Structured view" },
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -116,7 +115,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "terminal",
   "security",
   "devices",
-  "cockpit",
+  "structured-view",
   "logging",
 ]);
 
@@ -326,7 +325,7 @@ export function SettingsView({
   );
 
   const renderTabContent = () => {
-    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "cockpit" && activeTab !== "telemetry") {
+    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "structured-view" && activeTab !== "telemetry") {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 
@@ -367,12 +366,12 @@ export function SettingsView({
               onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
             />
             <TextField
-              label="Cockpit defaults"
-              description='Per-agent cockpit model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
-              value={formatJsonSetting(session.cockpit_defaults)}
+              label="Structured view defaults"
+              description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              value={formatJsonSetting(session.acp_defaults)}
               onChange={(v) => {
                 const parsed = parseJsonObjectSetting(v);
-                if (parsed) void saveField("session", session, "cockpit_defaults", parsed);
+                if (parsed) void saveField("session", session, "acp_defaults", parsed);
               }}
               placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
               mono
@@ -380,7 +379,7 @@ export function SettingsView({
             />
             <NumberField
               label="Auto-stop idle sessions (s)"
-              description="Seconds a plain tmux session may sit Idle before it is auto-stopped (its tmux session and any sandbox container are killed, leaving a restartable Stopped row). 0 disables (default). A session with an attached tmux client, or used more recently than the threshold, is spared. Checked about once a minute, so the stop can lag by up to a minute. Cockpit workers use the separate cockpit setting. Persists to config.toml as session.auto_stop_idle_secs; cross-device. See #1690."
+              description="Seconds a plain tmux session may sit Idle before it is auto-stopped (its tmux session and any sandbox container are killed, leaving a restartable Stopped row). 0 disables (default). A session with an attached tmux client, or used more recently than the threshold, is spared. Checked about once a minute, so the stop can lag by up to a minute. Acp workers use the separate acp setting. Persists to config.toml as session.auto_stop_idle_secs; cross-device. See #1690."
               value={
                 typeof session.auto_stop_idle_secs === "number"
                   ? (session.auto_stop_idle_secs as number)
@@ -597,13 +596,13 @@ export function SettingsView({
         return <SecuritySettings />;
       case "devices":
         return <ConnectedDevices />;
-      case "cockpit": {
-        const cockpit = (settings?.cockpit ?? {}) as Record<string, unknown>;
+      case "structured-view": {
+        const acp = (settings?.acp ?? {}) as Record<string, unknown>;
         return (
-          <CockpitSettings
+          <AcpSettings
             serverAbout={serverAbout}
             onRefresh={onServerAboutRefresh}
-            cockpit={cockpit}
+            acp={acp}
             onSaveField={saveSubField}
           />
         );
@@ -709,92 +708,39 @@ export function SettingsView({
   );
 }
 
-function CockpitSettings({
+function AcpSettings({
   serverAbout,
   onRefresh,
-  cockpit,
+  acp,
   onSaveField,
 }: {
   serverAbout: ServerAbout | null;
   onRefresh: () => Promise<void> | void;
-  cockpit: Record<string, unknown>;
+  acp: Record<string, unknown>;
   onSaveField: (section: string, field: string, value: unknown) => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const masterEnabled = !!serverAbout?.cockpit_master_enabled;
-  // Local mirror so the toggle reflects optimistically while the
-  // backend save + /api/about re-fetch propagate.
   const showToolDurations =
-    typeof cockpit.show_tool_durations === "boolean"
-      ? (cockpit.show_tool_durations as boolean)
-      : (serverAbout?.cockpit_show_tool_durations ?? true);
+    typeof acp.show_tool_durations === "boolean"
+      ? (acp.show_tool_durations as boolean)
+      : (serverAbout?.acp_show_tool_durations ?? true);
   const queueDrainMode: "combined" | "serial" =
-    cockpit.queue_drain_mode === "serial" || cockpit.queue_drain_mode === "combined"
-      ? (cockpit.queue_drain_mode as "combined" | "serial")
-      : (serverAbout?.cockpit_queue_drain_mode ?? "combined");
+    acp.queue_drain_mode === "serial" || acp.queue_drain_mode === "combined"
+      ? (acp.queue_drain_mode as "combined" | "serial")
+      : (serverAbout?.acp_queue_drain_mode ?? "combined");
   const maxConcurrentResumes =
-    typeof cockpit.max_concurrent_resumes === "number"
-      ? (cockpit.max_concurrent_resumes as number)
-      : (serverAbout?.cockpit_max_concurrent_resumes ?? 4);
-
-  const onToggle = async (next: boolean) => {
-    setBusy(true);
-    setError(null);
-    const res = await setCockpitMaster(next);
-    setBusy(false);
-    if (!res) {
-      setError("Failed to update; check server logs");
-      return;
-    }
-    await onRefresh();
-  };
+    typeof acp.max_concurrent_resumes === "number"
+      ? (acp.max_concurrent_resumes as number)
+      : (serverAbout?.acp_max_concurrent_resumes ?? 4);
 
   return (
     <div className="space-y-4">
-      <div className="rounded border border-surface-700 bg-surface-800/40 p-3 text-xs text-text-dim space-y-1">
-        <div>
-          <span className="text-text-muted">Status:</span>{" "}
-          {masterEnabled ? (
-            <span className="text-emerald-400">Cockpit available for new sessions</span>
-          ) : (
-            <span className="text-amber-400">Cockpit disabled</span>
-          )}
-        </div>
-        <div>
-          <span className="text-text-muted">cockpit.enabled:</span>{" "}
-          <code className="rounded bg-surface-900 px-1">{masterEnabled ? "true" : "false"}</code>
-        </div>
-      </div>
-
-      <div className="flex items-start justify-between gap-3 py-1">
-        <div>
-          <div className="text-sm text-text-bright">Cockpit master switch</div>
-          <div className="text-xs text-text-dim mt-0.5">
-            Persists to <code>config.toml</code> as <code>cockpit.enabled</code>; takes effect immediately.
-          </div>
-        </div>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => onToggle(!masterEnabled)}
-          className={`shrink-0 rounded px-3 py-1 text-xs font-medium transition-colors ${
-            masterEnabled
-              ? "bg-brand-500 text-white hover:bg-brand-400"
-              : "bg-surface-700 text-text-secondary hover:bg-surface-600"
-          } ${busy ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
-        >
-          {masterEnabled ? "Enabled" : "Disabled"}
-        </button>
-      </div>
-
       <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
         <div>
           <div className="text-sm text-text-bright">Show tool-call durations</div>
           <div className="text-xs text-text-dim mt-0.5">
             Persists to <code>config.toml</code> as{" "}
-            <code>cockpit.show_tool_durations</code>; cross-device. Renders the elapsed-time label on every
-            cockpit tool card. The underlying measurement is currently imprecise on{" "}
+            <code>acp.show_tool_durations</code>; cross-device. Renders the elapsed-time label on every
+            acp tool card. The underlying measurement is currently imprecise on{" "}
             <code>claude-agent-acp</code> (no <code>status: in_progress</code> signal); durations include
             stream-arrival skew rather than just runtime, so for example a parallel{" "}
             <code>sleep 1</code> can read as ~3 s. Turn off if the inflated numbers are more confusing than
@@ -807,7 +753,7 @@ function CockpitSettings({
           aria-label="Show tool-call durations"
           onClick={async () => {
             const next = !showToolDurations;
-            onSaveField("cockpit", "show_tool_durations", next);
+            onSaveField("acp", "show_tool_durations", next);
             await onRefresh();
           }}
           className={`shrink-0 rounded px-3 py-1 text-xs font-medium transition-colors cursor-pointer ${
@@ -823,9 +769,9 @@ function CockpitSettings({
       <div className="border-t border-surface-800 pt-3">
         <ToggleField
           label="Auto-resume after rate limit"
-          description="When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as cockpit.rate_limit_auto_resume; cross-device. See #1722."
-          checked={(cockpit.rate_limit_auto_resume as boolean) ?? false}
-          onChange={(v) => onSaveField("cockpit", "rate_limit_auto_resume", v)}
+          description="When an acp worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as acp.rate_limit_auto_resume; cross-device. See #1722."
+          checked={(acp.rate_limit_auto_resume as boolean) ?? false}
+          onChange={(v) => onSaveField("acp", "rate_limit_auto_resume", v)}
         />
       </div>
 
@@ -834,7 +780,7 @@ function CockpitSettings({
           <div className="text-sm text-text-bright">Queue drain mode</div>
           <div className="text-xs text-text-dim mt-0.5">
             Persists to <code>config.toml</code> as{" "}
-            <code>cockpit.queue_drain_mode</code>; cross-device. Controls how follow-up prompts queued
+            <code>acp.queue_drain_mode</code>; cross-device. Controls how follow-up prompts queued
             while the agent is busy get dispatched once the current turn ends. <strong>Combined</strong>{" "}
             (default) joins every queued entry with a blank line and sends them as a single prompt; one
             response covers the whole batch. <strong>Serial</strong> fires one entry at a time and waits
@@ -849,7 +795,7 @@ function CockpitSettings({
               aria-pressed={queueDrainMode === opt}
               onClick={async () => {
                 if (queueDrainMode === opt) return;
-                onSaveField("cockpit", "queue_drain_mode", opt);
+                onSaveField("acp", "queue_drain_mode", opt);
                 await onRefresh();
               }}
               className={`rounded px-2.5 py-1 transition-colors cursor-pointer ${
@@ -870,82 +816,81 @@ function CockpitSettings({
       >
         <NumberField
           label="History cap (events)"
-          description="Per-session retention cap on cockpit events. 0 = unlimited (default); set a non-zero value to bound disk usage on long-running sessions. Persists to config.toml as cockpit.replay_events; cross-device."
+          description="Per-session retention cap on acp events. 0 = unlimited (default); set a non-zero value to bound disk usage on long-running sessions. Persists to config.toml as acp.replay_events; cross-device."
           value={
-            typeof cockpit.replay_events === "number"
-              ? (cockpit.replay_events as number)
+            typeof acp.replay_events === "number"
+              ? (acp.replay_events as number)
               : 0
           }
           min={0}
-          onChange={(v) => onSaveField("cockpit", "replay_events", v)}
+          onChange={(v) => onSaveField("acp", "replay_events", v)}
         />
         <NumberField
           label="Replay buffer bytes"
-          description="Per-session byte cap on the in-memory replay buffer. Persists to config.toml as cockpit.replay_bytes; cross-device."
+          description="Per-session byte cap on the in-memory replay buffer. Persists to config.toml as acp.replay_bytes; cross-device."
           value={
-            typeof cockpit.replay_bytes === "number"
-              ? (cockpit.replay_bytes as number)
+            typeof acp.replay_bytes === "number"
+              ? (acp.replay_bytes as number)
               : 0
           }
           min={0}
-          onChange={(v) => onSaveField("cockpit", "replay_bytes", v)}
+          onChange={(v) => onSaveField("acp", "replay_bytes", v)}
         />
         <NumberField
           label="Max concurrent resumes"
-          description="Upper bound on parallel cockpit worker spawns/attaches the reconciler runs on `aoe serve` cold start. Default 4 keeps Node.js bootup memory bounded for laptops/Pis (each claude-agent-acp is ~50-80 MB transient). Bounded at runtime by `min(this, max_concurrent_workers).max(1)`. Persists to config.toml as cockpit.max_concurrent_resumes; cross-device."
+          description="Upper bound on parallel acp worker spawns/attaches the reconciler runs on `aoe serve` cold start. Default 4 keeps Node.js bootup memory bounded for laptops/Pis (each claude-agent-acp is ~50-80 MB transient). Bounded at runtime by `min(this, max_concurrent_workers).max(1)`. Persists to config.toml as acp.max_concurrent_resumes; cross-device."
           value={maxConcurrentResumes}
           min={1}
-          onChange={(v) => onSaveField("cockpit", "max_concurrent_resumes", v)}
+          onChange={(v) => onSaveField("acp", "max_concurrent_resumes", v)}
         />
         <NumberField
           label="Silent-orphan grace (s)"
-          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as cockpit.silent_orphan_grace_secs; cross-device. See #1240."
+          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as acp.silent_orphan_grace_secs; cross-device. See #1240."
           value={
-            typeof cockpit.silent_orphan_grace_secs === "number"
-              ? (cockpit.silent_orphan_grace_secs as number)
+            typeof acp.silent_orphan_grace_secs === "number"
+              ? (acp.silent_orphan_grace_secs as number)
               : 60
           }
           min={0}
-          onChange={(v) => onSaveField("cockpit", "silent_orphan_grace_secs", v)}
+          onChange={(v) => onSaveField("acp", "silent_orphan_grace_secs", v)}
         />
         <NumberField
           label="Silent-orphan fast grace (s)"
-          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as cockpit.silent_orphan_fast_grace_secs; cross-device. See #1240."
+          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as acp.silent_orphan_fast_grace_secs; cross-device. See #1240."
           value={
-            typeof cockpit.silent_orphan_fast_grace_secs === "number"
-              ? (cockpit.silent_orphan_fast_grace_secs as number)
+            typeof acp.silent_orphan_fast_grace_secs === "number"
+              ? (acp.silent_orphan_fast_grace_secs as number)
               : 20
           }
           min={0}
-          onChange={(v) => onSaveField("cockpit", "silent_orphan_fast_grace_secs", v)}
+          onChange={(v) => onSaveField("acp", "silent_orphan_fast_grace_secs", v)}
         />
         <NumberField
           label="Auto-stop idle workers (s)"
-          description="Seconds of inactivity (no cockpit events, no in-flight turn) after which the daemon stops an idle cockpit worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Cockpit workers only. Persists to config.toml as cockpit.auto_stop_idle_secs; cross-device. See #1689."
+          description="Seconds of inactivity (no acp events, no in-flight turn) after which the daemon stops an idle acp worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Acp workers only. Persists to config.toml as acp.auto_stop_idle_secs; cross-device. See #1689."
           value={
-            typeof cockpit.auto_stop_idle_secs === "number"
-              ? (cockpit.auto_stop_idle_secs as number)
+            typeof acp.auto_stop_idle_secs === "number"
+              ? (acp.auto_stop_idle_secs as number)
               : 0
           }
           min={0}
-          onChange={(v) => onSaveField("cockpit", "auto_stop_idle_secs", v)}
+          onChange={(v) => onSaveField("acp", "auto_stop_idle_secs", v)}
         />
         <NumberField
           label="Auto-resume grace (s)"
-          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as cockpit.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
+          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as acp.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
           value={
-            typeof cockpit.rate_limit_auto_resume_grace_secs === "number"
-              ? (cockpit.rate_limit_auto_resume_grace_secs as number)
+            typeof acp.rate_limit_auto_resume_grace_secs === "number"
+              ? (acp.rate_limit_auto_resume_grace_secs as number)
               : 15
           }
           min={0}
           onChange={(v) =>
-            onSaveField("cockpit", "rate_limit_auto_resume_grace_secs", v)
+            onSaveField("acp", "rate_limit_auto_resume_grace_secs", v)
           }
         />
       </CollapsibleSection>
 
-      {error && <div className="text-xs text-rose-400">{error}</div>}
     </div>
   );
 }

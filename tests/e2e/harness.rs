@@ -65,7 +65,7 @@ pub fn node_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Skip the calling test if Node.js is not installed. Cockpit e2e tests
+/// Skip the calling test if Node.js is not installed. Acp e2e tests
 /// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
 /// is a Node script; without Node the worker can't speak ACP.
 macro_rules! require_node {
@@ -79,7 +79,7 @@ macro_rules! require_node {
 pub(crate) use require_node;
 
 // ---------------------------------------------------------------------------
-// Daemon port helpers (shared by serve.rs and cockpit e2e)
+// Daemon port helpers (shared by serve.rs and structured view e2e)
 // ---------------------------------------------------------------------------
 
 /// Bind a TCP listener to an ephemeral port, drop it, and return the port.
@@ -185,14 +185,14 @@ pub struct TuiTestHarness {
     recording: bool,
     cast_path: Option<PathBuf>,
     /// Extra env vars exported on every spawned process (tmux session +
-    /// `run_cli` subprocesses). Used by cockpit tests to thread
+    /// `run_cli` subprocesses). Used by structured view tests to thread
     /// FAKE_ACP_* and the runner-socket timeout into the daemon (and
     /// thus the daemon-spawned worker, which inherits this env).
     extra_env: Vec<(String, String)>,
-    /// Dirs prepended to PATH ahead of the `claude` stub. Cockpit tests
+    /// Dirs prepended to PATH ahead of the `claude` stub. Acp tests
     /// install the ACP shim here so it shadows the exit-0 stub.
     extra_path_dirs: Vec<PathBuf>,
-    /// When set, `Drop` stops the cockpit workers and the serve daemon
+    /// When set, `Drop` stops the structured view workers and the serve daemon
     /// before killing the tmux session, so a panicking assertion can't
     /// leak a daemon between serial tests.
     stop_daemon_on_drop: bool,
@@ -208,8 +208,8 @@ impl TuiTestHarness {
     }
 
     /// Like [`new`](Self::new) but roots the isolated `$HOME` under `/tmp`.
-    /// Cockpit workers bind a unix socket at
-    /// `$HOME/.agent-of-empires-dev/cockpit-workers/<id>.sock`; a deep
+    /// Acp workers bind a unix socket at
+    /// `$HOME/.agent-of-empires-dev/acp-workers/<id>.sock`; a deep
     /// tempdir (macOS `/var/folders/...` is ~95 chars) blows past the
     /// 104-byte `sun_path` limit on Darwin, so the runner's
     /// `UnixListener::bind` fails. `/tmp` keeps the path short.
@@ -290,7 +290,7 @@ last_seen_version = "{}"
         }
     }
 
-    /// Build the PATH with cockpit shim dirs (if any) and the stub
+    /// Build the PATH with structured view shim dirs (if any) and the stub
     /// directory prepended so the fake agent / fake `claude` is found.
     /// `extra_path_dirs` come first so an installed ACP shim shadows the
     /// exit-0 `claude` stub.
@@ -311,18 +311,8 @@ last_seen_version = "{}"
         self.extra_env.push((key.to_string(), value.to_string()));
     }
 
-    /// Append `[cockpit] enabled = true` to the pre-seeded config so the
-    /// daemon flips its cockpit master atomic on at construction
-    /// (`src/server/mod.rs`).
-    pub fn enable_cockpit_master(&self) {
-        let cfg = app_dir_in(self.home_dir.path()).join("config.toml");
-        let mut content = std::fs::read_to_string(&cfg).unwrap_or_default();
-        content.push_str("\n[cockpit]\nenabled = true\n");
-        std::fs::write(&cfg, content).expect("append cockpit config");
-    }
-
     /// Install the shared Node fake-ACP agent as the `claude`,
-    /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The cockpit
+    /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
     /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
     /// command via `AgentRegistry`, so all three names must point at the
     /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
@@ -360,7 +350,7 @@ last_seen_version = "{}"
         // Belt-and-suspenders: the shim bakes these in, but keep them on
         // the daemon env too for any path that bypasses the shim.
         self.set_env("FAKE_ACP_DEBUG_LOG", &debug_log.display().to_string());
-        self.set_env("AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS", "60000");
+        self.set_env("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "60000");
     }
 
     /// Install a no-op executable named `name` on the CLI PATH so a
@@ -382,7 +372,7 @@ last_seen_version = "{}"
         bin
     }
 
-    /// Make `Drop` tear down cockpit workers and the serve daemon.
+    /// Make `Drop` tear down structured view workers and the serve daemon.
     pub fn stop_daemon_on_drop(&mut self) {
         self.stop_daemon_on_drop = true;
     }
@@ -692,12 +682,12 @@ last_seen_version = "{}"
 
 impl Drop for TuiTestHarness {
     fn drop(&mut self) {
-        // Stop cockpit workers and the daemon before tearing down tmux so
+        // Stop structured view workers and the daemon before tearing down tmux so
         // a panicking assertion can't leak a daemon (which holds the test
         // port / pid file) into the next serial test. Worker first, then
         // daemon, so the fake-ACP child exits cleanly.
         if self.stop_daemon_on_drop {
-            let _ = self.run_cli(&["cockpit", "stop", "--all"]);
+            let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
         if self.spawned {

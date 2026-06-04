@@ -15,7 +15,7 @@ auth, see the [Web Dashboard overview](../web-dashboard.md).
   the top bar. With no sessions yet, the sidebar shows a short hint and a
   **New session** button that opens the wizard.
 - **Main pane** shows the selected session: the agent terminal (or
-  cockpit view), with the diff and paired terminal reachable from the
+  structured view), with the diff and paired terminal reachable from the
   top bar.
 - **Top bar** carries the command-palette trigger, the right-panel
   picker, and the overflow (three-dot) **More options** menu.
@@ -101,7 +101,7 @@ The choice is per-browser (localStorage). Collapse state is tracked separately f
 The sidebar exposes three triage primitives via the right-click (long-press on touch) context menu on any session row:
 
 - **Pin** floats the workspace to the top of the sidebar in every sort mode (Manual, Recent activity, and Attention). Pin is web-only and intentionally distinct from the favorite mark, which is a within-tier signal for the Attention sort on both surfaces. The web pin renders as a pushpin glyph next to the row title; the TUI favorite keeps its `*` star marker.
-- **Archive** kills the session's tmux pane (or shuts down the cockpit worker for ACP-cockpit sessions) and sinks the row into the collapsible "Snoozed & archived" footer of its repo group. Sending a message to the row from the dashboard wakes it back into the live list automatically. Daemon restarts and the cockpit worker reconciler both skip archived sessions, so a row stays parked until you explicitly unarchive it.
+- **Archive** kills the session's tmux pane (or shuts down the structured view worker for ACP-structured view sessions) and sinks the row into the collapsible "Snoozed & archived" footer of its repo group. Sending a message to the row from the dashboard wakes it back into the live list automatically. Daemon restarts and the structured view worker reconciler both skip archived sessions, so a row stays parked until you explicitly unarchive it.
 - **Snooze** sinks the row into the same footer for a chosen duration. The menu offers the same eight presets as the TUI snooze dialog: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w. The row wakes automatically when the timer expires; sending a message wakes it early.
 
 Snooze and archive are mutually exclusive with pin: pinning a sunk row surfaces it, and archiving or snoozing a pinned row removes the pin. The three primitives can be mixed freely across concurrent surfaces (TUI, CLI, web), and the data layer enforces the mutual-exclusion rules in one place so peer writes cannot leave a row in a contradictory state.

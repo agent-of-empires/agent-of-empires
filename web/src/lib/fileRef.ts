@@ -1,5 +1,5 @@
 // Parsing and resolution for local file references that agents emit in
-// cockpit transcript markdown. Codex (and similar agents) cite source
+// structured view transcript markdown. Codex (and similar agents) cite source
 // locations as markdown links whose href is a filesystem path with an
 // optional line/column suffix, e.g. `[app.ts](/Users/me/repo/src/app.ts:42)`.
 // We intercept those in the markdown anchor override (see Markdown.tsx)

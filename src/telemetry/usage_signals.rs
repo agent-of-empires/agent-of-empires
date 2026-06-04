@@ -20,14 +20,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// The fixed allowlist of usage-signal names a snapshot may report. Adding a
 /// surface here is the only edit needed to instrument it end to end.
 ///
-/// `web` / `cockpit` are whole-UI opens; `diff_panel` / `diff_comments` /
+/// `web` / `structured_view` are whole-UI opens; `diff_panel` / `diff_comments` /
 /// `web_terminal` (#1881) are feature-level opens within the dashboard, each
 /// fired from its own frontend trigger point. Scratch-session usage is not
 /// here: it is cross-surface session state, reported point-in-time by the
 /// `sessions_by_substrate` census, not a browser-fired open.
 pub const USAGE_SIGNALS: &[&str] = &[
     "web",
-    "cockpit",
+    "structured_view",
     "diff_panel",
     "diff_comments",
     "web_terminal",
@@ -116,7 +116,7 @@ impl UsageSeenCounters {
 }
 
 /// A full allowlisted key set with every count at zero. The TUI never hosts the
-/// web dashboard or cockpit, so it reports this stable shape rather than an
+/// web dashboard or acp, so it reports this stable shape rather than an
 /// empty (or absent) map, keeping the wire key set identical to the daemon's.
 pub fn zeroed() -> BTreeMap<String, u32> {
     USAGE_SIGNALS
@@ -133,7 +133,7 @@ mod tests {
     fn record_rejects_unregistered_names() {
         let counters = UsageSeenCounters::new();
         assert!(counters.record("web"));
-        assert!(counters.record("cockpit"));
+        assert!(counters.record("structured_view"));
         // An off-list name is rejected and never creates a key.
         assert!(!counters.record("bogus"));
         let snap = counters.snapshot();
@@ -172,7 +172,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(keys, expected);
         assert_eq!(snap.get("web"), Some(&2));
-        assert_eq!(snap.get("cockpit"), Some(&0));
+        assert_eq!(snap.get("structured_view"), Some(&0));
         // zeroed() (the TUI shape) matches the same key set.
         assert_eq!(
             zeroed().keys().collect::<Vec<_>>(),
@@ -186,7 +186,7 @@ mod tests {
         for _ in 0..5 {
             counters.record("web");
         }
-        counters.record("cockpit");
+        counters.record("structured_view");
 
         // An open lands during the in-flight send (after the snapshot read).
         let reported = counters.snapshot();
@@ -194,9 +194,9 @@ mod tests {
 
         counters.decrement(&reported);
         let after = counters.snapshot();
-        // The web open that landed mid-send survives; cockpit is fully cleared.
+        // The web open that landed mid-send survives; acp is fully cleared.
         assert_eq!(after.get("web"), Some(&1));
-        assert_eq!(after.get("cockpit"), Some(&0));
+        assert_eq!(after.get("structured_view"), Some(&0));
     }
 
     #[test]

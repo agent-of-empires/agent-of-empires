@@ -3,7 +3,7 @@
 //! The browser never posts to the telemetry backend (that would leak its IP /
 //! User-Agent and create a second identity surface). Instead it manages the
 //! opt-in state through the local daemon, which owns the install id and does
-//! all sending. `seen` lets the web UI report that the dashboard / cockpit was
+//! all sending. `seen` lets the web UI report that the dashboard / acp was
 //! opened so the daemon's next snapshot can carry the `usage_seen` map.
 
 use std::sync::Arc;
@@ -79,7 +79,7 @@ pub async fn set_telemetry_consent(
 
 #[derive(Deserialize)]
 pub struct SeenRequest {
-    /// `"web"` or `"cockpit"`.
+    /// `"web"` or `"structured_view"`.
     surface: String,
     /// Optional coarse client form-factor (`"desktop"` / `"desktop_pwa"` /
     /// `"mobile"` / `"mobile_pwa"`). Absent on older clients; any value outside
@@ -89,7 +89,7 @@ pub struct SeenRequest {
     form_factor: Option<String>,
 }
 
-/// Record that the web dashboard / cockpit web UI was opened. Folded into the
+/// Record that the web dashboard / acp web UI was opened. Folded into the
 /// daemon's next opt-in snapshot. Returns 204 on success; the client need not
 /// branch on consent state (the daemon only sends the flag when opted in).
 pub async fn post_telemetry_seen(
@@ -142,7 +142,7 @@ pub async fn post_telemetry_seen(
     if let Some(ff) = form_factor {
         match req.surface.as_str() {
             "web" => state.telemetry_web_clients.increment(ff),
-            "cockpit" => state.telemetry_cockpit_clients.increment(ff),
+            "structured_view" => state.telemetry_structured_clients.increment(ff),
             _ => {}
         }
     }
@@ -150,22 +150,22 @@ pub async fn post_telemetry_seen(
 }
 
 #[derive(Deserialize)]
-pub struct CockpitInteractionRequest {
+pub struct StructuredInteractionRequest {
     /// Allowlisted interaction kind. Only `"prompt_queued"` today; the field
     /// is an open string so adding a kind is a one-line match arm here.
     kind: String,
 }
 
-/// Report a cockpit interaction that only the browser can observe, so the
+/// Report an acp interaction that only the browser can observe, so the
 /// daemon can fold it into its next opt-in snapshot. The four other
 /// interaction signals (approvals, agent switch, substrate toggle, plan mode)
 /// are tallied daemon-side in their REST handlers and never come through here;
 /// queued prompts are the exception because the prompt queue lives entirely in
-/// the web cockpit's client state. Returns 204 on success; the client need not
+/// the web structured view's client state. Returns 204 on success; the client need not
 /// branch on consent state (the daemon only sends counts when opted in).
-pub async fn post_telemetry_cockpit_interaction(
+pub async fn post_telemetry_structured_interaction(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CockpitInteractionRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<StructuredInteractionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -183,7 +183,7 @@ pub async fn post_telemetry_cockpit_interaction(
     match req.kind.as_str() {
         "prompt_queued" => {
             state
-                .telemetry_cockpit
+                .telemetry_structured
                 .prompts_queued
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

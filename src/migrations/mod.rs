@@ -19,13 +19,14 @@ mod v008_lock_in_default_profile;
 mod v009_update_check_mode;
 mod v010_drop_legacy_live_send_exit_chord;
 mod v011_relocate_sandbox_image;
+mod v012_acp_rename;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 11;
+const CURRENT_VERSION: u32 = 12;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -57,7 +58,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
-        name: "cockpit_defaults",
+        name: "acp_defaults",
         run: v005_cockpit_defaults::run,
     },
     Migration {
@@ -89,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "relocate_sandbox_image",
         run: v011_relocate_sandbox_image::run,
+    },
+    Migration {
+        version: 12,
+        name: "acp_rename",
+        run: v012_acp_rename::run,
     },
 ];
 

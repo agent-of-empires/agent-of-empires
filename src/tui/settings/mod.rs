@@ -287,7 +287,7 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Agents);
         push_tab(&mut rows, SettingsCategory::Interaction);
         push_tab(&mut rows, SettingsCategory::Diff);
-        push_tab(&mut rows, SettingsCategory::Cockpit);
+        push_tab(&mut rows, SettingsCategory::Acp);
 
         push_section(&mut rows, "Hooks");
         push_tab(&mut rows, SettingsCategory::Hooks);
@@ -538,7 +538,7 @@ impl SettingsView {
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
                 // Persist + live-apply the logging filter so a running
-                // `aoe serve` daemon (and its cockpit runners) pick up the
+                // `aoe serve` daemon (and its structured view runners) pick up the
                 // change without a restart. No-ops when no controller is
                 // installed (TUI-only process).
                 if let Ok(app_dir) = crate::session::get_app_dir() {

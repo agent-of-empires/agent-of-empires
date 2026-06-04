@@ -67,8 +67,8 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                 Err(EnsureReadyError::Transient(status)) => {
                     bail!("Session is mid-lifecycle ({status:?}); cannot send right now")
                 }
-                Err(EnsureReadyError::CockpitMode) => {
-                    bail!("Cockpit-mode sessions have no tmux pane; send is not supported")
+                Err(EnsureReadyError::StructuredView) => {
+                    bail!("Acp-mode sessions have no tmux pane; send is not supported")
                 }
                 Err(EnsureReadyError::Tmux(e)) => bail!("{}", e),
             }

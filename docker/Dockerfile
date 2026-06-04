@@ -60,7 +60,7 @@ RUN curl -fsSL https://cursor.com/install | bash
 RUN npm install -g @github/copilot
 
 # Install Pi (pi.dev). The pi-acp adapter (installed below alongside other
-# cockpit ACP adapters) shells out to the `pi` binary that this package
+# structured view ACP adapters) shells out to the `pi` binary that this package
 # provides, so the two packages are paired.
 RUN npm install -g @earendil-works/pi-coding-agent
 
@@ -70,12 +70,12 @@ RUN curl -fsSL https://cli.kiro.dev/install | bash
 # Install Qwen Code (Alibaba / QwenLM)
 RUN npm install -g @qwen-code/qwen-code
 
-# Install ACP adapters used by `aoe`'s cockpit mode when the session is
-# sandboxed. The cockpit runner `docker exec`s these by their bare binary
-# name (see `src/cockpit/agent_registry.rs`); if they aren't present in
+# Install ACP adapters used by `aoe`'s structured view mode when the session is
+# sandboxed. The structured view runner `docker exec`s these by their bare binary
+# name (see `src/acp/agent_registry.rs`); if they aren't present in
 # the image the agent process exits with status 127 and the ACP handshake
 # times out. The list mirrors the npm-distributed adapters in
-# `src/cockpit/install_hints.rs`; native adapters (`opencode acp`,
+# `src/acp/install_hints.rs`; native adapters (`opencode acp`,
 # `gemini --acp`, `vibe-acp`) are already provided by their respective
 # CLIs above.
 RUN npm install -g \

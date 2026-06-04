@@ -25,8 +25,8 @@ export default defineConfig(({ mode }) => {
   })();
 
   // All WebSocket routes live under `/sessions/{id}/...ws` (terminal,
-  // container-terminal, and cockpit at `/sessions/{id}/cockpit/ws`), so one
-  // regex covers them; REST (including `/api/cockpit/*`) goes through `/api`.
+  // container-terminal, and structured view at `/sessions/{id}/acp/ws`), so one
+  // regex covers them; REST (including `/api/acp/*`) goes through `/api`.
   const proxy = httpTarget
     ? {
         "/api": { target: httpTarget, changeOrigin: true },

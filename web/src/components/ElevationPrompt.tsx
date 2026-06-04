@@ -1,5 +1,5 @@
 // Inline passphrase prompt that pops when a sensitive request returns
-// `403 elevation_required` (terminal attach, cockpit command exec,
+// `403 elevation_required` (terminal attach, structured view command exec,
 // approval resolution, file writes). Calls `POST /api/login/elevate`
 // to open a fresh 15-minute window; the original action can be
 // retried by the user once the modal closes. See #1131.

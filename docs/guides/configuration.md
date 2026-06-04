@@ -36,7 +36,7 @@ All settings below can also be edited from the TUI settings screen (press `s` or
 |----------|-------------|
 | `AGENT_OF_EMPIRES_PROFILE` | Default profile to use |
 | `AGENT_OF_EMPIRES_DEBUG` | Enable debug logging to `debug.log` in app data dir (`1` to enable). Legacy alias for `AOE_LOG_LEVEL=debug`. |
-| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error`. Applies to `agent_of_empires`, `cockpit`, and `terminal` targets. |
+| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error`. Applies to `agent_of_empires`, `structured view`, and `terminal` targets. |
 | `AOE_ACP_TRACE` | Add the ACP framework's raw JSON-RPC firehose to `debug.log` (`1` to enable). Very chatty; useful for chasing schema mismatches. |
 | `AOE_TERMINAL_TRACE` | Add per-message byte tracing for the web terminal WebSocket relay to `debug.log` (`1` to enable). Bumps the `terminal` target to `trace`, surfacing every PTY read/write and every WS send/recv. Spammy under load (a busy claude session emits thousands of frames/min); use only when chasing terminal disconnect bugs. |
 
@@ -96,7 +96,7 @@ yolo_mode_default = false
 agent_status_hooks = true
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 
-[session.cockpit_defaults.opencode]
+[session.acp_defaults.opencode]
 model = "openai/gpt-5.5"
 effort = "high"
 ```
@@ -104,15 +104,15 @@ effort = "high"
 | Option | Default | Description |
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
-| `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Cockpit workers use the separate `cockpit.auto_stop_idle_secs`. See #1689 and #1690. |
-| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in cockpit mode it maps to ACP `bypassPermissions` (see [Cockpit: Permission modes and YOLO](../cockpit.md#permission-modes-and-yolo) for the adapter caveat). |
+| `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Structured view workers use the separate `acp.auto_stop_idle_secs`. See #1689 and #1690. |
+| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view.md#permission-modes-and-yolo) for the adapter caveat). |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in `~/.codex/config.toml`; other JSON-based agents use their settings JSON. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
-| `agent_cockpit_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in cockpit (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is cockpit-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
-| `cockpit_defaults` | `{}` | Per-agent defaults for cockpit startup. `model` is forwarded when the worker starts; `effort` is applied through the agent's ACP `thought_level` config option when advertised. Example: `[session.cockpit_defaults.opencode] model = "openai/gpt-5.5" effort = "high"`. |
+| `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
+| `acp_defaults` | `{}` | Per-agent defaults for structured view startup. `model` is forwarded when the worker starts; `effort` is applied through the agent's ACP `thought_level` config option when advertised. Example: `[session.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high"`. |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 
@@ -157,30 +157,30 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 
 - **`custom_agents`**: Maps a display name to the command AoE runs when that agent is selected. Custom-agent names are configured in config files or the TUI settings screen, and they appear alongside built-in agents like `claude`, `opencode`, and `codex`.
 - **`agent_detect_as`** (optional): Maps a custom agent to a built-in agent's status detection. Without this, custom agents default to `Idle` status. Setting `"lenovo-claude" = "claude"` reuses Claude's Running/Waiting/Idle detection heuristics for the remote session.
-- **`agent_cockpit_cmd`** (optional): The ACP launch command that lets a custom agent run in the structured cockpit UI instead of the tmux terminal. See the Cockpit subsection below.
+- **`agent_acp_cmd`** (optional): The ACP launch command that lets a custom agent run in the structured view UI instead of the tmux terminal. See the Structured view subsection below.
 - **`default_tool`** (optional): Can point at a custom-agent name so new sessions default to that configured agent.
 
 Custom agents are always shown as available in the TUI picker because their command may target a remote host or wrapper script instead of a local binary. From the CLI, use `aoe add --tool <name>` to create a session with a configured custom agent by name. The selected custom agent still uses the command from `custom_agents`; browser or CLI input is not treated as a raw command.
 
-The Web session wizard can select configured custom agents and submit the selected name to the server. For security, the Web UI does not expose custom-agent command strings, does not expose `agent_detect_as` or `agent_cockpit_cmd` values, and does not edit any of these maps. Edit those fields through config files or the TUI settings screen instead.
+The Web session wizard can select configured custom agents and submit the selected name to the server. For security, the Web UI does not expose custom-agent command strings, does not expose `agent_detect_as` or `agent_acp_cmd` values, and does not edit any of these maps. Edit those fields through config files or the TUI settings screen instead.
 
 All three fields are editable from the TUI settings screen and support profile/repo-level overrides.
 
-#### Running a custom agent in cockpit
+#### Running a custom agent in the structured view
 
-By default a custom agent runs in the tmux terminal. To run it in the structured cockpit UI, give it an ACP launch command in `agent_cockpit_cmd`. The agent must speak the [Agent Client Protocol](https://agentclientprotocol.com); the command is what AoE execs to start the ACP server.
+By default a custom agent runs in the tmux terminal. To run it in the structured view UI, give it an ACP launch command in `agent_acp_cmd`. The agent must speak the [Agent Client Protocol](https://agentclientprotocol.com); the command is what AoE execs to start the ACP server.
 
 ```toml
 [session.custom_agents]
 "oc-superpowers" = "ocp run sp"
 
-[session.agent_cockpit_cmd]
+[session.agent_acp_cmd]
 "oc-superpowers" = "ocp run sp acp"
 ```
 
-With the cockpit master switch on, selecting `oc-superpowers` in the web wizard now creates a cockpit session, and `aoe add --tool oc-superpowers --cockpit` launches the ACP command. A custom agent with no `agent_cockpit_cmd` keeps running in the terminal, and `aoe add --cockpit` for it now errors instead of silently launching the bundled fallback agent.
+Selecting `oc-superpowers` in the web wizard creates an structured-view session, and `aoe add --tool oc-superpowers` launches the ACP command. A custom agent with no `agent_acp_cmd` runs in the terminal view; if you force the structured view with `--agent oc-superpowers` and it has no ACP command, `aoe add` errors instead of silently launching the bundled fallback agent.
 
-Note the difference from `custom_agents`: the `custom_agents` value is a shell command run in a tmux pane, while the `agent_cockpit_cmd` value is split into argv with shell-word rules and executed directly, with no shell. For shell features, wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The agent name must match a `custom_agents` entry so it appears in the picker, and it cannot shadow a built-in agent name.
+Note the difference from `custom_agents`: the `custom_agents` value is a shell command run in a tmux pane, while the `agent_acp_cmd` value is split into argv with shell-word rules and executed directly, with no shell. For shell features, wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The agent name must match a `custom_agents` entry so it appears in the picker, and it cannot shadow a built-in agent name.
 
 > **Note:** Profile and repo-level overrides fully replace the global value rather than merging with it. A profile that defines `custom_agents` replaces the entire global set, so you must redeclare any global agents you want to keep in that profile.
 

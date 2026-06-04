@@ -214,7 +214,7 @@ const PAGES = [
     dest: "docs/push-notifications.md",
     title: "Push Notifications",
     description:
-      "Browser and PWA push notifications for Agent of Empires session status changes and cockpit approvals.",
+      "Browser and PWA push notifications for Agent of Empires session status changes and structured view approvals.",
   },
   {
     source: "docs/features.md",
@@ -259,53 +259,53 @@ const PAGES = [
       "Complete command-line reference for the aoe CLI tool.",
   },
   {
-    source: "docs/cockpit.md",
-    dest: "docs/cockpit.md",
-    title: "Cockpit (Native Agent Rendering)",
+    source: "docs/structured-view.md",
+    dest: "docs/structured-view.md",
+    title: "Structured View (Web Dashboard)",
     description:
-      "Mobile-first native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
+      "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
-    source: "docs/cockpit/multi-agent.md",
-    dest: "docs/cockpit/multi-agent.md",
-    title: "Cockpit Multi-Agent Support",
+    source: "docs/structured-view/multi-agent.md",
+    dest: "docs/structured-view/multi-agent.md",
+    title: "Structured View Multi-Agent Support",
     description:
-      "Per-agent cockpit feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
+      "Per-agent feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
   },
   {
-    source: "docs/cockpit/setup.md",
-    dest: "docs/cockpit/setup.md",
-    title: "Cockpit Setup",
+    source: "docs/structured-view/setup.md",
+    dest: "docs/structured-view/setup.md",
+    title: "Structured View Setup",
     description:
-      "Confirm prerequisites with aoe cockpit doctor, enable cockpit per session or globally, disable it, attach across machines, and drive it from the CLI.",
+      "Confirm prerequisites with aoe acp doctor, pick structured view or terminal view per session, attach across machines, and drive it from the CLI.",
   },
   {
-    source: "docs/cockpit/interface.md",
-    dest: "docs/cockpit/interface.md",
-    title: "Cockpit Interface",
+    source: "docs/structured-view/interface.md",
+    dest: "docs/structured-view/interface.md",
+    title: "Structured View Interface",
     description:
-      "The TUI and web cockpit views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
+      "The TUI and web structured views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
   },
   {
-    source: "docs/cockpit/controls.md",
-    dest: "docs/cockpit/controls.md",
-    title: "Cockpit Modes, Approvals & Model Controls",
+    source: "docs/structured-view/controls.md",
+    dest: "docs/structured-view/controls.md",
+    title: "Structured View Modes, Approvals & Model Controls",
     description:
       "Permission modes, YOLO and bypassPermissions, approval cards and notifications, plus the model and reasoning-effort selectors.",
   },
   {
-    source: "docs/cockpit/persistence.md",
-    dest: "docs/cockpit/persistence.md",
-    title: "Cockpit Persistence & Recovery",
+    source: "docs/structured-view/persistence.md",
+    dest: "docs/structured-view/persistence.md",
+    title: "Structured View Persistence & Recovery",
     description:
-      "How cockpit workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
+      "How agent workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
   },
   {
-    source: "docs/cockpit/troubleshooting.md",
-    dest: "docs/cockpit/troubleshooting.md",
-    title: "Cockpit Troubleshooting",
+    source: "docs/structured-view/troubleshooting.md",
+    dest: "docs/structured-view/troubleshooting.md",
+    title: "Structured View Troubleshooting",
     description:
-      "The cockpit security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
+      "The structured view security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
   },
   {
     source: "docs/guides/tool-sessions.md",
@@ -348,13 +348,13 @@ const URL_MAP = {
   "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
-  "docs/cockpit.md": "/docs/cockpit/",
-  "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
-  "docs/cockpit/setup.md": "/docs/cockpit/setup/",
-  "docs/cockpit/interface.md": "/docs/cockpit/interface/",
-  "docs/cockpit/controls.md": "/docs/cockpit/controls/",
-  "docs/cockpit/persistence.md": "/docs/cockpit/persistence/",
-  "docs/cockpit/troubleshooting.md": "/docs/cockpit/troubleshooting/",
+  "docs/structured-view.md": "/docs/structured-view/",
+  "docs/structured-view/multi-agent.md": "/docs/structured-view/multi-agent/",
+  "docs/structured-view/setup.md": "/docs/structured-view/setup/",
+  "docs/structured-view/interface.md": "/docs/structured-view/interface/",
+  "docs/structured-view/controls.md": "/docs/structured-view/controls/",
+  "docs/structured-view/persistence.md": "/docs/structured-view/persistence/",
+  "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
   "docs/api.md": "/docs/api/",
   "docs/telemetry.md": "/docs/telemetry/",
   // Guides
@@ -451,8 +451,8 @@ function computeLayoutPath(dest) {
 }
 
 function escapeYaml(str) {
-  if (/[:"']/.test(str)) {
-    return `"${str.replace(/"/g, '\\"')}"`;
+  if (/[:"'\\]/.test(str)) {
+    return `"${str.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   }
   return str;
 }

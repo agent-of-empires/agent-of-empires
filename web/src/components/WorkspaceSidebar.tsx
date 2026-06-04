@@ -73,9 +73,9 @@ import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
-import { useHasDraftForSessions } from "../lib/cockpitDrafts";
-import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
-import { useRateLimitedForSessions } from "../hooks/useCockpitRateLimit";
+import { useHasDraftForSessions } from "../lib/acpDrafts";
+import { useQueuedCountForSessions } from "../hooks/useAcpQueueCount";
+import { useRateLimitedForSessions } from "../hooks/useAcpRateLimit";
 import {
   triageMenuShape,
   triageStateOf,
@@ -254,9 +254,9 @@ function loadSunkExpanded(): boolean {
   return false;
 }
 
-/** One-line sidebar affordance showing plan progress for cockpit
+/** One-line sidebar affordance showing plan progress for structured view
  *  sessions that have emitted a Plan. Quiet by default (renders only
- *  when `summary.total > 0`); mirrors the top-of-cockpit PlanStrip's
+ *  when `summary.total > 0`); mirrors the top-of-structured view PlanStrip's
  *  visual language so the sidebar and main view stay consistent. See
  *  #1061. */
 function PlanProgressMini({
@@ -615,11 +615,11 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
-  // The cockpit session backing this row, if any. Drives the "Switch
-  // agent" context-menu item, which only makes sense for an ACP cockpit
+  // The structured view session backing this row, if any. Drives the "Switch
+  // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
-  // rare; pick the first cockpit session in the workspace.
-  const cockpitSession = workspace.sessions.find((s) => s.cockpit_mode);
+  // rare; pick the first structured view session in the workspace.
+  const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) =>
     isSessionActive(s, idleDecayWindowMs),
   );
@@ -661,8 +661,8 @@ export const SessionRow = memo(function SessionRow({
     firstSession?.notify_on_idle,
     firstSession?.notify_on_error,
   );
-  // Surface an unsent cockpit-composer draft on this workspace's row.
-  // Drafts live in localStorage under `cockpit:draft:<session_id>`; we
+  // Surface an unsent acp-composer draft on this workspace's row.
+  // Drafts live in localStorage under `acp:draft:<session_id>`; we
   // check every session id in the workspace so multi-session rows
   // (rare today) still light up if any of them has pending text.
   const sessionIds = useMemo(
@@ -670,15 +670,15 @@ export const SessionRow = memo(function SessionRow({
     [workspace.sessions],
   );
   const hasDraft = useHasDraftForSessions(sessionIds);
-  // Queued cockpit follow-up prompts waiting to fire when the current
+  // Queued structured view follow-up prompts waiting to fire when the current
   // turn ends. Summed across the workspace's sessions, mirroring how
   // `hasDraft` ORs the same set. Lets a user juggling sessions see at a
-  // glance which rows have prompts pending without opening the cockpit.
+  // glance which rows have prompts pending without opening the structured view.
   const queuedCount = useQueuedCountForSessions(sessionIds);
-  // Rate-limit park visibility parity with the cockpit notice (#1715).
+  // Rate-limit park visibility parity with the structured view notice (#1715).
   // The server maps rate-limited stops to Idle, so the status glyph can't
   // distinguish a parked session from a normal idle one; surface it here
-  // from the same cockpit-state mirror the queued badge reads.
+  // from the same acp-state mirror the queued badge reads.
   const rateLimited = useRateLimitedForSessions(sessionIds);
   const rateLimitResetLabel = useMemo(() => {
     if (!rateLimited?.resetsAt) return null;
@@ -735,7 +735,7 @@ export const SessionRow = memo(function SessionRow({
     setSnoozeModalOpen(true);
   };
 
-  // Open the switch-agent dialog for this row's cockpit session. The
+  // Open the switch-agent dialog for this row's structured view session. The
   // dialog lives in that session's Composer (it prefills the composer on
   // confirm), so we navigate to the session first, then request the open.
   // When the row is already the active session the navigation is a no-op
@@ -743,9 +743,9 @@ export const SessionRow = memo(function SessionRow({
   // Composer consumes the pending latch once it mounts.
   const handleSwitchAgent = () => {
     setContextMenu(null);
-    if (!cockpitSession) return;
-    requestOpenSession(cockpitSession.id);
-    requestSwitchAgent(cockpitSession.id);
+    if (!acpSession) return;
+    requestOpenSession(acpSession.id);
+    requestSwitchAgent(acpSession.id);
   };
 
   // Effective state for rendering: optimistic overrides win until the
@@ -1036,10 +1036,10 @@ export const SessionRow = memo(function SessionRow({
                   <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                 </span>
               )}
-              {firstSession?.cockpit_mode &&
-                firstSession.cockpit_worker_state === "resuming" && (
+              {firstSession?.view === "structured" &&
+                firstSession.acp_worker_state === "resuming" && (
                   <span
-                    title="Cockpit worker is resuming"
+                    title="Structured view worker is resuming"
                     aria-label="Resuming"
                     className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
                   >
@@ -1133,7 +1133,7 @@ export const SessionRow = memo(function SessionRow({
               Edit group
             </button>
           )}
-          {!readOnly && cockpitSession && (
+          {!readOnly && acpSession && (
             <button
               onClick={handleSwitchAgent}
               data-testid="sidebar-context-menu-switch-agent"

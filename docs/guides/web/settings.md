@@ -13,9 +13,9 @@ For running the server, see the [Web Dashboard overview](../web-dashboard.md).
 Settings are organized into the same groups as the TUI:
 
 - **Appearance**: Theme.
-- **Sessions**: Session defaults and Cockpit (the cockpit master
+- **Sessions**: Session defaults and Structured view (the structured view master
   switch plus the replay and watchdog tuning knobs; see
-  [Cockpit Setup](../../cockpit/setup.md)).
+  [Structured view Setup](../../structured-view/setup.md)).
 - **Environment**: Sandbox, Worktree, and Tmux.
 - **Notifications**: Sound and Notifications (web push; see
   [Push notifications](../../push-notifications.md)).

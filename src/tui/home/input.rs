@@ -1857,7 +1857,7 @@ impl HomeView {
         // Dynamic tool session hotkeys (checked before everything else).
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
             if matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name) {
-                self.view_mode = ViewMode::Agent;
+                self.view_mode = ViewMode::Structured;
             } else {
                 self.view_mode = ViewMode::Tool(tool_name);
                 self.preview_scroll_offset = 0;
@@ -1875,7 +1875,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
-                self.view_mode = ViewMode::Agent;
+                self.view_mode = ViewMode::Structured;
                 return None;
             }
             _ => {}
@@ -1996,7 +1996,7 @@ impl HomeView {
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
-                    self.view_mode = ViewMode::Agent;
+                    self.view_mode = ViewMode::Structured;
                 } else if !self.tool_configs.is_empty() {
                     self.open_tool_picker();
                 }
@@ -2031,8 +2031,8 @@ impl HomeView {
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
                 self.view_mode = match self.view_mode {
-                    ViewMode::Agent => ViewMode::Terminal,
-                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Agent,
+                    ViewMode::Structured => ViewMode::Terminal,
+                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
                 };
             }
             ActionId::SendMessage => self.open_send_message_dialog(),
@@ -2552,7 +2552,7 @@ impl HomeView {
     }
 
     /// Resolve the action that "activating" the currently-selected session
-    /// should produce (cockpit open, attach to tmux session, attach to a
+    /// should produce (structured view open, attach to tmux session, attach to a
     /// tool session, etc.). Returns `None` for in-flight sessions
     /// (`Creating`/`Deleting`) and when no session is selected. Shared
     /// between the `Enter` keybind and double-click activation so the two
@@ -2563,25 +2563,25 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_cockpit_mode() {
+            if inst.is_structured() {
                 #[cfg(feature = "serve")]
                 {
-                    return Some(Action::OpenCockpit(id));
+                    return Some(Action::OpenStructuredView(id));
                 }
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Cockpit session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with --features serve to attach".to_string(),
                     ));
                 }
             }
         }
         match self.view_mode {
-            ViewMode::Agent => {
+            ViewMode::Structured => {
                 // `default_attach_mode = LiveSend` swaps the historical
                 // tmux attach for live-send mode on Enter / double-click.
-                // Cockpit was already handled above (the resolver also
-                // returns None for cockpit, so the match is double-safe);
+                // Acp was already handled above (the resolver also
+                // returns None for structured view, so the match is double-safe);
                 // Terminal view honors the same setting (live-send onto
                 // the paired terminal pane); Tool view keeps its
                 // existing AttachToolSession path.
@@ -2591,9 +2591,9 @@ impl HomeView {
                 // double-click on the live row would otherwise re-run
                 // ensure_pane_ready and respawn the worker for no
                 // reason. `start_live_send` returns `None` for that
-                // and for cockpit/creating rows; in either of those
-                // cases we leave activation alone (cockpit was already
-                // dispatched to OpenCockpit above; same-target re-click
+                // and for structured view/creating rows; in either of those
+                // cases we leave activation alone (structured view was already
+                // dispatched to OpenStructuredView above; same-target re-click
                 // is intentionally a no-op).
                 if matches!(
                     self.default_attach_mode(&id),
@@ -2605,7 +2605,7 @@ impl HomeView {
                 }
             }
             ViewMode::Terminal => {
-                // Mirror Agent view: when `default_attach_mode = LiveSend`,
+                // Mirror Structured view: when `default_attach_mode = LiveSend`,
                 // Enter on the terminal row enters live-send mode against
                 // the paired terminal pane (host or container, whichever
                 // is currently shown). Otherwise fall back to the
@@ -2633,7 +2633,7 @@ impl HomeView {
 
     /// Resolve the "Tab swap" action that fires when
     /// `default_attach_mode = LiveSend`: Enter takes the live-send
-    /// slot, so Tab takes the tmux-attach slot. Mirrors the cockpit
+    /// slot, so Tab takes the tmux-attach slot. Mirrors the structured view
     /// and in-flight guards from `activate_selected_session`; returns
     /// the same per-view-mode attach actions Enter produces under the
     /// historical default.
@@ -2643,21 +2643,21 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_cockpit_mode() {
+            if inst.is_structured() {
                 #[cfg(feature = "serve")]
                 {
-                    return Some(Action::OpenCockpit(id));
+                    return Some(Action::OpenStructuredView(id));
                 }
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Cockpit session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with --features serve to attach".to_string(),
                     ));
                 }
             }
         }
         match self.view_mode {
-            ViewMode::Agent => Some(Action::AttachSession(id)),
+            ViewMode::Structured => Some(Action::AttachSession(id)),
             ViewMode::Terminal => {
                 let terminal_mode = if let Some(inst) = self.get_instance(&id) {
                     if inst.is_sandboxed() {
@@ -2842,7 +2842,7 @@ impl HomeView {
         }
 
         let active_cache = match self.view_mode {
-            ViewMode::Agent => &self.preview_cache,
+            ViewMode::Structured => &self.preview_cache,
             ViewMode::Terminal => {
                 let terminal_mode = self
                     .selected_session
@@ -3218,12 +3218,12 @@ impl HomeView {
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
-        // Deletion only allowed in Agent View.
+        // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
             let hint = if self.strict_hotkeys {
-                "Terminals cannot be deleted directly. Switch to Agent View (press Shift+T) and delete the agent session instead."
+                "Terminals cannot be deleted directly. Switch to Structured View (press Shift+T) and delete the agent session instead."
             } else {
-                "Terminals cannot be deleted directly. Switch to Agent View (press 't') and delete the agent session instead."
+                "Terminals cannot be deleted directly. Switch to Structured View (press 't') and delete the agent session instead."
             };
             self.info_dialog = Some(InfoDialog::new("Cannot Delete Terminal", hint));
             return;
@@ -3317,7 +3317,7 @@ impl HomeView {
     /// the `Enter` keybind would have produced) so users can still
     /// drop into a full tmux attach without going through live mode.
     /// Returns the action for the caller to dispatch, or `None` for
-    /// no-op clicks (group toggle, cockpit/creating rows, same-session
+    /// no-op clicks (group toggle, structured view/creating rows, same-session
     /// re-clicks while already live). The caller redraws unconditionally
     /// so the moved cursor / toggled group always paints before the
     /// action executes. Gated by `has_dialog()` (via
@@ -3390,7 +3390,7 @@ impl HomeView {
                 // the user can browse preview content without ever
                 // entering live-send; double-click still activates via
                 // `default_attach_mode`. `click_action` returns `None`
-                // for cockpit-mode sessions, where `start_live_send`
+                // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
                 // is fine.
                 if matches!(
@@ -3662,22 +3662,22 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
-        // Cockpit-mode sessions are not tmux-backed (HomeView's attach
+        // Acp-mode sessions are not tmux-backed (HomeView's attach
         // path special-cases them away from tmux). Live-send has no
         // target in that mode, so silently no-op rather than enqueue
         // an Action::EnterLiveSend that would fail downstream.
-        if inst.is_cockpit_mode() {
+        if inst.is_structured() {
             return None;
         }
         // Pick the live-send target based on which pane the user is
-        // currently previewing. Agent view → agent pane (historical
+        // currently previewing. Structured view → agent pane (historical
         // default). Terminal view → the paired host or container
         // terminal pane, so 'm'/Tab compose against the same shell
         // the user sees. Tool view stays out of live-send (no clean
         // target for lazygit/yazi etc.; let the caller fall back to
         // AttachToolSession).
         self.pending_live_send_target = match &self.view_mode {
-            ViewMode::Agent => live_send::LiveSendTarget::Agent,
+            ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
                 if inst.is_sandboxed() && self.get_terminal_mode(&id) == TerminalMode::Container {
                     live_send::LiveSendTarget::ContainerTerminal
@@ -3853,7 +3853,7 @@ impl HomeView {
 
     /// Returns `Some(reason)` if the live-send target has drifted out
     /// from under us between entry and now. Three drift modes:
-    /// - Instance row deleted (peer / web cockpit / another aoe killed
+    /// - Instance row deleted (peer / web structured view / another aoe killed
     ///   it).
     /// - Title renamed (which regenerates the tmux session name; the
     ///   worker is now targeting a stale name).
@@ -3916,13 +3916,13 @@ impl HomeView {
         self.send_message_dialog = Some(dialog);
     }
 
-    /// Compose target for the current view: agent in Agent view, the
+    /// Compose target for the current view: agent in Structured view, the
     /// paired host/container terminal in Terminal view. Tool view has
     /// no clean compose target (the tool owns the pane), so it falls
     /// through to Agent for the historical paste/letter-capture path.
     pub(super) fn current_send_target(&self) -> live_send::LiveSendTarget {
         match &self.view_mode {
-            ViewMode::Agent => live_send::LiveSendTarget::Agent,
+            ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
                 if let Some(id) = self.selected_session.as_deref() {
                     if let Some(inst) = self.get_instance(id) {

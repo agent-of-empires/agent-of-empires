@@ -163,11 +163,11 @@
       ]
     },
     {
-      "id": "telemetry.cockpit-seen",
+      "id": "telemetry.acp-seen",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-telemetry-seen.spec.ts"
+        "tests/live/acp-telemetry-seen.spec.ts"
       ],
       "components": [
         "web/src/App.tsx"
@@ -187,14 +187,14 @@
       ]
     },
     {
-      "id": "telemetry.cockpit-interaction",
+      "id": "telemetry.structured-interaction",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/hooks/useCockpit.queue.test.ts"
+        "src/hooks/useAcpSession.queue.test.ts"
       ],
       "components": [
-        "web/src/hooks/useCockpit.ts",
+        "web/src/hooks/useAcpSession.ts",
         "web/src/lib/api.ts"
       ]
     },
@@ -270,11 +270,11 @@
       "components": []
     },
     {
-      "id": "settings.cockpit-persistence",
+      "id": "settings.acp-persistence",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/settings-persistence-cockpit.spec.ts"
+        "tests/live/settings-persistence-acp.spec.ts"
       ],
       "components": [
         "web/src/components/SettingsView.tsx"
@@ -524,11 +524,11 @@
       ]
     },
     {
-      "id": "wizard.cockpit-opt-out",
+      "id": "wizard.acp-opt-out",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/session-wizard/__tests__/cockpitToggle.test.tsx",
+        "src/components/session-wizard/__tests__/structuredViewToggle.test.tsx",
         "src/components/session-wizard/wizardReducer.test.ts"
       ],
       "components": [
@@ -562,11 +562,11 @@
       ]
     },
     {
-      "id": "cockpit.custom-agent-acp-capable",
+      "id": "acp.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-custom-agent.spec.ts"
+        "tests/live/acp-custom-agent.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -626,10 +626,10 @@
       ]
     },
     {
-      "id": "wizard.cockpit-mode-creation",
+      "id": "wizard.acp-mode-creation",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/wizard-cockpit-create-session.spec.ts"],
+      "specs": ["tests/live/wizard-acp-create-session.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
@@ -851,7 +851,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-reorder-reload-persists.spec.ts"
+        "tests/live/acp-stories/sidebar-reorder-reload-persists.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -1109,13 +1109,13 @@
       "risk": "high",
       "specs": [
         "src/components/diff/comments/buildPrompt.test.ts",
-        "src/lib/cockpitTypes.test.ts",
-        "src/components/cockpit/CockpitRuntime.test.ts"
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/AcpRuntime.test.ts"
       ],
       "components": [
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
@@ -1237,163 +1237,163 @@
       ]
     },
     {
-      "id": "cockpit.spawn-prompt",
+      "id": "acp.spawn-prompt",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-spawn-prompt.spec.ts"
+        "tests/live/acp-spawn-prompt.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/Markdown.tsx",
-        "web/src/components/cockpit/ToolCards.tsx",
-        "web/src/components/cockpit/ToolErrorBody.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/Markdown.tsx",
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/ToolErrorBody.tsx"
       ]
     },
     {
-      "id": "cockpit.attachments",
+      "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-attachment.spec.ts"
+        "tests/live/acp-attachment.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.approval",
+      "id": "acp.approval",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-approval.spec.ts"
+        "tests/live/acp-approval.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ApprovalCard.tsx"
+        "web/src/components/acp/ApprovalCard.tsx"
       ]
     },
     {
-      "id": "cockpit.force-end-turn-gate",
+      "id": "acp.force-end-turn-gate",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/__tests__/WorkingSpinner.test.tsx"
+        "src/components/acp/__tests__/WorkingSpinner.test.tsx"
       ],
       "components": []
     },
     {
-      "id": "cockpit.spinner-tool-precedence",
+      "id": "acp.spinner-tool-precedence",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/__tests__/WorkingSpinner.test.tsx",
-        "src/lib/cockpitTypes.test.ts",
-        "src/lib/cockpitRattle.test.ts"
+        "src/components/acp/__tests__/WorkingSpinner.test.tsx",
+        "src/lib/acpTypes.test.ts",
+        "src/lib/acpRattle.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.escape-no-cancel",
+      "id": "acp.escape-no-cancel",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-escape-no-cancel.spec.ts"
+        "tests/live/acp-escape-no-cancel.spec.ts"
       ],
       "components": []
     },
     {
-      "id": "cockpit.escape-no-cancel-contract",
+      "id": "acp.escape-no-cancel-contract",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/Composer.escape.test.tsx"
+        "src/components/acp/Composer.escape.test.tsx"
       ],
       "components": []
     },
     {
-      "id": "cockpit.config-pickers",
+      "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-config-pickers.spec.ts",
-        "tests/live/cockpit-config-pickers-ui.spec.ts",
-        "src/components/cockpit/SessionConfigControls.test.tsx",
-        "src/hooks/useCockpit.configOption.test.ts"
+        "tests/live/acp-config-pickers.spec.ts",
+        "tests/live/acp-config-pickers-ui.spec.ts",
+        "src/components/acp/SessionConfigControls.test.tsx",
+        "src/hooks/useAcpSession.configOption.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/SessionConfigControls.tsx",
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/hooks/useCockpit.ts",
-        "web/src/lib/cockpitTypes.ts"
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts"
       ]
     },
     {
-      "id": "cockpit.mode-switch",
+      "id": "acp.mode-switch",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-mode-switch.spec.ts"
+        "tests/live/acp-mode-switch.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/SwitchSubstrateAction.tsx",
-        "web/src/components/cockpit/ContextPrimerBanner.tsx"
+        "web/src/components/acp/SwitchViewAction.tsx",
+        "web/src/components/acp/ContextPrimerBanner.tsx"
       ]
     },
     {
-      "id": "cockpit.completion",
+      "id": "acp.completion",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-files.spec.ts",
-        "tests/live/cockpit-context-primer.spec.ts",
-        "tests/live/cockpit-substrate-switch.spec.ts",
-        "tests/live/cockpit-disable.spec.ts",
-        "tests/live/cockpit-force-end-turn.spec.ts",
-        "tests/live/cockpit-replay-catchup.spec.ts",
-        "tests/live/cockpit-cancel.spec.ts",
-        "tests/live/cockpit-lagged-ws.spec.ts"
+        "tests/live/acp-files.spec.ts",
+        "tests/live/acp-context-primer.spec.ts",
+        "tests/live/acp-view-switch.spec.ts",
+        "tests/live/acp-disable.spec.ts",
+        "tests/live/acp-force-end-turn.spec.ts",
+        "tests/live/acp-replay-catchup.spec.ts",
+        "tests/live/acp-cancel.spec.ts",
+        "tests/live/acp-lagged-ws.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ContextPrimerBanner.tsx",
-        "web/src/components/cockpit/useFilesIndex.ts"
+        "web/src/components/acp/ContextPrimerBanner.tsx",
+        "web/src/components/acp/useFilesIndex.ts"
       ]
     },
     {
-      "id": "cockpit.rate-limit-recovery",
+      "id": "acp.rate-limit-recovery",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/lib/cockpitTypes.test.ts",
-        "src/components/cockpit/SwitchAgentModal.test.tsx"
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/SwitchAgentModal.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/SwitchAgentModal.tsx"
+        "web/src/components/acp/SwitchAgentModal.tsx"
       ]
     },
     {
-      "id": "cockpit.switch-agent-manual",
+      "id": "acp.switch-agent-manual",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/SwitchAgentModal.test.tsx",
-        "src/lib/api.cockpit.test.ts"
+        "src/components/acp/SwitchAgentModal.test.tsx",
+        "src/lib/api.acp.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/SwitchAgentModal.tsx",
-        "web/src/components/cockpit/Composer.tsx",
+        "web/src/components/acp/SwitchAgentModal.tsx",
+        "web/src/components/acp/Composer.tsx",
         "web/src/lib/api.ts"
       ]
     },
     {
-      "id": "cockpit.switch-agent-context-menu",
+      "id": "acp.switch-agent-context-menu",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
@@ -1402,326 +1402,326 @@
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.silent-orphan-watchdog",
+      "id": "acp.silent-orphan-watchdog",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/lib/cockpitTypes.test.ts",
-        "src/components/cockpit/__tests__/WorkerRestartingBanner.test.tsx"
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/__tests__/WorkerRestartingBanner.test.tsx"
       ],
       "components": []
     },
     {
-      "id": "cockpit.usage-baseline",
+      "id": "acp.usage-baseline",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/lib/cockpitTypes.test.ts"
+        "src/lib/acpTypes.test.ts"
       ],
       "components": [
-        "web/src/lib/cockpitTypes.ts"
+        "web/src/lib/acpTypes.ts"
       ]
     },
     {
-      "id": "cockpit.drafts",
+      "id": "acp.drafts",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/lib/cockpitDrafts.test.ts"
+        "src/lib/acpDrafts.test.ts"
       ],
       "components": [
-        "web/src/lib/cockpitDrafts.ts"
+        "web/src/lib/acpDrafts.ts"
       ]
     },
     {
-      "id": "cockpit.queue-drain-clear-split",
+      "id": "acp.queue-drain-clear-split",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/hooks/useCockpit.queue.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
         "src/lib/agentProfiles.test.ts"
       ],
       "components": [
-        "web/src/hooks/useCockpit.ts",
+        "web/src/hooks/useAcpSession.ts",
         "web/src/lib/agentProfiles.ts",
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.idle-dormant-wake",
+      "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/lib/cockpitTypes.test.ts",
-        "src/hooks/useCockpit.queue.test.ts"
+        "src/lib/acpTypes.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts"
       ],
       "components": [
-        "web/src/lib/cockpitTypes.ts",
-        "web/src/hooks/useCockpit.ts"
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts"
       ]
     },
     {
-      "id": "cockpit.files-index",
+      "id": "acp.files-index",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/useFilesIndex.test.tsx"
+        "src/components/acp/useFilesIndex.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/useFilesIndex.ts"
+        "web/src/components/acp/useFilesIndex.ts"
       ]
     },
     {
-      "id": "cockpit.rattle",
+      "id": "acp.rattle",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/lib/cockpitRattle.test.ts"
+        "src/lib/acpRattle.test.ts"
       ],
       "components": [
-        "web/src/lib/cockpitRattle.ts"
+        "web/src/lib/acpRattle.ts"
       ]
     },
     {
-      "id": "cockpit.cancel-force-stop",
+      "id": "acp.cancel-force-stop",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/__tests__/WorkingSpinner.test.tsx",
-        "src/lib/cockpitTypes.test.ts"
+        "src/components/acp/__tests__/WorkingSpinner.test.tsx",
+        "src/lib/acpTypes.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/hooks/useCockpit.ts",
-        "web/src/lib/cockpitTypes.ts"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts"
       ]
     },
     {
-      "id": "cockpit.args",
+      "id": "acp.args",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/lib/cockpitArgs.test.ts"
+        "src/lib/acpArgs.test.ts"
       ],
       "components": [
-        "web/src/lib/cockpitArgs.ts"
+        "web/src/lib/acpArgs.ts"
       ]
     },
     {
-      "id": "cockpit.approval-card",
+      "id": "acp.approval-card",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/ApprovalCard.test.tsx"
+        "src/components/acp/ApprovalCard.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ApprovalCard.tsx"
+        "web/src/components/acp/ApprovalCard.tsx"
       ]
     },
     {
-      "id": "cockpit.markdown",
+      "id": "acp.markdown",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/Markdown.test.tsx",
-        "src/components/cockpit/Markdown.breaks.test.tsx"
+        "src/components/acp/Markdown.test.tsx",
+        "src/components/acp/Markdown.breaks.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/Markdown.tsx"
+        "web/src/components/acp/Markdown.tsx"
       ]
     },
     {
-      "id": "cockpit.file-links",
+      "id": "acp.file-links",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-file-links.spec.ts"
+        "tests/live/acp-file-links.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitFileRefContext.tsx",
-        "web/src/components/cockpit/Markdown.tsx",
-        "web/src/components/cockpit/CockpitView.tsx",
+        "web/src/components/acp/AcpFileRefContext.tsx",
+        "web/src/components/acp/Markdown.tsx",
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/components/diff/DiffFileViewer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-single-newline",
+      "id": "acp.story.composer-single-newline",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-single-newline-renders.spec.ts"
+        "tests/live/acp-stories/composer-single-newline-renders.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/Markdown.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Markdown.tsx"
       ]
     },
     {
-      "id": "cockpit.tool-cards",
+      "id": "acp.tool-cards",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/ToolCards.render.test.tsx"
+        "src/components/acp/ToolCards.render.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.tool-density",
+      "id": "acp.tool-density",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/ToolDisplayMode.test.tsx"
+        "src/components/acp/ToolDisplayMode.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ToolDisplayMode.tsx"
+        "web/src/components/acp/ToolDisplayMode.tsx"
       ]
     },
     {
-      "id": "cockpit.queued-prompt-expand-bounds",
+      "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/QueuedPromptsStrip.test.tsx"
+        "src/components/acp/QueuedPromptsStrip.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.tool-stopped-sweep",
+      "id": "acp.tool-stopped-sweep",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/lib/cockpitStopSweep.test.ts",
-        "src/components/cockpit/CockpitRuntime.test.ts",
-        "src/components/cockpit/ToolCards.render.test.tsx"
+        "src/lib/acpStopSweep.test.ts",
+        "src/components/acp/AcpRuntime.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/ToolCards.tsx",
-        "web/src/components/cockpit/ToolErrorBody.tsx"
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/ToolErrorBody.tsx"
       ]
     },
     {
-      "id": "cockpit.story.stop-tool-card-terminal",
+      "id": "acp.story.stop-tool-card-terminal",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/stop-tool-card-terminal.spec.ts"
+        "tests/live/acp-stories/stop-tool-card-terminal.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.todo-group-fold",
+      "id": "acp.todo-group-fold",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/CockpitRuntime.test.ts",
-        "src/components/cockpit/ToolCards.render.test.tsx"
+        "src/components/acp/AcpRuntime.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitRuntime.tsx",
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.opencode-todos",
+      "id": "acp.opencode-todos",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/CockpitRuntime.test.ts",
-        "src/components/cockpit/ToolCards.render.test.tsx",
+        "src/components/acp/AcpRuntime.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx",
         "src/lib/agentProfiles.test.ts",
-        "src/lib/cockpitTypes.test.ts"
+        "src/lib/acpTypes.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ToolCards.tsx",
-        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/AcpRuntime.tsx",
         "web/src/lib/agentProfiles.ts",
-        "web/src/lib/cockpitArgs.ts",
-        "web/src/lib/cockpitTypes.ts"
+        "web/src/lib/acpArgs.ts",
+        "web/src/lib/acpTypes.ts"
       ]
     },
     {
-      "id": "cockpit.context-primer-banner",
+      "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/ContextPrimerBanner.test.tsx"
+        "src/components/acp/ContextPrimerBanner.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ContextPrimerBanner.tsx"
+        "web/src/components/acp/ContextPrimerBanner.tsx"
       ]
     },
     {
-      "id": "cockpit.switch-substrate-action",
+      "id": "acp.switch-view-action",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/SwitchSubstrateAction.test.tsx"
+        "src/components/acp/SwitchViewAction.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/SwitchSubstrateAction.tsx"
+        "web/src/components/acp/SwitchViewAction.tsx"
       ]
     },
     {
-      "id": "cockpit.tool-error-body",
+      "id": "acp.tool-error-body",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/ToolErrorBody.test.tsx"
+        "src/components/acp/ToolErrorBody.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ToolErrorBody.tsx"
+        "web/src/components/acp/ToolErrorBody.tsx"
       ]
     },
     {
-      "id": "cockpit.startup-error-screen",
+      "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/__tests__/StartupErrorScreen.test.tsx"
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/StartupErrorScreen.tsx"
+        "web/src/components/acp/StartupErrorScreen.tsx"
       ]
     },
     {
-      "id": "cockpit.startup-error-banner",
+      "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
       "specs": [
-        "src/components/cockpit/__tests__/StartupErrorBanner.test.tsx"
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.startup-error-banner-live",
+      "id": "acp.startup-error-banner-live",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-worker-log.spec.ts",
-        "tests/live/cockpit-stories/startup-error-banner-native-binary.spec.ts"
+        "tests/live/acp-worker-log.spec.ts",
+        "tests/live/acp-stories/startup-error-banner-native-binary.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "src/server/api/cockpit.rs",
-        "src/cockpit/acp_client.rs"
+        "web/src/components/acp/StructuredView.tsx",
+        "src/server/api/acp.rs",
+        "src/acp/acp_client.rs"
       ]
     },
     {
@@ -1771,7 +1771,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/settings-tmux-select.spec.ts"
+        "tests/live/acp-stories/settings-tmux-select.spec.ts"
       ],
       "components": [
         "web/src/components/settings/TmuxSettings.tsx",
@@ -1783,7 +1783,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/settings-tmux-mouse.spec.ts"
+        "tests/live/acp-stories/settings-tmux-mouse.spec.ts"
       ],
       "components": [
         "web/src/components/settings/TmuxSettings.tsx"
@@ -1794,7 +1794,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/profile-settings-isolation.spec.ts"
+        "tests/live/acp-stories/profile-settings-isolation.spec.ts"
       ],
       "components": [
         "web/src/components/SettingsView.tsx",
@@ -1806,7 +1806,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-palette.spec.ts"
+        "tests/live/acp-stories/shortcut-palette.spec.ts"
       ],
       "components": [
         "web/src/components/command-palette/CommandPalette.tsx",
@@ -1818,7 +1818,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-toggle-sidebar.spec.ts"
+        "tests/live/acp-stories/shortcut-toggle-sidebar.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
@@ -1830,7 +1830,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-help-key.spec.ts"
+        "tests/live/acp-stories/shortcut-help-key.spec.ts"
       ],
       "components": [
         "web/src/components/HelpOverlay.tsx",
@@ -1842,7 +1842,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-settings-key.spec.ts"
+        "tests/live/acp-stories/shortcut-settings-key.spec.ts"
       ],
       "components": [
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1853,7 +1853,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-new-session-key.spec.ts"
+        "tests/live/acp-stories/shortcut-new-session-key.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -1865,7 +1865,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-toggle-diff.spec.ts"
+        "tests/live/acp-stories/shortcut-toggle-diff.spec.ts"
       ],
       "components": [
         "web/src/components/ContentSplit.tsx",
@@ -1877,7 +1877,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-escape-closes-palette.spec.ts"
+        "tests/live/acp-stories/shortcut-escape-closes-palette.spec.ts"
       ],
       "components": [
         "web/src/components/command-palette/CommandPalette.tsx",
@@ -1889,7 +1889,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-filter.spec.ts"
+        "tests/live/acp-stories/sidebar-filter.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -1900,7 +1900,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-fold-group.spec.ts"
+        "tests/live/acp-stories/sidebar-fold-group.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -1911,7 +1911,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-topbar-toggle.spec.ts"
+        "tests/live/acp-stories/sidebar-topbar-toggle.spec.ts"
       ],
       "components": [
         "web/src/components/TopBar.tsx"
@@ -1922,7 +1922,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-toggle-right-panel.spec.ts"
+        "tests/live/acp-stories/shortcut-toggle-right-panel.spec.ts"
       ],
       "components": [
         "web/src/components/ContentSplit.tsx",
@@ -1934,7 +1934,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/palette-session-switch.spec.ts"
+        "tests/live/acp-stories/palette-session-switch.spec.ts"
       ],
       "components": [
         "web/src/components/command-palette/CommandPalette.tsx",
@@ -1946,7 +1946,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-resize-persist.spec.ts"
+        "tests/live/acp-stories/sidebar-resize-persist.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -1957,7 +1957,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/topbar-go-to-dashboard.spec.ts"
+        "tests/live/acp-stories/topbar-go-to-dashboard.spec.ts"
       ],
       "components": [
         "web/src/components/TopBar.tsx"
@@ -1968,7 +1968,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/shortcut-terminal-focus.spec.ts"
+        "tests/live/acp-stories/shortcut-terminal-focus.spec.ts"
       ],
       "components": [
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1979,7 +1979,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-row-click-navigate.spec.ts"
+        "tests/live/acp-stories/sidebar-row-click-navigate.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -1990,7 +1990,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-plan-progress.spec.ts"
+        "tests/live/acp-stories/sidebar-plan-progress.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2001,7 +2001,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-queued-count.spec.ts"
+        "tests/live/acp-stories/sidebar-queued-count.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2012,7 +2012,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/hooks/__tests__/useCockpitQueueCount.test.tsx"
+        "src/hooks/__tests__/useAcpQueueCount.test.tsx"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2023,7 +2023,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-rate-limit.spec.ts"
+        "tests/live/acp-stories/sidebar-rate-limit.spec.ts"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2034,7 +2034,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/hooks/__tests__/useCockpitRateLimit.test.tsx"
+        "src/hooks/__tests__/useAcpRateLimit.test.tsx"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2045,24 +2045,24 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/sidebar-select-focuses-terminal.spec.ts",
-        "tests/live/cockpit-stories/sidebar-select-focuses-composer.spec.ts"
+        "tests/live/acp-stories/sidebar-select-focuses-terminal.spec.ts",
+        "tests/live/acp-stories/sidebar-select-focuses-composer.spec.ts"
       ],
       "components": [
         "web/src/App.tsx",
         "web/src/lib/terminalFocus.ts",
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.substrate-switch-to-cockpit",
+      "id": "acp.story.view-switch-to-acp",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/substrate-switch-to-cockpit.spec.ts"
+        "tests/live/acp-stories/view-switch-to-acp.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/SwitchSubstrateAction.tsx"
+        "web/src/components/acp/SwitchViewAction.tsx"
       ]
     },
     {
@@ -2070,7 +2070,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/auth-sign-out.spec.ts"
+        "tests/live/acp-stories/auth-sign-out.spec.ts"
       ],
       "components": [
         "web/src/components/OverflowMenu.tsx",
@@ -2082,7 +2082,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/modal-about.spec.ts"
+        "tests/live/acp-stories/modal-about.spec.ts"
       ],
       "components": [
         "web/src/components/AboutModal.tsx"
@@ -2093,7 +2093,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/modal-help.spec.ts"
+        "tests/live/acp-stories/modal-help.spec.ts"
       ],
       "components": [
         "web/src/components/HelpOverlay.tsx"
@@ -2104,7 +2104,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/projects-open.spec.ts"
+        "tests/live/acp-stories/projects-open.spec.ts"
       ],
       "components": [
         "web/src/components/ProjectsView.tsx"
@@ -2115,7 +2115,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/profile-create.spec.ts"
+        "tests/live/acp-stories/profile-create.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ProfileSelector.tsx"
@@ -2126,7 +2126,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/profile-rename.spec.ts"
+        "tests/live/acp-stories/profile-rename.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ProfileSelector.tsx"
@@ -2137,7 +2137,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/projects-add.spec.ts"
+        "tests/live/acp-stories/projects-add.spec.ts"
       ],
       "components": [
         "web/src/components/ProjectsView.tsx"
@@ -2148,7 +2148,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/projects-remove.spec.ts"
+        "tests/live/acp-stories/projects-remove.spec.ts"
       ],
       "components": [
         "web/src/components/ProjectsView.tsx"
@@ -2159,7 +2159,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/right-panel-resize-persist.spec.ts"
+        "tests/live/acp-stories/right-panel-resize-persist.spec.ts"
       ],
       "components": [
         "web/src/components/ContentSplit.tsx"
@@ -2170,7 +2170,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/settings-theme-select.spec.ts"
+        "tests/live/acp-stories/settings-theme-select.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ThemeSettings.tsx"
@@ -2181,7 +2181,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/settings-theme-custom.spec.ts"
+        "tests/live/acp-stories/settings-theme-custom.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ThemeSettings.tsx",
@@ -2193,7 +2193,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/settings-theme-custom-malformed.spec.ts"
+        "tests/live/acp-stories/settings-theme-custom-malformed.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ThemeSettings.tsx"
@@ -2204,7 +2204,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/settings-theme-color-mode.spec.ts"
+        "tests/live/acp-stories/settings-theme-color-mode.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ThemeSettings.tsx",
@@ -2216,7 +2216,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/settings-theme-failure-revert.spec.ts"
+        "tests/live/acp-stories/settings-theme-failure-revert.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ThemeSettings.tsx",
@@ -2229,7 +2229,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/settings-logging-level.spec.ts"
+        "tests/live/acp-stories/settings-logging-level.spec.ts"
       ],
       "components": [
         "web/src/components/settings/LoggingSettings.tsx"
@@ -2240,7 +2240,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/settings-update-interval.spec.ts"
+        "tests/live/acp-stories/settings-update-interval.spec.ts"
       ],
       "components": [
         "web/src/components/settings/UpdateSettings.tsx"
@@ -2251,7 +2251,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/settings-sound-toggle.spec.ts"
+        "tests/live/acp-stories/settings-sound-toggle.spec.ts"
       ],
       "components": [
         "web/src/components/settings/SoundSettings.tsx"
@@ -2262,7 +2262,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/profile-delete.spec.ts"
+        "tests/live/acp-stories/profile-delete.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ProfileSelector.tsx"
@@ -2273,7 +2273,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/profile-switch-view.spec.ts"
+        "tests/live/acp-stories/profile-switch-view.spec.ts"
       ],
       "components": [
         "web/src/components/settings/ProfileSelector.tsx"
@@ -2284,43 +2284,43 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/modal-about-escape.spec.ts"
+        "tests/live/acp-stories/modal-about-escape.spec.ts"
       ],
       "components": [
         "web/src/components/AboutModal.tsx"
       ]
     },
     {
-      "id": "cockpit.story.approval-allow",
+      "id": "acp.story.approval-allow",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/approval-allow.spec.ts"
+        "tests/live/acp-stories/approval-allow.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ApprovalCard.tsx"
+        "web/src/components/acp/ApprovalCard.tsx"
       ]
     },
     {
-      "id": "cockpit.story.approval-deny",
+      "id": "acp.story.approval-deny",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/approval-deny.spec.ts"
+        "tests/live/acp-stories/approval-deny.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ApprovalCard.tsx"
+        "web/src/components/acp/ApprovalCard.tsx"
       ]
     },
     {
-      "id": "cockpit.story.mode-picker",
+      "id": "acp.story.mode-picker",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/cockpit-mode-picker.spec.ts"
+        "tests/live/acp-stories/acp-mode-picker.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
@@ -2328,7 +2328,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/diff-base-picker.spec.ts"
+        "tests/live/acp-stories/diff-base-picker.spec.ts"
       ],
       "components": [
         "web/src/components/diff/DiffFileList.tsx"
@@ -2339,7 +2339,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/delete-session-with-worktree.spec.ts"
+        "tests/live/acp-stories/delete-session-with-worktree.spec.ts"
       ],
       "components": [
         "web/src/components/DeleteSessionDialog.tsx"
@@ -2350,7 +2350,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/delete-active-session.spec.ts"
+        "tests/live/acp-stories/delete-active-session.spec.ts"
       ],
       "components": [
         "web/src/components/DeleteSessionDialog.tsx",
@@ -2362,7 +2362,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-arrow-up.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-arrow-up.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
@@ -2373,7 +2373,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-tab.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-tab.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
@@ -2384,7 +2384,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-escape.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-escape.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
@@ -2395,7 +2395,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-ctrl-modifier.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-ctrl-modifier.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
@@ -2406,7 +2406,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-ctrl-c.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-ctrl-c.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
@@ -2417,21 +2417,21 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/mobile-toolbar-hidden-on-desktop.spec.ts"
+        "tests/live/acp-stories/mobile-toolbar-hidden-on-desktop.spec.ts"
       ],
       "components": [
         "web/src/components/MobileTerminalToolbar.tsx"
       ]
     },
     {
-      "id": "cockpit.story.plan-strip",
+      "id": "acp.story.plan-strip",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/cockpit-plan-strip.spec.ts"
+        "tests/live/acp-stories/acp-plan-strip.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
@@ -2439,7 +2439,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/diff-viewer-shows-files.spec.ts"
+        "tests/live/acp-stories/diff-viewer-shows-files.spec.ts"
       ],
       "components": [
         "web/src/components/diff/DiffFileList.tsx"
@@ -2450,7 +2450,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/diff-hunk-comment.spec.ts"
+        "tests/live/acp-stories/diff-hunk-comment.spec.ts"
       ],
       "components": [
         "web/src/components/diff/DiffFileViewer.tsx",
@@ -2460,270 +2460,270 @@
       ]
     },
     {
-      "id": "cockpit.story.composer-send-enter",
+      "id": "acp.story.composer-send-enter",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-send-enter.spec.ts"
+        "tests/live/acp-stories/composer-send-enter.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-mobile-enter-newline",
+      "id": "acp.story.composer-mobile-enter-newline",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-mobile-enter-newline.spec.ts"
+        "tests/live/acp-stories/composer-mobile-enter-newline.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-ios-dictation",
+      "id": "acp.story.composer-ios-dictation",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-ios-dictation.spec.ts"
+        "tests/live/acp-stories/composer-ios-dictation.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.composer-ios-dictation-state-machine",
+      "id": "acp.composer-ios-dictation-state-machine",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/Composer.dictation.test.ts"
+        "src/components/acp/Composer.dictation.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-streamed-response",
+      "id": "acp.story.composer-streamed-response",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-streamed-response.spec.ts"
+        "tests/live/acp-stories/composer-streamed-response.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/Markdown.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Markdown.tsx"
       ]
     },
     {
-      "id": "cockpit.story.chat-bubble-overflow",
+      "id": "acp.story.chat-bubble-overflow",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/chat-bubble-overflow.spec.ts"
+        "tests/live/acp-stories/chat-bubble-overflow.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx",
-        "web/src/components/cockpit/Markdown.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Markdown.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-mobile-footer-actions",
+      "id": "acp.story.composer-mobile-footer-actions",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-mobile-footer-actions.spec.ts"
+        "tests/live/acp-stories/composer-mobile-footer-actions.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/SessionConfigControls.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/SessionConfigControls.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-stop-mid-turn",
+      "id": "acp.story.composer-stop-mid-turn",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-stop-mid-turn.spec.ts"
+        "tests/live/acp-stories/composer-stop-mid-turn.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-queue-follow-up",
+      "id": "acp.story.composer-queue-follow-up",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-queue-follow-up.spec.ts"
+        "tests/live/acp-stories/composer-queue-follow-up.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-draft-reload",
+      "id": "acp.story.composer-draft-reload",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-draft-reload.spec.ts"
+        "tests/live/acp-stories/composer-draft-reload.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/lib/cockpitDrafts.ts"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpDrafts.ts"
       ]
     },
     {
-      "id": "cockpit.story.composer-draft-session-switch",
+      "id": "acp.story.composer-draft-session-switch",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-draft-session-switch.spec.ts"
+        "tests/live/acp-stories/composer-draft-session-switch.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/lib/cockpitDrafts.ts"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpDrafts.ts"
       ]
     },
     {
-      "id": "cockpit.story.queue-edit-message",
+      "id": "acp.story.queue-edit-message",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/queue-edit-message.spec.ts"
+        "tests/live/acp-stories/queue-edit-message.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.story.queue-delete-message",
+      "id": "acp.story.queue-delete-message",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/queue-delete-message.spec.ts"
+        "tests/live/acp-stories/queue-delete-message.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-toolbar-insert",
+      "id": "acp.story.composer-toolbar-insert",
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/composer-toolbar-insert.spec.ts"
+        "tests/live/acp-stories/composer-toolbar-insert.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.composer-slash-pick-no-arg",
+      "id": "acp.story.composer-slash-pick-no-arg",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/composer-slash-pick-no-arg.spec.ts",
-        "src/components/cockpit/Composer.slashCommand.test.ts"
+        "tests/live/acp-stories/composer-slash-pick-no-arg.spec.ts",
+        "src/components/acp/Composer.slashCommand.test.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.queue-fold-unfold",
+      "id": "acp.story.queue-fold-unfold",
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/queue-fold-unfold.spec.ts"
+        "tests/live/acp-stories/queue-fold-unfold.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
-      "id": "cockpit.story.stop-during-thinking",
+      "id": "acp.story.stop-during-thinking",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-stop-during-thinking.spec.ts"
+        "tests/live/acp-stories/composer-stop-during-thinking.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {
-      "id": "cockpit.story.stop-during-tool-call",
+      "id": "acp.story.stop-during-tool-call",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-stop-during-tool-call.spec.ts"
+        "tests/live/acp-stories/composer-stop-during-tool-call.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.story.fold-failed-tool-card",
+      "id": "acp.story.fold-failed-tool-card",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/fold-failed-tool-card.spec.ts",
-        "src/components/cockpit/ToolCards.render.test.tsx"
+        "tests/live/acp-stories/fold-failed-tool-card.spec.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.story.edit-card-diff-scroll",
+      "id": "acp.story.edit-card-diff-scroll",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/edit-card-diff-scroll.spec.ts",
+        "tests/live/acp-stories/edit-card-diff-scroll.spec.ts",
         "src/components/diff/__tests__/StringDiff.test.tsx"
       ],
       "components": [
         "web/src/components/diff/StringDiff.tsx",
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
-      "id": "cockpit.edit-card-diff",
+      "id": "acp.edit-card-diff",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": [
-        "tests/cockpit-edit-card-diff.spec.ts"
+        "tests/acp-edit-card-diff.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/ToolCards.tsx",
+        "web/src/components/acp/ToolCards.tsx",
         "web/src/components/diff/StringDiff.tsx"
       ]
     },
     {
-      "id": "cockpit.story.queue-follow-up-with-nav",
+      "id": "acp.story.queue-follow-up-with-nav",
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/queue-follow-up-with-nav.spec.ts"
+        "tests/live/acp-stories/queue-follow-up-with-nav.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/hooks/useCockpit.ts"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/hooks/useAcpSession.ts"
       ]
     },
     {
-      "id": "cockpit.story.stop-during-sub-agent",
+      "id": "acp.story.stop-during-sub-agent",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/composer-stop-during-sub-agent.spec.ts"
+        "tests/live/acp-stories/composer-stop-during-sub-agent.spec.ts"
       ],
       "components": [
-        "web/src/components/cockpit/Composer.tsx",
-        "web/src/components/cockpit/ToolCards.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ToolCards.tsx"
       ]
     },
     {
@@ -2731,7 +2731,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-open-close.spec.ts"
+        "tests/live/acp-stories/wizard-open-close.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx"
@@ -2742,7 +2742,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-tabs-visible.spec.ts"
+        "tests/live/acp-stories/wizard-tabs-visible.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx"
@@ -2753,7 +2753,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-clone-url-input.spec.ts"
+        "tests/live/acp-stories/wizard-clone-url-input.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx"
@@ -2764,7 +2764,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-browse-disk.spec.ts"
+        "tests/live/acp-stories/wizard-browse-disk.spec.ts"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx"
@@ -2775,7 +2775,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-recent-project.spec.ts"
+        "tests/live/acp-stories/wizard-recent-project.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx"
@@ -2786,7 +2786,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-close-via-escape.spec.ts"
+        "tests/live/acp-stories/wizard-close-via-escape.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx"
@@ -2797,7 +2797,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-prefill-from-group.spec.ts"
+        "tests/live/acp-stories/wizard-prefill-from-group.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -2809,7 +2809,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-session-title-edit.spec.ts"
+        "tests/live/acp-stories/wizard-session-title-edit.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/SessionStep.tsx"
@@ -2820,7 +2820,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-worktree-toggle.spec.ts"
+        "tests/live/acp-stories/wizard-worktree-toggle.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/SessionStep.tsx"
@@ -2831,7 +2831,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-group-field.spec.ts"
+        "tests/live/acp-stories/wizard-group-field.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/SessionStep.tsx"
@@ -2842,7 +2842,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-extra-repos.spec.ts"
+        "tests/live/acp-stories/wizard-extra-repos.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
@@ -2853,7 +2853,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/wizard-launch-cmd-enter.spec.ts"
+        "tests/live/acp-stories/wizard-launch-cmd-enter.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -2865,7 +2865,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-creating-banner.spec.ts"
+        "tests/live/acp-stories/wizard-creating-banner.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
@@ -2876,7 +2876,7 @@
       "kind": "live-playwright",
       "risk": "low",
       "specs": [
-        "tests/live/cockpit-stories/wizard-last-tool-persists.spec.ts"
+        "tests/live/acp-stories/wizard-last-tool-persists.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx"
@@ -2887,7 +2887,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": [
-        "tests/live/cockpit-stories/wizard-launch-button.spec.ts"
+        "tests/live/acp-stories/wizard-launch-button.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
@@ -2898,7 +2898,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/cockpit-stories/wizard-branch-from-title.spec.ts"
+        "tests/live/acp-stories/wizard-branch-from-title.spec.ts"
       ],
       "components": [
         "web/src/components/session-wizard/sessionNames.ts",
@@ -3049,14 +3049,14 @@
       ]
     },
     {
-      "id": "triage.cockpit-banners",
+      "id": "triage.acp-banners",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/cockpit/__tests__/TriageBanners.test.tsx"
+        "src/components/acp/__tests__/TriageBanners.test.tsx"
       ],
       "components": [
-        "web/src/components/cockpit/CockpitView.tsx"
+        "web/src/components/acp/StructuredView.tsx"
       ]
     },
     {
@@ -3073,7 +3073,7 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/RightPanel.tsx",
-        "web/src/components/cockpit/Composer.tsx"
+        "web/src/components/acp/Composer.tsx"
       ]
     },
     {

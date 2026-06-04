@@ -1,8 +1,8 @@
-//! Remote home screen for cross-machine cockpit attach.
+//! Remote home screen for cross-machine structured view attach.
 //!
 //! Activated when `AOE_DAEMON_URL` is set at startup (or `--daemon-url`
 //! is passed on the CLI). Fetches the daemon's session list via
-//! `GET /api/sessions`, filters to cockpit-mode sessions (the only
+//! `GET /api/sessions`, filters to structured view-mode sessions (the only
 //! kind that's meaningful to drive cross-machine; tmux PTYs can't be
 //! attached remotely without SSH'ing into the host first), and lets
 //! the user open one with Enter.
@@ -11,7 +11,7 @@
 //! session can't be `tmux attach`-ed from this machine, can't run
 //! `aoe stop`, can't have its files edited locally. The web dashboard
 //! covers the long-tail of remote management; this view's only job is
-//! to be a fast lane into the cockpit transcript + composer for a
+//! to be a fast lane into the structured view transcript + composer for a
 //! known remote session.
 
 mod render;
@@ -25,8 +25,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde::Deserialize;
 
-use crate::cockpit::client::discovery::DaemonEndpoint;
-use crate::cockpit::client::HttpClient;
+use crate::acp::client::discovery::DaemonEndpoint;
+use crate::acp::client::HttpClient;
 use crate::tui::styles::Theme;
 
 /// Subset of `/api/sessions`'s `SessionResponse` we need. `serde` skips
@@ -39,11 +39,10 @@ pub struct RemoteSession {
     pub project_path: String,
     #[serde(default)]
     pub status: String,
-    /// Only present in builds compiled with `--features serve`.
-    /// Default `false` so an older daemon's response (pre-cockpit)
-    /// still deserialises.
+    /// How the remote session renders. Defaults to `terminal` so an older
+    /// daemon's response (which omits the field) still deserialises.
     #[serde(default)]
-    pub cockpit_mode: bool,
+    pub view: crate::session::View,
 }
 
 pub struct RemoteHomeState {
@@ -152,11 +151,11 @@ async fn run(
             KeyCode::Up | KeyCode::Char('k') => state.move_cursor(-1),
             KeyCode::Enter => {
                 if let Some(session) = state.sessions.get(state.cursor).cloned() {
-                    // Hand off to the cockpit view. Local-only actions
+                    // Hand off to the structured view. Local-only actions
                     // are out of scope by design; tmux PTYs, file edits,
                     // and the like aren't reachable on this machine.
                     let endpoint = state.endpoint.clone();
-                    super::cockpit_view::run_for_endpoint(
+                    super::structured_view::run_for_endpoint(
                         terminal,
                         event_stream,
                         theme,
@@ -187,10 +186,12 @@ async fn refresh(state: &mut RemoteHomeState) {
     };
     match client.list_sessions::<RemoteSession>().await {
         Ok(sessions) => {
-            // Only cockpit sessions are meaningful here: tmux sessions
+            // Only structured view sessions are meaningful here: tmux sessions
             // can't be attached from another machine without SSH.
-            let mut list: Vec<RemoteSession> =
-                sessions.into_iter().filter(|s| s.cockpit_mode).collect();
+            let mut list: Vec<RemoteSession> = sessions
+                .into_iter()
+                .filter(|s| s.view == crate::session::View::Structured)
+                .collect();
             list.sort_by(|a, b| a.title.cmp(&b.title));
             if state.cursor >= list.len() {
                 state.cursor = list.len().saturating_sub(1);

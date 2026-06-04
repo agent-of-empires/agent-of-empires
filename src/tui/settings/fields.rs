@@ -49,7 +49,7 @@ pub enum SettingsCategory {
     StatusHooks,
     Hooks,
     Web,
-    Cockpit,
+    Acp,
     Diff,
     Logging,
 }
@@ -70,7 +70,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Cockpit => "Cockpit",
+            Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
@@ -93,7 +93,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Cockpit => "Cockpit",
+            Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
@@ -189,8 +189,8 @@ pub enum ListItemValidation {
     CustomAgent,
     /// `name=builtin`, where `builtin` is a known agent.
     DetectAs,
-    /// `name=command`, an ACP launch command split into argv (cockpit).
-    CockpitCmd,
+    /// `name=command`, an ACP launch command split into argv (acp).
+    AcpCmd,
     /// Host/sandbox env entry (`KEY=value` etc).
     EnvEntry,
 }
@@ -241,7 +241,7 @@ impl SettingField {
                     }
                     "custom_agents" => ListItemValidation::CustomAgent,
                     "agent_detect_as" => ListItemValidation::DetectAs,
-                    "agent_cockpit_cmd" => ListItemValidation::CockpitCmd,
+                    "agent_acp_cmd" => ListItemValidation::AcpCmd,
                     _ => ListItemValidation::None,
                 }
             }
@@ -349,7 +349,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "agent_command_override"
                 | "custom_agents"
                 | "agent_detect_as"
-                | "agent_cockpit_cmd"
+                | "agent_acp_cmd"
         )
 }
 
@@ -1169,11 +1169,11 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_fields_have_advanced_section_marker() {
+    fn acp_fields_have_advanced_section_marker() {
         let global = Config::default();
         let profile = ProfileConfig::default();
         let fields = build_fields_for_category(
-            SettingsCategory::Cockpit,
+            SettingsCategory::Acp,
             SettingsScope::Global,
             &global,
             &profile,
@@ -1181,27 +1181,25 @@ mod tests {
         let header_idx = fields
             .iter()
             .position(|f| matches!(f.value, FieldValue::SectionHeader))
-            .expect("cockpit should contain an Advanced section header");
+            .expect("acp should contain an Advanced section header");
         assert_eq!(fields[header_idx].label, "Advanced");
         for ident in [
-            "cockpit.enabled",
-            "cockpit.default_for_claude",
-            "cockpit.default_agent",
-            "cockpit.replay_events",
-            "cockpit.node_path",
-            "cockpit.show_tool_durations",
+            "acp.default_agent",
+            "acp.replay_events",
+            "acp.node_path",
+            "acp.show_tool_durations",
         ] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos < header_idx, "{ident} must precede the Advanced header");
         }
         for ident in [
-            "cockpit.max_concurrent_workers",
-            "cockpit.max_concurrent_resumes",
-            "cockpit.queue_drain_mode",
-            "cockpit.replay_bytes",
-            "cockpit.force_end_turn_threshold_secs",
-            "cockpit.silent_orphan_grace_secs",
-            "cockpit.silent_orphan_fast_grace_secs",
+            "acp.max_concurrent_workers",
+            "acp.max_concurrent_resumes",
+            "acp.queue_drain_mode",
+            "acp.replay_bytes",
+            "acp.force_end_turn_threshold_secs",
+            "acp.silent_orphan_grace_secs",
+            "acp.silent_orphan_fast_grace_secs",
         ] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos > header_idx, "{ident} must follow the Advanced header");

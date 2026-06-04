@@ -6,7 +6,7 @@
 //! uncommitted working tree), falling back to the bare `CARGO_PKG_VERSION`
 //! when no VCS identity is available.
 //!
-//! Cockpit worker records embed this value so the daemon can respawn
+//! Acp worker records embed this value so the daemon can respawn
 //! workers left running on an older binary after `aoe update`. See #1754.
 
 /// Build identity of this binary. Stamped by `build.rs`; falls back to the

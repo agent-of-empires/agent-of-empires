@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main, cockpit-main]
+    branches: [main]
   pull_request:
-    branches: [main, cockpit-main]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,8 +39,8 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-      # tests/cockpit_acp_smoke.rs spawns the Node ACP shim under
-      # cockpit-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
+      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
+      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
       # so its deps must be installed before `cargo test --features serve`
       # runs. The shim itself auto-skips if node is missing, but on a
       # GitHub runner node is always present; without the install step
@@ -49,7 +49,7 @@ jobs:
       # exercised there and we can skip the install.
       - name: Install ACP shim deps
         if: runner.os == 'Linux'
-        working-directory: cockpit-worker/test-shim
+        working-directory: acp-worker/test-shim
         run: npm ci
       # `--features serve` is a strict superset of the default-feature
       # suite (1759 -> 2269 unit tests, 67 -> 72 e2e), so a single run

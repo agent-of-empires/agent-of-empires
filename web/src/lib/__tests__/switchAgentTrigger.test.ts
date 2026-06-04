@@ -2,7 +2,7 @@
 //
 // Unit tests for the cross-component switch-agent trigger (#1747): the
 // dispatch + pending-latch helper the sidebar context menu uses to ask a
-// (possibly not-yet-mounted) cockpit Composer to open its switch-agent
+// (possibly not-yet-mounted) structured view Composer to open its switch-agent
 // dialog. Asserts both the dispatched event and the stashed latch.
 
 import { afterEach, describe, expect, it } from "vitest";

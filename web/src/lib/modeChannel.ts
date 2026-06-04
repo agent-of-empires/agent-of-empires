@@ -1,6 +1,6 @@
 // Mode-picker channel resolution (#1764).
 //
-// The cockpit composer's mode picker can be driven by three different
+// The structured view composer's mode picker can be driven by three different
 // sources depending on what the active agent advertises over ACP. This
 // module owns the precedence and the read/write pairing so the picker
 // never reads one channel while writing another (the bug that trapped
@@ -23,10 +23,10 @@
 // picker renders nothing rather than a vocabulary the agent rejects.
 
 import type {
-  CockpitState,
+  AcpState,
   ConfigOptionDescriptor,
   SessionMode,
-} from "./cockpitTypes";
+} from "./acpTypes";
 
 /** Claude's historical four-mode taxonomy. Used only as the
  *  `capabilities.legacyModeFallback` fallback; not an ACP default. */
@@ -75,11 +75,11 @@ export type ModeChannel =
     };
 
 export interface ResolveModeChannelArgs {
-  configOptions: CockpitState["configOptions"];
-  availableModes: CockpitState["availableModes"];
+  configOptions: AcpState["configOptions"];
+  availableModes: AcpState["availableModes"];
   currentModeId: string | null;
   legacyMode: SessionMode;
-  pendingConfigOption: CockpitState["pendingConfigOption"];
+  pendingConfigOption: AcpState["pendingConfigOption"];
   /** From the active agent's profile (`capabilities.legacyModeFallback`). */
   allowLegacyFallback: boolean;
 }

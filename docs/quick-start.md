@@ -28,7 +28,7 @@ To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut).
 
 ## Use the Terminal View
 
-Press `t` to toggle between Agent View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
+Press `t` to toggle between Structured View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
 
 ## Review Changes with Diff View
 

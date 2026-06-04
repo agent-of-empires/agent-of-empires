@@ -105,12 +105,12 @@
       "count": 4
     }
   },
-  "src/components/cockpit/CockpitRuntime.tsx": {
+  "src/components/acp/AcpRuntime.tsx": {
     "react-refresh/only-export-components": {
       "count": 1
     }
   },
-  "src/components/cockpit/CockpitView.tsx": {
+  "src/components/acp/StructuredView.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
     },
@@ -118,7 +118,7 @@
       "count": 3
     }
   },
-  "src/components/cockpit/Composer.tsx": {
+  "src/components/acp/Composer.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
     },
@@ -138,7 +138,7 @@
       "count": 1
     }
   },
-  "src/components/cockpit/ContextPrimerBanner.tsx": {
+  "src/components/acp/ContextPrimerBanner.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
     },
@@ -146,12 +146,12 @@
       "count": 2
     }
   },
-  "src/components/cockpit/Markdown.tsx": {
+  "src/components/acp/Markdown.tsx": {
     "react-refresh/only-export-components": {
       "count": 1
     }
   },
-  "src/components/cockpit/SwitchAgentModal.tsx": {
+  "src/components/acp/SwitchAgentModal.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1
     },
@@ -159,17 +159,17 @@
       "count": 2
     }
   },
-  "src/components/cockpit/ToolCards.tsx": {
+  "src/components/acp/ToolCards.tsx": {
     "react-refresh/only-export-components": {
       "count": 1
     }
   },
-  "src/components/cockpit/ToolDisplayMode.tsx": {
+  "src/components/acp/ToolDisplayMode.tsx": {
     "react-refresh/only-export-components": {
       "count": 2
     }
   },
-  "src/components/cockpit/useFilesIndex.ts": {
+  "src/components/acp/useFilesIndex.ts": {
     "react-hooks/set-state-in-effect": {
       "count": 1
     },
@@ -246,7 +246,7 @@
       "count": 1
     }
   },
-  "src/hooks/useCockpit.ts": {
+  "src/hooks/useAcpSession.ts": {
     "react-hooks/set-state-in-effect": {
       "count": 2
     },
@@ -334,7 +334,7 @@
       "count": 1
     }
   },
-  "src/lib/cockpitPrefs.tsx": {
+  "src/lib/acpPrefs.tsx": {
     "react-refresh/only-export-components": {
       "count": 1
     }

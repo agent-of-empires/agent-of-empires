@@ -6,10 +6,10 @@ interface Props {
 }
 
 /// Render markdown for diff-comment bodies. We deliberately do NOT
-/// reuse the cockpit `<Markdown>` component because that one depends
+/// reuse the structured view `<Markdown>` component because that one depends
 /// on `@assistant-ui/react-markdown`'s `<AssistantRuntimeProvider>`
-/// which is only mounted under the cockpit panel. The diff viewer is
-/// a sibling of that panel, so calling the cockpit Markdown component
+/// which is only mounted under the structured view panel. The diff viewer is
+/// a sibling of that panel, so calling the structured view Markdown component
 /// here throws "requires an AuiProvider" and unmounts the tree.
 ///
 /// `marked` is configured with HTML disabled (`sanitize` is dropped in

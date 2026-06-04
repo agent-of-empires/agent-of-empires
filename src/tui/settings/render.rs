@@ -575,7 +575,7 @@ impl SettingsView {
         theme: &Theme,
     ) {
         // Section headers are non-interactive group dividers (e.g.
-        // "Advanced" inside Cockpit). Render as a styled heading with
+        // "Advanced" inside Acp). Render as a styled heading with
         // a dimmed subtitle. They never appear "selected" because the
         // input handler skips navigation past them. Label uses
         // `theme.text` (not dimmed) so it matches the categories-panel
@@ -1376,10 +1376,10 @@ mod tests {
         // Approximation of the Interaction tab description that
         // triggered the cutoff bug at narrow widths (issue #1551).
         let text = "What Enter (and double-click) does on a session row in \
-                    the Agent view: attach to tmux (default, historical \
+                    the Structured view: attach to tmux (default, historical \
                     behavior) or enter live-send mode so the home list stays \
                     visible and keystrokes pipe through to the agent. \
-                    Terminal/Tool views and cockpit sessions ignore this \
+                    Terminal/Tool views and structured-view sessions ignore this \
                     setting.";
         // At a 120-col-wide settings panel none of the wrapped lines
         // should exceed the available width.
@@ -1413,7 +1413,7 @@ mod tests {
             ("anything", 0),
             (
                 "What Enter (and double-click) does on a session row in \
-                 the Agent view: attach to tmux (default, historical \
+                 the Structured view: attach to tmux (default, historical \
                  behavior) or enter live-send mode so the home list stays \
                  visible and keystrokes pipe through to the agent.",
                 40,
@@ -1502,7 +1502,7 @@ mod field_height_tests {
             label: "Section".to_string(),
             description: "alpha beta gamma delta".to_string(),
             value: FieldValue::SectionHeader,
-            category: SettingsCategory::Cockpit,
+            category: SettingsCategory::Acp,
             has_override: false,
             inherited_display: None,
         };

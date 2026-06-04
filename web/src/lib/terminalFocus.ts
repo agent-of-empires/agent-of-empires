@@ -18,7 +18,7 @@ export function dispatchFocusTerminal(target: TerminalFocusTarget) {
 // collapsed so the paired terminal is gone, or a freshly selected session's
 // terminal/composer is still resolving), dispatching a focus event has no
 // listener to receive it. The caller stashes the intent here, and the target
-// (PairedTerminal, TerminalView, or the cockpit Composer) consumes it once it
+// (PairedTerminal, TerminalView, or the structured view Composer) consumes it once it
 // mounts and is ready.
 let pendingFocus: TerminalFocusTarget | null = null;
 
@@ -36,18 +36,18 @@ export function consumePendingTerminalFocus(
   return false;
 }
 
-// Focus the canonical input for a freshly selected session: the cockpit
-// composer in cockpit mode, the xterm textarea otherwise. Sets the pending
+// Focus the canonical input for a freshly selected session: the structured view
+// composer in structured view mode, the xterm textarea otherwise. Sets the pending
 // latch (consumed on mount when the target is still resolving) and dispatches
 // (handled immediately when the target is already mounted, e.g. re-selecting
 // the active session). No-ops when there is no session or on coarse pointers,
 // so a session swap never pops the soft keyboard (#1178).
 export function requestSessionInputFocus(
-  session: { cockpit_mode?: boolean } | undefined,
+  session: { view?: "structured" | "terminal" } | undefined,
   isCoarse: boolean,
 ): void {
   if (!session || isCoarse) return;
-  const target: TerminalFocusTarget = session.cockpit_mode
+  const target: TerminalFocusTarget = session.view === "structured"
     ? "composer"
     : "agent";
   setPendingTerminalFocus(target);

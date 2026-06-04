@@ -18,11 +18,11 @@ Browser access to the same sessions: real terminal in the page, switch sessions,
 
 [Web Dashboard guide](guides/web-dashboard.md)
 
-### Cockpit (Alpha)
+### Structured View
 
-Mobile-first native rendering of agent state via the Agent Client Protocol (ACP). Renders plan panels, tool-call cards, and swipe-to-approve flows instead of relaying raw terminal bytes. Opt-in per session.
+The web dashboard's default rendering: mobile-first native rendering of agent state via the Agent Client Protocol (ACP). Renders plan panels, tool-call cards, and swipe-to-approve flows instead of relaying raw terminal bytes. Every ACP-capable agent uses it by default; flip a session to the terminal view to see the raw tmux rendering instead.
 
-[Cockpit guide](cockpit.md), [per-agent feature matrix](cockpit/multi-agent.md)
+[Structured view guide](structured-view.md), [per-agent feature matrix](structured-view/multi-agent.md)
 
 ### CLI
 
@@ -48,7 +48,7 @@ Press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase
 
 AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code. AoE auto-detects which agents are installed on your machine and lists them in the new-session picker.
 
-For per-agent cockpit support detail (which agents render plan panels, which tools are recognized), see the [Cockpit multi-agent matrix](cockpit/multi-agent.md).
+For per-agent structured-view support detail (which agents render plan panels, which tools are recognized), see the [Structured view multi-agent matrix](structured-view/multi-agent.md).
 
 ### Agent command overrides
 
@@ -99,11 +99,11 @@ Alternative runtimes that share the same code paths:
 
 ### Status detection
 
-Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane content and agent-specific heuristics. The TUI, web dashboard, and cockpit all show the same status column.
+Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane content and agent-specific heuristics. The TUI, web dashboard, and structured view all show the same status column.
 
 ### Auto-stop idle sessions
 
-Reclaim resources from forgotten sessions: set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. It is off by default, never stops a session with an attached tmux client or one you used recently, and runs from both the TUI and `aoe serve`. Cockpit workers have the separate `cockpit.auto_stop_idle_secs` knob.
+Reclaim resources from forgotten sessions: set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. It is off by default, never stops a session with an attached tmux client or one you used recently, and runs from both the TUI and `aoe serve`. Agent workers have the separate `acp.auto_stop_idle_secs` knob.
 
 [Configuration: session section](guides/configuration.md#session)
 
@@ -141,12 +141,12 @@ Surface AoE session info inside your existing tmux status bar. Useful when you s
 
 ### Sound effects
 
-Audible cues for status transitions (`Waiting`, `Idle`, `Error`) and cockpit approval requests. Configurable per session and globally.
+Audible cues for status transitions (`Waiting`, `Idle`, `Error`) and structured view approval requests. Configurable per session and globally.
 
 [Sound Effects guide](sounds.md)
 
 ### Push notifications
 
-Browser push notifications when an agent is waiting for input, finishes a long-running job, errors out, or requests a cockpit approval. Smart suppression skips OS banners while you are already looking at the TUI or dashboard, so your phone only buzzes when you actually stepped away.
+Browser push notifications when an agent is waiting for input, finishes a long-running job, errors out, or requests an structured view approval. Smart suppression skips OS banners while you are already looking at the TUI or dashboard, so your phone only buzzes when you actually stepped away.
 
 [Push Notifications guide](push-notifications.md)

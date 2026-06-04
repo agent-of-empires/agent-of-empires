@@ -24,7 +24,7 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "diff", label: "Diff" },
       { kind: "divider", label: "Sessions" },
       { kind: "tab", id: "session", label: "Session" },
-      { kind: "tab", id: "cockpit", label: "Cockpit" },
+      { kind: "tab", id: "structured-view", label: "Structured view" },
       { kind: "divider", label: "Environment" },
       { kind: "tab", id: "sandbox", label: "Sandbox" },
       { kind: "tab", id: "worktree", label: "Worktree" },

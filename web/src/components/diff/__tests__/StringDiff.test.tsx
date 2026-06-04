@@ -3,7 +3,7 @@
 // Render contract for StringDiff: even with no token grid (the hook is
 // stubbed to return `tokens: null`), the raw old / new text must still
 // surface. Captures the same opacity-0 regression as the DiffLine
-// regression test but exercised through the cockpit Edit-card embed
+// regression test but exercised through the structured view Edit-card embed
 // path so a future refactor of StringDiff cannot reintroduce the gate.
 
 import { describe, expect, it, vi } from "vitest";

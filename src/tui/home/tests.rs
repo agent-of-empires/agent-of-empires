@@ -163,7 +163,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instances()[0].id.clone();
     env.view.select_session_by_id(&id);
-    env.view.view_mode = ViewMode::Agent;
+    env.view.view_mode = ViewMode::Structured;
     let theme = load_theme("empire");
 
     let render_to_string = |view: &mut HomeView| {
@@ -241,7 +241,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instances()[0].id.clone();
     env.view.select_session_by_id(&id);
-    env.view.view_mode = ViewMode::Agent;
+    env.view.view_mode = ViewMode::Structured;
     env.view.show_preview_info = true;
 
     let backend = TestBackend::new(120, 40);
@@ -632,17 +632,17 @@ fn test_enter_on_session_returns_attach_action() {
 #[cfg(feature = "serve")]
 #[test]
 #[serial]
-fn test_enter_on_cockpit_session_opens_cockpit_view() {
+fn test_enter_on_acp_session_opens_structured_view() {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
     let storage = Storage::new("test").unwrap();
     let mut instances = vec![
         Instance::new("plain", "/tmp/0"),
-        Instance::new("cockpit", "/tmp/1"),
+        Instance::new("acp", "/tmp/1"),
         Instance::new("plain2", "/tmp/2"),
     ];
-    instances[1].cockpit_mode = true;
+    instances[1].view = crate::session::View::Structured;
     storage
         .update(|i, g| {
             *i = instances.to_vec();
@@ -660,14 +660,16 @@ fn test_enter_on_cockpit_session_opens_cockpit_view() {
 
     let action = view.handle_key(key(KeyCode::Enter), None);
     match action {
-        Some(Action::OpenCockpit(id)) => {
-            // Should target the cockpit instance, not the plain ones.
+        Some(Action::OpenStructuredView(id)) => {
+            // Should target the structured view instance, not the plain ones.
             assert!(
-                id.contains("cockpit") || !id.is_empty(),
-                "OpenCockpit carried an empty session id"
+                id.contains("acp") || !id.is_empty(),
+                "OpenStructuredView carried an empty session id"
             );
         }
-        other => panic!("expected Action::OpenCockpit for cockpit session, got {other:?}"),
+        other => {
+            panic!("expected Action::OpenStructuredView for structured view session, got {other:?}")
+        }
     }
 }
 
@@ -1196,13 +1198,13 @@ fn test_t_toggles_view_mode() {
     let env = create_test_env_empty();
     let mut view = env.view;
 
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 
     view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Terminal);
 
     view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
 #[test]
@@ -1248,7 +1250,7 @@ fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
 
-    // In Agent view, Enter returns AttachSession
+    // In Structured view, Enter returns AttachSession
     let action = view.handle_key(key(KeyCode::Enter), None);
     assert!(matches!(action, Some(Action::AttachSession(_))));
 
@@ -1263,17 +1265,17 @@ fn test_enter_returns_attach_terminal_in_terminal_view() {
 
 #[test]
 #[serial]
-fn test_shift_t_attaches_terminal_from_agent_view() {
+fn test_shift_t_attaches_terminal_from_structured_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
 
-    // Should be in Agent view by default
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    // Should be in Structured view by default
+    assert_eq!(view.view_mode, ViewMode::Structured);
 
     // Shift+T should return AttachTerminal without switching view mode
     let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
 #[test]
@@ -2312,7 +2314,7 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
     env.view.update_selected();
 
     // Shift+T toggles the view (primary action), no terminal attach.
-    assert_eq!(env.view.view_mode, ViewMode::Agent);
+    assert_eq!(env.view.view_mode, ViewMode::Structured);
     let shift_t = env
         .view
         .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
@@ -2321,10 +2323,10 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
         !matches!(shift_t, Some(Action::AttachTerminal(_, _))),
         "Shift+T must toggle view, not attach terminal"
     );
-    // Reset to Agent view.
+    // Reset to Structured view.
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
-    assert_eq!(env.view.view_mode, ViewMode::Agent);
+    assert_eq!(env.view.view_mode, ViewMode::Structured);
 
     // Ctrl+T quick-attaches the paired terminal (secondary action) and must
     // NOT toggle the view.
@@ -2338,7 +2340,7 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
     );
     assert_eq!(
         env.view.view_mode,
-        ViewMode::Agent,
+        ViewMode::Structured,
         "Ctrl+T must not toggle the view"
     );
 
@@ -4126,7 +4128,7 @@ fn home_defaults_to_agent_when_config_unset() {
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let view = HomeView::new(Some("test".to_string()), tools).unwrap();
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
 #[test]
@@ -6845,12 +6847,12 @@ mod click_to_select {
         assert_eq!(env.view.cursor, 2);
     }
 
-    /// Cockpit-mode sessions are not tmux-backed, so click cannot
+    /// Acp-mode sessions are not tmux-backed, so click cannot
     /// enter live mode for them; selection still updates.
     #[cfg(feature = "serve")]
     #[test]
     #[serial]
-    fn single_click_on_cockpit_session_returns_no_action() {
+    fn single_click_on_acp_session_returns_no_action() {
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
@@ -6861,13 +6863,13 @@ mod click_to_select {
             _ => panic!("flat_items[2] should be a session"),
         };
         env.view.mutate_instance(&target_id, |inst| {
-            inst.cockpit_mode = true;
+            inst.view = crate::session::View::Structured;
         });
 
         let action = env.view.handle_click(5, 3);
         assert!(
             action.is_none(),
-            "Cockpit sessions can't enter live mode; click is a selection only"
+            "Acp sessions can't enter live mode; click is a selection only"
         );
         assert_eq!(env.view.cursor, 2);
     }
@@ -7915,16 +7917,16 @@ mod live_send_mode {
         );
     }
 
-    /// Cockpit-mode is a `serve` feature; the `cockpit_mode` field on
+    /// Acp-mode is a `serve` feature; the `structured_view` field on
     /// Instance only exists when that feature is compiled in. Without
-    /// it, `is_cockpit_mode()` is hard-coded to false and the gate is
+    /// it, `is_structured()` is hard-coded to false and the gate is
     /// a no-op, so there's nothing meaningful to verify in the default
     /// build.
     #[cfg(feature = "serve")]
     #[test]
     #[serial]
-    fn tab_does_not_start_live_send_for_cockpit_session() {
-        // Cockpit sessions are not tmux-backed, so live-send has no
+    fn tab_does_not_start_live_send_for_acp_session() {
+        // Acp sessions are not tmux-backed, so live-send has no
         // valid target. Tab must silently no-op rather than enqueue
         // an Action::EnterLiveSend that would fail downstream.
         let mut env = create_test_env_with_sessions(1);
@@ -7941,7 +7943,7 @@ mod live_send_mode {
             .expect("test env has one session");
         env.view.mutate_instance(&id, |inst| {
             inst.status = crate::session::Status::Stopped;
-            inst.cockpit_mode = true;
+            inst.view = crate::session::View::Structured;
         });
         let action = env
             .view
@@ -8283,7 +8285,7 @@ mod new_session_attach_mode {
     fn returns_none_for_missing_instance() {
         // Race: the apply_creation_results return reaches the dispatch
         // and the instance has been deleted in the meantime. `None`
-        // signals the caller to fall back to the cockpit-aware
+        // signals the caller to fall back to the structured view-aware
         // attach_session path rather than try to attach to a ghost.
         let env = create_test_env_empty();
         let mode = env.view.new_session_attach_mode("nonexistent-id");
@@ -8293,19 +8295,19 @@ mod new_session_attach_mode {
     #[cfg(feature = "serve")]
     #[test]
     #[serial]
-    fn returns_none_for_cockpit_session() {
-        // Cockpit sessions aren't tmux-backed; live mode has no target
+    fn returns_none_for_acp_session() {
+        // Acp sessions aren't tmux-backed; live mode has no target
         // and tmux attach is a no-op. The resolver returns None so the
         // dispatch picks the (no-op) fallback explicitly, regardless of
         // what the user configured globally.
         let mut env = create_test_env_empty();
         write_global_attach_mode(NewSessionAttachMode::LiveSend);
-        let id = add_session(&mut env.view, "cockpit-one");
+        let id = add_session(&mut env.view, "acp-one");
         env.view.mutate_instance(&id, |inst| {
-            inst.cockpit_mode = true;
+            inst.view = crate::session::View::Structured;
         });
         let mode = env.view.new_session_attach_mode(&id);
-        assert!(mode.is_none(), "cockpit sessions must return None");
+        assert!(mode.is_none(), "structured view sessions must return None");
     }
 
     /// Build a minimal `NewSessionData` for the sync create path: no
@@ -8362,7 +8364,7 @@ mod new_session_attach_mode {
 
 /// Tests for the `default_attach_mode` setting that drives whether
 /// pressing Enter (or double-clicking) on an existing session row in
-/// Agent view attaches to tmux or enters live-send mode.
+/// Structured view attaches to tmux or enters live-send mode.
 mod default_attach_mode {
     use super::*;
     use crate::session::config::{save_config, Config, NewSessionAttachMode};
@@ -8630,28 +8632,28 @@ mod default_attach_mode {
         );
     }
 
-    /// Cockpit sessions short-circuit before the setting is consulted
-    /// (the cockpit branch in `activate_selected_session` returns
-    /// `OpenCockpit`/transient-status before we get to the view-mode
+    /// Acp sessions short-circuit before the setting is consulted
+    /// (the structured view branch in `activate_selected_session` returns
+    /// `OpenStructuredView`/transient-status before we get to the view-mode
     /// match), so the resolver also returns None for them; the setting
-    /// must not be able to misroute a cockpit row into live mode.
+    /// must not be able to misroute a structured view row into live mode.
     #[cfg(feature = "serve")]
     #[test]
     #[serial]
-    fn cockpit_session_ignores_default_attach_mode() {
+    fn acp_session_ignores_default_attach_mode() {
         let mut env = create_test_env_empty();
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
-        let id = add_session(&mut env.view, "cockpit-one");
+        let id = add_session(&mut env.view, "acp-one");
         env.view.mutate_instance(&id, |inst| {
-            inst.cockpit_mode = true;
+            inst.view = crate::session::View::Structured;
         });
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
         env.view.update_selected();
         let action = env.view.activate_selected_session();
         assert!(
-            matches!(&action, Some(Action::OpenCockpit(returned_id)) if returned_id == &id),
-            "cockpit rows must route to OpenCockpit regardless of default_attach_mode, got {:?}",
+            matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
+            "structured view rows must route to OpenStructuredView regardless of default_attach_mode, got {:?}",
             action
         );
     }

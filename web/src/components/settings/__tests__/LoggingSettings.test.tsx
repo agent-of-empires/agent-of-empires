@@ -85,10 +85,10 @@ describe("LoggingSettings contract", () => {
 
   it("per-target select adds a new key to logging.targets", () => {
     const { onSaveField, container } = mount({ default_level: "info" });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "trace" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
-      "cockpit.acp": "trace",
+      "acp.protocol": "trace",
     });
   });
 
@@ -97,20 +97,20 @@ describe("LoggingSettings contract", () => {
       default_level: "info",
       targets: { "auth.token": "warn" },
     });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "debug" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
       "auth.token": "warn",
-      "cockpit.acp": "debug",
+      "acp.protocol": "debug",
     });
   });
 
   it("per-target select with empty value deletes the override", () => {
     const { onSaveField, container } = mount({
       default_level: "info",
-      targets: { "cockpit.acp": "trace", "auth.token": "warn" },
+      targets: { "acp.protocol": "trace", "auth.token": "warn" },
     });
-    const select = findSelectByLabel(container, "cockpit.acp");
+    const select = findSelectByLabel(container, "acp.protocol");
     fireEvent.change(select, { target: { value: "" } });
     expect(onSaveField).toHaveBeenCalledWith("logging", "targets", {
       "auth.token": "warn",

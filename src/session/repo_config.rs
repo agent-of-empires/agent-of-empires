@@ -24,7 +24,7 @@ use super::config::Config;
 use super::profile_config::ProfileConfig;
 
 /// Config sections a repo `.agent-of-empires/config.toml` may override.
-/// Personal/global sections (theme, status_hooks, cockpit, web, logging, host
+/// Personal/global sections (theme, status_hooks, acp, web, logging, host
 /// environment) are intentionally excluded, matching the historical typed
 /// `RepoConfig` that simply had no field for them.
 const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
@@ -225,7 +225,7 @@ pub fn repo_config_to_profile(repo: &RepoConfig) -> ProfileConfig {
 }
 
 /// Convert a ProfileConfig back into a RepoConfig after TUI editing. Sections
-/// the repo may not override (theme, cockpit, ...) are dropped here, matching
+/// the repo may not override (theme, acp, ...) are dropped here, matching
 /// the historical behavior where editing them in Repo scope was discarded.
 pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
     RepoConfig {

@@ -1,11 +1,11 @@
 # Sound Effects
 
-Agent of Empires can play sound effects when agent sessions change state, providing audio feedback for transitions like starting, running, waiting, idle, and error states. The cockpit also plays a browser-side chime when a pending approval lands.
+Agent of Empires can play sound effects when agent sessions change state, providing audio feedback for transitions like starting, running, waiting, idle, and error states. The structured view also plays a browser-side chime when a pending approval lands.
 
 ## Features
 
 - 🔊 State transition sounds (start, running, waiting, idle, error)
-- 🛡️ Cockpit approval chime, played in the browser
+- 🛡️ Structured view approval chime, played in the browser
 - 🎵 Multiple installation options (bundled, AoE II extraction, custom)
 - 🎨 Fully customizable - use any .wav/.ogg files
 - ⚙️ Configurable via Settings TUI
@@ -111,7 +111,7 @@ You can also edit configuration files directly:
 enabled = true
 mode = "random"
 on_error = "error"          # Use specific sound for errors
-on_approval = "approval"    # Cockpit only; browser-side chime
+on_approval = "approval"    # Structured view only; browser-side chime
 ```
 
 **Profile**: `~/.config/agent-of-empires/profiles/<profile>/config.toml`
@@ -146,7 +146,7 @@ Status transition sounds (start, running, waiting, idle, error) play on the **se
 - **macOS**: `afplay`
 - **Linux**: `aplay` (ALSA) or `paplay` (PulseAudio)
 
-The cockpit `on_approval` sound is the exception: it plays in the **browser** where the dashboard is open, not on the host. Approvals are user-facing and the dashboard is often on a different machine from `aoe serve`. Browsers enforce an autoplay policy, so the first approval after a fresh page load may stay silent until the user interacts with the cockpit tab; the OS push notification still surfaces the approval in that case.
+The structured view `on_approval` sound is the exception: it plays in the **browser** where the dashboard is open, not on the host. Approvals are user-facing and the dashboard is often on a different machine from `aoe serve`. Browsers enforce an autoplay policy, so the first approval after a fresh page load may stay silent until the user interacts with the structured view tab; the OS push notification still surfaces the approval in that case.
 
 If sounds don't play, ensure you have audio tools installed:
 ```bash

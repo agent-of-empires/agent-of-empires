@@ -199,7 +199,7 @@ pub(super) struct GroupRenameContext {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
-    Agent,
+    Structured,
     Terminal,
     /// Previewing a tool session (lazygit, yazi, etc.)
     Tool(String),
@@ -451,7 +451,7 @@ pub struct HomeView {
     /// (and reset to Agent) by `prepare_live_send` so each action
     /// carries its own target without a stale value leaking into a
     /// later live-send call. Defaults to Agent for the historical
-    /// path (Tab in Agent view).
+    /// path (Tab in Structured view).
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
     /// Live-send mode: when `Some`, every key event in the home view is
     /// translated to a tmux send-keys call against this session's pane
@@ -495,7 +495,7 @@ pub struct HomeView {
     pub(super) live_send_pending_leader: bool,
     /// When true, the session list (sidebar) is hidden so the preview pane
     /// gets the full terminal width. Toggled from live mode via the leader
-    /// (`leader b`) for a distraction-free agent view; reset on live-send
+    /// (`leader b`) for a distraction-free structured view; reset on live-send
     /// exit so the list always reappears in the normal home view.
     pub(super) sidebar_collapsed: bool,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
@@ -575,7 +575,7 @@ pub struct HomeView {
     pub(super) preview_area: Rect,
     /// Sub-rect of `preview_area` where the agent's captured pane content
     /// is actually painted: `preview_area` minus the info header when
-    /// the user has it expanded (Agent view, non-compact). When the
+    /// the user has it expanded (Structured view, non-compact). When the
     /// info header is hidden or the layout is compact, this matches
     /// `preview_area` exactly.
     ///
@@ -3835,16 +3835,16 @@ impl HomeView {
     /// the session was filed under (the home view's active profile may
     /// already have moved on); falls back to `config_profile()` when
     /// the instance has no recorded profile. Returns `None` for
-    /// cockpit-mode sessions because the attach-mode / click-action
-    /// settings all have cockpit-specific bypass paths upstream;
-    /// callers treat `None` as "skip this setting, the cockpit path
+    /// structured view-mode sessions because the attach-mode / click-action
+    /// settings all have structured view-specific bypass paths upstream;
+    /// callers treat `None` as "skip this setting, the structured view path
     /// handles activation."
     fn resolve_session_config_for(
         &self,
         session_id: &str,
     ) -> Option<crate::session::SessionConfig> {
         let inst = self.get_instance(session_id)?;
-        if inst.is_cockpit_mode() {
+        if inst.is_structured() {
             return None;
         }
         let profile = if inst.source_profile.is_empty() {
@@ -3857,7 +3857,7 @@ impl HomeView {
 
     /// Resolve `new_session_attach_mode` for a freshly-created session.
     /// See `resolve_session_config_for` for the profile-resolution and
-    /// cockpit-bypass rules.
+    /// structured view-bypass rules.
     pub fn new_session_attach_mode(
         &self,
         session_id: &str,
@@ -3867,20 +3867,20 @@ impl HomeView {
     }
 
     /// Resolve `click_action` for an existing session row when the
-    /// user single-clicks it in the Agent view. See
+    /// user single-clicks it in the Structured view. See
     /// `resolve_session_config_for` for resolution rules; `None`
-    /// (cockpit) is treated by the caller as "fall through to the
+    /// (structured view) is treated by the caller as "fall through to the
     /// historical live-send path," which `start_live_send` itself
-    /// short-circuits for cockpit anyway.
+    /// short-circuits for structured view anyway.
     pub(super) fn click_action(&self, session_id: &str) -> Option<crate::session::ClickAction> {
         self.resolve_session_config_for(session_id)
             .map(|s| s.click_action)
     }
 
     /// Resolve `default_attach_mode` for an existing session row when
-    /// the user activates it (Enter / double-click) in the Agent view.
+    /// the user activates it (Enter / double-click) in the Structured view.
     /// See `resolve_session_config_for` for resolution rules; callers
-    /// short-circuit to the cockpit-specific activation path before
+    /// short-circuit to the structured view-specific activation path before
     /// consulting this setting.
     pub(super) fn default_attach_mode(
         &self,

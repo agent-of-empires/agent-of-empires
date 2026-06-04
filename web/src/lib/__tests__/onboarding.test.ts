@@ -21,7 +21,7 @@ describe("shouldShowWelcome", () => {
 
   it("only shows on the dashboard scope", () => {
     expect(shouldShowWelcome({ ...base, scope: "session" })).toBe(false);
-    expect(shouldShowWelcome({ ...base, scope: "cockpit" })).toBe(false);
+    expect(shouldShowWelcome({ ...base, scope: "structured-view" })).toBe(false);
   });
 
   it("is suppressed in read-only mode (cannot persist a theme)", () => {

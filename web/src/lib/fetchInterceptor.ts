@@ -14,7 +14,7 @@ export const LOGIN_REQUIRED_EVENT = "aoe:login-required";
 
 /** Dispatched on `window` when an authenticated request hits a sensitive
  *  route whose login session is not currently elevated (the server
- *  returns `403 elevation_required`). Cockpit/terminal hooks listen for
+ *  returns `403 elevation_required`). Structured view/terminal hooks listen for
  *  this to pop an inline passphrase prompt. See #1131. */
 export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
 
@@ -126,7 +126,7 @@ export function installFetchErrorToasts(): void {
       }
       if (res.status === 403 && isApi) {
         // `elevation_required` signals a sensitive route called without
-        // a current 15-min passphrase confirmation. The cockpit/terminal
+        // a current 15-min passphrase confirmation. The structured view/terminal
         // surfaces listen for this and pop the inline prompt.
         try {
           const data = (await res.clone().json()) as { error?: unknown };

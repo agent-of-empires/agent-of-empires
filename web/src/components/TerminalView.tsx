@@ -4,7 +4,7 @@ import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
-import { SwitchSubstrateAction } from "./cockpit/SwitchSubstrateAction";
+import { SwitchViewAction } from "./acp/SwitchViewAction";
 import { ensureSession } from "../lib/api";
 import { isAcpCapable } from "../lib/acpCapableTools";
 import { safeSetItem } from "../lib/safeStorage";
@@ -20,10 +20,9 @@ import "@xterm/xterm/css/xterm.css";
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** When false (the default) the switch-to-cockpit pill is hidden
-   *  entirely so users with the master switch off aren't tempted
-   *  by a button that the server will reject. */
-  cockpitMasterEnabled?: boolean;
+  /** When false (the default) the switch-to-structured view pill is hidden
+   *  entirely so it only shows where switching to the structured view is
+   *  actually offered. */
 }
 
 const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
@@ -32,7 +31,6 @@ const SCROLL_HINT_TIMEOUT_MS = 8000;
 export function TerminalView({
   session,
   active = true,
-  cockpitMasterEnabled = false,
 }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
     "pending",
@@ -236,15 +234,14 @@ export function TerminalView({
       className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5"
       style={rootStyle}
     >
-      {/* Top-right substrate switch — discreet pill that lets the
-          user flip this session into cockpit mode. Only rendered
-          when the cockpit master switch is on, and only enabled
+      {/* Top-right view switch — discreet pill that lets the
+          user flip this session into structured view mode. Only enabled
           for tools whose ACP adapter we ship. */}
-      {session?.id && cockpitMasterEnabled && (
+      {session?.id && (
         <div className="absolute right-2 top-2 z-10">
-          <SwitchSubstrateAction
+          <SwitchViewAction
             sessionId={session.id}
-            cockpitMode={false}
+            structuredView={false}
             acpCapable={isAcpCapable(session.tool, session.acp_capable)}
             variant="icon"
           />

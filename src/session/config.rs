@@ -54,7 +54,7 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
-    pub cockpit: CockpitConfig,
+    pub acp: AcpConfig,
 
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -244,7 +244,7 @@ fn default_show_spans() -> bool {
     false
 }
 
-/// Configuration for the cockpit (ACP-based native rendering of agent
+/// Configuration for the acp (ACP-based native rendering of agent
 /// state). Defaults match the documented v4 design and v005 migration.
 ///
 /// `#[derive(SettingsSection)]` makes every `#[setting]`-annotated field the
@@ -252,23 +252,14 @@ fn default_show_spans() -> bool {
 /// validation (#1692). Adding a field here, with its `#[setting]` attributes,
 /// is the only edit needed for it to appear and round-trip everywhere.
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
-#[setting_section(name = "cockpit", category = "Cockpit")]
-pub struct CockpitConfig {
-    /// Master kill switch for cockpit mode. When off, every session
-    /// runs as plain tmux even if --cockpit is passed.
-    #[serde(default)]
-    #[setting(label = "Cockpit enabled", widget = "toggle")]
-    pub enabled: bool,
-    /// On mobile viewports, default new Claude sessions to cockpit mode.
-    #[serde(default = "default_true")]
-    #[setting(label = "Default for Claude (mobile)", widget = "toggle")]
-    pub default_for_claude: bool,
-    /// Cockpit agent used when --agent is not specified (e.g. aoe-agent,
+#[setting_section(name = "acp", category = "Acp")]
+pub struct AcpConfig {
+    /// Acp agent used when --agent is not specified (e.g. aoe-agent,
     /// claude-code, gemini).
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
-    /// Hard cap on simultaneously running cockpit agent subprocesses;
+    /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
     #[setting(
@@ -279,17 +270,17 @@ pub struct CockpitConfig {
         advanced
     )]
     pub max_concurrent_workers: u32,
-    /// Per-session retention cap on cockpit events. 0 = unlimited (default);
+    /// Per-session retention cap on acp events. 0 = unlimited (default);
     /// set a non-zero value to bound disk usage on long-running sessions.
     #[serde(default = "default_replay_events")]
     #[setting(label = "History cap (events)", widget = "number", min = 0)]
     pub replay_events: u32,
-    /// Maximum bytes of cockpit events kept in the per-session replay buffer.
+    /// Maximum bytes of acp events kept in the per-session replay buffer.
     #[serde(default = "default_replay_bytes")]
     #[setting(label = "Replay buffer bytes", widget = "number", min = 0, advanced)]
     pub replay_bytes: u64,
     /// Override Node.js binary location. Empty resolves via
-    /// AOE_COCKPIT_NODE then PATH then the bundled fallback.
+    /// AOE_ACP_NODE then PATH then the bundled fallback.
     #[serde(default)]
     #[setting(
         label = "Node path",
@@ -297,7 +288,7 @@ pub struct CockpitConfig {
         web = "local_only:host Node binary path, a local execution surface"
     )]
     pub node_path: String,
-    /// Render a per-tool elapsed-time label on every cockpit tool card.
+    /// Render a per-tool elapsed-time label on every acp tool card.
     /// Cross-device via config.toml. The underlying measurement is currently
     /// imprecise on claude-agent-acp (no `status: in_progress` signal), so
     /// durations include stream-arrival skew; turn off if the inflated
@@ -317,7 +308,7 @@ pub struct CockpitConfig {
         advanced
     )]
     pub queue_drain_mode: QueueDrainMode,
-    /// Maximum number of cockpit worker resumes (spawn or attach) the
+    /// Maximum number of acp worker resumes (spawn or attach) the
     /// reconciler runs in parallel on `aoe serve` cold start. Bounded
     /// at runtime by `min(max_concurrent_resumes, max_concurrent_workers).max(1)`
     /// so this knob can never exceed the total live worker cap. Default
@@ -333,7 +324,7 @@ pub struct CockpitConfig {
         advanced
     )]
     pub max_concurrent_resumes: u32,
-    /// Seconds of streaming inactivity after which the cockpit web UI
+    /// Seconds of streaming inactivity after which the acp web UI
     /// shows a "Force end turn" button. When `turnActive=true` and no
     /// frame arrives for this long, the spinner is likely stuck on a
     /// missed `Stopped` (#1100); the button locally clears the
@@ -394,7 +385,7 @@ pub struct CockpitConfig {
         advanced
     )]
     pub silent_orphan_fast_grace_secs: u32,
-    /// Auto-stop idle cockpit workers: seconds of inactivity (no cockpit
+    /// Auto-stop idle acp workers: seconds of inactivity (no acp
     /// events and no in-flight turn) after which the daemon shuts a
     /// worker down and marks its session dormant so the reconciler does
     /// not respawn it. The next user prompt wakes the session and the
@@ -410,9 +401,9 @@ pub struct CockpitConfig {
     )]
     pub auto_stop_idle_secs: u32,
     /// Opt-in auto-resume after a provider usage/rate-limit reset. When a
-    /// cockpit worker stops with `Stopped { reason: "rate_limited" }`, the
+    /// acp worker stops with `Stopped { reason: "rate_limited" }`, the
     /// session is parked and (by default) waits for explicit user
-    /// recovery via `/cockpit/spawn` or agent handoff (the #1281
+    /// recovery via `/acp/spawn` or agent handoff (the #1281
     /// behavior). With this enabled, the reconciler instead respawns the
     /// same worker automatically once the adapter-reported reset time
     /// (plus `rate_limit_auto_resume_grace_secs`) has passed, publishing a
@@ -461,8 +452,8 @@ fn default_silent_orphan_fast_grace_secs() -> u32 {
     20
 }
 
-/// Drain strategy for the cockpit composer's client-side prompt queue.
-/// See `CockpitConfig::queue_drain_mode`.
+/// Drain strategy for the acp composer's client-side prompt queue.
+/// See `AcpConfig::queue_drain_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueDrainMode {
@@ -494,11 +485,9 @@ impl QueueDrainMode {
     }
 }
 
-impl Default for CockpitConfig {
+impl Default for AcpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            default_for_claude: true,
             default_agent: default_agent(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
@@ -762,8 +751,8 @@ pub struct SessionConfig {
     pub agent_detect_as: HashMap<String, String>,
 
     /// ACP launch command for a custom agent, enabling it to run in the
-    /// structured cockpit UI (e.g., "oc-superpowers" = "ocp run sp acp").
-    /// A custom agent with an entry here is cockpit-capable; without one it
+    /// structured acp UI (e.g., "oc-superpowers" = "ocp run sp acp").
+    /// A custom agent with an entry here is acp-capable; without one it
     /// is tmux-only.
     ///
     /// Note: unlike `custom_agents` (a shell command run in a tmux pane),
@@ -772,14 +761,14 @@ pub struct SessionConfig {
     /// `sh -lc 'source ~/.profile && ocp run sp acp'`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Cockpit Command",
+        label = "Agent Acp Command",
         widget = "list",
-        web = "local_only:argv launched directly to run a custom agent in cockpit, a host execution surface",
+        web = "local_only:argv launched directly to run a custom agent in acp, a host execution surface",
         category = "Agents"
     )]
-    pub agent_cockpit_cmd: HashMap<String, String>,
+    pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Per-agent cockpit startup defaults. `model` is forwarded at spawn;
+    /// Per-agent acp startup defaults. `model` is forwarded at spawn;
     /// `effort` is applied through ACP config options when advertised.
     ///
     /// Map-of-struct (agent -> {model, effort}); not a flat settings widget,
@@ -787,7 +776,7 @@ pub struct SessionConfig {
     /// settings panel. Skipped in the derived schema (#1692).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(skip)]
-    pub cockpit_defaults: HashMap<String, CockpitAgentDefaults>,
+    pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
@@ -823,8 +812,8 @@ pub struct SessionConfig {
     /// transition into `Idle` and the last user interaction, and a session
     /// with a currently attached tmux client is never stopped, so a session
     /// the user is reading is spared. Checked about once a minute, so the stop
-    /// can lag the threshold by up to a minute. Cockpit workers use the
-    /// separate `cockpit.auto_stop_idle_secs` knob; see #1689 and #1690.
+    /// can lag the threshold by up to a minute. Acp workers use the
+    /// separate `acp.auto_stop_idle_secs` knob; see #1689 and #1690.
     #[serde(default = "default_auto_stop_idle_secs")]
     #[setting(
         label = "Auto-stop idle session (s)",
@@ -905,7 +894,7 @@ pub struct SessionConfig {
     /// historical behavior. `LiveSend` enters live-send mode against
     /// the new session's pane instead, so users who never want to be
     /// inside tmux directly can create-and-type without an extra
-    /// keystroke. Cockpit-mode sessions ignore this setting because
+    /// keystroke. Acp-mode sessions ignore this setting because
     /// neither tmux nor live-send applies to them.
     #[serde(default)]
     #[setting(
@@ -919,7 +908,7 @@ pub struct SessionConfig {
     /// What Enter (and double-click) does on a session row in the Agent view:
     /// attach to tmux (default, historical behavior) or enter live-send mode so
     /// the home list stays visible and keystrokes pipe through to the agent.
-    /// Terminal/Tool views and cockpit sessions ignore this setting.
+    /// Terminal/Tool views and acp sessions ignore this setting.
     #[serde(default)]
     #[setting(
         label = "Default Attach Mode",
@@ -951,7 +940,7 @@ pub struct SessionConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CockpitAgentDefaults {
+pub struct AcpAgentDefaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -959,7 +948,7 @@ pub struct CockpitAgentDefaults {
     pub effort: Option<String>,
 }
 
-impl CockpitAgentDefaults {
+impl AcpAgentDefaults {
     pub fn is_empty(&self) -> bool {
         self.model.as_deref().is_none_or(str::is_empty)
             && self.effort.as_deref().is_none_or(str::is_empty)
@@ -967,8 +956,8 @@ impl CockpitAgentDefaults {
 }
 
 impl SessionConfig {
-    pub fn cockpit_defaults_for(&self, agent: &str) -> Option<&CockpitAgentDefaults> {
-        self.cockpit_defaults
+    pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
+        self.acp_defaults
             .get(agent)
             .filter(|defaults| !defaults.is_empty())
     }
@@ -1043,8 +1032,8 @@ impl Default for SessionConfig {
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
-            agent_cockpit_cmd: HashMap::new(),
-            cockpit_defaults: HashMap::new(),
+            agent_acp_cmd: HashMap::new(),
+            acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
@@ -1163,35 +1152,35 @@ impl SessionConfig {
                 );
             }
         }
-        for (name, command) in &self.agent_cockpit_cmd {
+        for (name, command) in &self.agent_acp_cmd {
             if name.is_empty() {
-                tracing::warn!(target: "session.store", "agent_cockpit_cmd: entry with empty agent name will be ignored");
+                tracing::warn!(target: "session.store", "agent_acp_cmd: entry with empty agent name will be ignored");
                 continue;
             }
             if crate::agents::get_agent(name).is_some() {
                 tracing::warn!(target: "session.store",
-                    "agent_cockpit_cmd: '{}' shadows a built-in agent; built-in agents already have a cockpit adapter and the entry will be ignored",
+                    "agent_acp_cmd: '{}' shadows a built-in agent; built-in agents already have an acp adapter and the entry will be ignored",
                     name
                 );
                 continue;
             }
             if !self.custom_agents.contains_key(name) {
                 tracing::warn!(target: "session.store",
-                    "agent_cockpit_cmd: '{}' has no matching custom_agents entry; it will not appear in the agent picker",
+                    "agent_acp_cmd: '{}' has no matching custom_agents entry; it will not appear in the agent picker",
                     name
                 );
             }
             match shell_words::split(command) {
                 Ok(argv) if argv.is_empty() => {
                     tracing::warn!(target: "session.store",
-                        "agent_cockpit_cmd: '{}' has an empty command, cockpit will be unavailable for it",
+                        "agent_acp_cmd: '{}' has an empty command, acp will be unavailable for it",
                         name
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(target: "session.store",
-                        "agent_cockpit_cmd: '{}' has a malformed command ({}), cockpit will be unavailable for it",
+                        "agent_acp_cmd: '{}' has a malformed command ({}), acp will be unavailable for it",
                         name, e
                     );
                 }
@@ -1266,7 +1255,7 @@ pub struct WebConfig {
     #[setting(label = "Notify on error", widget = "toggle", global_only)]
     pub notify_on_error: bool,
 
-    /// Default: send a push when a cockpit session's ScheduleWakeup timer
+    /// Default: send a push when an acp session's ScheduleWakeup timer
     /// fires (the next /loop turn starts). Suppressed if the TUI or web
     /// dashboard has been active in the last 30s. See #1091.
     #[serde(default = "default_true")]
@@ -2701,9 +2690,9 @@ mod tests {
             .session
             .agent_extra_args
             .insert("opencode".to_string(), "--port 8080".to_string());
-        config.session.cockpit_defaults.insert(
+        config.session.acp_defaults.insert(
             "opencode".to_string(),
-            CockpitAgentDefaults {
+            AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
             },
@@ -2722,12 +2711,12 @@ mod tests {
             "agent_extra_args should survive roundtrip"
         );
         assert_eq!(
-            deserialized.session.cockpit_defaults.get("opencode"),
-            Some(&CockpitAgentDefaults {
+            deserialized.session.acp_defaults.get("opencode"),
+            Some(&AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
             }),
-            "cockpit_defaults should survive roundtrip"
+            "acp_defaults should survive roundtrip"
         );
     }
 
@@ -2902,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_cockpit_cmd_roundtrip() {
+    fn test_agent_acp_cmd_roundtrip() {
         let mut config = Config::default();
         config
             .session
@@ -2910,23 +2899,23 @@ mod tests {
             .insert("oc-sp".to_string(), "ocp run sp".to_string());
         config
             .session
-            .agent_cockpit_cmd
+            .agent_acp_cmd
             .insert("oc-sp".to_string(), "ocp run sp acp".to_string());
 
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(
-            deserialized.session.agent_cockpit_cmd.get("oc-sp"),
+            deserialized.session.agent_acp_cmd.get("oc-sp"),
             Some(&"ocp run sp acp".to_string()),
         );
     }
 
     #[test]
-    fn test_agent_cockpit_cmd_defaults_empty() {
-        // A config with no agent_cockpit_cmd must deserialize to an empty
+    fn test_agent_acp_cmd_defaults_empty() {
+        // A config with no agent_acp_cmd must deserialize to an empty
         // map (serde default), not error, so existing configs keep loading.
         let config: Config = toml::from_str("").unwrap();
-        assert!(config.session.agent_cockpit_cmd.is_empty());
+        assert!(config.session.agent_acp_cmd.is_empty());
     }
 
     #[test]
@@ -2951,14 +2940,11 @@ mod tests {
 default_level = "debug"
 
 [targets]
-"cockpit.acp" = "trace"
+"acp.acp" = "trace"
 "#;
         let parsed: LoggingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.default_level, "debug");
-        assert_eq!(
-            parsed.targets.get("cockpit.acp"),
-            Some(&"trace".to_string())
-        );
+        assert_eq!(parsed.targets.get("acp.acp"), Some(&"trace".to_string()));
         assert_eq!(parsed.output, SinkKind::File);
         assert_eq!(parsed.file_path, "debug.log");
         assert_eq!(parsed.rotation, RotationKind::Size);

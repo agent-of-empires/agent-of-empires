@@ -39,7 +39,7 @@ Running one AI agent is easy. Running five of them across different branches, ke
 - **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code
 - **TUI dashboard**: visual interface to create, monitor, and manage sessions
 - **Web dashboard** (Beta, stabilization in progress): create, monitor, and control your agents from any browser, installable as a PWA
-- **Cockpit** (Alpha, opt-in): mobile-first native rendering of agent state via the Agent Client Protocol, with plan panels, tool-call cards, and swipe-to-approve
+- **Structured view** (web dashboard default): mobile-first native rendering of agent state via the Agent Client Protocol, with plan panels, tool-call cards, and swipe-to-approve. Flip a session to the terminal view for raw tmux rendering
 - **CLI and HTTP API**: drive sessions from the command line or external orchestrators (integrates with tools like OpenClaw)
 - **Remote phone access**: press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth, via Tailscale Funnel or Cloudflare Tunnel
 - **Status detection**: see which agents are running, waiting for input, or idle
@@ -102,7 +102,7 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 - **[Installation](https://www.agent-of-empires.com/docs/installation/)**: prerequisites and install methods
 - **[Quick Start](https://www.agent-of-empires.com/docs/quick-start/)**: first steps and basic usage
 - **[Web Dashboard](https://www.agent-of-empires.com/guides/web-dashboard/)**: browser access, PWA install, auth modes
-- **[Cockpit (Native Agent Rendering)](https://www.agent-of-empires.com/docs/cockpit/)**: mobile-first ACP rendering with plan panels and swipe-to-approve
+- **[Structured View (Web Dashboard)](https://www.agent-of-empires.com/docs/structured-view/)**: the default mobile-first ACP rendering with plan panels and swipe-to-approve
 - **[Remote Phone Access](https://www.agent-of-empires.com/guides/remote-phone-access/)**: check on your agents from your phone via Tailscale Funnel or a Cloudflare tunnel
 - **[Git Worktrees](https://www.agent-of-empires.com/guides/worktrees/)**: parallel agents on different branches
 - **[Multi-Repo Workspaces](https://www.agent-of-empires.com/guides/multi-repo-workspaces/)**: drive one session across several git repositories

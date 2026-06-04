@@ -3,7 +3,7 @@
 // #1880 shipped the allowlisted usage_seen registry; this pins the three
 // dashboard feature opens that land on it: diff_panel (the diff panel is
 // opened for a session), web_terminal (the xterm.js terminal connects), and
-// the opted-out/read-only short-circuit. diff_comments needs a live cockpit
+// the opted-out/read-only short-circuit. diff_comments needs a live structured view
 // worker to accept the prompt, so it is covered by the mocked send-flow spec
 // (tests/diff-comments.spec.ts) instead.
 

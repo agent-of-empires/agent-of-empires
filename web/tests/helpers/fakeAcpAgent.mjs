@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Fake ACP agent for cockpit Playwright tests.
+// Fake ACP agent for structured view Playwright tests.
 //
 // Speaks just enough of the Agent Client Protocol (newline-delimited
-// JSON-RPC 2.0) for `src/cockpit/acp_client.rs` to drive a turn:
+// JSON-RPC 2.0) for `src/acp/acp_client.rs` to drive a turn:
 //
 //   initialize          -> return protocolVersion + agentCapabilities
 //   session/new         -> return a deterministic sessionId
-//   session/load        -> same shape; lets cockpit's Resume mode work
+//   session/load        -> same shape; lets structured view's Resume mode work
 //   session/prompt      -> emit scripted session/update notifications,
 //                          then return a stop response. Script entries
 //                          with `sessionUpdate: "permission_request"`
@@ -48,6 +48,7 @@
 
 import { createInterface } from "node:readline";
 import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 
 // Silently swallow EPIPE/EBADF on stdout/stderr writes. The fake is a
 // noisy stdout writer (one JSON line per session/update notification);
@@ -57,7 +58,7 @@ import { readFileSync, existsSync, appendFileSync } from "node:fs";
 // handler, Node treats that as an uncaught exception and exits the
 // process. The runner sees the child exit, deletes the worker_registry
 // entry, the supervisor's reap pass publishes Stopped {
-// reason: "user_stopped" }, and the UI banners "Cockpit worker
+// reason: "user_stopped" }, and the UI banners "Structured view worker
 // stopped" mid-turn. That matched the symptom in #1383 (see Once /
 // upon visible but "a time." never arriving in the composer-streamed
 // trace). Swallowing the error is safe: write failures here mean the
@@ -214,7 +215,7 @@ function resolveOutbound(msg) {
 
 // Default permission options when a `permission_request` script entry
 // omits its own. Covers every PermissionOptionKind aoe's
-// `pick_option_id` (src/cockpit/acp_client.rs) consults so an
+// `pick_option_id` (src/acp/acp_client.rs) consults so an
 // `allow` / `allow_always` / `deny` decision always maps cleanly.
 const DEFAULT_PERMISSION_OPTIONS = [
   { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -233,7 +234,7 @@ const cancelFlags = new Map();
 // FAKE_ACP_MODE_VIA_CONFIG_OPTION is set, the fake advertises its modes
 // ONLY as a `category:"mode"` config option (no ACP SessionModeState
 // `modes` field) and rejects any mode value outside this list, exactly
-// like `opencode acp`. Lets a test prove the cockpit picker reads the
+// like `opencode acp`. Lets a test prove the structured view picker reads the
 // config-option channel and never offers a phantom "default" mode.
 const OPENCODE_MODE_CHOICES = [
   { value: "build", name: "Build" },
@@ -298,7 +299,7 @@ async function emitSessionUpdates(sessionId, updates) {
       continue;
     }
     sendNotification("session/update", { sessionId, update: u });
-    // Inter-update tick so the cockpit reducer can apply each event in
+    // Inter-update tick so the structured view reducer can apply each event in
     // order rather than batching them. Bumped from 1ms to 5ms after
     // CI flakes (#1383): under 6-worker contention on the 4-core CI
     // runner, a 1ms tick didn't survive the event-loop pressure and
@@ -308,7 +309,7 @@ async function emitSessionUpdates(sessionId, updates) {
 }
 
 function makeSessionId() {
-  return `fake-acp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `fake-acp-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
 const INITIALIZE_RESULT = {
@@ -353,7 +354,7 @@ async function handleRequest(msg) {
   // ACP server per failure mode. Shape: script.failOn = { method:
   // "session/new", code: -32603, message: "Internal error", data: {...} }.
   // Single-shot by default; set `repeat: true` to keep failing on every
-  // call. See web/tests/live/cockpit-stories/startup-error-banner-native-binary.spec.ts.
+  // call. See web/tests/live/acp-stories/startup-error-banner-native-binary.spec.ts.
   if (script.failOn && script.failOn.method === method) {
     const f = script.failOn;
     sendError(
@@ -394,7 +395,7 @@ async function handleRequest(msg) {
       const sessionId = params?.sessionId ?? makeSessionId();
       // Test hook: when FAKE_ACP_COMMANDS is set, emit an
       // `available_commands_update` session/update notification right
-      // after the session/new response so the cockpit composer's
+      // after the session/new response so the structured view composer's
       // slash-command popover is populated for stories that drive the
       // `/` picker (e.g. composer-slash-pick-no-arg #1512).
       const commandsJson = process.env.FAKE_ACP_COMMANDS;
@@ -414,7 +415,7 @@ async function handleRequest(msg) {
               ...(c.accepts_input ? { input: { hint: c.hint ?? "" } } : {}),
             }));
             // Defer emission to the next tick so the session/new
-            // response lands first; the cockpit acp_client wires the
+            // response lands first; the structured view acp_client wires the
             // session id from the response before it can route follow-up
             // session/update notifications.
             setImmediate(() => {
@@ -436,7 +437,7 @@ async function handleRequest(msg) {
       // Mirror claude-agent-acp v0.37.0: the initial set of
       // per-session selectors (model + effort + mode) ships in the
       // session/new and session/load *response*, not as a subsequent
-      // notification. The cockpit's acp_client reads the response
+      // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
       const includeConfigOptions =
         process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
@@ -575,7 +576,7 @@ async function handleRequest(msg) {
       // Rate-limit park: a turn with `rateLimit` returns session/prompt as
       // a JSON-RPC error carrying the fingerprint aoe's
       // classify_rate_limit_error reads (errorKind "rate_limit" plus a
-      // resets_at), instead of a normal stopReason. The cockpit worker
+      // resets_at), instead of a normal stopReason. The structured view worker
       // then emits a typed RateLimit event and parks the session. See
       // #1281 / #1715. A cancel mid-turn still wins over the park.
       if (!wasCancelled && turn.rateLimit) {

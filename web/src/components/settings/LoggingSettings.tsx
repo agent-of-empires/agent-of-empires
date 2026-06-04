@@ -12,12 +12,12 @@ import {
 // directly or hit `PATCH /api/log-level` for arbitrary EnvFilter
 // directives.
 const KNOWN_TARGETS: { value: string; group: string }[] = [
-  { value: "cockpit.acp", group: "Cockpit" },
-  { value: "cockpit.acp.stderr", group: "Cockpit" },
-  { value: "cockpit.acp.tool_dispatch", group: "Cockpit" },
-  { value: "cockpit.supervisor", group: "Cockpit" },
-  { value: "cockpit.event_store", group: "Cockpit" },
-  { value: "cockpit.runner", group: "Cockpit" },
+  { value: "acp.protocol", group: "Structured view" },
+  { value: "acp.protocol.stderr", group: "Structured view" },
+  { value: "acp.protocol.tool_dispatch", group: "Structured view" },
+  { value: "acp.supervisor", group: "Structured view" },
+  { value: "acp.event_store", group: "Structured view" },
+  { value: "acp.runner", group: "Structured view" },
   { value: "terminal.ws", group: "Terminal" },
   { value: "terminal.ws.bytes", group: "Terminal" },
   { value: "auth.token", group: "Auth" },
@@ -115,7 +115,7 @@ export function LoggingSettings({ settings, onSaveField, onUpdate }: Props) {
     <div className="space-y-6">
       <div className="space-y-2">
         <p className="text-xs text-text-dim">
-          Persists to <code>[logging]</code> in <code>config.toml</code>. Changes apply live to the running daemon and any cockpit subprocesses (no restart needed). The <code>AOE_LOG_LEVEL</code> env var, when set, overrides these settings at startup.
+          Persists to <code>[logging]</code> in <code>config.toml</code>. Changes apply live to the running daemon and any structured-view subprocesses (no restart needed). The <code>AOE_LOG_LEVEL</code> env var, when set, overrides these settings at startup.
         </p>
       </div>
 
@@ -164,7 +164,7 @@ export function LoggingSettings({ settings, onSaveField, onUpdate }: Props) {
         </p>
         <SelectField
           label="Output"
-          description="file (default) sends tracing to a log file. stdout is honored only for foreground aoe serve and env-overridden one-shot CLI; TUI / daemon child / cockpit runner coerce to file regardless."
+          description="file (default) sends tracing to a log file. stdout is honored only for foreground aoe serve and env-overridden one-shot CLI; TUI / daemon child / structured-view runner coerce to file regardless."
           value={output}
           onChange={(v) => saveSinkField("output", v)}
           options={SINK_OPTIONS}

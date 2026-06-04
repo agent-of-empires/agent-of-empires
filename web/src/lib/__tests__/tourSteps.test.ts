@@ -111,7 +111,7 @@ describe("resolveTourSteps", () => {
     expect(ids).toContain("sidebar");
     expect(ids).toContain("new-session");
     expect(ids).toContain("topbar-more");
-    // cockpit-only steps must not leak onto the dashboard
+    // acp-only steps must not leak onto the dashboard
     expect(ids).not.toContain("composer");
     expect(ids).not.toContain("right-panel");
   });
@@ -128,7 +128,7 @@ describe("resolveTourSteps", () => {
 
   it("drops desktop-only steps on coarse pointers", () => {
     const steps = resolveTourSteps({
-      scope: "cockpit",
+      scope: "structured-view",
       readOnly: false,
       isDesktop: false,
       hasAnchor: present,
@@ -148,7 +148,7 @@ describe("resolveTourSteps", () => {
 
   it("preserves TOUR_STEPS order", () => {
     const steps = resolveTourSteps({
-      scope: "cockpit",
+      scope: "structured-view",
       readOnly: false,
       isDesktop: true,
       hasAnchor: present,
@@ -162,7 +162,7 @@ describe("resolveTourSteps", () => {
   it("isStepEligible ignores DOM presence (metadata only)", () => {
     const composer = TOUR_STEPS.find((s) => s.id === "composer") as TourStep;
     expect(
-      isStepEligible(composer, { scope: "cockpit", readOnly: false, isDesktop: true }),
+      isStepEligible(composer, { scope: "structured-view", readOnly: false, isDesktop: true }),
     ).toBe(true);
     expect(
       isStepEligible(composer, { scope: "dashboard", readOnly: false, isDesktop: true }),

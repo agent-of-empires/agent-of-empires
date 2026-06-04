@@ -1061,11 +1061,11 @@ async fn stop_daemon() -> Result<()> {
 /// can branch on it (`aoe serve --status && …`).
 async fn print_status() -> Result<()> {
     // `AOE_DAEMON_URL` retargets every `aoe` invocation at a remote
-    // daemon (see docs/cockpit.md). `--status` follows the same rule:
+    // daemon (see docs/acp.md). `--status` follows the same rule:
     // when the env override is set, report the remote endpoint's
     // health instead of the local PID file.
-    if let Some(endpoint) = crate::cockpit::client::discovery::discover_env() {
-        let client = crate::cockpit::client::HttpClient::new(endpoint.clone())
+    if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
+        let client = crate::acp::client::HttpClient::new(endpoint.clone())
             .map_err(|e| anyhow::anyhow!("http client init failed: {e}"))?;
         match client.health_check().await {
             Ok(()) => {

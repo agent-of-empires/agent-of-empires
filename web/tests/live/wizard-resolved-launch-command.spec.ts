@@ -1,17 +1,17 @@
 // User story: the new-session wizard shows the exact resolved launch
 // command (post-override, post-arg-resolution) in the review step, and
 // lets the user edit the command inline without duplicating the
-// registry args that cockpit always appends. Closes #1911.
+// registry args that structured view always appends. Closes #1911.
 
 import { test, expect } from "@playwright/test";
 import { spawnAoeServe } from "../helpers/aoeServe";
 
-test("review step shows the resolved cockpit launch command and edits it without double-appending args", async ({
+test("review step shows the resolved structured view launch command and edits it without double-appending args", async ({
   page,
 }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
-    cockpit: true,
+    acp: true,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
   });
@@ -40,10 +40,10 @@ test("review step shows the resolved cockpit launch command and edits it without
 
     // AgentStep: pick opencode, which has a registry arg ("acp"), so we
     // can prove the arg is shown and not duplicated on edit. Leave the
-    // cockpit toggle on (the default).
+    // structured view toggle on (the default).
     await wizard.getByRole("button", { name: "opencode", exact: true }).click();
-    const cockpitToggle = wizard.getByRole("switch", { name: "Use cockpit" });
-    await expect(cockpitToggle).toBeChecked();
+    const acpToggle = wizard.getByRole("switch", { name: "Use structured view" });
+    await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: "Next" }).click();
 
     // ReviewStep: the launch command row shows the registry command +
@@ -68,12 +68,12 @@ test("review step shows the resolved cockpit launch command and edits it without
   }
 });
 
-test("review step shows the cockpit registry command, not the bare binary", async ({
+test("review step shows the structured view registry command, not the bare binary", async ({
   page,
 }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
-    cockpit: true,
+    acp: true,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
   });
@@ -97,7 +97,7 @@ test("review step shows the cockpit registry command, not the bare binary", asyn
     ).toBeVisible({ timeout: 10_000 });
     await wizard.getByRole("button", { name: "Next" }).click();
 
-    // claude's binary is "claude" but its cockpit launcher is
+    // claude's binary is "claude" but its structured view launcher is
     // "claude-agent-acp"; the review row must show the latter, which fails
     // if the resolver regresses to binary + args.
     await wizard.getByRole("button", { name: "claude", exact: true }).click();

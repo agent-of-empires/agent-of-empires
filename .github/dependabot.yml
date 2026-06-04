@@ -108,9 +108,9 @@ updates:
       - dependency-name: "@tailwindcss/*"
         update-types: ["version-update:semver-major"]
 
-  # npm: cockpit-worker/aoe-agent
+  # npm: acp-worker/aoe-agent
   - package-ecosystem: "npm"
-    directory: "/cockpit-worker/aoe-agent"
+    directory: "/acp-worker/aoe-agent"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -120,7 +120,7 @@ updates:
     labels:
       - "dependencies"
       - "javascript"
-      - "area:cockpit"
+      - "area:acp"
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -143,9 +143,9 @@ updates:
           - "@agentclientprotocol/*"
         update-types: ["minor", "patch"]
 
-  # npm: cockpit-worker/test-shim
+  # npm: acp-worker/test-shim
   - package-ecosystem: "npm"
-    directory: "/cockpit-worker/test-shim"
+    directory: "/acp-worker/test-shim"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -155,7 +155,7 @@ updates:
     labels:
       - "dependencies"
       - "javascript"
-      - "area:cockpit"
+      - "area:acp"
     commit-message:
       prefix: "chore"
       include: "scope"

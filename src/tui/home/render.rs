@@ -168,7 +168,7 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Pick the agent view row icon for a session instance. Centralizes the
+/// Pick the structured view row icon for a session instance. Centralizes the
 /// archive/snooze override that kills the live spinner for sunk rows so the
 /// list reads as parked instead of "still alive." Exposed at crate visibility
 /// so tests can pin the override behavior without going through the full
@@ -653,7 +653,9 @@ impl HomeView {
         self.list_area = area;
         let profile = self.active_profile_display();
         let title = match &self.view_mode {
-            ViewMode::Agent => compose_list_title("aoe", profile, self.group_by, self.sort_order),
+            ViewMode::Structured => {
+                compose_list_title("aoe", profile, self.group_by, self.sort_order)
+            }
             ViewMode::Terminal => {
                 compose_list_title("Terminals", profile, self.group_by, self.sort_order)
             }
@@ -665,7 +667,7 @@ impl HomeView {
             ),
         };
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Agent => (theme.border, theme.title),
+            ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
@@ -912,7 +914,7 @@ impl HomeView {
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
                     match self.view_mode {
-                        ViewMode::Agent => {
+                        ViewMode::Structured => {
                             // For Idle sessions, decay color from `fresh_idle`
                             // toward `idle` over `idle_decay_window`. A slow
                             // `breathe` rattle replaces the static braille
@@ -1181,20 +1183,20 @@ impl HomeView {
                 // interaction (attach, send-keys), which would lie about
                 // how long it's actually been since the agent stopped.
                 //
-                // Cockpit-mode sessions are web-only (the TUI has no
+                // Acp-mode sessions are web-only (the TUI has no
                 // structured rendering surface). Surface this with a
                 // [web] badge so the user knows pressing Enter will
                 // open an info dialog instead of attaching to a tmux
                 // pane that doesn't exist. Takes precedence over the
-                // existing container/host badge in Agent view; the
+                // existing container/host badge in Structured view; the
                 // Terminal view keeps its existing badging because
                 // the host terminal still works against the worktree.
                 let badge_text: Option<&'static str> =
-                    if inst.is_cockpit_mode() && self.view_mode != ViewMode::Terminal {
+                    if inst.is_structured() && self.view_mode != ViewMode::Terminal {
                         // Renamed from `[web]` now that the TUI renders
-                        // cockpit sessions natively; `[cockpit]` better
-                        // describes the substrate the badge marks.
-                        Some(" [cockpit]")
+                        // structured-view sessions natively; `[structured]`
+                        // better describes the view the badge marks.
+                        Some(" [structured]")
                     } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
                         Some(match self.get_terminal_mode(id) {
                             TerminalMode::Container => " [container]",
@@ -1349,7 +1351,7 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Agent => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Structured => crate::tmux::Session::generate_name(&inst.id, &inst.title),
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
@@ -1488,7 +1490,7 @@ impl HomeView {
                     // Only record the dedup once the pane actually exists and was
                     // resized. If a Stopped session we're viewing is started later
                     // without an attach in this instance to clear the dedup (e.g.
-                    // a peer or the web cockpit launches it), marking it synced now
+                    // a peer or the web structured view launches it), marking it synced now
                     // would pin the preview to the pre-start size and keep clipping
                     // until the next geometry change. Leaving it unset retries on
                     // the next refresh; `exists()` is cache-backed, so the retry is
@@ -1646,7 +1648,7 @@ impl HomeView {
     /// Tool live mode, where a different cache backs the visible output.
     fn active_captured_lines(&self) -> usize {
         match &self.view_mode {
-            ViewMode::Agent => self.preview_cache.captured_lines,
+            ViewMode::Structured => self.preview_cache.captured_lines,
             ViewMode::Tool(_) => self.tool_preview_cache.captured_lines,
             ViewMode::Terminal => {
                 let mode = self
@@ -1672,7 +1674,7 @@ impl HomeView {
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Agent => (theme.border, theme.title),
+            ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
@@ -1742,7 +1744,7 @@ impl HomeView {
             block = block.title(line);
         } else {
             let title = match &self.view_mode {
-                ViewMode::Agent => " Preview ".to_string(),
+                ViewMode::Structured => " Preview ".to_string(),
                 ViewMode::Terminal => " Terminal Preview ".to_string(),
                 ViewMode::Tool(name) => format!(" {} Preview ", name),
             };
@@ -1821,7 +1823,7 @@ impl HomeView {
         self.sync_preview_capture_worker(desired);
 
         match self.view_mode {
-            ViewMode::Agent => {
+            ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
                 let is_creating = self
                     .selected_session

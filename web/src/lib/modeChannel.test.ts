@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ConfigOptionDescriptor } from "./cockpitTypes";
+import type { ConfigOptionDescriptor } from "./acpTypes";
 import { resolveModeChannel, type ResolveModeChannelArgs } from "./modeChannel";
 
 const BASE: ResolveModeChannelArgs = {

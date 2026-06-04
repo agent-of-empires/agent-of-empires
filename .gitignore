@@ -65,7 +65,7 @@ website/src/pages/guides/web/*.md
 website/src/pages/docs/*.md
 website/src/pages/docs/guides/*.md
 website/src/pages/docs/cli/*.md
-website/src/pages/docs/cockpit/*.md
+website/src/pages/docs/structured-view/*.md
 website/src/pages/docs/development/*.md
 .worktrees/
 .gstack/

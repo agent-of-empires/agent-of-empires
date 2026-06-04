@@ -143,15 +143,15 @@ Containers are named: `aoe-sandbox-{session_id_first_8_chars}`
 
 Example: `aoe-sandbox-a1b2c3d4`
 
-## Cockpit Mode Inside the Sandbox
+## Structured view Mode Inside the Sandbox
 
-Cockpit-mode sessions can run inside the sandbox container. When both are enabled, the cockpit runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
+Agent-view sessions can run inside the sandbox container. When both are enabled, the structured view runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
 
 - `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.39.0`, floor pin)
 - `codex-acp` (`@zed-industries/codex-acp`)
 - `pi-acp`
 
-Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the cockpit handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
+Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the structured view handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
 
 ## How It Works
 

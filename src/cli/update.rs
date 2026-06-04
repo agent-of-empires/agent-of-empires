@@ -245,7 +245,7 @@ fn restart_via_new_binary(binary_path: &Path) {
 
 /// Reminder printed after a successful in-place update: a running
 /// `aoe serve` daemon keeps executing the old code it already loaded
-/// until it is restarted, and its cockpit workers survive that restart by
+/// until it is restarted, and its structured view workers survive that restart by
 /// design (see #1037). The new binary therefore does not take effect
 /// anywhere until the daemon restarts; once it does, a worker left on the
 /// old build finishes any in-flight turn and then respawns on the new
@@ -253,7 +253,7 @@ fn restart_via_new_binary(binary_path: &Path) {
 /// mixed-version trap where a freshly-shipped fix appears not to work.
 fn daemon_restart_hint() -> &'static str {
     "  If `aoe serve` is running, restart it (`aoe serve --restart`) so the daemon\n  \
-     picks up the new binary. Cockpit workers from the old build finish their\n  \
+     picks up the new binary. Acp workers from the old build finish their\n  \
      current turn, then respawn on the new build."
 }
 
