@@ -169,6 +169,16 @@ Edge cases:
 - Daemon stop: file removal does not revert runner filters; the next daemon start writes a fresh value.
 - Garbled content: runner logs a `warn` to `log.runtime` and keeps its prior filter.
 
+## Per-session tee
+
+The daemon multiplexes many sessions, so its watchdog, cancel, and stop-reason breadcrumbs (target `acp.protocol`) all land in the one shared `debug.log`. To make `aoe acp logs --session <id>` useful during an incident, the daemon installs a `SessionTeeLayer` (`src/acp/session_tee.rs`) on top of its subscriber stack that mirrors each session-scoped event into that session's `acp-workers/<id>.log`.
+
+- **Routing.** Events are attributed by their `session` field. Each per-session connection task runs inside an `acp_session` span carrying that field, so events that do not set it explicitly still inherit it through the span scope; the layer reads the event's own fields first, then walks the scope.
+- **Additive.** The shared `debug.log` still receives everything; the tee is a copy, not a redirect.
+- **I/O.** Writes are synchronous through a per-session `SizeRotatingWriter` (10 MiB, keep 2), the same writer the shared log uses. Open writers are bounded (LRU, 64) so a long-lived daemon does not leak file descriptors.
+- **Scope.** Daemon only. The runner is single-session and keeps writing its startup marker and the agent's stderr directly. Events on the `acp.tee` target are skipped to prevent re-entrancy.
+- **Filtering.** The tee sits below the same dynamic `EnvFilter`, so `aoe log-level` changes apply to the per-session files too.
+
 ## Web client relay
 
 Browser-side `window.onerror`, `unhandledrejection`, React `ErrorBoundary`, and explicit `reportError()` calls are batched and POSTed to `/api/client-log`. The server re-emits them through `tracing` at target `web.client` so they land in the same `debug.log` as everything else.
@@ -187,7 +197,7 @@ Not captured (intentional, v1): `console.error`. Wrapping it produces noisy dupl
 | `<configured>.1` ... `<configured>.<keep_count>` | Rotated files, oldest at the highest number. |
 | `<configured>.lock` | Idle `fs2` advisory lock file used to serialize rotation across processes. Always present after the first rotation; do not delete while any aoe process is running. |
 | `~/.agent-of-empires/runtime_filter` | Atomically written on every successful `aoe log-level` swap; consumed by runner watchers. |
-| `~/.agent-of-empires/acp-workers/<session-id>.log` | Touched for compatibility; structured tracing lands in the shared configured log file. |
+| `~/.agent-of-empires/acp-workers/<session-id>.log` | Per-session diagnostics surfaced by `aoe acp logs --session <id>`. The runner writes its startup marker and the agent's stderr here directly; the daemon additionally tees every session-scoped tracing event into it (see Per-session tee below). Size-rotated at 10 MiB, keep 2. |
 | `~/.agent-of-empires/serve.log.legacy` | One-shot rename of the pre-consolidation `serve.log` by migration v007. Safe to delete once you've extracted any data you needed. |
 
 On Linux, replace `~/.agent-of-empires` with `$XDG_CONFIG_HOME/agent-of-empires`. Debug builds use `~/.agent-of-empires-dev` to avoid colliding with an installed release.

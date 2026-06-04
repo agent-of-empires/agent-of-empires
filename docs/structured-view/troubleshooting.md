@@ -235,9 +235,12 @@ from the host).
 
 ### Structured view feels "stuck" with no events
 
-- Check `aoe acp logs --session <id>` for the runner stderr drain;
-  the dashboard exposes the same content via the **Open agent log**
-  affordance on the red startup-error banner.
+- Check `aoe acp logs --session <id>`. Besides the runner stderr
+  drain, it now also carries the daemon's session-scoped breadcrumbs
+  (handshake, watchdog fires, `session/cancel`, stop reasons), which
+  previously only reached the shared `debug.log` (#1864). The dashboard
+  exposes the same file via the **Open agent log** affordance on the
+  red startup-error banner.
 - Check the dashboard's connection chrome at the top of the structured view
   view; it shows reconnect status if the WebSocket is degraded.
 - The supervisor watchdog respawns the agent up to 3 times in 60s
@@ -368,7 +371,10 @@ then SIGTERMs the runner and respawns via `session/load` so the
 transcript is preserved. The web UI shows a distinct banner ("Agent
 finished but didn't notify the daemon. Restarting worker; your
 transcript will be preserved.") so the user can tell this apart from
-the cancel-escalation path (`agent_unresponsive`). See #1240.
+the cancel-escalation path (`agent_unresponsive`). See #1240. The
+`silent-orphan watchdog fired` and `sending session/cancel` breadcrumbs
+are teed into `aoe acp logs --session <id>` (#1864), so you can confirm
+the cause without grepping the shared `debug.log`.
 
 The detector fires only when ALL hold for the current prompt:
 - `tool_calls_in_flight` is empty (no open tool call; long-running
