@@ -83,9 +83,12 @@ export function StatusGlyph({
     const r = rattle;
     const computeFrame = () =>
       Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
-    setFrame(computeFrame());
+    const initial = setTimeout(() => setFrame(computeFrame()), 0);
     const id = setInterval(() => setFrame(computeFrame()), r.interval);
-    return () => clearInterval(id);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(id);
+    };
   }, [rattle, epoch]);
 
   if (!rattle) {

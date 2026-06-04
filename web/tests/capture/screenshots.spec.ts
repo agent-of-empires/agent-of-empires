@@ -39,7 +39,6 @@ async function shot(page: Page, rel: string): Promise<void> {
   // Let late layout (xterm fit, fonts, status glyphs) settle.
   await page.waitForTimeout(700);
   await page.screenshot({ path: out });
-  // eslint-disable-next-line no-console
   console.log(`captured ${rel}`);
 }
 

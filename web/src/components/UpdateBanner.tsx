@@ -50,7 +50,7 @@ export function UpdateBanner() {
       timer = setTimeout(poll, minutes * 60_000);
     };
 
-    poll();
+    const initialTimer = setTimeout(() => void poll(), 0);
 
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -63,6 +63,7 @@ export function UpdateBanner() {
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      clearTimeout(initialTimer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);

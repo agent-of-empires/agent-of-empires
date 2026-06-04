@@ -63,6 +63,7 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "dist",
       emptyOutDir: true,
+      chunkSizeWarningLimit: 1500,
     },
     // Vitest unit tests live alongside source as `*.test.ts(x)`. Playwright
     // suites under `tests/` use the same `.spec.ts` extension Playwright

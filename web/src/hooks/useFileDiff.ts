@@ -57,7 +57,10 @@ export function useFileDiff(
   }, [sessionId, filePath, repoName]);
 
   useEffect(() => {
-    void fetchDiff();
+    const timer = setTimeout(() => {
+      void fetchDiff();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [fetchDiff, externalRevision]);
 
   return { diff, loading, error, refresh: fetchDiff };

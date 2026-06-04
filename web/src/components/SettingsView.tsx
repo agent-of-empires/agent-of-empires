@@ -226,29 +226,28 @@ export function SettingsView({
   const loadSchema = useCallback(async () => {
     setSchemaLoading(true);
     setSchemaError(null);
-    try {
-      const s = await getSettingsSchema();
-      if (!s) {
-        setSchemaError("Failed to load settings schema.");
-        return;
-      }
-      setSchema(s);
-    } catch {
+    const s = await getSettingsSchema().catch(() => null);
+    if (!s) {
       setSchemaError("Failed to load settings schema.");
-    } finally {
       setSchemaLoading(false);
+      return;
     }
+    setSchema(s);
+    setSchemaLoading(false);
   }, []);
 
   useEffect(() => {
-    void loadSchema();
+    const timer = setTimeout(() => {
+      void loadSchema();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [loadSchema]);
 
   // Follow `?profile=` when it changes after mount (e.g. a second deep-link
   // from the Profiles page while Settings stays mounted).
-  useEffect(() => {
-    if (profile) setSelectedProfile(profile);
-  }, [profile]);
+  if (profile && profile !== selectedProfile) {
+    setSelectedProfile(profile);
+  }
 
   const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
 
@@ -307,7 +306,7 @@ export function SettingsView({
   const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
   const web = (settings?.web ?? {}) as Record<string, unknown>;
 
-  const saveField = (
+  const saveField = useCallback((
     section: string,
     sectionData: Record<string, unknown>,
     field: string,
@@ -315,14 +314,14 @@ export function SettingsView({
   ): Promise<boolean> => {
     updateLocal({ [section]: { ...sectionData, [field]: value } });
     return sendSave(section, { [field]: value });
-  };
+  }, [updateLocal, sendSave]);
 
   const saveSubField = useCallback(
     (section: string, field: string, value: unknown): Promise<boolean> => {
       const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
       return saveField(section, sectionData, field, value);
     },
-    [settings, selectedProfile, sendSave, loadSettings],
+    [settings, saveField],
   );
 
   const renderTabContent = () => {

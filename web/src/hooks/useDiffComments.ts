@@ -38,49 +38,48 @@ export function useDiffComments(
     sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE },
   );
 
-  // Skip the first write-through after a session change; the initial
-  // load already mirrors disk and re-saving would no-op anyway. The
-  // ref guards against also writing on mount.
-  const initialMountRef = useRef(true);
-  const lastSessionRef = useRef<string | null>(sessionId);
-
+  // Track the latest state in a ref so save operations always have
+  // the current data without depending on state in effect deps.
+  const stateRef = useRef(state);
   useEffect(() => {
-    if (lastSessionRef.current !== sessionId) {
-      lastSessionRef.current = sessionId;
-      initialMountRef.current = true;
-      setState(sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE });
-    }
-  }, [sessionId]);
+    stateRef.current = state;
+  }, [state]);
+  const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
 
-  // Debounce write-through to localStorage so typing in the intro /
-  // outro textareas (which live in the same state object) doesn't
-  // JSON.stringify + setItem on every keystroke. 200 ms is below
-  // human-perceivable lag for losing a few in-flight keystrokes on a
-  // tab close, and trims write volume by ~10-20x during composition.
+  // Render-time sync: reload from storage when sessionId changes.
+  if (sessionId !== trackedSessionId) {
+    setTrackedSessionId(sessionId);
+    setState(sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE });
+  }
+
+  // Debounced save to localStorage. A counter drives the effect so
+  // it re-runs when state changes, but we read the latest state via
+  // stateRef to avoid a direct state dependency.
+  const [saveCounter, setSaveCounter] = useState(0);
+  const bumpSave = useCallback(() => setSaveCounter((c) => c + 1), []);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!sessionId) return;
-    if (initialMountRef.current) {
-      initialMountRef.current = false;
-      return;
-    }
-    const handle = window.setTimeout(() => {
-      saveComments(sessionId, state);
+    debounceTimerRef.current = setTimeout(() => {
+      saveComments(sessionId, stateRef.current);
     }, 200);
-    return () => window.clearTimeout(handle);
-  }, [sessionId, state]);
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, [sessionId, saveCounter]);
 
   // Flush any pending debounced write before the tab closes / hides
   // so the user doesn't lose the last keystrokes on a refresh.
   useEffect(() => {
     if (!sessionId) return;
-    const flush = () => saveComments(sessionId, state);
+    const flush = () => saveComments(sessionId, stateRef.current);
     window.addEventListener("beforeunload", flush);
     window.addEventListener("pagehide", flush);
     return () => {
       window.removeEventListener("beforeunload", flush);
       window.removeEventListener("pagehide", flush);
     };
-  }, [sessionId, state]);
+  }, [sessionId]);
 
   const addComment = useCallback(
     (draft: DiffCommentDraft): DiffComment => {
@@ -90,9 +89,10 @@ export function useDiffComments(
         ...draft,
       };
       setState((s) => ({ ...s, comments: [...s.comments, created] }));
+      bumpSave();
       return created;
     },
-    [],
+    [bumpSave],
   );
 
   const updateComment = useCallback((id: string, body: string) => {
@@ -103,30 +103,36 @@ export function useDiffComments(
         c.id === id ? { ...c, body, updatedAt: ts } : c,
       ),
     }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   const deleteComment = useCallback((id: string) => {
     setState((s) => ({
       ...s,
       comments: s.comments.filter((c) => c.id !== id),
     }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   const clearComments = useCallback(() => {
     setState((s) => ({ ...s, comments: [] }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   const setClearAfterSend = useCallback((v: boolean) => {
     setState((s) => ({ ...s, clearAfterSend: v }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   const setIntroDraft = useCallback((v: string) => {
     setState((s) => ({ ...s, introDraft: v }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   const setOutroDraft = useCallback((v: string) => {
     setState((s) => ({ ...s, outroDraft: v }));
-  }, []);
+    bumpSave();
+  }, [bumpSave]);
 
   return useMemo(
     () => ({

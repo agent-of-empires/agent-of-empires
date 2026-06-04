@@ -133,8 +133,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // #1911.
   const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
 
-  const steps = useMemo(() => computeSteps(state.data),
-    [state.data.sandboxEnabled, state.data.advancedEnabled]);
+  const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
   const currentStepDef = steps[state.currentStep];
   const isFirst = state.currentStep === 0;

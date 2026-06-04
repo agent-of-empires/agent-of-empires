@@ -7,7 +7,14 @@
 // cancelPrompt are surfaced via state.lastError so the user gets a
 // dismissible banner instead of a silently-lost action.
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   applyEvent,
   emptyAcpState,
@@ -740,7 +747,7 @@ export function useAcpSession(
   // react-you-might-not-need-an-effect/no-external-store-subscription.
   let _visCounter = 0;
   const visCounter = useSyncExternalStore(
-    (cb) => {
+    (cb: () => void) => {
       const handler = () => { _visCounter++; cb(); };
       document.addEventListener("visibilitychange", handler);
       window.addEventListener("pageshow", handler);
@@ -754,7 +761,7 @@ export function useAcpSession(
   );
 
   const isOnline = useSyncExternalStore(
-    (cb) => {
+    (cb: () => void) => {
       window.addEventListener("online", cb);
       window.addEventListener("offline", cb);
       return () => {

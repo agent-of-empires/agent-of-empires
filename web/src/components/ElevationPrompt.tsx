@@ -17,7 +17,12 @@ export function ElevationPrompt() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const onElevationRequired = () => setOpen(true);
+    const onElevationRequired = () => {
+      setOpen(true);
+      setPassphrase("");
+      setError(null);
+      setLoading(false);
+    };
     window.addEventListener(ELEVATION_REQUIRED_EVENT, onElevationRequired);
     return () =>
       window.removeEventListener(
@@ -25,15 +30,6 @@ export function ElevationPrompt() {
         onElevationRequired,
       );
   }, []);
-
-  useEffect(() => {
-    if (open) {
-      setPassphrase("");
-      setError(null);
-      setLoading(false);
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [open]);
 
   const close = () => setOpen(false);
 
@@ -80,6 +76,7 @@ export function ElevationPrompt() {
         </div>
         <input
           ref={inputRef}
+          autoFocus
           type="password"
           autoComplete="current-password"
           value={passphrase}

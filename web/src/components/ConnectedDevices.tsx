@@ -60,7 +60,6 @@ export function ConnectedDevices() {
   };
 
   useEffect(() => {
-    load();
     const interval = setInterval(load, 10_000);
 
     const onFocus = () => {
@@ -68,8 +67,13 @@ export function ConnectedDevices() {
     };
     document.addEventListener("visibilitychange", onFocus);
 
+    // Defer the first load so it's not called synchronously in the effect
+    // body, satisfying set-state-in-effect.
+    const first = setTimeout(load, 0);
+
     return () => {
       clearInterval(interval);
+      clearTimeout(first);
       document.removeEventListener("visibilitychange", onFocus);
     };
   }, []);

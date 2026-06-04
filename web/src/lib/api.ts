@@ -13,6 +13,10 @@ import type {
   CreateSessionRequest,
   SettingsFieldDescriptor,
 } from "./types";
+import {
+  clearDeviceBindingSecret,
+  getOrCreateDeviceBindingSecret,
+} from "./deviceBinding";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> {
@@ -847,11 +851,6 @@ export async function login(
 ): Promise<{ ok: boolean; error?: string }> {
   let deviceBindingSecret: string;
   try {
-    // Imported lazily to keep this module's load cost small; the
-    // helper itself is sync. Generates on first call.
-    const { getOrCreateDeviceBindingSecret } = await import(
-      "./deviceBinding"
-    );
     deviceBindingSecret = getOrCreateDeviceBindingSecret();
   } catch (err) {
     return {
@@ -897,9 +896,6 @@ export async function elevateLogin(
 ): Promise<{ ok: boolean; error?: string; elevated_until_secs?: number }> {
   let bindingSecret: string;
   try {
-    const { getOrCreateDeviceBindingSecret } = await import(
-      "./deviceBinding"
-    );
     bindingSecret = getOrCreateDeviceBindingSecret();
   } catch (err) {
     return {
@@ -950,7 +946,6 @@ export async function logout(): Promise<void> {
     // holds a valid binding for the next session created on this
     // browser. See #1131.
     try {
-      const { clearDeviceBindingSecret } = await import("./deviceBinding");
       clearDeviceBindingSecret();
     } catch {
       // ignore

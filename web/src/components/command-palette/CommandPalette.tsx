@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo, useRef } from "react";
 import { Command } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
 import { GROUP_ORDER } from "./groups";
@@ -12,18 +12,6 @@ interface Props {
 
 export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    if (open) {
-      previousFocusRef.current = document.activeElement as HTMLElement | null;
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => {
-        clearTimeout(t);
-        previousFocusRef.current?.focus?.();
-      };
-    }
-  }, [open]);
 
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
@@ -74,6 +62,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </svg>
           <Command.Input
             ref={inputRef}
+            autoFocus
             placeholder="Search actions, sessions, settings…"
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />

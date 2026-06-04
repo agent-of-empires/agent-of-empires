@@ -54,13 +54,10 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
   const [draft, setDraft] = useState(value);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (editing) inputRef.current?.select();
-  }, [editing]);
-
   const startEditing = () => {
     setDraft(value);
     setEditing(true);
+    requestAnimationFrame(() => inputRef.current?.select());
   };
 
   const commit = () => {
@@ -126,13 +123,10 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
   const [draft, setDraft] = useState(prefix);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (editing) inputRef.current?.select();
-  }, [editing]);
-
   const startEditing = () => {
     setDraft(prefix);
     setEditing(true);
+    requestAnimationFrame(() => inputRef.current?.select());
   };
 
   const commit = () => {

@@ -19,7 +19,14 @@ import {
   type Unstable_TriggerAdapter,
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   AtSign,
   ChevronUp,
@@ -472,7 +479,7 @@ export function Composer({
   // replaces the effect-based subscription to satisfy
   // no-external-store-subscription.
   useSyncExternalStore(
-    (_callback) => {
+    (_callback: () => void) => {
       const onOpen = (e: Event) => {
         const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
         if (detail?.sessionId === sessionId) {

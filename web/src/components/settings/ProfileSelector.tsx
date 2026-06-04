@@ -24,6 +24,20 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     fetchProfiles().then(setProfiles);
   }, []);
 
+  const validateName = (name: string): string | null => {
+    if (!name) return "Name is required";
+    if (!/^[a-zA-Z0-9_-]+$/.test(name))
+      return "Only letters, digits, hyphens, and underscores";
+    return null;
+  };
+
+  const closeInput = () => {
+    setCreating(false);
+    setRenaming(false);
+    setInputValue("");
+    setError(null);
+  };
+
   useEffect(() => {
     load();
   }, [load]);
@@ -41,13 +55,6 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [creating, renaming]);
-
-  const validateName = (name: string): string | null => {
-    if (!name) return "Name is required";
-    if (!/^[a-zA-Z0-9_-]+$/.test(name))
-      return "Only letters, digits, hyphens, and underscores";
-    return null;
-  };
 
   const handleCreate = async () => {
     const trimmed = inputValue.trim();
@@ -77,13 +84,6 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
       if (selectedProfile === name) onSelect(fallback === name ? "default" : fallback);
       load();
     }
-  };
-
-  const closeInput = () => {
-    setCreating(false);
-    setRenaming(false);
-    setInputValue("");
-    setError(null);
   };
 
   const startRename = () => {

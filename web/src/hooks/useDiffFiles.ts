@@ -74,19 +74,28 @@ export function useDiffFiles(
     enabledRef.current = enabled;
   }, [enabled]);
 
+  // Reset state when sessionId changes (render-time, avoids effect-based setState)
+  const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
+  if (sessionId !== trackedSessionId) {
+    setTrackedSessionId(sessionId);
+    if (sessionId === null) {
+      setFiles([]);
+      setLoading(false);
+      setRevision(0);
+    } else {
+      setLoading(true);
+    }
+  }
+
   // Fetch on session change; invalidate any in-flight requests.
   useEffect(() => {
     requestIdRef.current += 1;
-    if (!sessionId) {
-      setFiles([]);
-      setLoading(false);
-      lastFingerprintRef.current = "";
-      setRevision(0);
-      return;
-    }
-    setLoading(true);
     lastFingerprintRef.current = "";
-    void fetchFiles();
+    if (!sessionId) return;
+    const timer = setTimeout(() => {
+      void fetchFiles();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [sessionId, fetchFiles]);
 
   // Poll when enabled

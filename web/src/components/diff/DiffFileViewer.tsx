@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useMemo, useRef, useState } from "react";
 import { useFileDiff } from "../../hooks/useFileDiff";
 import {
   useHighlightedLines,
@@ -264,13 +264,20 @@ export function DiffFileViewer({
   // file / repo / session, or the diff refreshes. Without this an
   // unfinished selection or open draft from file A would render in
   // file B (and save the wrong filePath against the wrong snippet).
-  useEffect(() => {
+  // Synced at render time (not in an effect) to avoid set-state-in-effect.
+  const syncKey = `${sessionId}-${repoName}-${filePath}-${revision}`;
+  const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
+  if (syncKey !== handledSyncKey) {
+    setHandledSyncKey(syncKey);
     setRangeStart(null);
     setDraft(null);
-  }, [sessionId, repoName, filePath, revision]);
+  }
 
-  const hunks = diff?.hunks ?? [];
-  const comments = commentsStore?.comments ?? [];
+  const hunks = useMemo(() => diff?.hunks ?? [], [diff]);
+  const comments = useMemo(
+    () => commentsStore?.comments ?? [],
+    [commentsStore],
+  );
 
   const anchored: AnchoredComment[] = useMemo(
     () => anchorComments(comments, filePath, repoName, hunks),

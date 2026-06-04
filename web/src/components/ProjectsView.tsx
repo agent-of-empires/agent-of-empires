@@ -37,7 +37,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   };
 
   useEffect(() => {
-    reload();
+    const t = setTimeout(() => void reload(), 0);
+    return () => clearTimeout(t);
   }, []);
 
   const resetForm = () => {

@@ -773,10 +773,6 @@ export const SessionRow = memo(function SessionRow({
     };
   }, []);
 
-  useEffect(() => {
-    if (renaming) renameRef.current?.select();
-  }, [renaming]);
-
   useClampedMenuPosition(contextMenu, menuRef, setContextMenu);
 
   useEffect(() => {
@@ -850,6 +846,7 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     setRenameValue(sessionTitle || label);
     setRenaming(true);
+    requestAnimationFrame(() => renameRef.current?.select());
   };
 
   const commitRename = async () => {
@@ -1733,10 +1730,6 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
     openMenuAt(rect.left + 12, rect.bottom + 4);
   };
 
-  useEffect(() => {
-    if (renaming) renameRef.current?.select();
-  }, [renaming]);
-
   useClampedMenuPosition(contextMenu, menuRef, setContextMenu);
 
   useEffect(() => {
@@ -1888,6 +1881,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               setContextMenu(null);
               setRenameValue(group.alias ?? group.defaultDisplayName);
               setRenaming(true);
+              requestAnimationFrame(() => renameRef.current?.select());
             }}
             data-testid="sidebar-group-context-menu-rename"
             className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
@@ -2231,9 +2225,9 @@ export function WorkspaceSidebar({
   // Read-only viewers can't act on a selection (the bulk bar is hidden), so
   // never let one accumulate: drop any existing selection when read-only
   // turns on. Row clicks are forced down the navigate path below.
-  useEffect(() => {
-    if (readOnly) dispatchSelection({ type: "clear" });
-  }, [readOnly]);
+  if (readOnly && selection.selectedIds.size > 0) {
+    dispatchSelection({ type: "clear" });
+  }
 
   // Selected workspaces (existing ones only) and their per-action eligibility
   // buckets, for the bulk bar. Deduped against existence so a stale id never
@@ -2334,11 +2328,10 @@ export function WorkspaceSidebar({
       if (o) setFilterQuery("");
       return !o;
     });
+    if (!filterOpen) {
+      requestAnimationFrame(() => filterRef.current?.focus());
+    }
   };
-
-  useEffect(() => {
-    if (filterOpen) filterRef.current?.focus();
-  }, [filterOpen]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();

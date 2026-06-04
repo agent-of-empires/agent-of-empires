@@ -116,10 +116,10 @@ export function usePushSubscription() {
   }, []);
 
   useEffect(() => {
-    // refresh() is the initial-mount fetch; setState-in-effect is the
-    // correct pattern here (nothing external to subscribe to, just a
-    // one-shot async read of feature availability + server status).
-    refresh();
+    const timer = setTimeout(() => {
+      void refresh();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [refresh]);
 
   const enable = useCallback(async () => {

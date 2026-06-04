@@ -29,11 +29,13 @@ export function ContextPrimerBanner({
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    // Reset transient state whenever a new reset incident lands.
+  // Reset transient state whenever a new reset incident lands.
+  const [handledResetSeq, setHandledResetSeq] = useState<number | null>(null);
+  if (available?.resetSeq !== handledResetSeq) {
+    setHandledResetSeq(available?.resetSeq ?? null);
     setError(null);
     setLoading(false);
-  }, [available?.resetSeq]);
+  }
 
   useEffect(() => {
     return () => {

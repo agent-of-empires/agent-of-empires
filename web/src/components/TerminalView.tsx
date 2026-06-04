@@ -55,12 +55,27 @@ export function TerminalView({
     active,
   );
   const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
+  const [trackedSessionId, setTrackedSessionId] = useState(session.id);
+  if (session.id !== trackedSessionId) {
+    setTrackedSessionId(session.id);
+    setEnsureState("pending");
+    setEnsureError(null);
+  }
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
   // On mobile, pad the viewport by the live keyboard occlusion so the
   // terminal pane shrinks while the soft keyboard is up and grows back when
   // it dismisses. On desktop keyboardOcclusion stays 0 and this is a no-op.
   const appliedKeyboardPadding = keyboardOcclusion;
+
+  const focusSelf = useCallback(() => {
+    const ta = termRef.current?.element?.querySelector("textarea");
+    if (ta instanceof HTMLElement) {
+      ta.focus();
+      return true;
+    }
+    return false;
+  }, [termRef]);
 
   // Sync React state → hook ref in an effect. The mobile toolbar toggles
   // `ctrlActive` but the onData callback reads the ref to decide whether
@@ -76,19 +91,19 @@ export function TerminalView({
 
   useEffect(() => {
     const controller = new AbortController();
-    setEnsureState("pending");
-    setEnsureError(null);
     ensureSession(session.id, controller.signal).then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
         setEnsureState("ready");
+        if (active) activate();
+        if (consumePendingTerminalFocus("agent")) focusSelf();
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
       }
     });
     return () => controller.abort();
-  }, [session.id]);
+  }, [session.id, active, activate, focusSelf]);
 
   const retryEnsure = useCallback(() => {
     setEnsureState((prev) => {
@@ -99,6 +114,8 @@ export function TerminalView({
         if (controller.signal.aborted) return;
         if (res.ok) {
           setEnsureState("ready");
+          if (active) activate();
+          if (consumePendingTerminalFocus("agent")) focusSelf();
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -106,7 +123,7 @@ export function TerminalView({
       });
       return "pending";
     });
-  }, [session.id]);
+  }, [session.id, active, activate, focusSelf]);
 
   const [hintDismissed, setHintDismissed] = useState(() => {
     try {
@@ -128,18 +145,6 @@ export function TerminalView({
     return () => clearTimeout(t);
   }, [appliedKeyboardPadding]);
 
-  // Returns true if focus was applied. Mirrors PairedTerminal so the same
-  // pending-latch fallback covers both terminals when the terminal hasn't
-  // mounted yet (ensureSession round-trip on a fresh session).
-  const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element?.querySelector("textarea");
-    if (ta instanceof HTMLElement) {
-      ta.focus();
-      return true;
-    }
-    return false;
-  }, [termRef]);
-
   // Cmd+` shortcut focuses this terminal when "agent" is the dispatched target.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
@@ -150,15 +155,6 @@ export function TerminalView({
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
   }, [focusSelf]);
-
-  useEffect(() => {
-    if (ensureState !== "ready") return;
-    if (consumePendingTerminalFocus("agent")) focusSelf();
-  }, [ensureState, focusSelf]);
-
-  useEffect(() => {
-    if (active && ensureState === "ready") activate();
-  }, [active, ensureState, activate]);
 
   // Auto-keyboard-open on initial connect removed (#1178): the
   // KeyboardFab is always visible and lets the user open the keyboard

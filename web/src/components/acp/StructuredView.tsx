@@ -1069,23 +1069,20 @@ export function WorkingSpinner({
   }, [lastActivityRef]);
 
   // Live countdown to the cancel-escalation deadline while cancelling, so
-  // "Stopping…" shows when the worker will be force-restarted. Computed in
-  // an effect (not render) to keep the render pure. See #1727.
+  // "Stopping…" shows when the worker will be force-restarted. State-reset to
+  // null is synced at render time (outside the effect) so it doesn't trigger
+  // set-state-in-effect; the countdown interval runs in the effect.
   const [escalatesInSecs, setEscalatesInSecs] = useState<number | null>(null);
+  if (!cancelEscalatesAt && escalatesInSecs !== null) {
+    setEscalatesInSecs(null);
+  }
   useEffect(() => {
-    if (!cancelEscalatesAt) {
-      setEscalatesInSecs(null);
-      return;
-    }
+    if (!cancelEscalatesAt) return;
     const target = new Date(cancelEscalatesAt).getTime();
-    if (Number.isNaN(target)) {
-      setEscalatesInSecs(null);
-      return;
-    }
-    const tick = () =>
+    if (Number.isNaN(target)) return;
+    const t = window.setInterval(() => {
       setEscalatesInSecs(Math.max(0, Math.ceil((target - Date.now()) / 1000)));
-    tick();
-    const t = window.setInterval(tick, 1000);
+    }, 1000);
     return () => window.clearInterval(t);
   }, [cancelEscalatesAt]);
 

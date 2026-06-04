@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 import {
   setSessionArchive,
@@ -33,12 +33,11 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
   const [overlay, setOverlay] = useState<Map<string, OptimisticTriage>>(
     () => new Map(),
   );
-
-  // Drop overrides the server has caught up to. reconcileOptimistic returns
-  // the same map reference when nothing changed, so this never loops.
-  useEffect(() => {
+  const [trackedWorkspaces, setTrackedWorkspaces] = useState(workspaces);
+  if (workspaces !== trackedWorkspaces) {
+    setTrackedWorkspaces(workspaces);
     setOverlay((prev) => reconcileOptimistic(prev, workspaces));
-  }, [workspaces]);
+  }
 
   const setOverride = useCallback(
     (workspaceId: string, patch: Partial<OptimisticTriage>) => {

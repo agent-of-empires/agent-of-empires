@@ -135,18 +135,16 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
 
   useEffect(() => {
     fetchSessions().then((envelope) => {
-      if (envelope) setRecent(collectRecentProjects(envelope.sessions).slice(0, 6));
+      if (envelope) {
+        const projects = collectRecentProjects(envelope.sessions).slice(0, 6);
+        setRecent(projects);
+        if (projects.length === 0 && !initialTab) {
+          setActiveTab("browse");
+        }
+      }
       setLoading(false);
     });
-  }, []);
-
-  // Default to browse tab when no recent projects exist (unless an explicit tab was requested)
-  useEffect(() => {
-    if (!loading && recent.length === 0 && !initialTab) {
-      setActiveTab("browse");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, recent.length]);
+  }, [initialTab]);
 
   const filteredRecent = useMemo(() => {
     if (!data.path) return recent;

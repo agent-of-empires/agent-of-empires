@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 /** Renders the GitHub avatar for a repo owner. Hides itself on load error. */
 export function OwnerAvatar({
@@ -8,9 +8,8 @@ export function OwnerAvatar({
   owner: string | null;
   size?: number;
 }) {
-  const [hidden, setHidden] = useState(false);
-
-  useEffect(() => setHidden(false), [owner]);
+  const [erroredOwner, setErroredOwner] = useState<string | null>(null);
+  const hidden = owner === erroredOwner;
 
   if (!owner || hidden) return null;
 
@@ -21,7 +20,7 @@ export function OwnerAvatar({
       width={size}
       height={size}
       className="rounded-sm shrink-0"
-      onError={() => setHidden(true)}
+      onError={() => setErroredOwner(owner)}
     />
   );
 }
