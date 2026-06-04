@@ -79,7 +79,21 @@ export function useMobileKeyboard() {
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;
     const mql = window.matchMedia("(pointer: coarse)");
-    const onChange = () => store.update({ isMobile: mql.matches });
+    const onChange = () => {
+      if (mql.matches) {
+        store.update({ isMobile: true });
+      } else {
+        // Leaving mobile mode: clear any keyboard metrics so stale padding
+        // from a prior keyboard session can't survive on a now-desktop layout.
+        store.update({
+          isMobile: false,
+          keyboardOpen: false,
+          keyboardHeight: 0,
+          keyboardOcclusion: 0,
+          stableViewportHeight: 0,
+        });
+      }
+    };
     mql.addEventListener?.("change", onChange);
     return () => mql.removeEventListener?.("change", onChange);
   }, [store]);
