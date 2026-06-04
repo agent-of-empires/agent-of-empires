@@ -152,16 +152,21 @@ function dataUri(mimeType: string, data: string): string {
   return `data:${mimeType};base64,${data}`;
 }
 
-/** Schemes safe to render in an `href` / `img src`. Tool output uris are
- *  agent-controlled, so a `javascript:` uri must never reach the DOM where
- *  a click could execute it. Returns the uri when its scheme is allowlisted
- *  (resolved against the current origin so relative paths keep working) and
- *  null otherwise. See #1818 review. */
-const SAFE_URI_SCHEMES = new Set(["http:", "https:", "file:", "mailto:"]);
-function safeUri(uri: string): string | null {
+// Tool output uris are agent-controlled, so a `javascript:` uri must never
+// reach the DOM where a click could execute it. The allowlist is split by
+// sink: clickable links accept the broader set (a `mailto:` link is valid,
+// a `mailto:` image is not), while media `src` values accept only schemes a
+// browser can actually load over the dashboard's http origin. See #1818
+// review.
+const SAFE_LINK_SCHEMES = new Set(["http:", "https:", "file:", "mailto:"]);
+const SAFE_MEDIA_SCHEMES = new Set(["http:", "https:"]);
+
+/** Return `uri` unchanged when its scheme is in `schemes` (resolved against
+ *  the current origin so relative paths keep working), else null. */
+function safeUri(uri: string, schemes: ReadonlySet<string>): string | null {
   try {
     const parsed = new URL(uri, window.location.href);
-    return SAFE_URI_SCHEMES.has(parsed.protocol) ? uri : null;
+    return schemes.has(parsed.protocol) ? uri : null;
   } catch {
     return null;
   }
@@ -194,7 +199,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
       const src = block.data
         ? dataUri(block.mime_type, block.data)
         : block.uri
-          ? safeUri(block.uri)
+          ? safeUri(block.uri, SAFE_MEDIA_SCHEMES)
           : null;
       if (!src) {
         return (
@@ -230,7 +235,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
       );
     }
     case "resource_link": {
-      const href = safeUri(block.uri);
+      const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
       if (!href) {
         return (
           <MediaPlaceholder
@@ -274,7 +279,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
           </a>
         );
       }
-      const href = safeUri(block.uri);
+      const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
       if (!href) {
         return (
           <MediaPlaceholder
