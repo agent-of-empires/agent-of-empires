@@ -80,6 +80,10 @@ fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) 
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     use std::time::{Duration, Instant};
+    if child_exited(child) {
+        let _ = child.wait();
+        return;
+    }
     let pid = Pid::from_raw(child.id() as i32);
     let _ = killpg(pid, Signal::SIGTERM);
     let deadline = Instant::now() + grace;
@@ -136,8 +140,6 @@ fn is_watch_relevant(path: &Path) -> bool {
 /// so frontend HMR and the browser session survive the backend bounce.
 #[cfg(unix)]
 fn run_dev(args: DevArgs) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -204,8 +206,7 @@ fn run_dev(args: DevArgs) {
             // don't orphan a backend on the serve port.
             eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
             if let Some(mut serve) = serve.take() {
-                let _ = killpg(Pid::from_raw(serve.id() as i32), Signal::SIGTERM);
-                let _ = serve.wait();
+                terminate_group(&mut serve, Duration::from_secs(2));
             }
             std::process::exit(1);
         }
