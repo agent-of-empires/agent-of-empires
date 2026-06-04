@@ -34,6 +34,9 @@ export function useDiffFiles(
   // Session the `diff_panel` usage signal last fired for, so opening the panel
   // reports once per session rather than on every 10s poll tick or re-render.
   const diffPanelSeenForRef = useRef<string | null>(null);
+  // Mirrors `enabled` so fetchFiles can read the current panel state without
+  // taking it as a dep (which would tear down and re-run the fetch effects).
+  const enabledRef = useRef(enabled);
 
   const fetchFiles = useCallback(async () => {
     if (!sessionId) return;
@@ -51,9 +54,25 @@ export function useDiffFiles(
         setWarning(resp.warning ?? null);
         setRevision((r) => r + 1);
       }
+      // The diff list loaded successfully: report diff_panel once per session.
+      // Gated on enabledRef so a background fetch fired on session change while
+      // the panel is closed does not count, and on the per-session ref so the
+      // 10s poll does not re-fire it.
+      if (
+        enabledRef.current &&
+        diffPanelSeenForRef.current !== capturedSessionId
+      ) {
+        diffPanelSeenForRef.current = capturedSessionId;
+        reportTelemetrySeen("diff_panel");
+      }
     }
     setLoading(false);
   }, [sessionId]);
+
+  // Keep enabledRef in sync with the latest panel state.
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
 
   // Fetch on session change; invalidate any in-flight requests.
   useEffect(() => {
@@ -77,12 +96,6 @@ export function useDiffFiles(
       intervalRef.current = null;
     }
     if (enabled && sessionId) {
-      // The diff panel is open for this session: report a feature-usage signal
-      // once per session activation (deduped by sessionId), not per poll tick.
-      if (diffPanelSeenForRef.current !== sessionId) {
-        diffPanelSeenForRef.current = sessionId;
-        reportTelemetrySeen("diff_panel");
-      }
       intervalRef.current = setInterval(() => void fetchFiles(), POLL_INTERVAL);
     }
     return () => {
