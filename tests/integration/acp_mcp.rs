@@ -79,7 +79,7 @@ async fn configured_mcp_servers_reach_new_session() {
     let mut config = base_config(std::env::temp_dir(), record.path());
     config.mcp_servers = servers;
 
-    let mut client = AcpClient::spawn(config, AcpSessionId("mcp-forward".into()))
+    let client = AcpClient::spawn(config, AcpSessionId("mcp-forward".into()))
         .await
         .expect("spawn shim agent");
 
@@ -109,7 +109,7 @@ async fn no_config_forwards_empty_list() {
     let mut config = base_config(std::env::temp_dir(), record.path());
     config.mcp_servers = servers;
 
-    let mut client = AcpClient::spawn(config, AcpSessionId("mcp-empty".into()))
+    let client = AcpClient::spawn(config, AcpSessionId("mcp-empty".into()))
         .await
         .expect("spawn shim agent");
 
