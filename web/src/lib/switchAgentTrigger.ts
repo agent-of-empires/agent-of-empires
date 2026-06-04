@@ -21,10 +21,16 @@ export interface OpenSwitchAgentDetail {
 }
 
 let pendingSwitchAgent: string | null = null;
+const listeners = new Set<() => void>();
+
+function emitPendingSwitchAgent(): void {
+  listeners.forEach((listener) => listener());
+}
 
 export function requestSwitchAgent(sessionId: string): void {
   if (typeof window === "undefined") return;
   pendingSwitchAgent = sessionId;
+  emitPendingSwitchAgent();
   window.dispatchEvent(
     new CustomEvent<OpenSwitchAgentDetail>(OPEN_SWITCH_AGENT_EVENT, {
       detail: { sessionId },
@@ -32,12 +38,29 @@ export function requestSwitchAgent(sessionId: string): void {
   );
 }
 
+export function subscribePendingSwitchAgent(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+export function getPendingSwitchAgent(): string | null {
+  return pendingSwitchAgent;
+}
+
+export function clearPendingSwitchAgent(): void {
+  if (pendingSwitchAgent === null) return;
+  pendingSwitchAgent = null;
+  emitPendingSwitchAgent();
+}
+
 // Returns true (and clears the latch) when the stashed request targets
 // this session. The Composer calls it on mount so a navigation-then-open
 // request lands once the target session's structured view is ready.
 export function consumePendingSwitchAgent(sessionId: string): boolean {
   if (pendingSwitchAgent === sessionId) {
-    pendingSwitchAgent = null;
+    clearPendingSwitchAgent();
     return true;
   }
   return false;

@@ -226,14 +226,18 @@ export function SettingsView({
   const loadSchema = useCallback(async () => {
     setSchemaLoading(true);
     setSchemaError(null);
-    const s = await getSettingsSchema().catch(() => null);
-    if (!s) {
+    try {
+      const s = await getSettingsSchema();
+      if (!s) {
+        setSchemaError("Failed to load settings schema.");
+        return;
+      }
+      setSchema(s);
+    } catch {
       setSchemaError("Failed to load settings schema.");
+    } finally {
       setSchemaLoading(false);
-      return;
     }
-    setSchema(s);
-    setSchemaLoading(false);
   }, []);
 
   useEffect(() => {

@@ -90,7 +90,9 @@ function PairedTerminal({
         if (cancelled) return;
         if (ok) {
           setReady(true);
-          if (consumePendingTerminalFocus("paired")) focusSelf();
+          requestAnimationFrame(() => {
+            if (consumePendingTerminalFocus("paired")) focusSelf();
+          });
         } else setBootError(true);
       })
       .catch(() => {

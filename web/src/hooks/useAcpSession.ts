@@ -745,18 +745,26 @@ export function useAcpSession(
   // Subscribe to visibility+pageshow and online via useSyncExternalStore
   // so no effect directly subscribes to an external store, satisfying
   // react-you-might-not-need-an-effect/no-external-store-subscription.
-  let _visCounter = 0;
+  const visCounterRef = useRef(0);
+  const subscribeVisibility = useCallback((cb: () => void) => {
+    const handler = () => {
+      visCounterRef.current += 1;
+      cb();
+    };
+    document.addEventListener("visibilitychange", handler);
+    window.addEventListener("pageshow", handler);
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("pageshow", handler);
+    };
+  }, []);
+  const getVisibilitySnapshot = useCallback(
+    () => visCounterRef.current,
+    [],
+  );
   const visCounter = useSyncExternalStore(
-    (cb: () => void) => {
-      const handler = () => { _visCounter++; cb(); };
-      document.addEventListener("visibilitychange", handler);
-      window.addEventListener("pageshow", handler);
-      return () => {
-        document.removeEventListener("visibilitychange", handler);
-        window.removeEventListener("pageshow", handler);
-      };
-    },
-    () => _visCounter,
+    subscribeVisibility,
+    getVisibilitySnapshot,
     () => 0,
   );
 

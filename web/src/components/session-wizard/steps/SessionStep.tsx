@@ -199,6 +199,12 @@ function AdvancedWorktreeOptions({
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [hasFocus, setHasFocus] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const branchLoadKey = open ? data.path : null;
+  const [trackedBranchLoadKey, setTrackedBranchLoadKey] = useState(branchLoadKey);
+  if (branchLoadKey !== trackedBranchLoadKey) {
+    setTrackedBranchLoadKey(branchLoadKey);
+    setBranches(null);
+  }
   const loading = open && branches === null;
 
   useEffect(() => {

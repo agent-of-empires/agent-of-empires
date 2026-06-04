@@ -61,6 +61,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   const loadSeq = useRef(0);
 
   const loadProfileSettings = (name: string) => {
+    const seq = ++loadSeq.current;
     if (!name) {
       setProfileSettings(null);
       setGlobalHooks(undefined);
@@ -68,12 +69,12 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       setError(null);
       return;
     }
-    const seq = ++loadSeq.current;
     Promise.all([getProfileSettings(name), fetchSettings()])
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
         setGlobalHooks(global?.hooks as HooksOverride | undefined);
+        setError(null);
         setDescription(
           typeof profile?.description === "string" ? profile.description : "",
         );
@@ -82,6 +83,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
         if (seq !== loadSeq.current) return;
         setProfileSettings(null);
         setGlobalHooks(undefined);
+        setDescription("");
         setError("Failed to load profile settings");
       });
   };

@@ -413,9 +413,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const prevActiveSessionIdRef = useRef(activeSessionId);
   if (activeSessionId !== prevActiveSessionIdRef.current) {
     prevActiveSessionIdRef.current = activeSessionId;
-    if (!activeSessionId) {
-      setSelectedFile(null);
-    }
     setRightPanelView("agent");
     setPickerOpen(false);
     setPairedMounted(false);

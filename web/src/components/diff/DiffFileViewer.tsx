@@ -265,7 +265,12 @@ export function DiffFileViewer({
   // unfinished selection or open draft from file A would render in
   // file B (and save the wrong filePath against the wrong snippet).
   // Synced at render time (not in an effect) to avoid set-state-in-effect.
-  const syncKey = `${sessionId}-${repoName}-${filePath}-${revision}`;
+  const syncKey = JSON.stringify([
+    sessionId,
+    repoName ?? null,
+    filePath,
+    revision,
+  ]);
   const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
   if (syncKey !== handledSyncKey) {
     setHandledSyncKey(syncKey);

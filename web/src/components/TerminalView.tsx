@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -61,6 +61,7 @@ export function TerminalView({
     setEnsureState("pending");
     setEnsureError(null);
   }
+  const lastEnsuredSessionIdRef = useRef<string | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
   // On mobile, pad the viewport by the live keyboard occlusion so the
@@ -90,10 +91,16 @@ export function TerminalView({
   }, [clearCtrlRef]);
 
   useEffect(() => {
+    if (lastEnsuredSessionIdRef.current === session.id) {
+      if (active) activate();
+      if (consumePendingTerminalFocus("agent")) focusSelf();
+      return;
+    }
     const controller = new AbortController();
     ensureSession(session.id, controller.signal).then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
+        lastEnsuredSessionIdRef.current = session.id;
         setEnsureState("ready");
         if (active) activate();
         if (consumePendingTerminalFocus("agent")) focusSelf();
@@ -113,6 +120,7 @@ export function TerminalView({
       ensureSession(session.id, controller.signal).then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
+          lastEnsuredSessionIdRef.current = session.id;
           setEnsureState("ready");
           if (active) activate();
           if (consumePendingTerminalFocus("agent")) focusSelf();

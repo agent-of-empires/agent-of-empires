@@ -40,9 +40,9 @@ import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
-  OPEN_SWITCH_AGENT_EVENT,
-  consumePendingSwitchAgent,
-  type OpenSwitchAgentDetail,
+  clearPendingSwitchAgent,
+  getPendingSwitchAgent,
+  subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import type {
   AcpState,
@@ -341,19 +341,23 @@ export function Composer({
     [pendingAttachments.length, promptCapabilities, setPendingAttachments],
   );
 
-  // Reconcile already-staged attachments when capabilities change (e.g.
-  // after a manual agent switch): drop files whose kind the new agent no
-  // longer supports so they cannot be submitted. `attachmentsEnabled`
-  // only gates new intake, not files staged under the previous agent.
-  if (promptCapabilities && pendingAttachments.some((att) => !kindSupported(att.kind, promptCapabilities))) {
-    setPendingAttachments((prev) => prev.filter((att) => kindSupported(att.kind, promptCapabilities)));
-  }
+  const supportedPendingAttachments = useMemo(
+    () =>
+      promptCapabilities
+        ? pendingAttachments.filter((att) =>
+            kindSupported(att.kind, promptCapabilities),
+          )
+        : pendingAttachments,
+    [pendingAttachments, promptCapabilities],
+  );
 
   const removeAttachment = useCallback(
     (index: number) => {
-      setPendingAttachments((prev) => prev.filter((_, i) => i !== index));
+      const target = supportedPendingAttachments[index];
+      if (!target) return;
+      setPendingAttachments((prev) => prev.filter((att) => att !== target));
     },
-    [setPendingAttachments],
+    [setPendingAttachments, supportedPendingAttachments],
   );
 
   // When the soft keyboard is up the App root's safe-area-inset-bottom
@@ -457,41 +461,27 @@ export function Composer({
       taRef,
       composerRuntime,
       enqueuePrompt,
-      pendingAttachments,
+      supportedPendingAttachments,
       () => setPendingAttachments([]),
     );
-  }, [composerRuntime, enqueuePrompt, pendingAttachments, setPendingAttachments]);
+  }, [
+    composerRuntime,
+    enqueuePrompt,
+    setPendingAttachments,
+    supportedPendingAttachments,
+  ]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
   // trigger below. Unlike the rate-limit recovery path (which lives up in
   // StructuredView), this is available at any time so a user can hand back
   // to, say, claude after a rate-limit handoff to codex.
-  const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
-  // Open on a switch-agent request targeting this session. The dispatched
-  // event covers the already-open session; the pending latch (consumed during
-  // render) covers the case where the user picked the menu item on another
-  // session and navigation mounted this Composer a tick later.
-  if (consumePendingSwitchAgent(sessionId)) {
-    setSwitchAgentOpen(true);
-  }
-  // Subscribe to cross-component switch-agent events. useSyncExternalStore
-  // replaces the effect-based subscription to satisfy
-  // no-external-store-subscription.
-  useSyncExternalStore(
-    (_callback: () => void) => {
-      const onOpen = (e: Event) => {
-        const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
-        if (detail?.sessionId === sessionId) {
-          consumePendingSwitchAgent(sessionId);
-          setSwitchAgentOpen(true);
-        }
-      };
-      window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-      return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-    },
-    () => 0,
+  const pendingSwitchAgentSessionId = useSyncExternalStore(
+    subscribePendingSwitchAgent,
+    getPendingSwitchAgent,
+    () => null,
   );
+  const switchAgentOpen = pendingSwitchAgentSessionId === sessionId;
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -834,9 +824,9 @@ export function Composer({
 
             {/* Staged attachments — thumbnails for images, labelled
                 chips for audio / resources. Removable before send. */}
-            {pendingAttachments.length > 0 && (
+            {supportedPendingAttachments.length > 0 && (
               <div className="flex flex-wrap gap-2 px-3 pt-1">
-                {pendingAttachments.map((att, i) => (
+                {supportedPendingAttachments.map((att, i) => (
                   <div
                     key={`${att.name ?? att.kind}-${i}`}
                     className="group/att relative flex items-center gap-2 rounded-md border border-surface-700 bg-surface-800 py-1 pl-1 pr-2 text-[11px] text-text-secondary"
@@ -960,7 +950,7 @@ export function Composer({
         open={switchAgentOpen}
         sessionId={sessionId}
         currentAgent={currentAgent}
-        onClose={() => setSwitchAgentOpen(false)}
+        onClose={() => clearPendingSwitchAgent()}
         onPrefill={(text) => {
           composerRuntime.setText(text);
           requestAnimationFrame(() => {

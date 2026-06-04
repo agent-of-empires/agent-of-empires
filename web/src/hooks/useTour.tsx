@@ -155,11 +155,11 @@ export function useTour({
     const automated = isAutomatedSession();
     if (
       !shouldAutoLaunch({
-        autoLaunchReady: autoLaunchReadyRef.current,
-        seenKnown: seenKnownRef.current,
-        scope: scopeRef.current,
-        isDesktop: isDesktopRef.current,
-        seen: seenRef.current,
+        autoLaunchReady,
+        seenKnown,
+        scope,
+        isDesktop,
+        seen,
         automated,
       })
     )
@@ -168,16 +168,7 @@ export function useTour({
       autoStartedRef.current = true;
     });
     return () => cancelAnimationFrame(id);
-  }, [autoLaunchReady, seenKnown, seen, scope, isDesktop, begin]);
-
-  // Navigating to a different surface mid-tour cancels it without marking seen,
-  // so a returning user can still get the structured view steps on a later re-trigger.
-  useEffect(() => {
-    if (prevScopeRef.current !== scope) {
-      prevScopeRef.current = scope;
-      setRun(false);
-    }
-  }, [scope]);
+  }, [autoLaunchReady, seenKnown, scope, isDesktop, seen]);
 
   const handleFinish = useCallback(
     (markSeen: boolean) => {
