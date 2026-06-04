@@ -445,7 +445,7 @@ export async function setTelemetryConsent(
 }
 
 /// Tell the daemon the web dashboard or cockpit UI was opened, so its next
-/// opt-in snapshot can carry web_seen / cockpit_seen. Best-effort.
+/// opt-in snapshot can carry the `usage_seen` open-count map. Best-effort.
 export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
   void fetch("/api/telemetry/seen", {
     method: "POST",

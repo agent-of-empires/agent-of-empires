@@ -22,12 +22,16 @@ pub mod events;
 pub mod features;
 pub mod sanitize;
 mod state;
+pub mod usage_signals;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub use events::{ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
-pub use state::{cli_process_start_due, install_id, record_cli_process_start, reset_install_id};
+pub use events::{CliUsage, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
+pub use state::{
+    cli_usage_due, ensure_install_id, install_id, record_cli_command, record_cli_usage_flush,
+    reset_install_id,
+};
 
 use crate::session::Instance;
 
@@ -52,16 +56,41 @@ const DEFAULT_ENDPOINT: &str = "https://telemetry.agent-of-empires.com/v1/ingest
 /// gateway must be configured to require this exact value.
 const TELEMETRY_KEY: &str = "7bc5a4e45ce861662b9690a7105da988";
 
-/// CLI `process_start` is the only unbounded event source (one per `aoe`
-/// invocation), so it is throttled to at most once per install per day. That
-/// still answers "did this install run the CLI today" without a POST per
-/// command.
-const CLI_PROCESS_START_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
+/// CLI `cli_usage` is the only *high-frequency* event source in normal use (one
+/// per `aoe` invocation, and users script `aoe` in loops), so its flush is
+/// throttled locally to at most once per install per day. Per-command counts
+/// accumulate on disk between flushes, so a single daily POST still answers
+/// "which commands did this install run" without a POST per command. TUI and
+/// `aoe serve` `process_start` stay per-launch and are deliberately not capped:
+/// one emit per launch is the signal we want, and suppressing it would hide
+/// legitimate restarts. A pathological crash-loop could still flood from those
+/// surfaces; that is accepted as a telemetry-only risk, absorbed by the
+/// gateway's `X-Telemetry-Key` rate limiting rather than a local throttle.
+const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Retry backoff after a *failed* CLI `process_start` send. While the daily slot
+/// Retry backoff after a *failed* CLI `cli_usage` send. While the daily slot
 /// stays open (a failed send never claims it), this bounds re-attempts to once
 /// per hour so a down endpoint can't make every `aoe` invocation re-send.
-const CLI_PROCESS_START_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
+const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
+
+/// Base cadence for periodic `usage_snapshot` sends (TUI and serve). The real
+/// period is this plus bounded jitter (see [`snapshot_interval`]).
+pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Upper bound on the random jitter added to [`SNAPSHOT_BASE_INTERVAL`].
+const SNAPSHOT_JITTER: Duration = Duration::from_secs(30 * 60);
+
+/// Periodic snapshot period: [`SNAPSHOT_BASE_INTERVAL`] plus a random offset in
+/// `[0, SNAPSHOT_JITTER)`. A fixed 12h period anchored to process start means a
+/// fleet that boots together (e.g. a post-update restart wave) keeps snapshotting
+/// in lockstep forever; rolling a per-process jitter decorrelates the periodic
+/// ticks so they spread apart by the second tick. The boot snapshot is sent
+/// separately and stays immediate, so this only shapes the steady-state cadence.
+pub fn snapshot_interval() -> Duration {
+    use rand::RngExt;
+    let jitter_ms = rand::rng().random_range(0..SNAPSHOT_JITTER.as_millis() as u64);
+    SNAPSHOT_BASE_INTERVAL + Duration::from_millis(jitter_ms)
+}
 
 /// True when `DO_NOT_TRACK` is set to an affirmative value. This is the
 /// absolute override: it wins over `config.telemetry.enabled`.
@@ -93,6 +122,13 @@ pub fn is_opted_in() -> bool {
     crate::session::get_telemetry_settings().enabled && !do_not_track()
 }
 
+/// Opt-in check against an already-loaded `Config`, so a caller that needs the
+/// full config anyway (e.g. [`build_usage_snapshot`] for `active_features`)
+/// doesn't parse `config.toml` a second time via [`is_opted_in`].
+fn opted_in_with(config: &crate::session::Config) -> bool {
+    config.telemetry.enabled && !do_not_track()
+}
+
 /// Apply an opt-in/opt-out transition's side effect on the install id. The
 /// caller is responsible for persisting `config.telemetry.enabled`; this only
 /// manages `telemetry.json`. Enabling (when not suppressed) generates the id;
@@ -112,8 +148,49 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The fixed, closed substrate vocabulary, in precedence order. A session is
+/// classified into exactly one of these by [`substrate_bucket`]; the snapshot
+/// pre-seeds all five so the census is always complete.
+const SUBSTRATES: [&str; 5] = ["scratch", "workspace", "worktree", "sandbox", "local"];
+
+/// Classify a session into its single primary substrate bucket.
+///
+/// Mutually exclusive by fixed precedence: `scratch` > `workspace` >
+/// `worktree` > `sandbox` > `local`. `scratch` is invariant-exclusive with
+/// worktree/workspace, so a session carrying both is an upstream state bug; we
+/// log it at `debug` and bucket by precedence rather than panic, because
+/// telemetry must never crash the tool. A sandbox can legitimately co-occur
+/// with a worktree, so it sits below worktree and the orthogonal
+/// `session_sandboxed` count carries the "has sandbox at all" signal.
+fn substrate_bucket(inst: &Instance) -> &'static str {
+    let has_worktree = inst.worktree_info.is_some();
+    let has_workspace = inst.workspace_info.is_some();
+    if inst.scratch {
+        if has_worktree || has_workspace {
+            tracing::debug!(
+                target: "telemetry",
+                has_worktree,
+                has_workspace,
+                "scratch session also carries worktree/workspace info; bucketing as scratch by precedence"
+            );
+        }
+        return "scratch";
+    }
+    if has_workspace {
+        return "workspace";
+    }
+    if has_worktree {
+        return "worktree";
+    }
+    if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
+        return "sandbox";
+    }
+    "local"
+}
+
 /// Build a `process_start` event, or `None` when telemetry is not opted in
-/// (or `DO_NOT_TRACK` suppresses id generation).
+/// (or `DO_NOT_TRACK` suppresses id generation). Emitted only by the long-lived
+/// surfaces (TUI / serve); short-lived CLI runs report via `cli_usage` instead.
 pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     if !is_opted_in() {
         return None;
@@ -136,28 +213,36 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     })
 }
 
-/// Build a `usage_snapshot` from the current sessions, or `None` when not
-/// opted in. All agent/model strings pass through [`sanitize`]; raw values
-/// never reach the payload.
-pub fn build_usage_snapshot(
-    surface: Surface,
-    instances: &[Instance],
-    web_seen: bool,
-    cockpit_seen: bool,
-    session_creates_since_last_snapshot: u32,
-) -> Option<UsageSnapshot> {
-    if !is_opted_in() {
-        return None;
-    }
-    let install_id = state::ensure_install_id()?;
-    // Global, pre-profile-merge config on purpose: `features` is an install-level
-    // default-adoption signal, not per-session usage. See `features::active_features`.
-    let features = features::active_features(&crate::session::Config::load_or_warn());
+/// Pure per-session aggregation, split out of [`build_usage_snapshot`] so the
+/// counting logic is unit-testable without the opt-in / install-id / config
+/// global state the snapshot builder pulls in.
+struct InstanceMetrics {
+    total: u32,
+    running: u32,
+    idle: u32,
+    error: u32,
+    cockpit: u32,
+    sandboxed: u32,
+    yolo: u32,
+    pinned: u32,
+    snoozed: u32,
+    archived: u32,
+    by_agent: BTreeMap<String, u32>,
+    by_model_bucket: BTreeMap<String, u32>,
+    by_substrate: BTreeMap<String, u32>,
+}
 
-    let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
-    let mut sessions_by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
+fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
+    let mut by_agent: BTreeMap<String, u32> = BTreeMap::new();
+    let mut by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
+    // Pre-seed every substrate to 0 so the census is always complete: a
+    // dashboard never has to coalesce a missing key, and the values always
+    // sum to `session_total`.
+    let mut by_substrate: BTreeMap<String, u32> =
+        SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect();
     let (mut running, mut idle, mut error, mut cockpit, mut sandboxed, mut yolo) =
         (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut pinned, mut snoozed, mut archived) = (0u32, 0u32, 0u32);
 
     for inst in instances {
         match inst.status {
@@ -167,7 +252,7 @@ pub fn build_usage_snapshot(
             _ => {}
         }
         // Cockpit fields only exist in `serve` builds; treat them as absent
-        // otherwise so the snapshot logic stays surface-agnostic.
+        // otherwise so the aggregation stays surface-agnostic.
         #[cfg(feature = "serve")]
         let is_cockpit = inst.cockpit_mode;
         #[cfg(not(feature = "serve"))]
@@ -182,6 +267,43 @@ pub fn build_usage_snapshot(
             yolo += 1;
         }
 
+        // Mutually-exclusive primary substrate; orthogonal to the sandbox count
+        // above (a sandboxed worktree buckets as `worktree` here). The map is
+        // pre-seeded with the closed vocabulary, so increment the existing key
+        // rather than inserting: any drift in `substrate_bucket` then fails
+        // loudly instead of silently broadening the payload.
+        *by_substrate
+            .get_mut(substrate_bucket(inst))
+            .expect("SUBSTRATES must contain every substrate bucket") += 1;
+
+        // Point-in-time session-triage census. The three states are mutually
+        // exclusive per the triage invariant enforced in the session apply /
+        // merge path (see `Instance::archive`/`snooze`/`pin` and the merge
+        // reconciliation), so independent checks never double-count a
+        // well-formed session. The debug assert makes a future mutator or
+        // merge regression fail fast instead of silently skewing the census
+        // (sum of the three counts exceeding `session_total`).
+        let is_pinned = inst.is_pinned();
+        let is_snoozed = inst.is_snoozed();
+        let is_archived = inst.is_archived();
+        debug_assert!(
+            [is_pinned, is_snoozed, is_archived]
+                .into_iter()
+                .filter(|state| *state)
+                .count()
+                <= 1,
+            "session triage states must be mutually exclusive"
+        );
+        if is_pinned {
+            pinned += 1;
+        }
+        if is_snoozed {
+            snoozed += 1;
+        }
+        if is_archived {
+            archived += 1;
+        }
+
         // Prefer the canonical detection name; fall back to the raw tool
         // string. Either way it is coerced to an allowlisted bucket.
         let agent_src = if inst.detect_as.trim().is_empty() {
@@ -189,7 +311,7 @@ pub fn build_usage_snapshot(
         } else {
             inst.detect_as.as_str()
         };
-        *sessions_by_agent
+        *by_agent
             .entry(sanitize::agent_bucket(agent_src))
             .or_insert(0) += 1;
 
@@ -198,14 +320,99 @@ pub fn build_usage_snapshot(
         #[cfg(not(feature = "serve"))]
         let model: Option<&str> = None;
         let bucket = sanitize::model_bucket(model);
-        *sessions_by_model_bucket
-            .entry(bucket.to_string())
-            .or_insert(0) += 1;
+        *by_model_bucket.entry(bucket.to_string()).or_insert(0) += 1;
     }
 
+    InstanceMetrics {
+        total: instances.len() as u32,
+        running,
+        idle,
+        error,
+        cockpit,
+        sandboxed,
+        yolo,
+        pinned,
+        snoozed,
+        archived,
+        by_agent,
+        by_model_bucket,
+        by_substrate,
+    }
+}
+
+/// Build a `usage_snapshot` from the current sessions, or `None` when not
+/// opted in. All agent/model strings pass through [`sanitize`]; raw values
+/// never reach the payload.
+pub fn build_usage_snapshot(
+    surface: Surface,
+    instances: &[Instance],
+    usage_seen: BTreeMap<String, u32>,
+    session_creates_since_last_snapshot: u32,
+    auth_mode: Option<&str>,
+    serve_mode: Option<&str>,
+) -> Option<UsageSnapshot> {
+    // Load the global, pre-profile-merge config exactly once and reuse it for
+    // both the opt-in gate and `active_features`, instead of parsing
+    // `config.toml` twice (once via `is_opted_in`, once for features). It is the
+    // install-level config on purpose: `features` is a default-adoption signal,
+    // not per-session usage. See `features::active_features`.
+    let config = crate::session::Config::load_or_warn();
+    if !opted_in_with(&config) {
+        return None;
+    }
+    // auth_mode / serve_mode are serve-only deployment metadata. Normalize here
+    // rather than trusting every caller to pass None, so a future non-serve call
+    // site can never leak them onto a TUI / CLI payload.
+    debug_assert!(
+        matches!(surface, Surface::Serve) || (auth_mode.is_none() && serve_mode.is_none()),
+        "auth_mode and serve_mode are serve-only fields"
+    );
+    let (auth_mode, serve_mode) = if matches!(surface, Surface::Serve) {
+        (auth_mode, serve_mode)
+    } else {
+        (None, None)
+    };
+    let install_id = state::ensure_install_id()?;
+    let mut snapshot = assemble_usage_snapshot(
+        surface,
+        install_id,
+        &config,
+        instances,
+        usage_seen,
+        session_creates_since_last_snapshot,
+    );
+    // Layer the serve-only deployment metadata on top of the pure snapshot, so
+    // `assemble_usage_snapshot` stays focused on session/feature bucketing.
+    snapshot.auth_mode = auth_mode.map(str::to_string);
+    snapshot.serve_mode = serve_mode.map(str::to_string);
+    // Version-health is install-level I/O (update cache + on-disk schema version),
+    // kept out of the disk-free assembler and filled here. Same source as
+    // `build_process_start`, so both events agree within a launch.
     let (update_status, update_releases_behind) =
         crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
-    Some(UsageSnapshot {
+    snapshot.data_schema_version = crate::migrations::current_schema_version();
+    snapshot.update_status = update_status;
+    snapshot.update_releases_behind = update_releases_behind;
+    Some(snapshot)
+}
+
+/// Pure assembly of a `usage_snapshot` from an already-resolved install id and
+/// config: no disk reads, no opt-in gate, no id generation. Split out of
+/// [`build_usage_snapshot`] so the bucketing and feature-map logic can be unit
+/// tested with an injected `Config` and no filesystem or env mutation.
+fn assemble_usage_snapshot(
+    surface: Surface,
+    install_id: String,
+    config: &crate::session::Config,
+    instances: &[Instance],
+    usage_seen: BTreeMap<String, u32>,
+    session_creates_since_last_snapshot: u32,
+) -> UsageSnapshot {
+    let features = features::active_features(config);
+
+    let metrics = aggregate_instances(instances);
+
+    UsageSnapshot {
         schema: SCHEMA_VERSION,
         event: "usage_snapshot",
         install_id,
@@ -214,23 +421,33 @@ pub fn build_usage_snapshot(
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        data_schema_version: crate::migrations::current_schema_version(),
-        update_status,
-        update_releases_behind,
-        session_total: instances.len() as u32,
-        session_running: running,
-        session_idle: idle,
-        session_error: error,
-        session_cockpit: cockpit,
-        session_sandboxed: sandboxed,
-        session_yolo: yolo,
-        sessions_by_agent,
-        sessions_by_model_bucket,
+        // Version-health is install-level I/O (reads the update cache + schema
+        // version file), so the disk-free assembler leaves it at the unset
+        // defaults; `build_usage_snapshot` fills the real values.
+        data_schema_version: 0,
+        update_status: crate::update::UpdateStatus::Unknown,
+        update_releases_behind: crate::update::ReleasesBehind::Unknown,
+        session_total: metrics.total,
+        session_running: metrics.running,
+        session_idle: metrics.idle,
+        session_error: metrics.error,
+        session_cockpit: metrics.cockpit,
+        session_sandboxed: metrics.sandboxed,
+        session_yolo: metrics.yolo,
+        session_pinned: metrics.pinned,
+        session_snoozed: metrics.snoozed,
+        session_archived: metrics.archived,
+        sessions_by_agent: metrics.by_agent,
+        sessions_by_model_bucket: metrics.by_model_bucket,
+        sessions_by_substrate: metrics.by_substrate,
         features,
-        web_seen,
-        cockpit_seen,
+        usage_seen,
         session_creates_since_last_snapshot,
-    })
+        // Set by `build_usage_snapshot` for the serve surface; the pure
+        // assembler leaves them unset.
+        auth_mode: None,
+        serve_mode: None,
+    }
 }
 
 /// POST a serialized event to the endpoint. Returns `true` only on a *confirmed*
@@ -284,38 +501,77 @@ pub fn spawn_process_start(surface: Surface) {
     }
 }
 
-/// Emit a `process_start`, awaiting delivery with a hard timeout so the event
-/// has a chance to flush before the process exits. Returns whether delivery was
-/// *confirmed* (a 2xx), so a throttled caller can defer claiming its slot until
-/// the send actually succeeds. Bounded by the connect and send timeouts, so a
-/// dead endpoint can never hang the caller; a no-op (returns `false`) for the
-/// common default-off (not opted in) case.
-pub async fn flush_process_start(surface: Surface) -> bool {
-    let Some(event) = build_process_start(surface) else {
-        return false;
-    };
-    matches!(
-        tokio::time::timeout(SEND_TIMEOUT, post(&event)).await,
-        Ok(true)
-    )
+/// Build a `cli_usage` event from the accumulated per-command counts, or `None`
+/// when not opted in or there is nothing to report. Every key is filtered
+/// against the closed [`crate::cli::CLI_COMMAND_NAMES`] allowlist, so a
+/// hand-edited or corrupt `telemetry.json` can never smuggle an arbitrary
+/// string onto the wire: the in-process recorder only ever writes allowlisted
+/// names, and this is the defense-in-depth re-check before sending.
+pub fn build_cli_usage() -> Option<CliUsage> {
+    if !is_opted_in() {
+        return None;
+    }
+    let (counts, window_start) = state::cli_usage_window();
+    let command_counts: BTreeMap<String, u32> = counts
+        .into_iter()
+        .filter(|(name, _)| crate::cli::CLI_COMMAND_NAMES.contains(&name.as_str()))
+        .collect();
+    if command_counts.is_empty() {
+        return None;
+    }
+    let install_id = state::ensure_install_id()?;
+    let window_start = window_start
+        .map(|w| w.to_rfc3339())
+        .unwrap_or_else(now_rfc3339);
+    Some(CliUsage {
+        schema: SCHEMA_VERSION,
+        event: "cli_usage",
+        install_id,
+        sent_at: now_rfc3339(),
+        surface: Surface::Cli,
+        aoe_version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        window_start,
+        command_counts,
+    })
 }
 
-/// CLI entrypoint for `process_start`: same as [`flush_process_start`] for the
-/// `cli` surface, but throttled to at most once per install per day so a user
-/// scripting `aoe` in a loop can't flood the endpoint. The daily slot is claimed
-/// only after the send is *confirmed*, so a failed send leaves it open for the
-/// next invocation to retry (bounded by [`CLI_PROCESS_START_RETRY_GAP`] so a down
-/// endpoint can't make every invocation re-send). Nothing touches disk unless
-/// opted in and a send is actually due.
-pub async fn flush_cli_process_start() {
-    if !is_opted_in() {
+/// Record one CLI subcommand invocation and flush the accumulated `cli_usage`
+/// event if a send is due. Called once per `aoe <subcommand>` run.
+///
+/// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
+/// is a non-creating check, so app-data-free commands (`aoe completion`,
+/// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
+/// keep working in read-only / sandboxed environments. The daily slot is claimed
+/// only after a *confirmed* send, so a failed send leaves the counts and the slot
+/// intact for the next invocation to retry (bounded by [`CLI_USAGE_RETRY_GAP`]).
+/// Awaited with a hard timeout so a dead endpoint can never hang the CLI's exit.
+pub async fn track_cli_command(name: &str) {
+    // Cheap non-creating gate first: opt-in creates the app dir, so its absence
+    // means the install cannot be opted in, and we must not create it here.
+    if !crate::session::app_dir_exists() || !is_opted_in() {
         return;
     }
-    if !cli_process_start_due(CLI_PROCESS_START_MIN_GAP, CLI_PROCESS_START_RETRY_GAP) {
+    // Always record the command; this is a lock-protected RMW that also opens
+    // the window on the first command since the last flush.
+    state::record_cli_command(name);
+    // Throttle the flush to the daily slot (with a bounded retry while a send
+    // keeps failing); the per-command counts keep accumulating on disk until
+    // a send is confirmed.
+    if !cli_usage_due(CLI_USAGE_MIN_GAP, CLI_USAGE_RETRY_GAP) {
         return;
     }
-    let confirmed = flush_process_start(Surface::Cli).await;
-    record_cli_process_start(confirmed);
+    let Some(event) = build_cli_usage() else {
+        return;
+    };
+    let confirmed = matches!(
+        tokio::time::timeout(SEND_TIMEOUT, post(&event)).await,
+        Ok(true)
+    );
+    // Stamp the attempt always; on a confirmed 2xx also claim the daily slot and
+    // clear the reported counts/window. A failed send leaves both intact to retry.
+    record_cli_usage_flush(confirmed);
 }
 
 /// Fingerprint of the last `usage_snapshot` whose send we initiated this
@@ -364,7 +620,7 @@ fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
 }
 
 /// Outcome of a snapshot flush, so a caller can decide whether to consume the
-/// state the snapshot reported (e.g. reset `web_seen` / a create counter).
+/// state the snapshot reported (e.g. the `usage_seen` counts / a create counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     /// Delivery was confirmed (a 2xx). Safe to consume the reported state.
@@ -479,13 +735,123 @@ mod tests {
             session_cockpit: 0,
             session_sandboxed: 2,
             session_yolo: 0,
+            session_pinned: 0,
+            session_snoozed: 0,
+            session_archived: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
+            sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
             features: BTreeMap::new(),
-            web_seen: false,
-            cockpit_seen: false,
+            usage_seen: usage_signals::zeroed(),
             session_creates_since_last_snapshot: 0,
+            auth_mode: None,
+            serve_mode: None,
         }
+    }
+
+    use crate::session::Instance;
+
+    // A maintainer with two pinned sessions and one snoozed session must see
+    // `session_pinned = 2` and `session_snoozed = 1` (issue #1892, story 1).
+    #[test]
+    fn aggregate_counts_each_triage_state() {
+        let mut pinned_a = Instance::new("pin-a", "/tmp/a");
+        pinned_a.pin();
+        let mut pinned_b = Instance::new("pin-b", "/tmp/b");
+        pinned_b.pin();
+        let mut snoozed = Instance::new("snooze", "/tmp/c");
+        snoozed.snooze(60);
+        let mut archived = Instance::new("arch", "/tmp/d");
+        archived.archive();
+        let untouched = Instance::new("plain", "/tmp/e");
+
+        let m = aggregate_instances(&[pinned_a, pinned_b, snoozed, archived, untouched]);
+
+        assert_eq!(m.pinned, 2, "two pinned sessions");
+        assert_eq!(m.snoozed, 1, "one currently snoozed session");
+        assert_eq!(m.archived, 1, "one archived session");
+        assert_eq!(m.total, 5);
+    }
+
+    // A snooze whose window has elapsed must not be counted, matching
+    // `Instance::is_snoozed()` semantics (issue #1892, story 2).
+    #[test]
+    fn expired_snooze_is_not_counted() {
+        let mut expired = Instance::new("expired", "/tmp/x");
+        // A snooze that ended an hour ago: `snoozed_until` is set but in the past.
+        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(
+            !expired.is_snoozed(),
+            "precondition: expired snooze reads false"
+        );
+
+        let m = aggregate_instances(&[expired]);
+        assert_eq!(
+            m.snoozed, 0,
+            "an elapsed snooze must not increment session_snoozed"
+        );
+    }
+
+    // The triage census emits only integer counts; the fields are plain `u32`
+    // and carry no session id, name, path, or timestamp (issue #1892, story 3).
+    #[test]
+    fn triage_counts_are_plain_integers() {
+        // Assert the wire format, not just the Rust type: a future serde
+        // attribute or wrapper that serialized these as strings or null would
+        // regress the telemetry contract while a `u32`-only check still passed.
+        let json = serde_json::to_value(sample_snapshot()).unwrap();
+        assert!(json["session_pinned"].is_u64());
+        assert!(json["session_snoozed"].is_u64());
+        assert!(json["session_archived"].is_u64());
+    }
+
+    // An opted-out install records nothing: `build_usage_snapshot` returns
+    // `None` regardless of session state (issue #1892, story 4). `DO_NOT_TRACK`
+    // is the absolute, config-independent suppressor.
+    #[test]
+    #[serial]
+    fn opted_out_build_returns_none() {
+        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let mut pinned = Instance::new("pin", "/tmp/p");
+        pinned.pin();
+        assert!(
+            build_usage_snapshot(
+                Surface::Tui,
+                &[pinned],
+                usage_signals::zeroed(),
+                0,
+                None,
+                None
+            )
+            .is_none(),
+            "opted-out install must not build a snapshot"
+        );
+        unsafe { std::env::remove_var("DO_NOT_TRACK") };
+    }
+
+    // The serve deployment-mode fields are part of the content fingerprint, so a
+    // daemon that switches exposure or auth mode between snapshots is not deduped
+    // away as an unchanged repeat (#1885).
+    #[test]
+    #[serial]
+    fn serve_mode_fields_change_the_fingerprint() {
+        let base = sample_snapshot();
+        let mut serve = sample_snapshot();
+        serve.auth_mode = Some("passphrase".to_string());
+        serve.serve_mode = Some("tailscale".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&base),
+            snapshot_fingerprint(&serve),
+            "adding auth_mode / serve_mode must change the fingerprint"
+        );
+
+        let mut other = serve.clone();
+        other.serve_mode = Some("tunnel".to_string());
+        assert_ne!(
+            snapshot_fingerprint(&serve),
+            snapshot_fingerprint(&other),
+            "a different serve_mode must change the fingerprint"
+        );
     }
 
     // Regression for the duplicate `usage_snapshot` seen in dogfooding: the TUI
@@ -550,5 +916,47 @@ mod tests {
             "peeking must not record the fingerprint, so it still does not match"
         );
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
+    }
+
+    // Item B (#1877): the pure assembler builds a snapshot from an injected
+    // `Config` and install id with no disk reads, no opt-in gate, and no id
+    // generation. `build_usage_snapshot` therefore parses `config.toml` exactly
+    // once (for both the opt-in check and `active_features`) instead of twice.
+    #[test]
+    fn assemble_usage_snapshot_uses_injected_config_without_disk() {
+        use crate::session::{Config, Instance};
+        let config = Config::default();
+        let inst = Instance::new("s", "/p");
+
+        let snapshot = assemble_usage_snapshot(
+            Surface::Tui,
+            "test-install-id".to_string(),
+            &config,
+            std::slice::from_ref(&inst),
+            usage_signals::zeroed(),
+            3,
+        );
+
+        assert_eq!(snapshot.install_id, "test-install-id");
+        assert_eq!(snapshot.session_total, 1);
+        assert_eq!(snapshot.session_creates_since_last_snapshot, 3);
+        // The feature map comes from the injected config, proving the assembler
+        // consumes it rather than re-loading from disk.
+        assert_eq!(snapshot.features, features::active_features(&config));
+    }
+
+    // Item D (#1877): the jittered snapshot period always lands in
+    // `[base, base + jitter)`, so the cadence is bounded while still spreading
+    // installs apart.
+    #[test]
+    fn snapshot_interval_stays_within_jitter_bound() {
+        for _ in 0..1000 {
+            let period = snapshot_interval();
+            assert!(period >= SNAPSHOT_BASE_INTERVAL, "below base: {period:?}");
+            assert!(
+                period < SNAPSHOT_BASE_INTERVAL + SNAPSHOT_JITTER,
+                "above base+jitter: {period:?}"
+            );
+        }
     }
 }
