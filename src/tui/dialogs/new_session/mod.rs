@@ -511,6 +511,12 @@ impl NewSessionDialog {
         self.group = Input::new(group);
     }
 
+    /// Move focus to the title field. Used by "new from selection", where the
+    /// path is pre-filled so the user lands directly on naming the session.
+    pub fn focus_title(&mut self) {
+        self.focused_field = self.title_field();
+    }
+
     #[cfg(test)]
     pub fn path_value(&self) -> &str {
         self.path.value()

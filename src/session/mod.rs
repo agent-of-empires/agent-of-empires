@@ -91,6 +91,16 @@ pub fn get_app_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Whether the app data dir already exists, **without** creating it (unlike
+/// [`get_app_dir`], which auto-creates). Lets side-effect-sensitive callers
+/// probe install state cheaply: the per-command telemetry recorder uses it to
+/// stay a true no-op for app-data-free commands (`aoe completion`, `aoe init`,
+/// ...) on an install that is not opted in, so those commands keep working in
+/// read-only / sandboxed (e.g. Nix) environments without materializing the dir.
+pub fn app_dir_exists() -> bool {
+    get_app_dir_path().map(|p| p.exists()).unwrap_or(false)
+}
+
 fn get_app_dir_path() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = dirs::config_dir()

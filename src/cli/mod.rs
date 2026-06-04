@@ -31,7 +31,7 @@ pub mod update;
 pub mod url;
 pub mod worktree;
 
-pub use definition::{Cli, Commands};
+pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
 use crate::session::Instance;
 use anyhow::{bail, Result};
