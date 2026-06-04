@@ -531,7 +531,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       if (!active) return;
       if (about) setServerAbout(about);
       setServerAboutLoaded(true);
-      reportTelemetrySeen("web");
+      // Read-only servers can't persist an opt-in choice, so skip the ping.
+      if (about && !about.read_only) reportTelemetrySeen("web");
     });
     void fetchTelemetryStatus().then((status) => {
       if (!active || !status) return;
