@@ -445,12 +445,23 @@ export async function setTelemetryConsent(
   }
 }
 
-/// Tell the daemon the web dashboard or cockpit UI was opened, so its next
+/// Allowlisted usage-signal names the daemon accepts on `/api/telemetry/seen`.
+/// Mirrors `USAGE_SIGNALS` in `src/telemetry/usage_signals.rs`; an off-list
+/// name is rejected with a 400 server-side. `web` / `cockpit` are whole-UI
+/// opens; the rest are feature-level opens within the dashboard (#1881).
+export type TelemetrySignal =
+  | "web"
+  | "cockpit"
+  | "diff_panel"
+  | "diff_comments"
+  | "web_terminal";
+
+/// Tell the daemon an allowlisted surface or feature was opened, so its next
 /// opt-in snapshot can carry the `usage_seen` open-count map plus the coarse
-/// client form-factor class (#1883). Best-effort. The browser never posts to the
-/// telemetry backend; it pings the local daemon, which folds both into its own
-/// snapshot.
-export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
+/// client form-factor class (#1883). Best-effort; the daemon only forwards the
+/// count when the install is opted in. The browser never posts to the telemetry
+/// backend; it pings the local daemon, which folds both into its own snapshot.
+export function reportTelemetrySeen(surface: TelemetrySignal): void {
   void fetch("/api/telemetry/seen", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

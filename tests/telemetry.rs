@@ -163,6 +163,12 @@ fn snapshot_buckets_are_sanitized() {
     assert_eq!(snapshot.sessions_by_agent.get("claude"), Some(&1));
     assert_eq!(snapshot.session_total, 2);
 
+    // The base builder leaves the serve window fields at their point-in-time /
+    // empty defaults; only `aoe serve` overrides them from its aggregator.
+    assert_eq!(snapshot.peak_concurrent_sessions, 2);
+    assert!(snapshot.distinct_sessions_by_agent.is_empty());
+    assert!(snapshot.distinct_sessions_by_model_bucket.is_empty());
+
     // The feature-adoption map is present with its fixed allowlisted keys
     // (values reflect config; all false under a default config).
     for key in ["worktree", "sandbox", "cockpit", "auto_update"] {
@@ -527,19 +533,21 @@ fn snapshot_carries_registered_usage_signals() {
     assert_eq!(snapshot.usage_seen.get("cockpit"), Some(&1));
 }
 
-/// User story (#1880): an unregistered signal name is rejected by the registry
-/// (`record` returns false, which the endpoint turns into a 400) and never
-/// reaches the snapshot's `usage_seen` map.
+/// User story (#1881): the dashboard feature signals (diff panel, diff comments,
+/// web terminal) are allowlisted and flow through the daemon aggregate into the
+/// snapshot's `usage_seen` map, exactly like the whole-UI opens.
 #[test]
 #[serial]
-fn unregistered_usage_signal_is_rejected_and_never_reported() {
+fn snapshot_carries_feature_usage_signals() {
     let _tmp = isolate();
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
     let counters = UsageSeenCounters::new();
-    // The endpoint would return 400 on this false.
-    assert!(!counters.record("web_terminal"));
+    assert!(counters.record("diff_panel"));
+    assert!(counters.record("diff_comments"));
+    assert!(counters.record("diff_comments"));
+    assert!(counters.record("web_terminal"));
 
     let snapshot = telemetry::build_usage_snapshot(
         Surface::Serve,
@@ -551,7 +559,37 @@ fn unregistered_usage_signal_is_rejected_and_never_reported() {
         &telemetry::CockpitInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
-    assert!(!snapshot.usage_seen.contains_key("web_terminal"));
+    assert_eq!(snapshot.usage_seen.get("diff_panel"), Some(&1));
+    assert_eq!(snapshot.usage_seen.get("diff_comments"), Some(&2));
+    assert_eq!(snapshot.usage_seen.get("web_terminal"), Some(&1));
+}
+
+/// User story (#1880): an unregistered signal name is rejected by the registry
+/// (`record` returns false, which the endpoint turns into a 400) and never
+/// reaches the snapshot's `usage_seen` map.
+#[test]
+#[serial]
+fn unregistered_usage_signal_is_rejected_and_never_reported() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let counters = UsageSeenCounters::new();
+    // The endpoint would return 400 on this false. `not_a_signal` is off the
+    // allowlist; the registered names are asserted elsewhere.
+    assert!(!counters.record("not_a_signal"));
+
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        counters.snapshot(),
+        0,
+        None,
+        None,
+        &telemetry::CockpitInteractionCounts::default(),
+    )
+    .expect("snapshot built when opted in");
+    assert!(!snapshot.usage_seen.contains_key("not_a_signal"));
 }
 
 /// User story (#1880): the `usage_seen` map only ever carries allowlisted short
