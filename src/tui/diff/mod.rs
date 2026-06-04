@@ -133,7 +133,13 @@ impl DiffView {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string)
-            .or_else(|| worktree_base.as_deref().map(str::to_string))
+            .or_else(|| {
+                worktree_base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
             .or_else(|| config.diff.default_branch.clone())
             .or_else(|| get_default_base_ref(&repo_path).ok())
             .unwrap_or_else(|| "main".to_string());
