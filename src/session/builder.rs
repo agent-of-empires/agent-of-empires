@@ -1341,13 +1341,13 @@ mod tests {
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
-            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+            config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             temp_home.join(crate::session::APP_DIR_NAME_OTHER)
         }

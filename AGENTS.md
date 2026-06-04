@@ -179,7 +179,8 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
 
 - Runtime config/data location:
   - **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/` (defaults to `~/.config/agent-of-empires/`)
-  - **macOS/Windows**: `~/.agent-of-empires/`
+  - **macOS**: `~/.agent-of-empires/` by default, or `$XDG_CONFIG_HOME/agent-of-empires/` when `XDG_CONFIG_HOME` is set or that dir already exists (issue #1948). Resolution is `get_app_dir_path` -> `macos_app_dir`; nothing is moved automatically, so an existing `~/.agent-of-empires/` keeps being used.
+  - **Windows**: `~/.agent-of-empires/`
 - Keep user data out of commits. For repo-local experiments, use ignored paths like `./.agent-of-empires/`, `.env`, and `.mcp.json`.
 - `aoe serve` writes several files to the app dir while running. All are owner-only (0600) where they contain secrets. The daemon cleans them up on shutdown; `daemon_pid()`'s stale-PID check sweeps them otherwise.
   - `serve.pid`: daemon PID for `--stop` and reattach detection.

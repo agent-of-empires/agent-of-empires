@@ -15,7 +15,9 @@ All settings below can also be edited from the TUI settings screen (press `s` or
 | Platform | Global Config |
 |----------|--------------|
 | Linux | `$XDG_CONFIG_HOME/agent-of-empires/config.toml` (defaults to `~/.config/agent-of-empires/`) |
-| macOS | `~/.agent-of-empires/config.toml` |
+| macOS | `~/.agent-of-empires/config.toml` by default, or `$XDG_CONFIG_HOME/agent-of-empires/config.toml` when you opt into the XDG layout (see below) |
+
+On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/agent-of-empires/`) when you set `XDG_CONFIG_HOME`, or whenever that directory already exists, so a dotfile manager like chezmoi can share one config path with Linux. Otherwise it uses `~/.agent-of-empires/`. Nothing is moved automatically: an existing `~/.agent-of-empires/` keeps being used even after you set `XDG_CONFIG_HOME`, until you relocate it yourself.
 
 ```
 ~/.agent-of-empires/

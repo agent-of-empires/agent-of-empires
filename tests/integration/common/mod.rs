@@ -48,8 +48,9 @@ pub fn shim_ready() -> Result<(), String> {
     Ok(())
 }
 
-/// Set `HOME` (and `XDG_CONFIG_HOME` on Linux) to a fresh temp dir so tests
-/// read and write to isolated state. Returns the guard; drop it to clean up.
+/// Set `HOME` (and `XDG_CONFIG_HOME` on Linux/macOS) to a fresh temp dir so
+/// tests read and write to isolated state. Returns the guard; drop it to clean
+/// up.
 ///
 /// # Safety caveat
 /// `set_var` is not thread-safe. Callers must be `#[serial]`.
@@ -63,6 +64,6 @@ pub fn setup_temp_home() -> TempDir {
 /// files under the same path before returning the guard).
 pub fn set_temp_home(path: &Path) {
     std::env::set_var("HOME", path);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", path.join(".config"));
 }

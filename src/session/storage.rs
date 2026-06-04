@@ -425,7 +425,7 @@ mod tests {
 
     fn setup_test_home(temp: &std::path::Path) {
         std::env::set_var("HOME", temp);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
     }
 

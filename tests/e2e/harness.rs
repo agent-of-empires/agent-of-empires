@@ -26,9 +26,9 @@ use tempfile::TempDir;
 
 /// Return the app dir under the given test home, matching `get_app_dir_path`.
 pub fn app_dir_in(home: &Path) -> PathBuf {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         home.join(".config")
-            .join(agent_of_empires::session::APP_DIR_NAME_LINUX)
+            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
     } else {
         home.join(agent_of_empires::session::APP_DIR_NAME_OTHER)
     }
@@ -244,9 +244,10 @@ impl TuiTestHarness {
         // popup (gated on that flag alone in `App::new`) never renders over the
         // TUI and swallows input in the general e2e tests; the telemetry consent
         // surfaces are covered directly by their own unit and integration tests.
-        // On Linux the app uses $XDG_CONFIG_HOME/agent-of-empires[-dev]/ (set
-        // below), on macOS it uses $HOME/.agent-of-empires[-dev]/. The `-dev`
-        // suffix kicks in on debug builds, which is what `cargo test` produces.
+        // On Linux and macOS the app uses $XDG_CONFIG_HOME/agent-of-empires[-dev]/
+        // (set below); other platforms use $HOME/.agent-of-empires[-dev]/. The
+        // `-dev` suffix kicks in on debug builds, which is what `cargo test`
+        // produces.
         let config_dir = app_dir_in(home_dir.path());
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         let config_content = format!(

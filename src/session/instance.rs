@@ -3639,7 +3639,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let mut inst = Instance::new("wrapped", "/tmp/test");
@@ -3660,7 +3660,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let codex_home = tmp.path().join("profile-codex-home");
@@ -3690,7 +3690,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
@@ -3715,7 +3715,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let mut global = crate::session::config::Config::default();
@@ -5610,7 +5610,7 @@ mod tests {
         fn persist_session_to_storage_skips_on_cas_mismatch() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("cas-persist-mismatch").unwrap();
@@ -5639,7 +5639,7 @@ mod tests {
         fn persist_session_to_storage_writes_on_cas_match() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("cas-persist-match").unwrap();
@@ -5668,7 +5668,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_persist() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("reconcile-test").unwrap();
@@ -5707,7 +5707,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_clear() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("reconcile-clear").unwrap();
@@ -5857,7 +5857,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_resume_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("intent-reconcile").unwrap();
@@ -5923,7 +5923,7 @@ mod tests {
         fn reconcile_sidecar_adopts_fresh_sid_for_claude_default() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-adopt";
@@ -5961,7 +5961,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_tool_not_claude() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-tool";
@@ -5993,7 +5993,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_intent_use() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-use";
@@ -6025,7 +6025,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_intent_cleared() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-cleared";
@@ -6057,7 +6057,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_sid_in_retroactive_excludes() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-excluded";
@@ -6091,7 +6091,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_sidecar_absent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-absent";
@@ -6120,7 +6120,7 @@ mod tests {
         fn reconcile_sidecar_reloads_on_cas_skip() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-cas-skip";
@@ -6172,7 +6172,7 @@ mod tests {
         fn persist_session_id_reloads_memory_on_skipped() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-skipped-reload").unwrap();
@@ -6209,7 +6209,7 @@ mod tests {
         fn persist_session_id_atomic_writes_both_fields_on_match() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-atomic-match").unwrap();
@@ -6252,7 +6252,7 @@ mod tests {
         fn persist_session_id_writes_sid_only_on_default_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-default-intent").unwrap();
@@ -6294,7 +6294,7 @@ mod tests {
         fn persist_session_id_persists_sid_when_intent_cas_mismatches() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-intent-mismatch").unwrap();
@@ -6348,7 +6348,7 @@ mod tests {
         fn persist_session_id_skipped_reloads_both_fields() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage =
@@ -6407,7 +6407,7 @@ mod tests {
         fn clear_for_resume_fallback_atomically_clears_and_downgrades() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-happy";
@@ -6433,7 +6433,7 @@ mod tests {
         fn clear_for_resume_fallback_intent_already_default() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-default";
@@ -6458,7 +6458,7 @@ mod tests {
         fn clear_for_resume_fallback_preserves_user_repin() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-repin";
@@ -6498,7 +6498,7 @@ mod tests {
         fn clear_for_resume_fallback_skips_on_sid_cas_mismatch() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-sid-mismatch";
@@ -6543,7 +6543,7 @@ mod tests {
         fn clear_for_resume_fallback_heals_legacy_stuck_state() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-heal-legacy";
@@ -6580,7 +6580,7 @@ mod tests {
         fn clear_for_resume_fallback_skips_on_user_repin_with_none_sid() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-repin-none-sid";
@@ -6621,7 +6621,7 @@ mod tests {
         fn clear_for_resume_fallback_intent_cleared_not_downgraded() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-intent-cleared";
@@ -6650,7 +6650,7 @@ mod tests {
         fn clear_for_resume_fallback_returns_failed_on_missing_row() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-missing";
@@ -6675,7 +6675,7 @@ mod tests {
         fn restart_outcome_for_cockpit_session_is_fresh() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let mut inst = Instance::new("cockpit_test", "/tmp/x");
@@ -6700,7 +6700,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("fb-test").unwrap();
@@ -6774,7 +6774,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let _storage = crate::session::storage::Storage::new("fb-test-live").unwrap();
@@ -6856,7 +6856,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let _storage = crate::session::storage::Storage::new("fb-test-grace").unwrap();
@@ -6986,7 +6986,7 @@ mod tests {
 
         fn isolate_home(temp: &TempDir) {
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
         }
 

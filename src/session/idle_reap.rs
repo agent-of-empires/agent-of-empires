@@ -398,7 +398,7 @@ mod tests {
         let _env = EnvGuard::capture();
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
         let inst = idle_instance("claimable");

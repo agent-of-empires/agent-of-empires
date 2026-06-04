@@ -1159,7 +1159,7 @@ mod tests {
         fn isolate_app_dir() -> tempfile::TempDir {
             let tmp = tempfile::tempdir().expect("create temp home for scratch deletion tests");
             std::env::set_var("HOME", tmp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
             tmp
         }

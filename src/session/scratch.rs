@@ -79,7 +79,7 @@ mod tests {
         // (or $XDG_CONFIG_HOME on Linux) forces get_app_dir() into a temp.
         let tmp = tempfile::tempdir().expect("create temp home for scratch tests");
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         tmp
     }
