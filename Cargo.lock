@@ -5324,6 +5324,7 @@ dependencies = [
  "clap-markdown",
  "ctrlc",
  "nix 0.31.3",
+ "notify",
  "regex",
 ]
 
