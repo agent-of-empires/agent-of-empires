@@ -49,6 +49,31 @@ const PASTE_BURST_INTER_KEY_MS: u64 = 5;
 /// individual key events so genuine typing isn't mistaken for a paste.
 const PASTE_BURST_MIN_LEN: usize = 3;
 
+/// Wider inter-key timeout used once a burst is established (two events
+/// already arrived within `PASTE_BURST_INTER_KEY_MS` of each other, which
+/// only a paste does). The tight 5ms window catches a paste that streams in
+/// without gaps, but an unbracketed paste delivered as raw key events (e.g.
+/// shift+Insert on terminals that don't bracket it, #1942) can arrive in
+/// jittery chunks whose gaps exceed 5ms, fragmenting the burst so interior
+/// Enters leak through as individual `submit` keystrokes. Widening the
+/// window after the burst is confirmed absorbs that jitter without taxing
+/// single keystrokes, which never reach the two-event threshold and so keep
+/// the tight window.
+const PASTE_BURST_ESTABLISHED_GAP_MS: u64 = 50;
+
+/// Inter-key timeout (ms) for the next poll while accumulating a paste
+/// burst, given how many events are already in the burst. The first
+/// follow-up poll (`len` == 1) uses the tight window so a single keystroke
+/// stays snappy; once a second event has joined (`len` >= 2, which only a
+/// paste produces) the window widens to absorb delivery jitter (#1942).
+fn paste_burst_gap_ms(burst_len: usize) -> u64 {
+    if burst_len >= 2 {
+        PASTE_BURST_ESTABLISHED_GAP_MS
+    } else {
+        PASTE_BURST_INTER_KEY_MS
+    }
+}
+
 struct UpdateStatus {
     text: String,
     expires_at: Option<std::time::Instant>,
@@ -652,8 +677,18 @@ impl App {
                                 let mut burst_keys: Vec<KeyEvent> = vec![key];
                                 let mut deferred: Option<Event> = None;
                                 loop {
+                                    // Once two events have arrived inside the tight
+                                    // inter-key window, this is unambiguously a paste
+                                    // (no human presses two keys 5ms apart), so widen
+                                    // the window to absorb the delivery jitter that
+                                    // splits an unbracketed paste such as shift+Insert,
+                                    // which some terminals send as raw key events
+                                    // rather than a bracketed `Event::Paste` (#1942).
+                                    // Single keystrokes never reach len 2, so typing
+                                    // and home-view shortcuts keep the tight window
+                                    // and stay snappy.
                                     let next = tokio::time::timeout(
-                                        Duration::from_millis(PASTE_BURST_INTER_KEY_MS),
+                                        Duration::from_millis(paste_burst_gap_ms(burst_keys.len())),
                                         self.event_stream.as_mut().expect("event_stream missing").next(),
                                     ).await;
                                     match next {
@@ -2826,5 +2861,17 @@ mod tests {
             Some('\n'),
             "Enter must map to \\n so embedded sentence-breaks land in the burst"
         );
+    }
+
+    #[test]
+    fn paste_burst_gap_widens_once_burst_is_established() {
+        // The first follow-up poll (one event so far) uses the tight window
+        // so single keystrokes stay snappy; a single key never reaches the
+        // two-event threshold and so never pays the wider gap.
+        assert_eq!(paste_burst_gap_ms(1), PASTE_BURST_INTER_KEY_MS);
+        // Two+ events within the tight window mean a paste, so the window
+        // widens to absorb jittery unbracketed delivery (#1942).
+        assert_eq!(paste_burst_gap_ms(2), PASTE_BURST_ESTABLISHED_GAP_MS);
+        assert_eq!(paste_burst_gap_ms(9), PASTE_BURST_ESTABLISHED_GAP_MS);
     }
 }
