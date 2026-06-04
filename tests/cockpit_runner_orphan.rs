@@ -115,6 +115,50 @@ fn assert_exits_within(child: &mut Child, secs: u64, what: &str) {
     }
 }
 
+/// PID of the runner's direct child (the fake `cat` agent), via `pgrep -P`.
+fn agent_pid_of(runner_pid: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = Command::new("pgrep")
+            .args(["-P", &runner_pid.to_string()])
+            .output()
+            .expect("run pgrep");
+        if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<u32>().ok())
+        {
+            return pid;
+        }
+        if Instant::now() > deadline {
+            panic!("fake agent (cat) child of runner {runner_pid} never appeared");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `kill -0`: success means the pid is still alive.
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Assert the agent pid is gone within `secs`. The leak this PR fixes is
+/// specifically the agent surviving its runner, so the test must prove the
+/// agent dies, not just the runner.
+fn assert_pid_gone_within(pid: u32, secs: u64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while pid_alive(pid) {
+        if Instant::now() > deadline {
+            panic!("{what}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn orphaned_runner_self_terminates_when_record_deleted() {
     if cfg!(not(unix)) {
@@ -124,6 +168,7 @@ fn orphaned_runner_self_terminates_when_record_deleted() {
     let scratch = Scratch::new("a");
     let (home, xdg) = (scratch.0.clone(), scratch.0.clone());
     let (mut child, record) = spawn_runner_and_wait_for_record(&home, &xdg, "s1921");
+    let agent_pid = agent_pid_of(child.id());
 
     // It must stay alive while the record exists (the whole point of the
     // shim outliving a detached daemon).
@@ -142,6 +187,13 @@ fn orphaned_runner_self_terminates_when_record_deleted() {
         15,
         "orphaned runner did not self-terminate within 15s of its record being deleted",
     );
+    // The agent subprocess, not just the runner, must die: the agent
+    // surviving its runner is the exact leak this PR fixes.
+    assert_pid_gone_within(
+        agent_pid,
+        5,
+        "fake agent survived the runner's self-termination (the leak this PR fixes)",
+    );
 }
 
 #[test]
@@ -153,23 +205,28 @@ fn superseded_runner_exits_without_deleting_replacement_record() {
     let scratch = Scratch::new("b");
     let (home, xdg) = (scratch.0.clone(), scratch.0.clone());
     let (mut child, record) = spawn_runner_and_wait_for_record(&home, &xdg, "s1922");
+    let agent_pid = agent_pid_of(child.id());
 
     // Simulate a fresh runner taking over: rewrite the record so its `pid`
-    // is no longer ours. The watchdog must read this as "superseded" and
-    // exit, but MUST leave the (replacement's) record file in place.
+    // is no longer ours. Parse + mutate structurally so the test doesn't
+    // break on a harmless serializer format change. The watchdog must read
+    // this as "superseded" and exit, but MUST leave the (replacement's)
+    // record file in place.
+    let mut rec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
     let runner_pid = child.id();
-    let content = std::fs::read_to_string(&record).unwrap();
-    let replaced = content.replace(
-        &format!("\"pid\": {runner_pid}"),
-        &format!("\"pid\": {}", runner_pid.wrapping_add(1_000_000)),
-    );
-    assert_ne!(replaced, content, "expected to rewrite the record's pid");
-    std::fs::write(&record, &replaced).unwrap();
+    rec["pid"] = serde_json::json!(runner_pid.wrapping_add(1_000_000));
+    std::fs::write(&record, serde_json::to_vec(&rec).unwrap()).unwrap();
 
     assert_exits_within(
         &mut child,
         15,
         "superseded runner did not self-terminate within 15s of its record being taken over",
+    );
+    assert_pid_gone_within(
+        agent_pid,
+        5,
+        "fake agent survived the superseded runner's self-termination",
     );
 
     // The replacement runner's record must survive the superseded runner's

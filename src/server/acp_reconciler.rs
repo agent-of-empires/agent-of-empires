@@ -1205,7 +1205,11 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
         // process group, and a bare SIGTERM to just the leader pid can
         // leave them alive under PID 1 (part of the leak this fixes). The
         // escalation runs detached so one stubborn orphan can't stall the
-        // sweep for the grace window. See #1921.
+        // sweep for the grace window. If the daemon exits within the 2s
+        // grace the spawned task is dropped before its SIGKILL fires, so a
+        // grandchild that ignored the SIGTERM survives with only that
+        // signal; the next daemon boot re-sweeps it, so this is acceptable.
+        // See #1921.
         #[cfg(unix)]
         tokio::spawn(crate::acp::worker_registry::reap_group_escalating(
             record.pid,
