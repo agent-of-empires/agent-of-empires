@@ -103,7 +103,17 @@ pub(crate) fn resolve_base_branch(
 /// per-project layer of `resolve_base_branch` when building a workspace.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
     crate::session::projects::load_merged(profile)
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Don't fork worktrees from the wrong base in silence: if the
+            // registry can't be read, log it so the missing per-project
+            // defaults are explainable instead of mysterious.
+            tracing::warn!(
+                target: "session.create",
+                "Failed to load project registry for base-branch defaults; \
+                 extra repos fall back to the global default: {e}"
+            );
+            Vec::new()
+        })
         .into_iter()
         .filter_map(|p| {
             let base = p.default_base_branch?;

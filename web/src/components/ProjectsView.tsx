@@ -156,13 +156,15 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               type="text"
               value={baseBranch}
               onChange={(e) => setBaseBranch(e.target.value)}
-              placeholder="auto-detect (e.g. main, develop)"
+              placeholder="inherit global default, else auto-detect"
               className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono mb-1"
             />
             <p className="text-[11px] text-text-dim mb-3">
-              New worktree branches against this repo fork from here in a
-              multi-repo workspace, unless a base branch is set at session
-              creation.
+              When this repo is added as an extra repo in a multi-repo workspace,
+              new worktree branches fork from here. Leave blank to use the
+              global/profile default, then the repo's detected default branch. A
+              base branch set at session creation overrides this; the primary
+              repo of a session does not use it.
             </p>
 
             <label className="block text-[12px] text-text-dim mb-1">Scope</label>

@@ -1585,9 +1585,11 @@
     },
     {
       "id": "projects-view",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
+      "kind": "vitest",
       "risk": "low",
+      "specs": [
+        "src/components/__tests__/ProjectsView.test.tsx"
+      ],
       "components": [
         "web/src/components/ProjectsView.tsx"
       ]
