@@ -11,17 +11,10 @@ import {
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
-  type ServerAbout,
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
-import {
-  CollapsibleSection,
-  NumberField,
-  SelectField,
-  TextField,
-  ToggleField,
-} from "./settings/FormFields";
+import { SelectField, TextField } from "./settings/FormFields";
 import { ThemeSettings } from "./settings/ThemeSettings";
 import { DiffSettings } from "./settings/DiffSettings";
 import { SoundSettings } from "./settings/SoundSettings";
@@ -91,7 +84,6 @@ interface Props {
   onClose: () => void;
   tab: string | null;
   onSelectTab: (tab: TabId) => void;
-  serverAbout: ServerAbout | null;
   onServerAboutRefresh: () => Promise<void> | void;
   /** Profile to preselect, sourced from the `?profile=` query so the
    *  Profiles page can deep-link into a specific profile's section. */
@@ -179,7 +171,6 @@ export function SettingsView({
   onClose,
   tab,
   onSelectTab,
-  serverAbout,
   onServerAboutRefresh,
   profile,
   onSelectProfile,
@@ -459,29 +450,11 @@ export function SettingsView({
                 <p className="text-xs text-text-dim">
                   Controls which session events trigger push notifications on the server.
                 </p>
-                <ToggleField
-                  label="Push notifications enabled"
-                  description="Server-wide kill switch for push notifications"
-                  checked={(web.notifications_enabled as boolean) ?? true}
-                  onChange={(v) => saveField("web", web, "notifications_enabled", v)}
-                />
-                <ToggleField
-                  label="Notify on waiting"
-                  description="Send push when a session needs input"
-                  checked={(web.notify_on_waiting as boolean) ?? true}
-                  onChange={(v) => saveField("web", web, "notify_on_waiting", v)}
-                />
-                <ToggleField
-                  label="Notify on idle"
-                  description="Send push when a session finishes"
-                  checked={(web.notify_on_idle as boolean) ?? false}
-                  onChange={(v) => saveField("web", web, "notify_on_idle", v)}
-                />
-                <ToggleField
-                  label="Notify on error"
-                  description="Send push when a session errors"
-                  checked={(web.notify_on_error as boolean) ?? true}
-                  onChange={(v) => saveField("web", web, "notify_on_error", v)}
+                <SchemaSection
+                  section="web"
+                  schema={schema}
+                  values={web}
+                  onSaveField={saveSubField}
                 />
               </div>
             )}
@@ -495,13 +468,21 @@ export function SettingsView({
       case "devices":
         return <ConnectedDevices />;
       case "structured-view": {
-        const acp = (settings?.acp ?? {}) as Record<string, unknown>;
+        if (!settings) {
+          return <div className="text-sm text-text-dim">Loading settings...</div>;
+        }
+        const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
-          <AcpSettings
-            serverAbout={serverAbout}
-            onRefresh={onServerAboutRefresh}
-            acp={acp}
+          <SchemaSection
+            section="acp"
+            schema={schema}
+            values={acp}
             onSaveField={saveSubField}
+            // The acp section mirrors three fields into serverAbout, which
+            // ToolCards and the composer read live; refresh it after any acp
+            // save so those surfaces pick up the change without a reload.
+            onAfterSave={() => onServerAboutRefresh()}
+            advancedSubtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
           />
         );
       }
@@ -602,193 +583,6 @@ export function SettingsView({
           </div>
         </div>
       </div>
-    </div>
-  );
-}
-
-function AcpSettings({
-  serverAbout,
-  onRefresh,
-  acp,
-  onSaveField,
-}: {
-  serverAbout: ServerAbout | null;
-  onRefresh: () => Promise<void> | void;
-  acp: Record<string, unknown>;
-  onSaveField: (section: string, field: string, value: unknown) => void;
-}) {
-  const showToolDurations =
-    typeof acp.show_tool_durations === "boolean"
-      ? (acp.show_tool_durations as boolean)
-      : (serverAbout?.acp_show_tool_durations ?? true);
-  const queueDrainMode: "combined" | "serial" =
-    acp.queue_drain_mode === "serial" || acp.queue_drain_mode === "combined"
-      ? (acp.queue_drain_mode as "combined" | "serial")
-      : (serverAbout?.acp_queue_drain_mode ?? "combined");
-  const maxConcurrentResumes =
-    typeof acp.max_concurrent_resumes === "number"
-      ? (acp.max_concurrent_resumes as number)
-      : (serverAbout?.acp_max_concurrent_resumes ?? 4);
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
-        <div>
-          <div className="text-sm text-text-bright">Show tool-call durations</div>
-          <div className="text-xs text-text-dim mt-0.5">
-            Persists to <code>config.toml</code> as{" "}
-            <code>acp.show_tool_durations</code>; cross-device. Renders the elapsed-time label on every
-            acp tool card. The underlying measurement is currently imprecise on{" "}
-            <code>claude-agent-acp</code> (no <code>status: in_progress</code> signal); durations include
-            stream-arrival skew rather than just runtime, so for example a parallel{" "}
-            <code>sleep 1</code> can read as ~3 s. Turn off if the inflated numbers are more confusing than
-            useful.
-          </div>
-        </div>
-        <button
-          type="button"
-          aria-pressed={showToolDurations}
-          aria-label="Show tool-call durations"
-          onClick={async () => {
-            const next = !showToolDurations;
-            onSaveField("acp", "show_tool_durations", next);
-            await onRefresh();
-          }}
-          className={`shrink-0 rounded px-3 py-1 text-xs font-medium transition-colors cursor-pointer ${
-            showToolDurations
-              ? "bg-brand-500 text-white hover:bg-brand-400"
-              : "bg-surface-700 text-text-secondary hover:bg-surface-600"
-          }`}
-        >
-          {showToolDurations ? "Visible" : "Hidden"}
-        </button>
-      </div>
-
-      <div className="border-t border-surface-800 pt-3">
-        <ToggleField
-          label="Auto-resume after rate limit"
-          description="When an acp worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as acp.rate_limit_auto_resume; cross-device. See #1722."
-          checked={(acp.rate_limit_auto_resume as boolean) ?? false}
-          onChange={(v) => onSaveField("acp", "rate_limit_auto_resume", v)}
-        />
-      </div>
-
-      <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
-        <div>
-          <div className="text-sm text-text-bright">Queue drain mode</div>
-          <div className="text-xs text-text-dim mt-0.5">
-            Persists to <code>config.toml</code> as{" "}
-            <code>acp.queue_drain_mode</code>; cross-device. Controls how follow-up prompts queued
-            while the agent is busy get dispatched once the current turn ends. <strong>Combined</strong>{" "}
-            (default) joins every queued entry with a blank line and sends them as a single prompt; one
-            response covers the whole batch. <strong>Serial</strong> fires one entry at a time and waits
-            for each response before sending the next.
-          </div>
-        </div>
-        <div className="shrink-0 inline-flex rounded border border-surface-700 bg-surface-900/50 p-0.5 text-xs font-medium">
-          {(["combined", "serial"] as const).map((opt) => (
-            <button
-              key={opt}
-              type="button"
-              aria-pressed={queueDrainMode === opt}
-              onClick={async () => {
-                if (queueDrainMode === opt) return;
-                onSaveField("acp", "queue_drain_mode", opt);
-                await onRefresh();
-              }}
-              className={`rounded px-2.5 py-1 transition-colors cursor-pointer ${
-                queueDrainMode === opt
-                  ? "bg-brand-500 text-white"
-                  : "text-text-secondary hover:bg-surface-700"
-              }`}
-            >
-              {opt[0]!.toUpperCase() + opt.slice(1)}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <CollapsibleSection
-        title="Advanced"
-        subtitle="Replay retention caps and daemon watchdog tuning. Touch only when triaging a specific failure mode."
-      >
-        <NumberField
-          label="History cap (events)"
-          description="Per-session retention cap on acp events. 0 = unlimited (default); set a non-zero value to bound disk usage on long-running sessions. Persists to config.toml as acp.replay_events; cross-device."
-          value={
-            typeof acp.replay_events === "number"
-              ? (acp.replay_events as number)
-              : 0
-          }
-          min={0}
-          onChange={(v) => onSaveField("acp", "replay_events", v)}
-        />
-        <NumberField
-          label="Replay buffer bytes"
-          description="Per-session byte cap on the in-memory replay buffer. Persists to config.toml as acp.replay_bytes; cross-device."
-          value={
-            typeof acp.replay_bytes === "number"
-              ? (acp.replay_bytes as number)
-              : 0
-          }
-          min={0}
-          onChange={(v) => onSaveField("acp", "replay_bytes", v)}
-        />
-        <NumberField
-          label="Max concurrent resumes"
-          description="Upper bound on parallel acp worker spawns/attaches the reconciler runs on `aoe serve` cold start. Default 4 keeps Node.js bootup memory bounded for laptops/Pis (each claude-agent-acp is ~50-80 MB transient). Bounded at runtime by `min(this, max_concurrent_workers).max(1)`. Persists to config.toml as acp.max_concurrent_resumes; cross-device."
-          value={maxConcurrentResumes}
-          min={1}
-          onChange={(v) => onSaveField("acp", "max_concurrent_resumes", v)}
-        />
-        <NumberField
-          label="Silent-orphan grace (s)"
-          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as acp.silent_orphan_grace_secs; cross-device. See #1240."
-          value={
-            typeof acp.silent_orphan_grace_secs === "number"
-              ? (acp.silent_orphan_grace_secs as number)
-              : 60
-          }
-          min={0}
-          onChange={(v) => onSaveField("acp", "silent_orphan_grace_secs", v)}
-        />
-        <NumberField
-          label="Silent-orphan fast grace (s)"
-          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as acp.silent_orphan_fast_grace_secs; cross-device. See #1240."
-          value={
-            typeof acp.silent_orphan_fast_grace_secs === "number"
-              ? (acp.silent_orphan_fast_grace_secs as number)
-              : 20
-          }
-          min={0}
-          onChange={(v) => onSaveField("acp", "silent_orphan_fast_grace_secs", v)}
-        />
-        <NumberField
-          label="Auto-stop idle workers (s)"
-          description="Seconds of inactivity (no acp events, no in-flight turn) after which the daemon stops an idle acp worker and frees its resources. The session stays put; the next prompt respawns the worker seamlessly. 0 disables (default); no worker is ever stopped for inactivity. Checked about once a minute, so the stop can lag the threshold by up to a minute. Acp workers only. Persists to config.toml as acp.auto_stop_idle_secs; cross-device. See #1689."
-          value={
-            typeof acp.auto_stop_idle_secs === "number"
-              ? (acp.auto_stop_idle_secs as number)
-              : 0
-          }
-          min={0}
-          onChange={(v) => onSaveField("acp", "auto_stop_idle_secs", v)}
-        />
-        <NumberField
-          label="Auto-resume grace (s)"
-          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as acp.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
-          value={
-            typeof acp.rate_limit_auto_resume_grace_secs === "number"
-              ? (acp.rate_limit_auto_resume_grace_secs as number)
-              : 15
-          }
-          min={0}
-          onChange={(v) =>
-            onSaveField("acp", "rate_limit_auto_resume_grace_secs", v)
-          }
-        />
-      </CollapsibleSection>
-
     </div>
   );
 }

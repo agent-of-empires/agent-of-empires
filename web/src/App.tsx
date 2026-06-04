@@ -909,7 +909,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               `/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`,
             );
           }}
-          serverAbout={serverAbout}
           onServerAboutRefresh={refreshServerAbout}
           profile={searchParams.get("profile")}
           onSelectProfile={(p) => {

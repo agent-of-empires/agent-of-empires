@@ -54,7 +54,6 @@ function renderView(tab: string) {
       onClose={() => {}}
       tab={tab}
       onSelectTab={vi.fn()}
-      serverAbout={SERVER_ABOUT as never}
       onServerAboutRefresh={() => {}}
     />,
   );

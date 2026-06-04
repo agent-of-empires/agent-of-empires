@@ -87,7 +87,6 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -106,7 +105,6 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -127,7 +125,6 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );

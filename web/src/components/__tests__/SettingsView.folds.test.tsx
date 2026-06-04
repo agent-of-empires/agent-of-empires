@@ -68,7 +68,6 @@ function renderView(tab: string) {
       onClose={() => {}}
       tab={tab}
       onSelectTab={onSelectTab}
-      serverAbout={SERVER_ABOUT as never}
       onServerAboutRefresh={() => {}}
     />,
   );
@@ -183,7 +182,6 @@ describe("Settings Advanced fold", () => {
         onClose={() => {}}
         tab="worktree"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -196,7 +194,6 @@ describe("Settings Advanced fold", () => {
         onClose={() => {}}
         tab="sandbox"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
