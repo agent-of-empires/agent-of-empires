@@ -21,6 +21,7 @@
 - `tests/e2e/`: end-to-end tests exercising the full `aoe` binary (see E2E Tests below).
 - `docs/`: user-facing documentation and guides.
 - `docs/development/adding-agents.md`: guide for adding a new agent to AoE.
+- `docs/development/adding-settings.md`: guide for adding a setting via the single-source schema.
 - `scripts/`: installation and utility scripts.
 - `xtask/`: build automation workspace.
 

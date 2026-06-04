@@ -14,7 +14,7 @@ import {
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
-import { SelectField, TextField } from "./settings/FormFields";
+import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
@@ -141,25 +141,6 @@ export function resolveSelectedProfile(
 ): string {
   if (profiles.some((p) => p.name === current)) return current;
   return profiles.find((p) => p.is_default)?.name ?? "default";
-}
-
-function formatJsonSetting(value: unknown): string {
-  if (!value || typeof value !== "object") return "{}";
-  return JSON.stringify(value, null, 2);
-}
-
-function parseJsonObjectSetting(value: string): Record<string, unknown> | null {
-  const trimmed = value.trim();
-  if (!trimmed) return {};
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    return null;
-  }
-  return null;
 }
 
 export function SettingsView({
@@ -371,27 +352,15 @@ export function SettingsView({
               onChange={(v) => handleSetDefault(v)}
               options={profiles.map((p) => ({ value: p.name, label: p.name }))}
             />
+            {/* acp_defaults (Structured View Defaults) is now schema-driven via
+                the acp-defaults custom widget, so it renders inside this
+                SchemaSection alongside the rest of the session fields. */}
             <SchemaSection
               section="session"
               schema={schema}
               values={session}
               onSaveField={saveSubField}
               advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
-            />
-            {/* Non-schema row: acp_defaults is #[setting(skip)] (configured per
-                session via the wizard), so it has no schema descriptor and
-                keeps its bespoke JSON editor. */}
-            <TextField
-              label="Structured view defaults"
-              description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
-              value={formatJsonSetting(session.acp_defaults)}
-              onChange={(v) => {
-                const parsed = parseJsonObjectSetting(v);
-                if (parsed) void saveField("session", session, "acp_defaults", parsed);
-              }}
-              placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
-              mono
-              multiline
             />
           </div>
         );

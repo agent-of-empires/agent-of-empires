@@ -13,8 +13,8 @@ import * as api from "../../lib/api";
 const PROFILES = [{ name: "main", is_default: true }];
 
 // The session tab is schema-driven (#1692): auto_stop_idle_secs is a number
-// field built from this descriptor. The default-profile selector and the
-// acp_defaults JSON editor are non-schema rows rendered alongside it.
+// field and acp_defaults is the acp-defaults custom widget, both built from
+// these descriptors. The default-profile selector is the only non-schema row.
 const SESSION_SCHEMA = [
   {
     section: "session",
@@ -23,6 +23,18 @@ const SESSION_SCHEMA = [
     label: "Auto-stop idle sessions (s)",
     description: "",
     widget: { kind: "number", min: 0 },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+  {
+    section: "session",
+    field: "acp_defaults",
+    category: "Session",
+    label: "Structured View Defaults",
+    description: "",
+    widget: { kind: "custom", id: "acp-defaults" },
     web_write: { policy: "allow" },
     profile_overridable: true,
     validation: { rule: "none" },
@@ -141,10 +153,10 @@ describe("Session tab auto-stop idle field", () => {
         onServerAboutRefresh={() => {}}
       />,
     );
-    await screen.findByText("Structured view defaults");
+    await screen.findByText("Structured View Defaults");
 
     commitTextarea(
-      textareaByLabel(container, "Structured view defaults"),
+      textareaByLabel(container, "Structured View Defaults"),
       '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}',
     );
 

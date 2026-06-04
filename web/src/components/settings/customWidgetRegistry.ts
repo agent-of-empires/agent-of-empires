@@ -1,5 +1,6 @@
 import type { CustomSettingsWidget } from "./customWidgets";
 import {
+  AcpDefaultsWidget,
   DefaultToolWidget,
   LoggingTargetsWidget,
   SoundModeWidget,
@@ -17,4 +18,5 @@ export const CUSTOM_SETTINGS_WIDGETS: Record<string, CustomSettingsWidget> = {
   "sound-mode": SoundModeWidget,
   "sound-volume": SoundVolumeWidget,
   "logging-targets": LoggingTargetsWidget,
+  "acp-defaults": AcpDefaultsWidget,
 };

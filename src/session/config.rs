@@ -768,14 +768,15 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Per-agent acp startup defaults. `model` is forwarded at spawn;
-    /// `effort` is applied through ACP config options when advertised.
+    /// Per-agent acp startup defaults as a JSON object
+    /// (`{"<agent>": {"model": "...", "effort": "..."}}`). `model` is forwarded
+    /// at spawn; `effort` is applied through ACP config options when advertised.
     ///
-    /// Map-of-struct (agent -> {model, effort}); not a flat settings widget,
-    /// so it is configured through the session wizard rather than the generic
-    /// settings panel. Skipped in the derived schema (#1692).
+    /// Map-of-struct, so it has no flat widget: it is edited as raw JSON through
+    /// the `acp-defaults` custom widget (a JSON textarea on the web, an inline
+    /// JSON field in the TUI) and saved like any other schema field.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[setting(skip)]
+    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
     pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
@@ -1498,7 +1499,7 @@ pub struct WorktreeConfig {
 
     /// Show the worktree branch name in the TUI session list.
     #[serde(default = "default_true")]
-    #[setting(skip)]
+    #[setting(label = "Show Branch in TUI", widget = "toggle", advanced)]
     pub show_branch_in_tui: bool,
 
     /// Also delete the git branch when deleting a worktree. Default: false
