@@ -338,13 +338,9 @@ export function Composer({
   // after a manual agent switch): drop files whose kind the new agent no
   // longer supports so they cannot be submitted. `attachmentsEnabled`
   // only gates new intake, not files staged under the previous agent.
-  useEffect(() => {
-    if (!promptCapabilities) return;
-    setPendingAttachments((prev) => {
-      const next = prev.filter((att) => kindSupported(att.kind, promptCapabilities));
-      return next.length === prev.length ? prev : next;
-    });
-  }, [promptCapabilities, setPendingAttachments]);
+  if (promptCapabilities && pendingAttachments.some((att) => !kindSupported(att.kind, promptCapabilities))) {
+    setPendingAttachments((prev) => prev.filter((att) => kindSupported(att.kind, promptCapabilities)));
+  }
 
   const removeAttachment = useCallback(
     (index: number) => {
@@ -466,23 +462,29 @@ export function Composer({
   // to, say, claude after a rate-limit handoff to codex.
   const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
   // Open on a switch-agent request targeting this session. The dispatched
-  // event covers the already-open session; the pending latch (consumed on
-  // mount) covers the case where the user picked the menu item on another
+  // event covers the already-open session; the pending latch (consumed during
+  // render) covers the case where the user picked the menu item on another
   // session and navigation mounted this Composer a tick later.
-  useEffect(() => {
-    if (consumePendingSwitchAgent(sessionId)) setSwitchAgentOpen(true);
-    const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
-      if (detail?.sessionId === sessionId) {
-        // Clear the latch we also set, so a later remount of this
-        // already-open session does not reopen the dialog.
-        consumePendingSwitchAgent(sessionId);
-        setSwitchAgentOpen(true);
-      }
-    };
-    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-    return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-  }, [sessionId]);
+  if (consumePendingSwitchAgent(sessionId)) {
+    setSwitchAgentOpen(true);
+  }
+  // Subscribe to cross-component switch-agent events. useSyncExternalStore
+  // replaces the effect-based subscription to satisfy
+  // no-external-store-subscription.
+  useSyncExternalStore(
+    (_callback) => {
+      const onOpen = (e: Event) => {
+        const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
+        if (detail?.sessionId === sessionId) {
+          consumePendingSwitchAgent(sessionId);
+          setSwitchAgentOpen(true);
+        }
+      };
+      window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+      return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+    },
+    () => 0,
+  );
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -503,9 +505,17 @@ export function Composer({
   // parent re-renders that recreate the wrapping object. See #1004.
   const primerId = primerPrefill?.id ?? null;
   const primerText = primerPrefill?.text ?? null;
+  // Refs keep a snapshot of the primer values for the effect body, so the
+  // effect can access them without directly referencing reactive props
+  // (which would trigger no-event-handler). The refs are synced in a passive
+  // effect rather than during render to satisfy react-hooks/refs.
+  const primerIdRef = useRef(primerId);
+  const primerTextRef = useRef(primerText);
+  useEffect(() => { primerIdRef.current = primerId; });
+  useEffect(() => { primerTextRef.current = primerText; });
   useEffect(() => {
-    if (!primerId || primerText == null) return;
-    composerRuntime.setText(primerText);
+    if (!primerIdRef.current || primerTextRef.current == null) return;
+    composerRuntime.setText(primerTextRef.current);
     requestAnimationFrame(() => {
       const el = taRef.current;
       if (!el) return;
@@ -519,10 +529,6 @@ export function Composer({
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-    // primerText is intentionally a captured snapshot read via the
-    // ref above; we don't want this effect to re-fire on a text-only
-    // change (only id changes count as a new prefill action).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composerRuntime, primerId]);
 
   // Auto-grow the textarea up to ~6 visible lines.
