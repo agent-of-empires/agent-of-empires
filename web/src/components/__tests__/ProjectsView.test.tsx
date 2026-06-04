@@ -93,4 +93,37 @@ describe("ProjectsView default base branch", () => {
     expect(await screen.findByText(/base branch:/i)).toBeTruthy();
     expect(screen.getByText("develop")).toBeTruthy();
   });
+
+  it("does not render a base branch row when none is configured", async () => {
+    mockFetch.mockResolvedValue([
+      { name: "plain", path: "/repo/plain", scope: "global" },
+    ]);
+
+    render(<ProjectsView onClose={() => {}} />);
+
+    expect(await screen.findByText("plain")).toBeTruthy();
+    expect(screen.queryByText(/base branch:/i)).toBeNull();
+  });
+
+  it("clears the base branch field when the add form is cancelled", async () => {
+    mockFetch.mockResolvedValue([]);
+
+    render(<ProjectsView onClose={() => {}} />);
+    await openAddForm();
+    const baseInput = screen.getByPlaceholderText(
+      "inherit global default, else auto-detect",
+    );
+    fireEvent.change(baseInput, { target: { value: "develop" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // Reopening starts from a clean form (the cancel handler reset state).
+    fireEvent.click(screen.getByRole("button", { name: "+ Add project" }));
+    expect(
+      (
+        screen.getByPlaceholderText(
+          "inherit global default, else auto-detect",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("");
+  });
 });
