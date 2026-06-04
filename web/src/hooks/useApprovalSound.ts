@@ -134,6 +134,10 @@ async function playApprovalSound(): Promise<void> {
 export function useApprovalSound(pendingCount: number): void {
   const [trackedPendingCount, setTrackedPendingCount] = useState(pendingCount);
   const [quietPeriodDone, setQuietPeriodDone] = useState(false);
+  // Bumped on a committed 0 -> >=1 edge; the effect below plays the chime.
+  // Keeping playback in an effect (not the render-time block) keeps the hook
+  // pure and avoids duplicate/late chimes under re-render or replay.
+  const [playbackToken, setPlaybackToken] = useState(0);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -142,9 +146,15 @@ export function useApprovalSound(pendingCount: number): void {
     return () => clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    if (playbackToken === 0) return;
+    const timer = setTimeout(() => void playApprovalSound(), 0);
+    return () => clearTimeout(timer);
+  }, [playbackToken]);
+
   if (pendingCount !== trackedPendingCount) {
     if (trackedPendingCount === 0 && pendingCount !== 0 && quietPeriodDone) {
-      setTimeout(() => void playApprovalSound(), 0);
+      setPlaybackToken((t) => t + 1);
     }
     setTrackedPendingCount(pendingCount);
   }
