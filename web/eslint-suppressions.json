@@ -67,17 +67,6 @@
       "count": 1
     }
   },
-  "src/components/TerminalView.tsx": {
-    "react-hooks/set-state-in-effect": {
-      "count": 1
-    },
-    "react-you-might-not-need-an-effect/no-adjust-state-on-prop-change": {
-      "count": 2
-    },
-    "react-you-might-not-need-an-effect/no-event-handler": {
-      "count": 3
-    }
-  },
   "src/components/UpdateBanner.tsx": {
     "react-you-might-not-need-an-effect/no-external-store-subscription": {
       "count": 1
