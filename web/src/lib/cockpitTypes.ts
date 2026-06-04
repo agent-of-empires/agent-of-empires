@@ -55,6 +55,13 @@ export interface ToolCall {
    *  paths the SDK loaded into the agent's context; `synthesize`
    *  mode carries the synthesised memory text. */
   memory_recall?: MemoryRecall | null;
+  /** Structured file diffs the agent attached via ACP
+   *  `ToolCallContent::Diff`. Codex routes `apply_patch` edits through
+   *  this channel (one entry per touched file) rather than the legacy
+   *  `old_string`/`new_string` args, so the edit card reads the path and
+   *  +/- preview from here when present and falls back to the args shape
+   *  otherwise. See #1721. */
+  diffs?: DiffPreview[] | null;
 }
 
 export interface MemoryRecall {
@@ -248,6 +255,11 @@ export type CockpitEvent =
          *  rather than adapter scheduling time. Null for non-status
          *  updates. */
         started_at?: string | null;
+        /** Diffs carried on a late `ToolCallUpdate.fields.content` frame
+         *  (Codex emits apply_patch diffs on the in-progress and
+         *  completion updates). A non-empty list REPLACES the card's
+         *  diffs; null/absent leaves earlier diffs untouched. See #1721. */
+        diffs?: DiffPreview[] | null;
       };
     }
   | { ApprovalRequested: { approval: Approval } }
@@ -258,6 +270,7 @@ export type CockpitEvent =
   | "ThinkingStarted"
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
+  | { RateLimitAutoResumed: { resets_at: string } }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -604,6 +617,12 @@ export interface QueuedPrompt {
   /** ISO-8601 client wall clock at enqueue time. Displayed as a
    *  relative age in the strip. */
   queuedAt: string;
+  /** Attachments staged with this queued prompt. EPHEMERAL: these carry
+   *  raw base64 bytes, so `persistState` drops any queued row that has
+   *  them rather than writing megabytes into the per-origin localStorage
+   *  quota. They survive a component remount (the in-memory `stateCache`
+   *  keeps the full row) but not a full page reload. See #1833 / #1000. */
+  attachments?: PromptAttachmentInput[];
 }
 
 export interface ActivityRow {
@@ -870,8 +889,16 @@ export function applyEvent(
     if (existing >= 0) {
       const prev = next.activity[existing];
       if (prev) {
+        // Merge rather than replace so a sparse permission start (#1713)
+        // never clobbers richer args/kind from a real start frame.
+        const merged = prev.tool ? mergeToolStart(prev.tool, tc) : tc;
         const copy = next.activity.slice();
-        copy[existing] = { ...prev, tool: tc, text: tc.name };
+        copy[existing] = {
+          ...prev,
+          tool: merged,
+          text: merged.name,
+          at: merged.started_at,
+        };
         next.activity = copy;
       }
       return next;
@@ -890,6 +917,19 @@ export function applyEvent(
   if ("ToolCallCompleted" in event) {
     const { tool_call_id, is_error, content, completed_at } =
       event.ToolCallCompleted;
+    // #1713: a completion with no preceding start frame would render no
+    // card (the render layer only attaches results to an existing
+    // tool-call part). Synthesize a minimal start row first so the card
+    // appears.
+    if (!hasToolStart(next.activity, tool_call_id)) {
+      next.activity = pushActivity(
+        next.activity,
+        synthToolStartRow(tool_call_id, { started_at: completed_at }),
+      );
+      // A synthesized tool call is real turn output; without this the
+      // turn-end logic would append "Command produced no output."
+      next.turnHasOutput = true;
+    }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = null;
     }
@@ -929,14 +969,33 @@ export function applyEvent(
     return next;
   }
   if ("ToolCallUpdated" in event) {
-    const { tool_call_id, title, args_preview, started_at } =
+    const { tool_call_id, title, args_preview, started_at, diffs } =
       event.ToolCallUpdated;
+    // Per ACP, content is a replacement: a non-empty diff list overwrites
+    // the card's diffs; null/empty leaves an earlier frame's diffs intact
+    // so a text-only update can't blank the edit card. See #1721.
+    const incomingDiffs = diffs && diffs.length > 0 ? diffs : null;
+    // #1713: an update with no preceding start frame would be dropped
+    // (the patch loop below only touches an existing tool_start row).
+    // Synthesize one so the update lands and a card renders.
+    if (!hasToolStart(next.activity, tool_call_id)) {
+      next.activity = pushActivity(
+        next.activity,
+        synthToolStartRow(tool_call_id, {
+          name: title ?? undefined,
+          args_preview: args_preview ?? undefined,
+          started_at: started_at ?? undefined,
+        }),
+      );
+      next.turnHasOutput = true;
+    }
     if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
       next.inFlightTool = {
         ...next.inFlightTool,
         name: title ?? next.inFlightTool.name,
         args_preview: args_preview ?? next.inFlightTool.args_preview,
         started_at: started_at ?? next.inFlightTool.started_at,
+        diffs: incomingDiffs ?? next.inFlightTool.diffs,
       };
     }
     // Walk activity backwards to find the matching tool_start row and
@@ -960,6 +1019,7 @@ export function applyEvent(
             name: title ?? row.tool.name,
             args_preview: args_preview ?? row.tool.args_preview,
             started_at: started_at ?? row.tool.started_at,
+            diffs: incomingDiffs ?? row.tool.diffs,
           },
         };
       }
@@ -986,6 +1046,15 @@ export function applyEvent(
   }
   if ("RateLimit" in event) {
     next.rateLimit = event.RateLimit.info;
+    return next;
+  }
+  if ("RateLimitAutoResumed" in event) {
+    // The reconciler crossed the reset deadline and is respawning the
+    // worker (opt-in cockpit.rate_limit_auto_resume). Clear the parked
+    // banner so the composer unlocks; the imminent AcpSessionAssigned and
+    // the running worker let the drain effect dispatch any prompt the
+    // user queued during the wait. See #1722.
+    next.rateLimit = null;
     return next;
   }
   if ("UsageUpdated" in event) {
@@ -1534,6 +1603,73 @@ export function applyEvent(
   // no state mutation. The activity feed shows the raw text where
   // useful via the catch-all branch in the UI.
   return next;
+}
+
+/** True when `rows` already carries a `tool_start` row for this id. */
+function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
+  return rows.some(
+    (r) => r.kind === "tool_start" && r.toolCallId === toolCallId,
+  );
+}
+
+/** Build a minimal `tool_start` row for a tool call we never saw start.
+ *  Some agents (Gemini's permission flow) emit updates/completions with
+ *  no preceding start frame; synthesizing one keeps the card visible.
+ *  See #1713. */
+function synthToolStartRow(
+  toolCallId: string,
+  opts: { name?: string; args_preview?: string; started_at?: string },
+): ActivityRow {
+  const startedAt = opts.started_at ?? new Date().toISOString();
+  const tool: ToolCall = {
+    id: toolCallId,
+    name: opts.name && opts.name.length > 0 ? opts.name : "tool call",
+    kind: "other",
+    args_preview: opts.args_preview ?? "",
+    started_at: startedAt,
+  };
+  return {
+    id: `start-${toolCallId}`,
+    kind: "tool_start",
+    text: tool.name,
+    toolCallId,
+    tool,
+    at: startedAt,
+  };
+}
+
+/** Merge a duplicate `ToolCallStarted` into the existing row's payload
+ *  without clobbering richer data with a sparser frame. A permission
+ *  start (#1713) carries empty args and `kind: "other"`; a later real
+ *  start frame for the same id must win, but a real start that arrives
+ *  first must not be overwritten by the sparse permission start. */
+function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
+  const startedAt =
+    !prev.started_at ||
+    (incoming.started_at.length > 0 &&
+      Date.parse(incoming.started_at) > Date.parse(prev.started_at))
+      ? incoming.started_at
+      : prev.started_at;
+
+  return {
+    ...prev,
+    ...incoming,
+    name: incoming.name.length > 0 ? incoming.name : prev.name,
+    kind:
+      incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
+    args_preview:
+      incoming.args_preview.trim().length > 0
+        ? incoming.args_preview
+        : prev.args_preview,
+    started_at: startedAt,
+    diffs:
+      incoming.diffs && incoming.diffs.length > 0
+        ? incoming.diffs
+        : prev.diffs,
+    parent_tool_call_id:
+      incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
+    memory_recall: incoming.memory_recall ?? prev.memory_recall,
+  };
 }
 
 function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {

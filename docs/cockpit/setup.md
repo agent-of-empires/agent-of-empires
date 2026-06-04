@@ -67,6 +67,19 @@ it exits 2; otherwise 0. Pass `--json` for machine-readable output.
 
 ### Per session
 
+#### From the web wizard (primary)
+
+When the cockpit master switch is on, the web new-session wizard shows a
+per-session **Use cockpit** toggle, on by default for supported agents.
+Open `aoe serve`, click **New session**, pick the agent, leave the toggle
+on, and create. No CLI required. Tools without a verified ACP adapter (and
+custom agents without `agent_cockpit_cmd`) have no toggle and stay in tmux.
+
+#### From the CLI (optional)
+
+For scripting, headless, or non-interactive launches, `aoe add` starts
+cockpit sessions too:
+
 ```bash
 # Force cockpit on for this session, regardless of defaults.
 aoe add . --cmd claude --cockpit
@@ -78,6 +91,46 @@ aoe add . --cmd claude --no-cockpit
 aoe add . --cockpit --agent aoe-agent --model gpt-5
 aoe add . --cockpit --agent aoe-agent --model llama3.3:ollama
 aoe add . --cockpit --agent gemini
+```
+
+### Launch command and session name
+
+`--cmd <tool>` resolves through `session.agent_command_override` for
+cockpit sessions, the same as for tmux sessions. With
+
+```toml
+[session.agent_command_override]
+opencode = "opencode-plannotator"
+```
+
+`aoe add . --cmd opencode --cockpit` launches `opencode-plannotator`,
+not the bare `opencode` binary; the override's binary replaces the
+registry command and the agent's required ACP args are preserved (so
+`opencode acp` becomes `opencode-plannotator acp`). The override is
+applied only to a built-in agent whose registry binary matches the
+tool's own binary; adapter-backed agents such as Claude keep using
+`session.agent_cockpit_cmd` for a full command swap.
+
+The web new-session wizard shows the resolved launch command read-only
+so you can confirm it before the session starts.
+
+Session naming differs by entry point. By default `aoe add` does not
+prompt for a name: it uses `--title` when given, otherwise the worktree
+branch name, otherwise a generated name. Pass `-i`/`--interactive` to get
+the same name prompt the TUI `n` flow and the web new-session wizard
+provide; it shows the generated default and pressing Enter accepts it.
+`--interactive` requires a terminal and is ignored when `--title` is
+given, so scripted and non-interactive `aoe add` calls keep auto-naming.
+To name a session non-interactively, pass `--title "<name>"`.
+
+For web-created cockpit sessions, configure per-agent defaults under
+`[session.cockpit_defaults.<agent>]` so the dashboard starts that agent with
+the desired model and, when the adapter advertises it, reasoning effort:
+
+```toml
+[session.cockpit_defaults.opencode]
+model = "openai/gpt-5.5"
+effort = "high"
 ```
 
 ### Globally

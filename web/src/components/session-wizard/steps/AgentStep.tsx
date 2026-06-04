@@ -2,6 +2,8 @@ import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { resolveLaunchCommand } from "../../../lib/launchCommand";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
   tool: string;
@@ -28,7 +30,19 @@ interface Props {
   agents: AgentInfo[];
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
-  onApplyProfileDefaults: (defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => void;
+  onApplyProfileDefaults: (defaults: {
+    yoloMode: boolean;
+    sandboxEnabled: boolean;
+    tool: string;
+    extraEnv: string[];
+    cockpitModel?: string;
+    cockpitEffort?: string;
+    commandMaps?: CommandMaps;
+  }) => void;
+  /** Profile-resolved override / custom-agent maps, used to preview the
+   *  exact launch command. Sourced from the settings the wizard already
+   *  fetched, so this step issues no extra request. See #1911. */
+  commandMaps?: CommandMaps;
   /** Live value of the cockpit master switch. When true, sessions
    *  the user creates here run in cockpit mode automatically (for
    *  tools with an ACP adapter); when false, every session is tmux.
@@ -124,7 +138,7 @@ function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onCh
   );
 }
 
-export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled }: Props) {
+export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, onApplyProfileDefaults, cockpitMasterEnabled, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectableAgents = agents.filter(
     (agent) => agent.kind === "custom" || agent.installed,
   );
@@ -134,6 +148,22 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
+
+  // Mirror SessionWizard.handleSubmit / ReviewStep so the preview shows
+  // the substrate the session will actually launch with (#1580).
+  const willUseCockpit = cockpitMasterEnabled && acpCapable && data.useCockpit;
+  const resolvedCommand = resolveLaunchCommand({
+    tool: data.tool,
+    useCockpit: willUseCockpit,
+    binary: selectedAgent?.binary,
+    cockpitCommand: selectedAgent?.cockpit_command,
+    cockpitArgs: selectedAgent?.cockpit_args,
+    extraArgs: data.extraArgs,
+    manualOverride: data.commandOverride,
+    agentCommandOverride: commandMaps.agentCommandOverride,
+    customAgents: commandMaps.customAgents,
+  }).full;
+  const extraArgsIgnored = willUseCockpit && data.extraArgs.trim().length > 0;
 
   const handleProfileChange = useCallback(async (profileName: string) => {
     // If user had manual edits, confirm before overwriting
@@ -158,11 +188,17 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         const env = Array.isArray(sandbox?.environment)
           ? (sandbox.environment as unknown[]).filter((v): v is string => typeof v === "string")
           : [];
+        const defaultTool = (session?.default_tool as string) || data.tool;
+        const cockpitDefaults = session?.cockpit_defaults as Record<string, unknown> | undefined;
+        const cockpitDefault = cockpitDefaults?.[defaultTool] as Record<string, unknown> | undefined;
         onApplyProfileDefaults({
           yoloMode: (session?.yolo_mode_default as boolean) ?? false,
           sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
-          tool: (session?.default_tool as string) || data.tool,
+          tool: defaultTool,
           extraEnv: env,
+          cockpitModel: typeof cockpitDefault?.model === "string" ? cockpitDefault.model : "",
+          cockpitEffort: typeof cockpitDefault?.effort === "string" ? cockpitDefault.effort : "",
+          commandMaps: commandMapsFromSettings(settings),
         });
       }
     } catch {
@@ -412,6 +448,12 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="e.g. --port 8080"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {extraArgsIgnored && (
+              <p className="mt-1.5 text-xs text-status-warning" data-testid="extra-args-ignored">
+                Extra args are ignored for cockpit sessions; use the command
+                override to change the launch command.
+              </p>
+            )}
           </div>
 
           {/* Command override */}
@@ -424,6 +466,17 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
               placeholder="Override the agent launch command"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
+            {resolvedCommand && (
+              <p
+                className="mt-1.5 text-xs text-text-dim"
+                data-testid="resolved-launch-command"
+              >
+                Resolved launch command:{" "}
+                <code className="font-mono text-text-secondary">
+                  {resolvedCommand}
+                </code>
+              </p>
+            )}
           </div>
         </div>
       )}

@@ -409,6 +409,36 @@ pub struct CockpitConfig {
         advanced
     )]
     pub auto_stop_idle_secs: u32,
+    /// Opt-in auto-resume after a provider usage/rate-limit reset. When a
+    /// cockpit worker stops with `Stopped { reason: "rate_limited" }`, the
+    /// session is parked and (by default) waits for explicit user
+    /// recovery via `/cockpit/spawn` or agent handoff (the #1281
+    /// behavior). With this enabled, the reconciler instead respawns the
+    /// same worker automatically once the adapter-reported reset time
+    /// (plus `rate_limit_auto_resume_grace_secs`) has passed, publishing a
+    /// `RateLimitAutoResumed` breadcrumb for timeline clarity. Resume
+    /// timing is read from the persisted `RateLimit` event, so it survives
+    /// a daemon restart; a re-rate-limit writes a fresh reset time, so
+    /// there is no tight restart loop. Vendor-agnostic: any ACP backend
+    /// that reports `kind == "rate_limit"` is eligible. Default false,
+    /// preserving the manual-first behavior. See #1722.
+    #[serde(default)]
+    #[setting(label = "Auto-resume after rate limit", widget = "toggle")]
+    pub rate_limit_auto_resume: bool,
+    /// Seconds added to the adapter-reported `resets_at` before
+    /// auto-resume fires, to absorb clock skew and adapter jitter. Only
+    /// meaningful when `rate_limit_auto_resume` is true. Default 15. The
+    /// reconciler also enforces a hardcoded minimum park window from the
+    /// moment the rate limit was recorded, so a buggy adapter reporting a
+    /// past `resets_at` with grace 0 still cannot cause a tight respawn
+    /// loop. See #1722.
+    #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
+    #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
+    pub rate_limit_auto_resume_grace_secs: u32,
+}
+
+fn default_rate_limit_auto_resume_grace_secs() -> u32 {
+    15
 }
 
 fn default_auto_stop_idle_secs() -> u32 {
@@ -481,6 +511,8 @@ impl Default for CockpitConfig {
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
+            rate_limit_auto_resume: false,
+            rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
         }
     }
 }
@@ -580,6 +612,14 @@ impl GroupByMode {
 pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_welcome: bool,
+
+    /// Whether the user has completed or skipped the web dashboard's
+    /// first-run interactive tour. Stored server-side (rather than in
+    /// per-browser localStorage) so a new browser or device does not
+    /// re-show the tour. Distinct from `has_seen_welcome`, which gates
+    /// the native TUI intro.
+    #[serde(default)]
+    pub has_seen_web_tour: bool,
 
     #[serde(default)]
     pub last_seen_version: Option<String>,
@@ -738,6 +778,16 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub agent_cockpit_cmd: HashMap<String, String>,
+
+    /// Per-agent cockpit startup defaults. `model` is forwarded at spawn;
+    /// `effort` is applied through ACP config options when advertised.
+    ///
+    /// Map-of-struct (agent -> {model, effort}); not a flat settings widget,
+    /// so it is configured through the session wizard rather than the generic
+    /// settings panel. Skipped in the derived schema (#1692).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(skip)]
+    pub cockpit_defaults: HashMap<String, CockpitAgentDefaults>,
 
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
@@ -900,6 +950,30 @@ pub struct SessionConfig {
     pub confirm_before_quit: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CockpitAgentDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl CockpitAgentDefaults {
+    pub fn is_empty(&self) -> bool {
+        self.model.as_deref().is_none_or(str::is_empty)
+            && self.effort.as_deref().is_none_or(str::is_empty)
+    }
+}
+
+impl SessionConfig {
+    pub fn cockpit_defaults_for(&self, agent: &str) -> Option<&CockpitAgentDefaults> {
+        self.cockpit_defaults
+            .get(agent)
+            .filter(|defaults| !defaults.is_empty())
+    }
+}
+
 /// What a single mouse click on a session row does in the Agent view.
 /// See `SessionConfig::click_action`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -970,6 +1044,7 @@ impl Default for SessionConfig {
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             agent_cockpit_cmd: HashMap::new(),
+            cockpit_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
@@ -2327,6 +2402,7 @@ mod tests {
     fn test_app_state_config_default() {
         let app = AppStateConfig::default();
         assert!(!app.has_seen_welcome);
+        assert!(!app.has_seen_web_tour);
         assert!(app.last_seen_version.is_none());
         assert!(app.dismissed_update_version.is_none());
     }
@@ -2340,8 +2416,20 @@ mod tests {
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_welcome);
+        // Absent from the toml: defaults to false (backward compatible).
+        assert!(!app.has_seen_web_tour);
         assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
         assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_app_state_config_web_tour_roundtrip() {
+        let toml = r#"
+            has_seen_web_tour = true
+        "#;
+        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        assert!(app.has_seen_web_tour);
+        assert!(!app.has_seen_welcome);
     }
 
     // Full config serialization roundtrip
@@ -2613,6 +2701,13 @@ mod tests {
             .session
             .agent_extra_args
             .insert("opencode".to_string(), "--port 8080".to_string());
+        config.session.cockpit_defaults.insert(
+            "opencode".to_string(),
+            CockpitAgentDefaults {
+                model: Some("openai/gpt-5.5".to_string()),
+                effort: Some("high".to_string()),
+            },
+        );
 
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -2625,6 +2720,14 @@ mod tests {
             deserialized.session.agent_extra_args.get("opencode"),
             Some(&"--port 8080".to_string()),
             "agent_extra_args should survive roundtrip"
+        );
+        assert_eq!(
+            deserialized.session.cockpit_defaults.get("opencode"),
+            Some(&CockpitAgentDefaults {
+                model: Some("openai/gpt-5.5".to_string()),
+                effort: Some("high".to_string()),
+            }),
+            "cockpit_defaults should survive roundtrip"
         );
     }
 

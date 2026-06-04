@@ -72,6 +72,21 @@ In the TUI, enable the Worktree checkbox to create a new branch and worktree. By
 
 The web dashboard's new-session wizard folds the worktree controls behind an "Advanced" disclosure on the session step, leaving only the session title visible by default. Inside Advanced, a "Base branch" disclosure beneath the worktree name input shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same Advanced section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
 
+## Editing the Workdir Name After Creation
+
+When a worktree session was created with an auto-generated name, you can change its workdir (worktree directory) name later. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
+
+v1 supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
+
+| Surface | How |
+|---------|-----|
+| CLI | `aoe session set-worktree-name <session> --name <new-name>` (add `--rename-branch` to also rename the git branch) |
+| TUI | Select the session, press `W` (or open the command palette and pick "Edit worktree workdir name"). Toggle "Also rename git branch" in the dialog. |
+| Web | Right-click the session row, choose "Edit workdir name", enter a name, and optionally check "Also rename git branch". |
+| REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": <bool> }` |
+
+The new directory and branch persist across reload and restart. See #1723.
+
 ## Configuration
 
 ```toml

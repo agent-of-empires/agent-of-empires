@@ -18,6 +18,8 @@ import type { Page } from "@playwright/test";
 import { spawnAoeServe } from "../helpers/aoeServe";
 import { seedRepos } from "../helpers/sidebar";
 
+const TOGGLE = "[data-testid='sidebar-sort-toggle']";
+
 async function readGroupNames(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const headers = Array.from(
@@ -32,6 +34,12 @@ async function readGroupNames(page: Page): Promise<string[]> {
       )
       .filter(Boolean);
   });
+}
+
+async function selectSortMode(page: Page, mode: "manual" | "lastActivity") {
+  await page.locator(TOGGLE).click();
+  await page.locator(`[data-testid='sidebar-sort-option-${mode}']`).click();
+  await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", mode);
 }
 
 base.describe("sidebar group-header reorder (#1644)", () => {
@@ -121,10 +129,7 @@ base.describe("sidebar group-header reorder (#1644)", () => {
 
       // Flip to last-activity sort; the order is computed there, so the
       // grips disappear, matching how within-group row drag is gated.
-      await page.locator("[data-testid='sidebar-sort-toggle']").click();
-      await expect(
-        page.locator("[data-testid='sidebar-sort-toggle']"),
-      ).toHaveAttribute("data-sort-mode", "lastActivity");
+      await selectSortMode(page, "lastActivity");
       await expect(grips).toHaveCount(0);
     } finally {
       await serve.stop();

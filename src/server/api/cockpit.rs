@@ -347,10 +347,15 @@ pub async fn spawn_cockpit(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
+            effort: None,
             stored_acp_session_id,
             sandbox_info,
             source_profile,
             yolo_mode,
+            agent_command_override: crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ),
         })
         .await
     {
@@ -548,12 +553,20 @@ pub async fn switch_cockpit_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            effort: None,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
+            // Gated in the supervisor: only applies when the selected
+            // agent equals the instance tool and its binary matches, so
+            // an explicit switch to a different agent is unaffected.
+            agent_command_override: crate::server::cockpit_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ),
         })
         .await;
     if let Err(e) = spawn_result {
@@ -1360,6 +1373,10 @@ pub async fn cockpit_enable(
     let stored_acp_session_id = instance.cockpit_acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
     let profile_for_spawn = profile.clone();
+    let command_override = crate::server::cockpit_reconciler::command_override_for_spawn(
+        &instance.tool,
+        &instance.command,
+    );
     let state_for_spawn = state.clone();
     tokio::spawn(async move {
         let inst_lock = state_for_spawn.instance_lock(&session_id).await;
@@ -1391,10 +1408,12 @@ pub async fn cockpit_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
+                effort: None,
                 stored_acp_session_id,
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                agent_command_override: command_override,
             })
             .await
         {

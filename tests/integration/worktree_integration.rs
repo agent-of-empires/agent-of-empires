@@ -271,3 +271,119 @@ fn test_create_new_branch_with_b_flag() {
         .is_ok();
     assert!(branch_exists_after);
 }
+
+// --- Edit-workdir-name (#1723) ---
+
+use agent_of_empires::session::worktree_edit::{
+    edit_worktree_workdir, WorktreeEditError, WorktreeEditRequest,
+};
+
+fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
+    WorktreeInfo {
+        branch: branch.to_string(),
+        main_repo_path: repo.to_string_lossy().to_string(),
+        managed_by_aoe: true,
+        created_at: Utc::now(),
+        base_branch: None,
+    }
+}
+
+#[test]
+#[serial]
+fn edit_workdir_moves_dir_and_optionally_renames_branch() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let old_path = repo_dir.path().join("old-name");
+    git_wt
+        .create_worktree("old-name", &old_path, true, None)
+        .unwrap();
+    assert!(old_path.exists());
+    let info = managed_info("old-name", repo_dir.path());
+
+    // Path-only edit: directory moves, branch untouched.
+    let outcome = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &old_path,
+        new_name: "fresh-name",
+        rename_branch: false,
+    })
+    .unwrap();
+    let fresh_path = repo_dir.path().join("fresh-name");
+    assert_eq!(outcome.new_path, fresh_path);
+    assert_eq!(outcome.new_branch, None);
+    assert!(!old_path.exists());
+    assert!(fresh_path.exists());
+    assert!(git_wt.branch_exists("old-name"));
+
+    // Branch rename opted in: directory moves and branch is renamed.
+    let outcome2 = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &fresh_path,
+        new_name: "renamed",
+        rename_branch: true,
+    })
+    .unwrap();
+    let renamed_path = repo_dir.path().join("renamed");
+    assert_eq!(outcome2.new_branch.as_deref(), Some("renamed"));
+    assert!(!fresh_path.exists());
+    assert!(renamed_path.exists());
+    assert!(git_wt.branch_exists("renamed"));
+    assert!(!git_wt.branch_exists("old-name"));
+}
+
+#[test]
+#[serial]
+fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let old_path = repo_dir.path().join("aaa");
+    git_wt
+        .create_worktree("aaa", &old_path, true, None)
+        .unwrap();
+    let occupied = repo_dir.path().join("bbb");
+    git_wt
+        .create_worktree("bbb", &occupied, true, None)
+        .unwrap();
+    let info = managed_info("aaa", repo_dir.path());
+
+    // Target directory already exists: nothing moves.
+    let err = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &old_path,
+        new_name: "bbb",
+        rename_branch: false,
+    })
+    .unwrap_err();
+    assert!(matches!(err, WorktreeEditError::TargetExists(_)));
+    assert!(old_path.exists());
+
+    // Branch rename onto an existing branch is rejected; the source
+    // directory and branch are untouched.
+    let err = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &old_path,
+        new_name: "test-feature",
+        rename_branch: true,
+    })
+    .unwrap_err();
+    assert!(matches!(err, WorktreeEditError::BranchExists(_)));
+    assert!(old_path.exists());
+    assert!(git_wt.branch_exists("aaa"));
+
+    // Unmanaged worktrees cannot be edited.
+    let unmanaged = WorktreeInfo {
+        managed_by_aoe: false,
+        ..info.clone()
+    };
+    let err = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &unmanaged,
+        current_path: &old_path,
+        new_name: "ccc",
+        rename_branch: false,
+    })
+    .unwrap_err();
+    assert!(matches!(err, WorktreeEditError::NotManaged));
+    assert!(old_path.exists());
+}

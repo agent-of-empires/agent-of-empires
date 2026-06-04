@@ -61,6 +61,10 @@ struct ResumeTarget {
     source_profile: String,
     in_flight_turn: bool,
     yolo_mode: bool,
+    /// `Instance.command`: the resolved launch command (from
+    /// `session.agent_command_override` / `--cmd-override`). Threaded
+    /// into `SpawnRequest` so cockpit honors it like tmux. See #1766.
+    command: String,
 }
 
 /// Tuple shape used by the instance-list snapshot. Aliased to dodge
@@ -75,12 +79,14 @@ type RawTargetTuple = (
     Option<String>,
     String,
     bool,
+    String,
 );
 
 pub async fn reconcile_cockpit_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
     last_idle_reap: &mut Option<std::time::Instant>,
+    last_rate_limit_reap: &mut Option<std::time::Instant>,
 ) {
     // Honor `cockpit.enabled = false` from config.toml — the persistent
     // master switch. Mirrored as an atomic; `PATCH /api/cockpit/master`
@@ -92,11 +98,19 @@ pub async fn reconcile_cockpit_workers(
         return;
     }
 
+    // Respawn build-stale workers that were adopted to drain an in-flight
+    // turn (see #1754) and have since gone idle. Runs BEFORE
+    // `reap_user_stopped` so the marker + registry-delete this writes is
+    // picked up by the same tick's reaper, which tears down the attached
+    // handle and clears `attempted` so the resume pass below fresh-spawns
+    // on the current binary.
+    respawn_drained_stale_workers(state).await;
+
     // Detect `aoe cockpit stop|kill|restart` (a separate process that
     // deletes the registry entry + SIGTERMs the runner) and surface it
     // as a typed Stopped event. The daemon's protocol-layer connection
     // task blocks on `cmd_rx.recv()` while idle, so socket EOF doesn't
-    // propagate to the drain task on its own — without this poll, the
+    // propagate to the drain task on its own, so without this poll the
     // UI stays stuck on "thinking" and the supervisor keeps a phantom
     // worker. For the `restart` case, the reaper returns the ids it
     // marked as `restart_pending`; clear them from `attempted` so the
@@ -117,6 +131,18 @@ pub async fn reconcile_cockpit_workers(
     if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
         reap_idle_workers(state).await;
         *last_idle_reap = Some(std::time::Instant::now());
+    }
+
+    // Rate-limit auto-resume (#1722). Cadence-gated like the idle reaper:
+    // reset windows are long, so probing every 2s tick is wasteful. Runs
+    // BEFORE the resume snapshot so a session whose reset just elapsed is
+    // un-parked (breadcrumb published + cleared from `attempted`) in time
+    // for this same tick's spawn pass to bring its worker back. The pass is
+    // a no-op for the default-off case: profiles that did not opt in are
+    // dropped before any event-store probe.
+    if last_rate_limit_reap.is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL) {
+        reap_rate_limit_resumes(state, attempted).await;
+        *last_rate_limit_reap = Some(std::time::Instant::now());
     }
 
     // Snapshot per-target resume inputs under the instances read lock.
@@ -147,6 +173,7 @@ pub async fn reconcile_cockpit_workers(
                     i.cockpit_acp_session_id.clone(),
                     i.source_profile.clone(),
                     i.yolo_mode,
+                    i.command.clone(),
                 )
             })
             .collect()
@@ -179,6 +206,7 @@ pub async fn reconcile_cockpit_workers(
         stored_acp_session_id,
         source_profile,
         yolo_mode,
+        command,
     ) in raw_targets
     {
         if attempted.contains(&id) {
@@ -251,6 +279,7 @@ pub async fn reconcile_cockpit_workers(
             source_profile,
             in_flight_turn,
             yolo_mode,
+            command,
         });
     }
 
@@ -517,6 +546,262 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     }
 }
 
+/// Respawn build-stale workers that were adopted mid-turn (flagged via
+/// `Supervisor::mark_build_respawn_pending` in `resume_one`) once their
+/// in-flight turn has finished. Idle is detected with the same
+/// `has_in_flight_turn` event-store probe the resume pass uses.
+///
+/// For each drained session this mirrors `aoe cockpit restart`: write the
+/// restart marker so the reaper publishes `restart_pending` (the UI shows
+/// "Restarting…" rather than a stop), then SIGTERM the stale runner group
+/// and delete its registry entry. The caller runs the reaper immediately
+/// after, which tears down the attached handle and clears `attempted`, so
+/// the resume pass fresh-spawns on the current binary. See #1754.
+async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
+    for id in state.cockpit_supervisor.build_respawn_pending_ids() {
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_probe = id.clone();
+        let in_flight =
+            match tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe)).await {
+                Ok(v) => v,
+                // Probe failed: assume still busy so a transient error
+                // never hard-kills a possibly-live turn. Retried next tick.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cockpit.supervisor",
+                        session = %id,
+                        error = %e,
+                        "in-flight probe failed for draining stale worker; deferring respawn"
+                    );
+                    true
+                }
+            };
+        if in_flight {
+            continue;
+        }
+        tracing::info!(
+            target: "cockpit.supervisor",
+            session = %id,
+            "build-stale cockpit worker drained; respawning on current binary"
+        );
+        crate::cockpit::worker_registry::mark_restart_pending(&id);
+        crate::cockpit::worker_registry::terminate(&id);
+        state.cockpit_supervisor.clear_build_respawn_pending(&id);
+    }
+}
+
+/// What `resume_one` should do with the worker registry record it found
+/// for a cockpit session that has no live in-memory worker yet. Split out
+/// as a pure function so the build-version respawn policy (#1754) is
+/// unit-testable without standing up a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptDecision {
+    /// No usable record (dead PID / missing socket): sweep and fresh-spawn.
+    FreshSpawn,
+    /// Live worker on the current binary: reattach.
+    Attach,
+    /// Live worker on an older binary with no in-flight turn: terminate
+    /// now and fresh-spawn on the current binary.
+    RespawnStaleIdle,
+    /// Live worker on an older binary mid-turn: adopt to keep the turn
+    /// streaming, then respawn at the next idle boundary.
+    AdoptStaleForDrain,
+}
+
+fn adopt_decision(live: bool, build_current: bool, in_flight_turn: bool) -> AdoptDecision {
+    if !live {
+        AdoptDecision::FreshSpawn
+    } else if build_current {
+        AdoptDecision::Attach
+    } else if in_flight_turn {
+        AdoptDecision::AdoptStaleForDrain
+    } else {
+        AdoptDecision::RespawnStaleIdle
+    }
+}
+
+/// How often the rate-limit auto-resume pass runs. Reset windows are
+/// minutes to hours, so the 2s reconciler tick would re-probe far more
+/// often than needed; this gates it to a coarse cadence. See #1722.
+const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Hardcoded floor on the park window, measured from when the `RateLimit`
+/// event was recorded. A misbehaving adapter could report a `resets_at`
+/// already in the past (or with `grace_secs == 0`); without this floor the
+/// reconciler would respawn the worker on the very next pass and could
+/// thrash if the adapter keeps emitting past resets. 30s preserves the
+/// spirit of the #1281 "no eager restart loop" fix. See #1722.
+const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
+
+/// Opt-in rate-limit auto-resume pass (#1722). For cockpit sessions parked
+/// on `Stopped { reason: "rate_limited" }` whose profile enabled
+/// `cockpit.rate_limit_auto_resume`, respawn the worker once the
+/// adapter-reported `resets_at` (plus the configured grace, floored by
+/// `RATE_LIMIT_MIN_PARK_SECS` from when the limit was recorded) has passed.
+///
+/// Mechanism: publish a `RateLimitAutoResumed` breadcrumb (which supersedes
+/// the terminal `Stopped{rate_limited}` in `latest_status_event`) and clear
+/// the id from `attempted`. The main resume loop on the same tick then sees
+/// a non-park latest status and a clear `attempted` slot, so it fresh-spawns
+/// the worker through the existing path. Both the in-process park (id was
+/// inserted into `attempted` while the worker ran) and the daemon-restart
+/// park (the main loop parks it on the first tick) are covered because the
+/// candidate set is exactly `attempted` minus running workers.
+///
+/// Durable across daemon restart: `resets_at` is read from the persisted
+/// event store, never from memory. A re-rate-limit writes a fresh
+/// `RateLimit` event with a new `resets_at`, so the next auto-resume waits
+/// for the new window rather than looping.
+/// Wall-clock instant at which a rate-limit-parked session becomes
+/// eligible for auto-resume: the later of the adapter-reported reset
+/// (plus the configured grace) and a hardcoded minimum park measured from
+/// when the `RateLimit` event was recorded. The floor keeps a buggy
+/// adapter that reports a past `resets_at` (or a zero grace) from driving
+/// a tight respawn loop. See #1722.
+fn rate_limit_resume_at(
+    resets_at: chrono::DateTime<chrono::Utc>,
+    recorded_at_ms: i64,
+    grace_secs: u32,
+) -> chrono::DateTime<chrono::Utc> {
+    let resets_plus_grace = resets_at + chrono::Duration::seconds(i64::from(grace_secs));
+    match chrono::DateTime::from_timestamp_millis(recorded_at_ms)
+        .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
+    {
+        Some(floor) if floor > resets_plus_grace => floor,
+        _ => resets_plus_grace,
+    }
+}
+
+async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
+    // Candidates: cockpit sessions currently parked (recorded in
+    // `attempted`, no live worker). Snapshot (id, profile) under the read
+    // lock so we don't hold it across awaits. Archived/snoozed/dormant
+    // sessions are excluded for the same reasons as the resume snapshot.
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                i.cockpit_mode
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_idle_dormant()
+                    && attempted.contains(&i.id)
+            })
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Only sessions without a live worker are parked; a running worker in
+    // `attempted` is the steady-state perf entry, not a park.
+    let mut parked: Vec<(String, String)> = Vec::new();
+    for (id, profile) in candidates {
+        if !state.cockpit_supervisor.is_running(&id).await {
+            parked.push((id, profile));
+        }
+    }
+    if parked.is_empty() {
+        return;
+    }
+    // Resolve the auto-resume config per distinct profile off-thread (it
+    // touches disk). Sessions on a profile that did not opt in are dropped
+    // before any per-session event-store probe, so the feature is free for
+    // the default-off case.
+    let distinct_profiles: Vec<String> = {
+        let mut seen = HashSet::new();
+        parked
+            .iter()
+            .map(|(_, p)| p.clone())
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    };
+    let cfg_by_profile: std::collections::HashMap<String, (bool, u32)> =
+        tokio::task::spawn_blocking(move || {
+            distinct_profiles
+                .into_iter()
+                .map(|p| {
+                    let cockpit =
+                        crate::session::profile_config::resolve_config_or_warn(&p).cockpit;
+                    (
+                        p,
+                        (
+                            cockpit.rate_limit_auto_resume,
+                            cockpit.rate_limit_auto_resume_grace_secs,
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    for (id, profile) in parked {
+        let (enabled, grace_secs) = cfg_by_profile.get(&profile).copied().unwrap_or((false, 0));
+        if !enabled {
+            continue;
+        }
+        // Confirm the session is actually parked on a rate-limit stop (not
+        // some other terminal state that happens to sit in `attempted`) and
+        // read the reset time, both off-thread.
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_probe = id.clone();
+        let (is_rate_limit_parked, rate_limit) = match tokio::task::spawn_blocking(move || {
+            let parked = matches!(
+                store.latest_status_event(&id_probe),
+                Some(crate::cockpit::Event::Stopped { reason }) if reason == "rate_limited"
+            );
+            (parked, store.latest_rate_limit_event(&id_probe))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    error = %e,
+                    "rate-limit auto-resume probe failed"
+                );
+                continue;
+            }
+        };
+        if !is_rate_limit_parked {
+            continue;
+        }
+        let Some((info, recorded_at_ms)) = rate_limit else {
+            continue;
+        };
+        if now < rate_limit_resume_at(info.resets_at, recorded_at_ms, grace_secs) {
+            continue;
+        }
+        // Re-check liveness right before publishing: several awaits sit
+        // between the candidate snapshot and here, so a manual
+        // `/cockpit/spawn` could have brought the worker back in the gap.
+        // Without this guard we would emit a spurious auto-resume
+        // breadcrumb (and clear `attempted`) for an already-running
+        // session. Let the manual resume win. See #1722.
+        if state.cockpit_supervisor.is_running(&id).await {
+            continue;
+        }
+        // Eligible: publish the breadcrumb (supersedes Stopped{rate_limited})
+        // and free the `attempted` slot so the main resume loop spawns a
+        // fresh worker this tick.
+        state
+            .cockpit_supervisor
+            .publish_rate_limit_auto_resumed(&id, info.resets_at);
+        attempted.remove(&id);
+        tracing::info!(
+            target: "cockpit.supervisor",
+            session = %id,
+            resets_at = %info.resets_at,
+            "rate-limit auto-resume: reset window elapsed; respawning worker"
+        );
+    }
+}
+
 async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
     let ResumeTarget {
         id,
@@ -528,6 +813,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         source_profile,
         in_flight_turn,
         yolo_mode,
+        command,
     } = target;
 
     // Reattach path: if a previous daemon detached a runner for this
@@ -535,7 +821,46 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
     if let Ok(Some(record)) = crate::cockpit::worker_registry::load(&id) {
-        if crate::cockpit::worker_registry::is_record_live(&record) {
+        let decision = adopt_decision(
+            crate::cockpit::worker_registry::is_record_live(&record),
+            crate::cockpit::worker_registry::is_build_current(&record),
+            in_flight_turn,
+        );
+        if decision == AdoptDecision::FreshSpawn {
+            // Dead PID or missing socket: sweep the orphan registry entry
+            // so the fall-through below is a clean fresh spawn.
+            crate::cockpit::worker_registry::delete(&id).ok();
+        } else if decision == AdoptDecision::RespawnStaleIdle {
+            // The runner survived a daemon restart but is executing an
+            // older binary (e.g. after `aoe update`) and has no in-flight
+            // turn. Replace it now: SIGTERM the stale runner group (which
+            // also deletes the registry entry) and fall through to a
+            // fresh spawn on the current binary. See #1754.
+            tracing::info!(
+                target: "cockpit.supervisor",
+                session = %id,
+                old_build = %record.build_version,
+                new_build = crate::build_info::BUILD_VERSION,
+                "respawning idle build-stale cockpit worker on current binary"
+            );
+            crate::cockpit::worker_registry::terminate(&id);
+        } else {
+            // Attach or AdoptStaleForDrain: dial the live runner.
+            if decision == AdoptDecision::AdoptStaleForDrain {
+                // Build-stale but mid-turn: adopt now so the in-flight
+                // turn keeps streaming, and flag the session so the next
+                // idle boundary respawns it on the current binary instead
+                // of hard-killing the turn. Preserves the #1037
+                // survive-restart contract. See #1754.
+                tracing::info!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    old_build = %record.build_version,
+                    new_build = crate::build_info::BUILD_VERSION,
+                    "adopting build-stale cockpit worker to drain in-flight turn before respawn"
+                );
+                state.cockpit_supervisor.mark_build_respawn_pending(&id);
+            }
             let supervisor = Arc::clone(&state.cockpit_supervisor);
             let cwd = PathBuf::from(&project_path);
             // Reconstruct sandbox context from the live instance state
@@ -604,10 +929,6 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
-        } else {
-            // Dead PID or missing socket: sweep the orphan registry
-            // entry so the next attempt is a clean fresh spawn.
-            crate::cockpit::worker_registry::delete(&id).ok();
         }
     }
 
@@ -632,6 +953,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         source_profile,
         in_flight_turn,
         yolo_mode,
+        command,
     };
     let req = match build_spawn_request(&state, &resume_target).await {
         Ok(req) => req,
@@ -721,10 +1043,31 @@ async fn build_spawn_request(
         additional_dirs: vec![],
         provider_env: vec![],
         model: target.model.clone(),
+        effort: None,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
+        agent_command_override: command_override_for_spawn(&target.tool, &target.command),
+    })
+}
+
+/// Build a cockpit command override from the instance's persisted
+/// launch command. Returns `None` for an empty command so the spawn
+/// keeps the registry default. Applicability gating (registry-backed,
+/// matching binary) lives in the supervisor where the resolved
+/// `AgentSpec` is available. See #1766.
+pub(crate) fn command_override_for_spawn(
+    tool: &str,
+    command: &str,
+) -> Option<crate::cockpit::supervisor::AgentCommandOverride> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(crate::cockpit::supervisor::AgentCommandOverride {
+        logical_tool: tool.to_string(),
+        command: command.to_string(),
     })
 }
 
@@ -753,6 +1096,7 @@ async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<Re
         source_profile: inst.source_profile.clone(),
         in_flight_turn: false,
         yolo_mode: inst.yolo_mode,
+        command: inst.command.clone(),
     })
 }
 
@@ -879,9 +1223,88 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_auto_stop;
+    use super::{
+        adopt_decision, rate_limit_resume_at, should_auto_stop, AdoptDecision,
+        RATE_LIMIT_MIN_PARK_SECS,
+    };
+    use chrono::{Duration, TimeZone, Utc};
 
     const HOUR_MS: i64 = 3_600_000;
+
+    // --- build-version respawn policy (#1754) ---
+
+    /// Story 1: a live worker whose build differs from the daemon and is
+    /// NOT mid-turn is respawned (terminate + fresh spawn), not adopted.
+    #[test]
+    fn stale_build_idle_worker_respawns() {
+        assert_eq!(
+            adopt_decision(true, false, false),
+            AdoptDecision::RespawnStaleIdle
+        );
+    }
+
+    /// Story 2: a live worker whose build differs from the daemon but is
+    /// mid-turn is adopted to drain, not hard-killed. The reconciler's
+    /// per-tick drain check respawns it once the turn finishes.
+    #[test]
+    fn stale_build_busy_worker_adopts_to_drain() {
+        assert_eq!(
+            adopt_decision(true, false, true),
+            AdoptDecision::AdoptStaleForDrain
+        );
+    }
+
+    /// A live worker on the current build is reattached regardless of
+    /// in-flight state: the survive-restart contract (#1037) is unchanged
+    /// for same-version restarts.
+    #[test]
+    fn current_build_worker_attaches() {
+        assert_eq!(adopt_decision(true, true, false), AdoptDecision::Attach);
+        assert_eq!(adopt_decision(true, true, true), AdoptDecision::Attach);
+    }
+
+    /// A dead record fresh-spawns no matter the build/turn state; build
+    /// currency only matters for a live worker.
+    #[test]
+    fn dead_record_fresh_spawns() {
+        assert_eq!(
+            adopt_decision(false, false, false),
+            AdoptDecision::FreshSpawn
+        );
+        assert_eq!(adopt_decision(false, true, true), AdoptDecision::FreshSpawn);
+    }
+
+    #[test]
+    fn resume_at_is_reset_plus_grace_when_far_in_future() {
+        // A reset an hour out dominates the 30s recorded-at floor, so the
+        // resume instant is exactly resets_at + grace.
+        let recorded_at = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let resets_at = recorded_at + Duration::hours(1);
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 15);
+        assert_eq!(got, resets_at + Duration::seconds(15));
+    }
+
+    #[test]
+    fn resume_at_floors_on_recorded_at_for_past_reset() {
+        // Adapter reported a reset in the past with zero grace; without the
+        // floor this would resume immediately. The floor pins it to
+        // recorded_at + MIN_PARK so there is no tight respawn loop.
+        let recorded_at = Utc.timestamp_opt(2_000_000, 0).unwrap();
+        let resets_at = recorded_at - Duration::seconds(5); // already elapsed
+        let got = rate_limit_resume_at(resets_at, recorded_at.timestamp_millis(), 0);
+        assert_eq!(
+            got,
+            recorded_at + Duration::seconds(RATE_LIMIT_MIN_PARK_SECS)
+        );
+    }
+
+    #[test]
+    fn resume_at_grace_wins_when_above_floor() {
+        // resets_at == recorded_at, grace 120s > 30s floor: grace wins.
+        let recorded_at = Utc.timestamp_opt(3_000_000, 0).unwrap();
+        let got = rate_limit_resume_at(recorded_at, recorded_at.timestamp_millis(), 120);
+        assert_eq!(got, recorded_at + Duration::seconds(120));
+    }
 
     #[test]
     fn disabled_threshold_never_stops() {

@@ -57,6 +57,14 @@ pub struct SessionResponse {
     /// favorited rows and render the `*` marker without re-implementing
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
+    /// True when the agent has flagged this session as urgent via the
+    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
+    /// urgent rows above all non-urgent ones within their triage tier,
+    /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
+    /// returns false for archived/snoozed sessions, so a sunk row never
+    /// claws back to the top. See #1640.
+    pub urgent: bool,
     /// RFC3339 timestamp at which the session was web-pinned, or omitted
     /// when not pinned. Distinct from `favorited`: favorite is the TUI
     /// within-tier attention-sort signal, while pin is the hard
@@ -229,6 +237,7 @@ impl SessionResponse {
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
             // Surface `snoozed_until` only when the snooze is still
@@ -757,6 +766,346 @@ pub async fn rename_session(
         }
     }
 
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Edit worktree workdir name ---
+
+#[derive(Deserialize)]
+pub struct SetWorktreeNameBody {
+    pub name: String,
+    /// Also rename the underlying git branch to match. Off by default: the
+    /// session may have done meaningful work on its branch already.
+    #[serde(default)]
+    pub rename_branch: bool,
+}
+
+/// Map a worktree-edit failure to an HTTP status + client-safe message.
+/// Validation failures are 400/409; git/IO failures stay generic (raw git
+/// stderr and IO paths must not reach the wire).
+fn worktree_edit_error_response(
+    e: &crate::session::worktree_edit::WorktreeEditError,
+) -> (StatusCode, String) {
+    use crate::session::worktree_edit::WorktreeEditError as E;
+    match e {
+        E::NotManaged => (
+            StatusCode::BAD_REQUEST,
+            "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
+        ),
+        E::EmptyName => (
+            StatusCode::BAD_REQUEST,
+            "Workdir name cannot be empty".to_string(),
+        ),
+        E::Unchanged => (
+            StatusCode::BAD_REQUEST,
+            "The workdir name is unchanged".to_string(),
+        ),
+        E::NoParent(_) => (
+            StatusCode::BAD_REQUEST,
+            "Cannot determine the worktree's parent directory".to_string(),
+        ),
+        E::SourceMissing(_) => (
+            StatusCode::CONFLICT,
+            "The worktree directory no longer exists on disk".to_string(),
+        ),
+        E::TargetExists(_) => (
+            StatusCode::CONFLICT,
+            "A directory with that name already exists".to_string(),
+        ),
+        E::BranchExists(name) => (
+            StatusCode::CONFLICT,
+            format!("Branch '{name}' already exists"),
+        ),
+        E::RollbackFailed { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to move the worktree, and rolling back the branch rename also failed; the repository may be left on the new branch".to_string(),
+        ),
+        E::Git(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to move the worktree".to_string(),
+        ),
+    }
+}
+
+pub async fn set_worktree_name(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Workdir name cannot be empty" })),
+        )
+            .into_response();
+    }
+    if let Err(msg) = validate_no_shell_injection(&name, "name") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": msg })),
+        )
+            .into_response();
+    }
+
+    // Serialize against other mutations on this session (start, delete,
+    // another rename) so the git ops and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
+        )
+    };
+
+    let Some(worktree_info) = worktree_info else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Session does not use a worktree" })),
+        )
+            .into_response();
+    };
+    if status.blocks_worktree_edit() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "message": "Cannot edit the workdir name while the session is active; stop it first"
+            })),
+        )
+            .into_response();
+    }
+
+    let wt = worktree_info.clone();
+    let cur = current_path.clone();
+    let new_name = name.clone();
+    let rename_branch = body.rename_branch;
+    let edit = tokio::task::spawn_blocking(move || {
+        crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &wt,
+                current_path: std::path::Path::new(&cur),
+                new_name: &new_name,
+                rename_branch,
+            },
+        )
+        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+    })
+    .await;
+
+    let (new_path, new_branch) = match edit {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
+            let (code, msg) = worktree_edit_error_response(&e);
+            return (code, Json(serde_json::json!({ "message": msg }))).into_response();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "worktree edit join failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    // The git move has already landed, so persist to disk BEFORE mutating
+    // in-memory state. A silent persist failure here would leave stale
+    // metadata that points at the old (now-moved) path after a daemon
+    // restart, so any failure returns 500 instead of a misleading 200.
+    let persist_failed = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "persist_failed",
+                "message": "Worktree was moved on disk, but persisting the new session metadata failed"
+            })),
+        )
+            .into_response()
+    };
+
+    let storage = match Storage::new(&profile) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
+            return persist_failed();
+        }
+    };
+    let id_clone = id.clone();
+    let new_path_clone = new_path.clone();
+    let new_branch_clone = new_branch.clone();
+    match tokio::task::spawn_blocking(move || {
+        storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+            }
+            Ok(())
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
+            return persist_failed();
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Worktree edit persist join failed: {e}");
+            return persist_failed();
+        }
+    }
+
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Option<&str>) {
+    inst.project_path = new_path.to_string();
+    if let Some(branch) = new_branch {
+        if let Some(wt) = inst.worktree_info.as_mut() {
+            wt.branch = branch.to_string();
+        }
+    }
+}
+
+// --- Update session group ---
+
+#[derive(Deserialize)]
+pub struct UpdateGroupBody {
+    /// Destination group path. Empty string means "ungrouped". A
+    /// non-empty path auto-creates the group: `/api/groups` and the
+    /// `GroupTree` render model both derive groups from instance
+    /// `group_path` values, so no separate groups.json write is needed
+    /// (this mirrors `create_session`, which never touches the groups
+    /// Vec either).
+    pub group: String,
+}
+
+fn apply_session_group(inst: &mut Instance, group: String) {
+    inst.group_path = group;
+}
+
+/// `PATCH /api/sessions/:id/group`. Moves an existing session to another
+/// group, creates a new group by assigning its path, or clears the group
+/// (empty string). Web parity with the TUI rename dialog and `aoe session
+/// rename --group`, which already support post-create group edits.
+///
+/// Persist-first like the other per-field PATCH sub-routes (`/pin`,
+/// `/archive`, `/snooze`): disk is made durable before memory is touched,
+/// so a failed write returns 500 without leaving memory and disk diverged.
+/// See #1589.
+pub async fn update_session_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let group = body.group;
+    // Match `create_session`'s group handling exactly: shell-injection
+    // check on a non-empty path, no trimming or slash normalization. The
+    // empty string is the ungroup sentinel and skips validation.
+    if !group.is_empty() {
+        if let Err(msg) = validate_no_shell_injection(&group, "group") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": msg })),
+            )
+                .into_response();
+        }
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_group = group.clone();
+    if persist_session_update(profile, "group update", move |instances| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+            apply_session_group(inst, persist_group);
+        }
+    })
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "group update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    apply_session_group(inst, group);
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -1725,6 +2074,9 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub cockpit_model: Option<String>,
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub cockpit_effort: Option<String>,
     /// Scratch session: server provisions a fresh directory under
     /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
     /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
@@ -1755,6 +2107,26 @@ fn validate_session_tool_identity(
             );
             false
         }
+    }
+}
+
+/// Insert `instance` into the live registry, replacing any entry that
+/// already carries the same id rather than blind-pushing a second copy.
+///
+/// `create_session` persists the new session to disk (in `persist_and_start`)
+/// before it pushes the in-memory copy here. A `status_poll_loop` tick that
+/// fires in that window calls `load_all_instances`, reads the just-persisted
+/// row, and inserts it first. A blind `push` would then leave two entries
+/// with the same id in `state.instances` until the next poll tick collapses
+/// them, and `GET /api/sessions` would briefly return the session twice.
+fn upsert_instance(
+    instances: &mut Vec<crate::session::Instance>,
+    instance: crate::session::Instance,
+) {
+    if let Some(existing) = instances.iter_mut().find(|i| i.id == instance.id) {
+        *existing = instance;
+    } else {
+        instances.push(instance);
     }
 }
 
@@ -2007,10 +2379,30 @@ pub async fn create_session(
         // silently downgraded to tmux when the master switch is off
         // (`cockpit.enabled = false` in config.toml).
         #[cfg(feature = "serve")]
-        {
+        let cockpit_effort = {
             instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
             instance.cockpit_agent = body.cockpit_agent;
-            instance.cockpit_model = body.cockpit_model;
+            let cockpit_agent_key = instance
+                .cockpit_agent
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(instance.tool.as_str())
+                .to_string();
+            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &instance.source_profile,
+                std::path::Path::new(&instance.project_path),
+            );
+            let defaults = resolved_config
+                .session
+                .cockpit_defaults_for(&cockpit_agent_key);
+            instance.cockpit_model = body
+                .cockpit_model
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| defaults.and_then(|d| d.model.clone()));
+            let mut cockpit_effort = body
+                .cockpit_effort
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| defaults.and_then(|d| d.effort.clone()));
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in cockpit; a custom
             // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
@@ -2035,7 +2427,13 @@ pub async fn create_session(
                     });
                 instance.cockpit_mode = capable;
             }
-        }
+
+            if !instance.cockpit_mode {
+                cockpit_effort = None;
+            }
+
+            cockpit_effort
+        };
 
         // Anything that fails between here and the final `Ok(..)`
         // would otherwise orphan the scratch directory `build_instance`
@@ -2087,20 +2485,26 @@ pub async fn create_session(
             return Err(e);
         }
 
+        #[cfg(feature = "serve")]
+        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+            instance,
+            build_warnings,
+            cockpit_effort,
+        ));
+
+        #[cfg(not(feature = "serve"))]
         Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings))) => {
+        #[cfg(feature = "serve")]
+        Ok(Ok((instance, warnings, cockpit_effort))) => {
             let mut resp = SessionResponse::from_instance(
                 &instance,
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
-            // Overlay custom-agent ACP capability so the wizard's redirect
-            // into the new session renders the right substrate immediately.
-            #[cfg(feature = "serve")]
             if !resp.acp_capable {
                 let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
@@ -2110,23 +2514,24 @@ pub async fn create_session(
                 .agent_cockpit_cmd;
                 resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
             }
-            #[cfg(feature = "serve")]
             let cockpit_spawn_target = if instance.cockpit_mode {
                 Some((
                     instance.id.clone(),
                     instance.tool.clone(),
                     instance.cockpit_agent.clone(),
                     instance.cockpit_model.clone(),
+                    cockpit_effort,
                     instance.project_path.clone(),
                     instance.cockpit_acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
+                    instance.command.clone(),
                 ))
             } else {
                 None
             };
             let mut instances = state.instances.write().await;
-            instances.push(instance);
+            upsert_instance(&mut instances, instance);
             drop(instances);
 
             // Count the create for the opt-in telemetry trend counter. Bounded
@@ -2136,16 +2541,17 @@ pub async fn create_session(
                 .telemetry_session_creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            #[cfg(feature = "serve")]
             if let Some((
                 id,
                 tool,
                 agent_override,
                 model,
+                effort,
                 project_path,
                 stored_acp_session_id,
                 source_profile,
                 yolo_mode,
+                command,
             )) = cockpit_spawn_target
             {
                 let agent = state
@@ -2157,15 +2563,12 @@ pub async fn create_session(
                         std::path::Path::new(&project_path),
                     )
                     .await;
+                let command_override =
+                    crate::server::cockpit_reconciler::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = state.cockpit_supervisor.clone();
                 let state_for_check = state.clone();
                 tokio::spawn(async move {
-                    // Initial session creation: run on_launch hooks
-                    // once here so cockpit-mode parity with the tmux
-                    // path is preserved (tmux fires on_launch from
-                    // `instance.start()` at creation, then never
-                    // again).
                     let inst_lock = state_for_check.instance_lock(&id).await;
                     let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
                         &state_for_check.instances,
@@ -2187,10 +2590,6 @@ pub async fn create_session(
                             return;
                         }
                     };
-                    // Pass the session profile through regardless of
-                    // sandboxing so the spawn path resolves agent_cockpit_cmd
-                    // and worker env from the right profile for non-sandbox
-                    // sessions too.
                     let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
                         .spawn(crate::cockpit::supervisor::SpawnRequest {
@@ -2200,18 +2599,15 @@ pub async fn create_session(
                             additional_dirs: vec![],
                             provider_env: vec![],
                             model,
+                            effort,
                             stored_acp_session_id,
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
+                            agent_command_override: command_override,
                         })
                         .await
                     {
-                        // If the session was deleted during the 2-3s
-                        // ACP handshake, the spawn error is for a
-                        // vanished session; demote to debug instead
-                        // of publishing AgentStartupError to a UI
-                        // that no longer exists.
                         let still_present = state_for_check
                             .instances
                             .read()
@@ -2236,6 +2632,19 @@ pub async fn create_session(
                     }
                 });
             }
+
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        #[cfg(not(feature = "serve"))]
+        Ok(Ok((instance, warnings))) => {
+            let mut resp = SessionResponse::from_instance(
+                &instance,
+                crate::claude_settings::read_tui_fullscreen(),
+            );
+            resp.warnings = warnings;
+            let mut instances = state.instances.write().await;
+            instances.push(instance);
+            drop(instances);
 
             (StatusCode::CREATED, Json(resp)).into_response()
         }
@@ -3210,6 +3619,71 @@ mod tests {
     }
 
     #[test]
+    fn upsert_instance_replaces_same_id_instead_of_duplicating() {
+        // Race regression: `create_session` persists to disk before pushing
+        // the in-memory copy, so a `status_poll_loop` tick can load the row
+        // and insert it first. The handler's insert must replace that entry,
+        // not append a second one with the same id.
+        let poll_loaded = make_test_instance();
+        let id = poll_loaded.id.clone();
+        let mut instances = vec![poll_loaded];
+
+        let mut handler_copy = make_test_instance();
+        handler_copy.id = id.clone();
+        handler_copy.status = Status::Starting;
+
+        upsert_instance(&mut instances, handler_copy);
+
+        assert_eq!(
+            instances.len(),
+            1,
+            "same id must not duplicate in the registry"
+        );
+        assert_eq!(instances[0].id, id);
+        assert_eq!(
+            instances[0].status,
+            Status::Starting,
+            "handler copy must win"
+        );
+    }
+
+    #[test]
+    fn upsert_instance_appends_a_new_id() {
+        let mut instances = vec![make_test_instance()];
+        let other = Instance::new("other-session", "/tmp/other-project");
+        let other_id = other.id.clone();
+        upsert_instance(&mut instances, other);
+        assert_eq!(instances.len(), 2);
+        assert!(instances.iter().any(|i| i.id == other_id));
+    }
+
+    #[test]
+    fn from_instance_surfaces_hook_urgent_flag() {
+        // #1640: the web Attention sort needs `Instance::is_urgent()` on the
+        // wire. Write the hook-side attention.json the agent would emit and
+        // confirm it round-trips onto the response, then confirm a session
+        // with no hook file reports urgent: false.
+        let inst = make_test_instance();
+        let dir = crate::hooks::hook_status_dir(&inst.id).expect("test id must be allowlist-safe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attention.json"),
+            r#"{"urgent":true,"urgent_reason":"needs input"}"#,
+        )
+        .unwrap();
+
+        let urgent_resp = SessionResponse::from_instance(&inst, false);
+        assert!(urgent_resp.urgent, "hook-flagged session must be urgent");
+
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+        let plain_resp = SessionResponse::from_instance(&inst, false);
+        assert!(
+            !plain_resp.urgent,
+            "session with no hook file must not be urgent"
+        );
+    }
+
+    #[test]
     fn public_create_session_error_forwards_whitelisted_git_errors() {
         let dup: anyhow::Error =
             GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
@@ -3570,6 +4044,38 @@ mod tests {
         assert_eq!(
             inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
             Some("feature/test")
+        );
+    }
+
+    #[test]
+    fn worktree_name_edit_updates_path_and_optionally_branch() {
+        let mut inst = make_test_instance();
+        inst.project_path = "/tmp/repo-worktrees/old".to_string();
+        inst.title = "My Session".to_string();
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "old".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        // Path-only edit leaves the branch and title untouched.
+        apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/new", None);
+        assert_eq!(inst.project_path, "/tmp/repo-worktrees/new");
+        assert_eq!(inst.title, "My Session");
+        assert_eq!(
+            inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("old")
+        );
+
+        // Branch rename also updates worktree_info.branch.
+        apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/newer", Some("newer"));
+        assert_eq!(inst.project_path, "/tmp/repo-worktrees/newer");
+        assert_eq!(inst.title, "My Session");
+        assert_eq!(
+            inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("newer")
         );
     }
 
@@ -4101,6 +4607,63 @@ mod tests {
         let result = persist_session_update(profile.to_string(), "test", |_instances| {}).await;
         assert!(result.is_err(), "a storage failure must surface as Err");
     }
+
+    // Group edit (#1726): the persisted instance's group_path is the only
+    // thing that changes; the groups Vec is left alone (the group list is
+    // derived from instance group_path, exactly like create_session). Set
+    // and clear both round-trip to disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn group_edit_set_and_clear_round_trip_to_disk() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "group-edit";
+        let storage = Storage::new(profile).unwrap();
+        let seed = make_test_instance(); // seeded in "work/projects"
+        let id = seed.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        // Move to a brand-new group.
+        let set_id = id.clone();
+        persist_session_update(profile.to_string(), "group update", move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
+                apply_session_group(inst, "team/alpha".to_string());
+            }
+        })
+        .await
+        .expect("set should succeed");
+
+        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        assert_eq!(
+            reloaded.iter().find(|i| i.id == id).unwrap().group_path,
+            "team/alpha",
+            "group must move to the new path on disk"
+        );
+
+        // Clear to ungrouped via the empty-string sentinel.
+        let clear_id = id.clone();
+        persist_session_update(profile.to_string(), "group update", move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
+                apply_session_group(inst, String::new());
+            }
+        })
+        .await
+        .expect("clear should succeed");
+
+        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        assert_eq!(
+            reloaded.iter().find(|i| i.id == id).unwrap().group_path,
+            "",
+            "empty string must clear the group on disk"
+        );
+    }
 }
 
 // ============================================================================
@@ -4542,6 +5105,7 @@ mod workspace_ordering_tests {
             next_wakeup_at: None,
             next_wakeup_reason: None,
             favorited: false,
+            urgent: false,
             pinned_at: None,
             archived_at: None,
             snoozed_until: None,

@@ -94,6 +94,16 @@ when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
 
+**Approval card detail.** The web dashboard approval card shows a
+one-line preview of the tool call in its header (the command for a
+shell call, the path for a read or edit) so you can act without
+expanding. A benign approval starts collapsed with that preview; a
+destructive one starts expanded so the full arguments are in view
+before a hold-to-allow. Click the header to toggle the full argument
+list, and the Allow / Always / Deny buttons stay reachable in either
+state. The toggle is per-card and never re-expands on its own after a
+plan is approved.
+
 **Markdown rendering.** Agent messages in the transcript are parsed as
 markdown and rendered with styling: headings and `**bold**` show in
 bold, `*italics*` in italic, `` `inline code` `` and fenced code blocks
@@ -101,7 +111,14 @@ in a dim block, and `-`/`1.` lists with bullet or number markers. The
 raw `#`, `**`, backtick, and fence characters are not shown. Styling
 uses text attributes only (bold, italic, dim) so it tracks your theme
 colors. Code-block syntax highlighting is deferred; press `o` to open
-the web dashboard for full-fidelity rendering.
+the web dashboard for full-fidelity rendering. In the web dashboard,
+links inside transcript messages open in a new browser tab so following
+a docs, CI, or repo link keeps your cockpit session open. Local file
+references (the `path:line` links agents like Codex emit when citing
+source) are an exception: clicking one opens that file in the in-app
+diff/file viewer and keeps you on the current session, instead of
+navigating away. A file that is not inside the session's repo shows a
+brief notice and leaves the view unchanged.
 
 **Tool cards.** Tool calls in the transcript render per kind rather than
 as a single generic line. An edit or write shows the file path and a
@@ -110,8 +127,12 @@ an execute shows the command and a bounded preview of its output; a read
 shows the path and a content preview; a delete shows the target path.
 The diff is capped at 20 changed lines and previews at 12 lines, with a
 "+N more" footer when there is more; press `o` to open the web dashboard
-for the full diff and output. Any other tool kind falls back to the
-generic one-liner (name, arguments, output snapshot).
+for the full diff and output. Edit cards read the path and diff from the
+structured diff content the agent emits (Codex routes `apply_patch` edits
+this way, one entry per file), falling back to the legacy argument shape
+when an agent sends that instead; a single patch touching several files
+shows each file's path and diff in one card. Any other tool kind falls
+back to the generic one-liner (name, arguments, output snapshot).
 
 **File-mention picker.** Typing `@` in the composer opens a picker
 listing the session's workspace files, fetched once per session from
@@ -188,12 +209,15 @@ pruned in lockstep with it (and dropped when the session is deleted), so
 the event log stays lean. Replayed images are fetched lazily from
 `GET /api/sessions/{id}/cockpit/attachments/{attachment_id}`.
 
-Attachments require an idle, connected agent. Unlike text, they are not
-held in the offline prompt queue (which is stored locally in the
-browser); sending an attachment while the agent is mid-turn or
-disconnected surfaces an error rather than silently dropping it. Audio
-and embedded resources are sent and stored, but render as a labelled
-chip rather than an inline player or preview for now.
+Attachments queue alongside the prompt text. Sending one while the
+agent is mid-turn, disconnected, or restarting parks the message in the
+queue (the queued row shows a thumbnail / chip for each attachment) and
+the drain fires it once the session resumes, the same as a text-only
+follow-up. The bytes ride the queued row in memory only: they are kept
+out of the per-origin localStorage snapshot, so a full page reload drops
+any queued attachment row (you reattach and resend). Audio and embedded
+resources are sent and stored, but render as a labelled chip rather than
+an inline player or preview for now.
 
 ## Queued prompts (mid-turn + inactive session)
 
@@ -232,8 +256,12 @@ can't accept them yet. Two cases:
 Queued entries persist in the per-origin localStorage snapshot at
 `aoe:cockpit-state:v1:<sid>`, so a page reload (and closing then
 reopening the tab on the same origin) keeps them across the reconnect
-window. Server-side durability is not currently implemented; clearing
-site data wipes the queue.
+window. The one exception is queued rows that carry attachments: their
+base64 bytes are never written to the snapshot (they would blow the
+storage quota), and the whole row is dropped on reload rather than
+draining a text-only prompt with the image silently missing. Server-side
+durability is not currently implemented; clearing site data wipes the
+queue.
 
 **TUI cockpit.** The TUI cockpit view has the same client-side queue.
 Pressing `Enter` while a turn is active (or while the WebSocket is
@@ -266,16 +294,26 @@ single collapsible cards:
   with no agent text between them (for example Read, Read, Grep, Read
   during investigation) collapses into one "actions" card. Expand it to
   see each call as its normal per-tool card.
-- **Consecutive TodoWrite updates.** When the agent fires three or more
-  `TodoWrite` calls back-to-back, the per-call snapshots fold into one
-  todo card titled "updated N times". Collapsed, the card shows the
-  latest list (the only snapshot whose pending/in-progress/done mix is
-  current), so you see what the agent is working on without expanding.
-  Expand it to inspect each individual update in order and audit how the
-  plan evolved during the turn.
+- **Consecutive TodoWrite updates.** When Claude fires three or more
+  `TodoWrite` calls back-to-back, or OpenCode sends three or more
+  `todowrite` updates with a structured `todos` payload, the per-call
+  snapshots fold into one todo card titled "updated N times". Collapsed,
+  the card shows the latest list (the only snapshot whose
+  pending/in-progress/done mix is current), so you see what the agent is
+  working on without expanding. Expand it to inspect each individual
+  update in order and audit how the plan evolved during the turn.
 
 Folding only fires when every call in the run is the same shape. A
-TodoWrite sandwiched between real tool work (Read, Edit) stays inline as
-its own card rather than being hidden inside a group, so a status update
-between actions is never buried. Two-in-a-row stays inline as well; the
-fold threshold is three.
+TodoWrite or `todowrite` update sandwiched between real tool work (Read,
+Edit) stays inline as its own card rather than being hidden inside a
+group, so a status update between actions is never buried. Two-in-a-row
+stays inline as well; the fold threshold is three.
+
+Automatic grouping needs an unbroken run, so a phase where the agent
+narrates between each action (common right after a plan is approved)
+produces a long stream of individual cards instead. The **Compact
+tools** toggle at the top of the transcript collapses every tool card to
+its header for scanning, and new cards arrive collapsed while it stays
+on; the agent's narration stays visible and errored cards stay open so a
+failure is never hidden. It is a per-browser preference saved locally,
+and you can still expand any single card while compact mode is on.

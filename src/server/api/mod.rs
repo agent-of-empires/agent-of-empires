@@ -38,15 +38,15 @@ pub use projects::{create_project, delete_project, list_projects};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
     list_sessions, read_output, rename_session, send_message, session_diff_file,
-    session_diff_files, update_session_archive, update_session_diff_base,
-    update_session_notifications, update_session_pin, update_session_snooze,
+    session_diff_files, set_worktree_name, update_session_archive, update_session_diff_base,
+    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
     get_settings, get_settings_schema, get_update_status, list_agents, list_devices, list_groups,
-    list_profiles, list_sounds, list_themes, rename_profile, serve_sound_file,
+    list_profiles, list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
     update_profile_settings, update_settings,
 };
 pub use telemetry::{get_telemetry_status, post_telemetry_seen, set_telemetry_consent};
@@ -143,10 +143,12 @@ mod tests {
                     "create_session",
                     "delete_session",
                     "rename_session",
+                    "set_worktree_name",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                    "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
                     "update_session_pin",
@@ -171,6 +173,7 @@ mod tests {
                 include_str!("system.rs"),
                 &[
                     "update_settings",
+                    "mark_web_tour_seen",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",
@@ -279,10 +282,12 @@ mod tests {
                     "create_session",
                     "delete_session",
                     "rename_session",
+                    "set_worktree_name",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                    "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
                     "update_session_pin",

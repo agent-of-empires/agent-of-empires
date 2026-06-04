@@ -22,6 +22,7 @@ vi.mock("../../lib/highlighter", () => ({
     codeToHtml: (code: string) => `<pre>${code}</pre>`,
   }),
   langKeyForExt: (s: string) => s,
+  langImportForPath: () => null,
   loadLanguage: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -96,6 +97,39 @@ describe("ToolCards dispatch", () => {
     );
     expect(container.textContent).toContain("write");
     expect(container.textContent).toContain("/tmp/new.rs");
+  });
+
+  it("renders a Codex structured-diff edit with its path and a diff body (not '(unknown file)')", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard tool={fixtures.codexEdit} result={undefined} />
+      </Wrap>,
+    );
+    // Path shows in the (collapsed) header.
+    expect(container.textContent).toContain("edit");
+    expect(container.textContent).toContain("src/codex.rs");
+    expect(container.textContent).not.toContain("(unknown file)");
+    // Expand to reveal the diff body.
+    fireEvent.click(container.querySelector("button")!);
+    expect(
+      container.querySelector('[data-testid="string-diff"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders every touched file path for a multi-file Codex patch", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard tool={fixtures.codexEditMultiFile} result={undefined} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("src/alpha.rs");
+    expect(container.textContent).not.toContain("(unknown file)");
+    // The second file's path lives in the expanded body.
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.textContent).toContain("src/beta.rs");
+    expect(
+      container.querySelectorAll('[data-testid="string-diff"]').length,
+    ).toBe(2);
   });
 
   it("renders delete kind with a 'delete' label", () => {
@@ -226,6 +260,34 @@ describe("ToolCards profile-gated dispatch (claude)", () => {
   });
 });
 
+describe("ToolCards profile-gated dispatch (opencode)", () => {
+  it("routes OpenCode todowrite payloads to the todos card", () => {
+    const { container } = render(
+      <Wrap toolKey="opencode">
+        <ToolCard
+          tool={makeToolCall({
+            id: "oc-todo-1",
+            name: "5 todos",
+            kind: "other",
+            args_preview: JSON.stringify({
+              todos: [
+                { content: "Check ACP schema", status: "completed" },
+                { content: "Render OpenCode todos", status: "in_progress" },
+              ],
+            }),
+          })}
+          result={undefined}
+        />
+      </Wrap>,
+    );
+
+    expect(container.textContent).toContain("todos");
+    expect(container.textContent).toContain("2 items");
+    expect(container.textContent).toContain("Check ACP schema");
+    expect(container.textContent).toContain("Render OpenCode todos");
+  });
+});
+
 describe("TodoGroupCard fold (#1468)", () => {
   function snapshot(id: string, content: string, status: string) {
     return {
@@ -243,6 +305,42 @@ describe("TodoGroupCard fold (#1468)", () => {
     snapshot("td1", "Step Alpha", "in_progress"),
     snapshot("td2", "Step Bravo", "in_progress"),
     snapshot("td3", "Step Charlie", "in_progress"),
+  ];
+
+  const opencodeItems = [
+    {
+      tool: makeToolCall({
+        id: "oc-td1",
+        name: "todowrite",
+        kind: "other",
+        args_preview: JSON.stringify({
+          todos: [{ content: "OpenCode Alpha", status: "pending" }],
+        }),
+      }),
+      result: makeCompletion({ id: "done-oc-td1", toolCallId: "oc-td1" }),
+    },
+    {
+      tool: makeToolCall({
+        id: "oc-td2",
+        name: "2 todos",
+        kind: "other",
+        args_preview: JSON.stringify({
+          todos: [{ content: "OpenCode Bravo", status: "in_progress" }],
+        }),
+      }),
+      result: makeCompletion({ id: "done-oc-td2", toolCallId: "oc-td2" }),
+    },
+    {
+      tool: makeToolCall({
+        id: "oc-td3",
+        name: "1 todos",
+        kind: "other",
+        args_preview: JSON.stringify({
+          todos: [{ content: "OpenCode Charlie", status: "completed" }],
+        }),
+      }),
+      result: makeCompletion({ id: "done-oc-td3", toolCallId: "oc-td3" }),
+    },
   ];
 
   it("shows the latest snapshot collapsed without expanding", () => {
@@ -323,6 +421,20 @@ describe("TodoGroupCard fold (#1468)", () => {
     // The header reads "stopped", not the misleading "done".
     expect(container.textContent).toContain("stopped");
     expect(container.textContent).not.toContain("done");
+  });
+
+  it("keeps OpenCode todowrite groups visible", () => {
+    const { container } = render(
+      <Wrap toolKey="opencode">
+        <TodoGroupCard items={opencodeItems} />
+      </Wrap>,
+    );
+
+    expect(container.textContent).toContain("todos");
+    expect(container.textContent).toContain("updated 3 times");
+    expect(container.textContent).toContain("OpenCode Charlie");
+    expect(container.textContent).not.toContain("OpenCode Alpha");
+    expect(container.textContent).not.toContain("OpenCode Bravo");
   });
 });
 

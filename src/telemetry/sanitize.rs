@@ -65,6 +65,14 @@ pub fn model_bucket(model: Option<&str>) -> &'static str {
     };
     let lower = model.to_ascii_lowercase();
     use Needle::{Substr, Token};
+    // Manually maintained, privacy-preserving allowlist. Unlike `agent_bucket`,
+    // which derives from `crate::agents::AGENTS`, there is no in-repo source of
+    // model names to generate this from, so adding a newly common public family
+    // is a deliberate release chore: add a `(family, &[needle...])` row here.
+    // A model matching no row buckets as `"other"` and its raw name never
+    // leaves this function, so unknowns are coarse-counted, never leaked. Watch
+    // the `other` rate in the model-bucket telemetry (PostHog) to know when this
+    // list has drifted and needs a new family. See `docs/telemetry.md`.
     const FAMILIES: &[(&str, &[Needle])] = &[
         (
             "claude",
@@ -158,6 +166,64 @@ mod tests {
                 "other",
                 "`{name}` must not bucket as openai"
             );
+        }
+    }
+
+    // #1878 user story (maintainer visibility): a model from an unlisted family
+    // is not silently swallowed. It buckets as the observable `"other"`
+    // discriminator, which the snapshot reports as a non-zero count, so the
+    // allowlist drift is visible in the aggregate instead of vanishing.
+    #[test]
+    fn unknown_family_is_observable_as_other() {
+        for name in [
+            "acme-internal-v2",
+            "future-model-9000",
+            "kimi-k2",
+            "phi-4",
+            "command-r-plus",
+        ] {
+            assert_eq!(
+                model_bucket(Some(name)),
+                "other",
+                "`{name}` from an unlisted family must surface as the observable `other` bucket"
+            );
+        }
+    }
+
+    // #1878 user story (privacy): no raw model name, nor any reversible form of
+    // it, escapes the sanitizer. Whatever is fed in, the output is always one of
+    // the fixed, closed vocabulary, so an internal or sensitive model name can
+    // never reach a payload.
+    #[test]
+    fn output_is_always_from_the_closed_vocabulary() {
+        const VOCAB: &[&str] = &[
+            "claude", "openai", "gemini", "qwen", "grok", "llama", "mistral", "deepseek", "other",
+            "unset",
+        ];
+        for input in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("claude-opus-4-8"),
+            Some("gpt-5"),
+            Some("acme-secret-internal-llm-v7"),
+            Some("/opt/models/customer-private-finetune"),
+            Some("name with spaces and / slashes"),
+        ] {
+            let bucket = model_bucket(input);
+            assert!(
+                VOCAB.contains(&bucket),
+                "model_bucket({input:?}) returned `{bucket}`, outside the closed vocabulary"
+            );
+            if let Some(raw) = input {
+                let raw = raw.trim();
+                if !raw.is_empty() && !VOCAB.contains(&raw.to_ascii_lowercase().as_str()) {
+                    assert_ne!(
+                        bucket, raw,
+                        "the raw model string must never be returned verbatim"
+                    );
+                }
+            }
         }
     }
 

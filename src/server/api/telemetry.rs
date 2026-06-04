@@ -4,9 +4,8 @@
 //! User-Agent and create a second identity surface). Instead it manages the
 //! opt-in state through the local daemon, which owns the install id and does
 //! all sending. `seen` lets the web UI report that the dashboard / cockpit was
-//! opened so the daemon's next snapshot can carry `web_seen` / `cockpit_seen`.
+//! opened so the daemon's next snapshot can carry the `usage_seen` map.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -104,20 +103,14 @@ pub async fn post_telemetry_seen(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    match req.surface.as_str() {
-        "web" => {
-            state.telemetry_web_seen.fetch_add(1, Ordering::Relaxed);
-        }
-        "cockpit" => {
-            state.telemetry_cockpit_seen.fetch_add(1, Ordering::Relaxed);
-        }
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "bad_surface", "message": format!("unknown surface '{other}'")})),
-            )
-                .into_response();
-        }
+    // Validate the surface against the allowlisted registry; an off-list name
+    // is rejected and never creates a counter, so it can never reach a snapshot.
+    if !state.telemetry_usage_seen.record(&req.surface) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_surface", "message": format!("unknown surface '{}'", req.surface)})),
+        )
+            .into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }

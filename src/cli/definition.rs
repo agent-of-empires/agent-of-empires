@@ -192,3 +192,157 @@ pub enum Commands {
         shell: Shell,
     },
 }
+
+/// Every command name [`command_name`] can return, used as the closed
+/// allowlist when building the `cli_usage` telemetry event: any key loaded from
+/// a hand-edited or corrupt `telemetry.json` that is not in this set is dropped
+/// before sending, so the wire payload can only ever carry these tokens. The
+/// `serve` / `url` / `cockpit` / `log_level` names are listed unconditionally
+/// even though their variants are `serve`-feature-gated; in a TUI-only build
+/// those commands cannot run, so the extra allowlist entries are simply never
+/// matched. Keep in sync with [`command_name`]; the unit test asserts every
+/// `command_name` output is a member.
+pub const CLI_COMMAND_NAMES: &[&str] = &[
+    "add",
+    "agents",
+    "init",
+    "list",
+    "logs",
+    "log_level",
+    "remove",
+    "send",
+    "status",
+    "session",
+    "group",
+    "profile",
+    "project",
+    "worktree",
+    "tmux",
+    "sounds",
+    "theme",
+    "telemetry",
+    "serve",
+    "url",
+    "cockpit",
+    "uninstall",
+    "update",
+    "completion",
+];
+
+/// The canonical, telemetry-safe name of a CLI subcommand, or `None` for the
+/// hidden internal commands that are machine-spawned rather than user-invoked
+/// (`__cockpit-runner`, `__extract-session-id`) and must never be counted.
+///
+/// This is an exhaustive match with **no catch-all**: adding a [`Commands`]
+/// variant fails to compile until it is named here, so the telemetry vocabulary
+/// can never silently drift. The returned tokens are identifier-safe
+/// (`snake_case`, never clap's kebab-case like `log-level`) because the
+/// telemetry gateway drops map keys that do not match `^[a-z][a-z0-9_]{0,63}$`.
+/// They carry no arguments, flags, or paths, only the closed command name.
+pub fn command_name(command: &Commands) -> Option<&'static str> {
+    Some(match command {
+        Commands::Add(_) => "add",
+        Commands::Agents => "agents",
+        Commands::Init(_) => "init",
+        Commands::List(_) => "list",
+        Commands::Logs(_) => "logs",
+        #[cfg(feature = "serve")]
+        Commands::LogLevel(_) => "log_level",
+        Commands::Remove(_) => "remove",
+        Commands::Send(_) => "send",
+        Commands::Status(_) => "status",
+        Commands::Session { .. } => "session",
+        Commands::Group { .. } => "group",
+        Commands::Profile { .. } => "profile",
+        Commands::Project { .. } => "project",
+        Commands::Worktree { .. } => "worktree",
+        Commands::Tmux { .. } => "tmux",
+        Commands::Sounds { .. } => "sounds",
+        Commands::Theme { .. } => "theme",
+        Commands::Telemetry { .. } => "telemetry",
+        #[cfg(feature = "serve")]
+        Commands::Serve(_) => "serve",
+        #[cfg(feature = "serve")]
+        Commands::Url(_) => "url",
+        #[cfg(feature = "serve")]
+        Commands::Cockpit { .. } => "cockpit",
+        // Internal, machine-spawned commands: never a user action, never counted.
+        #[cfg(feature = "serve")]
+        Commands::CockpitRunner(_) => return None,
+        Commands::ExtractSessionId(_) => return None,
+        Commands::Uninstall(_) => "uninstall",
+        Commands::Update(_) => "update",
+        Commands::Completion { .. } => "completion",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every name `command_name` returns must be in the `CLI_COMMAND_NAMES`
+    /// allowlist and be an identifier-safe token (no args, no kebab-case), so a
+    /// privacy reviewer can trust the only strings reaching the wire are closed
+    /// command names. Parsed via clap so alias collapse (`ls` -> `list`,
+    /// `rm` -> `remove`) and the real kebab/underscore mapping are exercised.
+    #[test]
+    fn command_name_is_allowlisted_and_identifier_safe() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["aoe", "add", "demo"], "add"),
+            (&["aoe", "agents"], "agents"),
+            (&["aoe", "ls"], "list"), // alias collapses to canonical
+            (&["aoe", "rm", "demo"], "remove"),
+            (&["aoe", "session", "current"], "session"),
+            (&["aoe", "telemetry", "status"], "telemetry"),
+            (&["aoe", "update"], "update"),
+            (&["aoe", "completion", "bash"], "completion"),
+        ];
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(*argv).expect("parse");
+            let name = command_name(cli.command.as_ref().expect("command")).expect("named");
+            assert_eq!(name, *expected, "argv {argv:?}");
+            assert!(
+                CLI_COMMAND_NAMES.contains(&name),
+                "`{name}` missing from CLI_COMMAND_NAMES"
+            );
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "`{name}` is not an identifier-safe token"
+            );
+        }
+    }
+
+    /// Hidden, machine-spawned commands are never counted.
+    #[test]
+    fn hidden_commands_are_not_named() {
+        let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
+        assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
+    }
+
+    /// The compiler forces a `command_name` arm per `Commands` variant, but
+    /// nothing forces a matching `CLI_COMMAND_NAMES` entry. Without this guard a
+    /// contributor could add a counted command and silently drop it from the
+    /// `cli_usage` payload (`build_cli_usage` filters unknown keys). Assert every
+    /// visible clap subcommand is in the allowlist (subset direction: the
+    /// allowlist may carry extra `serve`-only names in a TUI-only build, which is
+    /// a harmless never-matched filter key). `log-level` maps to `log_level`.
+    #[test]
+    fn allowlist_covers_every_visible_subcommand() {
+        use clap::CommandFactory;
+        let visible: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name().replace('-', "_"))
+            .collect();
+        assert!(!visible.is_empty(), "expected visible subcommands");
+        for name in &visible {
+            assert!(
+                CLI_COMMAND_NAMES.contains(&name.as_str()),
+                "visible subcommand `{name}` is missing from CLI_COMMAND_NAMES; \
+                 it would be silently dropped from cli_usage telemetry"
+            );
+        }
+    }
+}

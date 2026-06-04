@@ -353,6 +353,13 @@ pub struct Supervisor<S: BroadcastSink> {
     /// just after the spawn handshake finishes resumes within a
     /// scheduler tick instead of waiting up to 50 ms.
     worker_notify: Arc<tokio::sync::Notify>,
+    /// Sessions whose adopted worker is running an older binary than the
+    /// daemon (detected at reconcile after `aoe update`) and carried an
+    /// in-flight turn, so the reconciler attached to drain it rather than
+    /// hard-killing the turn. The reconciler's per-tick drain check
+    /// respawns these on the current binary once the turn finishes. See
+    /// #1754.
+    build_respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Cap on concurrently-running workers, snapshotted from
     /// `[cockpit] max_concurrent_workers` at startup. Enforced in
     /// `spawn`; new workers past the cap return `CapacityFull`.
@@ -393,10 +400,24 @@ impl Drop for ResumeReservation {
     }
 }
 
+/// Instance-level command override carried from the stored session
+/// (`Instance.command`, populated by `session.agent_command_override`
+/// or `--cmd-override` in `aoe add`). The tmux substrate already
+/// honors `Instance.command`; this lets the cockpit substrate do the
+/// same so a session launches the same binary regardless of substrate.
+/// `logical_tool` is the instance's tool (e.g. `opencode`), kept
+/// separate from the launched binary so agent-name-keyed behavior
+/// (tool-kind mapping, status, `_meta`) stays correct. See #1766.
+#[derive(Debug, Clone)]
+pub struct AgentCommandOverride {
+    pub logical_tool: String,
+    pub command: String,
+}
+
 /// Inputs to `Supervisor::spawn`. A struct (rather than seven
 /// positional params with `#[allow(clippy::too_many_arguments)]`)
 /// because the previous signature was the kind that produces real
-/// bugs the next time someone adds a field — the auto-spawn caller in
+/// bugs the next time someone adds a field; the auto-spawn caller in
 /// `create_session` had to thread six identical values through the
 /// API plus a seventh on this PR.
 #[derive(Debug, Clone)]
@@ -407,6 +428,7 @@ pub struct SpawnRequest {
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     /// ACP session id from a previous run; when `Some` and the agent
     /// advertises `load_session = true`, the spawn calls
     /// `LoadSessionRequest` instead of `NewSessionRequest`.
@@ -431,6 +453,64 @@ pub struct SpawnRequest {
     /// Best-effort: adapters that don't advertise bypass mode log a
     /// warning and stay in default. See #1142.
     pub yolo_mode: bool,
+    /// When `Some`, overlay the instance's resolved launch command on
+    /// the registry `AgentSpec` so cockpit honors
+    /// `session.agent_command_override` like tmux does. Applied only
+    /// to registry-backed, same-tool specs whose binary matches the
+    /// tool's built-in binary (see `apply_agent_command_override`).
+    /// See #1766.
+    pub agent_command_override: Option<AgentCommandOverride>,
+}
+
+/// True when `command` names the same executable as `binary`, comparing
+/// the file name so an absolute path (`/usr/local/bin/opencode`) still
+/// matches the built-in binary name (`opencode`).
+fn command_matches_binary(command: &str, binary: &str) -> bool {
+    command == binary
+        || std::path::Path::new(command)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name == binary)
+}
+
+/// Overlay an instance command override onto a resolved `AgentSpec`.
+///
+/// Applies only when the override is safe: the spec came from the
+/// built-in registry, the selected agent is the override's logical
+/// tool, and the spec's command is that tool's built-in binary. This
+/// keeps `agent_command_override.opencode = "opencode-plannotator"`
+/// working (registry `opencode` → binary `opencode`) while leaving
+/// adapter-backed agents like Claude (`claude-agent-acp`) untouched,
+/// where `agent_cockpit_cmd` is the right knob for a full argv swap.
+///
+/// The override is treated as a command prefix: its first word replaces
+/// `spec.command`, any remaining words are prepended to `spec.args`, so
+/// the registry's ACP args (e.g. `acp`) are preserved
+/// (`opencode-plannotator` → `opencode-plannotator acp`). See #1766.
+pub(crate) fn apply_agent_command_override(
+    selected_agent: &str,
+    spec_from_registry: bool,
+    ovr: &AgentCommandOverride,
+    spec: &mut AgentSpec,
+) -> Result<(), SupervisorError> {
+    if !spec_from_registry || selected_agent != ovr.logical_tool {
+        return Ok(());
+    }
+    let Some(agent_def) = crate::agents::get_agent(&ovr.logical_tool) else {
+        return Ok(());
+    };
+    if !command_matches_binary(&spec.command, agent_def.binary) {
+        return Ok(());
+    }
+    let mut argv = shell_words::split(&ovr.command)
+        .map_err(|e| SupervisorError::InvalidAgentCommand(format!("{e}")))?;
+    if argv.is_empty() || argv[0].trim().is_empty() {
+        return Ok(());
+    }
+    spec.command = argv.remove(0);
+    argv.append(&mut spec.args);
+    spec.args = argv;
+    Ok(())
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -453,8 +533,31 @@ impl<S: BroadcastSink> Supervisor<S> {
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
+            build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
+    }
+
+    /// Flag a session whose build-stale worker was adopted to drain an
+    /// in-flight turn; the reconciler respawns it on the current binary
+    /// at the next idle boundary. Idempotent. See #1754.
+    pub fn mark_build_respawn_pending(&self, session_id: &str) {
+        lock_recover(&self.build_respawn_pending).insert(session_id.to_string());
+    }
+
+    /// Snapshot the sessions awaiting a post-drain respawn. The reconciler
+    /// polls this each tick and respawns those that have gone idle.
+    pub fn build_respawn_pending_ids(&self) -> Vec<String> {
+        lock_recover(&self.build_respawn_pending)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Drop a session from the pending set once it has been respawned (or
+    /// is gone). Idempotent.
+    pub fn clear_build_respawn_pending(&self, session_id: &str) {
+        lock_recover(&self.build_respawn_pending).remove(session_id);
     }
 
     /// Snapshot the lifecycle state of every cockpit session known to
@@ -509,17 +612,23 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// argv. Never mutates the registry, so two profiles defining the
     /// same custom name with different commands don't clobber each other
     /// and `/cockpit/switch-agent` validation stays per-session.
+    ///
+    /// The returned bool is true when the spec came from the built-in
+    /// registry (vs an `agent_cockpit_cmd` custom spec); callers use it
+    /// to decide whether a command override may overlay the spec without
+    /// taking the registry lock a second time. See #1766.
     pub async fn resolve_agent_spec(
         &self,
         name: &str,
         config: &crate::session::config::SessionConfig,
-    ) -> Result<AgentSpec, SupervisorError> {
+    ) -> Result<(AgentSpec, bool), SupervisorError> {
         if let Some(spec) = self.registry.lock().await.get(name).cloned() {
-            return Ok(spec);
+            return Ok((spec, true));
         }
         if let Some(cmd) = config.agent_cockpit_cmd.get(name) {
-            return AgentSpec::from_cockpit_cmd(name, cmd)
-                .map_err(SupervisorError::InvalidAgentCommand);
+            let spec = AgentSpec::from_cockpit_cmd(name, cmd)
+                .map_err(SupervisorError::InvalidAgentCommand)?;
+            return Ok((spec, false));
         }
         Err(SupervisorError::UnknownAgent(name.into()))
     }
@@ -669,6 +778,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         let seq = next_seq(&self.next_seqs, session_id);
         self.sink
             .publish(session_id, seq, &Event::AgentSwitched { from, to, reason });
+        seq
+    }
+
+    /// Publish a `RateLimitAutoResumed` breadcrumb for a session the
+    /// reconciler is about to auto-respawn after a rate-limit park. The
+    /// `resets_at` is the adapter-reported reset time that gated the
+    /// resume. This event doubles as the supersede marker: it becomes the
+    /// session's latest status event (see `latest_status_event`'s filter),
+    /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
+    /// and falls through to a fresh spawn instead of re-parking. The web
+    /// reducer also keys off it to clear the rate-limit banner and drain a
+    /// queued prompt. See #1722.
+    pub fn publish_rate_limit_auto_resumed(
+        &self,
+        session_id: &str,
+        resets_at: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink
+            .publish(session_id, seq, &Event::RateLimitAutoResumed { resets_at });
         seq
     }
 
@@ -1028,10 +1157,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             provider_env,
             model,
+            effort,
             stored_acp_session_id,
             sandbox_info,
             source_profile,
             yolo_mode,
+            agent_command_override,
         } = req;
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
@@ -1073,9 +1204,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         .map_err(|e| {
             SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
         })?;
-        let mut spec = self
+        // `spec_from_registry` distinguishes a built-in registry spec
+        // from an `agent_cockpit_cmd` custom spec: the command override
+        // only overlays registry specs (custom ACP commands own their
+        // full argv already). Returned by `resolve_agent_spec` so the
+        // registry is locked once, not raced across two reads.
+        let (mut spec, spec_from_registry) = self
             .resolve_agent_spec(&agent, &resolved_cfg.session)
             .await?;
+        // Overlay the instance command override (e.g. opencode →
+        // opencode-plannotator from `session.agent_command_override`)
+        // so cockpit launches the same binary tmux would. See #1766.
+        if let Some(ref ovr) = agent_command_override {
+            apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
+        }
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
@@ -1105,6 +1247,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             cwd,
             additional_dirs,
             provider_env: env,
+            default_effort: effort,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
             sandbox_info,
@@ -2546,6 +2689,90 @@ impl BroadcastSink for ChannelSink {
 mod tests {
     use super::*;
 
+    fn spec(command: &str, args: &[&str]) -> AgentSpec {
+        AgentSpec {
+            command: command.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            description: "test".into(),
+            env_allowlist: None,
+        }
+    }
+
+    fn ovr(tool: &str, command: &str) -> AgentCommandOverride {
+        AgentCommandOverride {
+            logical_tool: tool.into(),
+            command: command.into(),
+        }
+    }
+
+    #[test]
+    fn command_override_replaces_binary_and_preserves_registry_args() {
+        // The #1766 case: opencode → opencode-plannotator, keep `acp`.
+        let mut s = spec("opencode", &["acp"]);
+        apply_agent_command_override(
+            "opencode",
+            true,
+            &ovr("opencode", "opencode-plannotator"),
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.command, "opencode-plannotator");
+        assert_eq!(s.args, vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn command_override_splits_args_and_prepends_before_registry_args() {
+        let mut s = spec("opencode", &["acp"]);
+        apply_agent_command_override(
+            "opencode",
+            true,
+            &ovr("opencode", "opencode-plannotator --profile plan"),
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.command, "opencode-plannotator");
+        assert_eq!(s.args, vec!["--profile", "plan", "acp"]);
+    }
+
+    #[test]
+    fn command_override_skips_non_registry_spec() {
+        let mut s = spec("opencode", &["acp"]);
+        apply_agent_command_override(
+            "opencode",
+            false,
+            &ovr("opencode", "opencode-plannotator"),
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.command, "opencode");
+        assert_eq!(s.args, vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn command_override_skips_adapter_binary_mismatch() {
+        // Claude's cockpit binary is the adapter `claude-agent-acp`, not
+        // `claude`, so a terminal `agent_command_override.claude` must
+        // not rewrite the adapter command.
+        let mut s = spec("claude-agent-acp", &[]);
+        apply_agent_command_override("claude", true, &ovr("claude", "claude-wrapper"), &mut s)
+            .unwrap();
+        assert_eq!(s.command, "claude-agent-acp");
+        assert!(s.args.is_empty());
+    }
+
+    #[test]
+    fn command_override_skips_when_agent_differs_from_logical_tool() {
+        let mut s = spec("aoe-agent", &[]);
+        apply_agent_command_override(
+            "aoe-agent",
+            true,
+            &ovr("opencode", "opencode-plannotator"),
+            &mut s,
+        )
+        .unwrap();
+        assert_eq!(s.command, "aoe-agent");
+    }
+
     /// In-memory sink that captures published frames.
     struct VecSink {
         frames: std::sync::Mutex<Vec<(String, u64, Event)>>,
@@ -2589,10 +2816,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         assert!(matches!(result, Err(SupervisorError::UnknownAgent(_))));
@@ -2627,10 +2856,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         assert!(matches!(result, Err(SupervisorError::AlreadyRunning(_))));
@@ -2679,6 +2910,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -2768,6 +3000,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -2840,6 +3073,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -2912,6 +3146,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -3038,6 +3273,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
             provider_env: vec![],
+            default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
             sandbox_info: None,
@@ -3770,6 +4006,32 @@ mod tests {
         assert_eq!(drained_seq, 2, "drain seq must follow startup-error seq");
     }
 
+    /// `publish_rate_limit_auto_resumed` must emit a `RateLimitAutoResumed`
+    /// carrying the exact `resets_at` and allocate monotonic per-session
+    /// seqs, so the reconciler breadcrumb supersedes `Stopped{rate_limited}`
+    /// in the replay/store ordering. See #1722.
+    #[tokio::test]
+    async fn publish_rate_limit_auto_resumed_emits_event_with_monotonic_seq() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let resets_at = chrono::Utc::now();
+
+        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2, "seq must be monotonic per session");
+
+        let frames = sink.frames.lock().unwrap();
+        let first = frames
+            .iter()
+            .find(|(sid, seq, _)| sid == "s-rl" && *seq == 1)
+            .expect("first breadcrumb frame published");
+        assert!(matches!(
+            &first.2,
+            Event::RateLimitAutoResumed { resets_at: ts } if *ts == resets_at
+        ));
+    }
+
     /// `with_capacity` enforces the configured cap. Past the cap,
     /// new spawns return `CapacityFull` instead of starting another
     /// worker. The error must include `current` and `limit` so the
@@ -3810,10 +4072,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         match result {
@@ -3882,10 +4146,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         match result {
@@ -4101,10 +4367,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         match result {
@@ -4152,10 +4420,12 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                effort: None,
                 stored_acp_session_id: None,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                agent_command_override: None,
             })
             .await;
         match result {

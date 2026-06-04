@@ -81,6 +81,16 @@ pub struct ToolCall {
     /// generic read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_recall: Option<MemoryRecall>,
+    /// Structured file diffs the agent attached to this tool call via ACP
+    /// `ToolCallContent::Diff`. Codex routes `apply_patch` edits through
+    /// this channel (one entry per touched file) instead of the legacy
+    /// `old_string`/`new_string` raw_input keys, so the cockpit edit card
+    /// reads the path and +/- preview from here when present and falls
+    /// back to the args-preview shape otherwise. Text on each side is
+    /// capped at ingest (see `acp_client`) so a large patch can't bloat the
+    /// event store or WS frame. See #1721.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diffs: Vec<DiffPreview>,
 }
 
 /// Structured payload for a `memory_recall` tool call. `mode` mirrors
@@ -516,6 +526,15 @@ pub enum Event {
         /// time on completion.
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
+        /// Structured diffs carried on a late `ToolCallUpdate.fields.content`
+        /// frame (Codex emits `apply_patch` diffs on the in-progress and
+        /// completion updates, not only the initial `tool_call`). `Some`
+        /// REPLACES the tool's diff list wholesale (per ACP, content is a
+        /// replacement, not an append); `None` leaves any diffs from the
+        /// initial frame untouched so a text-only update can't erase them.
+        /// See #1721.
+        #[serde(default)]
+        diffs: Option<Vec<DiffPreview>>,
     },
     ApprovalRequested {
         approval: Approval,
@@ -531,6 +550,16 @@ pub enum Event {
     ThinkingEnded,
     RateLimit {
         info: RateLimitInfo,
+    },
+    /// Opt-in auto-resume breadcrumb. Published by the reconciler (not the
+    /// agent) when a session parked on `Stopped { reason: "rate_limited" }`
+    /// crosses its reset deadline and `cockpit.rate_limit_auto_resume` is
+    /// enabled, just before the same worker is respawned. Carries the
+    /// `resets_at` that gated the resume so the timeline can show why the
+    /// worker came back, and so the web reducer can clear the rate-limit
+    /// lock and drain any queued prompt. See #1722.
+    RateLimitAutoResumed {
+        resets_at: DateTime<Utc>,
     },
     /// Agent-reported context-window usage. Comes from ACP
     /// `SessionUpdate::UsageUpdate` (gated on the
@@ -792,6 +821,7 @@ impl CockpitState {
                 title,
                 args_preview,
                 started_at,
+                diffs,
             } => {
                 if let Some(tool) = self.in_flight_tool.as_mut() {
                     if tool.id == tool_call_id {
@@ -803,6 +833,9 @@ impl CockpitState {
                         }
                         if let Some(t) = started_at {
                             tool.started_at = t;
+                        }
+                        if let Some(d) = diffs {
+                            tool.diffs = d;
                         }
                     }
                 }
@@ -832,6 +865,11 @@ impl CockpitState {
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
+            // Auto-resume fired: the park is over and a fresh worker is
+            // being respawned. Clear the rate-limit snapshot so a client
+            // seeding state from the store (or the persistent reducer)
+            // doesn't keep showing the parked banner after the resume.
+            Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             // ModesAvailable + CurrentModeChanged carry the real ACP-
@@ -1056,6 +1094,7 @@ mod tests {
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
+            diffs: Vec::new(),
         };
         s.apply_event(Event::ToolCallStarted {
             tool_call: tc.clone(),
@@ -1070,6 +1109,57 @@ mod tests {
         })
         .unwrap();
         assert!(s.in_flight_tool.is_none());
+    }
+
+    #[test]
+    fn tool_call_updated_replaces_diffs_on_some_and_preserves_on_none() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "tc-1".into(),
+                name: "Edit".into(),
+                kind: "edit".into(),
+                args_preview: "{}".into(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        })
+        .unwrap();
+        // A later update carrying diff content populates the card.
+        s.apply_event(Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: None,
+            args_preview: None,
+            started_at: None,
+            diffs: Some(vec![DiffPreview {
+                path: "src/foo.rs".into(),
+                old_text: Some("old".into()),
+                new_text: Some("new".into()),
+                created_at: Utc::now(),
+            }]),
+        })
+        .unwrap();
+        assert_eq!(s.in_flight_tool.as_ref().unwrap().diffs.len(), 1);
+        assert_eq!(
+            s.in_flight_tool.as_ref().unwrap().diffs[0].path,
+            "src/foo.rs"
+        );
+        // A subsequent text-only update (diffs None) must not erase them.
+        s.apply_event(Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: Some("Edit src/foo.rs".into()),
+            args_preview: None,
+            started_at: None,
+            diffs: None,
+        })
+        .unwrap();
+        assert_eq!(
+            s.in_flight_tool.as_ref().unwrap().diffs.len(),
+            1,
+            "text-only update must preserve existing diffs"
+        );
     }
 
     #[test]
@@ -1326,5 +1416,27 @@ mod tests {
         let u = s.usage.as_ref().unwrap();
         assert_eq!(u.used, 5_000);
         assert_eq!(u.cost.as_ref().unwrap().currency, "USD");
+    }
+
+    #[test]
+    fn rate_limit_auto_resumed_clears_rate_limit_snapshot() {
+        let mut s = fresh_state();
+        s.apply_event(Event::RateLimit {
+            info: RateLimitInfo {
+                status: "usage limit reached".into(),
+                resets_at: Utc::now(),
+                kind: "rate_limit".into(),
+            },
+        })
+        .unwrap();
+        assert!(s.rate_limit.is_some(), "RateLimit seeds the park snapshot");
+        s.apply_event(Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            s.rate_limit.is_none(),
+            "RateLimitAutoResumed must clear the rate-limit snapshot"
+        );
     }
 }

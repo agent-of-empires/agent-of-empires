@@ -510,6 +510,18 @@
       ]
     },
     {
+      "id": "wizard.resolved-launch-command",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/wizard-resolved-launch-command.spec.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+      ]
+    },
+    {
       "id": "cockpit.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",
@@ -570,6 +582,17 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ReviewStep.tsx"
+      ]
+    },
+    {
+      "id": "wizard.cockpit-mode-creation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/wizard-cockpit-create-session.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
       ]
     },
@@ -682,6 +705,17 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useRepoGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.empty-state",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/sidebar-empty-state.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
       ]
     },
     {
@@ -849,7 +883,9 @@
         "tests/sidebar-sort-mode.spec.ts"
       ],
       "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/Tooltip.tsx"
       ]
     },
     {
@@ -860,7 +896,8 @@
         "tests/live/sidebar-sort-mode.spec.ts"
       ],
       "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx"
       ]
     },
     {
@@ -899,6 +936,30 @@
       ]
     },
     {
+      "id": "sidebar.nested-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sidebarGroups.test.ts"
+      ],
+      "components": [
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.nested-axis-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/sidebar-nested-axis.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useNestedSidebarGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
@@ -909,6 +970,20 @@
       "components": [
         "web/src/components/DeleteSessionDialog.tsx",
         "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "session.group-edit",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/session-group-edit.spec.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SessionGroupModal.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -1001,6 +1076,19 @@
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
         "web/src/components/cockpit/CockpitRuntime.tsx",
         "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.storage-cleanup",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/diff/comments/storage.test.ts",
+        "src/components/diff/comments/storage.sweep.test.ts",
+        "src/hooks/useDiffComments.rtl.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/comments/storage.ts"
       ]
     },
     {
@@ -1408,6 +1496,21 @@
       ]
     },
     {
+      "id": "cockpit.file-links",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-file-links.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/CockpitFileRefContext.tsx",
+        "web/src/components/cockpit/Markdown.tsx",
+        "web/src/components/cockpit/CockpitView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx"
+      ]
+    },
+    {
       "id": "cockpit.story.composer-single-newline",
       "kind": "live-playwright",
       "risk": "high",
@@ -1428,6 +1531,17 @@
       ],
       "components": [
         "web/src/components/cockpit/ToolCards.tsx"
+      ]
+    },
+    {
+      "id": "cockpit.tool-density",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/ToolDisplayMode.test.tsx"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolDisplayMode.tsx"
       ]
     },
     {
@@ -1481,6 +1595,24 @@
         "web/src/components/cockpit/CockpitRuntime.tsx",
         "web/src/components/cockpit/CockpitView.tsx",
         "web/src/components/cockpit/ToolCards.tsx"
+      ]
+    },
+    {
+      "id": "cockpit.opencode-todos",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/cockpit/CockpitRuntime.test.ts",
+        "src/components/cockpit/ToolCards.render.test.tsx",
+        "src/lib/agentProfiles.test.ts",
+        "src/lib/cockpitTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/ToolCards.tsx",
+        "web/src/components/cockpit/CockpitRuntime.tsx",
+        "web/src/lib/agentProfiles.ts",
+        "web/src/lib/cockpitArgs.ts",
+        "web/src/lib/cockpitTypes.ts"
       ]
     },
     {
@@ -1841,6 +1973,28 @@
       "risk": "medium",
       "specs": [
         "src/hooks/__tests__/useCockpitQueueCount.test.tsx"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "story.sidebar-rate-limit",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/cockpit-stories/sidebar-rate-limit.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.rate-limit-hook",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/__tests__/useCockpitRateLimit.test.tsx"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2335,6 +2489,18 @@
       ]
     },
     {
+      "id": "cockpit.story.composer-mobile-footer-actions",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/cockpit-stories/composer-mobile-footer-actions.spec.ts"
+      ],
+      "components": [
+        "web/src/components/cockpit/Composer.tsx",
+        "web/src/components/cockpit/SessionConfigControls.tsx"
+      ]
+    },
+    {
       "id": "cockpit.story.composer-stop-mid-turn",
       "kind": "live-playwright",
       "risk": "high",
@@ -2769,6 +2935,18 @@
       ]
     },
     {
+      "id": "sidebar.edit-workdir-name",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/WorkdirNameEdit.test.tsx"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "sidebar.context-menu-clamp",
       "kind": "vitest",
       "risk": "medium",
@@ -2790,6 +2968,44 @@
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.multi-select-logic",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sidebarSelection.test.ts",
+        "src/lib/__tests__/sidebarOptimistic.test.ts",
+        "src/lib/__tests__/sidebarBulk.test.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.multi-select-gestures",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/sidebar-multi-select.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.bulk-triage-live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/sidebar-bulk-triage.spec.ts"
+      ],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/BulkActionBar.tsx"
       ]
     },
     {
@@ -2833,6 +3049,45 @@
         "web/src/components/Dashboard.tsx",
         "web/src/lib/tourSteps.ts",
         "web/src/hooks/useTour.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.theme-welcome",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/theme-onboarding.spec.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.theme-welcome-unit",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
+        "src/lib/__tests__/onboarding.test.ts"
+      ],
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx"
+      ]
+    },
+    {
+      "id": "shortcuts.single-source",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/shortcuts.test.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/components/HelpOverlay.tsx",
+        "web/src/components/tour/TourRunner.tsx",
+        "web/src/lib/shortcuts.ts",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/tourSteps.ts"
       ]
     }
   ]

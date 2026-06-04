@@ -516,3 +516,58 @@ describe("useRepoGroups manual group order (#1644)", () => {
     );
   });
 });
+
+describe("useRepoGroups sortMode = attention (#1640)", () => {
+  it("orders workspaces inside a group by status attention, ignoring workspaceOrdering", () => {
+    const wRunning = workspace("running", "/repo-a", [
+      session({ id: "s-run", status: "Running" }),
+    ]);
+    const wWaiting = workspace("waiting", "/repo-a", [
+      session({ id: "s-wait", status: "Waiting" }),
+    ]);
+    // Server pins running first; attention floats the Waiting workspace.
+    const { result } = renderHook(() =>
+      useRepoGroups([wRunning, wWaiting], ["running", "waiting"], "attention"),
+    );
+    expect(result.current.groups[0].workspaces.map((w) => w.id)).toEqual([
+      "waiting",
+      "running",
+    ]);
+  });
+
+  it("floats a group holding a Waiting session above one whose best is Running", () => {
+    const wA = workspace("a1", "/repo-a", [
+      session({ id: "s-a", status: "Running" }),
+    ]);
+    const wB = workspace("b1", "/repo-b", [
+      session({ id: "s-b", status: "Waiting" }),
+    ]);
+    const { result } = renderHook(() =>
+      useRepoGroups([wA, wB], ["a1", "b1"], "attention"),
+    );
+    expect(result.current.groups.map((g) => g.id)).toEqual([
+      "/repo-b",
+      "/repo-a",
+    ]);
+  });
+
+  it("keeps synthetic groups pinned at the bottom even with an urgent session", () => {
+    const wReal = workspace("real", "/repo-a", [
+      session({ id: "s-real", status: "Idle" }),
+    ]);
+    const wScratch = workspace(
+      "sc",
+      "/home/u/.agent-of-empires/scratch/aaa",
+      [session({ id: "s-sc", status: "Waiting", urgent: true, scratch: true })],
+    );
+    const { result } = renderHook(() =>
+      useRepoGroups([wScratch, wReal], ["sc", "real"], "attention"),
+    );
+    // Scratch stays bottom for stable cross-toggle placement, matching
+    // lastActivity, even though it holds an urgent Waiting session.
+    expect(result.current.groups.map((g) => g.id)).toEqual([
+      "/repo-a",
+      SCRATCH_GROUP_ID,
+    ]);
+  });
+});

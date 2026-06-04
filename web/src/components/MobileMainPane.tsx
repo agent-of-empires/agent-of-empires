@@ -10,6 +10,7 @@ import type { RightPanelView } from "../lib/rightPanelView";
 import type { ServerAbout } from "../lib/api";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
+import type { FileRef } from "../lib/fileRef";
 
 const CockpitView = lazy(() =>
   import("./cockpit/CockpitView").then((m) => ({ default: m.CockpitView })),
@@ -32,6 +33,7 @@ interface Props {
   warning: string | null;
   diffFilesLoading: boolean;
   onSelectFile: (path: string, repoName?: string) => void;
+  onOpenFileRef: (ref: FileRef) => void;
   onCloseFile: () => void;
   onDiffRefresh: () => void;
   commentsEnabled: boolean;
@@ -72,6 +74,7 @@ export function MobileMainPane({
   warning,
   diffFilesLoading,
   onSelectFile,
+  onOpenFileRef,
   onCloseFile,
   onDiffRefresh,
   commentsEnabled,
@@ -111,6 +114,7 @@ export function MobileMainPane({
                 tool={activeSession.tool}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
+                onOpenFileRef={onOpenFileRef}
               />
             </Suspense>
           ) : (

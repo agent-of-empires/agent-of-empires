@@ -129,6 +129,9 @@ export interface SettingsResponse {
   theme?: {
     idle_decay_minutes?: number;
   };
+  app_state?: {
+    has_seen_web_tour?: boolean;
+  };
   [key: string]: unknown;
 }
 
@@ -152,6 +155,24 @@ export async function updateSettings(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Marks the first-run dashboard tour as seen for this server. Single-purpose
+ * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
+ * passphrase/elevation wall. Returns false on read-only servers (403) or
+ * network failure; callers treat that as nonfatal and suppress the tour in
+ * memory for the current page.
+ */
+export async function markWebTourSeen(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-tour-seen", {
+      method: "POST",
     });
     return res.ok;
   } catch {
@@ -424,7 +445,7 @@ export async function setTelemetryConsent(
 }
 
 /// Tell the daemon the web dashboard or cockpit UI was opened, so its next
-/// opt-in snapshot can carry web_seen / cockpit_seen. Best-effort.
+/// opt-in snapshot can carry the `usage_seen` open-count map. Best-effort.
 export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
   void fetch("/api/telemetry/seen", {
     method: "POST",
@@ -919,6 +940,57 @@ export async function renameSession(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Edit a managed worktree session's workdir name: move the worktree
+ * directory and, optionally, rename its git branch. The session must not be
+ * running. Returns the server's validation message on failure so the caller
+ * can surface it. See #1723.
+ */
+export async function setWorktreeName(
+  id: string,
+  name: string,
+  renameBranch: boolean,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/worktree-name`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, rename_branch: renameBranch }),
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Move an existing session to another group, create a new group by
+ *  passing a path that does not exist yet, or clear the group with an
+ *  empty string (the ungroup sentinel, matching session creation and the
+ *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
+export async function updateSessionGroup(
+  id: string,
+  group: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group }),
     });
     return res.ok;
   } catch {

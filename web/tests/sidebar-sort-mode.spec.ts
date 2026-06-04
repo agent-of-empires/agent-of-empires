@@ -1,14 +1,17 @@
-// Mocked-Playwright coverage for the sidebar sort-mode toggle (#1418).
+// Mocked-Playwright coverage for the sidebar sort picker (#1418, #1640).
 //
-// Drives the WorkspaceSidebar header toggle through its two states
-// (manual, lastActivity) against fully-stubbed /api responses, so the
-// only thing under test is the React + dnd-kit wiring:
+// Drives the WorkspaceSidebar header sort picker against fully-stubbed
+// /api responses, so the only thing under test is the React + dnd-kit
+// wiring:
 //   1. Default is manual; rows honor server-supplied workspace_ordering.
-//   2. Toggling to lastActivity reorders client-side by the issue's
-//      sort key (max of last_accessed_at, idle_entered_at, created_at).
-//   3. localStorage persists across reloads; the toggle starts pressed.
-//   4. Press-and-hold in lastActivity mode does not lift or PUT.
-//   5. Multi-repo group stays pinned at the bottom in lastActivity mode.
+//   2. Selecting "Last activity" reorders client-side by the issue's sort
+//      key (max of last_accessed_at, idle_entered_at, created_at).
+//   3. localStorage persists across reloads; the picker reopens on the
+//      stored mode.
+//   4. Drag affordances are absent in non-manual modes and no PUT fires.
+//   5. Multi-repo group stays pinned at the bottom in last-activity mode.
+//   6. Selecting "Attention" floats Waiting / Error rows above Running /
+//      Idle / Stopped, and an urgent flag promotes its row within the tier.
 //
 // Live persistence semantics (real aoe serve, real last_accessed_at
 // bump) live in the matching tests/live/sidebar-sort-mode.spec.ts.
@@ -22,6 +25,9 @@ interface MockSession {
   project_path: string;
   branch: string | null;
   created_at: string;
+  status?: string;
+  urgent?: boolean;
+  favorited?: boolean;
   last_accessed_at?: string | null;
   idle_entered_at?: string | null;
   workspace_repos?: { name: string; source_path: string; branch: string }[];
@@ -34,7 +40,7 @@ function sessionResponse(s: MockSession) {
     project_path: s.project_path,
     group_path: s.project_path,
     tool: "claude",
-    status: "Idle",
+    status: s.status ?? "Idle",
     yolo_mode: false,
     created_at: s.created_at,
     last_accessed_at: s.last_accessed_at ?? null,
@@ -43,6 +49,8 @@ function sessionResponse(s: MockSession) {
     branch: s.branch,
     main_repo_path: null,
     is_sandboxed: false,
+    favorited: s.favorited ?? false,
+    urgent: s.urgent ?? false,
     has_terminal: true,
     profile: "default",
     workspace_repos: s.workspace_repos ?? [],
@@ -105,7 +113,15 @@ async function readWorkspaceTitles(page: Page): Promise<string[]> {
 
 const TOGGLE = "[data-testid='sidebar-sort-toggle']";
 
-test.describe("Sidebar sort-mode toggle (#1418)", () => {
+// The control is now a dropdown picker, not a cycle button: open it, then
+// click the labeled option for the target mode.
+async function selectSortMode(page: Page, mode: string): Promise<void> {
+  await page.locator(TOGGLE).click();
+  await page.locator(`[data-testid='sidebar-sort-option-${mode}']`).click();
+  await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", mode);
+}
+
+test.describe("Sidebar sort picker (#1418, #1640)", () => {
   test("default is manual; rows follow server workspace_ordering", async ({
     page,
   }) => {
@@ -140,16 +156,12 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
       "data-sort-mode",
       "manual",
     );
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
     await expect
       .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
       .toEqual(["old-ws", "new-ws"]);
   });
 
-  test("clicking toggle reorders by last-activity desc and persists", async ({
+  test("selecting last-activity reorders desc and persists", async ({
     page,
     context,
   }) => {
@@ -182,15 +194,7 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
       .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
       .toEqual(["old-ws", "new-ws"]);
 
-    await page.locator(TOGGLE).click();
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "lastActivity",
-    );
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    await selectSortMode(page, "lastActivity");
     await expect
       .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
       .toEqual(["new-ws", "old-ws"]);
@@ -201,7 +205,7 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
     expect(stored).toBe("lastActivity");
 
     // Reload: mode and order persist on first paint without another
-    // toggle click. Use the same browser context so localStorage carries.
+    // selection. Use the same browser context so localStorage carries.
     await page.reload();
     await expect(page.locator(TOGGLE)).toHaveAttribute(
       "data-sort-mode",
@@ -211,12 +215,8 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
       .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
       .toEqual(["new-ws", "old-ws"]);
 
-    // Toggling back restores manual order.
-    await page.locator(TOGGLE).click();
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "manual",
-    );
+    // Selecting manual restores the server order.
+    await selectSortMode(page, "manual");
     await expect
       .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
       .toEqual(["old-ws", "new-ws"]);
@@ -256,11 +256,7 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
       page.locator("[aria-roledescription='Press and hold to reorder']"),
     ).toHaveCount(2, { timeout: 8000 });
 
-    await page.locator(TOGGLE).click();
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "lastActivity",
-    );
+    await selectSortMode(page, "lastActivity");
 
     // Drag wrappers gone in last-activity mode.
     await expect(
@@ -280,8 +276,8 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
     await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
     await page.mouse.up();
 
-    // Toggle back to manual: drag affordances return.
-    await page.locator(TOGGLE).click();
+    // Selecting manual: drag affordances return.
+    await selectSortMode(page, "manual");
     await expect(
       page.locator("[aria-roledescription='Press and hold to reorder']"),
     ).toHaveCount(2);
@@ -319,10 +315,7 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
     await mockApis(
       page,
       () => sessions,
-      () => [
-        "/tmp/repo::feature/multi",
-        "/tmp/repo::feature/single",
-      ],
+      () => ["/tmp/repo::feature/multi", "/tmp/repo::feature/single"],
     );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -332,16 +325,131 @@ test.describe("Sidebar sort-mode toggle (#1418)", () => {
       page.locator("[data-testid='sidebar-session-row']"),
     ).toHaveCount(2, { timeout: 8000 });
 
-    await page.locator(TOGGLE).click();
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "lastActivity",
-    );
+    await selectSortMode(page, "lastActivity");
 
     // Multi-repo group's row stays last even though its workspace has
     // the freshest activity. Single-repo row renders first.
     await expect
       .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
       .toEqual(["single-old", "multi-recent"]);
+  });
+
+  test("attention sort floats waiting and urgent rows to the top (#1640)", async ({
+    page,
+  }) => {
+    // Same repo so all four sessions sit in one group; manual order is
+    // newest-first by created_at. last_accessed_at is identical so the
+    // within-tier tie-break does not interfere with the status ordering.
+    const sessions: MockSession[] = [
+      {
+        id: "s-running",
+        title: "running-ws",
+        project_path: "/tmp/repo",
+        branch: "feature/running",
+        status: "Running",
+        created_at: "2025-01-04T00:00:00Z",
+        last_accessed_at: "2025-06-01T00:00:00Z",
+      },
+      {
+        id: "s-waiting",
+        title: "waiting-ws",
+        project_path: "/tmp/repo",
+        branch: "feature/waiting",
+        status: "Waiting",
+        created_at: "2025-01-03T00:00:00Z",
+        last_accessed_at: "2025-06-01T00:00:00Z",
+      },
+      {
+        id: "s-error",
+        title: "error-ws",
+        project_path: "/tmp/repo",
+        branch: "feature/error",
+        status: "Error",
+        created_at: "2025-01-02T00:00:00Z",
+        last_accessed_at: "2025-06-01T00:00:00Z",
+      },
+      {
+        id: "s-urgent",
+        title: "urgent-ws",
+        project_path: "/tmp/repo",
+        branch: "feature/urgent",
+        // Running status, but agent-flagged urgent: must float above the
+        // plain Waiting row despite a lower status rank.
+        status: "Running",
+        urgent: true,
+        created_at: "2025-01-01T00:00:00Z",
+        last_accessed_at: "2025-06-01T00:00:00Z",
+      },
+    ];
+    await mockApis(
+      page,
+      () => sessions,
+      () => [
+        "/tmp/repo::feature/running",
+        "/tmp/repo::feature/waiting",
+        "/tmp/repo::feature/error",
+        "/tmp/repo::feature/urgent",
+      ],
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await expect(
+      page.locator("[data-testid='sidebar-session-row']"),
+    ).toHaveCount(4, { timeout: 8000 });
+
+    await selectSortMode(page, "attention");
+
+    // urgent (cross-rank promoter) first, then Waiting, then Error, then
+    // the plain Running row last.
+    await expect
+      .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
+      .toEqual(["urgent-ws", "waiting-ws", "error-ws", "running-ws"]);
+
+    const stored = await page.evaluate(() =>
+      window.localStorage.getItem("aoe-sidebar-sort-mode"),
+    );
+    expect(stored).toBe("attention");
+  });
+
+  // #1836: the sort trigger used a native browser `title`, so its tooltip
+  // looked different from the grouping and filter controls (which wrap their
+  // buttons in the shared styled Tooltip). It now uses that same component,
+  // and the sidebar gained separator borders.
+  test("sort tooltip matches the styled group/filter tooltip; sidebar has separators (#1836)", async ({
+    page,
+  }) => {
+    const sessions: MockSession[] = [
+      {
+        id: "s1",
+        title: "alpha",
+        project_path: "/tmp/repo",
+        branch: "feature/a",
+        created_at: "2025-01-01T00:00:00Z",
+      },
+    ];
+    await mockApis(
+      page,
+      () => sessions,
+      () => ["/tmp/repo::feature/a"],
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    const toggle = page.locator(TOGGLE);
+    await expect(toggle).toBeVisible({ timeout: 8000 });
+
+    // No native browser tooltip on the trigger any more.
+    await expect(toggle).not.toHaveAttribute("title", /.+/);
+
+    // The active-mode label now lives in the shared Tooltip span, carrying
+    // the same surface-950 styling the group/filter tooltips use.
+    const tip = page.getByText("Sort: manual, drag enabled", { exact: true });
+    await expect(tip).toHaveClass(/bg-surface-950/);
+    await expect(tip).toHaveClass(/group-hover\/tip:opacity-100/);
+
+    // The scrollable session list is separated from the control row by a top
+    // border (the explicit ask in #1836).
+    await expect(page.locator("div.overflow-y-auto.border-t")).toHaveCount(1);
   });
 });

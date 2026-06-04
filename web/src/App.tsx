@@ -5,10 +5,11 @@ import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
 import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
 import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
-import { safeGetItem, safeSetItem } from "./lib/safeStorage";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup } from "./lib/sidebarGroups";
@@ -17,6 +18,10 @@ import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import {
+  clearStoredComments,
+  sweepOrphanComments,
+} from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -34,6 +39,7 @@ import {
   setTelemetryConsent,
   reportTelemetrySeen,
   isDebugBuild,
+  markWebTourSeen,
   updateWorkspaceOrdering,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
@@ -43,6 +49,7 @@ import {
   useIdleDecayWindowMs,
 } from "./lib/idleDecay";
 import { toastBus } from "./lib/toastBus";
+import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import {
   dispatchFocusTerminal,
@@ -73,6 +80,8 @@ import { ProjectsView } from "./components/ProjectsView";
 import { ProfilesPage } from "./components/profiles/ProfilesPage";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
+import { useWelcomePhase } from "./hooks/useWelcomePhase";
+import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
@@ -93,6 +102,9 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
+// Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
+// already dismissed the tour to the backend; no longer written.
+const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
   // Apply the user-selected theme as CSS custom properties on the root
@@ -242,6 +254,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
   }, [sessionsLoaded, sessions]);
 
+  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
+  // deleted sessions and retroactively removes empty keys written before the
+  // empty-removal fix. Mirrors the draft sweep above.
+  const sweptCommentsRef = useRef(false);
+  useEffect(() => {
+    if (sweptCommentsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptCommentsRef.current = true;
+    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
@@ -252,7 +275,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     reorderRepoGroups,
   } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
   const { groups: sessionGroups, toggleGroupCollapsed } =
-    useSessionGroups(workspaces);
+    useSessionGroups(workspaces, sidebarSortMode);
+  // The nested `repo+group` axis reuses the already-built repo groups for
+  // its top level (so repo collapse, appearance, and ordering are shared
+  // with the repo axis) and splits each repo by `group_path` underneath.
+  // See #1720.
+  const { groups: nestedGroups, toggleSubgroupCollapsed } =
+    useNestedSidebarGroups(repoGroups, sidebarSortMode);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -529,13 +558,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [serverAboutLoaded, serverAbout?.read_only]);
 
   // Telemetry: report that the cockpit web UI was opened, folded into the
-  // daemon's next opt-in snapshot as `cockpit_seen`. `activeSession` drives
-  // both the desktop and mobile cockpit mounts, so this single effect covers
-  // both layouts. Same guard as the `"web"` ping above: skip until
-  // `serverAbout` loads, skip read-only servers (which can't persist). The
-  // backend folds repeated pings into a monotonic open-count (reported as the
-  // boolean `cockpit_seen` and decremented by exactly what each snapshot
-  // reported), so re-fires on session switch are harmless. See #1882.
+  // daemon's next opt-in snapshot under the `usage_seen` map's `cockpit` key.
+  // `activeSession` drives both the desktop and mobile cockpit mounts, so this
+  // single effect covers both layouts. Same guard as the `"web"` ping above:
+  // skip until `serverAbout` loads, skip read-only servers (which can't
+  // persist). The backend folds repeated pings into a monotonic open-count
+  // (decremented by exactly what each snapshot reported), so re-fires on
+  // session switch are harmless. See #1882.
   useEffect(() => {
     if (!serverAboutLoaded || serverAbout?.read_only) return;
     if (!activeSession?.cockpit_mode) return;
@@ -585,6 +614,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // localStorage key doesn't linger (#1358). Cross-tab / cross-device
     // deletes go through the startup sweep instead.
     clearDraft(sessionId);
+    // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
+    // cross-device deletes still fall to the startup sweep.
+    clearStoredComments(sessionId);
 
     // Server returns `messages` from `perform_deletion` when there's something
     // user-facing to report (e.g. "Scratch directory kept at: <path>" when
@@ -631,6 +663,28 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       setSelectedFile({ path, repoName });
     },
     [],
+  );
+
+  // Open a local file reference cited in a cockpit transcript (Codex
+  // `path:line` markdown links). Resolve the absolute path back to a
+  // repo-relative path for the active session and open it in the in-app
+  // diff/file viewer, keeping the current session route. A path outside
+  // the session's known repo roots surfaces a non-destructive toast
+  // rather than navigating away. Line/column are parsed but not yet
+  // wired to viewer scroll-to-line. See #1718.
+  const handleOpenFileRef = useCallback(
+    (ref: FileRef) => {
+      if (!activeSession) return;
+      const resolved = resolveToRepoRelative(ref.path, activeSession);
+      if (!resolved) {
+        toastBus.handler?.error(
+          `Could not open ${ref.path}: not inside this session's repo`,
+        );
+        return;
+      }
+      handleSelectFile(resolved.relativePath, resolved.repoName);
+    },
+    [activeSession, handleSelectFile],
   );
 
   const handleCloseFile = useCallback(() => {
@@ -947,6 +1001,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           warning={warning}
           diffFilesLoading={diffFilesLoading}
           onSelectFile={handleSelectFile}
+          onOpenFileRef={handleOpenFileRef}
           onCloseFile={handleCloseFile}
           onDiffRefresh={refreshDiffFiles}
           commentsEnabled={commentsEnabled}
@@ -985,6 +1040,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                       tool={activeSession.tool}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
+                      onOpenFileRef={handleOpenFileRef}
                     />
                   </Suspense>
                 ) : (
@@ -1121,6 +1177,43 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       : activeSession.cockpit_mode
         ? "cockpit"
         : "session";
+  // First-run tour "seen" state, sourced from the backend (app_state) so it
+  // follows the user across browsers and devices. `tourSeenKnown` stays false
+  // until settings resolve, so the tour never flashes on a `false` default
+  // while the request is in flight (and never auto-launches when the fetch
+  // fails). Fetched here in AppContent (post-auth) so the request runs as the
+  // authenticated user. `LEGACY_TOUR_SEEN_KEY` is the pre-#1832 per-browser
+  // flag, read once to migrate existing users so they are not re-shown the tour.
+  const [tourSeen, setTourSeen] = useState(false);
+  const [tourSeenKnown, setTourSeenKnown] = useState(false);
+
+  useEffect(() => {
+    fetchSettings().then((settings) => {
+      // Fetch failed: leave the seen state unknown so the tour does not
+      // auto-launch over an error/recovery screen. The menu trigger still works.
+      if (!settings) return;
+      const backendSeen = settings.app_state?.has_seen_web_tour === true;
+      const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
+      // Treat the legacy local flag as a suppression hint while the migration
+      // POST is in flight, so the tour cannot flash before the backend agrees.
+      setTourSeen(backendSeen || legacySeen);
+      setTourSeenKnown(true);
+      if (legacySeen && !backendSeen) {
+        void markWebTourSeen().then((ok) => {
+          if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
+        });
+      }
+    });
+  }, []);
+
+  // Persist the seen flag when the user finishes or skips the tour. Optimistic:
+  // flip local state immediately so a failed POST (e.g. read-only 403) cannot
+  // re-auto-launch the tour for the rest of this page's lifetime.
+  const handleTourSeen = useCallback(() => {
+    setTourSeen(true);
+    void markWebTourSeen();
+  }, []);
+
   // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
   // an in-flight session route defers it (the flag stays unset until then).
   const tourAutoLaunchReady =
@@ -1134,11 +1227,24 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     !showHelp &&
     !showAbout &&
     !showPalette;
+  // First-run theme choice is phase one of onboarding. It decides on the same
+  // settled-dashboard gate as the tour, then the tour follows once the modal
+  // resolves so the two never overlap on first load.
+  const welcome = useWelcomePhase({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    autoLaunchReady: tourAutoLaunchReady,
+    tourSeen,
+    tourSeenKnown,
+  });
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
     isDesktop: !isCoarse,
-    autoLaunchReady: tourAutoLaunchReady,
+    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
+    seen: tourSeen,
+    seenKnown: tourSeenKnown,
+    onSeen: handleTourSeen,
   });
 
   return (
@@ -1171,6 +1277,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {!showSettings && !showProjects && (
           <WorkspaceSidebar
             groups={sidebarGroups}
+            nestedGroups={nestedGroups}
+            onToggleSubgroup={toggleSubgroupCollapsed}
             onReorderWorkspaces={handleReorderWorkspaces}
             onReorderGroups={reorderRepoGroups}
             activeId={activeWorkspace?.id ?? null}
@@ -1216,6 +1324,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
         />
       )}
+
+      {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
 
       {tour.tourElement}
 

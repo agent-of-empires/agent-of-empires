@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings 6",
     "preview": "vite preview",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
@@ -52,6 +52,7 @@
     "eslint": "^10.4.0",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.2",
+    "eslint-plugin-react-you-might-not-need-an-effect": "^1.0.0",
     "geist": "^1.7.1",
     "globals": "^17.4.0",
     "jsdom": "^29.1.1",

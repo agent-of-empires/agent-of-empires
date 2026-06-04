@@ -29,6 +29,44 @@ pub struct AgentInfo {
     /// valid `agent_cockpit_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in cockpit or tmux.
     pub acp_capable: bool,
+    /// The ACP command a built-in agent launches in cockpit, e.g.
+    /// `claude-agent-acp` for claude or `opencode` for opencode. This is
+    /// the registry command (post `${aoe_data_dir}` substitution), which
+    /// can differ from `binary`; the wizard previews it so the user sees
+    /// the real launch command before starting. Omitted for custom
+    /// agents, whose command values are never serialized here (see the
+    /// custom-agent serialization tests below).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cockpit_command: Option<String>,
+    /// The registry args appended to `cockpit_command` (e.g. `["acp"]`
+    /// for opencode, `["--acp"]` for gemini). Empty when there are none
+    /// or for custom agents.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cockpit_args: Vec<String>,
+}
+
+/// Resolve the cockpit launch command + args for a built-in agent from
+/// its registry spec, substituting `${aoe_data_dir}` so the preview
+/// matches what `supervisor::spawn_inner` actually runs. Returns
+/// `(None, [])` for agents without a registry entry.
+fn cockpit_command_fields(
+    spec: Option<&crate::cockpit::AgentSpec>,
+    data_dir: Option<&std::path::Path>,
+) -> (Option<String>, Vec<String>) {
+    let substitute = |value: &str| match data_dir {
+        Some(dir) if value.contains("${aoe_data_dir}") => {
+            value.replace("${aoe_data_dir}", &dir.to_string_lossy())
+        }
+        _ => value.to_string(),
+    };
+    match spec {
+        Some(spec) => {
+            let command = substitute(&spec.command);
+            let args = spec.args.iter().map(|arg| substitute(arg)).collect();
+            (Some(command), args)
+        }
+        None => (None, Vec::new()),
+    }
 }
 
 fn build_custom_agent_infos(
@@ -52,6 +90,10 @@ fn build_custom_agent_infos(
             acp_capable: agent_cockpit_cmd
                 .get(name)
                 .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(name, cmd).is_ok()),
+            // Custom agents' command values are deliberately never
+            // serialized here; they can hold hostnames or secrets.
+            cockpit_command: None,
+            cockpit_args: Vec::new(),
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -67,16 +109,23 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+        let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
-            .map(|a| AgentInfo {
-                kind: "builtin".to_string(),
-                name: a.name.to_string(),
-                binary: a.binary.to_string(),
-                host_only: a.host_only,
-                installed: available.iter().any(|s| s == a.name),
-                install_hint: a.install_hint.to_string(),
-                acp_capable: acp_registry.get(a.name).is_some(),
+            .map(|a| {
+                let (cockpit_command, cockpit_args) =
+                    cockpit_command_fields(acp_registry.get(a.name), data_dir.as_deref());
+                AgentInfo {
+                    kind: "builtin".to_string(),
+                    name: a.name.to_string(),
+                    binary: a.binary.to_string(),
+                    host_only: a.host_only,
+                    installed: available.iter().any(|s| s == a.name),
+                    install_hint: a.install_hint.to_string(),
+                    acp_capable: acp_registry.get(a.name).is_some(),
+                    cockpit_command,
+                    cockpit_args,
+                }
             })
             .collect::<Vec<_>>();
         agents.extend(build_custom_agent_infos(&custom_agents, &agent_cockpit_cmd));
@@ -232,6 +281,60 @@ pub async fn update_settings(
 /// policy), so this needs no elevation, only normal authentication.
 pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
     Json(crate::session::settings_schema::schema())
+}
+
+/// Marks the web dashboard's first-run tour as seen for this server.
+///
+/// Single-purpose write so the cosmetic flag never widens the
+/// `PATCH /api/settings` surface (which carries security-sensitive
+/// sections like `sandbox`/`worktree` and the `app_state`
+/// hooks-acknowledgement field). Deliberately exempt from the
+/// elevation/passphrase wall: it flips one cosmetic bool, grants no
+/// capability, and `read_only` still blocks it. Uses `Config::load()`
+/// (not `load_or_warn`) so a corrupt config is not silently replaced
+/// with defaults just to persist this flag.
+pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.has_seen_web_tour = true;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"has_seen_web_tour": true})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // --- Devices ---
@@ -596,13 +699,8 @@ pub struct ServerAbout {
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
     let auth_required = !state.token_manager.is_no_auth().await;
     let passphrase_enabled = state.login_manager.is_enabled();
-    let auth_mode = if auth_required {
-        "token"
-    } else if passphrase_enabled {
-        "passphrase"
-    } else {
-        "none"
-    };
+    let auth_mode =
+        crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
     let cockpit_master_enabled = state
         .cockpit_master_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1274,6 +1372,53 @@ mod tests {
         );
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
         assert!(!plain.acp_capable, "agent with no cockpit cmd is tmux-only");
+    }
+
+    #[test]
+    fn cockpit_command_fields_resolve_registry_command_and_args() {
+        let registry = crate::cockpit::AgentRegistry::with_defaults();
+
+        let (cmd, args) = cockpit_command_fields(registry.get("opencode"), None);
+        assert_eq!(cmd.as_deref(), Some("opencode"));
+        assert_eq!(args, vec!["acp".to_string()]);
+
+        let (cmd, args) = cockpit_command_fields(registry.get("gemini"), None);
+        assert_eq!(cmd.as_deref(), Some("gemini"));
+        assert_eq!(args, vec!["--acp".to_string()]);
+
+        let (cmd, args) = cockpit_command_fields(registry.get("claude"), None);
+        assert_eq!(cmd.as_deref(), Some("claude-agent-acp"));
+        assert!(args.is_empty());
+
+        let (cmd, args) = cockpit_command_fields(None, None);
+        assert_eq!(cmd, None);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn cockpit_command_fields_substitute_data_dir() {
+        let registry = crate::cockpit::AgentRegistry::with_defaults();
+        let dir = std::path::Path::new("/tmp/aoe-data");
+        let (cmd, _) = cockpit_command_fields(registry.get("aoe-agent"), Some(dir));
+        let cmd = cmd.expect("aoe-agent has a registry command");
+        assert!(
+            !cmd.contains("${aoe_data_dir}"),
+            "placeholder must be substituted"
+        );
+        assert!(cmd.starts_with("/tmp/aoe-data/"));
+    }
+
+    #[test]
+    fn custom_agent_entries_omit_cockpit_command_fields() {
+        let entries = build_custom_agent_infos(
+            &custom_agents(&[("oc-sp", "ocp run sp")]),
+            &custom_agents(&[("oc-sp", "ocp run sp acp")]),
+        );
+        let value = serde_json::to_value(&entries).unwrap();
+        assert!(value[0].get("cockpit_command").is_none());
+        assert!(value[0].get("cockpit_args").is_none());
+        // The custom cockpit command must not leak via the new fields.
+        assert!(!value.to_string().contains("ocp run sp"));
     }
 
     #[tokio::test]
