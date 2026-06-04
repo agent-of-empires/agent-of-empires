@@ -1,15 +1,4 @@
 {
-  "src/App.tsx": {
-    "react-hooks/set-state-in-effect": {
-      "count": 4
-    },
-    "react-you-might-not-need-an-effect/no-chain-state-updates": {
-      "count": 3
-    },
-    "react-you-might-not-need-an-effect/no-event-handler": {
-      "count": 4
-    }
-  },
   "src/components/ConnectedDevices.tsx": {
     "react-hooks/set-state-in-effect": {
       "count": 1

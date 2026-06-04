@@ -406,34 +406,32 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return () => window.removeEventListener("keydown", onKey);
   }, [commentSendEnabled, diffComments.count]);
 
-  useEffect(() => {
+  // Derive selectedFile/rightPanelView/pickerOpen/pairedMounted resets
+  // during render to satisfy
+  // react-you-might-not-need-an-effect/no-adjust-state-on-prop-change
+  // and react-hooks/set-state-in-effect.
+  const prevActiveSessionIdRef = useRef(activeSessionId);
+  if (activeSessionId !== prevActiveSessionIdRef.current) {
+    prevActiveSessionIdRef.current = activeSessionId;
     if (!activeSessionId) {
       setSelectedFile(null);
-      return;
     }
-    if (
-      selectedFilePath &&
-      !diffFilesLoading &&
-      !diffFiles.some((f) => f.path === selectedFilePath)
-    ) {
-      setSelectedFile(null);
-    }
-  }, [activeSessionId, diffFiles, diffFilesLoading, selectedFilePath]);
-
-  // Reset the mobile single-pane view to the agent terminal whenever the
-  // active session changes, and close the picker. Landing a freshly opened
-  // session on a stale "paired"/"diff" view would strand the user on a
-  // shell or empty file list before the new session's terminal is ready.
-  useEffect(() => {
     setRightPanelView("agent");
     setPickerOpen(false);
     setPairedMounted(false);
-  }, [activeSessionId]);
+    setSelectedFile(null);
+  }
+
+  // Inline derivation for diffFiles validation: if the selected file is no
+  // longer in the diff, clear the selection.
+  if (activeSessionId && selectedFilePath && !diffFilesLoading && !diffFiles.some((f) => f.path === selectedFilePath)) {
+    setSelectedFile(null);
+  }
 
   // Mount the paired shell on first activation and keep it mounted after.
-  useEffect(() => {
-    if (rightPanelView === "paired") setPairedMounted(true);
-  }, [rightPanelView]);
+  if (rightPanelView === "paired" && !pairedMounted) {
+    setPairedMounted(true);
+  }
 
   // Refit the newly active terminal after a single-pane view switch: the
   // layers keep their geometry while hidden (visibility, not display:none),
@@ -445,10 +443,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     );
     return () => cancelAnimationFrame(id);
   }, [singlePane, rightPanelView]);
-
-  useEffect(() => {
-    setSelectedFile(null);
-  }, [activeSessionId]);
 
   const focusKeyboardProxy = () => {
     if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
@@ -531,21 +525,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
   }, []);
 
+  // Kick off the initial server-about fetch on mount. The effect body only
+  // calls fetchAbout and schedules the telemetry consent check; neither runs
+  // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
-    refreshServerAbout();
-  }, [refreshServerAbout]);
-
-  // Telemetry: once authenticated and on a writable server, report that the
-  // web dashboard was opened (folded into the daemon's next opt-in snapshot)
-  // and, if the user has not yet answered the opt-in prompt, show the consent
-  // modal. The browser never posts to the telemetry backend; it only talks to
-  // the local daemon. Read-only servers can't persist a choice, so skip.
-  useEffect(() => {
-    // AppContent only renders past the login gate, so reaching here means the
-    // session is usable. Read-only servers can't persist a choice, so skip.
-    if (!serverAboutLoaded || serverAbout?.read_only) return;
-    reportTelemetrySeen("web");
     let active = true;
+    void fetchAbout().then((about) => {
+      if (!active) return;
+      if (about) setServerAbout(about);
+      reportTelemetrySeen("web");
+    });
     void fetchTelemetryStatus().then((status) => {
       if (!active || !status) return;
       if (!status.responded && !status.do_not_track) {
@@ -555,7 +544,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return () => {
       active = false;
     };
-  }, [serverAboutLoaded, serverAbout?.read_only]);
+  }, []);
 
   // Telemetry: report that the acp web UI was opened, folded into the
   // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.

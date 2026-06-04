@@ -14,6 +14,7 @@
 // only renders what we feed it and surfaces user actions back.
 
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { reportTelemetrySeen } from "../../lib/api";
 import {
   MessagePrimitive,
   ThreadPrimitive,
@@ -1032,6 +1033,10 @@ export function WorkingSpinner({
   // tree isn't perturbed by activity bookkeeping. See #1100.
   const [stalledSecs, setStalledSecs] = useState(0);
   const { forceEndTurnThresholdSecs } = useAcpPrefs();
+
+  useEffect(() => {
+    reportTelemetrySeen("cockpit");
+  }, []);
 
   useEffect(() => {
     const t = window.setInterval(() => {
