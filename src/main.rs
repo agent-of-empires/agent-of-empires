@@ -191,6 +191,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Record which CLI subcommand ran for opt-in telemetry, before dispatch so
+    // early-returning commands (e.g. `aoe update`, `aoe telemetry`) are counted
+    // too. A true no-op unless the install is opted in: `track_cli_command`
+    // gates on a non-creating app-dir check first, so app-data-free commands
+    // (`aoe completion`, `aoe init`, ...) never materialize the app dir and keep
+    // working in read-only / sandboxed (Nix) environments. Skipped for the
+    // detached `--daemon-child` re-exec so `aoe serve --daemon` counts the
+    // user's invocation once, not the machinery fork. The once-per-day flush is
+    // bounded so a dead endpoint can never hang the command.
+    if !is_daemon_child {
+        if let Some(name) = cli.command.as_ref().and_then(cli::command_name) {
+            agent_of_empires::telemetry::track_cli_command(name).await;
+        }
+    }
+
     // Handle commands that don't need app data or migrations.
     // These work in read-only/sandboxed environments (e.g. Nix builds).
     match cli.command {
@@ -266,18 +281,6 @@ async fn main() -> Result<()> {
         migrations::run_migrations()?;
     }
 
-    // Whether this invocation is a short-lived CLI command. The long-running
-    // surfaces (TUI, serve) emit their own `process_start` with the correct
-    // surface and run their own snapshot loop, so they're excluded here.
-    #[cfg(feature = "serve")]
-    let cli_oneshot = cli.command.is_some()
-        && !matches!(
-            cli.command,
-            Some(Commands::Serve(_)) | Some(Commands::CockpitRunner(_))
-        );
-    #[cfg(not(feature = "serve"))]
-    let cli_oneshot = cli.command.is_some();
-
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,
@@ -316,14 +319,6 @@ async fn main() -> Result<()> {
         }
         _ => unreachable!(),
     };
-
-    // Emit `process_start` for a short-lived CLI command AFTER it runs, so the
-    // command's own output isn't delayed. Throttled to once per install per
-    // day and awaited with a hard timeout so a dead endpoint can't hang exit;
-    // a no-op unless the user opted in, so default-off users pay nothing.
-    if cli_oneshot {
-        agent_of_empires::telemetry::flush_cli_process_start().await;
-    }
 
     result
 }

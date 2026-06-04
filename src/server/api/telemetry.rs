@@ -4,9 +4,8 @@
 //! User-Agent and create a second identity surface). Instead it manages the
 //! opt-in state through the local daemon, which owns the install id and does
 //! all sending. `seen` lets the web UI report that the dashboard / cockpit was
-//! opened so the daemon's next snapshot can carry `web_seen` / `cockpit_seen`.
+//! opened so the daemon's next snapshot can carry the `usage_seen` map.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -110,26 +109,9 @@ pub async fn post_telemetry_seen(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Resolve the surface to its coarse counter and its per-form-factor
-    // counters in one place so both web and cockpit share the form-factor path.
-    let (coarse, clients) = match req.surface.as_str() {
-        "web" => (&state.telemetry_web_seen, &state.telemetry_web_clients),
-        "cockpit" => (
-            &state.telemetry_cockpit_seen,
-            &state.telemetry_cockpit_clients,
-        ),
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "bad_surface", "message": format!("unknown surface '{other}'")})),
-            )
-                .into_response();
-        }
-    };
-
-    // Reject an unknown form-factor before recording anything, the way an
-    // unknown surface is rejected: a non-allowlisted value (a user-agent
-    // string, a screen size, a typo) must never be stored or coerced.
+    // Validate an optional form-factor up front so a non-allowlisted value (a
+    // user-agent string, a screen size, a typo) is rejected before any counter
+    // moves, the way an unknown surface is. Absent on older clients.
     let form_factor = match req.form_factor.as_deref() {
         Some(value) => match crate::telemetry::form_factor::parse(value) {
             Some(ff) => Some(ff),
@@ -144,12 +126,25 @@ pub async fn post_telemetry_seen(
         None => None,
     };
 
-    // The coarse `*_seen` counter always increments so an unclassified open
-    // (older frontend, no form_factor) still registers; a classified open also
-    // bumps its specific class.
-    coarse.fetch_add(1, Ordering::Relaxed);
+    // Validate + count the surface against the allowlisted registry; an off-list
+    // name is rejected and never creates a counter, so it can never reach a
+    // snapshot. This is the open count for the surface.
+    if !state.telemetry_usage_seen.record(&req.surface) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_surface", "message": format!("unknown surface '{}'", req.surface)})),
+        )
+            .into_response();
+    }
+
+    // Layer the per-form-factor class onto the browser surfaces. The registry
+    // already counted the open; this records which client class it came from.
     if let Some(ff) = form_factor {
-        clients.increment(ff);
+        match req.surface.as_str() {
+            "web" => state.telemetry_web_clients.increment(ff),
+            "cockpit" => state.telemetry_cockpit_clients.increment(ff),
+            _ => {}
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }

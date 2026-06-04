@@ -92,6 +92,14 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// The data-schema version this build targets, i.e. the version every install
+/// converges to after a successful startup (migration failures abort boot, so a
+/// running install is always at this version). Surfaced in telemetry as a coarse
+/// version-health signal; see `crate::telemetry`.
+pub fn current_schema_version() -> u32 {
+    CURRENT_VERSION
+}
+
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION

@@ -446,10 +446,10 @@ export async function setTelemetryConsent(
 }
 
 /// Tell the daemon the web dashboard or cockpit UI was opened, so its next
-/// opt-in snapshot can carry web_seen / cockpit_seen plus the coarse client
-/// form-factor class (#1883). Best-effort. The browser never posts to the
-/// telemetry backend; it pings the local daemon, which folds the class into its
-/// own snapshot.
+/// opt-in snapshot can carry the `usage_seen` open-count map plus the coarse
+/// client form-factor class (#1883). Best-effort. The browser never posts to the
+/// telemetry backend; it pings the local daemon, which folds both into its own
+/// snapshot.
 export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
   void fetch("/api/telemetry/seen", {
     method: "POST",
