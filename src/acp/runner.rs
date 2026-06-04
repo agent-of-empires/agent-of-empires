@@ -64,6 +64,12 @@ use super::worker_registry::{self, WorkerRecord};
 /// entries are dropped; the daemon-side event_store still has them.
 const NOTIFICATION_BUFFER_LINES: usize = 256;
 
+/// An agent that exits within this window of being spawned is treated as a
+/// broken spawn and logged at warn (not info), so a crash loop is visible in
+/// debug.log without grepping for the absence of success. Matches the
+/// runner-socket-appear deadline the daemon uses. See #1945.
+const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
+
 /// Pipe-read buffer for the agent's stdout. 64KB matches the default
 /// pipe size on macOS/Linux.
 const STDOUT_READ_BUF: usize = 64 * 1024;
@@ -172,6 +178,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
         spawn_agent(&args).with_context(|| format!("spawning agent {:?}", args.agent_argv))?;
+    // Anchor for the fast-exit warn below: an agent that dies within
+    // FAST_EXIT_THRESHOLD is almost always a broken spawn (missing adapter,
+    // bad command, immediate handshake failure) and is what drove the silent
+    // reconciler respawn loop. Measure from agent spawn, not run() entry, so
+    // logging/socket/registry setup time isn't counted. See #1945.
+    let agent_started_at = std::time::Instant::now();
 
     let our_pid = std::process::id();
     let record = WorkerRecord::new(
@@ -274,7 +286,20 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // unreachable but kept for symmetry).
     tokio::select! {
         status = agent_child.wait() => {
+            let elapsed = agent_started_at.elapsed();
             match status {
+                // A clean (status 0) but near-instant exit is still a broken
+                // worker; warn regardless of exit code so a `grep -E
+                // 'error|warn'` over debug.log surfaces the crash loop that
+                // INFO-level logging used to hide. See #1945.
+                Ok(s) if elapsed < FAST_EXIT_THRESHOLD => warn!(
+                    target: "cockpit.runner",
+                    session = %session_id,
+                    status = ?s,
+                    elapsed_ms = elapsed.as_millis(),
+                    "agent exited within {}s of startup (likely a broken spawn); runner shutting down",
+                    FAST_EXIT_THRESHOLD.as_secs()
+                ),
                 Ok(s) => info!(
                     target: "acp.runner",
                     session = %session_id,
