@@ -1,7 +1,8 @@
 // User story: add a new project from the Projects view.
 //
-// Navigate to /projects, click "+ Add project", type a path, click
-// Add. The project appears in the list below.
+// Navigate to /projects, click "+ Add project", type a path, set a default
+// base branch, click Add. The project appears in the list below with its
+// configured base branch.
 
 import { mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -52,6 +53,9 @@ base("add a project from the Projects view", async ({ page }, testInfo) => {
 
     await page.getByRole("button", { name: "+ Add project" }).click();
     await page.getByPlaceholder("/path/to/repo").fill(projectPath);
+    await page
+      .getByPlaceholder("blank = inherit global default, then auto-detect")
+      .fill("develop");
     await page.getByRole("button", { name: "Add", exact: true }).click();
 
     await expect(page.getByText(projectPath).first()).toBeVisible({
@@ -59,6 +63,10 @@ base("add a project from the Projects view", async ({ page }, testInfo) => {
     });
     await expect(
       page.getByText("story-projects-add", { exact: true }).first(),
+    ).toBeVisible();
+    // The configured base branch persists and renders on the project row.
+    await expect(
+      page.getByText("develop", { exact: true }).first(),
     ).toBeVisible();
   } finally {
     await serve.stop();

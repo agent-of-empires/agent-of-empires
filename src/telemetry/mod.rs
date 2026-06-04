@@ -18,8 +18,10 @@
 //!   are coerced to a closed allowlist; raw commands, paths, titles, branch
 //!   names, and prompts are never emitted.
 
+pub mod aggregate;
 pub mod events;
 pub mod features;
+pub mod form_factor;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
@@ -27,7 +29,10 @@ pub mod usage_signals;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub use events::{CliUsage, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION};
+pub use events::{
+    CliUsage, CockpitInteractionCounts, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION,
+};
+pub use form_factor::WebClientFormFactor;
 pub use state::{
     cli_usage_due, ensure_install_id, install_id, record_cli_command, record_cli_usage_flush,
     reset_install_id,
@@ -74,14 +79,19 @@ const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// Base cadence for periodic `usage_snapshot` sends (TUI and serve). The real
-/// period is this plus bounded jitter (see [`snapshot_interval`]).
-pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+/// period is this plus bounded jitter (see [`snapshot_interval`]). Set to 4h so
+/// the steady-state heartbeat covers a typical workday about twice and a hard
+/// kill (power-off / crash, which skips the graceful-shutdown flush) loses at
+/// most one ~4h window rather than 12h. Short-lived runs are already bracketed
+/// by the immediate boot snapshot and the shutdown flush, so this only shapes
+/// the cadence of a long-running daemon.
+pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Upper bound on the random jitter added to [`SNAPSHOT_BASE_INTERVAL`].
 const SNAPSHOT_JITTER: Duration = Duration::from_secs(30 * 60);
 
 /// Periodic snapshot period: [`SNAPSHOT_BASE_INTERVAL`] plus a random offset in
-/// `[0, SNAPSHOT_JITTER)`. A fixed 12h period anchored to process start means a
+/// `[0, SNAPSHOT_JITTER)`. A fixed 4h period anchored to process start means a
 /// fleet that boots together (e.g. a post-update restart wave) keeps snapshotting
 /// in lockstep forever; rolling a per-process jitter decorrelates the periodic
 /// ticks so they spread apart by the second tick. The boot snapshot is sent
@@ -201,6 +211,7 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     Some(ProcessStart {
         schema: SCHEMA_VERSION,
         event: "process_start",
+        uuid: uuid::Uuid::new_v4().to_string(),
         install_id,
         sent_at: now_rfc3339(),
         surface,
@@ -230,6 +241,29 @@ struct InstanceMetrics {
     by_agent: BTreeMap<String, u32>,
     by_model_bucket: BTreeMap<String, u32>,
     by_substrate: BTreeMap<String, u32>,
+}
+
+/// Map an instance to its `(agent bucket, model bucket)` telemetry labels, both
+/// already coerced to the [`sanitize`] allowlist. Shared by [`aggregate_instances`]
+/// (point-in-time) and the serve windowed aggregator ([`aggregate`]) so both
+/// bucket sessions identically. The model bucket only exists in `serve` builds;
+/// elsewhere it is treated as absent (`unset`).
+pub(crate) fn instance_buckets(inst: &Instance) -> (String, String) {
+    // Prefer the canonical detection name; fall back to the raw tool string.
+    // Either way it is coerced to an allowlisted bucket.
+    let agent_src = if inst.detect_as.trim().is_empty() {
+        inst.tool.as_str()
+    } else {
+        inst.detect_as.as_str()
+    };
+    #[cfg(feature = "serve")]
+    let model = inst.cockpit_model.as_deref();
+    #[cfg(not(feature = "serve"))]
+    let model: Option<&str> = None;
+    (
+        sanitize::agent_bucket(agent_src),
+        sanitize::model_bucket(model).to_string(),
+    )
 }
 
 fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
@@ -304,23 +338,9 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
             archived += 1;
         }
 
-        // Prefer the canonical detection name; fall back to the raw tool
-        // string. Either way it is coerced to an allowlisted bucket.
-        let agent_src = if inst.detect_as.trim().is_empty() {
-            inst.tool.as_str()
-        } else {
-            inst.detect_as.as_str()
-        };
-        *by_agent
-            .entry(sanitize::agent_bucket(agent_src))
-            .or_insert(0) += 1;
-
-        #[cfg(feature = "serve")]
-        let model = inst.cockpit_model.as_deref();
-        #[cfg(not(feature = "serve"))]
-        let model: Option<&str> = None;
-        let bucket = sanitize::model_bucket(model);
-        *by_model_bucket.entry(bucket.to_string()).or_insert(0) += 1;
+        let (agent, model) = instance_buckets(inst);
+        *by_agent.entry(agent).or_insert(0) += 1;
+        *by_model_bucket.entry(model).or_insert(0) += 1;
     }
 
     InstanceMetrics {
@@ -350,6 +370,7 @@ pub fn build_usage_snapshot(
     session_creates_since_last_snapshot: u32,
     auth_mode: Option<&str>,
     serve_mode: Option<&str>,
+    cockpit_counts: &CockpitInteractionCounts,
 ) -> Option<UsageSnapshot> {
     // Load the global, pre-profile-merge config exactly once and reuse it for
     // both the opt-in gate and `active_features`, instead of parsing
@@ -380,6 +401,7 @@ pub fn build_usage_snapshot(
         instances,
         usage_seen,
         session_creates_since_last_snapshot,
+        cockpit_counts,
     );
     // Layer the serve-only deployment metadata on top of the pure snapshot, so
     // `assemble_usage_snapshot` stays focused on session/feature bucketing.
@@ -407,6 +429,7 @@ fn assemble_usage_snapshot(
     instances: &[Instance],
     usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
+    cockpit_counts: &CockpitInteractionCounts,
 ) -> UsageSnapshot {
     let features = features::active_features(config);
 
@@ -415,6 +438,7 @@ fn assemble_usage_snapshot(
     UsageSnapshot {
         schema: SCHEMA_VERSION,
         event: "usage_snapshot",
+        uuid: uuid::Uuid::new_v4().to_string(),
         install_id,
         sent_at: now_rfc3339(),
         surface,
@@ -434,19 +458,37 @@ fn assemble_usage_snapshot(
         session_cockpit: metrics.cockpit,
         session_sandboxed: metrics.sandboxed,
         session_yolo: metrics.yolo,
+        // Point-in-time default: equals the instant total. The serve loop
+        // overrides this with its window peak; the TUI keeps the instant value.
+        peak_concurrent_sessions: metrics.total,
         session_pinned: metrics.pinned,
         session_snoozed: metrics.snoozed,
         session_archived: metrics.archived,
         sessions_by_agent: metrics.by_agent,
         sessions_by_model_bucket: metrics.by_model_bucket,
         sessions_by_substrate: metrics.by_substrate,
+        // Window aggregates are serve-only; empty here. The serve loop fills
+        // them from its `UsageAggregator`, the TUI leaves them empty.
+        distinct_sessions_by_agent: BTreeMap::new(),
+        distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
         usage_seen,
+        // Serve-only per-form-factor maps; the disk-free assembler leaves them
+        // empty and `build_serve_snapshot` fills them from the daemon's client
+        // counters after assembly. Always empty for TUI/CLI (no web client).
+        web_clients_seen: BTreeMap::new(),
+        cockpit_clients_seen: BTreeMap::new(),
         session_creates_since_last_snapshot,
         // Set by `build_usage_snapshot` for the serve surface; the pure
         // assembler leaves them unset.
         auth_mode: None,
         serve_mode: None,
+        approvals_resolved: cockpit_counts.approvals_resolved(),
+        approvals_by_decision: cockpit_counts.approvals_by_decision(),
+        agent_switches: cockpit_counts.agent_switches,
+        substrate_toggles: cockpit_counts.substrate_toggles,
+        plan_mode_seen: cockpit_counts.plan_mode_seen,
+        prompts_queued: cockpit_counts.prompts_queued,
     }
 }
 
@@ -583,14 +625,17 @@ pub async fn track_cli_command(name: &str) {
 /// re-sending back to back.
 static LAST_SNAPSHOT_FP: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
-/// Content fingerprint of a snapshot, excluding the volatile `sent_at` stamp.
-/// Everything else is included: `install_id` is stable per install, so two
-/// snapshots with the same counts hash equal. Used only for in-process dedup,
-/// never sent anywhere.
+/// Content fingerprint of a snapshot, excluding the volatile `sent_at` stamp
+/// and the per-emit random `uuid`. Everything else is included: `install_id` is
+/// stable per install, so two snapshots with the same counts hash equal. The
+/// `uuid` is freshly minted per build, so leaving it in would make every
+/// snapshot hash unique and defeat the exit-snapshot dedup entirely. Used only
+/// for in-process dedup, never sent anywhere.
 fn snapshot_fingerprint(snapshot: &UsageSnapshot) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut probe = snapshot.clone();
     probe.sent_at = String::new();
+    probe.uuid = String::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_string(&probe)
         .unwrap_or_default()
@@ -719,6 +764,7 @@ mod tests {
         UsageSnapshot {
             schema: SCHEMA_VERSION,
             event: "usage_snapshot",
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             install_id: "00000000-0000-0000-0000-000000000000".to_string(),
             sent_at: "2026-06-02T19:00:45Z".to_string(),
             surface: Surface::Tui,
@@ -735,17 +781,28 @@ mod tests {
             session_cockpit: 0,
             session_sandboxed: 2,
             session_yolo: 0,
+            peak_concurrent_sessions: 7,
             session_pinned: 0,
             session_snoozed: 0,
             session_archived: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
             sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
+            distinct_sessions_by_agent: BTreeMap::new(),
+            distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
+            web_clients_seen: BTreeMap::new(),
+            cockpit_clients_seen: BTreeMap::new(),
             session_creates_since_last_snapshot: 0,
             auth_mode: None,
             serve_mode: None,
+            approvals_resolved: 0,
+            approvals_by_decision: BTreeMap::new(),
+            agent_switches: 0,
+            substrate_toggles: 0,
+            plan_mode_seen: false,
+            prompts_queued: 0,
         }
     }
 
@@ -821,7 +878,8 @@ mod tests {
                 usage_signals::zeroed(),
                 0,
                 None,
-                None
+                None,
+                &CockpitInteractionCounts::default()
             )
             .is_none(),
             "opted-out install must not build a snapshot"
@@ -868,14 +926,16 @@ mod tests {
         let boot = sample_snapshot();
         record_snapshot_fp(&boot);
 
-        // Quit right after, sessions unchanged: same content, newer stamp.
-        // The only difference is `sent_at`, which the fingerprint excludes, so
-        // the exit snapshot is recognised as a duplicate and not re-sent.
+        // Quit right after, sessions unchanged: same content, newer stamp and
+        // a freshly minted uuid. Both `sent_at` and `uuid` are per-emit and
+        // excluded from the fingerprint, so the exit snapshot is still
+        // recognised as a duplicate and not re-sent.
         let mut exit = sample_snapshot();
         exit.sent_at = "2026-06-02T19:00:47Z".to_string();
+        exit.uuid = "22222222-2222-4222-8222-222222222222".to_string();
         assert!(
             snapshot_matches_last(&exit),
-            "an unchanged exit snapshot must dedupe against the boot snapshot"
+            "an unchanged exit snapshot must dedupe against the boot snapshot despite a new uuid"
         );
 
         // A snapshot whose counts actually changed is not a duplicate, so it
@@ -935,6 +995,7 @@ mod tests {
             std::slice::from_ref(&inst),
             usage_signals::zeroed(),
             3,
+            &CockpitInteractionCounts::default(),
         );
 
         assert_eq!(snapshot.install_id, "test-install-id");

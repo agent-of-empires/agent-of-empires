@@ -2,68 +2,50 @@
 import Base from '../../layouts/Base.astro';
 import Nav from '../../components/Nav.astro';
 import Footer from '../../components/Footer.astro';
+import YouTubeChannel from '../../components/YouTubeChannel.astro';
+import { getGuideSections } from '../../data/docsNav';
 
-const guides = [
-  { title: "Docker Sandbox", href: "/guides/sandbox/", description: "Run AI coding agents in isolated Docker containers." },
-  { title: "Repo Config & Hooks", href: "/guides/repo-config/", description: "Per-repo configuration and hooks for sessions." },
-  { title: "Git Worktrees", href: "/guides/worktrees/", description: "Git worktree commands and configuration reference." },
-  { title: "Diff View", href: "/guides/diff-view/", description: "Review git changes and edit files from the TUI." },
-  { title: "tmux Status Bar", href: "/guides/tmux-status-bar/", description: "Display session info in your tmux status bar." },
-  { title: "Web Dashboard", href: "/guides/web-dashboard/", description: "Remote access to sessions from any browser." },
-  { title: "Shell Completions", href: "/guides/shell-completions/", description: "Install and refresh tab-completion for the aoe CLI." },
-];
+const sections = getGuideSections();
 ---
 
 <Base
   title="Guides - Agent of Empires"
-  description="Guides and tutorials for Agent of Empires."
+  description="Step-by-step guides for Agent of Empires: sandboxing, git worktrees, the web dashboard, and more."
 >
   <Nav />
-  <main class="max-w-3xl mx-auto px-6 pt-32 pb-24">
+  <main class="max-w-6xl mx-auto px-6 pt-32 pb-24">
     <span class="font-mono text-xs uppercase tracking-widest text-brand-600">Guides</span>
-    <h1 class="text-4xl md:text-5xl font-bold text-white mb-6 mt-3 font-display">Under construction</h1>
-    <p class="text-lg text-gray-100 leading-relaxed mb-8">
-      More guides are on the way. In the meantime, check out our YouTube channel for tutorials and help videos.
+    <h1 class="text-4xl md:text-5xl font-bold text-white mb-6 mt-3 font-display">Guides</h1>
+    <p class="text-lg text-gray-100 leading-relaxed mb-16 max-w-2xl">
+      Practical, task-focused walkthroughs for getting the most out of aoe. Start anywhere, or
+      head to the <a href="/docs/quick-start/" class="text-brand-500 hover:text-brand-400 transition-colors">Quick Start</a>
+      if you're brand new.
     </p>
 
-    <div class="mb-12 rounded-2xl overflow-hidden bg-surface-800 border border-surface-700/50">
-      <iframe
-        width="100%"
-        style="aspect-ratio:16/9;display:block"
-        src="https://www.youtube-nocookie.com/embed/videoseries?list=UUjGgsnOCZXvvk6UwUQAuwPg"
-        title="Agent of Empires YouTube Channel"
-        frameborder="0"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-        allowfullscreen
-        loading="lazy"
-      ></iframe>
-      <div class="flex items-center gap-4 p-4">
-        <a href="https://www.youtube.com/@agent-of-empires" target="_blank" rel="noopener" class="flex items-center gap-3 flex-1 min-w-0 group">
-          <img src="/assets/logo-youtube.png" alt="Agent of Empires" class="w-10 h-10 rounded-full shrink-0" width="40" height="40">
-          <div class="min-w-0">
-            <span class="text-white font-semibold group-hover:text-brand-400 transition-colors">Agent of Empires</span>
-            <p class="text-gray-500 text-sm">Tutorials, walkthroughs, and tips</p>
-          </div>
-        </a>
-        <a href="https://www.youtube.com/@agent-of-empires?sub_confirmation=1" target="_blank" rel="noopener" class="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-600 hover:bg-red-500 text-white text-sm font-semibold transition-colors">
-          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
-          Subscribe
-        </a>
-      </div>
-    </div>
+    {sections.map((section) => (
+      <section class="mb-16">
+        <h2 class="text-2xl font-semibold text-white mb-6 font-display">{section.title}</h2>
+        <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {section.items.map((guide) => (
+            <a href={guide.href} class="feature-card rounded-xl p-5 group">
+              <span class="text-white font-medium group-hover:text-brand-400 transition-colors">{guide.title}</span>
+              {guide.description && (
+                <p class="text-gray-400 text-sm mt-1.5 leading-relaxed">{guide.description}</p>
+              )}
+            </a>
+          ))}
+        </div>
+      </section>
+    ))}
 
-    <!-- Existing Guides -->
-    <div class="mb-12">
-      <h2 class="text-2xl font-semibold text-white mb-6 font-display">Available guides</h2>
-      <div class="space-y-3">
-        {guides.map((guide) => (
-          <a href={guide.href} class="block p-4 rounded-xl bg-surface-800/50 border border-surface-700/30 hover:border-brand-600/30 transition-colors group">
-            <span class="text-white font-medium group-hover:text-brand-400 transition-colors">{guide.title}</span>
-            <p class="text-gray-500 text-sm mt-1">{guide.description}</p>
-          </a>
-        ))}
-      </div>
-    </div>
+    <section class="mb-12">
+      <span class="font-mono text-xs uppercase tracking-widest text-brand-600">Learn</span>
+      <h2 class="text-2xl font-semibold text-white mb-4 mt-3 font-display">Video tutorials</h2>
+      <p class="text-gray-400 leading-relaxed mb-6 max-w-xl">
+        Prefer watching? Our YouTube channel has walkthroughs, setup guides, and tips.
+      </p>
+      <YouTubeChannel class="max-w-2xl" />
+    </section>
 
     <p class="text-gray-400 leading-relaxed">
       Have a guide you'd like to see? <a href="https://github.com/agent-of-empires/agent-of-empires/issues" target="_blank" rel="noopener" class="text-brand-500 hover:text-brand-400 transition-colors">Open a GitHub issue</a> and let us know.

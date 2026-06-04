@@ -758,6 +758,7 @@ Add a project to the registry
   Possible values: `global`, `profile`
 
 * `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
+* `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project in a multi-repo workspace. When omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
 
 
 

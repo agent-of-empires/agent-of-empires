@@ -78,20 +78,78 @@ pub struct WorkspaceResult {
     pub warnings: Vec<String>,
 }
 
+/// Normalize a base-branch string, treating empty/whitespace as unset.
+fn normalize_base(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve a repo's effective base branch with precedence:
+/// explicit session base > per-project default > global/profile default.
+/// `None` means "auto-detect the repo's default branch".
+pub(crate) fn resolve_base_branch(
+    session: Option<&str>,
+    project: Option<&str>,
+    global: Option<&str>,
+) -> Option<String> {
+    normalize_base(session)
+        .or_else(|| normalize_base(project))
+        .or_else(|| normalize_base(global))
+}
+
+/// Map of canonical repo path to configured default base branch for every
+/// registered project (global + profile) that sets one. Used to fill in the
+/// per-project layer of `resolve_base_branch` when building a workspace.
+pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
+    crate::session::projects::load_merged(profile)
+        .unwrap_or_else(|e| {
+            // Don't fork worktrees from the wrong base in silence: if the
+            // registry can't be read, log it so the missing per-project
+            // defaults are explainable instead of mysterious.
+            tracing::warn!(
+                target: "session.create",
+                "Failed to load project registry for base-branch defaults; \
+                 extra repos fall back to the global default: {e}"
+            );
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|p| {
+            let base = p.default_base_branch?;
+            let base = base.trim().to_string();
+            if base.is_empty() {
+                None
+            } else {
+                Some((crate::session::projects::canonical_key(&p.path), base))
+            }
+        })
+        .collect()
+}
+
+/// One repository in a multi-repo workspace, paired with the base branch its
+/// freshly-created worktree branch should fork from. `base_branch` is the
+/// fully resolved value (`None` means auto-detect the repo's default branch);
+/// callers apply the session > per-project > global precedence before building
+/// this list.
+pub struct WorkspaceRepoSpec {
+    pub path: PathBuf,
+    pub base_branch: Option<String>,
+}
+
 /// Create a multi-repo workspace with worktrees for each repository.
 ///
 /// Validates repo paths, detects name collisions, creates worktrees inside
 /// a shared workspace directory, and rolls back on any error.
 pub fn create_workspace(
-    primary_path: &std::path::Path,
-    extra_repo_paths: &[PathBuf],
+    primary: &WorkspaceRepoSpec,
+    extra_repos: &[WorkspaceRepoSpec],
     branch: &str,
     create_new_branch: bool,
-    base_branch: Option<&str>,
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
-    let primary_main_repo = GitWorktree::find_main_repo(primary_path)?;
+    let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -102,17 +160,22 @@ pub fn create_workspace(
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
-    let all_repo_paths: Vec<PathBuf> = std::iter::once(primary_path.to_path_buf())
-        .chain(
-            extra_repo_paths
-                .iter()
-                .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone())),
-        )
-        .collect();
+    // (canonicalized path, resolved base branch) for the primary repo followed
+    // by every extra repo. The primary path is left as the caller passed it;
+    // extras are canonicalized to match how they are stored/compared.
+    let all_repos: Vec<(PathBuf, Option<String>)> =
+        std::iter::once((primary.path.clone(), primary.base_branch.clone()))
+            .chain(extra_repos.iter().map(|r| {
+                (
+                    r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
+                    r.base_branch.clone(),
+                )
+            }))
+            .collect();
 
     // Check for duplicate repo directory names
     let mut seen_names = std::collections::HashSet::new();
-    for repo_path in &all_repo_paths {
+    for (repo_path, _) in &all_repos {
         let name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -143,9 +206,10 @@ pub fn create_workspace(
         repo_name: String,
         main_repo_path: PathBuf,
         worktree_subdir: PathBuf,
+        base_branch: Option<String>,
     }
-    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repo_paths.len());
-    for repo_path in &all_repo_paths {
+    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
+    for (repo_path, base_branch) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
             cleanup(&[], &workspace_path);
             bail!(
@@ -172,6 +236,7 @@ pub fn create_workspace(
             repo_name,
             main_repo_path,
             worktree_subdir,
+            base_branch: base_branch.clone(),
         });
     }
 
@@ -187,7 +252,7 @@ pub fn create_workspace(
                 .iter()
                 .map(|plan| {
                     let branch = branch.to_string();
-                    let base = base_branch.map(|b| b.to_string());
+                    let base = plan.base_branch.clone();
                     let main_repo_path = plan.main_repo_path.clone();
                     let worktree_subdir = plan.worktree_subdir.clone();
                     let repo_name = plan.repo_name.clone();
@@ -393,15 +458,43 @@ pub fn build_instance(
             let primary_path = PathBuf::from(&params.path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&params.path));
-            let extra_paths: Vec<PathBuf> =
-                params.extra_repo_paths.iter().map(PathBuf::from).collect();
+
+            let session_base = params.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = project_base_branches(profile);
+            let resolve_extra = |path: &std::path::Path| -> Option<String> {
+                let project = project_bases
+                    .get(&crate::session::projects::canonical_key(
+                        &path.to_string_lossy(),
+                    ))
+                    .map(String::as_str);
+                resolve_base_branch(session_base, project, global_default)
+            };
+
+            // The primary repo is the launch repo, not a registered extra
+            // project, so it never consults the per-project layer: explicit
+            // session base, then the global/profile default.
+            let primary = WorkspaceRepoSpec {
+                base_branch: resolve_base_branch(session_base, None, global_default),
+                path: primary_path,
+            };
+            let extra_repos: Vec<WorkspaceRepoSpec> = params
+                .extra_repo_paths
+                .iter()
+                .map(|p| {
+                    let path = PathBuf::from(p);
+                    WorkspaceRepoSpec {
+                        base_branch: resolve_extra(&path),
+                        path,
+                    }
+                })
+                .collect();
 
             let ws_result = create_workspace(
-                &primary_path,
-                &extra_paths,
+                &primary,
+                &extra_repos,
                 branch,
                 params.create_new_branch,
-                params.base_branch.as_deref(),
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
             )?;
@@ -474,12 +567,15 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                let w = git_wt.create_worktree(
-                    branch,
-                    &worktree_path,
-                    true,
+                // Single-repo sessions only have the launch repo, so fall back
+                // from the explicit session base to the global/profile default.
+                let base = resolve_base_branch(
                     params.base_branch.as_deref(),
-                )?;
+                    None,
+                    config.worktree.default_base_branch.as_deref(),
+                );
+
+                let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
                 warnings.extend(w);
 
                 final_path = worktree_path.to_string_lossy().to_string();
@@ -492,7 +588,7 @@ pub fn build_instance(
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
                     created_at: Utc::now(),
-                    base_branch: params.base_branch.clone(),
+                    base_branch: base,
                 });
             }
         }
@@ -1053,11 +1149,16 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &repo_a,
-            &[repo_b],
+            &WorkspaceRepoSpec {
+                path: repo_a,
+                base_branch: None,
+            },
+            &[WorkspaceRepoSpec {
+                path: repo_b,
+                base_branch: None,
+            }],
             "nonexistent-branch",
             false,
-            None,
             &template,
             true,
         );
@@ -1096,11 +1197,13 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &repo_a,
+            &WorkspaceRepoSpec {
+                path: repo_a,
+                base_branch: None,
+            },
             &[],
             "nonexistent-branch",
             false,
-            None,
             &template,
             true,
         );
@@ -1119,6 +1222,122 @@ mod tests {
             "single-failure path should not use multi-error wording: {msg}"
         );
         assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
+    }
+
+    #[test]
+    fn resolve_base_branch_precedence() {
+        // Explicit session base wins over everything.
+        assert_eq!(
+            resolve_base_branch(Some("session"), Some("project"), Some("global")),
+            Some("session".to_string())
+        );
+        // Per-project default fills in when there is no session base.
+        assert_eq!(
+            resolve_base_branch(None, Some("project"), Some("global")),
+            Some("project".to_string())
+        );
+        // Global/profile default is the last configured layer.
+        assert_eq!(
+            resolve_base_branch(None, None, Some("global")),
+            Some("global".to_string())
+        );
+        // Nothing set means auto-detect.
+        assert_eq!(resolve_base_branch(None, None, None), None);
+        // Empty/whitespace at any layer is treated as unset and skipped.
+        assert_eq!(
+            resolve_base_branch(Some("   "), Some(""), Some("global")),
+            Some("global".to_string())
+        );
+        assert_eq!(resolve_base_branch(Some("  "), None, None), None);
+    }
+
+    /// Create a repo with `main` plus a second branch holding a distinct
+    /// commit. Returns the parent TempDir and the second branch's tip oid so a
+    /// test can assert a worktree forked from it instead of `main`.
+    fn init_repo_with_branch(name: &str, branch: &str) -> (tempfile::TempDir, git2::Oid) {
+        let parent = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let dir = parent.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        std::fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        let base_commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Branch off and add a distinct commit so the tip differs from `main`.
+        let base = repo.find_commit(base_commit).unwrap();
+        repo.branch(branch, &base, false).unwrap();
+        std::fs::write(dir.join("RELEASE.md"), "release\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("RELEASE.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        let branch_ref = format!("refs/heads/{branch}");
+        let release_commit = repo
+            .commit(Some(&branch_ref), &sig, &sig, "release", &tree, &[&base])
+            .unwrap();
+
+        (parent, release_commit)
+    }
+
+    #[test]
+    fn create_workspace_honors_per_repo_base_branch() {
+        // The extra repo's worktree should fork from its own configured base
+        // branch, while the primary repo forks from its default branch.
+        let (parent_primary, _) = init_repo_with_branch("primary", "release");
+        let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
+        let primary = parent_primary.path().join("primary");
+        let extra = parent_extra.path().join("extra");
+
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec {
+                path: primary,
+                base_branch: None,
+            },
+            &[WorkspaceRepoSpec {
+                path: extra,
+                base_branch: Some("release".to_string()),
+            }],
+            "feature-x",
+            true,
+            &template,
+            true,
+        )
+        .expect("workspace creation should succeed");
+
+        let extra_repo = result
+            .workspace_info
+            .repos
+            .iter()
+            .find(|r| r.name == "extra")
+            .expect("extra repo present in workspace");
+        let wt = git2::Repository::open(&extra_repo.worktree_path).unwrap();
+        let head = wt.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(
+            head.id(),
+            extra_release_tip,
+            "extra repo worktree should branch from its configured `release` base"
+        );
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {

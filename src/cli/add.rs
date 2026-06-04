@@ -229,12 +229,37 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
         if !all_extra_repos.is_empty() {
+            let session_base = args.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = builder::project_base_branches(profile);
+            let resolve_extra = |path: &std::path::Path| {
+                let project = project_bases
+                    .get(&crate::session::projects::canonical_key(
+                        &path.to_string_lossy(),
+                    ))
+                    .map(String::as_str);
+                builder::resolve_base_branch(session_base, project, global_default)
+            };
+
+            // The launch repo never consults the per-project layer: explicit
+            // session base, then the global/profile default.
+            let primary = builder::WorkspaceRepoSpec {
+                base_branch: builder::resolve_base_branch(session_base, None, global_default),
+                path: path.clone(),
+            };
+            let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
+                .iter()
+                .map(|p| builder::WorkspaceRepoSpec {
+                    base_branch: resolve_extra(p),
+                    path: p.clone(),
+                })
+                .collect();
+
             let ws_result = builder::create_workspace(
-                &path,
-                &all_extra_repos,
+                &primary,
+                &extra_repos,
                 branch,
                 args.create_branch,
-                args.base_branch.as_deref(),
                 &config.worktree.workspace_path_template,
                 init_submodules,
             )?;
@@ -313,13 +338,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
+                // Single-repo sessions only have the launch repo, so fall back
+                // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    args.base_branch.as_deref()
+                    builder::resolve_base_branch(
+                        args.base_branch.as_deref(),
+                        None,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
                 } else {
                     None
                 };
-                let warnings =
-                    git_wt.create_worktree(branch, &worktree_path, args.create_branch, base)?;
+                let warnings = git_wt.create_worktree(
+                    branch,
+                    &worktree_path,
+                    args.create_branch,
+                    base.as_deref(),
+                )?;
 
                 path = worktree_path;
 
@@ -328,7 +363,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
                     created_at: Utc::now(),
-                    base_branch: base.map(|s| s.to_string()),
+                    base_branch: base,
                 });
 
                 for w in &warnings {

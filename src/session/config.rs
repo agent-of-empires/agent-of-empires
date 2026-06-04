@@ -1546,6 +1546,19 @@ pub struct WorktreeConfig {
         advanced
     )]
     pub init_submodules: bool,
+
+    /// Default base branch for new worktree branches. When empty, falls back to
+    /// the repository's detected default branch. A per-project entry in the
+    /// registry, or an explicit base branch supplied at session creation,
+    /// takes precedence over this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Default Base Branch",
+        widget = "optional_text",
+        web = "elevation:worktree config affects host filesystem",
+        advanced
+    )]
+    pub default_base_branch: Option<String>,
 }
 
 impl Default for WorktreeConfig {
@@ -1559,6 +1572,7 @@ impl Default for WorktreeConfig {
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
             init_submodules: true,
+            default_base_branch: None,
         }
     }
 }

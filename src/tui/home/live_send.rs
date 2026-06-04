@@ -765,6 +765,22 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     cmd.stderr(Stdio::null());
     match action {
         TmuxAction::Literal(s) => {
+            // tmux's command parser treats a trailing `;` in a
+            // `send-keys -l` payload as a command separator and silently
+            // drops it, even after the `--` end-of-options marker, so a
+            // lone or trailing semicolon never reaches the pane (#1942).
+            // Peel the trailing semicolons off and deliver them as raw
+            // hex bytes (`-H 3b`), which tmux passes through verbatim;
+            // the remaining head still rides the literal path. Embedded
+            // and leading semicolons survive `-l` fine, so only the
+            // trailing run needs the hex detour.
+            let (head, semis) = peel_trailing_semicolons(s);
+            if semis > 0 {
+                if !head.is_empty() {
+                    send_literal(&target, head)?;
+                }
+                return dispatch_hex_bytes(&target, &vec![0x3b; semis]);
+            }
             // `-l --` mirrors `send_literal_no_enter`: literal-mode
             // send, followed by the end-of-options marker so a payload
             // starting with `-` isn't reparsed as a flag.
@@ -812,6 +828,38 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
 /// 4 KiB per fork keeps every argv under ~45 KiB, comfortably below the
 /// limit on every platform while keeping the fork count low.
 const MAX_HEX_BYTES_PER_SEND: usize = 4096;
+
+/// Split a literal payload into its leading content and the number of
+/// trailing `;` bytes. tmux's command parser drops a trailing `;` from a
+/// `send-keys -l` payload, reading it as a command separator even after the
+/// `--` end-of-options marker, so the trailing run never reaches the pane
+/// (#1942). The caller sends `head` on the literal path and the peeled
+/// semicolons as raw hex bytes. Embedded and leading semicolons survive
+/// `-l` untouched, so only the trailing run is peeled.
+fn peel_trailing_semicolons(s: &str) -> (&str, usize) {
+    let head = s.trim_end_matches(';');
+    (head, s.len() - head.len())
+}
+
+/// Send a literal string to the pane via one `tmux send-keys -l --` fork.
+/// Used for the head of a payload whose trailing semicolons were peeled
+/// off (see the `Literal` arm of [`dispatch_via_fork`]).
+fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("tmux");
+    cmd.stderr(Stdio::null());
+    cmd.args(["send-keys", "-t", target, "-l", "--", s]);
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
+    if !status.success() {
+        anyhow::bail!(
+            "live-send tmux subprocess exited non-zero for literal {:?}",
+            s
+        );
+    }
+    Ok(())
+}
 
 /// Dispatch a raw byte payload as one or more `tmux send-keys -H` forks,
 /// each bounded by [`MAX_HEX_BYTES_PER_SEND`]. tmux injects the bytes
@@ -1522,6 +1570,23 @@ mod tests {
         let batches = hex_send_batches(&payload);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].first().map(String::as_str), Some("1b"));
+    }
+
+    #[test]
+    fn peel_trailing_semicolons_splits_trailing_run_only() {
+        // tmux eats a trailing `;` from a `send-keys -l` payload, so the
+        // dispatcher peels the trailing run and sends it as raw hex (#1942).
+        // Lone, trailing, and multi-trailing semicolons get peeled.
+        assert_eq!(peel_trailing_semicolons(";"), ("", 1));
+        assert_eq!(peel_trailing_semicolons("ls;"), ("ls", 1));
+        assert_eq!(peel_trailing_semicolons(";;"), ("", 2));
+        assert_eq!(peel_trailing_semicolons("a;;"), ("a", 2));
+        // Embedded and leading semicolons survive `-l`, so they stay on the
+        // literal head and nothing is peeled.
+        assert_eq!(peel_trailing_semicolons("a;b"), ("a;b", 0));
+        assert_eq!(peel_trailing_semicolons(";a"), (";a", 0));
+        assert_eq!(peel_trailing_semicolons("hello"), ("hello", 0));
+        assert_eq!(peel_trailing_semicolons(""), ("", 0));
     }
 
     #[test]

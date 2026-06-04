@@ -16,7 +16,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyCockpitState, type QueuedPrompt } from "../lib/cockpitTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
-import { cockpitHookReducer, combineQueuedPrompts, useCockpit } from "./useCockpit";
+import { reportCockpitInteraction } from "../lib/api";
+import {
+  cockpitHookReducer,
+  combineQueuedPrompts,
+  useCockpit,
+} from "./useCockpit";
+
+// Spy on the telemetry ping while keeping the rest of the api module real
+// (the hook also calls setSessionArchive / setSessionSnooze through it).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, reportCockpitInteraction: vi.fn() };
+});
 
 describe("cockpitHookReducer / queue actions", () => {
   it("emptyCockpitState starts with an empty queue", () => {
@@ -38,9 +50,7 @@ describe("cockpitHookReducer / queue actions", () => {
       expect(s2.queuedPrompts).toHaveLength(2);
       expect(s2.queuedPrompts[0]?.text).toBe("first");
       expect(s2.queuedPrompts[1]?.text).toBe("second");
-      expect(s2.queuedPrompts[0]?.queuedAt).toBe(
-        "2026-01-01T00:00:00.000Z",
-      );
+      expect(s2.queuedPrompts[0]?.queuedAt).toBe("2026-01-01T00:00:00.000Z");
     } finally {
       vi.useRealTimers();
     }
@@ -51,7 +61,12 @@ describe("cockpitHookReducer / queue actions", () => {
       kind: "enqueue_prompt",
       text: "with image",
       attachments: [
-        { kind: "image", mimeType: "image/png", dataB64: "aA==", name: "x.png" },
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "x.png",
+        },
       ],
     });
     expect(s1.queuedPrompts[0]?.attachments).toHaveLength(1);
@@ -230,9 +245,9 @@ describe("combineQueuedPrompts (combined drain mode)", () => {
   });
 
   it("skips empty (attachment-only) entries so no stray blank lines appear (#1833)", () => {
-    expect(combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")])).toBe(
-      "before\n\nafter",
-    );
+    expect(
+      combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")]),
+    ).toBe("before\n\nafter");
     expect(combineQueuedPrompts([mk("a", ""), mk("b", "")])).toBe("");
   });
 });
@@ -313,6 +328,7 @@ describe("useCockpit drain race (#1144)", () => {
     promptPostStatus = 200;
     promptPostBody = "simulated failure";
     promptPostBodies = [];
+    vi.mocked(reportCockpitInteraction).mockClear();
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
       "fetch",
@@ -361,6 +377,81 @@ describe("useCockpit drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts[0]?.text).toBe(
       "queued before open",
     );
+  });
+
+  // #1888: parking a prompt because the agent is busy is the one cockpit
+  // interaction the daemon cannot observe (the queue is client-only), so the
+  // browser pings it for opt-in telemetry.
+  it("reports a prompt_queued telemetry interaction when a prompt parks (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-ping"));
+    await flushAsync();
+    // WS still CONNECTING, so sendPrompt parks the prompt rather than POSTing.
+    act(() => {
+      void result.current.sendPrompt("parked, please count me");
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledTimes(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("does not report a prompt_queued interaction when a prompt POSTs directly (#1888)", async () => {
+    const { result } = renderHook(() => useCockpit("sess-queue-noping"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    act(() => {
+      void result.current.sendPrompt("sent straight through");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(reportCockpitInteraction).not.toHaveBeenCalled();
+  });
+
+  it("reports a prompt_queued interaction on the retryable-failure requeue path (#1888)", async () => {
+    // Idle-dormant wake: the worker was reaped, so sendPrompt POSTs directly
+    // to wake it. When that POST fails retryably (worker_not_ready 503), the
+    // prompt is re-queued, and that re-queue must ping telemetry too.
+    const { result } = renderHook(() =>
+      useCockpit("sess-retry-requeue", "absent"),
+    );
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    // idle_auto_stop sets workerIdleStopped (not workerStopped), so sendPrompt
+    // takes the direct-POST wake path rather than parking up front.
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-retry-requeue",
+          seq: 1,
+          event: { Stopped: { reason: "idle_auto_stop" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.workerIdleStopped).toBe(true);
+
+    // Force the wake POST to fail retryably.
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready";
+    act(() => {
+      void result.current.sendPrompt("retry me");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledTimes(1);
+    expect(reportCockpitInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
   it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
@@ -428,7 +519,9 @@ describe("useCockpit drain race (#1144)", () => {
   it("a fresh prompt POSTs (wakes) instead of parking when the worker is idle-dormant (#1689)", async () => {
     // workerState="absent": the reconciler reaped the worker for
     // inactivity. The REST poll reads "absent" until the respawn lands.
-    const { result } = renderHook(() => useCockpit("sess-idle-fresh", "absent"));
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-fresh", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -482,7 +575,9 @@ describe("useCockpit drain race (#1144)", () => {
     // a cold-absent resume, then the reconciler reaped it to dormant.
     // The dormancy signal must let the drain effect fire the parked
     // prompt (the wake POST), otherwise it sits queued forever.
-    const { result } = renderHook(() => useCockpit("sess-idle-drain", "absent"));
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-drain", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -597,7 +692,9 @@ describe("useCockpit drain race (#1144)", () => {
     // worker_not_ready 503 for an attachment send has a retry path: park
     // it (image included) and suppress the banner, exactly like a
     // text-only send. The drain re-fires it once the worker comes online.
-    const { result } = renderHook(() => useCockpit("sess-idle-attach", "absent"));
+    const { result } = renderHook(() =>
+      useCockpit("sess-idle-attach", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -735,12 +832,22 @@ describe("useCockpit drain race (#1144)", () => {
 
     act(() => {
       void result.current.sendPrompt("first", [
-        { kind: "image", mimeType: "image/png", dataB64: "aA==", name: "a.png" },
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "aA==",
+          name: "a.png",
+        },
       ]);
     });
     act(() => {
       void result.current.sendPrompt("second", [
-        { kind: "image", mimeType: "image/png", dataB64: "bB==", name: "b.png" },
+        {
+          kind: "image",
+          mimeType: "image/png",
+          dataB64: "bB==",
+          name: "b.png",
+        },
       ]);
     });
     await flushAsync();
@@ -830,7 +937,9 @@ describe("useCockpit drain race (#1144)", () => {
         data: JSON.stringify({
           session_id: "sess-rl-resume",
           seq: 3,
-          event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
+          event: {
+            RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" },
+          },
         }),
       } as MessageEvent);
       ws.onmessage?.({

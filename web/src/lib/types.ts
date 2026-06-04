@@ -368,6 +368,8 @@ export interface ProjectInfo {
   name: string;
   path: string;
   scope: "global" | "profile";
+  /** Default base branch for new worktree branches against this project's repo. */
+  default_base_branch?: string;
 }
 
 /** Docker status returned by /api/docker/status */

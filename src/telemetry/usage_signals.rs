@@ -19,7 +19,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The fixed allowlist of usage-signal names a snapshot may report. Adding a
 /// surface here is the only edit needed to instrument it end to end.
-pub const USAGE_SIGNALS: &[&str] = &["web", "cockpit"];
+///
+/// `web` / `cockpit` are whole-UI opens; `diff_panel` / `diff_comments` /
+/// `web_terminal` (#1881) are feature-level opens within the dashboard, each
+/// fired from its own frontend trigger point. Scratch-session usage is not
+/// here: it is cross-surface session state, reported point-in-time by the
+/// `sessions_by_substrate` census, not a browser-fired open.
+pub const USAGE_SIGNALS: &[&str] = &[
+    "web",
+    "cockpit",
+    "diff_panel",
+    "diff_comments",
+    "web_terminal",
+];
 
 /// Window-scoped "feature was used" counters, one per allowlisted signal in
 /// [`USAGE_SIGNALS`]. Built once at daemon start and only ever borrowed, so the
@@ -124,10 +136,26 @@ mod tests {
         assert!(counters.record("cockpit"));
         // An off-list name is rejected and never creates a key.
         assert!(!counters.record("bogus"));
-        assert!(!counters.record("diff_panel"));
         let snap = counters.snapshot();
         assert!(!snap.contains_key("bogus"));
-        assert!(!snap.contains_key("diff_panel"));
+    }
+
+    #[test]
+    fn feature_signals_are_registered_and_reported() {
+        // The #1881 feature-level signals are allowlisted: they record and
+        // show up in the snapshot key set alongside the whole-UI opens.
+        let counters = UsageSeenCounters::new();
+        for name in ["diff_panel", "diff_comments", "web_terminal"] {
+            assert!(counters.record(name), "{name} should be allowlisted");
+        }
+        let snap = counters.snapshot();
+        assert_eq!(snap.get("diff_panel"), Some(&1));
+        assert_eq!(snap.get("diff_comments"), Some(&1));
+        assert_eq!(snap.get("web_terminal"), Some(&1));
+        // The TUI zero shape carries the same expanded key set.
+        for name in ["diff_panel", "diff_comments", "web_terminal"] {
+            assert_eq!(zeroed().get(name), Some(&0));
+        }
     }
 
     #[test]

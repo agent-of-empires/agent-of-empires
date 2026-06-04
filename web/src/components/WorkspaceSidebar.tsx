@@ -1816,6 +1816,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
         }`}
         style={headerStyle}
       >
+        {/* dnd-kit's setActivatorNodeRef is a ref-setter callback meant for
+            JSX ref=; react-hooks/refs misreads the "Ref"-named prop as a ref
+            value read during render and taints the whole dragHandle object.
+            We never touch .current here, so the warning is a false positive. */}
+        {/* eslint-disable react-hooks/refs */}
         {dragHandle && (
           <button
             ref={dragHandle.setActivatorNodeRef}
@@ -1829,6 +1834,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             <GripVertical className="h-3.5 w-3.5" />
           </button>
         )}
+        {/* eslint-enable react-hooks/refs */}
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
           onClick={onClick}

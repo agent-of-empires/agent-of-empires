@@ -22,7 +22,16 @@ use serde::Serialize;
 /// [`ProcessStart`] in favor of it.
 /// v7 (#1887): added version-health fields (`data_schema_version`,
 /// `update_status`, `update_releases_behind`) to every event.
-pub const SCHEMA_VERSION: u32 = 7;
+/// v8 (#1873): added a per-event `uuid` idempotency key to `process_start`
+/// and `usage_snapshot`.
+/// v9 (#1883): added the `web_clients_seen` / `cockpit_clients_seen`
+/// per-form-factor maps alongside the `usage_seen` open counts.
+/// v10 (#1870): added serve windowed fields `peak_concurrent_sessions` and the
+/// `distinct_sessions_by_agent` / `distinct_sessions_by_model_bucket` maps.
+/// v11 (#1888): added the cockpit-interaction aggregates (`approvals_resolved`,
+/// `approvals_by_decision`, `agent_switches`, `substrate_toggles`,
+/// `plan_mode_seen`, `prompts_queued`).
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,6 +65,11 @@ pub struct ProcessStart {
     pub schema: u32,
     /// Always `"process_start"`.
     pub event: &'static str,
+    /// Random v4 UUID minted once when the event is built. Stable across any
+    /// redelivery of the same logical event, so the gateway can forward it as
+    /// the PostHog event `uuid` and let PostHog dedup retried POSTs. Distinct
+    /// from `install_id` (stable per install) and `sent_at` (per-emit stamp).
+    pub uuid: String,
     pub install_id: String,
     /// RFC 3339 UTC timestamp.
     pub sent_at: String,
@@ -107,7 +121,7 @@ pub struct CliUsage {
 }
 
 /// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
-/// ~12 hours, and best-effort on graceful shutdown. Carries current
+/// ~4 hours, and best-effort on graceful shutdown. Carries current
 /// aggregate state, never a per-action stream. Every string-valued bucket
 /// has already passed through [`super::sanitize`].
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +129,11 @@ pub struct UsageSnapshot {
     pub schema: u32,
     /// Always `"usage_snapshot"`.
     pub event: &'static str,
+    /// Random v4 UUID minted once when the event is built; see
+    /// [`ProcessStart::uuid`]. Excluded from the in-process dedup fingerprint
+    /// (`super::snapshot_fingerprint`) so two snapshots with identical content
+    /// still compare equal.
+    pub uuid: String,
     pub install_id: String,
     pub sent_at: String,
     pub surface: Surface,
@@ -137,6 +156,13 @@ pub struct UsageSnapshot {
     pub session_cockpit: u32,
     pub session_sandboxed: u32,
     pub session_yolo: u32,
+
+    /// Peak concurrent `session_total` observed across the window since the
+    /// last snapshot. `aoe serve` folds a sample every ~30 min into a local
+    /// aggregate and reports the max here, so a short-lived burst of sessions
+    /// that opens and closes between two 4h sends is still captured. The TUI
+    /// does not aggregate, so it reports the point-in-time `session_total`.
+    pub peak_concurrent_sessions: u32,
 
     /// Sessions currently pinned, snoozed (future `snoozed_until`), or
     /// archived at snapshot time. Point-in-time state prevalence, not action
@@ -167,6 +193,17 @@ pub struct UsageSnapshot {
     /// workspace / worktree", NOT "all sandboxed sessions"; use
     /// `session_sandboxed` for the latter.
     pub sessions_by_substrate: BTreeMap<String, u32>,
+
+    /// Allowlisted agent bucket -> distinct sessions *seen* across the window
+    /// since the last snapshot (not concurrent at the tick), so short-lived
+    /// sessions caught by a ~30-min sample still contribute their agent mix.
+    /// The sum can exceed `session_total`. Populated by `aoe serve`; empty on
+    /// the TUI, which does not aggregate.
+    pub distinct_sessions_by_agent: BTreeMap<String, u32>,
+    /// Coarse model family bucket -> distinct sessions seen across the window.
+    /// Same window semantics as [`Self::distinct_sessions_by_agent`]; serve-only.
+    pub distinct_sessions_by_model_bucket: BTreeMap<String, u32>,
+
     /// Install-level feature adoption: allowlisted feature name -> active.
     /// Keyed by the fixed registry in [`super::features`]; lets new gated
     /// features be tracked by registering the flag, not by extending the
@@ -179,6 +216,18 @@ pub struct UsageSnapshot {
     /// entry, not a schema field. Zero-valued keys stay present so the wire key
     /// set is stable. See `telemetry::usage_signals`.
     pub usage_seen: BTreeMap<String, u32>,
+
+    /// Coarse client form-factor classes that opened the web dashboard since
+    /// the last snapshot: allowlisted class key (`desktop` / `desktop_pwa` /
+    /// `mobile` / `mobile_pwa`) -> was-seen. A boolean, not a count, on the
+    /// wire: it answers "which client classes used the dashboard" without
+    /// leaking open frequency. Empty (and so omitted) on surfaces that host no
+    /// web client, e.g. the TUI. See `telemetry::form_factor`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub web_clients_seen: BTreeMap<String, bool>,
+    /// Same per-class was-seen map for the cockpit web UI.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cockpit_clients_seen: BTreeMap<String, bool>,
 
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).
@@ -197,4 +246,104 @@ pub struct UsageSnapshot {
     /// a tunnel name, hostname, or `.ts.net` URL, only the coarse mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_mode: Option<String>,
+
+    /// Cockpit approvals the user resolved since the last snapshot. The sum of
+    /// [`Self::approvals_by_decision`]; the synthetic daemon-restart
+    /// `Cancelled` decision is never counted (it is not a user choice).
+    pub approvals_resolved: u32,
+    /// Decision mix for resolved approvals: allowlisted decision key
+    /// (`allow` / `allow_always` / `deny`) -> count. Zero-count keys are
+    /// omitted, like [`Self::sessions_by_agent`]. Shows whether people lean on
+    /// `allow_always` (trust) vs `deny` (friction).
+    pub approvals_by_decision: BTreeMap<String, u32>,
+    /// Mid-session agent switches since the last snapshot.
+    pub agent_switches: u32,
+    /// Cockpit/terminal substrate toggles since the last snapshot. Only real
+    /// transitions count; an enable on an already-cockpit session (or a disable
+    /// on an already-terminal session) is a no-op and is not counted.
+    pub substrate_toggles: u32,
+    /// A session entered plan mode at least once since the last snapshot.
+    pub plan_mode_seen: bool,
+    /// Prompts the web cockpit queued (parked because the agent was busy)
+    /// since the last snapshot. Reported by the browser, the only surface that
+    /// owns the prompt queue; the daemon never sees the queue directly.
+    pub prompts_queued: u32,
+}
+
+/// Resolved cockpit-interaction counts for one snapshot window, the input the
+/// daemon folds into a [`UsageSnapshot`]. Surfaces without a cockpit (the TUI)
+/// pass [`Default`] (all zero). Counts only, plus a closed decision key set, so
+/// nothing here can carry free-form content past [`super::sanitize`].
+#[derive(Debug, Clone, Default)]
+pub struct CockpitInteractionCounts {
+    pub approvals_allow: u32,
+    pub approvals_allow_always: u32,
+    pub approvals_deny: u32,
+    pub agent_switches: u32,
+    pub substrate_toggles: u32,
+    pub plan_mode_seen: bool,
+    pub prompts_queued: u32,
+}
+
+impl CockpitInteractionCounts {
+    /// Total user-resolved approvals (the three real decisions; `Cancelled`
+    /// is never accumulated here).
+    pub fn approvals_resolved(&self) -> u32 {
+        self.approvals_allow + self.approvals_allow_always + self.approvals_deny
+    }
+
+    /// Decision mix as an allowlisted-key map, omitting zero counts to match
+    /// the `sessions_by_agent` convention.
+    pub fn approvals_by_decision(&self) -> BTreeMap<String, u32> {
+        let mut map = BTreeMap::new();
+        for (key, count) in [
+            ("allow", self.approvals_allow),
+            ("allow_always", self.approvals_allow_always),
+            ("deny", self.approvals_deny),
+        ] {
+            if count > 0 {
+                map.insert(key.to_string(), count);
+            }
+        }
+        map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approvals_resolved_sums_the_three_real_decisions() {
+        let counts = CockpitInteractionCounts {
+            approvals_allow: 2,
+            approvals_allow_always: 1,
+            approvals_deny: 1,
+            ..Default::default()
+        };
+        // Issue #1888 story: 2 allow + 1 deny (+ 1 allow_always here) all count.
+        assert_eq!(counts.approvals_resolved(), 4);
+    }
+
+    #[test]
+    fn approvals_by_decision_omits_zero_keys() {
+        let counts = CockpitInteractionCounts {
+            approvals_allow: 2,
+            approvals_deny: 1,
+            ..Default::default()
+        };
+        let map = counts.approvals_by_decision();
+        // Matches the sessions_by_agent convention: absent key == zero.
+        assert_eq!(map.get("allow"), Some(&2));
+        assert_eq!(map.get("deny"), Some(&1));
+        assert!(!map.contains_key("allow_always"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn empty_counts_produce_an_empty_decision_map() {
+        let counts = CockpitInteractionCounts::default();
+        assert_eq!(counts.approvals_resolved(), 0);
+        assert!(counts.approvals_by_decision().is_empty());
+    }
 }

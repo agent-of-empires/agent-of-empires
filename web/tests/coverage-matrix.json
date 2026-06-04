@@ -174,6 +174,46 @@
       ]
     },
     {
+      "id": "telemetry.form-factor",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/telemetry-form-factor.spec.ts",
+        "src/lib/__tests__/formFactor.test.ts"
+      ],
+      "components": [
+        "web/src/lib/formFactor.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
+      "id": "telemetry.cockpit-interaction",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useCockpit.queue.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useCockpit.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
+      "id": "telemetry.feature-usage-signals",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/feature-usage-signals.spec.ts",
+        "tests/diff-comments.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useDiffFiles.ts",
+        "web/src/hooks/useTerminal.ts",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",
@@ -1717,9 +1757,11 @@
     },
     {
       "id": "projects-view",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
+      "kind": "vitest",
       "risk": "low",
+      "specs": [
+        "src/components/__tests__/ProjectsView.test.tsx"
+      ],
       "components": [
         "web/src/components/ProjectsView.tsx"
       ]
