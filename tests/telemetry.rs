@@ -196,6 +196,7 @@ fn form_factor_maps_are_a_presence_set_on_the_wire() {
         0,
         None,
         None,
+        &telemetry::CockpitInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     let empty_wire = serde_json::to_string(&snapshot).expect("serialize");
@@ -432,9 +433,16 @@ fn events_carry_distinct_idempotency_uuid() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let snap =
-        telemetry::build_usage_snapshot(Surface::Tui, &[], usage_signals::zeroed(), 0, None, None)
-            .expect("snapshot built when opted in");
+    let snap = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+        &telemetry::CockpitInteractionCounts::default(),
+    )
+    .expect("snapshot built when opted in");
     assert!(!snap.uuid.is_empty(), "snapshot uuid must be non-empty");
     assert_ne!(
         snap.uuid, snap.install_id,
@@ -450,9 +458,16 @@ fn events_carry_distinct_idempotency_uuid() {
 
     // Two events built in the same process must not collide.
     let proc = telemetry::build_process_start(Surface::Tui).expect("process_start built");
-    let snap2 =
-        telemetry::build_usage_snapshot(Surface::Tui, &[], usage_signals::zeroed(), 0, None, None)
-            .expect("second snapshot built");
+    let snap2 = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+        &telemetry::CockpitInteractionCounts::default(),
+    )
+    .expect("second snapshot built");
     assert_ne!(
         snap.uuid, snap2.uuid,
         "two snapshots must get distinct uuids"
@@ -476,7 +491,8 @@ fn opted_out_builds_no_uuid() {
         usage_signals::zeroed(),
         0,
         None,
-        None
+        None,
+        &telemetry::CockpitInteractionCounts::default(),
     )
     .is_none());
 }
