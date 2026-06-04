@@ -64,13 +64,17 @@ export function SwitchAgentModal({
 
   const rateLimited = trigger === "rate_limit";
 
-  // Reset loading/error when deps change (render-time to avoid effect-based setState)
+  // Reset loading/error when deps change (render-time to avoid effect-based setState).
+  // Track the key even while closed so reopening with the same agent/trigger still
+  // re-triggers the reset (the key flips on the close, then again on the reopen).
   const [depKey, setDepKey] = useState(() => `${open}-${currentAgent}-${rateLimited}`);
   const currentKey = `${open}-${currentAgent}-${rateLimited}`;
-  if (open && currentKey !== depKey) {
+  if (currentKey !== depKey) {
     setDepKey(currentKey);
-    setLoading(true);
-    setError(null);
+    if (open) {
+      setLoading(true);
+      setError(null);
+    }
   }
 
   useEffect(() => {
