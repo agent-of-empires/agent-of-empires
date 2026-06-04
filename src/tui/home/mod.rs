@@ -92,99 +92,131 @@ pub(super) enum DragKind {
     PreviewSelect,
 }
 
+/// The output pane's text layout, captured at render time so the input
+/// handlers (which run between frames) can map a screen cell to the
+/// absolute content line beneath it and back. `pane` is the on-screen
+/// rect the parsed agent output is painted into (the info header and
+/// banner are already stripped off); `first_line` is the index of the
+/// content line drawn on `pane`'s top row (i.e. `compute_scroll`'s
+/// result for the current scroll offset); `total_lines` is the parsed
+/// scrollback length. The output Paragraph renders with no wrap and no
+/// horizontal scroll, so screen row `pane.y + k` shows content line
+/// `first_line + k`, and screen col `pane.x + c` shows content column
+/// `c`. A `total_lines` of 0 means "no selectable content" (creating /
+/// no-selection / empty panes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PreviewTextView {
+    pub(super) pane: ratatui::layout::Rect,
+    pub(super) first_line: usize,
+    pub(super) total_lines: usize,
+}
+
+impl PreviewTextView {
+    /// True when `(col, row)` lands on a row/col that maps to real
+    /// content. Used to gate drag-select start.
+    pub(super) fn contains(self, col: u16, row: u16) -> bool {
+        self.total_lines > 0
+            && self
+                .pane
+                .contains(ratatui::layout::Position::from((col, row)))
+    }
+
+    /// Map a screen cell to content coords `(col_offset, line)`, clamped
+    /// into the pane and the scrollback. `col_offset` is 0-based from the
+    /// pane's left edge; `line` is an absolute index into the parsed
+    /// scrollback.
+    pub(super) fn screen_to_content(self, col: u16, row: u16) -> (u16, usize) {
+        let pane = self.pane;
+        let max_x = pane.right().saturating_sub(1);
+        let max_y = pane.bottom().saturating_sub(1);
+        let cx = col.clamp(pane.x, max_x);
+        let cy = row.clamp(pane.y, max_y);
+        let col_off = cx - pane.x;
+        let mut line = self.first_line + (cy - pane.y) as usize;
+        if self.total_lines > 0 {
+            line = line.min(self.total_lines - 1);
+        }
+        (col_off, line)
+    }
+}
+
 /// Flow-style text selection in the preview pane, matching tmux's
-/// default mouse selection: from the anchor cell, the selection runs
-/// in reading order (left-to-right, top-to-bottom) wrapping across
-/// every row in between, and ends at the extent cell. Coordinates are
-/// absolute terminal cells (matching the frame buffer's coords) so the
-/// renderer can apply a reversed-style highlight without re-deriving
-/// pane geometry.
+/// default mouse selection: from the anchor cell, the selection runs in
+/// reading order (left-to-right, top-to-bottom) wrapping across every
+/// row in between, and ends at the extent cell.
+///
+/// Coordinates are *content* coords, not screen cells: `col` is a 0-based
+/// offset from the output pane's left edge and `line` is an absolute
+/// index into the parsed scrollback. Anchoring to the scrollback (rather
+/// than the visible frame) is what lets a selection survive a scroll and
+/// span more than one page: the highlight tracks its text as the pane
+/// scrolls, and the copy pulls the full range even where it has scrolled
+/// off screen. The renderer re-derives screen rects each frame from the
+/// live `PreviewTextView` via `screen_flow_rects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewSelection {
-    /// Cell the user pressed Down(Left) on.
-    pub(super) anchor: (u16, u16),
+    /// Content cell the user pressed Down(Left) on: `(col_offset, line)`.
+    pub(super) anchor: (u16, usize),
     /// Current (or final) extent. Equals `anchor` at drag start.
-    pub(super) extent: (u16, u16),
+    pub(super) extent: (u16, usize),
     /// True once Up(Left) has fired. The renderer keeps the highlight
-    /// visible after release until the user dismisses it (next key,
-    /// click, or scroll), so they can verify what was copied.
+    /// visible after release until the user dismisses it (next key or
+    /// click), so they can verify what was copied.
     pub(super) finalized: bool,
 }
 
 impl PreviewSelection {
-    /// Anchor and extent ordered in reading order (row first, then
-    /// column). The first tuple is the cell where the selection starts
-    /// in the flow; the second is where it ends. A drag that runs
-    /// up-and-right still resolves to the higher row as the start.
-    pub(super) fn ordered(self) -> ((u16, u16), (u16, u16)) {
-        let (ac, ar) = self.anchor;
-        let (ec, er) = self.extent;
-        if (ar, ac) <= (er, ec) {
-            ((ac, ar), (ec, er))
+    /// Anchor and extent ordered in reading order (line first, then
+    /// column). The first tuple is where the selection starts in the
+    /// flow; the second is where it ends. A drag that runs up-and-right
+    /// still resolves to the lower line as the start.
+    pub(super) fn ordered(self) -> ((u16, usize), (u16, usize)) {
+        let (ac, al) = self.anchor;
+        let (ec, el) = self.extent;
+        if (al, ac) <= (el, ec) {
+            ((ac, al), (ec, el))
         } else {
-            ((ec, er), (ac, ar))
+            ((ec, el), (ac, al))
         }
     }
 
-    /// Decompose the selection into one to three flow-shape `Rect`
-    /// segments inside `preview_area`. Returns an empty vec when the
-    /// preview area is zero-sized. The shape is the tmux default:
-    ///
-    /// * single-row selection: one segment between the two columns.
-    /// * multi-row selection: (1) start col to the preview's right
-    ///   edge on the first row, (2) full-width middle rows when any
-    ///   exist, (3) the preview's left edge to the end col on the
-    ///   last row.
-    pub(super) fn flow_rects(
-        self,
-        preview_area: ratatui::layout::Rect,
-    ) -> Vec<ratatui::layout::Rect> {
+    /// Decompose the selection into per-row flow-shape screen `Rect`s,
+    /// clipped to the visible window described by `view`. Lines above or
+    /// below the visible window are skipped (the highlight just doesn't
+    /// paint there); a partially-visible multi-line selection runs to the
+    /// pane's right edge on every row but its last and from the left edge
+    /// on every row but its first, matching the tmux default flow shape.
+    /// Returns an empty vec when the pane is zero-sized.
+    pub(super) fn screen_flow_rects(self, view: PreviewTextView) -> Vec<ratatui::layout::Rect> {
+        let pane = view.pane;
         let mut out = Vec::new();
-        if preview_area.width == 0 || preview_area.height == 0 {
+        if pane.width == 0 || pane.height == 0 {
             return out;
         }
-        let ((start_col, start_row), (end_col, end_row)) = self.ordered();
-        let left = preview_area.x;
-        let right_excl = preview_area.right();
-
-        if start_row == end_row {
-            let lo = start_col.min(end_col);
-            let hi = start_col.max(end_col);
-            let width = hi.saturating_sub(lo).saturating_add(1);
-            out.push(ratatui::layout::Rect {
-                x: lo,
-                y: start_row,
-                width,
-                height: 1,
-            });
-            return out;
-        }
-
-        let first_width = right_excl.saturating_sub(start_col);
-        if first_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: start_col,
-                y: start_row,
-                width: first_width,
-                height: 1,
-            });
-        }
-        if end_row > start_row + 1 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: start_row + 1,
-                width: preview_area.width,
-                height: end_row - start_row - 1,
-            });
-        }
-        let last_width = end_col.saturating_sub(left).saturating_add(1);
-        if last_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: end_row,
-                width: last_width,
-                height: 1,
-            });
+        let ((start_col, start_line), (end_col, end_line)) = self.ordered();
+        let top = view.first_line;
+        let bottom_excl = top + pane.height as usize;
+        for line in start_line..=end_line {
+            if line < top || line >= bottom_excl {
+                continue;
+            }
+            let row = pane.y + (line - top) as u16;
+            let left_off = if line == start_line { start_col } else { 0 };
+            let right_off_excl = if line == end_line {
+                end_col.saturating_add(1).min(pane.width)
+            } else {
+                pane.width
+            };
+            let left = pane.x + left_off.min(pane.width);
+            let right_excl = pane.x + right_off_excl;
+            if right_excl > left {
+                out.push(ratatui::layout::Rect {
+                    x: left,
+                    y: row,
+                    width: right_excl - left,
+                    height: 1,
+                });
+            }
         }
         out
     }
@@ -595,6 +627,12 @@ pub struct HomeView {
     /// every consumer of "how many rows are visible" agrees with what's on
     /// screen.
     pub(super) preview_visible_rows: usize,
+    /// Snapshot of the output pane's text layout from the last render,
+    /// used by the drag-select handlers to map screen cells to absolute
+    /// content lines (and back) between frames. Set in `render_preview`
+    /// for the output-bearing paths; left at `total_lines == 0` for the
+    /// creating / no-selection paths so a drag there is inert.
+    pub(super) preview_text_view: PreviewTextView,
     /// Outer rect of the preview pane (block + borders + content), captured
     /// during `render_preview`. The live-send preview-only fast path uses
     /// this to call back into `render_preview` with the correct OUTER area,
@@ -919,6 +957,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             tool_preview_cache: PreviewCache::default(),
             preview_scroll_offset: 0,
+            preview_text_view: PreviewTextView::default(),
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),
             preview_visible_rows: 0,

@@ -257,6 +257,23 @@ pub(super) fn build_tool_hotkey_cache(
         .collect()
 }
 
+/// Pull the cell symbols in columns `[from, to_excl)` out of a parsed
+/// scrollback `Line`. The line is laid back out into a one-row buffer at
+/// the pane width so wide characters, combining marks, and right-edge
+/// truncation resolve exactly as ratatui rendered them on screen; reading
+/// cell symbols then mirrors the old frame-buffer extraction cell for
+/// cell. Unwritten cells read as a single space, which the caller trims.
+fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width: u16) -> String {
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+    buf.set_line(0, 0, line, width);
+    let hi = to_excl.min(width);
+    let mut out = String::new();
+    for col in from..hi {
+        out.push_str(buf[(col, 0)].symbol());
+    }
+    out
+}
+
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
@@ -368,10 +385,16 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return false;
         }
-        if self.hit_preview(col, row) {
+        // Seed the selection in content coords so it survives a scroll
+        // and can span more than one page. `contains` also requires the
+        // pane to hold real scrollback, so a drag over an empty / not-yet
+        // -captured pane is a no-op rather than a phantom selection.
+        let view = self.preview_text_view;
+        if view.contains(col, row) {
+            let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
-                anchor: (col, row),
-                extent: (col, row),
+                anchor: cell,
+                extent: cell,
                 finalized: false,
             });
             self.drag_state = Some(DragKind::PreviewSelect);
@@ -449,31 +472,76 @@ impl HomeView {
                 true
             }
             Some(DragKind::PreviewSelect) => {
+                let view = self.preview_text_view;
+                let pane = view.pane;
+                if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+                    return false;
+                }
+                // Dragging at (or past) the top/bottom edge auto-scrolls
+                // the pane so the selection can grow beyond one visible
+                // page in a single drag, mirroring how terminals extend a
+                // selection when the cursor leaves the viewport. The
+                // extent then tracks the freshly-revealed edge line.
+                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                let mut scrolled = false;
+                let new_extent = if row <= pane.y {
+                    scrolled = self.scroll_preview_offset(1);
+                    let first = self.projected_first_line();
+                    (col_off, first)
+                } else if row >= pane.bottom().saturating_sub(1) {
+                    scrolled = self.scroll_preview_offset(-1);
+                    let first = self.projected_first_line();
+                    let last = (first + pane.height as usize)
+                        .saturating_sub(1)
+                        .min(view.total_lines.saturating_sub(1));
+                    (col_off, last)
+                } else {
+                    view.screen_to_content(col, row)
+                };
                 let Some(sel) = self.preview_selection.as_mut() else {
                     return false;
                 };
-                // Clamp the drag extent to the preview pane so a
-                // mouse-out below the pane (very common: users drag down
-                // through the last visible row, expecting the selection
-                // to stop at the bottom) doesn't try to highlight
-                // chrome rows on neighbouring widgets.
-                let area = self.preview_area;
-                if area.width == 0 || area.height == 0 {
-                    return false;
-                }
-                let max_x = area.right().saturating_sub(1);
-                let max_y = area.bottom().saturating_sub(1);
-                let clamped_x = col.clamp(area.x, max_x);
-                let clamped_y = row.clamp(area.y, max_y);
-                let new_extent = (clamped_x, clamped_y);
                 if sel.extent == new_extent {
-                    return false;
+                    // A scroll with no extent change still needs a redraw
+                    // so the highlight repaints against the moved content.
+                    return scrolled;
                 }
                 sel.extent = new_extent;
                 true
             }
             None => false,
         }
+    }
+
+    /// Shift the preview scroll offset by `delta` lines (positive scrolls
+    /// up toward older output), clamped to the captured window. Returns
+    /// whether the offset actually moved. Factored out of the wheel
+    /// handlers so a drag-select at the pane edge can auto-scroll without
+    /// dragging the whole `handle_scroll_*` routing (and selection-clear)
+    /// along with it.
+    fn scroll_preview_offset(&mut self, delta: i32) -> bool {
+        let cache = self.active_preview_cache();
+        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
+        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
+        if new == self.preview_scroll_offset {
+            return false;
+        }
+        self.preview_scroll_offset = new;
+        true
+    }
+
+    /// The content line that will land on the output pane's top row given
+    /// the current scroll offset. Mirrors `render_preview`'s
+    /// `compute_scroll` so an auto-scroll can pin the selection extent to
+    /// the edge line before the next frame recomputes the snapshot.
+    fn projected_first_line(&self) -> usize {
+        let view = self.preview_text_view;
+        crate::tui::components::preview::compute_scroll(
+            view.total_lines,
+            view.pane.height as usize,
+            self.preview_scroll_offset,
+        ) as usize
     }
 
     /// End any active drag. For the list divider, persist the final
@@ -525,68 +593,49 @@ impl HomeView {
         matches!(self.drag_state, Some(DragKind::PreviewSelect))
     }
 
-    /// Read the characters underneath the current preview selection
-    /// from the rendered frame buffer, joined into a tmux-style flow
-    /// string. Called from `paint_preview_selection` on the render
-    /// that follows `handle_drag_end`, when `preview_copy_pending`
-    /// is set and the buffer still holds the cells the user dragged
-    /// over.
+    /// Join the text under the current preview selection into a tmux-style
+    /// flow string. Called from `paint_preview_selection` on the render
+    /// that follows `handle_drag_end`, when `preview_copy_pending` is set.
     ///
-    /// The frame buffer is the authoritative source: it carries exactly
-    /// what the user sees, with ansi-to-tui decoding and scroll already
-    /// applied. Reading the parsed `Text` upstream of the renderer would
-    /// duplicate the wrap math and skew when the preview is mid-scroll.
-    pub(super) fn extract_preview_selection_text(
-        &self,
-        buffer: &ratatui::buffer::Buffer,
-    ) -> Option<String> {
+    /// The selection is anchored to absolute scrollback lines, so this
+    /// reads straight from the active cache's parsed `Text` rather than
+    /// the visible frame buffer. That is what makes a multi-page copy work:
+    /// the buffer only holds the current page, but the parsed cache holds
+    /// the whole captured window, including the lines that have scrolled
+    /// off screen. Each line is laid back out into a one-row buffer at the
+    /// pane width so column slicing handles wide chars and truncation
+    /// exactly as the on-screen render did.
+    pub(super) fn extract_preview_selection_text(&self) -> Option<String> {
         let sel = self.preview_selection?;
-        let preview = self.preview_area;
-        let buf_area = buffer.area;
-        let preview = preview.intersection(buf_area);
-        if preview.width == 0 || preview.height == 0 {
+        let view = self.preview_text_view;
+        let width = view.pane.width;
+        if width == 0 || view.total_lines == 0 {
             return None;
         }
-        let ((start_col, start_row), (end_col, end_row)) = sel.ordered();
-        if start_row == end_row && start_col == end_col {
+        let lines = self.active_preview_cache().parsed_text.as_ref()?;
+        let ((start_col, start_line), (end_col, end_line)) = sel.ordered();
+        if start_line == end_line && start_col == end_col {
             return None;
         }
-        let preview_right_excl = preview.right();
-        let preview_left = preview.x;
         let mut out = String::new();
-        for row in start_row..=end_row {
-            if row < preview.y || row >= preview.bottom() {
-                if row < end_row {
-                    out.push('\n');
-                }
-                continue;
-            }
-            let row_start_col = if row == start_row {
-                start_col.max(preview_left)
+        for line_idx in start_line..=end_line {
+            let from = if line_idx == start_line { start_col } else { 0 };
+            let to_excl = if line_idx == end_line {
+                end_col.saturating_add(1).min(width)
             } else {
-                preview_left
+                width
             };
-            let row_end_excl = if row == end_row {
-                end_col.saturating_add(1).min(preview_right_excl)
-            } else {
-                preview_right_excl
-            };
-            if row_end_excl <= row_start_col {
-                if row < end_row {
-                    out.push('\n');
+            if let Some(line) = lines.lines.get(line_idx) {
+                if to_excl > from {
+                    // Trim only trailing whitespace per row, not leading:
+                    // a selection over indented code keeps the indentation,
+                    // while right-edge padding on unfilled rows doesn't
+                    // bloat the paste.
+                    let slice = slice_line_columns(line, from, to_excl, width);
+                    out.push_str(slice.trim_end());
                 }
-                continue;
             }
-            let mut line = String::new();
-            for col in row_start_col..row_end_excl {
-                line.push_str(buffer[(col, row)].symbol());
-            }
-            // Trim only trailing whitespace per row, not leading: a
-            // selection over indented code keeps the indentation,
-            // while padding at the right edge of the preview (the
-            // common case for unfilled rows) doesn't bloat the paste.
-            out.push_str(line.trim_end());
-            if row < end_row {
+            if line_idx < end_line {
                 out.push('\n');
             }
         }
@@ -2807,11 +2856,11 @@ impl HomeView {
     /// its scroll boundary or has no session selected.
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Any scroll repositions the preview content under the
-        // selection rect, so a leftover highlight from a previous drag
-        // would point at unrelated text. Drop it before changing
-        // offsets so the highlight disappears alongside the scroll.
-        self.clear_preview_selection();
+        // A preview selection is anchored to absolute scrollback lines,
+        // not screen cells, so scrolling no longer invalidates it: the
+        // highlight tracks its text as the pane moves and the copy spans
+        // the full range even where it has scrolled off screen. So we
+        // deliberately do NOT clear it here.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_up(STEP);
             return true;
@@ -3497,9 +3546,8 @@ impl HomeView {
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
     pub fn handle_scroll_down(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Mirror handle_scroll_up: a stale highlight pinned to cells
-        // whose content just moved would mislead, so drop it first.
-        self.clear_preview_selection();
+        // Mirror handle_scroll_up: the selection is anchored to scrollback
+        // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_down(STEP);
             return true;
