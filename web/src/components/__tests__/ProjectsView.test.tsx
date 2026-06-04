@@ -33,9 +33,7 @@ afterEach(() => {
 });
 
 async function openAddForm() {
-  fireEvent.click(
-    await screen.findByRole("button", { name: "+ Add project" }),
-  );
+  fireEvent.click(await screen.findByRole("button", { name: "+ Add project" }));
   fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), {
     target: { value: "/repo/extra" },
   });
@@ -49,7 +47,9 @@ describe("ProjectsView default base branch", () => {
     render(<ProjectsView onClose={() => {}} />);
     await openAddForm();
     fireEvent.change(
-      screen.getByPlaceholderText("inherit global default, else auto-detect"),
+      screen.getByPlaceholderText(
+        "blank = inherit global default, then auto-detect",
+      ),
       { target: { value: "develop" } },
     );
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
@@ -111,7 +111,7 @@ describe("ProjectsView default base branch", () => {
     render(<ProjectsView onClose={() => {}} />);
     await openAddForm();
     const baseInput = screen.getByPlaceholderText(
-      "inherit global default, else auto-detect",
+      "blank = inherit global default, then auto-detect",
     );
     fireEvent.change(baseInput, { target: { value: "develop" } });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -121,7 +121,7 @@ describe("ProjectsView default base branch", () => {
     expect(
       (
         screen.getByPlaceholderText(
-          "inherit global default, else auto-detect",
+          "blank = inherit global default, then auto-detect",
         ) as HTMLInputElement
       ).value,
     ).toBe("");
