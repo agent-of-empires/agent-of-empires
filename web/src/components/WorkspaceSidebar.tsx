@@ -1847,11 +1847,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
         }`}
         style={headerStyle}
       >
-        {/* dnd-kit's setActivatorNodeRef is a ref-setter callback meant for
-            JSX ref=; react-hooks/refs misreads the "Ref"-named prop as a ref
-            value read during render and taints the whole dragHandle object.
-            We never touch .current here, so the warning is a false positive. */}
-        {/* eslint-disable react-hooks/refs */}
+        {/* eslint-disable react-hooks/refs -- dnd-kit's DragHandleProps bundles
+            setActivatorNodeRef (a ref-setter callback) alongside plain
+            attributes/listeners objects; the rule incorrectly taints every
+            property access on the whole object as a "ref value read during
+            render". None of these touch .current — it's a false positive. */}
         {dragHandle && (
           <button
             ref={dragHandle.setActivatorNodeRef}
