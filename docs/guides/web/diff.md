@@ -28,8 +28,10 @@ Enter / Space opens a file or toggles a directory.
 
 ## Base override
 
-By default the diff is computed against the session's base branch. The
-**base picker** chip lets you override it per session: type to filter
+By default the diff is computed against the branch the worktree was
+forked from (its recorded base branch), falling back to the configured
+`diff.default_branch` and then auto-detection. The **base picker** chip
+lets you override it per session: type to filter
 branches, pick one, and the diff recomputes against the new base. A
 reset affordance appears while an override is active. The override is
 sent to the server (`PATCH /api/sessions/{id}/diff-base`) so it persists

@@ -92,11 +92,20 @@ comments to the agent as a single prompt (#928).
 ## Per-session base override
 
 Each session has an optional `base_branch_override` that takes
-precedence over the profile default and auto-detection. Use it when
-the eventual PR target differs from the project default (stacked PRs,
-hotfix off `release/*`, branch rename). The override is sticky across
-restarts and only affects the comparison, not the worktree itself
-(no rebase). See #970.
+precedence over the worktree's recorded base, the profile default, and
+auto-detection. Use it when the eventual PR target differs from the
+project default (stacked PRs, hotfix off `release/*`, branch rename).
+The override is sticky across restarts and only affects the comparison,
+not the worktree itself (no rebase). See #970.
+
+When no override is set, the comparison defaults to the branch the
+worktree was actually forked from (`worktree_info.base_branch`, set at
+creation from an explicit session base, a per-project default, or the
+global/profile `worktree.default_base_branch`). So a worktree created
+off `release` compares against `release` rather than the repo's
+auto-detected default. The full precedence is: per-session override,
+then worktree base, then `diff.default_branch`, then auto-detection.
+See #1951.
 
 - **Web dashboard**: click the `vs <ref>` chip in the diff header, pick
   a branch from the typeahead (local + remote-only), or use
