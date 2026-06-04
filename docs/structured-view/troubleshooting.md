@@ -165,6 +165,21 @@ The rate-limit banner offers a primary "Continue in another agent" CTA. Clicking
 
 After the switch, the modal fetches the context primer and pre-fills the composer with a framed recap of the prior conversation. If the user's last prompt is what triggered the rate-limit (it was published to the event log before the adapter rejected it), the primer endpoint surfaces it separately as `unprocessed_prompt`; the modal drops it into the composer as the user's pending request so they don't have to retype it. The composer is NOT auto-sent; review and submit manually.
 
+### Crash-loop park (worker keeps failing to start)
+
+A worker that comes up and then exits within ~10 seconds (a broken agent command, a missing adapter, an immediate handshake failure) used to be respawned by the daemon's reconciler on every tick with no ceiling, producing a silent loop: a fresh `aoe __cockpit-runner` every few seconds, no error in `debug.log`, and a pile of empty `cockpit-workers/<id>.log` files. Two changes make this debuggable and bounded:
+
+- **The runner logs a `warn` when its agent exits within ~10s of startup**, including the session id, exit status, and `elapsed_ms`, on the `cockpit.runner` target. A `grep -E 'error|warn' ~/.agent-of-empires/debug.log` now surfaces the crash instead of showing only the startup markers. (Linux config path: `~/.config/agent-of-empires/debug.log`.)
+- **The reconciler enforces a respawn budget.** A session that needs a (re)spawn more than 5 times in a rolling 60-second window is parked: the daemon publishes one `AgentStartupError` (the cockpit view shows the startup-error banner instead of going silent) and stops auto-respawning it. This is independent of, and looser than, the supervisor's in-flight restart budget (3 in 60s); the reconciler counts the decision to act before the outcome is known, so a healthy daemon restart plus one transient blip never trips it.
+
+Recovery from a parked session:
+
+- **Retry from the dashboard** (or `POST /api/sessions/{id}/cockpit/spawn`, or "Switch agent" below). A worker that comes back online clears the budget and un-parks the session automatically.
+- **`aoe cockpit restart <session>`** also wipes the budget and retries fresh.
+- **An `aoe serve` restart** clears the in-memory budget, so a genuinely-broken session gets one more bounded burst (5 attempts) before re-parking. It does not loop forever.
+
+Empty (0-byte) worker logs are now swept on worker teardown; non-empty logs are still kept for post-mortem.
+
 ### Switching agents manually
 
 The same hand-off is available at any time, not just when an agent is rate-limited. This matters when you handed a session off (say, claude to codex during a rate limit) and later want to return to the original agent once the limit clears.
