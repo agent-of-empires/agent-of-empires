@@ -204,6 +204,7 @@ function AdvancedWorktreeOptions({
   if (branchLoadKey !== trackedBranchLoadKey) {
     setTrackedBranchLoadKey(branchLoadKey);
     setBranches(null);
+    setHighlightIdx(0);
   }
   const loading = open && branches === null;
 
