@@ -45,6 +45,19 @@ both. Ports are overridable with `--serve-port` / `--web-port`. See the
 [web dashboard guide](guides/web-dashboard.md#frontend-development) for the
 manual two-shell alternative.
 
+Add `--watch` to auto-rebuild the Rust backend on source edits:
+
+```bash
+cargo xtask dev --watch
+```
+
+It watches `src/**`, `Cargo.toml`, and `Cargo.lock`; on a change it runs
+`cargo build --features serve` and, if that succeeds, restarts `aoe serve`. A
+failed build leaves the running backend in place and prints the error. The Vite
+dev server is never restarted, so frontend HMR keeps working and the browser
+reconnects through the proxy once the backend is back. Note that the backend
+restart drops all live terminal and cockpit WebSocket connections.
+
 ### Dev namespace
 
 Debug builds use an isolated namespace so a local `cargo run` shares no

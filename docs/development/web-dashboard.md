@@ -22,6 +22,14 @@ cargo xtask dev
 # Ctrl-C stops both processes
 ```
 
+Pass `--watch` to auto-rebuild the Rust backend when you edit it:
+
+```bash
+cargo xtask dev --watch
+```
+
+It watches `src/**`, `Cargo.toml`, and `Cargo.lock`. On a change it runs `cargo build --features serve` and restarts `aoe serve` if the build succeeds; a failed build keeps the running backend up and prints the error. The Vite dev server stays up throughout (frontend HMR is unaffected), so the browser reconnects through the proxy once the backend is back. The restart drops live terminal and cockpit WebSocket connections, which is fine for a dev loop. Unix-only, same as the base command.
+
 ## Manual frontend development
 
 If you prefer to run the pieces by hand, the React frontend lives in `web/`:
