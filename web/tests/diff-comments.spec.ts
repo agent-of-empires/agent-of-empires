@@ -249,6 +249,18 @@ test.describe("Diff comments (#928)", () => {
         return r.fulfill({ json: {} });
       },
     );
+    // Capture the usage-signal pings so we can assert `diff_comments` fires
+    // on a confirmed send (#1881).
+    const seenSignals: string[] = [];
+    await page.route("**/api/telemetry/seen", (r) => {
+      try {
+        const body = JSON.parse(r.request().postData() || "{}");
+        if (typeof body.surface === "string") seenSignals.push(body.surface);
+      } catch {
+        // Ignore unparseable bodies.
+      }
+      return r.fulfill({ status: 204, body: "" });
+    });
     await openSessionAndFile(page);
     await startSingleLineComment(page, "new", 3);
     await page
@@ -279,6 +291,8 @@ test.describe("Diff comments (#928)", () => {
     expect(captured?.assembledMarkdown).not.toContain("aoe:diff-comments");
     // Banner cleared.
     await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
+    // The confirmed send fired the diff_comments usage signal (#1881).
+    await expect.poll(() => seenSignals).toContain("diff_comments");
   });
 
   test("hides feature for non-cockpit sessions", async ({ page }) => {

@@ -187,6 +187,21 @@
       ]
     },
     {
+      "id": "telemetry.feature-usage-signals",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/feature-usage-signals.spec.ts",
+        "tests/diff-comments.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useDiffFiles.ts",
+        "web/src/hooks/useTerminal.ts",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",
