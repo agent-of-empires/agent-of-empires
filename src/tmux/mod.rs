@@ -13,7 +13,7 @@ pub(crate) mod utils;
 pub use session::Session;
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
-pub(crate) use status_detection::reconcile_codex_hook_status;
+pub(crate) use status_detection::{reconcile_claude_hook_status, reconcile_codex_hook_status};
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;

@@ -122,6 +122,16 @@ pub fn detect_claude_status(content: &str) -> Status {
     let recent_joined = recent.join("\n");
     let recent_lower = recent_joined.to_lowercase();
 
+    // A blocking approval prompt has to outrank the spinner. Claude keeps its
+    // live "Working…" line rendered *below* the permission prompt while it
+    // waits for the user, so a sandboxed session (whose in-container hook
+    // status the host can't read, see `claude_poll_fn_sandboxed`) would
+    // otherwise match the spinner and report Running the whole time it is
+    // blocked. See #1913.
+    if claude_has_approval_prompt(&recent, &recent_lower) {
+        return Status::Waiting;
+    }
+
     if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
         return Status::Running;
     }
@@ -186,6 +196,59 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
     let first_word = &rest[..first_word_end];
     let starts_uppercase = first_word.chars().next().is_some_and(|c| c.is_uppercase());
     starts_uppercase && first_word.contains('…')
+}
+
+/// Claude renders a blocking approval prompt when a tool needs the user's
+/// permission (Bash command, file edit, plan exit, ...). Every variant pairs
+/// a yes/no question ("Do you want to proceed?", "Do you want to make this
+/// edit to <file>?", "Would you like to proceed?") with a numbered choice
+/// menu. Requiring both keeps an assistant-authored numbered list from being
+/// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
+fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
+    let has_question = recent_lower.contains("do you want to")
+        || recent_lower.contains("would you like to proceed");
+    has_question
+        && recent
+            .iter()
+            .any(|line| claude_line_is_numbered_choice(line))
+}
+
+/// A numbered menu option, optionally preceded by the `❯`/`>` selection
+/// cursor: `❯ 1. Yes`, `2. No`, `3. No, and tell Claude ...`.
+fn claude_line_is_numbered_choice(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix('❯')
+        .or_else(|| trimmed.strip_prefix('>'))
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
+}
+
+/// Strip ANSI and scan the recent pane lines for an approval prompt. Shares
+/// the same recent-window shape as `detect_claude_status`; this entry point
+/// exists for callers that hold raw (un-stripped) `capture-pane -e` output.
+fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    let recent_lower = recent.join("\n").to_lowercase();
+    claude_has_approval_prompt(&recent, &recent_lower)
+}
+
+/// When Claude's status hook reports Running, the pane can still be parked on a
+/// blocking approval prompt. Claude keeps its live spinner rendered below the
+/// prompt and re-emits running-mapped hook events (`PreToolUse`,
+/// `UserPromptSubmit`) while the prompt is up, so the last hook write stays
+/// `running` even though the agent is blocked on the user. Mirrors
+/// `reconcile_codex_hook_status`: downgrade Running -> Waiting when the pane
+/// shows an approval prompt, otherwise trust the hook. See #1913.
+pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &str) -> Status {
+    if hook_status == Status::Running && claude_pane_has_approval_prompt(raw_content) {
+        return Status::Waiting;
+    }
+    hook_status
 }
 
 pub fn detect_opencode_status(raw_content: &str) -> Status {
@@ -1571,6 +1634,107 @@ enter to select · esc to cancel";
             content.push('\n');
         }
         assert_eq!(detect_claude_status(&content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_bash_permission_prompt() {
+        // Regression for #1913: a sandboxed Claude session reaches the
+        // pane fallback (the host can't read the in-container hook status),
+        // and Claude keeps its live spinner line rendered *below* the
+        // approval prompt while it waits. The prompt must outrank the
+        // spinner or the session reports Running (green) the whole time
+        // it is blocked on the user.
+        let content = "\
+  Bash command
+
+    SANDBOX=aoe-sandbox-ee1a86c7
+    echo \"checking sandbox gitconfig\"
+
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. No
+
+  Esc to cancel · Tab to amend
+
+✶ Herding… (53s · ↓ 7.0k tokens)
+  Tip: Use /bts to ask a quick side question without interrupting Claude's current work";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_edit_permission_prompt() {
+        let content = "\
+  Do you want to make this edit to src/main.rs?
+  ❯ 1. Yes
+    2. Yes, allow all edits during this session (shift+tab)
+    3. No, and tell Claude what to do differently (esc)
+
+✶ Cooking… (8s · ↓ 412 tokens)";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_plan_exit_prompt() {
+        let content = "\
+  Would you like to proceed?
+  ❯ 1. Yes, and auto-accept edits
+    2. Yes, and manually approve edits
+    3. No, keep planning";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_not_confused_by_numbered_prose() {
+        // A numbered list in assistant prose must not be mistaken for an
+        // approval prompt: without a "do you want to" / "would you like to
+        // proceed" question, the live spinner still wins.
+        let content = "\
+  Here is the plan:
+  1. Read the config
+  2. Patch the parser
+
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_approval_prompt() {
+        // The hook reports Running (PreToolUse fired) but the pane is parked
+        // on a permission prompt with the spinner still alive below it. The
+        // reconciler must downgrade to Waiting. ANSI is preserved here to
+        // exercise the strip path the live capture goes through. See #1913.
+        let pane = "\x1b[1m  Do you want to proceed?\x1b[0m\n\
+  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend\n\
+\x1b[38;5;174m✶\x1b[0m Herding… (53s · ↓ 7.0k tokens)";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_keeps_running_without_prompt() {
+        let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_passes_non_running_through() {
+        // A Notification(permission_prompt) hook that does fire writes
+        // Waiting directly; the reconciler must not second-guess it, and an
+        // Idle/Waiting hook is trusted as-is even with no pane evidence.
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Waiting, ""),
+            Status::Waiting
+        );
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes"),
+            Status::Idle
+        );
     }
 
     #[test]
