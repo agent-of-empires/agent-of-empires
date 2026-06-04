@@ -216,7 +216,16 @@ export function SchemaSection({
     async (value: unknown): Promise<boolean> => {
       const result = onSaveField(d.section, d.field, value);
       const ok = result instanceof Promise ? await result : result !== false;
-      if (ok && onAfterSave) await onAfterSave(d, value);
+      // The setting is already persisted; a failing post-save hook (e.g. a
+      // serverAbout refresh that errors) must not turn a successful save into
+      // a failed one.
+      if (ok && onAfterSave) {
+        try {
+          await onAfterSave(d, value);
+        } catch (err) {
+          console.warn("settings onAfterSave hook failed", err);
+        }
+      }
       return ok;
     };
 
