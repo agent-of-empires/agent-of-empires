@@ -1712,31 +1712,42 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 }
 
 /// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
-/// every ~12 hours (jittered), plus a final one on graceful shutdown. The boot
+/// every ~4 hours (jittered), plus a final one on graceful shutdown. The boot
 /// `process_start` is emitted separately by the caller before transport setup.
 /// All sends are best-effort and swallow errors; nothing leaves the box unless
 /// the user opted in and an endpoint is configured.
 fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        // Jittered period (12h + up to 30m) so installs that boot together don't
+        // Jittered period (4h + up to 30m) so installs that boot together don't
         // snapshot in lockstep; the first tick is still immediate (boot
         // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
         let mut interval = tokio::time::interval(crate::telemetry::snapshot_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Sample the live session list more often than we send, folding each
+        // sample into a window aggregate so short-lived sessions' agent/model
+        // mix and the concurrency peak survive into the periodic snapshot (#1870).
+        // Both tickers share this one task, so a sample tick and a flush tick
+        // never run concurrently: the aggregate needs no locking and a plain
+        // reset after a confirmed send is race-free. `Skip` so a long suspend
+        // does not fire a run of catch-up samples on wake.
+        let mut sample = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
                     // Deduped: a serve process that starts and stops between
-                    // 12h ticks would otherwise emit the initial first-tick
+                    // periodic ticks would otherwise emit the initial first-tick
                     // snapshot and an identical shutdown snapshot seconds apart.
-                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                    // We exit after this, so the aggregate is dropped; no reset.
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
                         let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
                         clear_reported_serve_signals(&state, outcome);
                     }
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Some(snapshot) = build_serve_snapshot(&state).await {
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
                         // Awaited (not detached) so the reported signals are
                         // cleared only after a confirmed send. A failed send
                         // retains the usage_seen counts / the create counter
@@ -1747,7 +1758,17 @@ fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
                             crate::telemetry::SendOutcome::Failed
                         };
                         clear_reported_serve_signals(&state, outcome);
+                        // Reset the window only after a confirmed send, mirroring
+                        // the signal-clear discipline: a failed send keeps the
+                        // aggregate so the next flush re-reports the full window.
+                        if outcome == crate::telemetry::SendOutcome::Sent {
+                            aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+                        }
                     }
+                }
+                _ = sample.tick() => {
+                    let instances = state.instances.read().await.clone();
+                    aggregator.sample(&instances);
                 }
             }
         }
@@ -1873,13 +1894,23 @@ struct ReportedServeSignals {
 /// resetting them*. The reported counts are stashed in `AppState` so
 /// [`clear_reported_serve_signals`] can subtract exactly what was reported once
 /// the send is confirmed. Returns `None` when telemetry is not opted in.
-async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::UsageSnapshot> {
+///
+/// The live read is also folded into `aggregator` as the flush-moment sample,
+/// then the window's peak concurrency and distinct-sessions-seen maps override
+/// the point-in-time defaults `build_usage_snapshot` produced (#1870). The
+/// point-in-time `session_total` and status/sandbox/yolo/cockpit counts keep
+/// their instant-of-flush meaning.
+async fn build_serve_snapshot(
+    state: &AppState,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+) -> Option<crate::telemetry::UsageSnapshot> {
     use std::sync::atomic::Ordering;
     let usage_seen = state.telemetry_usage_seen.snapshot();
     let web_clients = state.telemetry_web_clients.read();
     let cockpit_clients = state.telemetry_cockpit_clients.read();
     let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
     let instances = state.instances.read().await.clone();
+    aggregator.sample(&instances);
     let mut snapshot = crate::telemetry::build_usage_snapshot(
         crate::telemetry::Surface::Serve,
         &instances,
@@ -1893,6 +1924,9 @@ async fn build_serve_snapshot(state: &AppState) -> Option<crate::telemetry::Usag
     // daemon fills them here from its client counters.
     snapshot.web_clients_seen = web_clients.seen_map();
     snapshot.cockpit_clients_seen = cockpit_clients.seen_map();
+    snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
+    snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
+    snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
         usage_seen,
         web_clients,

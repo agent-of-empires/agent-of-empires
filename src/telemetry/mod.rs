@@ -18,6 +18,7 @@
 //!   are coerced to a closed allowlist; raw commands, paths, titles, branch
 //!   names, and prompts are never emitted.
 
+pub mod aggregate;
 pub mod events;
 pub mod features;
 pub mod form_factor;
@@ -76,14 +77,19 @@ const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// Base cadence for periodic `usage_snapshot` sends (TUI and serve). The real
-/// period is this plus bounded jitter (see [`snapshot_interval`]).
-pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+/// period is this plus bounded jitter (see [`snapshot_interval`]). Set to 4h so
+/// the steady-state heartbeat covers a typical workday about twice and a hard
+/// kill (power-off / crash, which skips the graceful-shutdown flush) loses at
+/// most one ~4h window rather than 12h. Short-lived runs are already bracketed
+/// by the immediate boot snapshot and the shutdown flush, so this only shapes
+/// the cadence of a long-running daemon.
+pub const SNAPSHOT_BASE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Upper bound on the random jitter added to [`SNAPSHOT_BASE_INTERVAL`].
 const SNAPSHOT_JITTER: Duration = Duration::from_secs(30 * 60);
 
 /// Periodic snapshot period: [`SNAPSHOT_BASE_INTERVAL`] plus a random offset in
-/// `[0, SNAPSHOT_JITTER)`. A fixed 12h period anchored to process start means a
+/// `[0, SNAPSHOT_JITTER)`. A fixed 4h period anchored to process start means a
 /// fleet that boots together (e.g. a post-update restart wave) keeps snapshotting
 /// in lockstep forever; rolling a per-process jitter decorrelates the periodic
 /// ticks so they spread apart by the second tick. The boot snapshot is sent
@@ -235,6 +241,29 @@ struct InstanceMetrics {
     by_substrate: BTreeMap<String, u32>,
 }
 
+/// Map an instance to its `(agent bucket, model bucket)` telemetry labels, both
+/// already coerced to the [`sanitize`] allowlist. Shared by [`aggregate_instances`]
+/// (point-in-time) and the serve windowed aggregator ([`aggregate`]) so both
+/// bucket sessions identically. The model bucket only exists in `serve` builds;
+/// elsewhere it is treated as absent (`unset`).
+pub(crate) fn instance_buckets(inst: &Instance) -> (String, String) {
+    // Prefer the canonical detection name; fall back to the raw tool string.
+    // Either way it is coerced to an allowlisted bucket.
+    let agent_src = if inst.detect_as.trim().is_empty() {
+        inst.tool.as_str()
+    } else {
+        inst.detect_as.as_str()
+    };
+    #[cfg(feature = "serve")]
+    let model = inst.cockpit_model.as_deref();
+    #[cfg(not(feature = "serve"))]
+    let model: Option<&str> = None;
+    (
+        sanitize::agent_bucket(agent_src),
+        sanitize::model_bucket(model).to_string(),
+    )
+}
+
 fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
     let mut by_agent: BTreeMap<String, u32> = BTreeMap::new();
     let mut by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
@@ -307,23 +336,9 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
             archived += 1;
         }
 
-        // Prefer the canonical detection name; fall back to the raw tool
-        // string. Either way it is coerced to an allowlisted bucket.
-        let agent_src = if inst.detect_as.trim().is_empty() {
-            inst.tool.as_str()
-        } else {
-            inst.detect_as.as_str()
-        };
-        *by_agent
-            .entry(sanitize::agent_bucket(agent_src))
-            .or_insert(0) += 1;
-
-        #[cfg(feature = "serve")]
-        let model = inst.cockpit_model.as_deref();
-        #[cfg(not(feature = "serve"))]
-        let model: Option<&str> = None;
-        let bucket = sanitize::model_bucket(model);
-        *by_model_bucket.entry(bucket.to_string()).or_insert(0) += 1;
+        let (agent, model) = instance_buckets(inst);
+        *by_agent.entry(agent).or_insert(0) += 1;
+        *by_model_bucket.entry(model).or_insert(0) += 1;
     }
 
     InstanceMetrics {
@@ -438,12 +453,19 @@ fn assemble_usage_snapshot(
         session_cockpit: metrics.cockpit,
         session_sandboxed: metrics.sandboxed,
         session_yolo: metrics.yolo,
+        // Point-in-time default: equals the instant total. The serve loop
+        // overrides this with its window peak; the TUI keeps the instant value.
+        peak_concurrent_sessions: metrics.total,
         session_pinned: metrics.pinned,
         session_snoozed: metrics.snoozed,
         session_archived: metrics.archived,
         sessions_by_agent: metrics.by_agent,
         sessions_by_model_bucket: metrics.by_model_bucket,
         sessions_by_substrate: metrics.by_substrate,
+        // Window aggregates are serve-only; empty here. The serve loop fills
+        // them from its `UsageAggregator`, the TUI leaves them empty.
+        distinct_sessions_by_agent: BTreeMap::new(),
+        distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
         usage_seen,
         // Serve-only per-form-factor maps; the disk-free assembler leaves them
@@ -748,12 +770,15 @@ mod tests {
             session_cockpit: 0,
             session_sandboxed: 2,
             session_yolo: 0,
+            peak_concurrent_sessions: 7,
             session_pinned: 0,
             session_snoozed: 0,
             session_archived: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
             sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
+            distinct_sessions_by_agent: BTreeMap::new(),
+            distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),

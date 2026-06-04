@@ -161,6 +161,12 @@ fn snapshot_buckets_are_sanitized() {
     assert_eq!(snapshot.sessions_by_agent.get("claude"), Some(&1));
     assert_eq!(snapshot.session_total, 2);
 
+    // The base builder leaves the serve window fields at their point-in-time /
+    // empty defaults; only `aoe serve` overrides them from its aggregator.
+    assert_eq!(snapshot.peak_concurrent_sessions, 2);
+    assert!(snapshot.distinct_sessions_by_agent.is_empty());
+    assert!(snapshot.distinct_sessions_by_model_bucket.is_empty());
+
     // The feature-adoption map is present with its fixed allowlisted keys
     // (values reflect config; all false under a default config).
     for key in ["worktree", "sandbox", "cockpit", "auto_update"] {

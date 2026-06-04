@@ -26,7 +26,9 @@ use serde::Serialize;
 /// and `usage_snapshot`.
 /// v9 (#1883): added the `web_clients_seen` / `cockpit_clients_seen`
 /// per-form-factor maps alongside the `usage_seen` open counts.
-pub const SCHEMA_VERSION: u32 = 9;
+/// v10 (#1870): added serve windowed fields `peak_concurrent_sessions` and the
+/// `distinct_sessions_by_agent` / `distinct_sessions_by_model_bucket` maps.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -116,7 +118,7 @@ pub struct CliUsage {
 }
 
 /// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
-/// ~12 hours, and best-effort on graceful shutdown. Carries current
+/// ~4 hours, and best-effort on graceful shutdown. Carries current
 /// aggregate state, never a per-action stream. Every string-valued bucket
 /// has already passed through [`super::sanitize`].
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +154,13 @@ pub struct UsageSnapshot {
     pub session_sandboxed: u32,
     pub session_yolo: u32,
 
+    /// Peak concurrent `session_total` observed across the window since the
+    /// last snapshot. `aoe serve` folds a sample every ~30 min into a local
+    /// aggregate and reports the max here, so a short-lived burst of sessions
+    /// that opens and closes between two 4h sends is still captured. The TUI
+    /// does not aggregate, so it reports the point-in-time `session_total`.
+    pub peak_concurrent_sessions: u32,
+
     /// Sessions currently pinned, snoozed (future `snoozed_until`), or
     /// archived at snapshot time. Point-in-time state prevalence, not action
     /// counts; the three are mutually exclusive per the session triage
@@ -181,6 +190,17 @@ pub struct UsageSnapshot {
     /// workspace / worktree", NOT "all sandboxed sessions"; use
     /// `session_sandboxed` for the latter.
     pub sessions_by_substrate: BTreeMap<String, u32>,
+
+    /// Allowlisted agent bucket -> distinct sessions *seen* across the window
+    /// since the last snapshot (not concurrent at the tick), so short-lived
+    /// sessions caught by a ~30-min sample still contribute their agent mix.
+    /// The sum can exceed `session_total`. Populated by `aoe serve`; empty on
+    /// the TUI, which does not aggregate.
+    pub distinct_sessions_by_agent: BTreeMap<String, u32>,
+    /// Coarse model family bucket -> distinct sessions seen across the window.
+    /// Same window semantics as [`Self::distinct_sessions_by_agent`]; serve-only.
+    pub distinct_sessions_by_model_bucket: BTreeMap<String, u32>,
+
     /// Install-level feature adoption: allowlisted feature name -> active.
     /// Keyed by the fixed registry in [`super::features`]; lets new gated
     /// features be tracked by registering the flag, not by extending the
