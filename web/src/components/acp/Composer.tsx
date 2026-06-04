@@ -508,8 +508,12 @@ export function Composer({
   // effect rather than during render to satisfy react-hooks/refs.
   const primerIdRef = useRef(primerId);
   const primerTextRef = useRef(primerText);
-  useEffect(() => { primerIdRef.current = primerId; });
-  useEffect(() => { primerTextRef.current = primerText; });
+  useEffect(() => {
+    primerIdRef.current = primerId;
+  }, [primerId]);
+  useEffect(() => {
+    primerTextRef.current = primerText;
+  }, [primerText]);
   useEffect(() => {
     if (!primerIdRef.current || primerTextRef.current == null) return;
     composerRuntime.setText(primerTextRef.current);
