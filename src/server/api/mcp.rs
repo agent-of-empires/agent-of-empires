@@ -38,7 +38,7 @@ fn resolve_agent(state: &AppState, requested: Option<String>) -> String {
     })
 }
 
-/// `GET /api/mcp/servers?agent=<a>` — the effective set plus drift, redacted.
+/// `GET /api/mcp/servers?agent=<a>`: the effective set plus drift, redacted.
 pub async fn get_mcp_servers(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentQuery>,
@@ -91,7 +91,7 @@ pub struct ResolveConflictBody {
     fingerprint: String,
 }
 
-/// `POST /api/mcp/servers/{name}/resolve` — resolve a conflict (feature C).
+/// `POST /api/mcp/servers/{name}/resolve`: resolve a conflict (feature C).
 pub async fn resolve_mcp_conflict(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -153,7 +153,7 @@ pub struct AgentBody {
     agent: String,
 }
 
-/// `POST /api/mcp/servers/{name}/keep` — keep a removed server (feature D),
+/// `POST /api/mcp/servers/{name}/keep`: keep a removed server (feature D),
 /// promoting it into the global `mcp.json`.
 pub async fn keep_mcp_server(
     State(state): State<Arc<AppState>>,
@@ -179,7 +179,7 @@ pub async fn keep_mcp_server(
     }
 }
 
-/// `POST /api/mcp/servers/{name}/drop` — drop a kept-on-removal server without
+/// `POST /api/mcp/servers/{name}/drop`: drop a kept-on-removal server without
 /// promoting it (feature D).
 pub async fn drop_mcp_server(
     State(state): State<Arc<AppState>>,
