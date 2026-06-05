@@ -214,9 +214,23 @@ impl LoginManager {
         // Rewrite the store once at startup so the passphrase hash is
         // refreshed (rotates the salt) and any dropped/expired entries
         // are pruned on disk. Synchronous: a one-time tiny write, and no
-        // tokio lock is held yet. Errors are logged inside write_sessions.
-        let snapshot = build_persisted(&passphrase_hash, &sessions);
-        write_sessions(&sessions_path, &snapshot);
+        // tokio lock is held yet. Skip the rewrite when the path is
+        // insecure (symlink, loose perms, untrusted parent dir): writing
+        // there would be the same fail-open the load-side rejection
+        // guards against. See #1235.
+        match check_path_security(&sessions_path) {
+            Ok(()) => {
+                let snapshot = build_persisted(&passphrase_hash, &sessions);
+                write_sessions(&sessions_path, &snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "auth.passphrase",
+                    error = %e,
+                    "refusing to write persisted login sessions to an insecure path"
+                );
+            }
+        }
 
         Self {
             passphrase_hash,
@@ -302,6 +316,12 @@ impl LoginManager {
         // past `REFRESH_PERSIST_THRESHOLD`, and an expiry eviction
         // persists immediately. See #1235.
         let mut needs_persist = false;
+        // `Some(deadline)` when this validation refreshed the sliding
+        // window far enough to re-persist. The watermark is advanced only
+        // after a successful write (below), so a failed persist keeps
+        // retrying on later refreshes instead of suppressing them for the
+        // next ~24h. See #1235.
+        let mut refreshed_deadline: Option<Instant> = None;
         let valid = {
             let mut sessions = self.sessions.write().await;
             let Some(session) = sessions.get_mut(session_id) else {
@@ -324,15 +344,19 @@ impl LoginManager {
                 if new_expiry.saturating_duration_since(session.last_persisted_expires_at)
                     > REFRESH_PERSIST_THRESHOLD
                 {
-                    session.last_persisted_expires_at = new_expiry;
                     needs_persist = true;
+                    refreshed_deadline = Some(new_expiry);
                 }
                 true
             }
         };
 
-        if needs_persist {
-            self.persist().await;
+        if needs_persist && self.persist().await {
+            if let Some(deadline) = refreshed_deadline {
+                if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+                    session.last_persisted_expires_at = deadline;
+                }
+            }
         }
         valid
     }
@@ -544,18 +568,23 @@ impl LoginManager {
     }
 
     /// Persist the current sessions to disk when persistence is enabled.
-    /// No-op otherwise. Errors are logged, never propagated: a failed
-    /// write must not break an in-flight login. Runs the blocking file
-    /// write on a blocking thread so the async runtime is never stalled.
-    async fn persist(&self) {
+    /// Returns whether the store is now durable: `true` on a successful
+    /// write (or when persistence is disabled, nothing to do), `false`
+    /// when the write failed. Errors are logged, never propagated: a
+    /// failed write must not break an in-flight login. Runs the blocking
+    /// file write on a blocking thread so the async runtime is never
+    /// stalled. See #1235.
+    async fn persist(&self) -> bool {
         let Some(path) = self.sessions_path.clone() else {
-            return;
+            return true;
         };
         let snapshot = {
             let sessions = self.sessions.read().await;
             build_persisted(&self.passphrase_hash, &sessions)
         };
-        let _ = tokio::task::spawn_blocking(move || write_sessions(&path, &snapshot)).await;
+        tokio::task::spawn_blocking(move || write_sessions(&path, &snapshot))
+            .await
+            .unwrap_or(false)
     }
 
     /// Spawn periodic cleanup (piggybacks on the rate limiter's interval).
@@ -689,19 +718,21 @@ fn build_persisted(
     }
 }
 
-/// Atomically write the session store, owner-only (0600). Errors are
-/// logged, never propagated: a failed persist must not break a login.
-fn write_sessions(path: &Path, file: &PersistedFile) {
+/// Atomically write the session store, owner-only (0600). Returns
+/// whether the write succeeded. Errors are logged, never propagated: a
+/// failed persist must not break a login, but the boolean lets callers
+/// avoid advancing the on-disk-expiry watermark on a failed write.
+fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
     let toml = match toml::to_string(file) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(target: "auth.passphrase", error = %e, "serialize login sessions");
-            return;
+            return false;
         }
     };
     if let Err(e) = crate::session::atomic_write(path, toml.as_bytes()) {
         tracing::warn!(target: "auth.passphrase", error = %e, "write login sessions");
-        return;
+        return false;
     }
     // `atomic_write` lands the file via a `NamedTempFile`, which is 0600
     // on first create; re-assert it defensively so the secret can never
@@ -710,6 +741,50 @@ fn write_sessions(path: &Path, file: &PersistedFile) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    true
+}
+
+/// Fail-closed check that the sessions store is safe to read from or
+/// write to: the parent dir must exist, not be a symlink, and not be
+/// group/world writable; the file itself (when it exists) must be a
+/// regular, owner-only (0600) file, not a symlink. Shared by the load
+/// path and the startup rewrite so neither fails open on a tampered or
+/// misconfigured app dir. A missing file is fine, it has not been
+/// created yet. See #1235.
+fn check_path_security(path: &Path) -> anyhow::Result<()> {
+    use anyhow::{bail, Context};
+
+    if let Some(parent) = path.parent() {
+        let pmeta = std::fs::symlink_metadata(parent).context("stat login sessions parent dir")?;
+        if pmeta.file_type().is_symlink() {
+            bail!("login sessions parent dir is a symlink; refusing");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if pmeta.permissions().mode() & 0o022 != 0 {
+                bail!("login sessions parent dir is group/world writable; refusing");
+            }
+        }
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("login sessions path is a symlink; refusing");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o077 != 0 {
+                    bail!("login sessions file is group/world accessible; refusing");
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("stat login sessions file"),
     }
 }
 
@@ -722,27 +797,17 @@ fn load_sessions(
     path: &Path,
     passphrase: Option<&str>,
 ) -> anyhow::Result<HashMap<String, LoginSession>> {
-    use anyhow::{bail, Context};
+    use anyhow::Context;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(e) => return Err(e).context("stat login sessions file"),
-    };
-    if meta.file_type().is_symlink() {
-        bail!("login sessions path is a symlink; refusing to read");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o077 != 0 {
-            bail!("login sessions file is group/world accessible; refusing to read");
-        }
-    }
+    check_path_security(path)?;
 
-    let raw = std::fs::read_to_string(path).context("read login sessions file")?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e).context("read login sessions file"),
+    };
     let file: PersistedFile = toml::from_str(&raw).context("parse login sessions file")?;
 
     if file.schema_version != SESSIONS_SCHEMA_VERSION {
@@ -1875,5 +1940,59 @@ mod tests {
             !dir.path().join(SESSIONS_FILE).exists(),
             "no persistence path means no file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_path_security_rejects_symlink_and_loose_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A symlink at the sessions path is rejected (no following).
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            check_path_security(&link).is_err(),
+            "symlink must be rejected"
+        );
+
+        // A world/group-accessible file is rejected.
+        let loose = dir.path().join("loose.toml");
+        std::fs::write(&loose, "x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            check_path_security(&loose).is_err(),
+            "0644 file must be rejected"
+        );
+
+        // A 0600 file under a private dir passes.
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "x").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // tempfile dirs are 0700, so the parent check passes too.
+        assert!(check_path_security(&ok).is_ok(), "0600 file should pass");
+
+        // A missing file (not yet created) passes: the parent is fine.
+        assert!(check_path_security(&dir.path().join("missing.toml")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_persistence_skips_rewrite_on_symlinked_path() {
+        // Regression for the fail-closed contract: a symlinked store must
+        // not be rewritten (which would write through the link). See #1235.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.toml");
+        std::fs::write(&target, "original").unwrap();
+        let store = dir.path().join(SESSIONS_FILE);
+        std::os::unix::fs::symlink(&target, &store).unwrap();
+
+        let _mgr = LoginManager::with_persistence(Some("pass"), dir.path());
+
+        // The symlink target is untouched: the startup rewrite was skipped.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
     }
 }
