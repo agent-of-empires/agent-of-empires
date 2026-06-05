@@ -207,9 +207,12 @@ on_create = ["echo v1"]
     );
 
     // Trust v1
-    if let TrustSurface::NeedsTrust { hash, .. } = &check_repo_trust(repo.path()).unwrap().hooks {
-        trust_repo(repo.path(), Some(hash), None).unwrap();
-    }
+    let trust = check_repo_trust(repo.path()).unwrap();
+    let hash = match &trust.hooks {
+        TrustSurface::NeedsTrust { hash, .. } => hash.clone(),
+        _ => panic!("v1 hooks should initially need trust"),
+    };
+    trust_repo(repo.path(), Some(&hash), None).unwrap();
 
     // Modify to v2
     let config_dir = repo.path().join(".agent-of-empires");
