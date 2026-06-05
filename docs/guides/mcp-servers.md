@@ -66,6 +66,38 @@ Per-profile entries are AoE state only. AoE never writes them back into any
 agent's native config; the sync direction is native into AoE, never the
 reverse.
 
+## Project-local servers (trusted repos)
+
+A repository can ship its own MCP servers in a `.mcp.json` at its root, the same
+ecosystem-standard file other tools read. AoE forwards these as the
+highest-precedence layer, but only after you have trusted the repository, because
+a project-local stdio server would otherwise launch its `command` the moment a
+session starts: opening a cloned, untrusted repo would be a zero-click way to run
+its code. This is the same trust gate AoE already applies to repository lifecycle
+hooks.
+
+When you create a session for a repo whose `.mcp.json` (or hooks) you have not
+yet approved, AoE shows a trust prompt listing the servers it found: each
+server's name, transport, command and arguments or URL, and the NAMES of its env
+vars and headers. Values are never shown. Approving records the trust; declining
+creates the session without forwarding the project servers.
+
+The file is read from the repository root (for a worktree session, the main
+repository the worktree was created from), so the servers you reviewed in the
+prompt are exactly the servers forwarded. The trust is re-checked on every
+session start: if `.mcp.json` changes, AoE re-prompts the next time you create a
+session for that repo, and in the meantime the changed servers are skipped.
+
+Two current limitations:
+
+- The trust prompt exists in the TUI and the `aoe add` CLI only. Sessions created
+  from the web dashboard cannot approve project MCP yet, so their project-local
+  `.mcp.json` is skipped (with a log notice) until you approve the repo from the
+  TUI or CLI. A web trust surface is tracked separately.
+- Per-worktree or per-branch `.mcp.json` divergence is not supported: the main
+  repository's file is the one read. Use a per-profile `mcp.json` for servers
+  that should differ per worktree.
+
 ## Native agent config
 
 If you already declared MCP servers in your agent's own config, AoE reads them
@@ -84,13 +116,14 @@ When the same server name appears in more than one source, the higher-precedence
 source wins (per server, not whole file):
 
 ```text
-agent-native  <  mcp.json (global)  <  per-profile mcp.json
+agent-native  <  mcp.json (global)  <  per-profile mcp.json  <  project-local .mcp.json (trusted)
 ```
 
 So a server defined in both your agent's native config and the global `mcp.json`
-is taken from `mcp.json`, and one defined in both the global and per-profile
-files is taken from the per-profile file. Each override is logged. A project-local
-source is a planned higher layer on top of this stack and is tracked separately.
+is taken from `mcp.json`; one defined in both the global and per-profile files is
+taken from the per-profile file; and a trusted project-local server outranks all
+of them. Each override is logged. The project-local layer only participates once
+the repository is trusted (see Project-local servers above).
 
 ## Capability gating
 
@@ -113,17 +146,15 @@ entries and any secrets in `env` / `headers` stay out of source control. Treat
 it like any file that can launch processes on your behalf: a stdio server runs
 its `command` locally when a session starts.
 
-<<<<<<< HEAD
-Project-local `.mcp.json` (read from a repository) and per-profile MCP config
-are not supported yet.
-=======
 A per-profile `mcp.json` lives in the profile directory under your app
 directory, so it is owned by you with the same trust as the global file. Treat
 it the same way: its `command` entries can launch processes on your behalf.
 
-Project-local `.mcp.json` (read from a repository) is not supported yet. A
-repository-provided server config would let a cloned, untrusted repo launch
-commands the moment you open a session, so it must sit behind the same
-repo-trust gate AoE already uses for lifecycle hooks; that work is tracked
-separately.
->>>>>>> 396266e1 (docs(mcp): document per-profile MCP config layer)
+A project-local `.mcp.json` is repository-provided, so unlike the files above it
+is NOT implicitly trusted: a cloned, untrusted repo could otherwise launch its
+`command` the moment you open a session. It sits behind the same repo-trust gate
+AoE uses for lifecycle hooks, forwarded only after you approve the repo, and
+re-checked on every session start so a changed file re-prompts. See Project-local
+servers above. The trust fingerprint includes env and header values, so rotating
+a secret in a project `.mcp.json` re-prompts; the prompt itself never displays
+those values.
