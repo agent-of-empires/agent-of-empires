@@ -7168,17 +7168,32 @@ mod divider_drag {
 mod preview_drag_select {
     //! Click-and-drag on the preview pane starts an in-app text
     //! selection whenever the pane is on screen (in or out of live
-    //! mode). The selection is anchored to absolute scrollback lines, so
-    //! it survives a scroll and can span more than one page; the renderer
-    //! re-derives the highlight rects each frame and release copies the
-    //! full range through OSC 52. We need our own selection handler
-    //! because the TUI captures mouse events to support wheel scroll,
-    //! which keeps terminal-native drag-select from reaching the preview.
+    //! mode). The selection is anchored to a distance from the newest
+    //! line, so it survives a scroll (even as the captured window grows)
+    //! and can span more than one page; the renderer re-derives the
+    //! highlight rects each frame and release copies the full range
+    //! through OSC 52. We need our own selection handler because the TUI
+    //! captures mouse events to support wheel scroll, which keeps
+    //! terminal-native drag-select from reaching the preview.
 
     use super::*;
     use crate::tui::home::{live_send::LiveSendState, DragKind, PreviewSelection, PreviewTextView};
     use ratatui::layout::Rect;
     use ratatui::text::{Line, Text};
+
+    /// Absolute parsed-line index to the `from_bottom` distance the
+    /// selection stores, for a pane of `total` lines. Tests express
+    /// positions in absolute lines for readability and convert at the
+    /// boundary.
+    fn fb(total: usize, abs: usize) -> usize {
+        total - 1 - abs
+    }
+
+    /// Read a stored `(col, from_bottom)` selection cell back as
+    /// `(col, abs_line)` for a pane of `total` lines.
+    fn to_abs(total: usize, cell: (u16, usize)) -> (u16, usize) {
+        (cell.0, total - 1 - cell.1)
+    }
 
     /// Stage the output-pane text-view snapshot the render path would set,
     /// plus the backing parsed cache, so the drag handlers can map screen
@@ -7240,8 +7255,8 @@ mod preview_drag_select {
         assert!(matches!(env.view.drag_state, Some(DragKind::PreviewSelect)));
         let sel = env.view.preview_selection.expect("selection installed");
         // col offset 50-40=10, content line first_line(0)+10=10.
-        assert_eq!(sel.anchor, (10, 10));
-        assert_eq!(sel.extent, (10, 10));
+        assert_eq!(to_abs(100, sel.anchor), (10, 10));
+        assert_eq!(to_abs(100, sel.extent), (10, 10));
         assert!(!sel.finalized);
     }
 
@@ -7255,7 +7270,7 @@ mod preview_drag_select {
         assert!(env.view.handle_drag_start(50, 10));
         let sel = env.view.preview_selection.expect("selection installed");
         // line first_line(100) + (row 10 - pane.y 0) = 110.
-        assert_eq!(sel.anchor, (10, 110));
+        assert_eq!(to_abs(200, sel.anchor), (10, 110));
     }
 
     #[test]
@@ -7297,8 +7312,8 @@ mod preview_drag_select {
         assert!(env.view.handle_drag_start(50, 10));
         assert!(matches!(env.view.drag_state, Some(DragKind::PreviewSelect)));
         let sel = env.view.preview_selection.expect("selection installed");
-        assert_eq!(sel.anchor, (10, 10));
-        assert_eq!(sel.extent, (10, 10));
+        assert_eq!(to_abs(100, sel.anchor), (10, 10));
+        assert_eq!(to_abs(100, sel.extent), (10, 10));
         assert!(!sel.finalized);
     }
 
@@ -7314,7 +7329,7 @@ mod preview_drag_select {
         let sel = env.view.preview_selection.expect("selection still live");
         // col offset clamps to width-1 = 59, content line to the last
         // visible line first_line(0)+height-1 = 19.
-        assert_eq!(sel.extent, (59, 19));
+        assert_eq!(to_abs(20, sel.extent), (59, 19));
     }
 
     #[test]
@@ -7405,7 +7420,10 @@ mod preview_drag_select {
         // No scroll yet, extent pinned to the last visible line (39).
         assert_eq!(env.view.preview_scroll_offset, 10);
         assert_eq!(
-            env.view.preview_selection.expect("live selection").extent,
+            to_abs(
+                50,
+                env.view.preview_selection.expect("live selection").extent
+            ),
             (0, 39)
         );
     }
@@ -7427,7 +7445,10 @@ mod preview_drag_select {
         assert!(env.view.tick_preview_autoscroll());
         assert_eq!(env.view.preview_scroll_offset, 9);
         assert_eq!(
-            env.view.preview_selection.expect("live selection").extent,
+            to_abs(
+                50,
+                env.view.preview_selection.expect("live selection").extent
+            ),
             (0, 40)
         );
         // Second tick, still no mouse event: advance again. (Clear the
@@ -7437,7 +7458,10 @@ mod preview_drag_select {
         assert!(env.view.tick_preview_autoscroll());
         assert_eq!(env.view.preview_scroll_offset, 8);
         assert_eq!(
-            env.view.preview_selection.expect("live selection").extent,
+            to_abs(
+                50,
+                env.view.preview_selection.expect("live selection").extent
+            ),
             (0, 41)
         );
     }
@@ -7455,7 +7479,10 @@ mod preview_drag_select {
         assert_eq!(env.view.preview_scroll_offset, 11);
         // New top line 34.
         assert_eq!(
-            env.view.preview_selection.expect("live selection").extent,
+            to_abs(
+                50,
+                env.view.preview_selection.expect("live selection").extent
+            ),
             (0, 34)
         );
     }
@@ -7497,9 +7524,10 @@ mod preview_drag_select {
                 "line0aaa", "line1bbb", "line2ccc", "line3ddd", "line4eee", "line5fff",
             ],
         );
+        // Absolute lines 1..4 (col 0 of line 1 through col 6 of line 4).
         env.view.preview_selection = Some(PreviewSelection {
-            anchor: (0, 1),
-            extent: (6, 4),
+            anchor: (0, fb(6, 1)),
+            extent: (6, fb(6, 4)),
             finalized: true,
         });
         let text = env
@@ -7520,8 +7548,8 @@ mod preview_drag_select {
             &["hello     ", "world     ", "          "],
         );
         env.view.preview_selection = Some(PreviewSelection {
-            anchor: (0, 0),
-            extent: (9, 1),
+            anchor: (0, fb(3, 0)),
+            extent: (9, fb(3, 1)),
             finalized: true,
         });
         let text = env
@@ -7537,8 +7565,8 @@ mod preview_drag_select {
         let mut env = create_test_env_empty();
         stage_text(&mut env, Rect::new(0, 0, 5, 2), 0, &["     ", "     "]);
         env.view.preview_selection = Some(PreviewSelection {
-            anchor: (0, 0),
-            extent: (4, 1),
+            anchor: (0, fb(2, 0)),
+            extent: (4, fb(2, 1)),
             finalized: true,
         });
         assert!(env.view.extract_preview_selection_text().is_none());
@@ -7620,8 +7648,8 @@ mod preview_drag_select {
             &["abcdefghij", "klmnopqrst", "uvwxyz0123"],
         );
         env.view.preview_selection = Some(PreviewSelection {
-            anchor: (3, 0),
-            extent: (5, 2),
+            anchor: (3, fb(3, 0)),
+            extent: (5, fb(3, 2)),
             finalized: true,
         });
         let text = env
@@ -7639,8 +7667,8 @@ mod preview_drag_select {
         let mut env = create_test_env_empty();
         stage_text(&mut env, Rect::new(0, 0, 5, 2), 0, &["abcde", "fghij"]);
         env.view.preview_selection = Some(PreviewSelection {
-            anchor: (2, 1),
-            extent: (1, 0),
+            anchor: (2, fb(2, 1)),
+            extent: (1, fb(2, 0)),
             finalized: true,
         });
         let text = env
@@ -7663,8 +7691,8 @@ mod preview_drag_select {
     #[serial]
     fn screen_flow_rects_single_row_returns_one_segment() {
         let sel = PreviewSelection {
-            anchor: (10, 5),
-            extent: (15, 5),
+            anchor: (10, fb(100, 5)),
+            extent: (15, fb(100, 5)),
             finalized: false,
         };
         let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
@@ -7676,8 +7704,8 @@ mod preview_drag_select {
     #[serial]
     fn screen_flow_rects_two_rows_returns_two_segments() {
         let sel = PreviewSelection {
-            anchor: (10, 5),
-            extent: (3, 6),
+            anchor: (10, fb(100, 5)),
+            extent: (3, fb(100, 6)),
             finalized: false,
         };
         let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
@@ -7692,8 +7720,8 @@ mod preview_drag_select {
     #[serial]
     fn screen_flow_rects_three_rows_are_per_row_full_width_middles() {
         let sel = PreviewSelection {
-            anchor: (10, 5),
-            extent: (3, 8),
+            anchor: (10, fb(100, 5)),
+            extent: (3, fb(100, 8)),
             finalized: false,
         };
         let rects = sel.screen_flow_rects(view(Rect::new(0, 0, 40, 20), 0, 100));
@@ -7712,8 +7740,8 @@ mod preview_drag_select {
         // inside the visible window paint, each full width since neither
         // the start nor the end line is in view.
         let sel = PreviewSelection {
-            anchor: (2, 8),
-            extent: (7, 20),
+            anchor: (2, fb(100, 8)),
+            extent: (7, fb(100, 20)),
             finalized: false,
         };
         // Visible lines are 10..15 (first_line 10, height 5).
@@ -7728,8 +7756,8 @@ mod preview_drag_select {
     #[serial]
     fn screen_flow_rects_fully_offscreen_returns_empty() {
         let sel = PreviewSelection {
-            anchor: (0, 2),
-            extent: (5, 4),
+            anchor: (0, fb(100, 2)),
+            extent: (5, fb(100, 4)),
             finalized: false,
         };
         // Selection lines 2..4 sit above the visible window 10..15.

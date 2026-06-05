@@ -121,22 +121,43 @@ impl PreviewTextView {
                 .contains(ratatui::layout::Position::from((col, row)))
     }
 
-    /// Map a screen cell to content coords `(col_offset, line)`, clamped
-    /// into the pane and the scrollback. `col_offset` is 0-based from the
-    /// pane's left edge; `line` is an absolute index into the parsed
-    /// scrollback.
-    pub(super) fn screen_to_content(self, col: u16, row: u16) -> (u16, usize) {
+    /// Absolute parsed-text index of the line painted on screen row
+    /// `row`, clamped into the pane and the scrollback.
+    fn abs_line_at_row(self, row: u16) -> usize {
         let pane = self.pane;
-        let max_x = pane.right().saturating_sub(1);
         let max_y = pane.bottom().saturating_sub(1);
-        let cx = col.clamp(pane.x, max_x);
         let cy = row.clamp(pane.y, max_y);
-        let col_off = cx - pane.x;
         let mut line = self.first_line + (cy - pane.y) as usize;
         if self.total_lines > 0 {
             line = line.min(self.total_lines - 1);
         }
-        (col_off, line)
+        line
+    }
+
+    /// Map a screen cell to selection coords `(col_offset, from_bottom)`,
+    /// clamped into the pane and the scrollback. `col_offset` is 0-based
+    /// from the pane's left edge; `from_bottom` counts lines up from the
+    /// newest captured line (0 = the bottom line). See `PreviewSelection`
+    /// for why selections anchor to the bottom rather than an absolute
+    /// index.
+    pub(super) fn screen_to_content(self, col: u16, row: u16) -> (u16, usize) {
+        let pane = self.pane;
+        let max_x = pane.right().saturating_sub(1);
+        let col_off = col.clamp(pane.x, max_x) - pane.x;
+        let abs = self.abs_line_at_row(row);
+        (
+            col_off,
+            self.total_lines.saturating_sub(1).saturating_sub(abs),
+        )
+    }
+
+    /// Absolute parsed-text index for a `from_bottom` distance under this
+    /// view's current `total_lines`. The inverse of the `from_bottom` term
+    /// in `screen_to_content`.
+    fn abs_from_bottom(self, from_bottom: usize) -> usize {
+        self.total_lines
+            .saturating_sub(1)
+            .saturating_sub(from_bottom)
     }
 }
 
@@ -146,16 +167,20 @@ impl PreviewTextView {
 /// row in between, and ends at the extent cell.
 ///
 /// Coordinates are *content* coords, not screen cells: `col` is a 0-based
-/// offset from the output pane's left edge and `line` is an absolute
-/// index into the parsed scrollback. Anchoring to the scrollback (rather
-/// than the visible frame) is what lets a selection survive a scroll and
-/// span more than one page: the highlight tracks its text as the pane
-/// scrolls, and the copy pulls the full range even where it has scrolled
-/// off screen. The renderer re-derives screen rects each frame from the
-/// live `PreviewTextView` via `screen_flow_rects`.
+/// offset from the output pane's left edge and `from_bottom` counts lines
+/// up from the newest captured line (0 = the bottom line). Anchoring to
+/// the bottom (not an absolute index) is load-bearing: in live mode the
+/// preview re-captures every frame, and the captured window *grows from
+/// the top* as the user scrolls back (`capture_lines_for` adds the scroll
+/// offset), so an absolute index would silently point at an older line as
+/// the window grew, the exact bug where a drag-to-scroll copied the wrong
+/// range. Distance from the newest line is invariant under that top-side
+/// growth, so the highlight and the copy stay locked to the same text as
+/// the user scrolls. The renderer re-derives screen rects each frame from
+/// the live `PreviewTextView` via `screen_flow_rects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewSelection {
-    /// Content cell the user pressed Down(Left) on: `(col_offset, line)`.
+    /// Content cell the user pressed Down(Left) on: `(col_offset, from_bottom)`.
     pub(super) anchor: (u16, usize),
     /// Current (or final) extent. Equals `anchor` at drag start.
     pub(super) extent: (u16, usize),
@@ -166,17 +191,20 @@ pub(super) struct PreviewSelection {
 }
 
 impl PreviewSelection {
-    /// Anchor and extent ordered in reading order (line first, then
-    /// column). The first tuple is where the selection starts in the
-    /// flow; the second is where it ends. A drag that runs up-and-right
-    /// still resolves to the lower line as the start.
-    pub(super) fn ordered(self) -> ((u16, usize), (u16, usize)) {
-        let (ac, al) = self.anchor;
-        let (ec, el) = self.extent;
-        if (al, ac) <= (el, ec) {
-            ((ac, al), (ec, el))
+    /// Anchor and extent resolved to absolute parsed-text indices under
+    /// `total_lines` and ordered in reading order (line first, then
+    /// column). The first tuple is where the selection starts in the flow;
+    /// the second is where it ends. A drag that runs up-and-right still
+    /// resolves to the higher line as the start.
+    pub(super) fn ordered_abs(self, view: PreviewTextView) -> ((u16, usize), (u16, usize)) {
+        let (ac, ad) = self.anchor;
+        let (ec, ed) = self.extent;
+        let a = (ac, view.abs_from_bottom(ad));
+        let e = (ec, view.abs_from_bottom(ed));
+        if (a.1, a.0) <= (e.1, e.0) {
+            (a, e)
         } else {
-            ((ec, el), (ac, al))
+            (e, a)
         }
     }
 
@@ -193,7 +221,7 @@ impl PreviewSelection {
         if pane.width == 0 || pane.height == 0 {
             return out;
         }
-        let ((start_col, start_line), (end_col, end_line)) = self.ordered();
+        let ((start_col, start_line), (end_col, end_line)) = self.ordered_abs(view);
         let top = view.first_line;
         let bottom_excl = top + pane.height as usize;
         for line in start_line..=end_line {

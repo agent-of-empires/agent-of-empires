@@ -544,17 +544,20 @@ impl HomeView {
         }
         self.preview_autoscroll_at = Some(now);
         let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-        let first = self.projected_first_line();
-        let new_extent = if at_top {
-            (col_off, first)
+        // Pin the extent to the now-revealed edge line in `from_bottom`
+        // terms, which the new scroll offset gives directly: the bottom
+        // visible line sits `offset` lines up from the newest line, the top
+        // visible line `offset + height - 1`. Deriving it from the offset
+        // (not the stale pre-scroll `total_lines`) keeps it correct even
+        // before the next frame re-captures.
+        let offset = self.preview_scroll_offset as usize;
+        let from_bottom = if at_top {
+            offset + (pane.height as usize).saturating_sub(1)
         } else {
-            let last = (first + pane.height as usize)
-                .saturating_sub(1)
-                .min(view.total_lines.saturating_sub(1));
-            (col_off, last)
+            offset
         };
         if let Some(sel) = self.preview_selection.as_mut() {
-            sel.extent = new_extent;
+            sel.extent = (col_off, from_bottom);
         }
         true
     }
@@ -574,19 +577,6 @@ impl HomeView {
         }
         self.preview_scroll_offset = new;
         true
-    }
-
-    /// The content line that will land on the output pane's top row given
-    /// the current scroll offset. Mirrors `render_preview`'s
-    /// `compute_scroll` so an auto-scroll can pin the selection extent to
-    /// the edge line before the next frame recomputes the snapshot.
-    fn projected_first_line(&self) -> usize {
-        let view = self.preview_text_view;
-        crate::tui::components::preview::compute_scroll(
-            view.total_lines,
-            view.pane.height as usize,
-            self.preview_scroll_offset,
-        ) as usize
     }
 
     /// End any active drag. For the list divider, persist the final
@@ -662,7 +652,10 @@ impl HomeView {
             return None;
         }
         let lines = self.active_preview_cache().parsed_text.as_ref()?;
-        let ((start_col, start_line), (end_col, end_line)) = sel.ordered();
+        // Resolve `from_bottom` distances to absolute indices against the
+        // SAME `total_lines` the renderer used this frame, so the copied
+        // range matches the painted highlight cell for cell.
+        let ((start_col, start_line), (end_col, end_line)) = sel.ordered_abs(view);
         if start_line == end_line && start_col == end_col {
             return None;
         }
