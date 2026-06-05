@@ -1553,5 +1553,18 @@ mod tests {
         assert!(!requires_elevation(&Method::GET, "/api/about"));
         assert!(!requires_elevation(&Method::POST, "/api/login"));
         assert!(!requires_elevation(&Method::POST, "/api/login/elevate"));
+
+        // Device / login-session management IS gated: revoking another
+        // device or signing everyone out is credential management, so a
+        // stolen session+binding cannot do it without re-proving the
+        // passphrase. See #1235.
+        assert!(requires_elevation(&Method::POST, "/api/login/logout-all"));
+        assert!(requires_elevation(
+            &Method::DELETE,
+            "/api/login/sessions/abc123"
+        ));
+        // But listing devices (read-only) and self-logout are not gated.
+        assert!(!requires_elevation(&Method::GET, "/api/devices"));
+        assert!(!requires_elevation(&Method::POST, "/api/logout"));
     }
 }
