@@ -198,6 +198,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
   - `serve.mode`: `tunnel` / `tailscale` / `local`.
   - `serve.passphrase`: plaintext Tunnel passphrase, so the TUI can show it on reopen across restarts.
   - `serve.last_mode`, `serve.last_port`: picker defaults across launches.
+  - `login_sessions.toml`: persisted dashboard login sessions (0600), so signed-in devices survive a daemon restart (#1235). Unlike the `serve.*` files it is intentionally NOT cleaned up on `--stop`; that would reproduce the re-prompt bug. Dropped on a passphrase change; gated by `auth.persist_sessions`.
 
 Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and structured-view runners; see `docs/development/logging.md` for sinks and rotation.
 

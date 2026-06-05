@@ -39,12 +39,25 @@ below).
 ## Connected devices
 
 Under **Web Dashboard > Connected Devices**, the dashboard lists every
-device that has authenticated, with a browser and OS label parsed from
-the user agent and a relative "last seen" time. The list polls every
-ten seconds and refreshes when you return to the tab, so a device that
-just connected (or went quiet) shows up without a manual reload. This is
-the surface for spotting an unexpected session and is also where token
-rotation and rate-limit lockouts surface.
+signed-in login session as a device, with a browser and OS label parsed
+from the user agent, the origin IP, and a relative "last seen" time. The
+session you are using is labeled "this device". The list polls every ten
+seconds and refreshes when you return to the tab, so a device that just
+signed in (or went quiet) shows up without a manual reload. This is the
+surface for spotting an unexpected session.
+
+Each other device has a **Revoke** button that ends just that session,
+and **Sign out all devices** signs every device out at once (including
+this one). Both are step-up actions: the first click after a fresh page
+load surfaces the passphrase prompt (see Step-up elevation below).
+
+Sessions are persisted to an owner-only file under the app dir, so they
+survive an `aoe serve` restart: signed-in devices stay signed in across
+a daemon bounce (config edit, `aoe update`, crash) instead of being
+re-prompted for the passphrase. Changing the passphrase drops every
+persisted session. To opt out and force re-authentication on every
+restart, turn off **Persist login sessions** under Web Dashboard, or set
+`auth.persist_sessions = false` in `config.toml`.
 
 ## Step-up elevation
 
