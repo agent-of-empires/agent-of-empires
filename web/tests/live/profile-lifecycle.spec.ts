@@ -30,7 +30,7 @@ test("create profile via + New round-trips through POST /api/profiles", async ({
   expect(baseline.map((p) => p.name)).toEqual(["main"]);
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "+ New" }).click();
   const nameInput = page.getByPlaceholder("Profile name");
@@ -58,7 +58,7 @@ test("rename profile via Rename button round-trips through PATCH .../rename", as
   expect(seed.ok).toBeTruthy();
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Select `work` so Rename targets it (rename acts on the selectedProfile).
   const profileSelect = page
@@ -140,7 +140,7 @@ test("delete profile via Delete button round-trips through DELETE /api/profiles/
   expect(seed.ok).toBeTruthy();
 
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Select the non-default profile so Delete is visible (component hides
   // it for the active row, and the server rejects deletion of the active
@@ -173,7 +173,7 @@ test("invalid profile name: client validation blocks POST /api/profiles", async 
   page,
 }) => {
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   // Intercept POST /api/profiles to detect any leak through validation.
   let posted = false;

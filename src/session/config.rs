@@ -138,14 +138,20 @@ pub struct LoggingConfig {
         label = "Output (restart req.)",
         widget = "select",
         options = "file:file,stdout:stdout",
-        global_only
+        global_only,
+        advanced
     )]
     pub output: SinkKind,
 
     /// Log file location. Relative paths resolve under the app data dir;
     /// absolute paths are used verbatim. Restart aoe for changes.
     #[serde(default = "default_file_path")]
-    #[setting(label = "File path (restart req.)", widget = "text", global_only)]
+    #[setting(
+        label = "File path (restart req.)",
+        widget = "text",
+        global_only,
+        advanced
+    )]
     pub file_path: String,
 
     /// size rotates when the live file crosses the threshold; never disables
@@ -155,7 +161,8 @@ pub struct LoggingConfig {
         label = "Rotation (restart req.)",
         widget = "select",
         options = "size:size,never:never",
-        global_only
+        global_only,
+        advanced
     )]
     pub rotation: RotationKind,
 
@@ -165,7 +172,8 @@ pub struct LoggingConfig {
         label = "Max size MiB (restart req.)",
         widget = "number",
         min = 0,
-        global_only
+        global_only,
+        advanced
     )]
     pub max_size_mib: u64,
 
@@ -175,7 +183,8 @@ pub struct LoggingConfig {
         label = "Keep count (restart req.)",
         widget = "number",
         min = 0,
-        global_only
+        global_only,
+        advanced
     )]
     pub keep_count: u8,
 
@@ -188,7 +197,8 @@ pub struct LoggingConfig {
     #[setting(
         label = "Show span context (restart req.)",
         widget = "toggle",
-        global_only
+        global_only,
+        advanced
     )]
     pub show_spans: bool,
 }

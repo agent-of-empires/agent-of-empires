@@ -47,7 +47,7 @@ test("per-profile setting override leaves global state untouched", async ({
 
   // Land on the Session settings tab and pick the `work` profile.
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByText("Profile", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
 
   const profileSelect = page
     .locator("label", { hasText: /^Profile$/ })
