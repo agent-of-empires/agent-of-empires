@@ -748,6 +748,58 @@ mod tests {
         assert_eq!(stdio_command(&merged[0]), "profile");
     }
 
+    #[test]
+    fn project_servers_to_acp_converts_all_transports() {
+        use crate::session::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        let mut env = BTreeMap::new();
+        env.insert("TOKEN".to_string(), "secret".to_string());
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer x".to_string());
+        let project = vec![
+            ProjectMcpServer {
+                name: "a-stdio".to_string(),
+                transport: ProjectMcpTransport::Stdio {
+                    command: "cmd".to_string(),
+                    args: vec!["--arg".to_string()],
+                    env,
+                },
+            },
+            ProjectMcpServer {
+                name: "b-http".to_string(),
+                transport: ProjectMcpTransport::Http {
+                    url: "https://e/mcp".to_string(),
+                    headers,
+                },
+            },
+            ProjectMcpServer {
+                name: "c-sse".to_string(),
+                transport: ProjectMcpTransport::Sse {
+                    url: "https://e/sse".to_string(),
+                    headers: BTreeMap::new(),
+                },
+            },
+        ];
+        let acp = project_servers_to_acp(project);
+        assert_eq!(names(&acp), vec!["a-stdio", "b-http", "c-sse"]);
+        match &acp[0] {
+            McpServer::Stdio(s) => {
+                assert_eq!(s.command.to_string_lossy(), "cmd");
+                assert_eq!(s.args, vec!["--arg".to_string()]);
+                assert_eq!(s.env[0].name, "TOKEN");
+                assert_eq!(s.env[0].value, "secret");
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+        match &acp[1] {
+            McpServer::Http(h) => {
+                assert_eq!(h.url, "https://e/mcp");
+                assert_eq!(h.headers[0].name, "Authorization");
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+        assert!(matches!(&acp[2], McpServer::Sse(_)));
+    }
+
     fn write(home: &Path, rel: &str, contents: &str) {
         let path = home.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
