@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The committed .cargo/config.toml sets rustc-wrapper = "kache" for fast local
+  # multi-worktree builds. CI runners have no kache; this empty value overrides
+  # that config key so cargo builds without the wrapper.
+  CARGO_BUILD_RUSTC_WRAPPER: ""
 
 jobs:
   cargo:

@@ -14,6 +14,12 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+env:
+  # The committed .cargo/config.toml sets rustc-wrapper = "kache" for fast local
+  # multi-worktree builds. CI runners have no kache; this empty value overrides
+  # that config key so `cargo xtask gen-docs` builds without the wrapper.
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+
 permissions:
   contents: read
   pages: write

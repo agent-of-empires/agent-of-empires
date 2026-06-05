@@ -12,6 +12,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The committed .cargo/config.toml sets rustc-wrapper = "kache" for fast local
+  # multi-worktree builds. Release runners have no kache and must stay
+  # reproducible; this empty value overrides the config key so the shipped
+  # binaries are compiled by plain rustc, not through a third-party wrapper.
+  CARGO_BUILD_RUSTC_WRAPPER: ""
   # Centralizes the "which ref do we operate on" rule so every job's checkout
   # stays in sync. Without this, workflow_dispatch silently fell back to main:
   # checkout's default ref ignored the `tag` input, so validation read main's
