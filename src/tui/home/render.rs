@@ -598,7 +598,7 @@ impl HomeView {
             worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
-            hook_trust_dialog,
+            repo_trust_dialog,
             intro_dialog,
             no_agents_dialog,
             changelog_dialog,
@@ -833,7 +833,7 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()

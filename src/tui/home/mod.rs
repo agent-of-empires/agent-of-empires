@@ -406,9 +406,9 @@ pub struct HomeView {
     /// position when opened; the renderer clamps it into view.
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
-    pub(super) hook_trust_dialog: Option<RepoTrustDialog>,
+    pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
     /// Session data pending repo trust approval (hooks and/or project MCP)
-    pub(super) pending_hook_trust_data: Option<NewSessionData>,
+    pub(super) pending_repo_trust_data: Option<NewSessionData>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
@@ -861,8 +861,8 @@ impl HomeView {
             restart_dialog: None,
             context_menu: None,
             group_rename_context: None,
-            hook_trust_dialog: None,
-            pending_hook_trust_data: None,
+            repo_trust_dialog: None,
+            pending_repo_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             intro_dialog: None,
@@ -2366,7 +2366,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
@@ -2403,7 +2403,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
