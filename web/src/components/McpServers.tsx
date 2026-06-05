@@ -23,7 +23,7 @@ function detail(s: McpServerView): string {
 
 function ProvenanceBadge({ label }: { label: string }) {
   return (
-    <span className="font-mono text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-700 text-text-secondary">
+    <span className="font-mono text-[11px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-700 text-text-secondary">
       {label}
     </span>
   );
@@ -34,7 +34,7 @@ function ServerRow({ s }: { s: McpServerView }) {
     <div className="py-2 border-b border-surface-700">
       <div className="flex items-center gap-2">
         <span className="font-body text-[13px] font-medium text-text-primary">{s.name}</span>
-        <span className="font-mono text-[10px] text-text-muted">({s.transport})</span>
+        <span className="font-mono text-[11px] text-text-muted">({s.transport})</span>
         <ProvenanceBadge label={s.provenance} />
       </div>
       <p className="font-mono text-[11px] text-text-secondary ml-1">{detail(s)}</p>
