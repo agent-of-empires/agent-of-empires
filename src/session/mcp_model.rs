@@ -24,7 +24,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
@@ -76,6 +76,78 @@ pub struct ResolvedMcpServer {
     pub shadowed: Vec<McpProvenance>,
 }
 
+impl ResolvedMcpServer {
+    /// The redaction-safe, serializable view shared by every surface (web JSON,
+    /// CLI `--json`, TUI rows). This is the single chokepoint: the connection
+    /// detail the user needs to identify a server (command/args/url) is kept, but
+    /// env and header VALUES never leave [`ResolvedMcpServer`]; only their names
+    /// do. The unredacted [`def`](Self::def) is reachable only for forwarding and
+    /// the drift store, never for display.
+    pub fn redacted(&self) -> RedactedMcpServer {
+        let (transport, command, args, url, env_names, header_names) = match &self.def.transport {
+            ProjectMcpTransport::Stdio { command, args, env } => (
+                "stdio",
+                Some(command.clone()),
+                args.clone(),
+                None,
+                env.keys().cloned().collect(),
+                Vec::new(),
+            ),
+            ProjectMcpTransport::Http { url, headers } => (
+                "http",
+                None,
+                Vec::new(),
+                Some(url.clone()),
+                Vec::new(),
+                headers.keys().cloned().collect(),
+            ),
+            ProjectMcpTransport::Sse { url, headers } => (
+                "sse",
+                None,
+                Vec::new(),
+                Some(url.clone()),
+                Vec::new(),
+                headers.keys().cloned().collect(),
+            ),
+        };
+        RedactedMcpServer {
+            name: self.def.name.clone(),
+            transport,
+            command,
+            args,
+            url,
+            env_names,
+            header_names,
+            provenance: self.provenance.label(),
+            shadowed: self.shadowed.iter().map(McpProvenance::label).collect(),
+        }
+    }
+}
+
+/// Redaction-safe view of a resolved server for all surfaces. `command`, `args`,
+/// and `url` identify the server and are not secret; env and header VALUES are
+/// secret and are reduced to their NAMES (`env_names` / `header_names`). Built
+/// only via [`ResolvedMcpServer::redacted`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedMcpServer {
+    pub name: String,
+    pub transport: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_names: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub header_names: Vec<String>,
+    pub provenance: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shadowed: Vec<String>,
+}
+
 /// Merge layers by precedence. `layers` are ordered lowest first; a server in a
 /// later layer overrides one of the same name in an earlier layer (per server,
 /// not whole layer). The shadowed provenances accumulate in precedence order so
@@ -116,6 +188,110 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
         .map(|s| format!("{}({})", s.def.name, s.def.kind()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Resolve the effective MCP server set for a session context, applying the
+/// full precedence stack: agent-native -> global -> per-profile ->
+/// project-local (trust-gated), higher wins per name. This is the single source
+/// of truth for BOTH forwarding (the supervisor converts the winning set to ACP)
+/// and the management surfaces (#1996), so what the user sees equals what the
+/// agent receives.
+///
+/// Each layer is isolated: a missing, unreadable, or malformed source warns and
+/// contributes nothing rather than aborting, so a single broken file never
+/// blocks a spawn. `profile` is the session's source profile; an empty/`None`
+/// value resolves to the default. `cwd` is the session working directory, from
+/// which the project-local repo (and its `.mcp.json`) is resolved. The
+/// project-local layer is forwarded ONLY when the repo is trusted at the file's
+/// current fingerprint; an untrusted (or changed) file is skipped and logged,
+/// exactly like the create-time trust gate refuses untrusted hooks.
+pub fn resolve_effective(
+    agent_key: &str,
+    profile: Option<&str>,
+    cwd: &Path,
+) -> Vec<ResolvedMcpServer> {
+    let native = load_native_mcp_servers_from_home(agent_key).unwrap_or_else(|e| {
+        warn!(
+            target: "acp.mcp",
+            agent = %agent_key,
+            error = %e,
+            "failed to load native MCP config; contributing none from it"
+        );
+        Vec::new()
+    });
+
+    let global = match super::get_app_dir() {
+        Ok(app_dir) => load_global_mcp_servers(&app_dir).unwrap_or_else(|e| {
+            warn!(target: "acp.mcp", error = %e, "failed to load global MCP config; contributing none from it");
+            Vec::new()
+        }),
+        Err(e) => {
+            warn!(target: "acp.mcp", error = %e, "could not resolve app dir for MCP config; contributing none from it");
+            Vec::new()
+        }
+    };
+
+    let per_profile = match super::get_profile_dir_path(profile.unwrap_or_default()) {
+        Ok(profile_dir) => load_profile_mcp_servers(&profile_dir).unwrap_or_else(|e| {
+            warn!(target: "acp.mcp", error = %e, "failed to load per-profile MCP config; contributing none from it");
+            Vec::new()
+        }),
+        Err(e) => {
+            warn!(target: "acp.mcp", error = %e, "could not resolve profile dir for MCP config; contributing none from it");
+            Vec::new()
+        }
+    };
+
+    let source = super::repo_config::repo_config_source_path(cwd);
+    let project_local = match super::project_mcp::load_project_mcp_servers(&source) {
+        Ok(servers) if servers.is_empty() => Vec::new(),
+        Ok(servers) => {
+            let hash = super::project_mcp::fingerprint(&servers);
+            match super::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
+                Ok(true) => servers,
+                Ok(false) => {
+                    warn!(
+                        target: "acp.mcp",
+                        repo = %source.display(),
+                        count = servers.len(),
+                        "skipping project-local MCP servers: repo not trusted at this .mcp.json fingerprint; review and approve by creating a session for this repo in the TUI or CLI"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    warn!(target: "acp.mcp", repo = %source.display(), error = %e, "could not check project-local MCP trust; contributing none from it");
+                    Vec::new()
+                }
+            }
+        }
+        Err(e) => {
+            warn!(target: "acp.mcp", repo = %source.display(), error = %e, "failed to load project-local MCP config; contributing none from it");
+            Vec::new()
+        }
+    };
+
+    resolve(vec![
+        McpLayer {
+            provenance: McpProvenance::AgentNative {
+                agent: agent_key.to_string(),
+            },
+            servers: native,
+        },
+        McpLayer {
+            provenance: McpProvenance::Global,
+            servers: global,
+        },
+        McpLayer {
+            provenance: McpProvenance::Profile {
+                name: profile.unwrap_or_default().to_string(),
+            },
+            servers: per_profile,
+        },
+        McpLayer {
+            provenance: McpProvenance::ProjectLocal,
+            servers: project_local,
+        },
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +729,62 @@ mod tests {
         let s = summarize(&merged);
         assert_eq!(s, "fs(stdio)");
         assert!(!s.contains("supersecret"));
+    }
+
+    #[test]
+    fn redacted_view_keeps_names_drops_secret_values() {
+        let merged = resolve(vec![
+            layer(
+                McpProvenance::AgentNative {
+                    agent: "claude".into(),
+                },
+                standard(r#"{ "mcpServers": { "fs": { "command": "fs-old" } } }"#),
+            ),
+            layer(
+                McpProvenance::Global,
+                standard(
+                    r#"{ "mcpServers": {
+                        "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "SUPER_SECRET_DO_NOT_LEAK" } },
+                        "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer HEADER_SECRET_DO_NOT_LEAK" } }
+                    } }"#,
+                ),
+            ),
+        ]);
+
+        let stdio = merged
+            .iter()
+            .find(|s| s.def.name == "fs")
+            .unwrap()
+            .redacted();
+        assert_eq!(stdio.transport, "stdio");
+        assert_eq!(stdio.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(stdio.args, vec!["--root", "."]);
+        assert_eq!(stdio.env_names, vec!["TOKEN"]);
+        assert_eq!(stdio.provenance, "global");
+        assert_eq!(stdio.shadowed, vec!["agent-native:claude"]);
+
+        let remote = merged
+            .iter()
+            .find(|s| s.def.name == "remote")
+            .unwrap()
+            .redacted();
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://e/mcp"));
+        assert_eq!(remote.header_names, vec!["Authorization"]);
+
+        // The single chokepoint must never serialize a secret VALUE on any
+        // surface (web JSON, CLI --json, TUI rows all go through this).
+        let json = serde_json::to_string(&merged.iter().map(|s| s.redacted()).collect::<Vec<_>>())
+            .unwrap();
+        assert!(
+            !json.contains("SUPER_SECRET_DO_NOT_LEAK"),
+            "env value leaked: {json}"
+        );
+        assert!(
+            !json.contains("HEADER_SECRET_DO_NOT_LEAK"),
+            "header value leaked: {json}"
+        );
+        assert!(json.contains("TOKEN") && json.contains("Authorization"));
     }
 
     #[test]
