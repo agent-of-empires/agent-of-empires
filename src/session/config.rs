@@ -54,6 +54,9 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
+    pub auth: AuthConfig,
+
+    #[serde(default)]
     pub acp: AcpConfig,
 
     #[serde(default)]
@@ -1282,6 +1285,27 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "auth", category = "Web")]
+pub struct AuthConfig {
+    /// Keep dashboard login sessions across `aoe serve` restarts. When on,
+    /// signed-in devices stay signed in after a daemon restart instead of
+    /// being re-prompted for the passphrase; sessions are stored owner-only
+    /// (0600) under the app dir and dropped if the passphrase changes. Turn
+    /// off to make every restart force re-authentication. See #1235.
+    #[serde(default = "default_true")]
+    #[setting(label = "Persist login sessions", widget = "toggle", global_only)]
+    pub persist_sessions: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            persist_sessions: true,
         }
     }
 }
