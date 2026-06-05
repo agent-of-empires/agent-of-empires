@@ -1003,17 +1003,17 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.hook_trust_dialog {
+        if let Some(dialog) = &self.repo_trust_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
-                        self.hook_trust_dialog = None;
-                        self.pending_hook_trust_data = None;
+                        self.repo_trust_dialog = None;
+                        self.pending_repo_trust_data = None;
                     }
                     DialogResult::Submit(action) => {
-                        self.hook_trust_dialog = None;
-                        if let Some(data) = self.pending_hook_trust_data.take() {
+                        self.repo_trust_dialog = None;
+                        if let Some(data) = self.pending_repo_trust_data.take() {
                             let emit = match action {
                                 RepoTrustAction::Trust {
                                     hooks_hash,
@@ -1021,14 +1021,21 @@ impl HomeView {
                                     project_path,
                                     hooks,
                                 } => {
+                                    // If persisting trust fails, abort creation:
+                                    // launching anyway leaves a split state where
+                                    // hooks are treated as approved but project MCP
+                                    // stays gated off (it is read back from the
+                                    // unwritten hashes).
                                     if let Err(e) = repo_config::trust_repo(
                                         std::path::Path::new(&project_path),
                                         hooks_hash.as_deref(),
                                         mcp_hash.as_deref(),
                                     ) {
-                                        tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                        None
+                                    } else {
+                                        self.create_session_with_hooks(data, hooks)
                                     }
-                                    self.create_session_with_hooks(data, hooks)
                                 }
                                 RepoTrustAction::Skip { hooks } => {
                                     self.create_session_with_hooks(data, hooks)
@@ -1408,16 +1415,16 @@ impl HomeView {
             return None;
         }
 
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
-                    self.hook_trust_dialog = None;
-                    self.pending_hook_trust_data = None;
+                    self.repo_trust_dialog = None;
+                    self.pending_repo_trust_data = None;
                 }
                 DialogResult::Submit(action) => {
-                    self.hook_trust_dialog = None;
-                    if let Some(data) = self.pending_hook_trust_data.take() {
+                    self.repo_trust_dialog = None;
+                    if let Some(data) = self.pending_repo_trust_data.take() {
                         match action {
                             RepoTrustAction::Trust {
                                 hooks_hash,
@@ -1425,12 +1432,16 @@ impl HomeView {
                                 project_path,
                                 hooks,
                             } => {
+                                // Abort creation if trust cannot be persisted, to
+                                // avoid a split state (hooks approved but project
+                                // MCP gated off the unwritten hashes).
                                 if let Err(e) = repo_config::trust_repo(
                                     std::path::Path::new(&project_path),
                                     hooks_hash.as_deref(),
                                     mcp_hash.as_deref(),
                                 ) {
-                                    tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                    return None;
                                 }
                                 return self.create_session_with_hooks(data, hooks);
                             }
@@ -3449,7 +3460,7 @@ impl HomeView {
         if let Some(dialog) = &mut self.no_agents_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(picker) = &mut self.tool_picker_dialog {
@@ -4173,7 +4184,7 @@ impl HomeView {
             .as_ref()
             .map(|h| repo_config::merge_hooks_for_display(&data.profile, h))
             .unwrap_or_default();
-        self.hook_trust_dialog = Some(RepoTrustDialog::new(
+        self.repo_trust_dialog = Some(RepoTrustDialog::new(
             merged_hooks,
             repo_hooks.unwrap_or_default(),
             mcp_servers,
@@ -4183,7 +4194,7 @@ impl HomeView {
             mcp_hash,
             data.path.clone(),
         ));
-        self.pending_hook_trust_data = Some(data);
+        self.pending_repo_trust_data = Some(data);
         None
     }
 
