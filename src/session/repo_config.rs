@@ -530,7 +530,20 @@ pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
         _ => TrustSurface::Absent,
     };
 
-    let servers = super::project_mcp::load_project_mcp_servers(Path::new(&normalized))?;
+    // MCP load errors must not suppress hook trust: a malformed `.mcp.json`
+    // here would otherwise make the whole call fail and silently drop
+    // already-trusted hooks. Treat a load error as "no project MCP" (the
+    // supervisor is the real MCP gate and logs/skips a broken file at spawn).
+    let servers = super::project_mcp::load_project_mcp_servers(Path::new(&normalized))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "session.store",
+                path = %normalized,
+                error = %e,
+                "failed to load project .mcp.json for trust; treating as absent"
+            );
+            Vec::new()
+        });
     let mcp = if servers.is_empty() {
         TrustSurface::Absent
     } else {
