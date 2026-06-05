@@ -1411,12 +1411,14 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resolve the MCP servers to forward on session/new and session/load:
         // the agent's own native config (lowest precedence) merged under the
-        // global `<app_dir>/mcp.json`, merged under this session's per-profile
-        // `<profile_dir>/mcp.json` (#1986), so a server defined in several is
-        // taken from the highest layer. Disk reads and parsing run off the async
-        // runtime because a native config (e.g. `~/.claude.json`) can be large.
-        // Any broken layer warns and contributes nothing rather than failing the
-        // spawn; the project-local source is deferred (follow-up #1985).
+        // global `<app_dir>/mcp.json`, the per-profile `<profile_dir>/mcp.json`
+        // (#1986), and the trusted project-local `.mcp.json` (#1985), so a server
+        // defined in several is taken from the highest layer. The project-local
+        // layer is only forwarded when the repo is trusted for the file's current
+        // fingerprint; otherwise it is skipped and logged. Disk reads and parsing
+        // run off the async runtime because a native config (e.g. `~/.claude.json`)
+        // can be large. Any broken layer warns and contributes nothing rather than
+        // failing the spawn.
         let mcp_agent = agent.clone();
         let mcp_session = session_id.clone();
         let mcp_profile = source_profile.clone();
@@ -1874,9 +1876,11 @@ impl<S: BroadcastSink> Supervisor<S> {
 
                     // Re-resolve the MCP layers rather than reusing the list
                     // cached at first spawn: edits to the agent's native config,
-                    // `<app_dir>/mcp.json`, or the per-profile `mcp.json` made
-                    // since then are forwarded on `session/load` too, so a
-                    // respawn must pick them up.
+                    // `<app_dir>/mcp.json`, the per-profile `mcp.json`, or the
+                    // trusted project-local `.mcp.json` made since then are
+                    // forwarded on `session/load` too, so a respawn must pick them
+                    // up. The project-local trust gate runs here as well, so an
+                    // edited `.mcp.json` is re-locked until the repo is re-trusted.
                     let mcp_agent = respawn_config.agent_key.clone();
                     let mcp_session = session_id.clone();
                     let mcp_profile = respawn_config.source_profile.clone();
