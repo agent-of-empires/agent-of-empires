@@ -7389,10 +7389,11 @@ mod preview_drag_select {
 
     #[test]
     #[serial]
-    fn drag_at_bottom_edge_autoscrolls_and_extends() {
-        // Dragging at the bottom edge scrolls toward newer output and
-        // extends the selection to the freshly-revealed bottom line, so
-        // a single drag can grow past one visible page.
+    fn drag_move_to_bottom_edge_extends_without_scrolling() {
+        // The drag-move itself only records the edge position and extends
+        // to the last visible line; the scroll is the ticker's job (so a
+        // held-still cursor still advances). This keeps mouse movement
+        // from lurching the scroll one line per event.
         let mut env = create_test_env_empty();
         // 50 lines, 5 visible, started scrolled 10 back (showing 35..40).
         stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
@@ -7401,31 +7402,78 @@ mod preview_drag_select {
         env.view.handle_drag_start(0, 0); // anchor line 35
                                           // Drag held at the bottom edge (row 4 == pane.bottom()-1).
         assert!(env.view.handle_drag_move(0, 4));
-        assert_eq!(env.view.preview_scroll_offset, 9);
-        let sel = env.view.preview_selection.expect("live selection");
-        // New top line 36, bottom visible line 36+5-1 = 40.
-        assert_eq!(sel.extent, (0, 40));
-        // Hold again: scroll one more and extend further.
-        assert!(env.view.handle_drag_move(0, 4));
-        assert_eq!(env.view.preview_scroll_offset, 8);
-        let sel = env.view.preview_selection.expect("live selection");
-        assert_eq!(sel.extent, (0, 41));
+        // No scroll yet, extent pinned to the last visible line (39).
+        assert_eq!(env.view.preview_scroll_offset, 10);
+        assert_eq!(
+            env.view.preview_selection.expect("live selection").extent,
+            (0, 39)
+        );
     }
 
     #[test]
     #[serial]
-    fn drag_at_top_edge_autoscrolls_up() {
-        // Dragging at the top edge scrolls into older output and extends
-        // the selection up to the freshly-revealed top line.
+    fn autoscroll_tick_at_bottom_edge_scrolls_and_extends_without_new_events() {
+        // The core fix: with the cursor held at the bottom edge, plain
+        // ticker ticks (no further mouse events) keep scrolling toward
+        // newer output and growing the selection past one visible page.
+        let mut env = create_test_env_empty();
+        stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
+        stage_live_send(&mut env);
+        env.view.handle_drag_start(0, 0); // anchor line 35
+        env.view.handle_drag_move(0, 4); // record edge position
+        assert_eq!(env.view.preview_scroll_offset, 10);
+
+        // First tick: scroll one line, extend to the new bottom (40).
+        assert!(env.view.tick_preview_autoscroll());
+        assert_eq!(env.view.preview_scroll_offset, 9);
+        assert_eq!(
+            env.view.preview_selection.expect("live selection").extent,
+            (0, 40)
+        );
+        // Second tick, still no mouse event: advance again.
+        assert!(env.view.tick_preview_autoscroll());
+        assert_eq!(env.view.preview_scroll_offset, 8);
+        assert_eq!(
+            env.view.preview_selection.expect("live selection").extent,
+            (0, 41)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn autoscroll_tick_at_top_edge_scrolls_into_history() {
         let mut env = create_test_env_empty();
         stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
         stage_live_send(&mut env);
         env.view.handle_drag_start(0, 4); // anchor line 39
-        assert!(env.view.handle_drag_move(0, 0)); // top edge
+        env.view.handle_drag_move(0, 0); // record top-edge position
+        assert_eq!(env.view.preview_scroll_offset, 10);
+        assert!(env.view.tick_preview_autoscroll());
         assert_eq!(env.view.preview_scroll_offset, 11);
-        let sel = env.view.preview_selection.expect("live selection");
         // New top line 34.
-        assert_eq!(sel.extent, (0, 34));
+        assert_eq!(
+            env.view.preview_selection.expect("live selection").extent,
+            (0, 34)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn autoscroll_tick_is_noop_off_edge_and_without_drag() {
+        let mut env = create_test_env_empty();
+        stage_pane(&mut env, Rect::new(0, 0, 10, 5), 35, 50);
+        stage_live_send(&mut env);
+        // No drag in progress yet.
+        assert!(!env.view.tick_preview_autoscroll());
+        // Drag held in the middle of the pane: nothing to auto-scroll.
+        env.view.handle_drag_start(0, 2);
+        env.view.handle_drag_move(0, 2);
+        assert!(!env.view.tick_preview_autoscroll());
+        assert_eq!(env.view.preview_scroll_offset, 10);
+        // After release the tick must not resume scrolling.
+        env.view.preview_drag_pos = Some((0, 4)); // pretend edge
+        env.view.handle_drag_end();
+        assert!(!env.view.tick_preview_autoscroll());
     }
 
     #[test]

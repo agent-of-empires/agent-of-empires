@@ -477,34 +477,20 @@ impl HomeView {
                 if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
                     return false;
                 }
-                // Dragging at (or past) the top/bottom edge auto-scrolls
-                // the pane so the selection can grow beyond one visible
-                // page in a single drag, mirroring how terminals extend a
-                // selection when the cursor leaves the viewport. The
-                // extent then tracks the freshly-revealed edge line.
-                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-                let mut scrolled = false;
-                let new_extent = if row <= pane.y {
-                    scrolled = self.scroll_preview_offset(1);
-                    let first = self.projected_first_line();
-                    (col_off, first)
-                } else if row >= pane.bottom().saturating_sub(1) {
-                    scrolled = self.scroll_preview_offset(-1);
-                    let first = self.projected_first_line();
-                    let last = (first + pane.height as usize)
-                        .saturating_sub(1)
-                        .min(view.total_lines.saturating_sub(1));
-                    (col_off, last)
-                } else {
-                    view.screen_to_content(col, row)
-                };
+                // Record the live pointer cell so the ticker-driven
+                // auto-scroll (`tick_preview_autoscroll`) can keep
+                // extending while the cursor is held at the edge. The
+                // scroll itself is NOT done here: crossterm only emits
+                // Drag events on movement, so scrolling per-event makes
+                // a held cursor stall and a moving one lurch one line per
+                // event. The ticker advances it smoothly instead.
+                self.preview_drag_pos = Some((col, row));
+                let new_extent = view.screen_to_content(col, row);
                 let Some(sel) = self.preview_selection.as_mut() else {
                     return false;
                 };
                 if sel.extent == new_extent {
-                    // A scroll with no extent change still needs a redraw
-                    // so the highlight repaints against the moved content.
-                    return scrolled;
+                    return false;
                 }
                 sel.extent = new_extent;
                 true
@@ -513,12 +499,57 @@ impl HomeView {
         }
     }
 
+    /// Advance an edge-held preview drag by one line. Driven by the event
+    /// loop's ~33ms ticker (not by mouse events) so holding the cursor at
+    /// the pane's top or bottom edge scrolls continuously and grows the
+    /// selection past a single page. Returns whether anything moved, so
+    /// the caller can redraw.
+    pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
+            return false;
+        }
+        let Some((col, row)) = self.preview_drag_pos else {
+            return false;
+        };
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+            return false;
+        }
+        let at_top = row <= pane.y;
+        let at_bottom = row >= pane.bottom().saturating_sub(1);
+        if !at_top && !at_bottom {
+            return false;
+        }
+        let scrolled = if at_top {
+            self.scroll_preview_offset(1)
+        } else {
+            self.scroll_preview_offset(-1)
+        };
+        if !scrolled {
+            return false;
+        }
+        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+        let first = self.projected_first_line();
+        let new_extent = if at_top {
+            (col_off, first)
+        } else {
+            let last = (first + pane.height as usize)
+                .saturating_sub(1)
+                .min(view.total_lines.saturating_sub(1));
+            (col_off, last)
+        };
+        if let Some(sel) = self.preview_selection.as_mut() {
+            sel.extent = new_extent;
+        }
+        true
+    }
+
     /// Shift the preview scroll offset by `delta` lines (positive scrolls
     /// up toward older output), clamped to the captured window. Returns
     /// whether the offset actually moved. Factored out of the wheel
-    /// handlers so a drag-select at the pane edge can auto-scroll without
-    /// dragging the whole `handle_scroll_*` routing (and selection-clear)
-    /// along with it.
+    /// handlers so the edge auto-scroll can move the pane without dragging
+    /// the whole `handle_scroll_*` routing along with it.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
         let cache = self.active_preview_cache();
         let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
@@ -559,6 +590,9 @@ impl HomeView {
         let Some(state) = self.drag_state.take() else {
             return false;
         };
+        // The pointer is up, so edge auto-scroll stops; drop the tracked
+        // position so a finalized highlight doesn't keep scrolling.
+        self.preview_drag_pos = None;
         match state {
             DragKind::ListDivider { .. } => {
                 self.save_list_width();
@@ -660,10 +694,12 @@ impl HomeView {
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
             // Cancel any in-progress drag too so the next Up(Left)
-            // doesn't re-finalize a stale selection.
+            // doesn't re-finalize a stale selection, and stop the edge
+            // auto-scroll from chasing a now-cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
                 self.drag_state = None;
             }
+            self.preview_drag_pos = None;
             // A pending capture from a previous finalized drag is
             // moot once the selection is gone; drop it so the next
             // selection starts clean.

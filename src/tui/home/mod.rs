@@ -715,6 +715,13 @@ pub struct HomeView {
     /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
     pub(super) drag_state: Option<DragKind>,
 
+    /// Last pointer cell reported during a `PreviewSelect` drag, `None`
+    /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
+    /// to keep scrolling while the cursor is held at the pane edge:
+    /// crossterm only emits `Drag` events on movement, so without a
+    /// ticker-driven scroll, holding still at the edge wouldn't advance.
+    pub(super) preview_drag_pos: Option<(u16, u16)>,
+
     /// In-app text selection over the preview pane, populated only in
     /// live-send mode (where terminal-native drag-select doesn't reach
     /// us because mouse capture is on). The renderer reads this to
@@ -986,6 +993,7 @@ impl HomeView {
             divider_col: None,
             main_area_width: 0,
             drag_state: None,
+            preview_drag_pos: None,
             preview_selection: None,
             preview_copy_pending: false,
             preview_copy_text: None,
