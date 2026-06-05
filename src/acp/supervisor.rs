@@ -490,9 +490,10 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::McpServer> {
-    use crate::acp::mcp_config::{
+    use crate::acp::mcp_config::project_servers_to_acp;
+    use crate::session::mcp_model::{
         load_global_mcp_servers, load_native_mcp_servers_from_home, load_profile_mcp_servers,
-        merge_by_precedence, project_servers_to_acp, summarize, McpLayer,
+        resolve, summarize, McpLayer, McpProvenance,
     };
 
     let native = match load_native_mcp_servers_from_home(agent_key) {
@@ -576,7 +577,7 @@ fn resolve_mcp_layers(
         Ok(servers) => {
             let hash = crate::session::project_mcp::fingerprint(&servers);
             match crate::session::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
-                Ok(true) => project_servers_to_acp(servers),
+                Ok(true) => servers,
                 Ok(false) => {
                     warn!(
                         target: "acp.mcp",
@@ -611,21 +612,25 @@ fn resolve_mcp_layers(
         }
     };
 
-    let merged = merge_by_precedence(vec![
+    let merged = resolve(vec![
         McpLayer {
-            label: "agent-native",
+            provenance: McpProvenance::AgentNative {
+                agent: agent_key.to_string(),
+            },
             servers: native,
         },
         McpLayer {
-            label: "global",
+            provenance: McpProvenance::Global,
             servers: global,
         },
         McpLayer {
-            label: "per-profile",
+            provenance: McpProvenance::Profile {
+                name: profile.unwrap_or_default().to_string(),
+            },
             servers: per_profile,
         },
         McpLayer {
-            label: "project-local",
+            provenance: McpProvenance::ProjectLocal,
             servers: project_local,
         },
     ]);
@@ -639,7 +644,8 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    merged
+    // Convert only the winning set to ACP wire values just before forwarding.
+    project_servers_to_acp(merged.into_iter().map(|s| s.def).collect())
 }
 
 /// Overlay an instance command override onto a resolved `AgentSpec`.

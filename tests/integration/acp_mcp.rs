@@ -13,6 +13,7 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::mcp_config;
 use agent_of_empires::acp::state::AcpSessionId;
+use agent_of_empires::session::mcp_model::{self, McpLayer, McpProvenance};
 
 use crate::common::{shim_path, shim_ready};
 
@@ -72,7 +73,7 @@ async fn configured_mcp_servers_reach_new_session() {
         r#"{ "mcpServers": { "probe": { "command": "echo", "args": ["hi"] } } }"#,
     )
     .unwrap();
-    let servers = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
+    let servers = mcp_model::load_global_mcp_servers(app_dir.path()).unwrap();
     assert_eq!(servers.len(), 1, "fixture should parse one server");
 
     // A tempdir + plain path, not NamedTempFile: the shim writes this file from
@@ -80,7 +81,7 @@ async fn configured_mcp_servers_reach_new_session() {
     let record_dir = tempfile::tempdir().unwrap();
     let record_path = record_dir.path().join("record.json");
     let mut config = base_config(std::env::temp_dir(), &record_path);
-    config.mcp_servers = servers;
+    config.mcp_servers = mcp_config::project_servers_to_acp(servers);
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-forward".into()))
         .await
@@ -114,7 +115,7 @@ async fn native_and_global_merge_reaches_new_session() {
         } }"#,
     )
     .unwrap();
-    let native = mcp_config::load_native_mcp_servers("claude", home.path()).unwrap();
+    let native = mcp_model::load_native_mcp_servers("claude", home.path()).unwrap();
 
     // Global layer (higher precedence): `<app_dir>/mcp.json`. It overrides
     // "shared" and adds "global-only".
@@ -127,15 +128,17 @@ async fn native_and_global_merge_reaches_new_session() {
         } }"#,
     )
     .unwrap();
-    let global = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
+    let global = mcp_model::load_global_mcp_servers(app_dir.path()).unwrap();
 
-    let merged = mcp_config::merge_by_precedence(vec![
-        mcp_config::McpLayer {
-            label: "agent-native",
+    let merged = mcp_model::resolve(vec![
+        McpLayer {
+            provenance: McpProvenance::AgentNative {
+                agent: "claude".into(),
+            },
             servers: native,
         },
-        mcp_config::McpLayer {
-            label: "global",
+        McpLayer {
+            provenance: McpProvenance::Global,
             servers: global,
         },
     ]);
@@ -143,7 +146,8 @@ async fn native_and_global_merge_reaches_new_session() {
     let record_dir = tempfile::tempdir().unwrap();
     let record_path = record_dir.path().join("record.json");
     let mut config = base_config(std::env::temp_dir(), &record_path);
-    config.mcp_servers = merged;
+    config.mcp_servers =
+        mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect());
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-native-merge".into()))
         .await
@@ -187,13 +191,13 @@ async fn no_config_forwards_empty_list() {
 
     // No mcp.json in the app dir => empty list, unchanged from pre-feature.
     let app_dir = tempfile::tempdir().unwrap();
-    let servers = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
+    let servers = mcp_model::load_global_mcp_servers(app_dir.path()).unwrap();
     assert!(servers.is_empty());
 
     let record_dir = tempfile::tempdir().unwrap();
     let record_path = record_dir.path().join("record.json");
     let mut config = base_config(std::env::temp_dir(), &record_path);
-    config.mcp_servers = servers;
+    config.mcp_servers = mcp_config::project_servers_to_acp(servers);
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-empty".into()))
         .await
