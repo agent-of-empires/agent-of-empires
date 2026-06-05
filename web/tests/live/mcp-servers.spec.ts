@@ -49,11 +49,13 @@ base("MCP panel shows native servers with provenance and redacts secrets", async
     await expect(panel.getByText("remote", { exact: true })).toBeVisible();
     await expect(panel.getByText("agent-native:claude").first()).toBeVisible();
 
-    // Secret values never reach the DOM; only the names do.
+    // Secret values never reach the DOM; only the names do. The negative
+    // assertions prove the env value (TOKEN) and header value (Authorization)
+    // are redacted; the positive assertions prove their NAMES still render.
     await expect(panel).not.toContainText("SUPER_SECRET_DO_NOT_LEAK");
     await expect(panel).not.toContainText("HEADER_SECRET_DO_NOT_LEAK");
-    await expect(panel).toContainText("TOKEN");
-    await expect(panel).toContainText("Authorization");
+    await expect(panel).toContainText("TOKEN"); // env var name
+    await expect(panel).toContainText("Authorization"); // header name
   } finally {
     await serve.stop();
   }
