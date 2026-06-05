@@ -106,7 +106,13 @@ test("elevation does not survive restart: high-risk actions re-prompt", async ({
   }).toPass({ timeout: 10_000 });
 });
 
-test("revoke and sign-out-all are elevation-gated and then work", async ({
+// NOTE on elevation gating: revoke and logout-all are gated behind
+// step-up elevation in `requires_elevation`, but a loopback caller
+// bypasses the passphrase wall entirely (#1525), so a local test cannot
+// observe the 403. The path-level gating policy is unit-tested in
+// `requires_elevation_paths` (src/server/auth.rs); here we exercise the
+// behavior the handlers produce for a trusted local caller.
+test("revoke removes one device and sign-out-all clears every session", async ({
   servePreauthed,
 }) => {
   const passphrase = servePreauthed.passphrase!;
@@ -119,10 +125,6 @@ test("revoke and sign-out-all are elevation-gated and then work", async ({
     body: JSON.stringify({ passphrase, device_binding_secret: otherBinding }),
   });
   expect(loginRes.ok).toBe(true);
-  const otherCookie = /aoe_session=([^;]+)/.exec(
-    loginRes.headers.get("set-cookie") ?? "",
-  )?.[1];
-  expect(otherCookie).toBeTruthy();
 
   const devicesBefore: Array<{ session_id: string; current: boolean }> = await fetch(
     `${servePreauthed.baseUrl}/api/devices`,
@@ -132,19 +134,7 @@ test("revoke and sign-out-all are elevation-gated and then work", async ({
   const otherSession = devicesBefore.find((d) => !d.current);
   expect(otherSession).toBeTruthy();
 
-  // Without elevation, revoke is blocked (403 elevation_required).
-  const gated = await fetch(
-    `${servePreauthed.baseUrl}/api/login/sessions/${otherSession!.session_id}`,
-    { method: "DELETE", headers: authHeaders(servePreauthed) },
-  );
-  expect(gated.status).toBe(403);
-
-  // Elevate, then revoke succeeds and the other device disappears.
-  await fetch(`${servePreauthed.baseUrl}/api/login/elevate`, {
-    method: "POST",
-    headers: { ...authHeaders(servePreauthed), "Content-Type": "application/json" },
-    body: JSON.stringify({ passphrase }),
-  });
+  // Revoke the other device; it disappears from the list.
   const revoke = await fetch(
     `${servePreauthed.baseUrl}/api/login/sessions/${otherSession!.session_id}`,
     { method: "DELETE", headers: authHeaders(servePreauthed) },
@@ -157,7 +147,7 @@ test("revoke and sign-out-all are elevation-gated and then work", async ({
   ).then((r) => r.json());
   expect(devicesAfter.some((d) => d.session_id === otherSession!.session_id)).toBe(false);
 
-  // Sign out everyone (still elevated). The current session is dropped too.
+  // Sign out everyone. The current session is dropped too.
   const all = await fetch(`${servePreauthed.baseUrl}/api/login/logout-all`, {
     method: "POST",
     headers: authHeaders(servePreauthed),
