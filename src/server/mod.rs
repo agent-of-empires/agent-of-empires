@@ -537,12 +537,22 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // bounce. The owner-only store lives in the app dir; fall back to an
     // in-memory manager when persistence is disabled or no app dir
     // resolves.
-    let login_manager = Arc::new(
-        match (config.auth.persist_sessions, crate::session::get_app_dir()) {
-            (true, Ok(app_dir)) => login::LoginManager::with_persistence(passphrase, &app_dir),
-            _ => login::LoginManager::new(passphrase),
-        },
-    );
+    let login_manager = Arc::new(if config.auth.persist_sessions {
+        match crate::session::get_app_dir() {
+            Ok(app_dir) => login::LoginManager::with_persistence(passphrase, &app_dir),
+            Err(e) => {
+                tracing::warn!(
+                    target: "auth.passphrase",
+                    error = %e,
+                    "auth.persist_sessions is on but the app dir is unavailable; \
+                     login sessions will be in-memory only and will not survive a restart"
+                );
+                login::LoginManager::new(passphrase)
+            }
+        }
+    } else {
+        login::LoginManager::new(passphrase)
+    });
     let rate_limiter = Arc::new(RateLimiter::new());
 
     if login_manager.is_enabled() {
