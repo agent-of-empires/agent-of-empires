@@ -1697,7 +1697,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         guard.remove(&session_id);
                         return;
                     }
-                    let respawn_config: SpawnConfig =
+                    let mut respawn_config: SpawnConfig =
                         match restart_decision(&workers, &session_id).await {
                             RestartDecision::Respawn(cfg) => {
                                 info!(
@@ -1774,6 +1774,26 @@ impl<S: BroadcastSink> Supervisor<S> {
                         };
 
                     tokio::time::sleep(RESPAWN_BACKOFF).await;
+
+                    // Re-resolve the MCP layers rather than reusing the list
+                    // cached at first spawn: edits to the agent's native config
+                    // or `<app_dir>/mcp.json` made since then are forwarded on
+                    // `session/load` too, so a respawn must pick them up.
+                    let mcp_agent = respawn_config.agent_key.clone();
+                    let mcp_session = session_id.clone();
+                    respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
+                        resolve_mcp_layers(&mcp_agent, &mcp_session)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            target: "acp.mcp",
+                            session = %session_id,
+                            error = %e,
+                            "MCP re-resolution on respawn failed; forwarding no servers"
+                        );
+                        Vec::new()
+                    });
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     let mut new_client =
@@ -2971,6 +2991,71 @@ mod tests {
         let sup = Supervisor::new(sink);
         assert_eq!(sup.count().await, 0);
         assert!(!sup.is_running("anything").await);
+    }
+
+    /// `resolve_mcp_layers` is the supervisor's own resolver: it reads the
+    /// agent's native config (HOME-relative) and the global `<app_dir>/mcp.json`,
+    /// then merges with global winning name collisions. The integration test in
+    /// `tests/integration/acp_mcp.rs` precomputes the merge itself and so never
+    /// covers this wiring; this test exercises it end to end against temp dirs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_mcp_layers_merges_native_under_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
+        // these env vars, which is the existing pattern in this module.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        // Native (Claude) layer: defines "native-only" and "shared".
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": {
+                "native-only": { "command": "n" },
+                "shared": { "command": "from-native" }
+            } }"#,
+        )
+        .unwrap();
+
+        // Global layer in the resolved app dir: adds "global-only" and overrides
+        // "shared". Resolve the dir via the same call the resolver uses so the
+        // namespace (release vs dev) always matches.
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mcp.json"),
+            r#"{ "mcpServers": {
+                "global-only": { "command": "g" },
+                "shared": { "command": "from-global" }
+            } }"#,
+        )
+        .unwrap();
+
+        let merged = tokio::task::spawn_blocking(|| resolve_mcp_layers("claude", "resolve-test"))
+            .await
+            .unwrap();
+
+        let val = serde_json::to_value(&merged).unwrap();
+        let arr = val.as_array().expect("mcp_servers serializes to an array");
+        assert_eq!(arr.len(), 3, "native + global union, got {val}");
+        let shared = arr
+            .iter()
+            .find(|s| s["name"] == "shared")
+            .expect("shared server present");
+        assert_eq!(
+            shared["command"], "from-global",
+            "global must win the name collision, got {val}"
+        );
+        assert!(
+            arr.iter().any(|s| s["name"] == "native-only"),
+            "native-only must survive the merge, got {val}"
+        );
+        assert!(
+            arr.iter().any(|s| s["name"] == "global-only"),
+            "global-only must survive the merge, got {val}"
+        );
     }
 
     /// Watchdog: after MAX_RESPAWNS_IN_WINDOW respawn attempts inside
