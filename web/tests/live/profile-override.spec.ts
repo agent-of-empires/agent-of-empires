@@ -59,7 +59,7 @@ test("per-profile setting override leaves global state untouched", async ({
   // Change `session.default_tool` under `work`. The TextField commits on
   // blur via onChange, which fires onSave -> PATCH .../profiles/work/settings.
   const defaultAgentInput = page
-    .locator("label", { hasText: /^Default agent$/ })
+    .locator("label", { hasText: /^Default Tool$/ })
     .locator("..")
     .locator("input[type=text]");
   await defaultAgentInput.fill(sentinel);

@@ -1616,7 +1616,8 @@ pub struct SandboxConfig {
         label = "Extra Volumes",
         widget = "list",
         validate = "volume_list",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub extra_volumes: Vec<String>,
 
@@ -1632,7 +1633,8 @@ pub struct SandboxConfig {
         label = "Sandbox Environment",
         widget = "list",
         validate = "env_list",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub environment: Vec<String>,
 
@@ -1650,7 +1652,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "CPU Limit",
         widget = "optional_text",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub cpu_limit: Option<String>,
 
@@ -1660,7 +1663,8 @@ pub struct SandboxConfig {
         label = "Memory Limit",
         widget = "optional_text",
         validate = "memory_limit",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub memory_limit: Option<String>,
 
@@ -1674,7 +1678,8 @@ pub struct SandboxConfig {
         label = "Port Mappings",
         widget = "list",
         validate = "port_mapping_list",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub port_mappings: Vec<String>,
 
@@ -1693,7 +1698,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Volume Ignores",
         widget = "list",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub volume_ignores: Vec<String>,
 
@@ -1705,7 +1711,8 @@ pub struct SandboxConfig {
         label = "Volume Ignores Strategy",
         widget = "select",
         options = "anonymous:anonymous,named:named",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub volume_ignores_strategy: VolumeIgnoresStrategy,
 
@@ -1725,7 +1732,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "SELinux Relabel",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub selinux_relabel: bool,
 
@@ -1735,7 +1743,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Custom Instruction",
         widget = "optional_text",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        advanced
     )]
     pub custom_instruction: Option<String>,
 
