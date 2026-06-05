@@ -212,6 +212,33 @@ fn server_kind(server: &McpServer) -> &'static str {
     }
 }
 
+/// Convert the always-compiled project-local servers (parsed and fingerprinted
+/// by `session::project_mcp` outside the serve gate) into ACP `McpServer`
+/// values for forwarding (#1985). The supervisor calls this only after the repo
+/// is trusted for the matching fingerprint, so the converted set is exactly the
+/// reviewed set.
+pub fn project_servers_to_acp(
+    servers: Vec<crate::session::project_mcp::ProjectMcpServer>,
+) -> Vec<McpServer> {
+    use crate::session::project_mcp::ProjectMcpTransport;
+    servers
+        .into_iter()
+        .map(|server| match server.transport {
+            ProjectMcpTransport::Stdio { command, args, env } => McpServer::Stdio(
+                McpServerStdio::new(server.name, command)
+                    .args(args)
+                    .env(to_env(env)),
+            ),
+            ProjectMcpTransport::Http { url, headers } => {
+                McpServer::Http(McpServerHttp::new(server.name, url).headers(to_headers(headers)))
+            }
+            ProjectMcpTransport::Sse { url, headers } => {
+                McpServer::Sse(McpServerSse::new(server.name, url).headers(to_headers(headers)))
+            }
+        })
+        .collect()
+}
+
 /// A named source of MCP servers for precedence merging. Layers are passed
 /// lowest-precedence first; on a server-name collision the higher (later) layer
 /// wins and both labels are logged so the override is visible. The `label` is

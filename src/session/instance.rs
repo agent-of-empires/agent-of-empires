@@ -1827,14 +1827,14 @@ impl Instance {
             .hooks
             .on_launch;
 
-        // Check if repo has trusted hooks that override
-        match super::repo_config::check_hook_trust(Path::new(&self.project_path)) {
-            Ok(super::repo_config::HookTrustStatus::Trusted(hooks))
-                if !hooks.on_launch.is_empty() =>
-            {
-                resolved_on_launch = hooks.on_launch.clone();
+        // Check if repo has trusted hooks that override. Only the hooks surface
+        // matters here; untrusted project MCP must not suppress trusted hooks.
+        if let Ok(trust) = super::repo_config::check_repo_trust(Path::new(&self.project_path)) {
+            if let Some(hooks) = trust.hooks.trusted() {
+                if !hooks.on_launch.is_empty() {
+                    resolved_on_launch = hooks.on_launch;
+                }
             }
-            _ => {}
         }
 
         if resolved_on_launch.is_empty() {

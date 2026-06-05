@@ -14,10 +14,10 @@ use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HookTrustAction,
-    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
-    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
-    RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
+    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
+    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
+    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -1015,25 +1015,23 @@ impl HomeView {
                         self.hook_trust_dialog = None;
                         if let Some(data) = self.pending_hook_trust_data.take() {
                             let emit = match action {
-                                HookTrustAction::Trust {
-                                    hooks,
+                                RepoTrustAction::Trust {
                                     hooks_hash,
+                                    mcp_hash,
                                     project_path,
+                                    hooks,
                                 } => {
                                     if let Err(e) = repo_config::trust_repo(
                                         std::path::Path::new(&project_path),
-                                        &hooks_hash,
+                                        hooks_hash.as_deref(),
+                                        mcp_hash.as_deref(),
                                     ) {
                                         tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
                                     }
-                                    let merged =
-                                        repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                    self.create_session_with_hooks(data, merged)
+                                    self.create_session_with_hooks(data, hooks)
                                 }
-                                HookTrustAction::Skip => {
-                                    let fallback =
-                                        repo_config::resolve_global_profile_hooks(&data.profile);
-                                    self.create_session_with_hooks(data, fallback)
+                                RepoTrustAction::Skip { hooks } => {
+                                    self.create_session_with_hooks(data, hooks)
                                 }
                             };
                             self.pending_dialog_click_action = emit;
@@ -1421,25 +1419,23 @@ impl HomeView {
                     self.hook_trust_dialog = None;
                     if let Some(data) = self.pending_hook_trust_data.take() {
                         match action {
-                            HookTrustAction::Trust {
-                                hooks,
+                            RepoTrustAction::Trust {
                                 hooks_hash,
+                                mcp_hash,
                                 project_path,
+                                hooks,
                             } => {
                                 if let Err(e) = repo_config::trust_repo(
                                     std::path::Path::new(&project_path),
-                                    &hooks_hash,
+                                    hooks_hash.as_deref(),
+                                    mcp_hash.as_deref(),
                                 ) {
                                     tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
                                 }
-                                let merged =
-                                    repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                return self.create_session_with_hooks(data, merged);
+                                return self.create_session_with_hooks(data, hooks);
                             }
-                            HookTrustAction::Skip => {
-                                let fallback =
-                                    repo_config::resolve_global_profile_hooks(&data.profile);
-                                return self.create_session_with_hooks(data, fallback);
+                            RepoTrustAction::Skip { hooks } => {
+                                return self.create_session_with_hooks(data, hooks);
                             }
                         }
                     }
@@ -4125,33 +4121,70 @@ impl HomeView {
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
-        match repo_config::check_hook_trust(std::path::Path::new(&data.path)) {
-            Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                use crate::tui::dialogs::HookTrustDialog;
-                let merged_hooks = repo_config::merge_hooks_for_display(&data.profile, &hooks);
-                self.hook_trust_dialog = Some(HookTrustDialog::new(
-                    hooks,
-                    merged_hooks,
-                    hooks_hash,
-                    data.path.clone(),
-                ));
-                self.pending_hook_trust_data = Some(data);
-                None
-            }
-            Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                let merged = repo_config::merge_hooks_with_config(&data.profile, repo_hooks);
-                self.create_session_with_hooks(data, merged)
-            }
-            Ok(repo_config::HookTrustStatus::NoHooks) => {
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
-            }
+        use crate::session::TrustSurface;
+        let trust = match repo_config::check_repo_trust(std::path::Path::new(&data.path)) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to check repo hooks: {}", e);
+                tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
                 let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
+                return self.create_session_with_hooks(data, fallback);
             }
+        };
+
+        let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+            TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
+                Some(h.clone())
+            }
+            TrustSurface::Absent => None,
+        };
+        let hooks_hash = match &trust.hooks {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_hash = match &trust.mcp {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_servers = match &trust.mcp {
+            TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => s.clone(),
+            TrustSurface::Absent => Vec::new(),
+        };
+
+        // Hooks to run if approved (repo hooks, else global) vs skipped
+        // (already-trusted repo hooks still run; newly-prompted hooks fall back
+        // to the global set, matching the prior TUI skip behavior).
+        let hooks_on_trust = match &repo_hooks {
+            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
+            None => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+        let hooks_on_skip = match &trust.hooks {
+            TrustSurface::Trusted(h) => {
+                repo_config::merge_hooks_with_config(&data.profile, h.clone())
+            }
+            _ => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+
+        if !trust.needs_prompt() {
+            return self.create_session_with_hooks(data, hooks_on_trust);
         }
+
+        use crate::tui::dialogs::RepoTrustDialog;
+        let merged_hooks = repo_hooks
+            .as_ref()
+            .map(|h| repo_config::merge_hooks_for_display(&data.profile, h))
+            .unwrap_or_default();
+        self.hook_trust_dialog = Some(RepoTrustDialog::new(
+            merged_hooks,
+            repo_hooks.unwrap_or_default(),
+            mcp_servers,
+            hooks_on_trust,
+            hooks_on_skip,
+            hooks_hash,
+            mcp_hash,
+            data.path.clone(),
+        ));
+        self.pending_hook_trust_data = Some(data);
+        None
     }
 
     /// Create a session with optional hooks. Delegates to the background
