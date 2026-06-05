@@ -519,7 +519,20 @@ impl HomeView {
         let at_top = row <= pane.y;
         let at_bottom = row >= pane.bottom().saturating_sub(1);
         if !at_top && !at_bottom {
+            // Cursor pulled back inside the pane: arm the next edge entry
+            // to scroll immediately rather than wait out the interval.
+            self.preview_autoscroll_at = None;
             return false;
+        }
+        // Pace the scroll to a steady cadence regardless of how often the
+        // loop woke this iteration, so the speed is even instead of racing
+        // with capture-worker activity.
+        const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.preview_autoscroll_at {
+            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
+                return false;
+            }
         }
         let scrolled = if at_top {
             self.scroll_preview_offset(1)
@@ -529,6 +542,7 @@ impl HomeView {
         if !scrolled {
             return false;
         }
+        self.preview_autoscroll_at = Some(now);
         let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
         let first = self.projected_first_line();
         let new_extent = if at_top {
@@ -593,6 +607,7 @@ impl HomeView {
         // The pointer is up, so edge auto-scroll stops; drop the tracked
         // position so a finalized highlight doesn't keep scrolling.
         self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
         match state {
             DragKind::ListDivider { .. } => {
                 self.save_list_width();
@@ -700,6 +715,7 @@ impl HomeView {
                 self.drag_state = None;
             }
             self.preview_drag_pos = None;
+            self.preview_autoscroll_at = None;
             // A pending capture from a previous finalized drag is
             // moot once the selection is gone; drop it so the next
             // selection starts clean.

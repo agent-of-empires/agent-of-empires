@@ -722,6 +722,14 @@ pub struct HomeView {
     /// ticker-driven scroll, holding still at the edge wouldn't advance.
     pub(super) preview_drag_pos: Option<(u16, u16)>,
 
+    /// When the edge auto-scroll last advanced a line. Paces the scroll to
+    /// a steady cadence so it doesn't race: the event loop wakes more often
+    /// than the ticker (capture-worker wakes, post-key wakes), and stepping
+    /// once per wake made the scroll speed lurch with pane activity.
+    /// Reset whenever the cursor leaves the edge so re-entering scrolls at
+    /// once.
+    pub(super) preview_autoscroll_at: Option<std::time::Instant>,
+
     /// In-app text selection over the preview pane, populated only in
     /// live-send mode (where terminal-native drag-select doesn't reach
     /// us because mouse capture is on). The renderer reads this to
@@ -994,6 +1002,7 @@ impl HomeView {
             main_area_width: 0,
             drag_state: None,
             preview_drag_pos: None,
+            preview_autoscroll_at: None,
             preview_selection: None,
             preview_copy_pending: false,
             preview_copy_text: None,

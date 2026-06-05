@@ -1143,8 +1143,13 @@ impl App {
             // single drag can grab more than a page without depending on
             // mouse movement to fire events. No-op unless a drag is live
             // and the pointer sits at the edge.
+            //
+            // Request a normal (diffed) redraw via `refresh_needed`, NOT
+            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // top of the loop, and clearing every ticker frame while the
+            // scroll runs strobes the screen blank-then-repaint. The diffed
+            // draw at the bottom of the loop repaints smoothly.
             if self.home.tick_preview_autoscroll() {
-                self.needs_redraw = true;
                 refresh_needed = true;
                 needs_full_refresh = true;
             }

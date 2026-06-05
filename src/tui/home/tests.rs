@@ -7430,7 +7430,10 @@ mod preview_drag_select {
             env.view.preview_selection.expect("live selection").extent,
             (0, 40)
         );
-        // Second tick, still no mouse event: advance again.
+        // Second tick, still no mouse event: advance again. (Clear the
+        // pacing gate so the back-to-back call isn't throttled; the gate's
+        // wall-clock interval is exercised in real use, not here.)
+        env.view.preview_autoscroll_at = None;
         assert!(env.view.tick_preview_autoscroll());
         assert_eq!(env.view.preview_scroll_offset, 8);
         assert_eq!(
