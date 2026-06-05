@@ -361,21 +361,6 @@ pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSur
     }
 }
 
-/// Keep a server that was removed from a native config: promote its last-seen
-/// definition into the global `mcp.json` (where it outranks native and resolves
-/// with provenance `global`), then forget the native snapshot entry so it stops
-/// being reported as kept-on-removal. AoE never writes the native file.
-pub fn keep_removed(agent: &str, server: &ProjectMcpServer) -> Result<()> {
-    super::mcp_overrides::upsert_global_server(server)?;
-    super::mcp_state::forget_native(agent, &server.name)
-}
-
-/// Drop a kept-on-removal server: forget the native snapshot entry without
-/// promoting it, so it disappears from the view entirely.
-pub fn drop_removed(agent: &str, name: &str) -> Result<()> {
-    super::mcp_state::forget_native(agent, name)
-}
-
 // ---------------------------------------------------------------------------
 // Standard `.mcp.json` layers: global and per-profile.
 // ---------------------------------------------------------------------------
@@ -952,7 +937,7 @@ mod tests {
 
         // Keep it: promote to global mcp.json; it now forwards as `global` and is
         // no longer reported as kept-on-removal.
-        keep_removed("claude", &kept.def).unwrap();
+        assert!(super::super::mcp_state::keep_removed("claude", &kept.def.name).unwrap());
         let view = resolve_surface("claude", None, &cwd);
         assert!(
             view.kept_on_removal.is_empty(),
@@ -983,7 +968,7 @@ mod tests {
         let view = resolve_surface("claude", None, &cwd);
         assert_eq!(view.kept_on_removal.len(), 1);
 
-        drop_removed("claude", "gone").unwrap();
+        super::super::mcp_state::forget_native("claude", "gone").unwrap();
         let view = resolve_surface("claude", None, &cwd);
         assert!(
             view.kept_on_removal.is_empty(),

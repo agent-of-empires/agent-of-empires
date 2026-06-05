@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
+import { McpServers } from "./McpServers";
 import { NotificationSettings } from "./NotificationSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
@@ -34,6 +35,7 @@ type TabId =
   | "security"
   | "devices"
   | "structured-view"
+  | "mcp"
   | "logging";
 
 type SidebarItem =
@@ -57,6 +59,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
     { kind: "tab", id: "structured-view", label: "Structured view" },
+    { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -103,6 +106,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "security",
   "devices",
   "structured-view",
+  "mcp",
   "logging",
 ]);
 
@@ -331,6 +335,7 @@ export function SettingsView({
       activeTab !== "security" &&
       activeTab !== "devices" &&
       activeTab !== "structured-view" &&
+      activeTab !== "mcp" &&
       activeTab !== "telemetry"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
@@ -511,6 +516,8 @@ export function SettingsView({
         return <SecuritySettings />;
       case "devices":
         return <ConnectedDevices />;
+      case "mcp":
+        return <McpServers />;
       case "structured-view": {
         if (!settings) {
           return (

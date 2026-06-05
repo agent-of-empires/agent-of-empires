@@ -1174,6 +1174,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        // Unified MCP management surface (#1996)
+        .route("/api/mcp/servers", get(api::get_mcp_servers))
+        .route(
+            "/api/mcp/servers/{name}/resolve",
+            post(api::resolve_mcp_conflict),
+        )
+        .route("/api/mcp/servers/{name}/keep", post(api::keep_mcp_server))
+        .route("/api/mcp/servers/{name}/drop", post(api::drop_mcp_server))
         .route(
             "/api/sessions/{id}",
             patch(api::rename_session).delete(api::delete_session),

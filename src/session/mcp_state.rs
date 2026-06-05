@@ -182,11 +182,33 @@ pub fn reconcile_agent(agent: &str, read: &NativeRead) -> Result<McpReconcile> {
     })
 }
 
-/// Drop a server from an agent's snapshot. Used to finalize a keep-on-removal
-/// decision: "keep" promotes the server into the global `mcp.json` and then
-/// forgets the native snapshot entry; "drop" just forgets it. Either way the
-/// server stops being reported as kept-on-removal on the next open. A no-op if
-/// the entry is already gone.
+/// Keep a server that was removed from a native config (feature D): promote its
+/// last-seen definition (held in the snapshot) into the global `mcp.json` so it
+/// keeps forwarding as `global`, then forget the snapshot entry so it stops
+/// being reported as kept-on-removal. By NAME so every surface can call it
+/// (the web client never holds the unredacted definition). Returns `false` if
+/// no such kept entry exists (already kept or dropped by another surface).
+/// Reads the definition, promotes, then forgets, so a failed global write
+/// leaves the entry intact and still keepable.
+pub fn keep_removed(agent: &str, name: &str) -> Result<bool> {
+    let def = with_locked_state(|state| {
+        state
+            .native_snapshots
+            .get(agent)
+            .and_then(|m| m.get(name))
+            .cloned()
+    })?;
+    let Some(def) = def else {
+        return Ok(false);
+    };
+    super::mcp_overrides::upsert_global_server(&def)?;
+    forget_native(agent, name)?;
+    Ok(true)
+}
+
+/// Drop a server from an agent's snapshot. Finalizes a keep-on-removal "drop"
+/// decision (or the second half of [`keep_removed`]). The server stops being
+/// reported as kept-on-removal on the next open. A no-op if already gone.
 pub fn forget_native(agent: &str, name: &str) -> Result<()> {
     with_locked_state(|state| {
         if let Some(snapshot) = state.native_snapshots.get_mut(agent) {

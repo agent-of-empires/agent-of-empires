@@ -1256,3 +1256,79 @@ export async function deleteSession(
     };
   }
 }
+
+// --- MCP servers (#1996) ---
+
+export interface McpServerView {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  envNames?: string[];
+  headerNames?: string[];
+  provenance: string;
+  shadowed?: string[];
+}
+
+export interface McpConflictView {
+  name: string;
+  agent: string;
+  previous: string;
+  current: string;
+  fingerprint: string;
+}
+
+export interface McpServersResponse {
+  agent: string;
+  effective: McpServerView[];
+  keptOnRemoval: McpServerView[];
+  conflicts: McpConflictView[];
+  driftPaused: boolean;
+}
+
+export function fetchMcpServers(agent?: string): Promise<McpServersResponse | null> {
+  const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return fetchJson<McpServersResponse>(`/api/mcp/servers${q}`);
+}
+
+async function postMcp(url: string, body: unknown): Promise<Response | null> {
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  }
+}
+
+export type McpResolveResult = "applied" | "stale" | "error";
+
+export async function resolveMcpConflict(
+  name: string,
+  agent: string,
+  winner: "aoe" | "native",
+  fingerprint: string,
+): Promise<McpResolveResult> {
+  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/resolve`, {
+    agent,
+    winner,
+    fingerprint,
+  });
+  if (!res) return "error";
+  if (res.ok) return "applied";
+  if (res.status === 409) return "stale";
+  return "error";
+}
+
+export async function keepMcpServer(name: string, agent: string): Promise<boolean> {
+  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/keep`, { agent });
+  return !!res && res.ok;
+}
+
+export async function dropMcpServer(name: string, agent: string): Promise<boolean> {
+  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/drop`, { agent });
+  return !!res && res.ok;
+}

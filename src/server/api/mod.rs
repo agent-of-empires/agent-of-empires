@@ -16,6 +16,7 @@ mod acp;
 mod client_log;
 mod git;
 mod log_level;
+mod mcp;
 mod projects;
 mod sessions;
 mod system;
@@ -33,6 +34,7 @@ pub use acp::{
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
+pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
@@ -160,6 +162,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
             (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
@@ -302,6 +309,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
             (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
