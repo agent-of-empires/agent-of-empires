@@ -3178,6 +3178,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
+        // Tied mode (#1927) collapses naming into a single Rename action: the
+        // directory follows the title, so route the standalone workdir edit to
+        // the rename dialog instead of editing the directory independently.
+        if self.tie_workdir_applies_for(&id) {
+            self.open_rename_for_selected();
+            return;
+        }
         let snapshot = self.get_instance(&id).map(|inst| {
             (
                 inst.worktree_info.clone(),

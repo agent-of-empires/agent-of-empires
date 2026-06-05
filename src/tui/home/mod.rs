@@ -3855,6 +3855,26 @@ impl HomeView {
         Some(crate::session::resolve_config_or_warn(&profile).session)
     }
 
+    /// Whether renaming this session should also move its worktree directory
+    /// leaf, per the resolved `session.tie_workdir_to_name` setting. True only
+    /// for aoe-managed worktree sessions. Unlike `resolve_session_config_for`,
+    /// this does not bypass structured-view sessions: the directory tie is
+    /// orthogonal to the view. See #1927.
+    pub(super) fn tie_workdir_applies_for(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        let profile = if inst.source_profile.is_empty() {
+            self.config_profile()
+        } else {
+            inst.source_profile.clone()
+        };
+        let tie = crate::session::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name;
+        inst.tie_workdir_applies(tie)
+    }
+
     /// Resolve `new_session_attach_mode` for a freshly-created session.
     /// See `resolve_session_config_for` for the profile-resolution and
     /// structured view-bypass rules.
