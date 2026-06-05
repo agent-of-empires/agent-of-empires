@@ -2106,25 +2106,8 @@ impl HomeView {
                         "Session was created, but the following warnings were emitted during worktree setup:\n\n{}",
                         body
                     );
-                    // Size to fit content. The default 50x9 truncates everything
-                    // past the prefix sentence, so the user only sees the prefix
-                    // and a blank line. Mirrors the math in app.rs:show_startup_warning.
-                    const WIDTH: u16 = 96;
-                    let inner_width = WIDTH.saturating_sub(4) as usize;
-                    let visual_lines: usize = message
-                        .lines()
-                        .map(|l| {
-                            if l.is_empty() {
-                                1
-                            } else {
-                                l.len().div_ceil(inner_width)
-                            }
-                        })
-                        .sum();
-                    let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
-                    self.info_dialog = Some(
-                        InfoDialog::new("Worktree warnings", &message).with_size(WIDTH, height),
-                    );
+                    self.info_dialog =
+                        Some(InfoDialog::sized_to_fit("Worktree warnings", &message));
                 }
 
                 Some(session_id)
@@ -2136,7 +2119,9 @@ impl HomeView {
                     self.rebuild_group_trees();
                     self.flat_items = self.build_flat_items();
                     self.update_selected();
-                    self.info_dialog = Some(InfoDialog::new("Creation Failed", &error));
+                    // Hook failures carry multi-line output; size to fit so
+                    // the actual error isn't clipped at the default 50x9.
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
                 } else if let Some(dialog) = &mut self.new_dialog {
                     dialog.set_loading(false);
                     dialog.set_error(error);

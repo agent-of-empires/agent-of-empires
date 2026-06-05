@@ -406,40 +406,15 @@ impl App {
     }
 
     pub fn show_startup_warning(&mut self, message: &str) {
-        // Size the dialog to fit the message after wrapping. The message area
-        // is `width - 4` columns wide (borders + 1-cell margin on each side),
-        // so each \n-separated line wraps to ceil(len / inner_width) visual
-        // rows. Borders + margin + the OK button take 6 rows.
-        //
-        // 96, not 80: at the typical ~35-col sidebar width, a centered
-        // 80-wide dialog on a 150-col terminal lands its left border exactly
-        // at the sidebar's right border, which makes the modal visually
-        // blend into the layout. 96 shifts the coincidence point off the
-        // common laptop-fullscreen width and gives long path lines (e.g.
-        // `~/.config/agent-of-empires-dev`) more breathing room.
-        const WIDTH: u16 = 96;
-        let inner_width = WIDTH.saturating_sub(4) as usize;
-        let visual_lines: usize = message
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    1
-                } else {
-                    l.len().div_ceil(inner_width)
-                }
-            })
-            .sum();
-        // +6 for borders/margin/button; +1 safety margin since byte-length
-        // wrap estimation under-counts when Paragraph word-wraps mid-line.
-        let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
         // Warnings preempt onboarding dialogs so the user sees the problem
         // before the intro walkthrough.
         self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
         self.home.telemetry_consent_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
-        self.home.info_dialog =
-            Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
+        self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
+            "Warning", message,
+        ));
     }
 
     pub fn set_theme(&mut self, name: &str) {
