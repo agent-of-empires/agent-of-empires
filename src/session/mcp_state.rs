@@ -93,9 +93,6 @@ fn mcp_state_path() -> Result<PathBuf> {
 /// The whole read-modify-write runs under an exclusive lock so concurrent
 /// surface opens (e.g. web and TUI) cannot clobber each other's snapshot.
 pub fn reconcile_agent(agent: &str, read: &NativeRead) -> Result<McpReconcile> {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     if !read.skipped.is_empty() {
         tracing::warn!(
             target: "acp.mcp",
@@ -109,6 +106,73 @@ pub fn reconcile_agent(agent: &str, read: &NativeRead) -> Result<McpReconcile> {
         });
     }
 
+    let current: BTreeMap<String, ProjectMcpServer> = read
+        .servers
+        .iter()
+        .map(|s| (s.name.clone(), s.clone()))
+        .collect();
+
+    with_locked_state(|state| {
+        let snapshot = state.native_snapshots.entry(agent.to_string()).or_default();
+
+        let mut conflicts = Vec::new();
+        for (name, cur) in &current {
+            if let Some(prev) = snapshot.get(name) {
+                if prev != cur {
+                    conflicts.push(McpConflict {
+                        agent: agent.to_string(),
+                        previous: prev.clone(),
+                        current: cur.clone(),
+                    });
+                }
+            }
+        }
+
+        let removed: Vec<ProjectMcpServer> = snapshot
+            .iter()
+            .filter(|(name, _)| !current.contains_key(*name))
+            .map(|(_, def)| def.clone())
+            .collect();
+
+        // Adopt new servers (present in native, absent from snapshot). Unchanged
+        // servers already match. Conflicts and removals deliberately keep their
+        // old snapshot value until the user resolves them.
+        for (name, cur) in &current {
+            snapshot.entry(name.clone()).or_insert_with(|| cur.clone());
+        }
+
+        McpReconcile {
+            conflicts,
+            removed,
+            paused: false,
+        }
+    })
+}
+
+/// Drop a server from an agent's snapshot. Used to finalize a keep-on-removal
+/// decision: "keep" promotes the server into the global `mcp.json` and then
+/// forgets the native snapshot entry; "drop" just forgets it. Either way the
+/// server stops being reported as kept-on-removal on the next open. A no-op if
+/// the entry is already gone.
+pub fn forget_native(agent: &str, name: &str) -> Result<()> {
+    with_locked_state(|state| {
+        if let Some(snapshot) = state.native_snapshots.get_mut(agent) {
+            snapshot.remove(name);
+            if snapshot.is_empty() {
+                state.native_snapshots.remove(agent);
+            }
+        }
+    })
+}
+
+/// Open the drift store, lock it exclusively, hand the parsed state to `f`, then
+/// write the (possibly mutated) state back through the same locked handle. The
+/// lock serializes concurrent surface opens (web and TUI) so neither clobbers
+/// the other's snapshot.
+fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
+    use fs2::FileExt;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     let path = mcp_state_path()?;
     if !path.exists() {
         std::fs::write(&path, "").with_context(|| format!("creating {}", path.display()))?;
@@ -121,94 +185,47 @@ pub fn reconcile_agent(agent: &str, read: &NativeRead) -> Result<McpReconcile> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let mut lock_file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    lock_file
-        .lock_exclusive()
-        .context("locking mcp_state.json")?;
+    file.lock_exclusive().context("locking mcp_state.json")?;
 
     let mut content = String::new();
-    lock_file.read_to_string(&mut content)?;
+    file.read_to_string(&mut content)?;
     let mut state: McpState = if content.trim().is_empty() {
         McpState::default()
     } else {
         serde_json::from_str(&content).context("parsing mcp_state.json")?
     };
 
-    let current: BTreeMap<String, ProjectMcpServer> = read
-        .servers
-        .iter()
-        .map(|s| (s.name.clone(), s.clone()))
-        .collect();
-    let snapshot = state.native_snapshots.entry(agent.to_string()).or_default();
-
-    let mut conflicts = Vec::new();
-    for (name, cur) in &current {
-        if let Some(prev) = snapshot.get(name) {
-            if prev != cur {
-                conflicts.push(McpConflict {
-                    agent: agent.to_string(),
-                    previous: prev.clone(),
-                    current: cur.clone(),
-                });
-            }
-        }
-    }
-
-    let removed: Vec<ProjectMcpServer> = snapshot
-        .iter()
-        .filter(|(name, _)| !current.contains_key(*name))
-        .map(|(_, def)| def.clone())
-        .collect();
-
-    // Adopt new servers (present in native, absent from snapshot). Unchanged
-    // servers already match. Conflicts and removals deliberately keep their old
-    // snapshot value until the user resolves them.
-    for (name, cur) in &current {
-        snapshot.entry(name.clone()).or_insert_with(|| cur.clone());
-    }
+    let result = f(&mut state);
 
     let new_content = serde_json::to_string_pretty(&state)?;
-    lock_file.seek(SeekFrom::Start(0))?;
-    lock_file.set_len(0)?;
-    lock_file.write_all(new_content.as_bytes())?;
-
-    Ok(McpReconcile {
-        conflicts,
-        removed,
-        paused: false,
-    })
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(new_content.as_bytes())?;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::project_mcp::parse_standard_mcp_servers;
-    use std::sync::{Mutex, MutexGuard};
 
-    // The drift store lives at a HOME-derived path; serialize the env mutation.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct TmpHome {
-        _guard: MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-    }
-
-    fn with_tmp_home() -> TmpHome {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    /// The drift store path derives from HOME; the env mutation is serialized
+    /// across the whole suite by `#[serial_test::serial]` on each test (the same
+    /// global lock the supervisor's HOME-touching tests use), and the returned
+    /// `TempDir` must be kept alive for the test body.
+    fn set_tmp_home() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by ENV_LOCK for the duration of the returned guard.
+        // SAFETY: serialized by `#[serial]`; matches the existing pattern.
         unsafe {
             std::env::set_var("HOME", dir.path());
             std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
         }
-        TmpHome {
-            _guard: guard,
-            _dir: dir,
-        }
+        dir
     }
 
     fn read(json: &str) -> NativeRead {
@@ -219,8 +236,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn first_open_adopts_silently_no_conflicts() {
-        let _home = with_tmp_home();
+        let _home = set_tmp_home();
         let r = reconcile_agent(
             "claude",
             &read(r#"{ "mcpServers": { "fs": { "command": "c" }, "remote": { "type": "http", "url": "u" } } }"#),
@@ -240,8 +258,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn changed_definition_is_conflict_and_snapshot_holds_old() {
-        let _home = with_tmp_home();
+        let _home = set_tmp_home();
         reconcile_agent(
             "claude",
             &read(r#"{ "mcpServers": { "fs": { "command": "old" } } }"#),
@@ -271,8 +290,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn disappeared_server_is_kept_on_removal() {
-        let _home = with_tmp_home();
+        let _home = set_tmp_home();
         reconcile_agent(
             "claude",
             &read(r#"{ "mcpServers": { "fs": { "command": "c" }, "gone": { "command": "g" } } }"#),
@@ -296,8 +316,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn skipped_entry_pauses_drift_detection() {
-        let _home = with_tmp_home();
+        let _home = set_tmp_home();
         reconcile_agent(
             "claude",
             &read(r#"{ "mcpServers": { "fs": { "command": "c" } } }"#),

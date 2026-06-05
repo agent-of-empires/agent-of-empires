@@ -42,6 +42,11 @@ pub enum McpProvenance {
     Profile { name: String },
     /// The repo's trusted `cwd/.mcp.json`.
     ProjectLocal,
+    /// A server AoE last saw in the named agent's native config that has since
+    /// disappeared from it. Kept in AoE's view (keep-on-removal, feature D) and
+    /// not forwarded until the user keeps it (promoting it to `global`) or drops
+    /// it. `agent` is the native config it last lived in.
+    KeptOnRemoval { agent: String },
 }
 
 impl McpProvenance {
@@ -53,6 +58,7 @@ impl McpProvenance {
             McpProvenance::Global => "global".to_string(),
             McpProvenance::Profile { name } => format!("profile:{name}"),
             McpProvenance::ProjectLocal => "project-local".to_string(),
+            McpProvenance::KeptOnRemoval { agent } => format!("kept-on-removal:{agent}"),
         }
     }
 }
@@ -294,6 +300,82 @@ pub fn resolve_effective(
     ])
 }
 
+/// The full management-surface view for a session context (#1996): the
+/// effective forwarded set, plus servers kept-on-removal, plus the conflicts and
+/// drift-paused state the surfaces render. Built by [`resolve_surface`].
+pub struct McpSurfaceView {
+    /// The merged, trust-gated set that actually forwards to the agent, each
+    /// tagged with its winning provenance and shadow chain. Same set
+    /// [`resolve_effective`] feeds to forwarding.
+    pub effective: Vec<ResolvedMcpServer>,
+    /// Servers that vanished from the active agent's native config since AoE
+    /// last saw them, kept in the view with `KeptOnRemoval` provenance and NOT
+    /// forwarded until the user keeps (promote to global) or drops them.
+    pub kept_on_removal: Vec<ResolvedMcpServer>,
+    /// Servers whose native definition diverged from AoE's snapshot, awaiting a
+    /// which-side-wins decision.
+    pub conflicts: Vec<super::mcp_state::McpConflict>,
+    /// True when drift detection was paused for the active agent because its
+    /// native config has a malformed entry; conflicts and kept-on-removal are
+    /// then empty and the surface should say so rather than imply no drift.
+    pub drift_paused: bool,
+}
+
+/// Resolve the full management-surface view for the active agent and session
+/// context. Combines the forwarded effective set ([`resolve_effective`]) with a
+/// reconcile of the agent's native config against the drift store, so the
+/// surface shows provenance, conflicts, and kept-on-removal in one shot. The
+/// reconcile updates the snapshot (silent adoption of new servers); conflicts
+/// and removals persist until the user resolves them.
+pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
+    let effective = resolve_effective(agent, profile, cwd);
+
+    let reconcile = match load_native_mcp_servers_checked_from_home(agent) {
+        Ok(read) => super::mcp_state::reconcile_agent(agent, &read).unwrap_or_else(|e| {
+            warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
+            Default::default()
+        }),
+        Err(e) => {
+            warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to read native MCP config for drift");
+            Default::default()
+        }
+    };
+
+    let kept_on_removal = reconcile
+        .removed
+        .into_iter()
+        .map(|def| ResolvedMcpServer {
+            def,
+            provenance: McpProvenance::KeptOnRemoval {
+                agent: agent.to_string(),
+            },
+            shadowed: Vec::new(),
+        })
+        .collect();
+
+    McpSurfaceView {
+        effective,
+        kept_on_removal,
+        conflicts: reconcile.conflicts,
+        drift_paused: reconcile.paused,
+    }
+}
+
+/// Keep a server that was removed from a native config: promote its last-seen
+/// definition into the global `mcp.json` (where it outranks native and resolves
+/// with provenance `global`), then forget the native snapshot entry so it stops
+/// being reported as kept-on-removal. AoE never writes the native file.
+pub fn keep_removed(agent: &str, server: &ProjectMcpServer) -> Result<()> {
+    super::mcp_overrides::upsert_global_server(server)?;
+    super::mcp_state::forget_native(agent, &server.name)
+}
+
+/// Drop a kept-on-removal server: forget the native snapshot entry without
+/// promoting it, so it disappears from the view entirely.
+pub fn drop_removed(agent: &str, name: &str) -> Result<()> {
+    super::mcp_state::forget_native(agent, name)
+}
+
 // ---------------------------------------------------------------------------
 // Standard `.mcp.json` layers: global and per-profile.
 // ---------------------------------------------------------------------------
@@ -390,6 +472,13 @@ pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<Proje
 pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectMcpServer>> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
     load_native_mcp_servers(agent_key, &home)
+}
+
+/// Like [`load_native_mcp_servers_checked`] but resolves the real home dir. Used
+/// by the management surface, which needs the skipped-entry list to gate drift.
+pub fn load_native_mcp_servers_checked_from_home(agent_key: &str) -> Result<NativeRead> {
+    let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
+    load_native_mcp_servers_checked(agent_key, &home)
 }
 
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
@@ -818,6 +907,90 @@ mod tests {
             "header value leaked: {json}"
         );
         assert!(json.contains("TOKEN") && json.contains("Authorization"));
+    }
+
+    fn set_tmp_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by `#[serial]`; matches the existing pattern.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
+        }
+        dir
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn surface_shows_effective_then_keep_on_removal_then_promote() {
+        let home = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Native config (claude) with two servers; first open adopts both.
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{ "mcpServers": { "fs": { "command": "c" }, "gone": { "command": "g" } } }"#,
+        )
+        .unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(view.effective.len(), 2);
+        assert!(view.kept_on_removal.is_empty());
+        assert!(view.conflicts.is_empty() && !view.drift_paused);
+
+        // Drop "gone" from native: it must be kept-on-removal, not forwarded.
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{ "mcpServers": { "fs": { "command": "c" } } }"#,
+        )
+        .unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(view.effective.len(), 1, "removed server no longer forwards");
+        assert_eq!(view.kept_on_removal.len(), 1);
+        let kept = &view.kept_on_removal[0];
+        assert_eq!(kept.def.name, "gone");
+        assert_eq!(kept.provenance.label(), "kept-on-removal:claude");
+
+        // Keep it: promote to global mcp.json; it now forwards as `global` and is
+        // no longer reported as kept-on-removal.
+        keep_removed("claude", &kept.def).unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert!(
+            view.kept_on_removal.is_empty(),
+            "kept server no longer flagged"
+        );
+        let promoted = view
+            .effective
+            .iter()
+            .find(|s| s.def.name == "gone")
+            .expect("kept server now forwards");
+        assert_eq!(promoted.provenance, McpProvenance::Global);
+        let _ = home;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn surface_drop_removed_discards_without_promoting() {
+        let home = set_tmp_home();
+        let cwd = home.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{ "mcpServers": { "gone": { "command": "g" } } }"#,
+        )
+        .unwrap();
+        resolve_surface("claude", None, &cwd);
+        std::fs::write(home.path().join(".claude.json"), r#"{ "mcpServers": {} }"#).unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert_eq!(view.kept_on_removal.len(), 1);
+
+        drop_removed("claude", "gone").unwrap();
+        let view = resolve_surface("claude", None, &cwd);
+        assert!(
+            view.kept_on_removal.is_empty(),
+            "dropped server is gone entirely"
+        );
+        assert!(view.effective.is_empty(), "drop must not promote to global");
+        let _ = home;
     }
 
     #[test]
