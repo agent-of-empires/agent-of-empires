@@ -1175,9 +1175,10 @@
     {
       "id": "devices",
       "kind": "live-playwright",
-      "risk": "low",
+      "risk": "medium",
       "specs": [
-        "tests/live/devices.spec.ts"
+        "tests/live/devices.spec.ts",
+        "tests/live/login-session-persistence.spec.ts"
       ],
       "components": [
         "web/src/components/ConnectedDevices.tsx"
