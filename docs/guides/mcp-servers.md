@@ -125,6 +125,48 @@ taken from the per-profile file; and a trusted project-local server outranks all
 of them. Each override is logged. The project-local layer only participates once
 the repository is trusted (see Project-local servers above).
 
+## Inspecting the effective set
+
+Because the effective set is merged from up to four layers, AoE gives you one
+surface to see exactly which servers an agent will reach and where each came
+from. Every value is redacted: you see a server's command, args, or URL, and the
+names of its env vars and headers, but never their secret values.
+
+### CLI
+
+```text
+aoe mcp list                 # effective set for the default tool
+aoe mcp list --agent gemini  # for a specific agent
+aoe mcp list --json          # machine-readable, same redaction
+```
+
+Each row shows the server name, transport, its winning provenance
+(`agent-native:claude`, `global`, `profile:<name>`, `project-local`), and which
+lower layers it shadowed on a name collision.
+
+### Web dashboard
+
+The dashboard has an **MCP servers** tab under Settings (when running
+`aoe serve`). It shows the same merged set with provenance, plus two things the
+CLI surfaces read-only:
+
+- **Conflicts.** AoE remembers the last definition it saw for each server in an
+  agent's native config. If that file changes on disk, the next time you open the
+  surface the changed server is flagged as a conflict, and you choose which side
+  wins. Keeping AoE's version stores it in the global `mcp.json` (which outranks
+  the native layer); choosing the native version simply accepts the new
+  definition. AoE never writes back to an agent-native config.
+- **Kept after removal.** If a server disappears from a native config, AoE keeps
+  it in view and warns rather than silently dropping it. You can **keep** it
+  (promoting it into the global `mcp.json` so it keeps forwarding) or **drop** it.
+
+AoE remembers this last-seen state in `mcp_state.json` in the app directory,
+written owner-only. The stored definitions keep their secret values (so a kept
+server still works) but those values are redacted everywhere they are displayed.
+
+Live connection status and reconnect / authenticate actions are tracked
+separately and are not part of this surface yet.
+
 ## Capability gating
 
 Not every agent supports every transport. `stdio` works everywhere. `http` and
@@ -149,6 +191,12 @@ its `command` locally when a session starts.
 A per-profile `mcp.json` lives in the profile directory under your app
 directory, so it is owned by you with the same trust as the global file. Treat
 it the same way: its `command` entries can launch processes on your behalf.
+
+The drift store `mcp_state.json` (used by the management surface) also lives in
+your app directory, owner-only. It records the last-seen definition of each
+agent-native server, including secret values, so keep-on-removal and conflict
+resolution can reconstruct a working server; treat it with the same care as
+`mcp.json`. Those values are redacted on every surface that displays them.
 
 A project-local `.mcp.json` is repository-provided, so unlike the files above it
 is NOT implicitly trusted: a cloned, untrusted repo could otherwise launch its
