@@ -57,6 +57,39 @@ pub struct McpConflict {
     pub current: ProjectMcpServer,
 }
 
+impl McpConflict {
+    /// Optimistic-concurrency token: the fingerprint of the AoE (snapshot) side
+    /// as this surface saw it when it opened the conflict modal. [`resolve_conflict`]
+    /// rejects the resolution as stale if the on-disk snapshot no longer matches
+    /// this token, i.e. another surface (web vs TUI) resolved the same conflict
+    /// first.
+    pub fn fingerprint(&self) -> String {
+        super::project_mcp::fingerprint(std::slice::from_ref(&self.previous))
+    }
+}
+
+/// Which side wins a conflict resolution (feature C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictWinner {
+    /// Keep AoE's last-seen definition: promote it into the global `mcp.json`
+    /// (where it outranks native) so it keeps forwarding unchanged.
+    Aoe,
+    /// Accept the native config's current definition: just re-baseline the
+    /// snapshot to it. The native definition then forwards on its own.
+    Native,
+}
+
+/// Outcome of a conflict resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveStatus {
+    /// The resolution was applied.
+    Applied,
+    /// The on-disk snapshot changed since the surface opened the modal (another
+    /// surface resolved this conflict first); nothing was changed. The caller
+    /// should refetch and re-prompt rather than blindly overwrite.
+    Stale,
+}
+
 /// Outcome of reconciling one agent's native config against the snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpReconcile {
@@ -163,6 +196,68 @@ pub fn forget_native(agent: &str, name: &str) -> Result<()> {
             }
         }
     })
+}
+
+/// Resolve a conflict between AoE's snapshot and the native config (feature C).
+///
+/// `expected_fingerprint` is the optimistic-concurrency token the surface
+/// captured when it opened the modal ([`McpConflict::fingerprint`]). Under the
+/// store lock, if the snapshot entry is gone or no longer matches that token
+/// (another surface already resolved it), nothing changes and [`ResolveStatus::Stale`]
+/// is returned. Otherwise the snapshot is re-baselined to the native definition
+/// (so the conflict does not re-surface), and for [`ConflictWinner::Aoe`] the
+/// AoE-side definition is additionally promoted into the global `mcp.json` so it
+/// keeps forwarding. AoE never writes the native config either way.
+pub fn resolve_conflict(
+    conflict: &McpConflict,
+    winner: ConflictWinner,
+    expected_fingerprint: &str,
+) -> Result<ResolveStatus> {
+    let name = conflict.current.name.clone();
+
+    // Phase 1, under the store lock: verify the token, re-baseline the snapshot,
+    // and report whether the AoE side must still be promoted to global.
+    enum Decision {
+        Stale,
+        Applied { promote: Option<ProjectMcpServer> },
+    }
+    let decision = with_locked_state(|state| {
+        let Some(snap) = state
+            .native_snapshots
+            .get(&conflict.agent)
+            .and_then(|m| m.get(&name))
+        else {
+            return Decision::Stale;
+        };
+        if super::project_mcp::fingerprint(std::slice::from_ref(snap)) != expected_fingerprint {
+            return Decision::Stale;
+        }
+        let promote = match winner {
+            ConflictWinner::Aoe => Some(snap.clone()),
+            ConflictWinner::Native => None,
+        };
+        // Re-baseline to the native definition so subsequent diffs compare
+        // against the now-known state and the conflict does not re-surface.
+        state
+            .native_snapshots
+            .get_mut(&conflict.agent)
+            .expect("snapshot present: looked up above under the same lock")
+            .insert(name.clone(), conflict.current.clone());
+        Decision::Applied { promote }
+    })?;
+
+    match decision {
+        Decision::Stale => Ok(ResolveStatus::Stale),
+        Decision::Applied { promote } => {
+            // Promote AoE's definition into the global mcp.json (a separate
+            // locked file) only after the snapshot re-baseline committed, so a
+            // stale resolution never writes global.
+            if let Some(def) = promote {
+                super::mcp_overrides::upsert_global_server(&def)?;
+            }
+            Ok(ResolveStatus::Applied)
+        }
+    }
 }
 
 /// Open the drift store, lock it exclusively, hand the parsed state to `f`, then
@@ -313,6 +408,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r2.removed.len(), 1, "removal persists until dropped");
+    }
+
+    fn make_conflict(agent: &str) -> McpConflict {
+        reconcile_agent(
+            agent,
+            &read(r#"{ "mcpServers": { "fs": { "command": "old" } } }"#),
+        )
+        .unwrap();
+        let r = reconcile_agent(
+            agent,
+            &read(r#"{ "mcpServers": { "fs": { "command": "new" } } }"#),
+        )
+        .unwrap();
+        assert_eq!(r.conflicts.len(), 1);
+        r.conflicts.into_iter().next().unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_conflict_aoe_wins_promotes_to_global_and_clears() {
+        let _home = set_tmp_home();
+        let conflict = make_conflict("claude");
+        let fp = conflict.fingerprint();
+        let status = resolve_conflict(&conflict, ConflictWinner::Aoe, &fp).unwrap();
+        assert_eq!(status, ResolveStatus::Applied);
+
+        // AoE's old definition is promoted into global mcp.json.
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let global = crate::session::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
+        assert_eq!(global.len(), 1);
+        assert!(matches!(&global[0].transport,
+            crate::session::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "old"));
+
+        // Conflict no longer surfaces (snapshot re-baselined to native).
+        let r = reconcile_agent(
+            "claude",
+            &read(r#"{ "mcpServers": { "fs": { "command": "new" } } }"#),
+        )
+        .unwrap();
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_conflict_native_wins_clears_without_global_write() {
+        let _home = set_tmp_home();
+        let conflict = make_conflict("claude");
+        let fp = conflict.fingerprint();
+        assert_eq!(
+            resolve_conflict(&conflict, ConflictWinner::Native, &fp).unwrap(),
+            ResolveStatus::Applied
+        );
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let global = crate::session::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
+        assert!(global.is_empty(), "native wins must not write global");
+        let r = reconcile_agent(
+            "claude",
+            &read(r#"{ "mcpServers": { "fs": { "command": "new" } } }"#),
+        )
+        .unwrap();
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_conflict_stale_token_is_rejected() {
+        let _home = set_tmp_home();
+        let conflict = make_conflict("claude");
+        let status =
+            resolve_conflict(&conflict, ConflictWinner::Aoe, "not-the-real-fingerprint").unwrap();
+        assert_eq!(status, ResolveStatus::Stale);
+
+        // Nothing changed: conflict still surfaces, global untouched.
+        let app_dir = crate::session::get_app_dir().unwrap();
+        assert!(crate::session::mcp_model::load_global_mcp_servers(&app_dir)
+            .unwrap()
+            .is_empty());
+        let r = reconcile_agent(
+            "claude",
+            &read(r#"{ "mcpServers": { "fs": { "command": "new" } } }"#),
+        )
+        .unwrap();
+        assert_eq!(
+            r.conflicts.len(),
+            1,
+            "stale resolution must not clear the conflict"
+        );
     }
 
     #[test]
