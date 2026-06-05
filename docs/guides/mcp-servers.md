@@ -71,7 +71,7 @@ The native config read per agent:
 When the same server name appears in more than one source, the higher-precedence
 source wins (per server, not whole file):
 
-```
+```text
 agent-native  <  mcp.json (global)
 ```
 
