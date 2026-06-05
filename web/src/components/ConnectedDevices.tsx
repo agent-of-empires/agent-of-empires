@@ -188,7 +188,7 @@ export function ConnectedDevices() {
                   {parseUserAgent(device.user_agent)}
                 </span>
                 {device.current && (
-                  <span className="font-mono text-[10px] uppercase tracking-wider text-brand-500">
+                  <span className="font-mono text-[11px] uppercase tracking-wider text-text-secondary">
                     this device
                   </span>
                 )}
