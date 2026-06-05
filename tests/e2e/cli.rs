@@ -69,6 +69,76 @@ fn test_cli_add_next_steps_uses_aoe_binary_name() {
     );
 }
 
+/// #1996: `aoe mcp list --json` shows the merged effective MCP set with
+/// per-server provenance and redacts every secret value (env/header values
+/// reduced to names). Native (claude) + global mcp.json are merged; global wins
+/// a name collision. The native config also carries a secret that must never
+/// reach stdout.
+#[test]
+#[serial]
+fn test_cli_mcp_list_provenance_and_redaction() {
+    let h = TuiTestHarness::new("cli_mcp_list");
+    let home = h.home_path();
+
+    // Native (claude) layer: defines "shared" and "native-only", plus a secret.
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{ "mcpServers": {
+            "shared": { "command": "from-native" },
+            "native-only": { "command": "n", "env": { "TOKEN": "SUPER_SECRET_DO_NOT_LEAK" } }
+        } }"#,
+    )
+    .expect("write .claude.json");
+
+    // Global layer: overrides "shared" and adds "global-only".
+    let app_dir = crate::harness::app_dir_in(home);
+    std::fs::create_dir_all(&app_dir).expect("create app dir");
+    std::fs::write(
+        app_dir.join("mcp.json"),
+        r#"{ "mcpServers": {
+            "shared": { "command": "from-global" },
+            "global-only": { "command": "g" }
+        } }"#,
+    )
+    .expect("write mcp.json");
+
+    let out = h.run_cli(&["mcp", "list", "--agent", "claude", "--json"]);
+    assert!(
+        out.status.success(),
+        "aoe mcp list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // No secret value may ever reach stdout.
+    assert!(
+        !stdout.contains("SUPER_SECRET_DO_NOT_LEAK"),
+        "secret env value leaked to CLI output:\n{stdout}"
+    );
+
+    let val: serde_json::Value = serde_json::from_str(&stdout).expect("output is JSON");
+    let effective = val["effective"].as_array().expect("effective array");
+    assert_eq!(effective.len(), 3, "native + global union, got {stdout}");
+
+    let shared = effective
+        .iter()
+        .find(|s| s["name"] == "shared")
+        .expect("shared present");
+    assert_eq!(
+        shared["command"], "from-global",
+        "global must win the name collision"
+    );
+    assert_eq!(shared["provenance"], "global");
+
+    let native_only = effective
+        .iter()
+        .find(|s| s["name"] == "native-only")
+        .expect("native-only present");
+    assert_eq!(native_only["provenance"], "agent-native:claude");
+    // The secret env var is reported by NAME only.
+    assert_eq!(native_only["envNames"], serde_json::json!(["TOKEN"]));
+}
+
 /// #1909: `aoe add --interactive` must fail loudly when stdin is not a
 /// terminal instead of hanging on the name prompt. `run_cli` runs the
 /// binary as a plain subprocess with no controlling TTY, which is the

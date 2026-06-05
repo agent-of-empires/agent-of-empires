@@ -256,6 +256,10 @@ async fn main() -> Result<()> {
             };
         }
         Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
+        Some(Commands::Mcp { command }) => {
+            let profile = cli.profile.clone().unwrap_or_default();
+            return cli::mcp::run(&profile, command).await;
+        }
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         _ => {}
