@@ -157,15 +157,25 @@ export function McpServers() {
 
   const onKeep = async (name: string) => {
     setBusy(true);
-    await keepMcpServer(name, agent);
+    const ok = await keepMcpServer(name, agent);
     setBusy(false);
+    if (!ok) {
+      setNotice(`Could not keep "${name}".`);
+      return;
+    }
+    setNotice(null);
     await load();
   };
 
   const onDrop = async (name: string) => {
     setBusy(true);
-    await dropMcpServer(name, agent);
+    const ok = await dropMcpServer(name, agent);
     setBusy(false);
+    if (!ok) {
+      setNotice(`Could not drop "${name}".`);
+      return;
+    }
+    setNotice(null);
     await load();
   };
 
