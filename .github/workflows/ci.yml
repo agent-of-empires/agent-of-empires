@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The committed .cargo/config.toml sets rustc-wrapper = "kache" for fast local
+  # multi-worktree builds. CI runners have no kache; this empty value overrides
+  # that config key so cargo builds without the wrapper.
+  CARGO_BUILD_RUSTC_WRAPPER: ""
 
 permissions:
   contents: read
@@ -118,6 +122,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
+
+  build-cache-selftest:
+    name: Build Cache Self-Test
+    runs-on: ubuntu-latest
+    # Guards the device:inode + link-count comparator that the kache
+    # verify script relies on (scripts/verify-shared-target.sh). No cargo,
+    # no kache, no toolchain: builds a known hardlinked/copied pair and
+    # asserts the comparator tells them apart. Runs in seconds.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: scripts/verify-shared-target.sh --self-test
 
   nix:
     name: Nix Eval
