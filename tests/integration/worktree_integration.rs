@@ -332,7 +332,7 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
     assert!(!git_wt.branch_exists("old-name"));
 }
 
-// --- Tied workdir/title (#1927) ---
+// Tied workdir/title (#1927)
 
 use agent_of_empires::session::worktree_edit::worktree_leaf_from_title;
 

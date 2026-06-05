@@ -816,12 +816,15 @@ impl HomeView {
                     let new_title = instance.title.clone();
                     let moved_path = new_path.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
-                    self.mutate_instance(&id, |inst| {
-                        inst.title = new_title;
+                    // apply_user_action (not mutate_instance + save) so a tied
+                    // worktree's moved project_path actually persists; save()
+                    // via merge_from_tui does not write project_path. (#1927)
+                    self.apply_user_action(&id, |inst| {
+                        inst.title = new_title.clone();
                         if let Some(path) = &moved_path {
                             inst.project_path = path.clone();
                         }
-                    });
+                    })?;
 
                     self.rebuild_group_trees();
                     if !effective_group.is_empty() {

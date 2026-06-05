@@ -878,21 +878,22 @@ pub async fn rename_session(
     };
     if let Err(e) = persisted {
         tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
-        // A failed dir move already returned above; reaching here with a moved
-        // path means the move landed but persistence did not.
-        if new_path.is_some() {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "persist_failed",
-                    "message": "Worktree was moved on disk, but persisting the new session metadata failed"
-                })),
-            )
-                .into_response();
-        }
+        // Persist-first: never fall through to mutate in-memory state on a
+        // failed write, or the rename silently reverts on restart. When a dir
+        // move already landed, say so; otherwise it is a plain title persist.
+        let message = if new_path.is_some() {
+            "Worktree was moved on disk, but persisting the new session metadata failed"
+        } else {
+            "Persisting the renamed session failed"
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+        )
+            .into_response();
     }
 
-    let response = {
+    let mut response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return (
@@ -907,6 +908,11 @@ pub async fn rename_session(
         apply_session_title_rename(inst, title.clone());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
+    // Single-session responses are not run through list_sessions' overlay, so
+    // carry the resolved tie value here too (#1927); otherwise a client that
+    // trusts the mutation response would see a managed worktree claim it is
+    // untied until the next list refresh.
+    response.tie_workdir_to_name = tied;
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -2657,6 +2663,16 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
             if !resp.acp_capable {
                 let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
