@@ -337,15 +337,6 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
-// --- Devices ---
-
-pub async fn list_devices(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<crate::server::DeviceInfo>> {
-    let devices = state.devices.read().await;
-    Json(devices.clone())
-}
-
 // --- Themes ---
 
 pub async fn list_themes() -> Json<Vec<String>> {

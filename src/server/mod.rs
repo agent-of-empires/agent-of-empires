@@ -23,7 +23,6 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use rust_embed::Embed;
-use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Instrument};
@@ -49,18 +48,6 @@ use self::rate_limit::RateLimiter;
 #[derive(Embed)]
 #[folder = "web/dist/"]
 struct StaticAssets;
-
-// ── DeviceInfo ──────────────────────────────────────────────────────────────
-
-/// A device that has connected to the dashboard.
-#[derive(Clone, Serialize)]
-pub struct DeviceInfo {
-    pub ip: String,
-    pub user_agent: String,
-    pub first_seen: chrono::DateTime<chrono::Utc>,
-    pub last_seen: chrono::DateTime<chrono::Utc>,
-    pub request_count: u64,
-}
 
 // ── TokenManager ────────────────────────────────────────────────────────────
 
@@ -249,7 +236,6 @@ pub struct AppState {
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
     pub rate_limiter: Arc<RateLimiter>,
-    pub devices: RwLock<Vec<DeviceInfo>>,
     pub behind_tunnel: bool,
     /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` /
     /// `"none"`). `/api/about` and the opt-in telemetry snapshot both read this
@@ -544,7 +530,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_lifetime,
         token_grace,
     ));
-    let login_manager = Arc::new(login::LoginManager::new(passphrase));
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+
+    // Login sessions persist across daemon restarts by default (#1235) so
+    // signed-in devices are not re-prompted for the passphrase on every
+    // bounce. The owner-only store lives in the app dir; fall back to an
+    // in-memory manager when persistence is disabled or no app dir
+    // resolves.
+    let login_manager = Arc::new(
+        match (config.auth.persist_sessions, crate::session::get_app_dir()) {
+            (true, Ok(app_dir)) => login::LoginManager::with_persistence(passphrase, &app_dir),
+            _ => login::LoginManager::new(passphrase),
+        },
+    );
     let rate_limiter = Arc::new(RateLimiter::new());
 
     if login_manager.is_enabled() {
@@ -562,7 +560,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Push notifications: initialize only when the operator flag is on at
     // startup. Flipping it later requires a server restart to take effect.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
     let push_enabled = config.web.notifications_enabled;
     let push_state = if push_enabled {
         match crate::session::get_app_dir() {
@@ -825,7 +822,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
-        devices: RwLock::new(Vec::new()),
         behind_tunnel: remote || behind_proxy,
         auth_mode,
         serve_mode,
@@ -1264,8 +1260,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/login/elevate", post(login::elevate_handler))
         .route("/api/logout", post(login::logout_handler))
         .route("/api/login/status", get(login::login_status_handler))
-        // Devices
-        .route("/api/devices", get(api::list_devices))
+        // Sign out every device (elevation-gated). See #1235.
+        .route("/api/login/logout-all", post(login::logout_all_handler))
+        // Revoke a single device's login session (elevation-gated).
+        .route(
+            "/api/login/sessions/{id}",
+            delete(login::revoke_session_handler),
+        )
+        // Devices: the connected-devices view is backed by persisted
+        // login sessions (#1235), not the old IP/UA request tracker.
+        .route("/api/devices", get(login::devices_handler))
         // About (version, auth status, read-only state)
         .route("/api/about", get(api::get_about))
         // Update status (latest release, available flag)
