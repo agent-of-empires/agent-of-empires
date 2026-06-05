@@ -340,22 +340,49 @@ fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     }
 }
 
+/// A native config read: the converted servers plus the names of any entries
+/// that were skipped because they failed to convert. The skipped list gates
+/// drift detection (#1996): a native file with a malformed entry must not make
+/// the drift detector report that entry as "removed" (it is still there, just
+/// unparseable), so callers pause drift for that agent when `skipped` is
+/// non-empty.
+pub struct NativeRead {
+    pub servers: Vec<ProjectMcpServer>,
+    pub skipped: Vec<String>,
+}
+
+impl NativeRead {
+    fn empty() -> Self {
+        NativeRead {
+            servers: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+}
+
 /// Read the active agent's own MCP config (the file its CLI reads) and convert
-/// it to neutral servers. Live read-through: called once per spawn, no caching,
-/// so edits are picked up on the next session. Returns an empty list for an
-/// agent with no known native reader and for a missing file. A
-/// present-but-unparseable file is an error the caller downgrades to a warning,
-/// so a broken native file (which AoE does not own) never blocks a spawn.
-/// Individual malformed server entries are skipped with a warning.
-pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<ProjectMcpServer>> {
+/// it to neutral servers, reporting any skipped malformed entries. Live
+/// read-through: called once per spawn, no caching, so edits are picked up on
+/// the next session. Returns an empty read for an agent with no known native
+/// reader and for a missing file. A present-but-unparseable file is an error the
+/// caller downgrades to a warning, so a broken native file (which AoE does not
+/// own) never blocks a spawn. Individual malformed server entries are skipped
+/// with a warning and recorded in `skipped`.
+pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<NativeRead> {
     let Some(config) = native_config_for(agent_key) else {
-        return Ok(Vec::new());
+        return Ok(NativeRead::empty());
     };
     match config {
         NativeMcpConfig::StandardJson(rel) => read_standard_json(&home.join(rel)),
         NativeMcpConfig::GeminiJson(rel) => read_gemini_json(&home.join(rel)),
         NativeMcpConfig::CodexToml(rel) => read_codex_toml(&home.join(rel)),
     }
+}
+
+/// Like [`load_native_mcp_servers_checked`] but discards the skipped-entry list.
+/// Used by forwarding, which only needs the parseable servers.
+pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<ProjectMcpServer>> {
+    Ok(load_native_mcp_servers_checked(agent_key, home)?.servers)
 }
 
 /// Convenience wrapper that resolves the real home dir. Kept separate from
@@ -368,15 +395,17 @@ pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectM
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
 /// fails to convert rather than failing the whole file. Native configs are owned
 /// by other tools, so one bad entry must not discard the user's other servers.
+/// Returns the converted servers and the names of the skipped entries.
 fn convert_tolerant<R>(
     servers: BTreeMap<String, R>,
     path: &Path,
     convert: impl Fn(String, R) -> Result<ProjectMcpServer>,
-) -> Vec<ProjectMcpServer> {
-    servers
-        .into_iter()
-        .filter_map(|(name, raw)| match convert(name.clone(), raw) {
-            Ok(server) => Some(server),
+) -> NativeRead {
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, raw) in servers {
+        match convert(name.clone(), raw) {
+            Ok(server) => out.push(server),
             Err(e) => {
                 warn!(
                     target: "acp.mcp",
@@ -385,10 +414,14 @@ fn convert_tolerant<R>(
                     error = %e,
                     "skipping malformed MCP server in native config"
                 );
-                None
+                skipped.push(name);
             }
-        })
-        .collect()
+        }
+    }
+    NativeRead {
+        servers: out,
+        skipped,
+    }
 }
 
 /// Open a config file, mapping "not found" to `None` (the user does not use that
@@ -456,9 +489,9 @@ fn convert_standard(name: String, raw: StandardRawServer) -> Result<ProjectMcpSe
 /// Read a standard `mcpServers` JSON config, streaming so a large host file
 /// (e.g. `~/.claude.json`, which also holds project history) is parsed without
 /// materializing the unrelated keys.
-fn read_standard_json(path: &Path) -> Result<Vec<ProjectMcpServer>> {
+fn read_standard_json(path: &Path) -> Result<NativeRead> {
     let Some(file) = open_optional(path)? else {
-        return Ok(Vec::new());
+        return Ok(NativeRead::empty());
     };
     let parsed: StandardConfigFile = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
@@ -511,9 +544,9 @@ fn convert_gemini(name: String, raw: GeminiRawServer) -> Result<ProjectMcpServer
     Ok(ProjectMcpServer { name, transport })
 }
 
-fn read_gemini_json(path: &Path) -> Result<Vec<ProjectMcpServer>> {
+fn read_gemini_json(path: &Path) -> Result<NativeRead> {
     let Some(file) = open_optional(path)? else {
-        return Ok(Vec::new());
+        return Ok(NativeRead::empty());
     };
     let parsed: GeminiConfigFile = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parsing native MCP config at {}", path.display()))?;
@@ -560,10 +593,10 @@ fn convert_codex(name: String, raw: CodexRawServer) -> Result<ProjectMcpServer> 
 
 /// Codex config files are small (no embedded history), so a whole-string read is
 /// fine; `toml` has no streaming reader.
-fn read_codex_toml(path: &Path) -> Result<Vec<ProjectMcpServer>> {
+fn read_codex_toml(path: &Path) -> Result<NativeRead> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NativeRead::empty()),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("reading native MCP config at {}", path.display()))

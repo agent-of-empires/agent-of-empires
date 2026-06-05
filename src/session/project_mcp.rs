@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Project-local MCP config filename, read from the repository root.
@@ -54,13 +54,13 @@ struct RawServer {
 /// so the fingerprint is order-independent. Values are kept in memory for the
 /// fingerprint (a changed token is an effective config change), but the display
 /// helpers redact them so secrets never reach a screen or log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMcpServer {
     pub name: String,
     pub transport: ProjectMcpTransport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectMcpTransport {
     Stdio {
         command: String,
