@@ -89,6 +89,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
+    /// Whether renaming this session also moves its worktree directory (the
+    /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
+    /// Populated by `list_sessions` from the per-profile config; single-session
+    /// responses leave it `false` and the sidebar reads the list value. #1927.
+    #[serde(default)]
+    pub tie_workdir_to_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -256,6 +262,8 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            // Overlaid per-profile in list_sessions; see the field doc.
+            tie_workdir_to_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -471,6 +479,25 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         };
         fresh
     };
+
+    // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
+    // the standalone workdir action for tied worktree sessions. Resolved once
+    // per distinct profile, not per session.
+    {
+        use std::collections::HashMap;
+        let mut tie_cache: HashMap<String, bool> = HashMap::new();
+        for session in &mut sessions {
+            if !session.has_managed_worktree {
+                continue;
+            }
+            let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                    .session
+                    .tie_workdir_to_name
+            });
+            session.tie_workdir_to_name = tied;
+        }
+    }
 
     // Resolve remote owners with a permanent cache on AppState
     {
@@ -1005,6 +1032,23 @@ pub async fn set_worktree_name(
         )
             .into_response();
     };
+    // When tied (#1927), the directory is not edited independently: it follows
+    // the title. Reject the standalone edit so no client can drift the two
+    // apart, pointing callers at the unified rename.
+    if worktree_info.managed_by_aoe
+        && crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "tied",
+                "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
     if status.blocks_worktree_edit() {
         return (
             StatusCode::CONFLICT,
@@ -5211,6 +5255,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            tie_workdir_to_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

@@ -67,6 +67,11 @@ export interface SessionResponse {
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
   has_managed_worktree: boolean;
+  /** True when renaming this session also moves its worktree directory (the
+   *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
+   *  sidebar uses this to collapse the standalone "edit workdir name" action
+   *  into the unified rename. Populated by the list endpoint. See #1927. */
+  tie_workdir_to_name?: boolean;
   has_terminal: boolean;
   profile: string;
   cleanup_defaults: CleanupDefaults;

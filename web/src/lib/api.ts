@@ -1012,19 +1012,33 @@ export async function logout(): Promise<void> {
   }
 }
 
+/**
+ * Rename a session's title. When the session is a tied aoe-managed worktree
+ * (session.tie_workdir_to_name), the server also moves the worktree directory
+ * to match and returns 409 if the session is running, so the message is
+ * surfaced to the caller. See #1927.
+ */
 export async function renameSession(
   id: string,
   title: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; message?: string }> {
   try {
     const res = await fetch(`/api/sessions/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
     });
-    return res.ok;
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 

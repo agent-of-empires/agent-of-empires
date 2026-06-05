@@ -1165,6 +1165,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
+    // When tied (#1927) the directory follows the title, so reject the
+    // standalone edit and point at the unified rename instead.
+    if inst.tie_workdir_applies(
+        crate::session::profile_config::resolve_config_or_warn(profile)
+            .session
+            .tie_workdir_to_name,
+    ) {
+        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+    }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
     // enforcing the guard.
