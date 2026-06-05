@@ -7508,6 +7508,52 @@ mod preview_drag_select {
 
     #[test]
     #[serial]
+    fn extract_stays_locked_to_lines_when_capture_window_grows() {
+        // Regression for the scroll-up-copies-wrong bug: live mode
+        // re-captures a LARGER window as the user scrolls back, which
+        // shifts every absolute line index. Because the selection is
+        // anchored to the newest line, growing the window must NOT change
+        // which physical lines the copy resolves to.
+        let mut env = create_test_env_empty();
+        // Small window: 6 lines, bottom two are E and F.
+        stage_text(
+            &mut env,
+            Rect::new(0, 0, 5, 3),
+            3,
+            &["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE", "FFFFF"],
+        );
+        // Select the bottom two lines (abs 4 and 5 in the small window).
+        env.view.preview_selection = Some(PreviewSelection {
+            anchor: (0, fb(6, 4)),
+            extent: (4, fb(6, 5)),
+            finalized: true,
+        });
+        assert_eq!(
+            env.view.extract_preview_selection_text().as_deref(),
+            Some("EEEEE\nFFFFF")
+        );
+
+        // The window grows by four older lines prepended at the top (a
+        // scroll-back re-capture); the same physical bottom lines are now
+        // at abs 8 and 9. The stored `from_bottom` distances are untouched.
+        stage_text(
+            &mut env,
+            Rect::new(0, 0, 5, 3),
+            7,
+            &[
+                "qqqqq", "rrrrr", "sssss", "ttttt", "AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE",
+                "FFFFF",
+            ],
+        );
+        // Same physical lines, even though their absolute indices moved.
+        assert_eq!(
+            env.view.extract_preview_selection_text().as_deref(),
+            Some("EEEEE\nFFFFF")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn extract_spans_full_scrollback_across_pages() {
         // The core multi-page guarantee: a selection whose start has
         // scrolled off the top of the visible window still copies the
