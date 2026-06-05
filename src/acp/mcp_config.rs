@@ -16,12 +16,13 @@
 //! }
 //! ```
 //!
-//! Only a single global file in the AoE app dir is read today. A project-local
-//! `cwd/.mcp.json` is intentionally NOT read: AoE opens cloned and potentially
-//! untrusted repositories, and stdio MCP servers launch unconditionally when a
-//! session spawns, so project scope must sit behind the repo-trust gate (the
-//! same boundary that already protects lifecycle hooks). That, plus per-profile
-//! config, are tracked as follow-ups.
+//! The global file in the AoE app dir and a per-profile `<profile_dir>/mcp.json`
+//! (issue #1986) are both read; the per-profile layer merges above global. A
+//! project-local `cwd/.mcp.json` is intentionally NOT read: AoE opens cloned and
+//! potentially untrusted repositories, and stdio MCP servers launch
+//! unconditionally when a session spawns, so project scope must sit behind the
+//! repo-trust gate (the same boundary that already protects lifecycle hooks).
+//! That project-local layer is tracked as a follow-up.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -67,8 +68,24 @@ struct RawServer {
 /// present-but-malformed file is an error the caller surfaces; it must not be
 /// silently treated as "no servers".
 pub fn load_global_mcp_servers(app_dir: &Path) -> Result<Vec<McpServer>> {
-    let path = app_dir.join("mcp.json");
-    let text = match std::fs::read_to_string(&path) {
+    read_mcp_json(&app_dir.join("mcp.json"))
+}
+
+/// Read and parse a profile's `<profile_dir>/mcp.json` (issue #1986). Same
+/// on-disk shape and same missing/malformed semantics as the global file; it is
+/// just resolved from the active session's profile directory. The per-profile
+/// layer is merged ABOVE global (so a same-named server in the profile file
+/// overrides the global one) and below project-local. Per-profile entries are
+/// AoE state only: they are never written back to any agent's native config.
+pub fn load_profile_mcp_servers(profile_dir: &Path) -> Result<Vec<McpServer>> {
+    read_mcp_json(&profile_dir.join("mcp.json"))
+}
+
+/// Read and parse an `mcp.json` at `path`. A missing file yields an empty list;
+/// a present-but-malformed file is an error the caller surfaces. Shared by the
+/// global and per-profile loaders so both layers behave identically.
+fn read_mcp_json(path: &Path) -> Result<Vec<McpServer>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
@@ -655,6 +672,53 @@ mod tests {
             servers: Vec::new(),
         };
         assert!(merge_by_precedence(vec![empty]).is_empty());
+    }
+
+    #[test]
+    fn profile_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = load_profile_mcp_servers(dir.path()).unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn profile_loads_and_parses_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{ "mcpServers": { "fs": { "command": "profile-fs" } } }"#,
+        )
+        .unwrap();
+        let servers = load_profile_mcp_servers(dir.path()).unwrap();
+        assert_eq!(names(&servers), vec!["fs"]);
+    }
+
+    #[test]
+    fn profile_malformed_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mcp.json"), "{ not json").unwrap();
+        assert!(load_profile_mcp_servers(dir.path()).is_err());
+    }
+
+    #[test]
+    fn merge_profile_overrides_global() {
+        // Ordering native < global < per-profile: on the shared "fs" name, the
+        // per-profile layer (highest of the three) wins.
+        let native = layer(
+            "agent-native",
+            r#"{ "mcpServers": { "fs": { "command": "native" } } }"#,
+        );
+        let global = layer(
+            "global",
+            r#"{ "mcpServers": { "fs": { "command": "global" } } }"#,
+        );
+        let profile = layer(
+            "per-profile",
+            r#"{ "mcpServers": { "fs": { "command": "profile" } } }"#,
+        );
+        let merged = merge_by_precedence(vec![native, global, profile]);
+        assert_eq!(names(&merged), vec!["fs"]);
+        assert_eq!(stdio_command(&merged[0]), "profile");
     }
 
     fn write(home: &Path, rel: &str, contents: &str) {

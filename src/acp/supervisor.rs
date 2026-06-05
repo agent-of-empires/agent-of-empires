@@ -473,19 +473,22 @@ fn command_matches_binary(command: &str, binary: &str) -> bool {
             .is_some_and(|name| name == binary)
 }
 
-/// Resolve the MCP servers to forward for a spawn: the agent's native config
-/// (lowest precedence) merged under the global `<app_dir>/mcp.json`. Runs on a
-/// blocking thread (callers spawn_blocking it) because a native config can be
-/// large. Each layer is isolated: a missing, unreadable, or malformed source
+/// Resolve the MCP servers to forward for a spawn, lowest precedence first: the
+/// agent's native config, merged under the global `<app_dir>/mcp.json`, merged
+/// under the session's per-profile `<profile_dir>/mcp.json` (issue #1986). Runs
+/// on a blocking thread (callers spawn_blocking it) because a native config can
+/// be large. Each layer is isolated: a missing, unreadable, or malformed source
 /// warns and contributes nothing rather than aborting, so a single broken file
-/// never blocks the spawn.
+/// never blocks the spawn. `profile` is the session's `source_profile`; an empty
+/// or `None` value resolves to the default profile.
 fn resolve_mcp_layers(
     agent_key: &str,
     session_id: &str,
+    profile: Option<&str>,
 ) -> Vec<agent_client_protocol::schema::McpServer> {
     use crate::acp::mcp_config::{
-        load_global_mcp_servers, load_native_mcp_servers_from_home, merge_by_precedence, summarize,
-        McpLayer,
+        load_global_mcp_servers, load_native_mcp_servers_from_home, load_profile_mcp_servers,
+        merge_by_precedence, summarize, McpLayer,
     };
 
     let native = match load_native_mcp_servers_from_home(agent_key) {
@@ -526,6 +529,33 @@ fn resolve_mcp_layers(
         }
     };
 
+    // Per-profile layer: `<profile_dir>/mcp.json` for the session's profile,
+    // resolved read-only so a session under a profile with no MCP file never
+    // creates a stub directory. An empty/None profile resolves to the default.
+    let per_profile = match crate::session::get_profile_dir_path(profile.unwrap_or_default()) {
+        Ok(profile_dir) => match load_profile_mcp_servers(&profile_dir) {
+            Ok(servers) => servers,
+            Err(e) => {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    error = %e,
+                    "failed to load per-profile MCP config; forwarding none from it"
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "could not resolve profile dir for MCP config; forwarding none from it"
+            );
+            Vec::new()
+        }
+    };
+
     let merged = merge_by_precedence(vec![
         McpLayer {
             label: "agent-native",
@@ -534,6 +564,10 @@ fn resolve_mcp_layers(
         McpLayer {
             label: "global",
             servers: global,
+        },
+        McpLayer {
+            label: "per-profile",
+            servers: per_profile,
         },
     ]);
 
@@ -1318,25 +1352,28 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resolve the MCP servers to forward on session/new and session/load:
         // the agent's own native config (lowest precedence) merged under the
-        // global `<app_dir>/mcp.json`, so a server defined in both is taken from
-        // the global file. Disk reads and parsing run off the async runtime
-        // because a native config (e.g. `~/.claude.json`) can be large. Any
-        // broken layer warns and contributes nothing rather than failing the
-        // spawn; project-local and per-profile sources are deferred (follow-ups).
+        // global `<app_dir>/mcp.json`, merged under this session's per-profile
+        // `<profile_dir>/mcp.json` (#1986), so a server defined in several is
+        // taken from the highest layer. Disk reads and parsing run off the async
+        // runtime because a native config (e.g. `~/.claude.json`) can be large.
+        // Any broken layer warns and contributes nothing rather than failing the
+        // spawn; the project-local source is deferred (follow-up #1985).
         let mcp_agent = agent.clone();
         let mcp_session = session_id.clone();
-        let mcp_servers =
-            tokio::task::spawn_blocking(move || resolve_mcp_layers(&mcp_agent, &mcp_session))
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(
-                        target: "acp.mcp",
-                        session = %session_id,
-                        error = %e,
-                        "MCP resolution task failed; forwarding no servers"
-                    );
-                    Vec::new()
-                });
+        let mcp_profile = source_profile.clone();
+        let mcp_servers = tokio::task::spawn_blocking(move || {
+            resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "MCP resolution task failed; forwarding no servers"
+            );
+            Vec::new()
+        });
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
@@ -1776,13 +1813,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                     tokio::time::sleep(RESPAWN_BACKOFF).await;
 
                     // Re-resolve the MCP layers rather than reusing the list
-                    // cached at first spawn: edits to the agent's native config
-                    // or `<app_dir>/mcp.json` made since then are forwarded on
-                    // `session/load` too, so a respawn must pick them up.
+                    // cached at first spawn: edits to the agent's native config,
+                    // `<app_dir>/mcp.json`, or the per-profile `mcp.json` made
+                    // since then are forwarded on `session/load` too, so a
+                    // respawn must pick them up.
                     let mcp_agent = respawn_config.agent_key.clone();
                     let mcp_session = session_id.clone();
+                    let mcp_profile = respawn_config.source_profile.clone();
                     respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
-                        resolve_mcp_layers(&mcp_agent, &mcp_session)
+                        resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref())
                     })
                     .await
                     .unwrap_or_else(|e| {
@@ -2994,13 +3033,15 @@ mod tests {
     }
 
     /// `resolve_mcp_layers` is the supervisor's own resolver: it reads the
-    /// agent's native config (HOME-relative) and the global `<app_dir>/mcp.json`,
-    /// then merges with global winning name collisions. The integration test in
-    /// `tests/integration/acp_mcp.rs` precomputes the merge itself and so never
-    /// covers this wiring; this test exercises it end to end against temp dirs.
+    /// agent's native config (HOME-relative), the global `<app_dir>/mcp.json`,
+    /// and the session's per-profile `<profile_dir>/mcp.json` (#1986), then
+    /// merges lowest-first so the per-profile layer wins, then global, then
+    /// native. The integration test in `tests/integration/acp_mcp.rs` precomputes
+    /// the merge itself and so never covers this wiring; this test exercises it
+    /// end to end against temp dirs.
     #[tokio::test]
     #[serial_test::serial]
-    async fn resolve_mcp_layers_merges_native_under_global() {
+    async fn resolve_mcp_layers_merges_native_global_and_profile() {
         let tmp = tempfile::TempDir::new().unwrap();
         // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
         // these env vars, which is the existing pattern in this module.
@@ -3033,29 +3074,42 @@ mod tests {
         )
         .unwrap();
 
-        let merged = tokio::task::spawn_blocking(|| resolve_mcp_layers("claude", "resolve-test"))
-            .await
-            .unwrap();
+        // Per-profile layer for profile "work": adds "profile-only" and overrides
+        // "shared" again. Highest precedence, so it must win "shared".
+        let profile_dir = crate::session::get_profile_dir_path("work").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("mcp.json"),
+            r#"{ "mcpServers": {
+                "profile-only": { "command": "p" },
+                "shared": { "command": "from-profile" }
+            } }"#,
+        )
+        .unwrap();
+
+        let merged = tokio::task::spawn_blocking(|| {
+            resolve_mcp_layers("claude", "resolve-test", Some("work"))
+        })
+        .await
+        .unwrap();
 
         let val = serde_json::to_value(&merged).unwrap();
         let arr = val.as_array().expect("mcp_servers serializes to an array");
-        assert_eq!(arr.len(), 3, "native + global union, got {val}");
+        assert_eq!(arr.len(), 4, "native + global + profile union, got {val}");
         let shared = arr
             .iter()
             .find(|s| s["name"] == "shared")
             .expect("shared server present");
         assert_eq!(
-            shared["command"], "from-global",
-            "global must win the name collision, got {val}"
+            shared["command"], "from-profile",
+            "per-profile must win the name collision, got {val}"
         );
-        assert!(
-            arr.iter().any(|s| s["name"] == "native-only"),
-            "native-only must survive the merge, got {val}"
-        );
-        assert!(
-            arr.iter().any(|s| s["name"] == "global-only"),
-            "global-only must survive the merge, got {val}"
-        );
+        for expected in ["native-only", "global-only", "profile-only"] {
+            assert!(
+                arr.iter().any(|s| s["name"] == expected),
+                "{expected} must survive the merge, got {val}"
+            );
+        }
     }
 
     /// Watchdog: after MAX_RESPAWNS_IN_WINDOW respawn attempts inside
