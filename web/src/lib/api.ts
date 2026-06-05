@@ -599,16 +599,47 @@ export function fetchContextPrimer(
 
 // --- Devices ---
 
-export interface DeviceInfo {
-  ip: string;
+/** A persisted login session, surfaced as a connected device. Backed by
+ *  the server's login-session store (#1235), so it survives a daemon
+ *  restart. `current` flags the session making the request. */
+export interface DeviceSession {
+  session_id: string;
   user_agent: string;
-  first_seen: string;
+  created_ip: string;
+  created_at: string;
   last_seen: string;
-  request_count: number;
+  current: boolean;
 }
 
-export function fetchDevices(): Promise<DeviceInfo[] | null> {
-  return fetchJson<DeviceInfo[]>("/api/devices");
+export function fetchDevices(): Promise<DeviceSession[] | null> {
+  return fetchJson<DeviceSession[]>("/api/devices");
+}
+
+/** Revoke a single device's login session. Elevation-gated: a 403
+ *  elevation_required pops the global passphrase prompt (handled by the
+ *  fetch interceptor) and this resolves false so the caller can ask the
+ *  user to retry after confirming. */
+export async function revokeDevice(sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/login/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Sign every device out (the escape hatch that replaces "restart logs
+ *  everyone out"). Ends this session too. Elevation-gated. */
+export async function signOutAllDevices(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/login/logout-all", { method: "POST" });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // --- Wizard APIs ---
