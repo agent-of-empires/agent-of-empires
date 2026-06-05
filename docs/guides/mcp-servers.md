@@ -49,6 +49,23 @@ Each entry is one of:
 
 The same list is forwarded for fresh and resumed sessions.
 
+## Per-profile servers
+
+A profile can carry its own `mcp.json` that adds to, or overrides, the global
+one. Create it in the profile's directory:
+
+- `<app_dir>/profiles/<profile-name>/mcp.json`
+
+It uses the exact same `mcpServers` shape as the global file. When a
+structured-view session runs under a profile, AoE reads that profile's
+`mcp.json` and merges it on top of the global file: a server name defined in
+both is taken from the per-profile file (see Precedence below). A missing
+per-profile file is normal and simply forwards nothing extra.
+
+Per-profile entries are AoE state only. AoE never writes them back into any
+agent's native config; the sync direction is native into AoE, never the
+reverse.
+
 ## Native agent config
 
 If you already declared MCP servers in your agent's own config, AoE reads them
@@ -61,10 +78,26 @@ config read per agent:
   sse).
 - **Codex**: `~/.codex/config.toml` (`[mcp_servers.<name>]` tables).
 
-When the same server name appears in both sources, `mcp.json` wins (per server).
+## Precedence
 
-> **Note:** `http` and `sse` servers are forwarded only to agents that advertise
-> support for them; otherwise that server is dropped. `stdio` works everywhere.
+When the same server name appears in more than one source, the higher-precedence
+source wins (per server, not whole file):
+
+```text
+agent-native  <  mcp.json (global)  <  per-profile mcp.json
+```
+
+So a server defined in both your agent's native config and the global `mcp.json`
+is taken from `mcp.json`, and one defined in both the global and per-profile
+files is taken from the per-profile file. Each override is logged. A project-local
+source is a planned higher layer on top of this stack and is tracked separately.
+
+## Capability gating
+
+Not every agent supports every transport. `stdio` works everywhere. `http` and
+`sse` servers are forwarded only when the agent advertises support for them in
+its handshake; otherwise that server is dropped (with a warning in the log) so
+AoE never sends a request the agent would reject.
 
 ## Errors
 
@@ -80,5 +113,17 @@ entries and any secrets in `env` / `headers` stay out of source control. Treat
 it like any file that can launch processes on your behalf: a stdio server runs
 its `command` locally when a session starts.
 
+<<<<<<< HEAD
 Project-local `.mcp.json` (read from a repository) and per-profile MCP config
 are not supported yet.
+=======
+A per-profile `mcp.json` lives in the profile directory under your app
+directory, so it is owned by you with the same trust as the global file. Treat
+it the same way: its `command` entries can launch processes on your behalf.
+
+Project-local `.mcp.json` (read from a repository) is not supported yet. A
+repository-provided server config would let a cloned, untrusted repo launch
+commands the moment you open a session, so it must sit behind the same
+repo-trust gate AoE already uses for lifecycle hooks; that work is tracked
+separately.
+>>>>>>> 396266e1 (docs(mcp): document per-profile MCP config layer)
