@@ -473,6 +473,82 @@ fn command_matches_binary(command: &str, binary: &str) -> bool {
             .is_some_and(|name| name == binary)
 }
 
+/// Resolve the MCP servers to forward for a spawn: the agent's native config
+/// (lowest precedence) merged under the global `<app_dir>/mcp.json`. Runs on a
+/// blocking thread (callers spawn_blocking it) because a native config can be
+/// large. Each layer is isolated: a missing, unreadable, or malformed source
+/// warns and contributes nothing rather than aborting, so a single broken file
+/// never blocks the spawn.
+fn resolve_mcp_layers(
+    agent_key: &str,
+    session_id: &str,
+) -> Vec<agent_client_protocol::schema::McpServer> {
+    use crate::acp::mcp_config::{
+        load_global_mcp_servers, load_native_mcp_servers_from_home, merge_by_precedence, summarize,
+        McpLayer,
+    };
+
+    let native = match load_native_mcp_servers_from_home(agent_key) {
+        Ok(servers) => servers,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                agent = %agent_key,
+                error = %e,
+                "failed to load native MCP config; forwarding none from it"
+            );
+            Vec::new()
+        }
+    };
+
+    let global = match crate::session::get_app_dir() {
+        Ok(app_dir) => match load_global_mcp_servers(&app_dir) {
+            Ok(servers) => servers,
+            Err(e) => {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    error = %e,
+                    "failed to load global MCP config; forwarding none from it"
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "could not resolve app dir for MCP config; forwarding none from it"
+            );
+            Vec::new()
+        }
+    };
+
+    let merged = merge_by_precedence(vec![
+        McpLayer {
+            label: "agent-native",
+            servers: native,
+        },
+        McpLayer {
+            label: "global",
+            servers: global,
+        },
+    ]);
+
+    if !merged.is_empty() {
+        info!(
+            target: "acp.mcp",
+            session = %session_id,
+            count = merged.len(),
+            servers = %summarize(&merged),
+            "forwarding MCP servers"
+        );
+    }
+    merged
+}
+
 /// Overlay an instance command override onto a resolved `AgentSpec`.
 ///
 /// Applies only when the override is safe: the spec came from the
@@ -1240,45 +1316,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
         })?;
 
-        // Resolve the user's MCP servers from the global `<app_dir>/mcp.json`
-        // so they reach the agent on session/new and session/load. A malformed
-        // file warns and forwards nothing rather than failing every spawn; a
-        // single typo must not brick all structured-view sessions. Project-local
-        // and per-profile sources are deferred (see issue follow-ups).
-        let mcp_servers = match crate::session::get_app_dir() {
-            Ok(app_dir) => match crate::acp::mcp_config::load_global_mcp_servers(&app_dir) {
-                Ok(servers) => {
-                    if !servers.is_empty() {
-                        info!(
-                            target: "acp.mcp",
-                            session = %session_id,
-                            count = servers.len(),
-                            servers = %crate::acp::mcp_config::summarize(&servers),
-                            "forwarding MCP servers from global config"
-                        );
-                    }
-                    servers
-                }
-                Err(e) => {
+        // Resolve the MCP servers to forward on session/new and session/load:
+        // the agent's own native config (lowest precedence) merged under the
+        // global `<app_dir>/mcp.json`, so a server defined in both is taken from
+        // the global file. Disk reads and parsing run off the async runtime
+        // because a native config (e.g. `~/.claude.json`) can be large. Any
+        // broken layer warns and contributes nothing rather than failing the
+        // spawn; project-local and per-profile sources are deferred (follow-ups).
+        let mcp_agent = agent.clone();
+        let mcp_session = session_id.clone();
+        let mcp_servers =
+            tokio::task::spawn_blocking(move || resolve_mcp_layers(&mcp_agent, &mcp_session))
+                .await
+                .unwrap_or_else(|e| {
                     warn!(
                         target: "acp.mcp",
                         session = %session_id,
                         error = %e,
-                        "failed to load MCP config; forwarding no servers"
+                        "MCP resolution task failed; forwarding no servers"
                     );
                     Vec::new()
-                }
-            },
-            Err(e) => {
-                warn!(
-                    target: "acp.mcp",
-                    session = %session_id,
-                    error = %e,
-                    "could not resolve app dir for MCP config; forwarding no servers"
-                );
-                Vec::new()
-            }
-        };
+                });
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
