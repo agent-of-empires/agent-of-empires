@@ -16,6 +16,7 @@ Thanks for your interest in contributing to aoe (Agent of Empires)! This documen
 - **tmux**: Required for running the application (`brew install tmux` on macOS, `apt install tmux` on Ubuntu)
 - **Git**: For version control
 - **Node.js + npm** (optional): Only needed for the web dashboard feature (`cargo build --features serve`). Not required for TUI-only development.
+- **[kache](https://github.com/kunobi-ninja/kache)**: The committed `.cargo/config.toml` uses kache as the rustc wrapper to share dependency builds across worktrees, so it is needed for a local build. Install a prebuilt binary with `cargo binstall kache`. To build without it, opt out with `export CARGO_BUILD_RUSTC_WRAPPER=""`. See [Faster rebuilds across worktrees](docs/development.md#faster-rebuilds-across-worktrees-kache).
 
 ### Quick Start
 
