@@ -856,7 +856,7 @@ fn run_hooks_streamed(
     // the error; it's the only context that survives to the user.
     const ERROR_TAIL_LINES: usize = 20;
 
-    for cmd in commands {
+    for (idx, cmd) in commands.iter().enumerate() {
         tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
         let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
 
@@ -900,6 +900,13 @@ fn run_hooks_streamed(
                 };
                 let lines: Vec<String> = tail.into();
                 detail.push_str(&format!("\n{}:\n{}", label, lines.join("\n")));
+            }
+            if commands.len() > 1 {
+                detail.push_str(&format!(
+                    "\n(hook {} of {}; remaining hooks skipped)",
+                    idx + 1,
+                    commands.len()
+                ));
             }
             let _ = progress_tx.send(HookProgress::Output(detail.clone()));
             anyhow::bail!(detail);
@@ -1669,6 +1676,39 @@ mod tests {
              actual failure, not just the exit code; got:\n{}",
             msg
         );
+    }
+
+    /// With multiple on_create hooks the failure detail says which hook
+    /// failed and that the rest were skipped, so the user doesn't assume
+    /// later hooks ran.
+    #[test]
+    fn streamed_hook_failure_names_position_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec![
+            "true".to_string(),
+            "sh -c 'exit 7'".to_string(),
+            "true".to_string(),
+        ];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("second hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("(hook 2 of 3; remaining hooks skipped)"),
+            "got: {}",
+            msg
+        );
+    }
+
+    /// A single hook keeps the error free of position noise.
+    #[test]
+    fn streamed_hook_failure_omits_position_when_single() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
     }
 
     /// The CLI/captured path leaves the terminal attached so users running
