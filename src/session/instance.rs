@@ -804,6 +804,18 @@ impl Instance {
         }
     }
 
+    /// Whether a title rename should also move the worktree directory leaf,
+    /// given the resolved `session.tie_workdir_to_name` setting. True only for
+    /// aoe-managed worktree sessions: non-worktree (scratch, plain tmux) and
+    /// externally-attached worktrees are always a no-op. See #1927.
+    pub fn tie_workdir_applies(&self, tie_setting: bool) -> bool {
+        tie_setting
+            && self
+                .worktree_info
+                .as_ref()
+                .is_some_and(|w| w.managed_by_aoe)
+    }
+
     /// Stamp `last_accessed_at` to the current time AND wake the session
     /// from any sink state. Call this on user-initiated interactions
     /// (attach, send keys, etc.); every existing call site already does.
