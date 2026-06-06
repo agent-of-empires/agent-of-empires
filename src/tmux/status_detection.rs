@@ -251,6 +251,43 @@ pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &st
     hook_status
 }
 
+/// OH-MY-PI TUI status detection via tmux pane parsing.
+/// OMP's output mirrors Claude Code's live spinner/activity shapes, so this
+/// fallback keeps the same recent-line window and reuses the shared spinner and
+/// activity helpers used by the other pane detectors.
+pub fn detect_omp_status(raw_content: &str) -> Status {
+    let non_empty: Vec<&str> = raw_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    let recent_joined = recent.join("\n");
+    let recent_lower = recent_joined.to_lowercase();
+
+    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
+        return Status::Running;
+    }
+
+    if has_claude_live_token_counter(&recent_joined)
+        || has_spinner_activity_line(&recent)
+        || recent
+            .iter()
+            .any(|line| has_live_activity_word(&line.to_lowercase()))
+    {
+        return Status::Running;
+    }
+
+    if has_any_spinner(&recent)
+        || recent
+            .iter()
+            .any(|line| claude_line_is_active_spinner(line))
+    {
+        return Status::Running;
+    }
+
+    Status::Idle
+}
+
 pub fn detect_opencode_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -1747,6 +1784,30 @@ enter to select · esc to cancel";
             detect_status_from_content(ansi_running, "claude"),
             Status::Running,
             "Per-word ANSI coloring must not prevent Running detection for Claude Code"
+        );
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_on_claude_style_spinner() {
+        assert_eq!(detect_omp_status("✶ Working…"), Status::Running);
+        assert_eq!(
+            detect_omp_status("✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_on_shared_spinner_activity() {
+        assert_eq!(detect_omp_status("⠋ Reading 1.2k tokens"), Status::Running);
+        assert_eq!(detect_omp_status("Generating response"), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_idle_on_plain_text() {
+        assert_eq!(detect_omp_status(""), Status::Idle);
+        assert_eq!(
+            detect_omp_status("file saved successfully\n> "),
+            Status::Idle
         );
     }
 

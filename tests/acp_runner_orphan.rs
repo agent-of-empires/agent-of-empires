@@ -15,13 +15,15 @@
 //! which is safe under the test's own process group, and is exactly the
 //! path where the superseded-delete bug lived.
 
+#![cfg(feature = "serve")]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// App data dir for the debug binary, which uses the `-dev` namespace.
 fn app_dir(home: &Path, xdg: &Path) -> PathBuf {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         xdg.join("agent-of-empires-dev")
     } else {
         home.join(".agent-of-empires-dev")

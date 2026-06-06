@@ -559,6 +559,23 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
     },
+    AgentDef {
+        name: "omp",
+        binary: "omp",
+        aliases: &[],
+        detection: DetectionMethod::Which("omp"),
+        yolo: Some(YoloMode::CliFlag("--auto-approve")),
+        instruction_flag: None,
+        set_default_command: true,
+        detect_status: status_detection::detect_omp_status,
+        container_env: &[],
+        hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint:
+            "curl -fsSL https://raw.githubusercontent.com/nicepkg/oh-my-pi/main/scripts/install.sh | bash",
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -645,6 +662,7 @@ mod tests {
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
+        assert_eq!(get_agent("omp").unwrap().binary, "omp");
     }
 
     #[test]
@@ -661,6 +679,28 @@ mod tests {
         assert_eq!(
             hermes.install_hint,
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+        );
+    }
+
+    #[test]
+    fn test_omp_agent_definition() {
+        let omp = get_agent("omp").unwrap();
+        assert_eq!(omp.binary, "omp");
+        assert!(matches!(&omp.detection, DetectionMethod::Which("omp")));
+        assert!(matches!(
+            &omp.yolo,
+            Some(YoloMode::CliFlag("--auto-approve"))
+        ));
+        assert!(matches!(
+            &omp.resume_strategy,
+            ResumeStrategy::Flag("--resume")
+        ));
+        assert!(omp.set_default_command);
+        assert!(!omp.host_only);
+        assert_eq!(omp.send_keys_enter_delay_ms, 0);
+        assert_eq!(
+            omp.install_hint,
+            "curl -fsSL https://raw.githubusercontent.com/nicepkg/oh-my-pi/main/scripts/install.sh | bash"
         );
     }
 
@@ -688,7 +728,8 @@ mod tests {
                 "hermes",
                 "kiro",
                 "qwen",
-                "antigravity"
+                "antigravity",
+                "omp"
             ]
         );
     }
@@ -715,6 +756,7 @@ mod tests {
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
         assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("omp"), Some("omp"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -734,6 +776,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
+        assert_eq!(settings_index_from_name(Some("omp")), 15);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -747,6 +790,7 @@ mod tests {
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
+        assert_eq!(name_from_settings_index(15), Some("omp"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -771,6 +815,7 @@ mod tests {
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
         assert_eq!(send_keys_enter_delay("antigravity"), 0);
+        assert_eq!(send_keys_enter_delay("omp"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
 
@@ -818,6 +863,10 @@ mod tests {
         assert_eq!(
             install_hint("antigravity"),
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
+        );
+        assert_eq!(
+            install_hint("omp"),
+            Some("curl -fsSL https://raw.githubusercontent.com/nicepkg/oh-my-pi/main/scripts/install.sh | bash")
         );
         assert!(install_hint("unknown").is_none());
     }

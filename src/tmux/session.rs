@@ -274,6 +274,25 @@ impl Session {
 
         info.join(", ")
     }
+    fn first_window_first_pane_target(&self) -> String {
+        let first_window = format!("{}:^", self.name);
+        let output = Command::new("tmux")
+            .args(["list-panes", "-t", &first_window, "-F", "#{pane_id}"])
+            .output();
+
+        output
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|stdout| {
+                stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or(first_window)
+    }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         self.capture_pane_with_size(lines, None, None)
@@ -289,9 +308,9 @@ impl Session {
             return Ok(String::new());
         }
 
-        // Use `^.0` to target the first window's first pane regardless of
-        // base-index or which pane is active.  See #435, #488.
-        let target = format!("{}:^.0", self.name);
+        // Resolve to the first window's first pane by pane id instead of
+        // assuming pane index 0; users may have pane-base-index=1 in tmux.conf.
+        let target = self.first_window_first_pane_target();
         let output = Command::new("tmux")
             .args([
                 "capture-pane",
