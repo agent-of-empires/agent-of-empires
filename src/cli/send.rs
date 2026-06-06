@@ -1,18 +1,39 @@
 //! `agent-of-empires send` subcommand implementation
+//!
+//! Two modes share one entry point:
+//! - **single target** — `aoe send <id> "msg"` (unchanged, backward-compatible);
+//! - **bulk** — `aoe send [FILTER] "msg"` selects a set via [`TargetFilter`] and,
+//!   by default, PREVIEWS it (prints matched targets, sends nothing). Only
+//!   `--yes` actually delivers. This preview gate is the whole reason bulk send
+//!   is safe: a blind `send` appends + submits, clobbering any input the agent
+//!   has staged at its prompt, so we never fan out keystrokes the operator
+//!   hasn't seen the blast radius of first.
 
 use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::cli::session::stale_history_suffix;
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
+use crate::cli::target::{self, ResolvedTarget, TargetFilter};
+use crate::session::{EnsureReadyError, EnsureReadyOutcome, Status, Storage};
 
 #[derive(Args)]
 pub struct SendArgs {
-    /// Session ID or title
-    identifier: String,
+    /// In single-target mode: the session id or title. In bulk mode (a filter
+    /// is present): omit this and pass only the message. Positional parsing:
+    /// when two positionals are given they are `<identifier> <message>`; when
+    /// one is given it is the `<message>` and targets come from the filter.
+    arg1: Option<String>,
 
-    /// Message to send to the agent
-    message: String,
+    /// Second positional; present only in `<identifier> <message>` form.
+    arg2: Option<String>,
+
+    #[command(flatten)]
+    filter: TargetFilter,
+
+    /// Actually deliver in bulk mode. Without it, bulk send only previews the
+    /// matched targets. No effect on single-target sends (those always send).
+    #[arg(long, short = 'y')]
+    yes: bool,
 
     /// Fail loud on dead/stopped sessions instead of auto-respawning. Default
     /// behavior is to revive the session so a `send` after a crash or stop
@@ -23,14 +44,38 @@ pub struct SendArgs {
 
 #[tracing::instrument(target = "cli.send", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
-    let (mut instances, _) = storage.load_with_groups()?;
+    // Disambiguate positionals: `<id> <msg>` vs filter-mode `<msg>`.
+    let (identifier, message) = match (args.arg1, args.arg2) {
+        (Some(id), Some(msg)) => (Some(id), msg),
+        (Some(msg), None) => (None, msg),
+        (None, _) => bail!("a message is required"),
+    };
 
-    if args.message.trim().is_empty() {
+    if message.trim().is_empty() {
         bail!("Message cannot be empty");
     }
 
-    let inst = super::resolve_session(&args.identifier, &instances)?;
+    // Bulk when any filter selector is present, or when no identifier was
+    // given at all (a filter-less, identifier-less send is a no-op guard, not
+    // a whole-fleet blast).
+    if args.filter.has_selector() || identifier.is_none() {
+        return bulk_send(profile, &args.filter, &message, args.yes, args.no_revive).await;
+    }
+
+    let identifier = identifier.expect("checked: Some in single-target branch");
+    let title = deliver_send(profile, &identifier, &message, args.no_revive)?;
+    println!("Sent message to '{}'", title);
+    Ok(())
+}
+
+/// Deliver one message to one session in one profile: revive the pane if
+/// needed, send keystrokes, then stamp `last_accessed`/`Running`. Returns the
+/// session title on success. Shared by the single-target and bulk paths.
+fn deliver_send(profile: &str, identifier: &str, message: &str, no_revive: bool) -> Result<String> {
+    let storage = Storage::new(profile)?;
+    let (mut instances, _) = storage.load_with_groups()?;
+
+    let inst = super::resolve_session(identifier, &instances)?;
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
@@ -38,7 +83,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     // Revive the pane if needed before delivering keystrokes. Without this,
     // a send to a dead pane silently writes to a corpse with no agent to
     // respond to it.
-    if !args.no_revive {
+    if !no_revive {
         if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
             match target.ensure_pane_ready() {
                 Ok(EnsureReadyOutcome::Respawned { stale_sid: None }) => {
@@ -79,12 +124,12 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     if !tmux_session.exists() {
         bail!(
             "Session is not running. Start it first with: aoe session start {}",
-            args.identifier
+            identifier
         );
     }
 
     let delay = crate::agents::send_keys_enter_delay(&tool);
-    tmux_session.send_keys_with_delay(&args.message, delay)?;
+    tmux_session.send_keys_with_delay(message, delay)?;
 
     // Stamp last_accessed_at so the "last activity" column reflects user
     // interaction, and remap the status to Running. The agent has just been
@@ -113,6 +158,93 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         );
     }
 
-    println!("Sent message to '{}'", session_title);
+    Ok(session_title)
+}
+
+/// Bulk send: resolve the matched set across profiles, PREVIEW by default,
+/// deliver only on `--yes`. Excludes the invoking session so the operator
+/// never messages themselves; warns on `waiting`/`idle` targets that may hold
+/// input staged at the prompt (a send appends + submits, mixing the two).
+async fn bulk_send(
+    ambient_profile: &str,
+    filter: &TargetFilter,
+    message: &str,
+    yes: bool,
+    no_revive: bool,
+) -> Result<()> {
+    let self_id = target::self_instance_id();
+    let targets = target::resolve_targets(ambient_profile, filter, self_id.as_deref(), true)?;
+
+    if targets.is_empty() {
+        println!("No sessions match the filter (nothing to send).");
+        return Ok(());
+    }
+
+    let staged: Vec<&ResolvedTarget> = targets
+        .iter()
+        .filter(|t| matches!(t.instance.status, Status::Waiting | Status::Idle))
+        .collect();
+
+    println!(
+        "{} session(s) match{}:",
+        targets.len(),
+        if yes { "" } else { " (preview)" }
+    );
+    for t in &targets {
+        println!(
+            "  · [{}] {:<20} {:<8} {}",
+            t.profile,
+            super::truncate(&t.instance.title, 20),
+            t.instance.status.as_str(),
+            t.instance.id,
+        );
+    }
+    if self_id.is_some() {
+        println!("  (excluding this session)");
+    }
+    if !staged.is_empty() {
+        println!(
+            "⚠ {} target(s) are waiting/idle and may hold input staged at the prompt; \
+             a send appends + submits, mixing your message with theirs:",
+            staged.len()
+        );
+        for t in &staged {
+            println!("    · [{}] {}", t.profile, t.instance.title);
+        }
+    }
+
+    if !yes {
+        println!(
+            "\nPreview only — nothing sent. Re-run with --yes to deliver to the {} matched session(s).",
+            targets.len()
+        );
+        return Ok(());
+    }
+
+    println!("\nMessage: {message:?}\n");
+    let mut sent: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for t in &targets {
+        match deliver_send(&t.profile, &t.instance.id, message, no_revive) {
+            Ok(title) => sent.push(format!("[{}] {}", t.profile, title)),
+            Err(e) => failed.push((
+                format!("[{}] {}", t.profile, t.instance.title),
+                e.to_string(),
+            )),
+        }
+    }
+
+    println!("✓ Sent to {}/{} sessions:", sent.len(), targets.len());
+    for s in &sent {
+        println!("  · {s}");
+    }
+    if !failed.is_empty() {
+        println!("✗ {} failed:", failed.len());
+        for (label, err) in &failed {
+            println!("  · {label}: {err}");
+        }
+        bail!("{} session(s) failed to receive the message", failed.len());
+    }
+
     Ok(())
 }

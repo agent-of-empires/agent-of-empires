@@ -112,21 +112,30 @@ pub struct SessionIdArgs {
 
 #[derive(Args)]
 pub struct RestartArgs {
-    /// Session ID or title (required unless `--all` is passed)
+    /// Session ID or title. Required unless a fleet filter (`--all`,
+    /// `--state`, `--errors`, `--group`, `--ids`, `--path`, `--profiles`)
+    /// is passed. Mutually exclusive with every filter selector.
+    #[arg(conflicts_with_all = ["all", "profiles", "groups", "states", "errors", "ids", "path"])]
     pub identifier: Option<String>,
 
-    /// Restart every session in the active profile. Useful after
-    /// `aoe update`, after editing `sandbox.environment`, after a
-    /// Docker hiccup, or after changing a hook. Mutually exclusive
-    /// with `identifier`.
-    #[arg(long, conflicts_with = "identifier")]
-    pub all: bool,
+    /// Fleet selector. With no narrowing, `--all` restarts every session
+    /// across every profile (consistent with `send`/`status`); add
+    /// `--state error`, `--group`, etc. to narrow. Useful after
+    /// `aoe update`, editing `sandbox.environment`, a Docker hiccup, or
+    /// changing a hook.
+    #[command(flatten)]
+    pub filter: crate::cli::target::TargetFilter,
 
-    /// Concurrency cap for `--all`. Restarting many sandboxed
+    /// Concurrency cap for bulk restart. Restarting many sandboxed
     /// sessions in parallel pressures dockerd, so the default is
-    /// intentionally modest. Ignored when `--all` is not set.
+    /// intentionally modest. Ignored for a single-identifier restart.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+
+    /// Print the resolved target set (grouped by profile) and exit without
+    /// restarting anything. The safety valve for the no-preview bulk path.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
@@ -507,45 +516,46 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()> {
-    if args.all {
-        return restart_all_sessions(profile, args.parallel).await;
+    if let Some(identifier) = args.identifier {
+        // `conflicts_with_all` on `identifier` guarantees no filter selector
+        // is present here, so a single-identifier restart is unambiguous.
+        return restart_session(profile, SessionIdArgs { identifier }).await;
     }
-    let identifier = args
-        .identifier
-        .ok_or_else(|| anyhow::anyhow!("session identifier required (or pass --all)"))?;
-    restart_session(profile, SessionIdArgs { identifier }).await
+    if args.filter.has_selector() {
+        return restart_targets(profile, &args.filter, args.parallel, args.dry_run).await;
+    }
+    bail!("session identifier required (or pass a fleet filter such as --all / --state error)")
 }
 
-async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
+/// Outcome of one profile's restart fan-out, aggregated by the caller so a
+/// cross-profile bulk restart prints a single summary.
+#[derive(Default)]
+struct RestartReport {
+    total: usize,
+    /// `(title, stale_sid)` per restarted session; `stale_sid` is `Some` when
+    /// the resume cascade had to start fresh.
+    succeeded: Vec<(String, Option<String>)>,
+    failed: Vec<(String, String)>,
+    orphaned: Vec<(String, String)>,
+}
+
+/// Restart an explicit set of already-cloned target instances within one
+/// profile, using the same three-phase (snapshot → unlocked parallel tmux
+/// restart → locked merge-by-id) protocol as the legacy `--all`. `targets`
+/// must already carry `source_profile` so start-time config resolution honors
+/// the right profile's overrides.
+async fn restart_fanout(
+    profile: &str,
+    targets: Vec<crate::session::Instance>,
+    parallel: usize,
+) -> Result<RestartReport> {
     let storage = Storage::new(profile)?;
-
-    // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
-    // across the parallel restart fan-out below; phase 3 re-loads under
-    // the lock and merges by id.
-    let (instances, _groups) = storage.load_with_groups()?;
-    let target_ids = pick_targets_for_restart_all(&instances);
-    if target_ids.is_empty() {
-        println!("No sessions to restart in profile '{}'.", profile);
-        return Ok(());
+    let total = targets.len();
+    if total == 0 {
+        return Ok(RestartReport::default());
     }
-
-    let total = target_ids.len();
     let size = crate::terminal::get_size();
     let parallel = parallel.max(1);
-
-    // Clone each target into its worker. `source_profile` is runtime-only
-    // (skip_serializing) so storage-loaded instances always come back
-    // blank; rehydrate it from the storage profile so start-time config
-    // resolution honors the right profile's overrides (sandbox.environment,
-    // on_launch hooks, etc.).
-    let mut targets: Vec<crate::session::Instance> = Vec::with_capacity(total);
-    for id in &target_ids {
-        if let Some(inst) = instances.iter().find(|i| &i.id == id) {
-            let mut clone = inst.clone();
-            clone.source_profile = profile.to_string();
-            targets.push(clone);
-        }
-    }
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
     let mut join_set: tokio::task::JoinSet<(
@@ -615,7 +625,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 tracing::warn!(
                     target: "session.cli",
                     session_id = %restarted_inst.id,
-                    "session row removed by peer between phase 1 and phase 3 of restart --all; tmux session is now orphan"
+                    "session row removed by peer between phase 1 and phase 3 of bulk restart; tmux session is now orphan"
                 );
                 orphaned.push((restarted_inst.id.clone(), restarted_inst.title.clone()));
             }
@@ -627,67 +637,135 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
     succeeded.retain(|(id, _, _)| !orphaned_ids.contains(id));
 
-    let stale_count = succeeded.iter().filter(|(_, _, s)| s.is_some()).count();
+    Ok(RestartReport {
+        total,
+        succeeded: succeeded
+            .into_iter()
+            .map(|(_id, title, stale)| (title, stale))
+            .collect(),
+        failed,
+        orphaned,
+    })
+}
+
+/// Bulk restart across the filtered target set (possibly spanning profiles).
+/// Excludes the invoking session, prints the resolved plan grouped by profile,
+/// and — unless `--dry-run` — fans out per profile via [`restart_fanout`],
+/// then prints one aggregated summary.
+async fn restart_targets(
+    ambient_profile: &str,
+    filter: &crate::cli::target::TargetFilter,
+    parallel: usize,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::cli::target;
+    use std::collections::BTreeMap;
+
+    let self_id = target::self_instance_id();
+    let resolved = target::resolve_targets(ambient_profile, filter, self_id.as_deref(), true)?;
+    if resolved.is_empty() {
+        println!("No sessions match the filter (nothing to restart).");
+        return Ok(());
+    }
+
+    // Group by (canonical) profile so each fan-out opens the right Storage and
+    // the plan reads profile-by-profile. Stamp source_profile for config
+    // resolution at restart time.
+    let mut by_profile: BTreeMap<String, Vec<crate::session::Instance>> = BTreeMap::new();
+    for t in resolved {
+        let mut inst = t.instance;
+        inst.source_profile = t.profile.clone();
+        by_profile.entry(t.profile).or_default().push(inst);
+    }
+    let total: usize = by_profile.values().map(|v| v.len()).sum();
+
+    println!(
+        "Restarting {} session(s) across {} profile(s){}:",
+        total,
+        by_profile.len(),
+        if dry_run { " [dry run]" } else { "" }
+    );
+    for (prof, insts) in &by_profile {
+        println!("  ═ {} ({}):", prof, insts.len());
+        for inst in insts {
+            println!(
+                "    · {:<20} {:<8} {}",
+                super::truncate(&inst.title, 20),
+                inst.status.as_str(),
+                inst.id,
+            );
+        }
+    }
+    if self_id.is_some() {
+        println!("  (excluding this session)");
+    }
+    if dry_run {
+        println!("\nDry run — nothing restarted.");
+        return Ok(());
+    }
+
+    // Fan out per profile. Each profile's fan-out is independent (separate
+    // Storage lock); run them sequentially so the dockerd-pressure cap stays
+    // honored per profile rather than multiplying across profiles.
+    let mut agg = RestartReport {
+        total,
+        ..Default::default()
+    };
+    for (prof, insts) in by_profile {
+        match restart_fanout(&prof, insts, parallel).await {
+            Ok(report) => {
+                agg.succeeded.extend(report.succeeded);
+                agg.failed.extend(report.failed);
+                agg.orphaned.extend(report.orphaned);
+            }
+            Err(e) => {
+                // A whole-profile failure (e.g. Storage open) shouldn't abort
+                // the other profiles; record it and continue.
+                agg.failed
+                    .push((format!("[{prof}] <profile>"), e.to_string()));
+            }
+        }
+    }
+
+    let stale_count = agg.succeeded.iter().filter(|(_, s)| s.is_some()).count();
     if stale_count == 0 {
-        println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
+        println!(
+            "✓ Restarted {}/{} sessions:",
+            agg.succeeded.len(),
+            agg.total
+        );
     } else {
         println!(
             "✓ Restarted {}/{} sessions ({} without prior history):",
-            succeeded.len(),
-            total,
+            agg.succeeded.len(),
+            agg.total,
             stale_count,
         );
     }
-    for (_id, title, stale) in &succeeded {
+    for (title, stale) in &agg.succeeded {
         match stale {
             Some(sid) => println!("  · {}{}", title, stale_history_suffix(sid)),
             None => println!("  · {}", title),
         }
     }
-    if !orphaned.is_empty() {
+    if !agg.orphaned.is_empty() {
         println!(
             "⚠ {} orphaned (row removed by peer mid-flight; tmux running but unrooted):",
-            orphaned.len()
+            agg.orphaned.len()
         );
-        for (_, title) in &orphaned {
+        for (_, title) in &agg.orphaned {
             println!("  · {}", title);
         }
     }
-    if !failed.is_empty() {
-        println!("✗ {} failed:", failed.len());
-        for (title, err) in &failed {
+    if !agg.failed.is_empty() {
+        println!("✗ {} failed:", agg.failed.len());
+        for (title, err) in &agg.failed {
             println!("  · {}: {}", title, err);
         }
-        bail!("{} session(s) failed to restart", failed.len());
+        bail!("{} session(s) failed to restart", agg.failed.len());
     }
 
     Ok(())
-}
-
-/// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Cockpit-mode sessions are skipped
-/// because their lifecycle is owned by `aoe serve`'s supervisor, not
-/// tmux: a CLI-side restart would no-op silently and (with the explicit
-/// bail in `restart_session`) flood `--all` with per-session errors.
-/// Everything else is fair game; agents have their own resume-or-restart
-/// logic on the next start.
-fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<String> {
-    use crate::session::Status;
-    instances
-        .iter()
-        .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|_i| {
-            #[cfg(feature = "serve")]
-            {
-                !_i.cockpit_mode
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                true
-            }
-        })
-        .map(|i| i.id.clone())
-        .collect()
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1308,7 +1386,7 @@ mod restart_args_tests {
             .expect("identifier-only must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
-                assert!(!args.all);
+                assert!(!args.filter.all);
                 assert_eq!(args.identifier.as_deref(), Some("claude-3"));
                 assert_eq!(args.parallel, 3);
             }
@@ -1321,7 +1399,7 @@ mod restart_args_tests {
         let cli = Cli::try_parse_from(["aoe", "restart", "--all"]).expect("--all alone must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
-                assert!(args.all);
+                assert!(args.filter.all);
                 assert!(args.identifier.is_none());
                 assert_eq!(args.parallel, 3);
             }
@@ -1335,7 +1413,7 @@ mod restart_args_tests {
             .expect("--all --parallel must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
-                assert!(args.all);
+                assert!(args.filter.all);
                 assert_eq!(args.parallel, 5);
             }
             _ => panic!("wrong subcommand"),
@@ -1390,48 +1468,63 @@ mod restart_args_tests {
 }
 
 #[cfg(test)]
-mod target_filter_tests {
-    use super::pick_targets_for_restart_all;
-    use crate::session::{Instance, Status};
+mod restart_filter_dispatch_tests {
+    use super::SessionCommands;
+    use clap::Parser;
 
-    fn instance_with_status(id: &str, status: Status) -> Instance {
-        let mut inst = Instance::new(id, "/tmp");
-        inst.id = id.to_string();
-        inst.status = status;
-        inst
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: SessionCommands,
     }
 
     #[test]
-    fn skips_deleting_and_creating() {
-        let instances = vec![
-            instance_with_status("running", Status::Running),
-            instance_with_status("idle", Status::Idle),
-            instance_with_status("stopped", Status::Stopped),
-            instance_with_status("error", Status::Error),
-            instance_with_status("waiting", Status::Waiting),
-            instance_with_status("starting", Status::Starting),
-            instance_with_status("unknown", Status::Unknown),
-            instance_with_status("deleting", Status::Deleting),
-            instance_with_status("creating", Status::Creating),
-        ];
-        let mut picked = pick_targets_for_restart_all(&instances);
-        picked.sort();
-        let mut expected = vec![
-            "error".to_string(),
-            "idle".to_string(),
-            "running".to_string(),
-            "starting".to_string(),
-            "stopped".to_string(),
-            "unknown".to_string(),
-            "waiting".to_string(),
-        ];
-        expected.sort();
-        assert_eq!(picked, expected);
+    fn restart_state_filter_parses_without_identifier() {
+        let cli = Cli::try_parse_from(["aoe", "restart", "--state", "error"])
+            .expect("a state filter alone must parse");
+        match cli.cmd {
+            SessionCommands::Restart(args) => {
+                assert!(args.identifier.is_none());
+                assert_eq!(args.filter.states.len(), 1);
+                assert!(args.filter.has_selector());
+            }
+            _ => panic!("wrong subcommand"),
+        }
     }
 
     #[test]
-    fn empty_input_yields_empty_targets() {
-        assert!(pick_targets_for_restart_all(&[]).is_empty());
+    fn restart_errors_shorthand_and_dry_run_parse() {
+        let cli = Cli::try_parse_from(["aoe", "restart", "--errors", "--dry-run"])
+            .expect("--errors --dry-run must parse");
+        match cli.cmd {
+            SessionCommands::Restart(args) => {
+                assert!(args.filter.errors);
+                assert!(args.dry_run);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn restart_identifier_conflicts_with_any_filter_selector() {
+        // identifier + --state, --errors, --group, --ids, --path, --profiles
+        // all conflict at parse time (mirrors the historical --all conflict).
+        for sel in [
+            vec!["--state", "error"],
+            vec!["--errors"],
+            vec!["--group", "fleet"],
+            vec!["--ids", "abc"],
+            vec!["--path", "/tmp"],
+            vec!["--profiles", "main"],
+        ] {
+            let mut argv = vec!["aoe", "restart", "claude-3"];
+            argv.extend(sel.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "identifier + {:?} should conflict",
+                sel
+            );
+        }
     }
 }
 
