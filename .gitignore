@@ -67,6 +67,7 @@ website/src/pages/docs/guides/*.md
 website/src/pages/docs/cli/*.md
 website/src/pages/docs/structured-view/*.md
 website/src/pages/docs/development/*.md
+website/src/pages/docs/development/internals/*.md
 .worktrees/
 .gstack/
 .playwright-mcp/

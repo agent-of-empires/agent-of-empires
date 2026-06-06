@@ -57,12 +57,9 @@ export const docsNav: NavSection[] = [
     title: "Structured View",
     items: [
       { title: "Overview", href: "/docs/structured-view/" },
-      { title: "Setup", href: "/docs/structured-view/setup/" },
       { title: "Interface", href: "/docs/structured-view/interface/" },
       { title: "Modes, Approvals & Models", href: "/docs/structured-view/controls/" },
-      { title: "Persistence & Recovery", href: "/docs/structured-view/persistence/" },
       { title: "Troubleshooting", href: "/docs/structured-view/troubleshooting/" },
-      { title: "Multi-Agent Support", href: "/docs/structured-view/multi-agent/" },
     ],
   },
   {
@@ -88,6 +85,14 @@ export const docsNav: NavSection[] = [
         title: "Web Dashboard Development",
         href: "/docs/development/web-dashboard/",
       },
+    ],
+  },
+  {
+    title: "Internals (Contributor)",
+    items: [
+      { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
+      { title: "Sandbox Internals", href: "/docs/development/internals/sandbox/" },
+      { title: "Session & Worktree Internals", href: "/docs/development/internals/sessions/" },
     ],
   },
 ];

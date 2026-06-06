@@ -8,9 +8,7 @@ From the main screen, press `D` to open the diff view. It shows:
 - **Left panel**: List of changed files with status indicators (M=modified, A=added, D=deleted)
 - **Right panel**: Diff content for the selected file
 
-The diff is computed against the base branch (defaults to `main` or your repo's default branch).
-
-Auto-detection scores every configured remote, not just `origin`. In a fork plus `upstream` layout, the diff compares against `upstream/main` when that tip is fresher than your local `main` and `origin/main`. The chosen ref is whichever candidate HEAD descends from with the most recent commit time, so a worktree branched off `upstream/main` does not see the gap between your stale fork-main and the actual branch point as session changes.
+The diff is computed against the base branch (defaults to `main` or your repo's default branch). Auto-detection considers every configured remote, not just `origin`, so a fork plus `upstream` layout compares against the branch point rather than a stale fork-main.
 
 ## Navigation
 
@@ -56,63 +54,39 @@ The path is relative to the file's repository root, so it pastes straight into c
 
 ## Commenting on the diff (web only, structured view sessions)
 
-The web dashboard lets you annotate lines in the diff and send the
-comments to the agent as a single prompt (#928).
+The web dashboard lets you annotate diff lines and send the comments to the
+agent as a single prompt.
 
-- Hover any line in the diff viewer to reveal a `+` button in the
-  left gutter. Click it to start a comment.
-- Click the `+` on the same line again to comment on that single
-  line, or click `+` on another line in the **same hunk** to extend
-  the range. Cross-hunk ranges are not allowed.
-- An inline form opens beneath the last line of the range. The body
-  supports markdown; `Cmd/Ctrl+Enter` saves, `Esc` cancels.
-- Saved comments render inline as cards with edit / delete actions
-  and a markdown-rendered body. Each card shows the line range it's
-  anchored to.
-- The right panel surfaces a banner above the diff file list once
-  you have at least one comment, with a Send button (or
-  `Cmd/Ctrl+Shift+S`).
-- The send dialog has three pieces: an editable intro textarea, a
-  read-only markdown preview of the assembled comments (each with
-  its captured code snippet so the agent can act without re-reading
-  the file), and an editable outro textarea (default "Please
-  address these comments."). Send fires `POST
-  /api/sessions/:id/acp/prompt`. Comments are cleared on
-  success unless you uncheck "Clear comments after sending".
-- Comments persist in `localStorage`, scoped per session. They
-  survive page reloads but are browser-local.
-- If a line range becomes unreachable in the current diff (agent
-  edited the file), the comment moves to a "stale comments" block
-  at the top of the file view with a `[stale]` chip; the captured
-  snippet still goes through to the agent in the prompt.
-- The feature is hidden for non-structured view sessions (tmux/PTY). The
-  Send button is also disabled while the structured view worker isn't
-  running.
+1. Hover a line and click the `+` in the left gutter to start a comment. Click
+   `+` on another line in the **same hunk** to extend the range (cross-hunk
+   ranges are not allowed).
+2. Write the comment in the inline form (markdown supported). `Cmd/Ctrl+Enter`
+   saves, `Esc` cancels. Saved comments render inline as cards with edit/delete.
+3. Once you have a comment, a banner appears above the file list with a **Send**
+   button (or `Cmd/Ctrl+Shift+S`). The send dialog has an editable intro, a
+   preview of the assembled comments (each with its captured snippet), and an
+   editable outro. Comments clear on success unless you uncheck "Clear comments
+   after sending".
+
+Comments persist in `localStorage` per session (browser-local). If the agent
+edits a file so a range no longer matches, the comment moves to a "stale
+comments" block with a `[stale]` chip; the captured snippet still goes to the
+agent. The feature is hidden for non-structured view sessions, and Send is
+disabled while the worker isn't running.
 
 ## Per-session base override
 
-Each session has an optional `base_branch_override` that takes
-precedence over the worktree's recorded base, the profile default, and
-auto-detection. Use it when the eventual PR target differs from the
-project default (stacked PRs, hotfix off `release/*`, branch rename).
-The override is sticky across restarts and only affects the comparison,
-not the worktree itself (no rebase). See #970.
+Each session can override the branch it diffs against. Use it when the eventual
+PR target differs from the project default (stacked PRs, hotfix off `release/*`,
+branch rename). The override is sticky across restarts and only changes the
+comparison, not the worktree (no rebase).
 
-When no override is set, the comparison defaults to the branch the
-worktree was actually forked from (`worktree_info.base_branch`, set at
-creation from an explicit session base, a per-project default, or the
-global/profile `worktree.default_base_branch`). So a worktree created
-off `release` compares against `release` rather than the repo's
-auto-detected default. The full precedence is: per-session override,
-then worktree base, then `diff.default_branch`, then auto-detection.
-See #1951.
+Comparison precedence: per-session override, then the branch the worktree was
+forked from, then `diff.default_branch`, then auto-detection.
 
-- **Web dashboard**: click the `vs <ref>` chip in the diff header, pick
-  a branch from the typeahead (local + remote-only), or reset to clear
-  the override (the comparison then falls back to the worktree base, or
-  auto-detection when none was recorded).
-- **TUI diff view**: press `b`, pick a branch; the choice is persisted
-  to `sessions.json` and restored on next launch.
+- **Web dashboard**: click the `vs <ref>` chip in the diff header, pick a branch
+  from the typeahead, or reset to clear the override.
+- **TUI diff view**: press `b`, pick a branch.
 - **CLI**: `aoe session set-base <session> <branch>` to set,
   `aoe session set-base <session> --clear` to clear.
 
@@ -134,26 +108,13 @@ split_view = false
 
 ## Tips: See Changes While Editing
 
-The diff view shows you where changes are before you edit. For an even better experience, you can install editor plugins that show git diff markers in the gutter while you edit:
+To show git diff markers in your editor's gutter while editing:
 
-### Vim
-
-Install [vim-gitgutter](https://github.com/airblade/vim-gitgutter) or [vim-signify](https://github.com/mhinz/vim-signify). These show `+`, `-`, and `~` markers in the sign column for added, removed, and modified lines.
-
-With vim-plug:
-```vim
-Plug 'airblade/vim-gitgutter'
-```
-
-### Nano
-
-Nano doesn't have a plugin system, so there's no equivalent. Use the diff view to note line numbers before editing, or consider switching to vim for this workflow.
-
-### Other Editors
-
-- **Emacs**: [git-gutter](https://github.com/emacsorphanage/git-gutter)
-- **VS Code**: Built-in git gutter support
-- **Sublime Text**: [GitGutter](https://packagecontrol.io/packages/GitGutter)
+- **Vim**: [vim-gitgutter](https://github.com/airblade/vim-gitgutter) or [vim-signify](https://github.com/mhinz/vim-signify) (`Plug 'airblade/vim-gitgutter'`).
+- **Emacs**: [git-gutter](https://github.com/emacsorphanage/git-gutter).
+- **VS Code**: built-in.
+- **Sublime Text**: [GitGutter](https://packagecontrol.io/packages/GitGutter).
+- **Nano**: no plugin system; note line numbers from the diff view before editing.
 
 ## Workflow Example
 

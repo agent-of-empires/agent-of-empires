@@ -14,6 +14,8 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 - Automatic container lifecycle management
 - Full project access via volume mounts
 
+Agent credentials are shared into containers automatically, so agents authenticate without re-login. For how this works, see [Sandbox internals](../development/internals/sandbox.md).
+
 ## CLI vs TUI Behavior
 
 | Feature | CLI | TUI |
@@ -100,76 +102,12 @@ volume_ignores_strategy = "named"
 | `~/.ssh/` | `/root/.ssh/` | RO | SSH keys |
 | `~/.config/opencode/` | `/root/.config/opencode/` | RO | OpenCode config |
 
-### Shared Agent Config Directories
-
-AOE shares your host agent credentials with sandboxed containers so agents can authenticate without re-login. This works for all supported agents.
-
-Rather than bind-mounting your actual host config directories (which would let container writes modify your host files), AOE creates a **shared sandbox directory** per agent:
-
-1. For each agent whose host config directory exists, AOE syncs credential files into a shared sandbox directory.
-2. The sandbox directory is mounted read-write into **all** containers that use that agent.
-3. Containers can read credentials and write runtime state freely without affecting your host config.
-4. In-container changes (e.g. permission approvals, settings tweaks) persist across sessions since all containers share the same directory.
-5. Sandbox directories are **never automatically deleted** -- not even when you remove all sandboxed sessions. This is intentional: if you later create a new sandbox, your accumulated state (permission approvals, settings) is still there so you don't have to set things up again.
-
-If an agent's config directory doesn't exist on the host (e.g. you haven't installed that agent locally), AOE still creates the sandbox directory and mounts it. This way the agent can write auth and state inside the container and have it persist across sessions.
-
-**What gets synced:**
-
-- **Top-level files** from each agent's config directory (auth tokens, credentials, config files). Subdirectories are skipped by default to keep the sandbox dir small.
-- **Specific subdirectories** listed per agent (e.g. Claude Code's `plugins/` and `skills/` are copied recursively so extensions work inside the container).
-- **Seed files** (write-once) where needed (e.g. Claude Code gets a minimal `hasCompletedOnboarding` flag to skip the first-run wizard). Seed files are only written if they don't already exist, so any changes made inside the container are preserved.
-
-**Platform-specific authentication:**
-
-- **Linux:** Credential files (e.g. `.credentials.json`) live directly in the agent's config directory and are synced automatically.
-- **macOS:** Some agents store credentials in the macOS Keychain rather than on disk. AOE extracts these at sync time and writes them as files in the sandbox directory so the container can authenticate. For example, Claude Code OAuth tokens are extracted from the Keychain and written as `.credentials.json`. If no Keychain entry is found (e.g. you authenticate via `ANTHROPIC_API_KEY`), the sandbox dir still works -- just pass your API key via the `environment` config.
-
-**Credential refresh:** Host credentials are re-synced every time a session starts (not just on first creation). If you re-authenticate on the host or update credentials, the next session start picks up the changes. Container-specific state (permission approvals, runtime config) is not overwritten during refresh.
-
-**Sandbox directory location:** Each agent's shared sandbox directory lives inside that agent's own config directory as a `sandbox/` subdirectory (e.g. `~/.claude/sandbox/`). All containers share this directory.
-
-Deleting an agent's config directory removes everything related to that agent, including the sandbox directory. To reset just the sandbox state for an agent, delete its `sandbox/` subdirectory -- it will be re-created on the next session start.
-
-**Upgrading from named volumes:** Older versions of AOE stored agent auth in named Docker volumes (e.g. `aoe-claude-auth`). On upgrade, AOE automatically migrates data from these volumes into the sandbox directories. The old volumes are intentionally **not** deleted -- you can remove them manually once you've confirmed everything works:
-
-```bash
-docker volume rm aoe-claude-auth aoe-opencode-auth aoe-codex-auth aoe-gemini-auth aoe-vibe-auth
-```
-
-## Container Naming
-
-Containers are named: `aoe-sandbox-{session_id_first_8_chars}`
-
-Example: `aoe-sandbox-a1b2c3d4`
-
-## Structured view Mode Inside the Sandbox
-
-Agent-view sessions can run inside the sandbox container. When both are enabled, the structured view runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
-
-- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.39.0`, floor pin)
-- `codex-acp` (`@zed-industries/codex-acp`)
-- `pi-acp`
-
-Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the structured view handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
-
-## How It Works
-
-1. **Session Creation:** When you add a sandboxed session, aoe records the sandbox configuration
-2. **Container Start:** When you start the session, aoe creates/starts the Docker container with appropriate volume mounts
-3. **tmux + docker exec:** Host tmux runs `docker exec -it <container> <tool>` to launch the selected agent
-4. **Cleanup:** When you remove the session, the container is automatically deleted
-
-
 ## Environment Variables
 
-These terminal-related variables are **always** passed through for proper UI/theming:
-- `TERM`, `COLORTERM`, `FORCE_COLOR`, `NO_COLOR`
+Pass variables through containers by adding them to the `environment` list. Each entry can be:
 
-Pass additional variables through containers by adding them to the `environment` list. Each entry can be:
-
-- **`KEY`** (bare name) -- passes the host env var value into the container
-- **`KEY=VALUE`** -- sets an explicit value
+- **`KEY`** (bare name) passes the host env var value into the container
+- **`KEY=VALUE`** sets an explicit value
 
 ```toml
 [sandbox]
@@ -191,25 +129,6 @@ export AOE_GH_TOKEN="ghp_sandbox_scoped_token"
 If the referenced host env var is not set, the entry is silently skipped.
 
 To use a literal value starting with `$`, double it: `$$LITERAL` is injected as `$LITERAL`.
-
-### Claude on Vertex AI
-
-If `CLAUDE_CODE_USE_VERTEX` is set on the host (and non-empty), AOE wires up Claude+Vertex sessions automatically:
-
-- The Vertex env vars `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `ANTHROPIC_VERTEX_REGION`, and `CLOUD_ML_REGION` are forwarded into the container when set.
-- GCP Application Default Credentials are bind-mounted read-only at the well-known container path `/root/.config/gcloud/application_default_credentials.json`. AOE uses `$GOOGLE_APPLICATION_CREDENTIALS` if set, otherwise falls back to `~/.config/gcloud/application_default_credentials.json`. `GOOGLE_APPLICATION_CREDENTIALS` itself is not forwarded; client libraries discover the well-known path automatically.
-
-This only triggers when the active agent is `claude`; other agents (opencode, codex, etc.) get neither the vars nor the cred mount even if the host flag is set. `ANTHROPIC_API_KEY` is not auto-forwarded; if you also want it inside the container, list it in `sandbox.environment` explicitly.
-
-### GitHub authentication with `GH_TOKEN`
-
-Forwarding `GH_TOKEN` (e.g. `"GH_TOKEN=$GH_TOKEN"` in `sandbox.environment`) enables both `gh` and plain `git push` to authenticate against `github.com` inside the container. AOE seeds a scoped credential helper in the sandbox gitconfig that reads the token at push time; no credential is ever written to disk.
-
-Security notes:
-
-- The helper only fires for `https://github.com` remotes; other hosts are unaffected.
-- Any process running in the sandbox can obtain the token by invoking `git credential fill`. Prefer **fine-grained** PATs limited to the specific repositories you expect the agent to push to.
-- If `GH_TOKEN` is unset at push time the helper stays silent and git falls through to its normal credential flow. Unset the env var to temporarily disable sandboxed pushes without deleting the gitconfig.
 
 ## Available Images
 
@@ -295,61 +214,11 @@ default_image = "my-sandbox:latest"
 aoe add --sandbox-image my-sandbox:latest .
 ```
 
+> Building a custom image and using structured view? Install the ACP adapters too, or the handshake fails. See [Sandbox internals](../development/internals/sandbox.md).
+
 ## Worktrees and Sandboxing
 
-When using git worktrees with sandboxing, there's an important consideration: worktrees have a `.git` file that points back to the main repository's git directory. If this reference points outside the sandboxed directory, git operations inside the container may fail.
-
-### The Problem
-
-With the default worktree template (`../{repo-name}-worktrees/{branch}`):
-
-```
-/projects/
-  my-repo/
-    .git/                    # Main repo's git directory
-    src/
-  my-repo-worktrees/
-    feature-branch/
-      .git                   # FILE pointing to /projects/my-repo/.git/...
-      src/
-```
-
-When sandboxing `feature-branch/`, the container can't access `/projects/my-repo/.git/`.
-
-### The Solution: Bare Repo Pattern
-
-Use the linked worktree bare repo pattern to keep everything in one directory:
-
-```
-/projects/my-repo/
-  .bare/                     # Bare git repository
-  .git                       # FILE: "gitdir: ./.bare"
-  main/                      # Worktree (main branch)
-  feature/                   # Worktree (feature branch)
-```
-
-Now when sandboxing `feature/`, the container has access to the sibling `.bare/` directory.
-
-AOE automatically detects bare repo setups and uses `./{branch}` as the default worktree path template, keeping new worktrees as siblings.
-
-### Quick Setup
-
-```bash
-# Convert existing repo to bare repo pattern
-cd my-project
-mv .git .bare
-echo "gitdir: ./.bare" > .git
-
-# Or clone fresh as bare
-git clone --bare git@github.com:user/repo.git my-project/.bare
-cd my-project
-echo "gitdir: ./.bare" > .git
-git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-git fetch origin
-git worktree add main main
-```
-
-See the [Workflow Guide](workflow.md) for detailed bare repo setup instructions.
+Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See the [Workflow Guide](workflow.md).
 
 ## Troubleshooting
 

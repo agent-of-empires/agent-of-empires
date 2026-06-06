@@ -14,7 +14,7 @@ Settings are organized into the same groups as the TUI:
 
 - **Appearance**: Theme.
 - **Sessions**: Session defaults and Structured view (the replay and watchdog
-  tuning knobs; see [Structured view Setup](../../structured-view/setup.md)).
+  tuning knobs; see [Structured View Internals](../../development/internals/structured-view.md#global-tuning-acp)).
 - **Environment**: Sandbox, Worktree, and Tmux.
 - **Notifications**: Sound and Notifications (web push; see
   [Push notifications](../../push-notifications.md)).
@@ -38,26 +38,10 @@ below).
 
 ## Connected devices
 
-Under **Web Dashboard > Connected Devices**, the dashboard lists every
-device that has authenticated, with a browser and OS label parsed from
-the user agent and a relative "last seen" time. The list polls every
-ten seconds and refreshes when you return to the tab, so a device that
-just connected (or went quiet) shows up without a manual reload. This is
-the surface for spotting an unexpected session and is also where token
-rotation and rate-limit lockouts surface.
+Under **Web Dashboard > Connected Devices**, the dashboard lists every device that has authenticated, with a browser/OS label parsed from the user agent and a relative "last seen" time. The list polls every ten seconds and refreshes when you return to the tab. This is the surface for spotting an unexpected session, and where token rotation and rate-limit lockouts surface.
 
 ## Step-up elevation
 
-When passphrase login is configured, day-to-day actions (sending
-prompts, resolving approvals, switching mode) never re-prompt. Editing
-persisted config is different: saving the global settings panel,
-creating / deleting / renaming a profile, editing a profile, or changing
-the default profile requires that your login session has been elevated
-within the last 15 minutes via `POST /api/login/elevate`. The first such
-action after a fresh page load surfaces an inline passphrase prompt;
-subsequent edits inside the 15-minute window go through without
-re-prompting.
+When passphrase login is configured, day-to-day actions (sending prompts, resolving approvals, switching mode) never re-prompt. Editing persisted config is different: saving the global settings panel, creating / deleting / renaming a profile, editing a profile, or changing the default profile requires that your login session was elevated within the last 15 minutes via `POST /api/login/elevate`. The first such action after a page load surfaces an inline passphrase prompt; subsequent edits inside the window go through without re-prompting.
 
-This narrow gate covers the persisted-tamper attack (an attacker with a
-stolen session planting a malicious Docker image, worktree template, or
-profile) without putting friction on the conversation surface.
+This narrow gate covers the persisted-tamper attack (a stolen session planting a malicious Docker image, worktree template, or profile) without friction on the conversation surface.

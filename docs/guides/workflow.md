@@ -4,7 +4,7 @@ This guide covers the recommended setup and daily workflow for using `aoe` with 
 
 ## Project Setup: Bare Git Repos
 
-The recommended way to set up a project is using a "bare repo" structure. This keeps your main repository and all worktrees organized under a single directory:
+The recommended setup is a "bare repo" structure, keeping the main repository and all worktrees under one directory:
 
 ```
 my-project/
@@ -18,29 +18,17 @@ my-project/
 ### Initial Setup
 
 ```bash
-# Clone as bare repo
 git clone --bare git@github.com:user/repo.git my-project/.bare
-
 cd my-project
-
-# Create .git file pointing to bare repo
 echo "gitdir: ./.bare" > .git
-
-# Configure fetch to get all branches
 git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
 git fetch origin
-
-# Create your main worktree
 git worktree add main main
 ```
 
-Now when you run `aoe` from `my-project/`, new worktrees are created as siblings (e.g., `my-project/feat-api/`) rather than in a separate directory.
+Run `aoe` from `my-project/` and new worktrees are created as siblings (e.g. `my-project/feat-api/`) rather than in a separate directory.
 
-### Why Bare Repos?
-
-- **Clean organization**: Everything lives under one project directory
-- **Sandbox-friendly**: All paths stay within the project root (important for Docker sandboxing)
-- **Easy navigation**: Switch between branches by switching directories
+Bare repos keep all paths within the project root (required for Docker sandboxing) and let you switch branches by switching directories.
 
 ## Single-Window Workflow
 

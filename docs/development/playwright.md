@@ -37,7 +37,7 @@ Heuristics:
 
 ## Live harness (`web/tests/helpers/aoeServe.ts`)
 
-`spawnAoeServe()` boots a real `aoe serve` subprocess against a per-test isolated filesystem root. Three fixtures wrap it in `liveTest.ts`:
+`spawnAoeServe()` boots a real `aoe serve` subprocess against a per-test isolated filesystem root. `liveTest.ts` wraps it in fixtures; pick one by the auth/agent mode you need, or call `spawnAoeServe()` directly for custom options.
 
 ```ts
 import { test, expect, seedAuth } from "../helpers/liveTest";
@@ -46,50 +46,21 @@ test("dashboard loads", async ({ serve, page }) => {
   await page.goto(serve.baseUrl);
   await expect(page.getByRole("heading", { name: "Sessions" })).toBeVisible();
 });
-
-test("login flow", async ({ servePassphrase, page }) => {
-  await page.goto(servePassphrase.baseUrl);
-  await page.locator("input#passphrase").fill(servePassphrase.passphrase!);
-  await page.locator("button[type=submit]").click();
-});
-
-test("read-only blocks new sessions", async ({ serveReadOnly }) => {
-  const res = await fetch(`${serveReadOnly.baseUrl}/api/sessions`, {
-    method: "POST",
-    body: "...",
-  });
-  expect(res.status).toBe(403);
-});
 ```
 
 Fixtures:
 
-- `serve` : `aoe serve --no-auth`. Default for backend round-trip flows.
-- `servePassphrase` : `aoe serve --passphrase aoe-e2e-fixed-passphrase`. The harness mints a session cookie via `POST /api/login` and exposes it as `handle.sessionCookie`. Specs that drive auth from the browser side use `seedAuth(page, handle)` to inject cookie + binding secret before the first navigation.
-- `serveToken` : `aoe serve --auth=token`. The harness reads the daemon-written `serve.token` from the isolated app dir and exposes the value as `handle.authToken` plus its on-disk path as `handle.tokenFile`. Rotation-aware specs call `spawnAoeServe` directly with `tokenLifetimeSecs` / `tokenGraceSecs` overrides; both env vars are debug-build only (`AOE_TEST_TOKEN_LIFETIME_SECS`, `AOE_TEST_TOKEN_GRACE_SECS`) and ignored in release.
-- `serveReadOnly` : `aoe serve --no-auth --read-only`.
-- `serveAcp` : like `serve` but the fake-ACP agent (see below) is on `$PATH` as `claude`, `claude-agent-acp`, and `aoe-agent`, (the structured view is the default, so no enable step is needed). The `claude-agent-acp` name matters because the structured view supervisor resolves the `claude` tool key through `AgentRegistry` to command `claude-agent-acp`, not `claude`; without that shim the supervisor would fall through to the system-installed adapter and fail with "Authentication required" on the first prompt.
+- `serve`: `--no-auth`. Default for backend round-trip flows.
+- `servePassphrase`: `--passphrase aoe-e2e-fixed-passphrase`. Mints a session cookie via `POST /api/login` (exposed as `handle.sessionCookie`); browser-side auth specs use `seedAuth(page, handle)` to inject cookie + binding secret before first navigation.
+- `serveToken`: `--auth=token`. Exposes the daemon-written token as `handle.authToken` (path `handle.tokenFile`). Rotation specs call `spawnAoeServe` directly with `tokenLifetimeSecs` / `tokenGraceSecs` (backed by `AOE_TEST_TOKEN_LIFETIME_SECS` / `AOE_TEST_TOKEN_GRACE_SECS`, debug-build only).
+- `serveReadOnly`: `--no-auth --read-only`.
+- `serveAcp`: like `serve` with the fake-ACP agent (below) on `$PATH` as `claude`, `claude-agent-acp`, and `aoe-agent`. The `claude-agent-acp` name is load-bearing: the supervisor resolves the `claude` tool key through `AgentRegistry` to command `claude-agent-acp`, so without that shim it falls through to the system adapter and fails with "Authentication required".
 
-Isolation per test:
-
-- Fresh `mkdtemp` for `HOME`, with `XDG_CONFIG_HOME`, `TMPDIR`, `TMUX_TMPDIR`, and `bin/` as subdirs (all `0700`).
-- Port: `5200 + workerIndex*100 + parallelIndex + attempt*7`. Five retries on bind failure.
-- Fake `claude` shim in `home/bin/claude` (`exec tail -f /dev/null`). Structured view fixture overrides with the fake-ACP shim, installed under `claude`, `claude-agent-acp`, and `aoe-agent`.
-- `stop()` does `SIGTERM` with a 2s wait, `SIGKILL` fallback, then `rm -rf home`. Never calls `tmux kill-server` (would kill the developer's tmux).
-- `restart()` kills the running proc (`SIGTERM` then `SIGKILL` after 2s) and respawns with the same args on the same port. Used by connectivity-recovery specs (`disconnect-banner.spec.ts`) that need to observe `setServerDown(true)` on SIGTERM and `setServerDown(false)` after the server comes back. Token mode re-reads the freshly written `serve.token` so `handle.authToken` tracks the second boot. Does NOT re-run passphrase prelogin or structured view master-enable across the restart; specs that need those should call `spawnAoeServe` again.
-
-Binary resolution: `AOE_E2E_BINARY` env wins; otherwise `<repo>/target/release/aoe`. `liveGlobalSetup.ts` runs once before any worker and calls `cargo build --features serve --release` if the binary is missing.
+Per-test isolation: fresh `mkdtemp` `HOME` with `XDG_CONFIG_HOME` / `TMPDIR` / `TMUX_TMPDIR` / `bin/` subdirs (`0700`); port `5200 + workerIndex*100 + parallelIndex + attempt*7` (5 bind retries); a fake `claude` shim (`exec tail -f /dev/null`, ACP fixture overrides it). `stop()` is SIGTERM (2s) then SIGKILL then `rm -rf home`, never `tmux kill-server` (would kill the dev's tmux). `restart()` respawns with the same args/port for connectivity-recovery specs; it re-reads a rotated token but does NOT re-run passphrase prelogin or structured-view enable. Binary: `AOE_E2E_BINARY` else `<repo>/target/release/aoe`; `liveGlobalSetup.ts` builds it once if missing.
 
 ## Fake ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`)
 
-Structured view specs need a deterministic ACP agent because the real `claude` subprocess depends on Anthropic credentials and emits non-deterministic output. The fake speaks the minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0:
-
-- `initialize` returns protocolVersion 1 + agentCapabilities.
-- `session/new` and `session/load` return a deterministic sessionId.
-- `session/prompt` consumes one entry from a script file (path supplied via `FAKE_ACP_SCRIPT` env), emits its scripted `session/update` notifications, then responds with `stopReason`. Default script (used when env is absent) emits one `agent_message_chunk` then stops.
-- `session/setMode` responds and emits `current_mode_changed`.
-- `session/cancel` responds and emits `stopped { stopReason: "cancelled" }`.
-- Other methods return `-32601 Method not found`.
+Structured view specs need a deterministic ACP agent (the real `claude` depends on credentials and emits non-deterministic output). The fake speaks a minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0: `initialize` returns protocolVersion 1 + capabilities; `session/new` and `session/load` return a deterministic id; `session/prompt` consumes one entry from the script file (`FAKE_ACP_SCRIPT` env, default emits one `agent_message_chunk` then stops), emits its `session/update` notifications, then responds with `stopReason`; `session/setMode` emits `current_mode_changed`; `session/cancel` emits `stopped {stopReason: "cancelled"}`; everything else returns `-32601`.
 
 Script file shape:
 
@@ -151,18 +122,7 @@ base("send message via Enter renders agent chunk", async ({ page }, testInfo) =>
 });
 ```
 
-`enableStructuredViewAndWait` posts to `/acp/enable`, asserts the response
-was 2xx (so a 4xx/5xx surfaces immediately rather than as a noisy
-readiness timeout), and then waits for the supervisor handshake.
-`waitForStructuredView` waits for the React tree to mount the composer.
-Together they ensure both sides are ready before any click or keystroke.
-Look up the seeded session by `title` rather than `sessions[0]` so the
-spec stays deterministic if seeding adds more rows later.
-
-Custom per-spec scripts go through a temp file (see
-`acp-stories/approval-allow.spec.ts` or `acp-approval.spec.ts`
-for the canonical setup); the `serveAcp` fixture is for stories
-happy with the default chunk-then-stop script.
+`enableStructuredViewAndWait` posts to `/acp/enable`, asserts 2xx (so a 4xx/5xx surfaces immediately instead of as a readiness timeout), then waits for the supervisor handshake; `waitForStructuredView` waits for the composer to mount. Together they ensure both sides are ready before any input. Look up the seeded session by `title`, not `sessions[0]`, so the spec stays deterministic as seeding grows. Custom per-spec scripts go through a temp file (see `acp-stories/approval-allow.spec.ts`); `serveAcp` is for the default chunk-then-stop script.
 
 ## Coverage matrix
 
