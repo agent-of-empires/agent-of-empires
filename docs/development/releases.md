@@ -9,7 +9,7 @@ How `agent-of-empires` ships. Maintainer-facing reference for the weekly automat
 - Default semver bump is **patch**. The maintainer reviews the PR, optionally edits the version bump on the branch (patch -> minor / major), then clicks merge.
 - Merging the PR fires `.github/workflows/tag-release-pr.yml`, which tags the merge commit. The tag push triggers `.github/workflows/release.yml`, which builds the four platform binaries and publishes the GitHub release + ClawHub artifact.
 
-The staging PR body embeds a plain newest-first commit list for maintainer review only. The user-facing `CHANGELOG.md` and GitHub Release body are generated separately by [git-cliff](https://github.com/orhun/git-cliff), grouped by conventional-commit prefix; see [`cliff.toml`](../../cliff.toml) and the "Changelog visibility" section of [`CONTRIBUTING.md`](../../CONTRIBUTING.md). Folding the staging PR body into the same grouped render is queued under #1387.
+The staging PR body embeds a plain newest-first commit list for maintainer review only. The user-facing `CHANGELOG.md` and GitHub Release body are generated separately by [git-cliff](https://github.com/orhun/git-cliff), grouped by conventional-commit prefix; see [`cliff.toml`](https://github.com/agent-of-empires/agent-of-empires/blob/main/cliff.toml) and the "Changelog visibility" section of [`CONTRIBUTING.md`](https://github.com/agent-of-empires/agent-of-empires/blob/main/CONTRIBUTING.md). Folding the staging PR body into the same grouped render is queued under #1387.
 
 The maintainer's only manual step on a normal release: review the PR, optionally edit the bump, merge.
 
