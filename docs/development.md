@@ -21,22 +21,28 @@ worktree recompiles all ~400 dependency crates from scratch, even when
 both slow (minutes of dependency compilation) and wasteful on disk (each
 `target/` holds its own multi-gigabyte copy of the same artifacts).
 
-To fix this the committed `.cargo/config.toml` sets
-[kache](https://github.com/kunobi-ninja/kache) as the rustc wrapper. kache is a
-content-addressed build cache: it compiles each crate once, stores the artifact
-in a shared local store (`~/Library/Caches/kache` on macOS, `~/.cache/kache` on
-Linux), and **shares it into each worktree's `target/` without copying** by
-reflinking it (a copy-on-write clone, on APFS/btrfs/xfs) or hardlinking it (on
-filesystems without reflink support, such as ext4). The first build of a given
-`Cargo.lock` populates the store; every later build, in any worktree, restores
-the dependency artifacts instead of recompiling them. Each worktree still
-produces its own `target/debug/aoe` binary, and the shared blocks mean one
-physical copy of each dependency artifact backs all worktrees, so disk usage
-drops too.
+[kache](https://github.com/kunobi-ninja/kache) is an optional, opt-in fix for
+this. It is a content-addressed rustc wrapper: it compiles each crate once,
+stores the artifact in a shared local store (`~/Library/Caches/kache` on macOS,
+`~/.cache/kache` on Linux), and **shares it into each worktree's `target/`
+without copying** by reflinking it (a copy-on-write clone, on APFS/btrfs/xfs) or
+hardlinking it (on filesystems without reflink support, such as ext4). The first
+build of a given `Cargo.lock` populates the store; every later build, in any
+worktree, restores the dependency artifacts instead of recompiling them. Each
+worktree still produces its own `target/debug/aoe` binary, and the shared blocks
+mean one physical copy of each dependency artifact backs all worktrees, so both
+build time and disk usage drop.
 
-Because the wrapper is committed, **kache must be installed to build locally.**
-Install it with a prebuilt binary (do not `cargo install` it from inside this
-repo, see the note below):
+kache is **not** required and is deliberately **not** committed to the repo (no
+`rustc-wrapper` in `.cargo/config.toml`): a plain `cargo build` with no extra
+setup works exactly as it does today, and CI, the Nix build, and release builds
+never touch kache, so shipped release binaries stay compiled by plain `rustc`.
+Each developer turns it on for themselves with two environment variables.
+
+### Opting in
+
+Install a prebuilt binary (the prebuilt avoids compiling kache; see the
+bootstrap caveat below):
 
 ```bash
 cargo binstall kache         # prebuilt binary, recommended
@@ -44,32 +50,24 @@ cargo binstall kache         # prebuilt binary, recommended
 mise use -g github:kunobi-ninja/kache@latest
 ```
 
-You do not need to set anything else; the wrapper and `CARGO_INCREMENTAL`
-(disabled, kache and incremental compilation are mutually exclusive) come from
-the committed `.cargo/config.toml`. Build exactly as before:
+Enable it for your shell (for example in `~/.zshrc` or `~/.bashrc`):
 
 ```bash
-cargo build --all-features   # unchanged; rustc now routes through kache
+export RUSTC_WRAPPER=kache
+export CARGO_INCREMENTAL=0   # kache and incremental compilation are mutually exclusive
+```
+
+Then build as usual; `rustc` now routes through kache and your per-worktree
+`target/debug/aoe` is unchanged:
+
+```bash
+cargo build --all-features
 ```
 
 Watch cache hits and deduplicated bytes live with `kache monitor`, or print a
-non-interactive summary with `kache stats`.
-
-### Opting out
-
-If you do not want kache (for example a one-off contribution, or you prefer
-sccache), disable the wrapper in your shell. The empty value overrides the
-committed config key, exactly as CI does:
-
-```bash
-export CARGO_BUILD_RUSTC_WRAPPER=""        # plain rustc, no cache
-# or point it at another wrapper you have installed:
-export CARGO_BUILD_RUSTC_WRAPPER="sccache" # time-only cache, no disk dedup
-```
-
-CI, the Nix build, and release builds all set `CARGO_BUILD_RUSTC_WRAPPER=""` so
-they never require kache and the shipped release binaries are compiled by plain
-rustc.
+non-interactive summary with `kache stats`. To go back to plain `rustc`, unset
+`RUSTC_WRAPPER` (or point it at another wrapper, e.g. `export
+RUSTC_WRAPPER=sccache` for a time-only cache without disk dedup).
 
 ### Caveats
 
@@ -88,10 +86,10 @@ rustc.
   suspect a stale bundle, `cargo clean -p agent-of-empires` forces a rebuild.
 - **macOS:** kache excludes its store from Spotlight indexing and Time Machine
   automatically.
-- **Bootstrap.** Do not run `cargo install --git ... kache` from inside this
-  repo: cargo would read the committed `rustc-wrapper = "kache"` and try to use
-  kache to compile kache. Use the prebuilt `cargo binstall` / `mise` install
-  above, or run `cargo install` from a directory outside the repo.
+- **Bootstrap.** Prefer the prebuilt install above. If you do build kache from
+  source with `cargo install` while `RUSTC_WRAPPER=kache` is already exported,
+  cargo tries to use kache to compile kache and fails; unset the variable for
+  that one command.
 
 You can confirm the dependency artifacts are actually shared and deduplicated
 across two target dirs with `scripts/verify-shared-target.sh` (see the script

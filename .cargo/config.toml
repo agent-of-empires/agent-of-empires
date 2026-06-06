@@ -1,17 +1,5 @@
 [build]
 jobs = 8
-# kache (https://github.com/kunobi-ninja/kache) is a content-addressed rustc
-# wrapper: it compiles each dependency crate once and hardlinks the artifact
-# into every worktree's target/, so switching worktrees no longer recompiles
-# the ~400 dependency crates. Each worktree keeps its own target/debug/aoe.
-# kache is therefore a required local build tool; see docs/development.md.
-# CI, Nix, and release builds set CARGO_BUILD_RUSTC_WRAPPER="" to disable it
-# (those environments are ephemeral or must stay reproducible, and a committed
-# wrapper would otherwise hard-fail any runner without kache installed).
-rustc-wrapper = "kache"
-# kache and incremental compilation are mutually exclusive; kache caches whole
-# crate artifacts, incremental caches per-CGU and conflicts with the wrapper.
-incremental = false
 
 [alias]
 xtask = "run -p xtask --"

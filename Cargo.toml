@@ -208,6 +208,9 @@ serial_test = "3.4"
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.
 serde_json = "1.0"
+# Integration tests are separate crates and don't inherit the normal `toml`
+# dependency; the build-cache guard test parses .cargo/config.toml.
+toml = "1.1"
 cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
 # Test-only axum dep, used by the update e2e fixture server that serves
 # a fake release tarball. The runtime code uses reqwest, not axum.

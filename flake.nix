@@ -32,13 +32,6 @@
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
-            # The committed .cargo/config.toml sets rustc-wrapper = "kache" for
-            # fast local multi-worktree builds. The hermetic Nix sandbox has no
-            # kache binary and no writable cache dir, and crane already caches
-            # dependencies via cargoArtifacts, so disable the wrapper here. The
-            # empty value overrides the config key. Inherited by commonArgsWithWeb
-            # and every craneLib build/clippy/test derivation below.
-            CARGO_BUILD_RUSTC_WRAPPER = "";
           };
 
           # Build only workspace dependencies first (for caching)
