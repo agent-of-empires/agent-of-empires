@@ -182,6 +182,7 @@ case "${1:-}" in
   --self-test) self_test ;;
   "") full_run ;;
   *)
+    echo "unknown argument: $1" >&2
     echo "usage: $0 [--self-test]" >&2
     exit 2
     ;;
