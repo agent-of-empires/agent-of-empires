@@ -67,6 +67,22 @@ pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
     }
 }
 
+/// Whether an `urgent` record's explicit `urgent_expires_at` (if present) has
+/// already passed. A record with no expiry never expires here — the producer
+/// (`attention-urgent`) always writes one, so legacy/expiry-less records stay
+/// honored by design. Shared by [`read_hook_urgent`] and
+/// [`read_hook_attention`] so the auto-expiry rule has a single source of truth.
+fn urgent_expired(value: &serde_json::Value) -> bool {
+    let Some(exp) = value.get("urgent_expires_at").and_then(|v| v.as_i64()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now > exp
+}
+
 /// Read the urgent flag from the hook-written `attention.json` for the given
 /// instance. Set by the `attention-urgent` script (cx-scripts) when the agent
 /// surfaces something genuinely time-sensitive (expiring device code, hard
@@ -92,16 +108,68 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
     {
         return false;
     }
-    if let Some(exp) = value.get("urgent_expires_at").and_then(|v| v.as_i64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if now > exp {
-            return false;
-        }
-    }
-    true
+    !urgent_expired(&value)
+}
+
+/// Per-session activity/attention metadata parsed from `attention.json`, which
+/// the Claude attention-signal hook rewrites every turn. Powers the
+/// `last_activity_*` fields in `aoe list`/`status --json` so consumers can see
+/// how long ago a session was active and what it last did without scraping
+/// panes. Every field is optional: a session not running under the hook (or
+/// whose file predates a field) simply omits it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookAttention {
+    /// Attention tier (0 = most urgent). From `tier`.
+    pub tier: Option<i64>,
+    /// What kind of event last fired: `turn_complete`, `tool_invoke`, or
+    /// `tool_error`. From `reason`.
+    pub reason: Option<String>,
+    /// Unix seconds of the most recent hook event = last activity. From `since`.
+    pub since: Option<i64>,
+    /// Tool name on the last Pre/PostToolUse event. From `tool`. After a
+    /// toolless turn-complete this reflects the *prior* tool; `since` is always
+    /// the true last-activity time.
+    pub tool: Option<String>,
+    /// Unix seconds when this attention record expires. From `expires_at`.
+    pub expires_at: Option<i64>,
+    /// Honored `urgent` flag — true only when set AND `urgent_expires_at` (if
+    /// present) has not passed, matching [`read_hook_urgent`].
+    pub urgent: bool,
+}
+
+/// Read the full attention record for an instance from `attention.json`.
+///
+/// Returns `None` when the file is absent or unparseable; individual fields are
+/// `None`/false when their key is missing. Shares the read path and urgent
+/// auto-expiry rule with [`read_hook_urgent`] — callers that need only the
+/// urgent bool should keep using that lighter function (it is on the polling
+/// hot path), while list/status JSON uses this to emit the richer row.
+pub fn read_hook_attention(instance_id: &str) -> Option<HookAttention> {
+    let dir = hook_status_dir(instance_id).ok()?;
+    let path = dir.join("attention.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+
+    let urgent = value
+        .get("urgent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !urgent_expired(&value);
+
+    Some(HookAttention {
+        tier: value.get("tier").and_then(|v| v.as_i64()),
+        reason: value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        since: value.get("since").and_then(|v| v.as_i64()),
+        tool: value
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        expires_at: value.get("expires_at").and_then(|v| v.as_i64()),
+        urgent,
+    })
 }
 
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
@@ -359,6 +427,70 @@ mod tests {
     #[test]
     fn read_hook_urgent_returns_false_for_unsafe_id() {
         assert!(!read_hook_urgent("../etc"));
+    }
+
+    #[test]
+    fn test_read_hook_attention_full_record() {
+        let id = "test_attention_full";
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let body = format!(
+            r#"{{"tier":0,"reason":"tool_invoke","since":1700000000,"tool":"Bash","expires_at":{future},"urgent":true,"urgent_expires_at":{future}}}"#
+        );
+        let dir = write_attention_json(id, &body);
+        let att = read_hook_attention(id).expect("record should parse");
+        assert_eq!(att.tier, Some(0));
+        assert_eq!(att.reason.as_deref(), Some("tool_invoke"));
+        assert_eq!(att.since, Some(1_700_000_000));
+        assert_eq!(att.tool.as_deref(), Some("Bash"));
+        assert_eq!(att.expires_at, Some(future as i64));
+        assert!(att.urgent);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_read_hook_attention_none_when_absent() {
+        assert_eq!(read_hook_attention("test_attention_no_file"), None);
+    }
+
+    #[test]
+    fn test_read_hook_attention_partial_record() {
+        // turn_complete with no tool: tool is None, since/reason present.
+        let id = "test_attention_partial";
+        let dir = write_attention_json(id, r#"{"reason":"turn_complete","since":1700000123}"#);
+        let att = read_hook_attention(id).expect("record should parse");
+        assert_eq!(att.reason.as_deref(), Some("turn_complete"));
+        assert_eq!(att.since, Some(1_700_000_123));
+        assert_eq!(att.tool, None);
+        assert_eq!(att.tier, None);
+        assert!(!att.urgent);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_read_hook_attention_urgent_respects_expiry() {
+        // urgent flag set but past its expiry => urgent must be false, while
+        // the rest of the record still parses.
+        let id = "test_attention_urgent_expired";
+        let dir = write_attention_json(
+            id,
+            r#"{"urgent":true,"urgent_expires_at":1,"since":1700000000}"#,
+        );
+        let att = read_hook_attention(id).expect("record should parse");
+        assert!(!att.urgent);
+        assert_eq!(att.since, Some(1_700_000_000));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_read_hook_attention_none_when_malformed() {
+        let id = "test_attention_bad_json";
+        let dir = write_attention_json(id, "{ not json");
+        assert_eq!(read_hook_attention(id), None);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

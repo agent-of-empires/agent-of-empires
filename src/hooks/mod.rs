@@ -16,8 +16,8 @@ use fs2::FileExt as _;
 use serde_json::Value;
 
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_attention, read_hook_session_id,
+    read_hook_status, read_hook_urgent, HookAttention,
 };
 
 /// Base directory for all AoE hook status files.

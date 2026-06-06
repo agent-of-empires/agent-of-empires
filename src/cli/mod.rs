@@ -101,6 +101,28 @@ pub fn truncate_id(id: &str, max_len: usize) -> &str {
     }
 }
 
+/// Per-session activity fields derived from the agent attention hook, shared by
+/// `list --json` and `status --json` so both surface identical semantics.
+/// Returns `(last_activity_age_secs, last_tool, last_reason, urgent)`:
+/// - age is `now - since` clamped at 0 (`None` when the session isn't tracked);
+/// - `last_tool`/`last_reason` come straight from the hook record;
+/// - `urgent` honors `urgent_expires_at`, matching the TUI.
+pub(crate) fn session_activity(
+    instance_id: &str,
+) -> (Option<i64>, Option<String>, Option<String>, bool) {
+    let Some(att) = crate::hooks::read_hook_attention(instance_id) else {
+        return (None, None, None, false);
+    };
+    let age = att.since.map(|since| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        (now - since).max(0)
+    });
+    (age, att.tool, att.reason, att.urgent)
+}
+
 /// Resolve `identifier` and run `f` on the matching instance. Designed for
 /// use inside `Storage::update`'s closure: find + mutate is atomic under
 /// both lock layers. Delegates to `resolve_session`, so ambiguous prefixes

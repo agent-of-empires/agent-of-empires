@@ -39,6 +39,62 @@ struct StatusJson {
     stopped: usize,
     error: usize,
     total: usize,
+    /// Complete per-session rows. Additive: the count fields above are kept
+    /// for existing consumers, and each row carries the identity fields
+    /// (`id/title/path/group/profile`) ALONGSIDE `state` and the activity
+    /// metadata, so one `status --json` call replaces the old
+    /// `list --json` ⋈ `status -v` join on path.
+    sessions: Vec<StatusSessionJson>,
+}
+
+/// A complete per-session row in `status --json`: identity + live state +
+/// activity metadata. This is the shape the fleet consumer keys on to address
+/// matched sessions (send/restart) without a second call.
+#[derive(Serialize)]
+struct StatusSessionJson {
+    id: String,
+    title: String,
+    path: String,
+    group: String,
+    profile: String,
+    /// Live status word: `running`/`waiting`/`idle`/`stopped`/`error`/etc.
+    state: String,
+    /// Seconds since the session's last hook activity (`now - since`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_activity_age_secs: Option<i64>,
+    /// Tool name on the most recent Pre/PostToolUse event (see `HookAttention`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_tool: Option<String>,
+    /// Kind of the most recent hook event: `turn_complete`/`tool_invoke`/`tool_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reason: Option<String>,
+    /// Honored urgent flag (respects `urgent_expires_at`).
+    urgent: bool,
+}
+
+fn build_session_rows(
+    profile: &str,
+    instances: &[crate::session::Instance],
+) -> Vec<StatusSessionJson> {
+    instances
+        .iter()
+        .map(|inst| {
+            let (last_activity_age_secs, last_tool, last_reason, urgent) =
+                super::session_activity(&inst.id);
+            StatusSessionJson {
+                id: inst.id.clone(),
+                title: inst.title.clone(),
+                path: inst.project_path.clone(),
+                group: inst.group_path.clone(),
+                profile: profile.to_string(),
+                state: inst.status.as_str().to_string(),
+                last_activity_age_secs,
+                last_tool,
+                last_reason,
+                urgent,
+            }
+        })
+        .collect()
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
@@ -48,9 +104,16 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
 
     if instances.is_empty() {
         if args.json {
-            println!(
-                r#"{{"waiting": 0, "running": 0, "idle": 0, "stopped": 0, "error": 0, "total": 0}}"#
-            );
+            let empty = StatusJson {
+                waiting: 0,
+                running: 0,
+                idle: 0,
+                stopped: 0,
+                error: 0,
+                total: 0,
+                sessions: Vec::new(),
+            };
+            println!("{}", serde_json::to_string(&empty)?);
         } else if args.quiet {
             println!("0");
         } else {
@@ -77,6 +140,7 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
             stopped: counts.stopped,
             error: counts.error,
             total: counts.total,
+            sessions: build_session_rows(storage.profile(), &instances),
         };
         println!("{}", serde_json::to_string(&status_json)?);
     } else if args.quiet {

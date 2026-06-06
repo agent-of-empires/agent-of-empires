@@ -38,6 +38,18 @@ struct SessionJson {
     workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<WorktreeJson>,
+    /// Seconds since the session's last hook activity (`now - since`). `None`
+    /// when the session isn't tracked by the attention hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_activity_age_secs: Option<i64>,
+    /// Tool name on the most recent Pre/PostToolUse event. See the `last_tool`
+    /// caveat on `HookAttention`: after a toolless turn-complete this reflects
+    /// the prior tool; the age above is always the true last-activity time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_tool: Option<String>,
+    /// Kind of the most recent hook event: `turn_complete`/`tool_invoke`/`tool_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -131,17 +143,24 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     if args.json {
         let sessions: Vec<SessionJson> = instances
             .iter()
-            .map(|inst| SessionJson {
-                id: inst.id.clone(),
-                title: inst.title.clone(),
-                path: inst.project_path.clone(),
-                group: inst.group_path.clone(),
-                tool: inst.tool.clone(),
-                command: inst.command.clone(),
-                profile: storage.profile().to_string(),
-                created_at: inst.created_at,
-                workspace_repos: workspace_repos_for(inst),
-                worktree: worktree_for(inst),
+            .map(|inst| {
+                let (last_activity_age_secs, last_tool, last_reason, _urgent) =
+                    super::session_activity(&inst.id);
+                SessionJson {
+                    id: inst.id.clone(),
+                    title: inst.title.clone(),
+                    path: inst.project_path.clone(),
+                    group: inst.group_path.clone(),
+                    tool: inst.tool.clone(),
+                    command: inst.command.clone(),
+                    profile: storage.profile().to_string(),
+                    created_at: inst.created_at,
+                    workspace_repos: workspace_repos_for(inst),
+                    worktree: worktree_for(inst),
+                    last_activity_age_secs,
+                    last_tool,
+                    last_reason,
+                }
             })
             .collect();
         super::output::print_json(&sessions)?;
@@ -176,6 +195,8 @@ async fn run_all_profiles(json: bool) -> Result<()> {
                     for inst in instances {
                         let workspace_repos = workspace_repos_for(&inst);
                         let worktree = worktree_for(&inst);
+                        let (last_activity_age_secs, last_tool, last_reason, _urgent) =
+                            super::session_activity(&inst.id);
                         all_sessions.push(SessionJson {
                             id: inst.id,
                             title: inst.title,
@@ -187,6 +208,9 @@ async fn run_all_profiles(json: bool) -> Result<()> {
                             created_at: inst.created_at,
                             workspace_repos,
                             worktree,
+                            last_activity_age_secs,
+                            last_tool,
+                            last_reason,
                         });
                     }
                 }
