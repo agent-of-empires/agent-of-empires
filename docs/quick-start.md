@@ -8,6 +8,21 @@ aoe
 
 This opens the dashboard. You'll see an empty session list on first run.
 
+| Key | Action |
+|-----|--------|
+| `n` | New session |
+| `b` | New session from saved project |
+| `Enter` | Attach to session |
+| `d` | Delete session |
+| `t` | Toggle Agent/Terminal view |
+| `D` | Open diff view |
+| `/` | Search sessions |
+| `?` | Show help (full keymap) |
+| `q` | Quit |
+| `Ctrl+b d` | Detach from tmux session |
+
+Press `?` in the TUI for the full keymap.
+
 ## Create Your First Session
 
 **From the TUI:** Press `n` to open the new session dialog. Fill in the path to your project (or leave it as `.` for the current directory) and press `Enter`.
@@ -50,20 +65,15 @@ This creates a new git branch, a worktree directory, and a session pointing at i
 
 ## Attach to Existing Work
 
-Already have a worktree checked out, or a Claude Code conversation you want to keep going? AoE can wrap both without forcing you to start over.
-
-**Attach to an existing branch or worktree.** Omit the `-b` flag and AoE re-uses the worktree if one exists for that branch, or checks the branch out into a new worktree if not:
+**Attach to an existing branch or worktree.** Omit `-b` and AoE re-uses the worktree for that branch, or checks the branch out into a new worktree if none exists:
 
 ```bash
-# CLI: attach to whatever worktree/branch already exists
 aoe add . -w feat/my-feature
 ```
 
-In the TUI, press `Ctrl+P` on the Worktree field and toggle **Attach to existing branch**. The web wizard exposes the same toggle under the worktree name input. See [Worktrees Reference](guides/worktrees.md) for the full matrix.
+In the TUI, press `Ctrl+P` on the Worktree field and toggle **Attach to existing branch** (same toggle in the web wizard). Removing the session only cleans up worktrees AoE created; attached ones are left alone. See [Worktrees Reference](guides/worktrees.md) for the full matrix.
 
-When you later remove the session, AoE only cleans up worktrees it created; attached ones are left alone.
-
-**Resume an existing Claude Code conversation.** After attaching, run `/resume` inside the Claude pane and pick the conversation you want. AoE installs hooks into `~/.claude/settings.json` to capture the active session ID and persists it so the next launch reattaches to the same conversation automatically. Details in [Session Resume](guides/session-resume.md), including the `aoe session set-session-id` command for setting the Claude UUID explicitly.
+**Resume a Claude Code conversation.** After attaching, run `/resume` in the Claude pane and pick a conversation. AoE captures the session ID and persists it so the next launch reattaches automatically. See [Session Resume](guides/session-resume.md), including `aoe session set-session-id` to set the Claude UUID explicitly.
 
 ## Create a Sandboxed Session
 
@@ -87,21 +97,6 @@ aoe add -c opencode .   # or any other supported agent
 
 In the TUI, select the tool from the dropdown in the new session dialog.
 
-## TUI Keyboard Reference
-
-| Key | Action |
-|-----|--------|
-| `n` | New session |
-| `b` | New session from saved project |
-| `Enter` | Attach to session |
-| `d` | Delete session |
-| `t` | Toggle Agent/Terminal view |
-| `D` | Open diff view |
-| `/` | Search sessions |
-| `?` | Show help |
-| `q` | Quit |
-| `Ctrl+b d` | Detach from tmux session |
-
 ## Use the Web Dashboard
 
 Prefer a browser? Run `aoe serve` to start the web dashboard:
@@ -112,14 +107,12 @@ aoe serve --host 0.0.0.0          # accessible from other devices (use with VPN)
 aoe serve --daemon                # run in background
 ```
 
-Open the printed URL in any browser -- your phone, tablet, or another computer. You get the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience.
-
-See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
+Open the printed URL in any browser (phone, tablet, or another computer) for the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience. See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
 
 ## Next Steps
 
-- [Web Dashboard](guides/web-dashboard.md) -- access sessions from any browser
-- [Workflow Guide](guides/workflow.md) -- recommended setup with bare repos and parallel agents
-- [Docker Sandbox](guides/sandbox.md) -- container configuration and custom images
-- [Repo Config & Hooks](guides/repo-config.md) -- per-project settings
-- [CLI Reference](cli/reference.md) -- every command and flag
+- [Web Dashboard](guides/web-dashboard.md): access sessions from any browser
+- [Workflow Guide](guides/workflow.md): recommended setup with bare repos and parallel agents
+- [Docker Sandbox](guides/sandbox.md): container configuration and custom images
+- [Repo Config & Hooks](guides/repo-config.md): per-project settings
+- [CLI Reference](cli/reference.md): every command and flag

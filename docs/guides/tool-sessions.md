@@ -65,11 +65,8 @@ still reachable from the picker and command palette; only the dead
 binding is dropped.
 
 If two tools claim the same hotkey, the alphabetically-first tool name
-wins.
-
-Tool hotkeys are checked **before** the built-in normal-mode keybindings
-on the home screen, so a tool hotkey will shadow any future built-in
-binding that uses the same combination.
+wins. Tool hotkeys are checked before built-in home-screen keybindings,
+so they shadow any built-in binding using the same combination.
 
 ## Using tools
 
@@ -101,21 +98,14 @@ Once you're attached:
 
 Each tool session is tied to one agent session's working directory.
 Switching to a different agent session and pressing the same hotkey
-opens a **separate** tmux session running the same tool against that
-worktree, with its own independent state.
+opens a **separate** tool session against that worktree, with its own
+independent state.
 
 Tool sessions are automatically killed when their parent agent session
-is removed, including:
-
-- `aoe remove <id>`
-- "Remove session" from the TUI
-- Delete via the web dashboard
-
-Removal sweeps every `aoe_tool_*_<id>` tmux session (or `aoe_dev_tool_*`
-under a debug build) regardless of whether the corresponding `[tools.*]`
-entry still exists in your config. This means you can rename or delete
-a tool from your config without leaving orphaned tmux sessions behind
-on the next session removal.
+is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete
+in the web dashboard). Cleanup sweeps all of the agent's tool sessions
+even if you renamed or deleted the `[tools.*]` entry, so nothing is left
+orphaned.
 
 ## Where the tool runs
 
@@ -176,15 +166,7 @@ command = "btm"
 
 ## tmux session naming
 
-Tool sessions follow a deterministic naming scheme so you can find them
-manually if you ever need to:
-
-- Release builds: `aoe_tool_<tool>_<title>_<id8>`
-- Debug builds:   `aoe_dev_tool_<tool>_<title>_<id8>`
-
-Where `<id8>` is the first 8 characters of the agent session ID. Tool
-and title strings are sanitized (colons, dots, and spaces stripped) to
-satisfy tmux's session-name constraints.
-
-You can attach manually with `tmux attach -t <name>`, but you'll
-normally never need to: AoE's three access paths are faster.
+Tool sessions are named `aoe_tool_<tool>_<title>_<id8>` (`aoe_dev_tool_` in debug builds; `<id8>` is the
+first 8 characters of the agent session ID). You can attach manually
+with `tmux attach -t <name>`, though AoE's three access paths are
+faster.

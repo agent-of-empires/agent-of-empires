@@ -4,40 +4,40 @@ Agent of Empires uses the [`tracing`](https://docs.rs/tracing) crate. The TUI, t
 
 ## Targets
 
-Targets use the convention `<module>.<submodule>`. The default filter expands a chosen level to a directive per top-level root, so target names like `auth.token` inherit from `auth` without per-target env config.
+Targets use `<module>.<submodule>`. The default filter expands a level to a directive per top-level root, so `auth.token` inherits from `auth` without per-target config. The settings dropdown only enumerates `KNOWN_SUB_TARGETS` (`src/logging.rs`); code may emit under any sub-target, and raw EnvFilter directives go through the settings filter field or `PATCH /api/log-level`.
 
-Only a small set of sub-targets is enumerated in the settings dropdown (see `KNOWN_SUB_TARGETS` in `src/logging.rs`). Code is free to emit under any sub-target it wants; the dropdown is for convenience. Advanced filters can be entered as raw EnvFilter directives in the settings UI's filter field or via `PATCH /api/log-level`.
+Top-level roots:
 
 | Root | What lands here |
 |------|-----------------|
-| `agent_of_empires` | Default crate target. General library code emitting without `target:`. |
+| `agent_of_empires` | Default crate target. Library code emitting without `target:`. |
 | `acp` | ACP transport, supervisor, event store, runner shim, per-tool-call entry/exit. |
 | `terminal` | Web terminal WS relay + per-byte firehose (trace). |
-| `auth` | Token rotate, middleware accept/reject, rate-limit, login flow. |
+| `auth` | Token rotate, middleware accept/reject, rate-limit, login. |
 | `process` | Signal sends, process-tree walks, survivor reap, ppid resolution. |
-| `update` | GitHub release polling, cache hits/misses, version compare. |
-| `containers` | Docker daemon, image pull, container lifecycle, exec into running container. |
-| `git` | `git` invocation arguments, exit, duration. |
+| `update` | GitHub release polling, cache, version compare. |
+| `containers` | Docker daemon, image pull, container lifecycle, exec. |
+| `git` | `git` invocation args, exit, duration. |
 | `migrations` | Per-migration progress with duration. |
-| `web` | Browser-side events relayed via `/api/client-log` under `web.client`. The client-side module name is preserved in the `client_target` field. |
-| `cli` | One-shot CLI subcommand entry/exit and outcome (e.g. `cli.serve`, `cli.add`). |
-| `tui` | TUI key dispatch, screen transitions, dialog lifecycle, sampled render diagnostics. |
-| `session` | Session/profile/group CRUD, terminal capture, heartbeat writes, storage IO. |
+| `web` | Browser-side events relayed via `/api/client-log` (`web.client`); client module preserved in `client_target`. |
+| `cli` | One-shot CLI subcommand entry/exit and outcome (`cli.serve`, `cli.add`). |
+| `tui` | Key dispatch, screen transitions, dialog lifecycle, sampled render diagnostics. |
+| `session` | Session/profile/group CRUD, terminal capture, heartbeat, storage IO. |
 | `tmux` | tmux invocations, cache refresh, status detection, pane CRUD. |
-| `http` | Axum request-scoped span with `request_id`/`method`/`path`/`status`/`latency_ms`, plus per-route semantic events. |
-| `serve` | `aoe serve` daemonize/foreground startup, PID/URL file IO, tunnel up/down, signal-driven shutdown. |
-| `hooks` | Agent hook integration (Claude/Settl/Hermes/Kiro) install/uninstall, hook status file lifecycle, user-configured status hook command failures, and attached status hook watcher failures. |
-| `sound` | Notification sound asset download/install and per-event playback. |
-| `telemetry` | Anonymous opt-in usage telemetry: install-id persistence, opt-in/opt-out transitions, and send outcomes (all at `debug`). The `aoe serve` consent route emits under `http.api.telemetry`. |
-| `log.runtime` | Filter swaps (REST + runner file-watch). A swap whose new directive equals the active one is a silent no-op: it does not log or rewrite `runtime_filter`, so a watcher write cannot re-trigger itself. |
+| `http` | Axum request span (`request_id`/`method`/`path`/`status`/`latency_ms`) + per-route events. |
+| `serve` | `aoe serve` startup, PID/URL file IO, tunnel up/down, signal shutdown. |
+| `hooks` | Agent hook install/uninstall, status-file lifecycle, hook command + watcher failures. |
+| `sound` | Notification sound download/install and per-event playback. |
+| `telemetry` | Opt-in usage telemetry (all `debug`); consent route emits under `http.api.telemetry`. |
+| `log.runtime` | Filter swaps (REST + runner file-watch). A swap matching the active directive is a silent no-op, so a watcher write cannot re-trigger itself. |
 
 ## Levels
 
-- **error** — user-visible failure or invariant violation
-- **warn** — recovered from, but worth investigating (rate-limit lockout, SIGTERM survivor, garbled runtime-filter file)
-- **info** — lifecycle / state transitions (token rotate, container start, migration completed)
-- **debug** — frequent / per-operation detail (every git invocation, every signal)
-- **trace** — per-byte / per-message firehose (`terminal.ws.bytes`, ACP JSON-RPC transport)
+- **error**: user-visible failure or invariant violation
+- **warn**: recovered from, but worth investigating (rate-limit lockout, SIGTERM survivor, garbled runtime-filter file)
+- **info**: lifecycle / state transitions (token rotate, container start, migration completed)
+- **debug**: frequent / per-operation detail (every git invocation, every signal)
+- **trace**: per-byte / per-message firehose (`terminal.ws.bytes`, ACP JSON-RPC transport)
 
 ## Env variables
 
@@ -101,15 +101,13 @@ show_spans = false
 
 ## Rotation
 
-When `rotation = "size"`, the writer rotates the live file whenever it crosses `max_size_mib`. The rename chain shifts `debug.log.N-1 → .N` down to `keep_count`, then renames the current `debug.log → debug.log.1` and opens a fresh `debug.log`. Older files (`> keep_count`) are dropped.
+When `rotation = "size"`, crossing `max_size_mib` shifts the rename chain (`debug.log.N-1 → .N` up to `keep_count`, current `→ .1`) and opens a fresh `debug.log`; files past `keep_count` are dropped. `rotation = "never"` grows unbounded (useful for debug sessions).
 
-**Multi-process safety.** The TUI + daemon + structured view runners + env-overridden CLI invocations may all append to the same `debug.log` concurrently. The writer uses three mechanisms to keep that safe:
+TUI, daemon, runners, and env-overridden CLI may all append concurrently. Three mechanisms keep that safe:
 
-1. **`fs2` advisory exclusive lock** on a sidecar `{path}.lock` file serializes the rename chain. The OS releases the lock on process exit, so a crashed rotater never wedges future rotations.
-2. **Inode tracking + reopen.** Each writer remembers the file's inode at open time and re-stats every 16 KiB. If another process rotated the file out from under us, the inode mismatch triggers a reopen so subsequent writes land in the new `debug.log` rather than the archived `.1`.
-3. **Line-buffered writes.** Tracing events accumulate in an internal buffer until a `\n` (or 8 KiB without one); only complete lines pass through the rotation check, so a rotation can never split one event across files.
-
-Set `rotation = "never"` to disable the size threshold entirely. The file grows unbounded; useful for debug sessions where rotation noise would interfere.
+1. **`fs2` advisory exclusive lock** on `{path}.lock` serializes the rename chain. The OS releases it on exit, so a crashed rotater never wedges future rotations.
+2. **Inode tracking + reopen:** each writer re-stats every 16 KiB; an inode mismatch (another process rotated) triggers a reopen so writes land in the new file, not the archived `.1`.
+3. **Line-buffered writes:** only complete lines (`\n`, or 8 KiB without one) pass the rotation check, so a rotation never splits an event across files.
 
 ## Startup marker
 
@@ -157,27 +155,15 @@ aoe log-level --filter auth.rate_limit=debug,warn
 aoe log-level --get
 ```
 
-The CLI reads the daemon URL from `serve.url` and authenticates via the token in the query string. Works against a foreground `aoe serve` too — it does not require the daemon mode.
+The CLI reads the daemon URL from `serve.url` and authenticates via the token in the query string. Works against a foreground `aoe serve` too; it does not require daemon mode.
 
 ## Runner propagation
 
-When you `PATCH /api/log-level`, the daemon writes the new directive atomically to `~/.agent-of-empires/runtime_filter` (0600). Each structured view runner subprocess uses `notify` to watch the file and applies updates to its own `FilterController`. Both daemon and runners stay in lockstep without restart, which is the point: you can pull from `info` to `trace` mid-incident without losing in-flight agent state.
-
-Edge cases:
-
-- File missing: runner no-ops until the daemon writes one.
-- Daemon stop: file removal does not revert runner filters; the next daemon start writes a fresh value.
-- Garbled content: runner logs a `warn` to `log.runtime` and keeps its prior filter.
+`PATCH /api/log-level` makes the daemon write the new directive atomically to `~/.agent-of-empires/runtime_filter` (0600); each runner subprocess `notify`-watches the file and applies it to its own `FilterController`, so you can pull `info` to `trace` mid-incident without restart or losing agent state. Edge cases: missing file, runner no-ops; daemon stop does not revert runner filters (next start rewrites); garbled content, runner `warn`s and keeps its prior filter.
 
 ## Per-session tee
 
-The daemon multiplexes many sessions, so its watchdog, cancel, and stop-reason breadcrumbs (target `acp.protocol`) all land in the one shared `debug.log`. To make `aoe acp logs --session <id>` useful during an incident, the daemon installs a `SessionTeeLayer` (`src/acp/session_tee.rs`) on top of its subscriber stack that mirrors each session-scoped event into that session's `acp-workers/<id>.log`.
-
-- **Routing.** Events are attributed by their `session` field. Each per-session connection task runs inside an `acp_session` span carrying that field, so events that do not set it explicitly still inherit it through the span scope; the layer reads the event's own fields first, then walks the scope.
-- **Additive.** The shared `debug.log` still receives everything; the tee is a copy, not a redirect.
-- **I/O.** Writes are synchronous through a per-session `SizeRotatingWriter` (10 MiB, keep 2), the same writer the shared log uses. Open writers are bounded (LRU, 64) so a long-lived daemon does not leak file descriptors.
-- **Scope.** Daemon only. The runner is single-session and keeps writing its startup marker and the agent's stderr directly. Events on the `acp.tee` target are skipped to prevent re-entrancy.
-- **Filtering.** The tee sits below the same dynamic `EnvFilter`, so `aoe log-level` changes apply to the per-session files too.
+To make `aoe acp logs --session <id>` useful, the daemon's `SessionTeeLayer` (`src/acp/session_tee.rs`) mirrors each session-scoped event into `acp-workers/<id>.log` in addition to the shared `debug.log` (a copy, not a redirect). Events are attributed by their `session` field, inherited through the `acp_session` span scope when not set explicitly. Per-session writes use the same `SizeRotatingWriter` (10 MiB, keep 2); open writers are LRU-bounded (64) so the daemon doesn't leak fds. Daemon-only (the runner is single-session); `acp.tee`-target events are skipped to avoid re-entrancy; the tee sits below the same `EnvFilter`, so `aoe log-level` applies to per-session files too.
 
 ## Web client relay
 

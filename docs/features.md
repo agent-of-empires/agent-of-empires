@@ -1,8 +1,6 @@
 # Features
 
-Everything Agent of Empires ships, grouped by what it does. Each entry links to the guide that covers it in detail.
-
-If you are new, read the [Quick Start](quick-start.md) first; this page is the inventory.
+Everything Agent of Empires ships, grouped by what it does, each linking to its full guide. New here? Read the [Quick Start](quick-start.md) first; this page is the inventory.
 
 ## Surfaces
 
@@ -20,9 +18,9 @@ Browser access to the same sessions: real terminal in the page, switch sessions,
 
 ### Structured View
 
-The web dashboard's default rendering: mobile-first native rendering of agent state via the Agent Client Protocol (ACP). Renders plan panels, tool-call cards, and swipe-to-approve flows instead of relaying raw terminal bytes. Every ACP-capable agent uses it by default; flip a session to the terminal view to see the raw tmux rendering instead.
+The web dashboard's default rendering: mobile-first native rendering of agent state via the Agent Client Protocol (ACP), with plan panels, tool-call cards, and swipe-to-approve flows instead of raw terminal bytes. Every ACP-capable agent uses it by default; flip a session to terminal view for raw tmux rendering.
 
-[Structured view guide](structured-view.md), [per-agent feature matrix](structured-view/multi-agent.md)
+[Structured view guide](structured-view.md), [per-agent feature matrix](structured-view.md#feature-matrix)
 
 ### CLI
 
@@ -38,7 +36,7 @@ REST endpoints for driving sessions from external orchestrators. Same operations
 
 ### Remote phone access
 
-Press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth. Uses Tailscale Funnel when available for a stable URL that survives restarts, falling back to Cloudflare Tunnel otherwise. The exposed dashboard installs as a PWA on your phone, so notifications keep working after you put the device down.
+Press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth. Uses Tailscale Funnel when available for a stable URL that survives restarts, falling back to Cloudflare Tunnel. Installs as a PWA on your phone, so notifications keep working after you put the device down.
 
 [Remote Phone Access guide](guides/remote-phone-access.md)
 
@@ -46,9 +44,9 @@ Press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase
 
 ### Multi-agent support
 
-AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code. AoE auto-detects which agents are installed on your machine and lists them in the new-session picker.
+AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, Kiro CLI, and Qwen Code, auto-detecting which are installed and listing them in the new-session picker.
 
-For per-agent structured-view support detail (which agents render plan panels, which tools are recognized), see the [Structured view multi-agent matrix](structured-view/multi-agent.md).
+For per-agent structured-view support (which agents render plan panels, which tools are recognized), see the [Structured view feature matrix](structured-view.md#feature-matrix).
 
 ### Agent command overrides
 
@@ -66,7 +64,7 @@ Create a session and AoE creates a branch + worktree automatically. Delete the s
 
 ### Multi-repo workspaces
 
-Drive a single session across several git repositories. The project registry and multi-select pickers let one agent reach into more than one repo at a time, for tasks that span services or monorepos split into siblings.
+Drive a single session across several git repositories. The project registry and multi-select pickers let one agent reach into more than one repo at once, for tasks that span services or sibling monorepos.
 
 [Multi-Repo Workspaces guide](guides/multi-repo-workspaces.md)
 
@@ -103,7 +101,7 @@ Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane
 
 ### Auto-stop idle sessions
 
-Reclaim resources from forgotten sessions: set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. It is off by default, never stops a session with an attached tmux client or one you used recently, and runs from both the TUI and `aoe serve`. Agent workers have the separate `acp.auto_stop_idle_secs` knob.
+Set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. Off by default; never stops an attached or recently used session; runs from both the TUI and `aoe serve`. Agent workers use the separate `acp.auto_stop_idle_secs` knob.
 
 [Configuration: session section](guides/configuration.md#session)
 
@@ -115,7 +113,7 @@ Persist and resume Claude Code conversations across reboots, upgrades, and runti
 
 ### tmux persistence
 
-Every agent runs in its own tmux session. Close the TUI, disconnect SSH, or crash your terminal; the agents keep running. Reopen `aoe` and everything is exactly where you left it. The shortcut to remember: `Ctrl+b d` detaches and returns to the TUI.
+Every agent runs in its own tmux session. Close the TUI, disconnect SSH, or crash your terminal; the agents keep running. Reopen `aoe` and everything is where you left it. `Ctrl+b d` detaches and returns to the TUI.
 
 ### Tool sessions
 
@@ -147,6 +145,6 @@ Audible cues for status transitions (`Waiting`, `Idle`, `Error`) and structured 
 
 ### Push notifications
 
-Browser push notifications when an agent is waiting for input, finishes a long-running job, errors out, or requests an structured view approval. Smart suppression skips OS banners while you are already looking at the TUI or dashboard, so your phone only buzzes when you actually stepped away.
+Browser push when an agent is waiting for input, finishes a long-running job, errors out, or requests a structured-view approval. Suppression skips OS banners while you are looking at the TUI or dashboard, so your phone only buzzes when you stepped away.
 
 [Push Notifications guide](push-notifications.md)

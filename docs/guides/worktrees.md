@@ -117,17 +117,11 @@ On the delete side, aoe runs `git submodule deinit -f --all` before `git worktre
 ### Path Template Examples
 
 ```toml
-# Default (sibling directory) - used for non-bare repos
+# Default (sibling directory), used for non-bare repos
 path_template = "../{repo-name}-worktrees/{branch}"
-
-# Bare repo default (worktrees as siblings)
-bare_repo_path_template = "./{branch}"
 
 # Nested in repo
 path_template = "./worktrees/{branch}"
-
-# Absolute path
-path_template = "/absolute/path/to/worktrees/{repo-name}/{branch}"
 
 # With session ID for uniqueness
 path_template = "../wt/{branch}-{session-id}"
@@ -159,26 +153,6 @@ git fetch <remote> <branch> failed for <repo>: <stderr>
 
 The session is still created when the fetch fails. The worktree branches off whatever local ref already exists, which may be stale. Multi-repo sessions emit one warning per repo whose fetch failed, so a single bad remote in a workspace of five repos shows up as one toast rather than aborting the whole workspace. See issue \#1511 for the rationale.
 
-## Performance & Debug Logging
-
-`create_worktree` is instrumented end-to-end so a slow run can be diagnosed from `debug.log` (`AGENT_OF_EMPIRES_DEBUG=1`):
-
-```
-INFO worktree create: start branch=... path=...
-INFO worktree create: prune done in 12ms
-INFO git fetch origin/main ok in 1.7s
-INFO worktree create: fetch step done in 1.7s
-INFO worktree create: branch resolve done in 2ms
-INFO worktree create: git worktree add done in 90ms (518 files, 5690035 bytes checked out)
-INFO worktree create: convert .git file done in 120µs
-INFO worktree create: submodules (initialized count=1) done in 2.0s
-INFO worktree create: TOTAL 3.9s branch=... path=... warnings=0
-```
-
-Network IO (`git fetch`, `git submodule update`) dominates almost every slow run. `git worktree add` itself only checks out tracked files; it does **not** copy `node_modules`, `.venv`, `target/`, or any other gitignored content.
-
-For multi-repo workspaces, the per-repo `create_worktree` calls run concurrently via `std::thread::scope`, so wall-clock time is roughly that of the slowest single repo rather than the sum across repos.
-
 ## Cleanup Behavior
 
 | Scenario | Cleanup Prompt? |
@@ -188,9 +162,9 @@ For multi-repo workspaces, the per-repo `create_worktree` calls run concurrently
 | `--delete-worktree` flag | Yes (deletes worktree) |
 | Non-worktree session | No |
 
-## Auto-Detection
+## Bare Repos
 
-AOE automatically detects bare repos and uses `bare_repo_path_template` instead of `path_template`, creating worktrees as siblings within the project directory.
+AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory. See [Workflow](workflow.md) for the bare-repo setup.
 
 ## File Locations
 
@@ -198,12 +172,3 @@ AOE automatically detects bare repos and uses `bare_repo_path_template` instead 
 |------|------|
 | Config | `~/.agent-of-empires/config.toml` |
 | Sessions | `~/.agent-of-empires/profiles/<profile>/sessions.json` |
-
-## Error Messages
-
-| Error | Solution |
-|-------|----------|
-| "Not in a git repository" | Navigate to a git repo first |
-| "Worktree already exists" | Use different branch name or add `{session-id}` to template |
-| "Failed to remove worktree" | May need manual cleanup with `git worktree remove` |
-| "Branch already exists" (CLI) | Branch exists; remove `-b` flag to use existing branch |
