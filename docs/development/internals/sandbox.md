@@ -56,7 +56,7 @@ docker volume rm aoe-claude-auth aoe-opencode-auth aoe-codex-auth aoe-gemini-aut
 
 Agent-view sessions can run inside the container. When both are enabled, the structured view runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters:
 
-- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.39.0`, floor pin)
+- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.41.0`, floor pin)
 - `codex-acp` (`@zed-industries/codex-acp`)
 - `pi-acp`
 
