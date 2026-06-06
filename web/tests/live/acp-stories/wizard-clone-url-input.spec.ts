@@ -17,11 +17,16 @@ base("wizard Clone URL tab accepts a repo URL", async ({ page }, testInfo) => {
 
   try {
     await page.goto(serve.baseUrl);
-    await page.getByRole("button", { name: "New session", exact: true }).first().click();
+    await page
+      .getByRole("button", { name: "New session", exact: true })
+      .first()
+      .click();
     await page.getByRole("button", { name: "Clone URL", exact: true }).click();
 
     const input = page.getByPlaceholder("https://github.com/user/repo.git");
-    const cloneButton = page.getByRole("button", { name: /^Clone repository$/i });
+    const cloneButton = page.getByRole("button", {
+      name: /^Clone repository$/i,
+    });
     await expect(input).toBeVisible({ timeout: 5_000 });
     await expect(cloneButton).toBeDisabled({ timeout: 5_000 });
     await input.fill("https://github.com/example/repo.git");

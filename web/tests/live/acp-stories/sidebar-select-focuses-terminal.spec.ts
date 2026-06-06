@@ -38,9 +38,7 @@ base(
       if (!seeded) throw new Error("seeded session 'story-focus-term' missing");
 
       await page.goto(serve.baseUrl);
-      const row = page
-        .locator('[data-testid="sidebar-session-row"]')
-        .first();
+      const row = page.locator('[data-testid="sidebar-session-row"]').first();
       await expect(row).toBeVisible({ timeout: 10_000 });
 
       // First select: navigate + connect; useTerminal autofocuses the xterm
@@ -53,9 +51,9 @@ base(
         ).toString(),
         { timeout: 10_000 },
       );
-      await expect.poll(() => activeElementInXterm(page), { timeout: 10_000 }).toBe(
-        true,
-      );
+      await expect
+        .poll(() => activeElementInXterm(page), { timeout: 10_000 })
+        .toBe(true);
 
       // Blur, then re-select the already-connected session. The socket does
       // not reopen, so a refocus here can only come from the select dispatch.
@@ -65,9 +63,9 @@ base(
       await expect.poll(() => activeElementInXterm(page)).toBe(false);
 
       await row.click();
-      await expect.poll(() => activeElementInXterm(page), { timeout: 10_000 }).toBe(
-        true,
-      );
+      await expect
+        .poll(() => activeElementInXterm(page), { timeout: 10_000 })
+        .toBe(true);
     } finally {
       await serve.stop();
     }

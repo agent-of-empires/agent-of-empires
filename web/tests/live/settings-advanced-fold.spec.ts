@@ -32,12 +32,15 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
   await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(
-    page.locator("label", { hasText: /^CPU Limit$/ }),
-  ).toHaveCount(0);
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
+    0,
+  );
 
   // Expand the Advanced fold.
-  await page.getByRole("button", { name: /Advanced/ }).first().click();
+  await page
+    .getByRole("button", { name: /Advanced/ })
+    .first()
+    .click();
 
   const cpuInput = page
     .locator("label", { hasText: /^CPU Limit$/ })
@@ -61,11 +64,14 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
   await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(
-    page.locator("label", { hasText: /^CPU Limit$/ }),
-  ).toHaveCount(0);
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
+    0,
+  );
 
-  await page.getByRole("button", { name: /Advanced/ }).first().click();
+  await page
+    .getByRole("button", { name: /Advanced/ })
+    .first()
+    .click();
   await expect(cpuInput).toHaveValue(newValue, { timeout: 5_000 });
 });
 
@@ -81,19 +87,36 @@ test("worktree, structured-view, and logging advanced folds expand in the browse
     // Worktree is schema-driven (#1692): labels + the advanced fold come from
     // the settings schema, so they match the TUI ("Enabled by Default",
     // "Bare Repo Template") rather than the old hand-written web copy.
-    { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
-    { tab: "structured-view", anchor: "Show tool-call durations", field: /^Replay buffer bytes$/ },
-    { tab: "logging", anchor: "Default level", field: /^Output \(restart req\.\)$/ },
+    {
+      tab: "worktree",
+      anchor: "Enabled by Default",
+      field: /^Bare Repo Template$/,
+    },
+    {
+      tab: "structured-view",
+      anchor: "Show tool-call durations",
+      field: /^Replay buffer bytes$/,
+    },
+    {
+      tab: "logging",
+      anchor: "Default level",
+      field: /^Output \(restart req\.\)$/,
+    },
   ];
 
   for (const { tab, anchor, field } of cases) {
     await page.goto(`${serve.baseUrl}/settings/${tab}`);
-    await expect(page.getByText(anchor).first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(anchor).first()).toBeVisible({
+      timeout: 10_000,
+    });
 
     // Folded away by default.
     await expect(page.locator("label", { hasText: field })).toHaveCount(0);
 
-    await page.getByRole("button", { name: /Advanced/ }).first().click();
+    await page
+      .getByRole("button", { name: /Advanced/ })
+      .first()
+      .click();
     await expect(page.locator("label", { hasText: field })).toBeVisible({
       timeout: 5_000,
     });

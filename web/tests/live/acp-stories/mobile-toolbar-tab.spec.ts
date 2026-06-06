@@ -46,7 +46,9 @@ base("mobile toolbar Tab sends \\t", async ({ page }, testInfo) => {
       };
     });
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
 
     const tab = page.getByRole("button", { name: "Tab" });
     await expect(tab).toBeVisible({ timeout: 15_000 });

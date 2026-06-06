@@ -21,7 +21,9 @@ describe("WorkerRestartingBanner (#1240)", () => {
         agentOrphaned={false}
       />,
     );
-    expect(container.textContent).toContain("Restarting structured view worker");
+    expect(container.textContent).toContain(
+      "Restarting structured view worker",
+    );
     expect(container.textContent).not.toContain("stopped responding to cancel");
     expect(container.textContent).not.toContain(
       "finished but didn't notify the daemon",

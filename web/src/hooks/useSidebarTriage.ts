@@ -1,10 +1,6 @@
 import { useCallback, useState } from "react";
 
-import {
-  setSessionArchive,
-  setSessionPin,
-  setSessionSnooze,
-} from "../lib/api";
+import { setSessionArchive, setSessionPin, setSessionSnooze } from "../lib/api";
 import { reportError } from "../lib/toastBus";
 import {
   EMPTY_OPTIMISTIC,

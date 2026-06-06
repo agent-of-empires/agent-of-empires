@@ -49,7 +49,9 @@ async function openSession(page: Page, handle: MockHandle) {
 }
 
 test.describe("Init resize storm regression (#807)", () => {
-  test("never sends xterm.js's 80x24 default at session open", async ({ page }) => {
+  test("never sends xterm.js's 80x24 default at session open", async ({
+    page,
+  }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);

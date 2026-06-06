@@ -36,7 +36,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function mockSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: overrides.id ?? "s1",
     title: overrides.title ?? "session",
@@ -141,7 +143,9 @@ describe("ProjectStep scratch toggle (#1324)", () => {
     // Browse tab always exists; Recent only renders when fetchSessions
     // returns something. The await is required because the component
     // fetches recents on mount and the loading skeleton must resolve.
-    expect(await findByRole("button", { name: "Browse", exact: true })).toBeTruthy();
+    expect(
+      await findByRole("button", { name: "Browse", exact: true }),
+    ).toBeTruthy();
   });
 });
 

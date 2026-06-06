@@ -59,7 +59,9 @@ base("edit a queued follow-up before it fires", async ({ page }, testInfo) => {
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", {
@@ -72,9 +74,13 @@ base("edit a queued follow-up before it fires", async ({ page }, testInfo) => {
       timeout: 10_000,
     });
     await composer.fill("original queued text");
-    await page.getByRole("button", { name: /Queue follow-up message/i }).click();
+    await page
+      .getByRole("button", { name: /Queue follow-up message/i })
+      .click();
 
-    const queuedRow = page.getByRole("button", { name: /^original queued text$/ });
+    const queuedRow = page.getByRole("button", {
+      name: /^original queued text$/,
+    });
     await expect(queuedRow).toBeVisible({ timeout: 5_000 });
 
     await queuedRow.click();

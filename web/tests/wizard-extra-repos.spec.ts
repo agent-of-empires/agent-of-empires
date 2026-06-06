@@ -27,7 +27,9 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "settings" || path === "about" || path === "system/update-status"
+          path === "settings" ||
+          path === "about" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -39,18 +41,23 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
-        { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" },
+        {
+          name: "claude",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+        },
       ],
     }),
   );
   await page.route("**/api/projects**", (r) =>
     r.fulfill({
-      json:
-        opts.projects ?? [
-          { name: "primary", path: "/tmp/example", scope: "global" },
-          { name: "shared-lib", path: "/tmp/shared-lib", scope: "global" },
-          { name: "docs", path: "/tmp/docs", scope: "profile" },
-        ],
+      json: opts.projects ?? [
+        { name: "primary", path: "/tmp/example", scope: "global" },
+        { name: "shared-lib", path: "/tmp/shared-lib", scope: "global" },
+        { name: "docs", path: "/tmp/docs", scope: "profile" },
+      ],
     }),
   );
   await page.route("**/api/sessions", (r) =>
@@ -85,8 +92,13 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
 async function openProjectStepWithPath(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
+  const recent = page
+    .getByRole("button")
+    .filter({ hasText: "/tmp/example" })
+    .first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   // Extra repos picker section becomes visible once a primary path is set.
@@ -110,15 +122,22 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(
       page.getByRole("button").filter({ hasText: /^shared-lib/ }),
     ).toBeVisible();
-    await expect(page.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
+    await expect(
+      page.getByRole("button").filter({ hasText: /^docs/ }),
+    ).toBeVisible();
   });
 
-  test("clicking a registered project chip toggles selection", async ({ page }) => {
+  test("clicking a registered project chip toggles selection", async ({
+    page,
+  }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openProjectStepWithPath(page);
-    const sharedLib = page.getByRole("button").filter({ hasText: /^shared-lib/ }).first();
+    const sharedLib = page
+      .getByRole("button")
+      .filter({ hasText: /^shared-lib/ })
+      .first();
     await sharedLib.click();
     await expect(page.getByText("1 selected")).toBeVisible();
     // Removing via the dedicated remove button on the selected chip.

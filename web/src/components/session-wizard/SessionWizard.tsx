@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
-import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
+import {
+  fetchAgents,
+  fetchGroups,
+  fetchDockerStatus,
+  fetchProfiles,
+  fetchSettings,
+  createSession,
+} from "../../lib/api";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
@@ -96,7 +103,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   const prefillData: WizardData = prefill
     ? {
         ...baseInitial,
-        path: prefill.scratch ? "" : (prefill.path || ""),
+        path: prefill.scratch ? "" : prefill.path || "",
         tool: prefill.tool || baseInitial.tool,
         yoloMode: prefill.yoloMode ?? false,
         sandboxEnabled: prefill.sandboxEnabled ?? false,
@@ -119,19 +126,22 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // contract (a wizard opened with `scratch: true` for "open at
     // ProjectStep with scratch pre-enabled" would have skipped past
     // the project step entirely).
-    currentStep:
-      prefill?.skipToReview
-        ? 3
-        : (prefill?.path ? 1 : 0),
-    data: prefillData, isSubmitting: false, error: null,
-    agents: [], groups: [], profiles: [], dockerAvailable: false,
+    currentStep: prefill?.skipToReview ? 3 : prefill?.path ? 1 : 0,
+    data: prefillData,
+    isSubmitting: false,
+    error: null,
+    agents: [],
+    groups: [],
+    profiles: [],
+    dockerAvailable: false,
   });
 
   // Profile-resolved override/custom-agent maps for the launch-command
   // preview. Sourced from the settings the wizard already fetches on open
   // and on a profile switch, so the preview adds no extra request. See
   // #1911.
-  const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+  const [commandMaps, setCommandMaps] =
+    useState<CommandMaps>(EMPTY_COMMAND_MAPS);
 
   const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
@@ -142,7 +152,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
+    fetchDockerStatus().then((d) =>
+      dispatch({ type: "SET_DOCKER", available: d.available }),
+    );
 
     // Seed the wizard with the resolved (global + active profile) defaults so
     // single-profile users get yolo_mode_default and friends without ever
@@ -164,14 +176,19 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
-        if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
+        if (img)
+          dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const env = Array.isArray(sandbox?.environment)
           ? (sandbox?.environment as unknown[]).filter(
               (v): v is string => typeof v === "string",
             )
           : [];
-        const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
-        const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
+        const defaultTool =
+          prefill?.tool || (session?.default_tool as string) || "";
+        const acpDefaults = acpDefaultsFor(
+          session,
+          defaultTool || state.data.tool,
+        );
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
@@ -180,10 +197,12 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           type: "APPLY_PROFILE_DEFAULTS",
           yoloMode:
             prefill?.yoloMode ??
-            ((session?.yolo_mode_default as boolean) ?? false),
+            (session?.yolo_mode_default as boolean) ??
+            false,
           sandboxEnabled:
             prefill?.sandboxEnabled ??
-            ((sandbox?.enabled_by_default as boolean) ?? false),
+            (sandbox?.enabled_by_default as boolean) ??
+            false,
           tool: defaultTool,
           extraEnv: env,
           agentModel: acpDefaults.model,
@@ -202,23 +221,35 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
-  const handleApplyProfileDefaults = useCallback((defaults: {
-    yoloMode: boolean;
-    sandboxEnabled: boolean;
-    tool: string;
-    extraEnv: string[];
-    agentModel?: string;
-    agentEffort?: string;
-    commandMaps?: CommandMaps;
-  }) => {
-    const { commandMaps: maps, ...rest } = defaults;
-    if (maps) setCommandMaps(maps);
-    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
-  }, []);
+  const handleApplyProfileDefaults = useCallback(
+    (defaults: {
+      yoloMode: boolean;
+      sandboxEnabled: boolean;
+      tool: string;
+      extraEnv: string[];
+      agentModel?: string;
+      agentEffort?: string;
+      commandMaps?: CommandMaps;
+    }) => {
+      const { commandMaps: maps, ...rest } = defaults;
+      if (maps) setCommandMaps(maps);
+      dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
+    },
+    [],
+  );
 
-  const goNext = () => { if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 }); };
-  const goBack = () => { if (state.currentStep > 0) dispatch({ type: "SET_STEP", step: state.currentStep - 1 }); };
-  const jumpTo = (stepId: StepId) => { const idx = steps.findIndex((s) => s.id === stepId); if (idx >= 0) dispatch({ type: "SET_STEP", step: idx }); };
+  const goNext = () => {
+    if (state.currentStep < steps.length - 1)
+      dispatch({ type: "SET_STEP", step: state.currentStep + 1 });
+  };
+  const goBack = () => {
+    if (state.currentStep > 0)
+      dispatch({ type: "SET_STEP", step: state.currentStep - 1 });
+  };
+  const jumpTo = (stepId: StepId) => {
+    const idx = steps.findIndex((s) => s.id === stepId);
+    if (idx >= 0) dispatch({ type: "SET_STEP", step: idx });
+  };
 
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
@@ -234,7 +265,8 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     const body: CreateSessionRequest = {
       path: d.scratch ? "" : d.path,
       tool: d.tool,
-      title: d.title || undefined, group: d.group || undefined,
+      title: d.title || undefined,
+      group: d.group || undefined,
       yolo_mode: d.yoloMode,
       worktree_branch:
         !d.scratch && d.useWorktree
@@ -247,9 +279,14 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           : undefined,
       sandbox: d.sandboxEnabled,
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
-      extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
+      extra_env:
+        d.sandboxEnabled && d.extraEnv.length > 0
+          ? d.extraEnv.filter(Boolean)
+          : undefined,
       extra_repo_paths:
-        !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
+        !d.scratch && d.extraRepoPaths.length > 0
+          ? d.extraRepoPaths
+          : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
@@ -263,7 +300,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       // so a tampered request can't escalate structured view on for a
       // non-capable agent.
       view:
-        selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
+        selectedAgentAcpCapable && d.useStructuredView
+          ? "structured"
+          : "terminal",
       agent_model:
         selectedAgentAcpCapable && d.useStructuredView && d.agentModel
           ? d.agentModel
@@ -283,17 +322,28 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         for (const w of warnings) toastBus.handler?.error(w);
       }
       onCreated(result.session);
-    } else dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
+    } else
+      dispatch({
+        type: "SUBMIT_ERROR",
+        error: result.error || "Unknown error",
+      });
   };
 
   useEffect(() => {
-    if (state.currentStep >= steps.length) dispatch({ type: "SET_STEP", step: steps.length - 1 });
+    if (state.currentStep >= steps.length)
+      dispatch({ type: "SET_STEP", step: steps.length - 1 });
   }, [steps.length, state.currentStep]);
 
   const renderStep = () => {
     switch (currentStepDef?.id) {
       case "project":
-        return <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />;
+        return (
+          <ProjectStep
+            data={state.data}
+            onChange={handleChange}
+            initialTab={prefill?.initialTab}
+          />
+        );
       case "session":
         return <SessionStep data={state.data} onChange={handleChange} />;
       case "agent":
@@ -309,7 +359,19 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} agents={state.agents} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} commandMaps={commandMaps} />;
+        return (
+          <ReviewStep
+            data={state.data}
+            onChange={handleChange}
+            agents={state.agents}
+            isSubmitting={state.isSubmitting}
+            error={state.error}
+            onSubmit={handleSubmit}
+            onJumpTo={jumpTo}
+            steps={steps}
+            commandMaps={commandMaps}
+          />
+        );
       default:
         return null;
     }
@@ -319,17 +381,23 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // without a path: the server provisions the working directory on
   // submit. Otherwise require a path as before.
   const nextDisabled =
-    currentStepDef?.id === "project" &&
-    !state.data.scratch &&
-    !state.data.path;
+    currentStepDef?.id === "project" && !state.data.scratch && !state.data.path;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-xl flex flex-col max-h-[min(720px,90vh)]">
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700/20">
-          <h1 className="text-sm font-medium text-text-secondary">New session</h1>
-          <button onClick={onClose} className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors" aria-label="Close">&times;</button>
+          <h1 className="text-sm font-medium text-text-secondary">
+            New session
+          </h1>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
+            aria-label="Close"
+          >
+            &times;
+          </button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <StepIndicator steps={steps} currentIndex={state.currentStep} />
@@ -337,16 +405,21 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         </div>
         {!isLast && (
           <div className="flex justify-between px-5 py-4 border-t border-surface-700/20">
-            <button onClick={isFirst ? onClose : goBack}
-              className="px-5 py-2.5 text-sm rounded-lg border border-surface-700 text-text-secondary hover:bg-surface-800 active:bg-surface-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600">
+            <button
+              onClick={isFirst ? onClose : goBack}
+              className="px-5 py-2.5 text-sm rounded-lg border border-surface-700 text-text-secondary hover:bg-surface-800 active:bg-surface-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
+            >
               {isFirst ? "Cancel" : "Back"}
             </button>
-            <button onClick={goNext} disabled={nextDisabled}
+            <button
+              onClick={goNext}
+              disabled={nextDisabled}
               className={`px-5 py-2.5 text-sm rounded-lg font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
                 nextDisabled
                   ? "bg-brand-600/50 text-surface-900/50 cursor-not-allowed"
                   : "bg-brand-600 hover:bg-brand-700 active:bg-brand-800 text-surface-900 cursor-pointer"
-              }`}>
+              }`}
+            >
               Next
             </button>
           </div>

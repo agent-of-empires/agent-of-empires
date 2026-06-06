@@ -73,7 +73,9 @@ test("URL form (?token=...) and raw-token form both unlock TokenEntryPage", asyn
   await expect(page.locator("#token")).toBeVisible({ timeout: 15_000 });
 
   // Submit the full URL form (extractToken in TokenEntryPage.tsx parses it).
-  await page.locator("#token").fill(`${serveToken.baseUrl}/?token=${validToken}`);
+  await page
+    .locator("#token")
+    .fill(`${serveToken.baseUrl}/?token=${validToken}`);
   await page.getByRole("button", { name: /connect/i }).click();
   await expect(page.locator("#token")).toBeHidden({ timeout: 10_000 });
 });

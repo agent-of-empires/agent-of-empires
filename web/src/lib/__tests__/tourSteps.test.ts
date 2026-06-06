@@ -78,7 +78,10 @@ describe("tour drift guard", () => {
     }
     for (const step of TOUR_STEPS) {
       const key = ANCHOR_KEY_BY_VALUE.get(step.anchor);
-      expect(key, `anchor ${step.anchor} missing from TOUR_ANCHORS`).toBeDefined();
+      expect(
+        key,
+        `anchor ${step.anchor} missing from TOUR_ANCHORS`,
+      ).toBeDefined();
       expect(
         usedInSource.has(key as string),
         `anchor "${step.anchor}" (step "${step.id}") is never attached in component source`,
@@ -92,7 +95,10 @@ describe("tour drift guard", () => {
       const text = readFileSync(file, "utf8");
       if (/data-tour=["']/.test(text)) offenders.push(file);
     }
-    expect(offenders, `raw data-tour literals found in: ${offenders.join(", ")}`).toEqual([]);
+    expect(
+      offenders,
+      `raw data-tour literals found in: ${offenders.join(", ")}`,
+    ).toEqual([]);
   });
 });
 
@@ -162,10 +168,18 @@ describe("resolveTourSteps", () => {
   it("isStepEligible ignores DOM presence (metadata only)", () => {
     const composer = TOUR_STEPS.find((s) => s.id === "composer") as TourStep;
     expect(
-      isStepEligible(composer, { scope: "structured-view", readOnly: false, isDesktop: true }),
+      isStepEligible(composer, {
+        scope: "structured-view",
+        readOnly: false,
+        isDesktop: true,
+      }),
     ).toBe(true);
     expect(
-      isStepEligible(composer, { scope: "dashboard", readOnly: false, isDesktop: true }),
+      isStepEligible(composer, {
+        scope: "dashboard",
+        readOnly: false,
+        isDesktop: true,
+      }),
     ).toBe(false);
   });
 });

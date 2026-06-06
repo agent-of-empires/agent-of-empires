@@ -4,9 +4,19 @@
 // title (which often contains spaces and would otherwise be rejected
 // by libgit2 with an opaque InvalidSpec error).
 const LIGATURES: Record<string, string> = {
-  "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
-  "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
-  "þ": "th", "Þ": "Th",
+  ß: "ss",
+  æ: "ae",
+  Æ: "AE",
+  œ: "oe",
+  Œ: "OE",
+  ø: "o",
+  Ø: "O",
+  ł: "l",
+  Ł: "L",
+  đ: "d",
+  Đ: "D",
+  þ: "th",
+  Þ: "Th",
 };
 
 export function slugifyBranch(title: string): string {
@@ -23,8 +33,7 @@ export function slugifyBranch(title: string): string {
   for (const ch of stripped) {
     const code = ch.charCodeAt(0);
     const isAlnum =
-      (code >= 0x30 && code <= 0x39) ||
-      (code >= 0x61 && code <= 0x7a);
+      (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x7a);
     if (isAlnum || ch === "-" || ch === "_") {
       out += ch;
       lastDash = false;
@@ -38,7 +47,10 @@ export function slugifyBranch(title: string): string {
   return out.length === 0 ? "session" : out;
 }
 
-export function applyBranchOverride(_title: string, worktreeBranch: string): {
+export function applyBranchOverride(
+  _title: string,
+  worktreeBranch: string,
+): {
   worktreeBranch: string;
   worktreeBranchDirty: boolean;
 } {
@@ -52,11 +64,17 @@ export function applyBranchOverride(_title: string, worktreeBranch: string): {
   };
 }
 
-export function getSubmittedBranch(title: string, worktreeBranch: string): string {
+export function getSubmittedBranch(
+  title: string,
+  worktreeBranch: string,
+): string {
   return worktreeBranch || title || "";
 }
 
-export function getReviewSummary(title: string, worktreeBranch: string): {
+export function getReviewSummary(
+  title: string,
+  worktreeBranch: string,
+): {
   title: string;
   branch: string;
 } {

@@ -23,10 +23,7 @@
 import { ChevronUp } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import type {
-  ConfigOptionDescriptor,
-  AcpState,
-} from "../../lib/acpTypes";
+import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
 interface Props {
   configOptions: AcpState["configOptions"];
@@ -195,9 +192,7 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
                   </span>
                 )}
                 {isPending && (
-                  <span className="text-[10px] uppercase text-text-dim">
-                    …
-                  </span>
+                  <span className="text-[10px] uppercase text-text-dim">…</span>
                 )}
               </button>
             );

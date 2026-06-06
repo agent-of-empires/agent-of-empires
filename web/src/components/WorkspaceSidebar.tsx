@@ -39,11 +39,7 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type {
-  SessionResponse,
-  SessionStatus,
-  Workspace,
-} from "../lib/types";
+import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   nestedSidebarGroupHasLiveWorkspace,
@@ -175,7 +171,10 @@ interface Props {
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
   onToggleGroup: (groupId: string) => void;
-  onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
+  onUpdateRepoAppearance: (
+    repoId: string,
+    update: RepoAppearanceUpdate,
+  ) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
   onSettings: () => void;
@@ -197,7 +196,9 @@ function bestSession(
   createdAt: string | null;
   idleEnteredAt: string | null;
 } {
-  const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
+  const running = ws.sessions.find((s) =>
+    isSessionActive(s, idleDecayWindowMs),
+  );
   if (running)
     return {
       status: running.status,
@@ -317,10 +318,10 @@ function WakeupCountdown({
   }, [elapsed]);
   if (!Number.isFinite(targetMs)) return null;
   const remaining = Math.max(0, Math.floor((targetMs - now) / 1000));
-  const label = elapsed ? "waking…" : `in ${formatDurationSecondsShort(remaining)}`;
-  const title = reason
-    ? `Scheduled wakeup: ${reason}`
-    : "Scheduled wakeup";
+  const label = elapsed
+    ? "waking…"
+    : `in ${formatDurationSecondsShort(remaining)}`;
+  const title = reason ? `Scheduled wakeup: ${reason}` : "Scheduled wakeup";
   return (
     <span
       title={title}
@@ -380,7 +381,8 @@ export function formatSnoozeRemainingShort(snoozedUntilIso: string): string {
 // see each other through a module-scoped global. The document
 // listener checks `ref.current` on every click; rows write to it
 // while dragging and on release.
-export const DragSuppressContext = createContext<MutableRefObject<number> | null>(null);
+export const DragSuppressContext =
+  createContext<MutableRefObject<number> | null>(null);
 function useDragSuppressRef(): MutableRefObject<number> {
   const ref = useContext(DragSuppressContext);
   if (!ref) {
@@ -398,7 +400,9 @@ const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
   slate: "--color-surface-700",
 };
 
-function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
+function repoColorStyle(
+  color: RepoColor | null,
+): React.CSSProperties | undefined {
   if (!color) return undefined;
   const token = REPO_COLOR_TOKENS[color];
   return {
@@ -494,9 +498,7 @@ function SortableSessionRow({
       ref={setNodeRef}
       style={style}
       {...(dragOff ? {} : listeners)}
-      aria-roledescription={
-        dragOff ? undefined : "Press and hold to reorder"
-      }
+      aria-roledescription={dragOff ? undefined : "Press and hold to reorder"}
       // While dragging, the row gets an amber ring (matches the active
       // session accent) and a soft shadow so it reads as elevated above
       // the rest of the list. ring-inset keeps the highlight tight to
@@ -604,10 +606,11 @@ export const SessionRow = memo(function SessionRow({
   onSnooze: (ws: Workspace, minutes: number | null) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
-  const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(
-    workspace,
-    idleDecayWindowMs,
-  );
+  const {
+    status: sessionStatus,
+    createdAt,
+    idleEnteredAt,
+  } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
@@ -631,12 +634,12 @@ export const SessionRow = memo(function SessionRow({
   const label = singleSession
     ? sessionTitle || branchLabel || "default"
     : branchLabel || sessionTitle || "default";
-  const subtitle = singleSession && sessionTitle && branchLabel && sessionTitle !== branchLabel
-    ? branchLabel
-    : null;
-  const subtitleTitle = subtitle && baseBranch
-    ? `${subtitle} (based on ${baseBranch})`
-    : subtitle;
+  const subtitle =
+    singleSession && sessionTitle && branchLabel && sessionTitle !== branchLabel
+      ? branchLabel
+      : null;
+  const subtitleTitle =
+    subtitle && baseBranch ? `${subtitle} (based on ${baseBranch})` : subtitle;
   // Workspace renders as favorited when any of its sessions are
   // favorited. Mirrors the TUI's within-tier pin: the star promotes the
   // row visually so the user can find their starred work fast. Toggled
@@ -649,8 +652,8 @@ export const SessionRow = memo(function SessionRow({
   // `lib/sidebarSort.ts` to keep render and sort in sync. See #1581.
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
-  const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)
-    ?.snoozed_until ?? null;
+  const snoozedUntil =
+    workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId
@@ -753,10 +756,16 @@ export const SessionRow = memo(function SessionRow({
   // sidebar's overlay reconciler drops them once the prop catches up.
   const effectivePinned = effectivePinnedOf(optimistic, isPinned);
   const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
-  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(
+    optimistic,
+    snoozedUntil,
+  );
   const effectiveSnoozed = effectiveSnoozedUntil != null;
 
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -963,7 +972,9 @@ export const SessionRow = memo(function SessionRow({
             />
           </span>
           <div className="min-w-0 flex-1">
-            <span className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}>
+            <span
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
+            >
               {effectivePinned && (
                 <span
                   title="Pinned"
@@ -982,7 +993,9 @@ export const SessionRow = memo(function SessionRow({
                   *
                 </span>
               )}
-              <span className="truncate" title={label}>{label}</span>
+              <span className="truncate" title={label}>
+                {label}
+              </span>
               {hasDraft && (
                 <span
                   title="Unsent draft"
@@ -1024,16 +1037,20 @@ export const SessionRow = memo(function SessionRow({
                   <span className="hidden sm:inline">archived</span>
                 </span>
               )}
-              {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
-                <span
-                  title={`Snoozed until ${new Date(effectiveSnoozedUntil).toLocaleString()}`}
-                  aria-label="Snoozed"
-                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
-                >
-                  <Moon className="h-3 w-3" />
-                  <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
-                </span>
-              )}
+              {!effectiveArchived &&
+                effectiveSnoozed &&
+                effectiveSnoozedUntil && (
+                  <span
+                    title={`Snoozed until ${new Date(effectiveSnoozedUntil).toLocaleString()}`}
+                    aria-label="Snoozed"
+                    className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                  >
+                    <Moon className="h-3 w-3" />
+                    <span>
+                      {formatSnoozeRemainingShort(effectiveSnoozedUntil)}
+                    </span>
+                  </span>
+                )}
               {firstSession?.view === "structured" &&
                 firstSession.acp_worker_state === "resuming" && (
                   <span
@@ -1077,195 +1094,199 @@ export const SessionRow = memo(function SessionRow({
                   firstSession.plan_summary.total &&
                 firstSession.status === "Idle"
               ) && <PlanProgressMini summary={firstSession.plan_summary} />}
-            {firstSession && (firstSession.workspace_repos?.length ?? 0) > 1 && (
-              <span
-                className="mt-0.5 flex flex-wrap gap-1 text-[10px] font-mono text-text-dim"
-                title={firstSession.workspace_repos.map((r) => r.source_path).join("\n")}
-              >
-                {firstSession.workspace_repos.map((r) => (
-                  <span
-                    key={r.source_path}
-                    className="px-1 py-px bg-surface-800/50 border border-surface-700/40 rounded text-text-secondary"
-                  >
-                    {r.name}
-                  </span>
-                ))}
-              </span>
-            )}
+            {firstSession &&
+              (firstSession.workspace_repos?.length ?? 0) > 1 && (
+                <span
+                  className="mt-0.5 flex flex-wrap gap-1 text-[10px] font-mono text-text-dim"
+                  title={firstSession.workspace_repos
+                    .map((r) => r.source_path)
+                    .join("\n")}
+                >
+                  {firstSession.workspace_repos.map((r) => (
+                    <span
+                      key={r.source_path}
+                      className="px-1 py-px bg-surface-800/50 border border-surface-700/40 rounded text-text-secondary"
+                    >
+                      {r.name}
+                    </span>
+                  ))}
+                </span>
+              )}
           </div>
         </div>
       </a>
-      {contextMenu && createPortal(
-        <div
-          ref={menuRef}
-          data-testid="sidebar-context-menu"
-          className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[180px] overflow-y-auto"
-          style={{
-            left: contextMenu.x,
-            top: contextMenu.y,
-            maxHeight: "calc(100vh - 16px)",
-          }}
-        >
-          <button
-            onClick={startRename}
-            data-testid="sidebar-context-menu-rename"
-            className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+      {contextMenu &&
+        createPortal(
+          <div
+            ref={menuRef}
+            data-testid="sidebar-context-menu"
+            className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[180px] overflow-y-auto"
+            style={{
+              left: contextMenu.x,
+              top: contextMenu.y,
+              maxHeight: "calc(100vh - 16px)",
+            }}
           >
-            Rename
-          </button>
-          {!readOnly && canEditWorkdir && (
             <button
-              onClick={openWorkdirModal}
-              data-testid="sidebar-context-menu-edit-workdir"
+              onClick={startRename}
+              data-testid="sidebar-context-menu-rename"
               className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
             >
-              Edit workdir name
+              Rename
             </button>
-          )}
-          {!readOnly && (
-            <button
-              onClick={startGroupEdit}
-              data-testid="sidebar-context-menu-edit-group"
-              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-            >
-              Edit group
-            </button>
-          )}
-          {!readOnly && acpSession && (
-            <button
-              onClick={handleSwitchAgent}
-              data-testid="sidebar-context-menu-switch-agent"
-              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-            >
-              <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
-              Switch agent
-            </button>
-          )}
-          <div className="border-t border-surface-700/20 my-1" />
-          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-            Notifications
-          </div>
-          {(["off", "default", "all"] as const).map((preset) => {
-            const label =
-              preset === "off"
-                ? "Off"
-                : preset === "default"
-                  ? "Default"
-                  : "All events";
-            const selected = notifyPreset === preset;
-            return (
+            {!readOnly && canEditWorkdir && (
               <button
-                key={preset}
-                onClick={() => void setNotifyPreset(preset)}
-                className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
-                  selected ? "text-text-primary" : "text-text-secondary"
-                }`}
+                onClick={openWorkdirModal}
+                data-testid="sidebar-context-menu-edit-workdir"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
               >
-                <span className="w-3 text-brand-500">
-                  {selected ? "✓" : ""}
-                </span>
-                {label}
+                Edit workdir name
               </button>
-            );
-          })}
-          {!readOnly && (
-            <>
-              <div className="border-t border-surface-700/20 my-1" />
-              <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-                Triage
-              </div>
-              {(() => {
-                // Menu actions are gated by the row's current triage
-                // state so contradictory transitions never appear in
-                // the UI: an archived row only offers Unarchive, a
-                // pinned row only offers Unpin, etc. The shape helper
-                // lives in `lib/sidebarSort.ts` so it can be unit
-                // tested. See #1581.
-                const shape = triageMenuShape(
-                  triageStateOf({
-                    isPinned: effectivePinned,
-                    isArchived: effectiveArchived,
-                    isSnoozed: effectiveSnoozed,
-                  }),
-                );
-                return (
-                  <>
-                    {shape.showPin && (
-                      <button
-                        onClick={() => void togglePin()}
-                        data-testid="sidebar-context-menu-pin"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                        Pin
-                      </button>
-                    )}
-                    {shape.showUnpin && (
-                      <button
-                        onClick={() => void togglePin()}
-                        data-testid="sidebar-context-menu-pin"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
-                        Unpin
-                      </button>
-                    )}
-                    {shape.showArchive && (
-                      <button
-                        onClick={() => void toggleArchive()}
-                        data-testid="sidebar-context-menu-archive"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Archive className="h-3.5 w-3.5 shrink-0" />
-                        Archive
-                      </button>
-                    )}
-                    {shape.showUnarchive && (
-                      <button
-                        onClick={() => void toggleArchive()}
-                        data-testid="sidebar-context-menu-archive"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Archive className="h-3.5 w-3.5 shrink-0" />
-                        Unarchive
-                      </button>
-                    )}
-                    {shape.showSnooze && (
-                      <button
-                        onClick={openSnoozeModal}
-                        data-testid="sidebar-context-menu-snooze"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Moon className="h-3.5 w-3.5 shrink-0" />
-                        Snooze…
-                      </button>
-                    )}
-                    {shape.showUnsnooze && (
-                      <button
-                        onClick={() => void applySnooze(null)}
-                        data-testid="sidebar-context-menu-unsnooze"
-                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                      >
-                        <Moon className="h-3.5 w-3.5 shrink-0" />
-                        Unsnooze
-                      </button>
-                    )}
-                  </>
-                );
-              })()}
-              <div className="border-t border-surface-700/20 my-1" />
+            )}
+            {!readOnly && (
               <button
-                onClick={handleDelete}
-                data-testid="sidebar-context-menu-delete"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
+                onClick={startGroupEdit}
+                data-testid="sidebar-context-menu-edit-group"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
               >
-                Delete
+                Edit group
               </button>
-            </>
-          )}
-        </div>,
-        document.body,
-      )}
+            )}
+            {!readOnly && acpSession && (
+              <button
+                onClick={handleSwitchAgent}
+                data-testid="sidebar-context-menu-switch-agent"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+                Switch agent
+              </button>
+            )}
+            <div className="border-t border-surface-700/20 my-1" />
+            <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+              Notifications
+            </div>
+            {(["off", "default", "all"] as const).map((preset) => {
+              const label =
+                preset === "off"
+                  ? "Off"
+                  : preset === "default"
+                    ? "Default"
+                    : "All events";
+              const selected = notifyPreset === preset;
+              return (
+                <button
+                  key={preset}
+                  onClick={() => void setNotifyPreset(preset)}
+                  className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
+                    selected ? "text-text-primary" : "text-text-secondary"
+                  }`}
+                >
+                  <span className="w-3 text-brand-500">
+                    {selected ? "✓" : ""}
+                  </span>
+                  {label}
+                </button>
+              );
+            })}
+            {!readOnly && (
+              <>
+                <div className="border-t border-surface-700/20 my-1" />
+                <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                  Triage
+                </div>
+                {(() => {
+                  // Menu actions are gated by the row's current triage
+                  // state so contradictory transitions never appear in
+                  // the UI: an archived row only offers Unarchive, a
+                  // pinned row only offers Unpin, etc. The shape helper
+                  // lives in `lib/sidebarSort.ts` so it can be unit
+                  // tested. See #1581.
+                  const shape = triageMenuShape(
+                    triageStateOf({
+                      isPinned: effectivePinned,
+                      isArchived: effectiveArchived,
+                      isSnoozed: effectiveSnoozed,
+                    }),
+                  );
+                  return (
+                    <>
+                      {shape.showPin && (
+                        <button
+                          onClick={() => void togglePin()}
+                          data-testid="sidebar-context-menu-pin"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                          Pin
+                        </button>
+                      )}
+                      {shape.showUnpin && (
+                        <button
+                          onClick={() => void togglePin()}
+                          data-testid="sidebar-context-menu-pin"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                          Unpin
+                        </button>
+                      )}
+                      {shape.showArchive && (
+                        <button
+                          onClick={() => void toggleArchive()}
+                          data-testid="sidebar-context-menu-archive"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Archive className="h-3.5 w-3.5 shrink-0" />
+                          Archive
+                        </button>
+                      )}
+                      {shape.showUnarchive && (
+                        <button
+                          onClick={() => void toggleArchive()}
+                          data-testid="sidebar-context-menu-archive"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Archive className="h-3.5 w-3.5 shrink-0" />
+                          Unarchive
+                        </button>
+                      )}
+                      {shape.showSnooze && (
+                        <button
+                          onClick={openSnoozeModal}
+                          data-testid="sidebar-context-menu-snooze"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Moon className="h-3.5 w-3.5 shrink-0" />
+                          Snooze…
+                        </button>
+                      )}
+                      {shape.showUnsnooze && (
+                        <button
+                          onClick={() => void applySnooze(null)}
+                          data-testid="sidebar-context-menu-unsnooze"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Moon className="h-3.5 w-3.5 shrink-0" />
+                          Unsnooze
+                        </button>
+                      )}
+                    </>
+                  );
+                })()}
+                <div className="border-t border-surface-700/20 my-1" />
+                <button
+                  onClick={handleDelete}
+                  data-testid="sidebar-context-menu-delete"
+                  className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
+                >
+                  Delete
+                </button>
+              </>
+            )}
+          </div>,
+          document.body,
+        )}
       {snoozeModalOpen &&
         createPortal(
           <SnoozeModal
@@ -1558,7 +1579,10 @@ export function SnoozeModal({
         className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
       >
         <div className="px-4 py-3 border-b border-surface-700/40">
-          <div className="text-sm font-mono text-text-primary truncate" title={title}>
+          <div
+            className="text-sm font-mono text-text-primary truncate"
+            title={title}
+          >
             Snooze
             <span className="text-text-muted"> · {title}</span>
           </div>
@@ -1698,15 +1722,19 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // menu trigger and rename input are gated off rather than rendered inert.
   const canAppearance = group.capabilities.appearance;
   const headerTitle = group.groupPath ?? group.repoPath;
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [renaming, setRenaming] = useState(false);
-  const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
+  const [renameValue, setRenameValue] = useState(
+    group.alias ?? group.displayName,
+  );
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const dotClass =
-    STATUS_DOT_CLASS[
-      group.status === "active" ? "Running" : "Idle"
-    ] ?? "bg-status-idle";
+    STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ??
+    "bg-status-idle";
   const headerStyle = repoColorStyle(group.color);
   const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
 
@@ -1844,10 +1872,20 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               group.collapsed ? "-rotate-90" : ""
             }`}
           >
-            <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            <path
+              d="M2 3 L5 6.5 L8 3"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           </svg>
           <OwnerAvatar owner={group.remoteOwner} size={16} />
-          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
+          <span
+            className="text-[13px] md:text-[14px] font-medium truncate flex-1"
+            title={headerTitle}
+          >
             {group.displayName}
           </span>
         </button>
@@ -1858,84 +1896,96 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
             aria-label={`New session in ${group.displayName}`}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+            >
               <line x1="12" y1="5" x2="12" y2="19" />
               <line x1="5" y1="12" x2="19" y2="12" />
             </svg>
           </button>
         </Tooltip>
       </div>
-      {canAppearance && contextMenu && createPortal(
-        <div
-          ref={menuRef}
-          data-testid="sidebar-group-context-menu"
-          className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px] overflow-y-auto"
-          style={{
-            left: contextMenu.x,
-            top: contextMenu.y,
-            maxHeight: "calc(100vh - 16px)",
-          }}
-        >
-          <button
-            onClick={() => {
-              setContextMenu(null);
-              setRenameValue(group.alias ?? group.defaultDisplayName);
-              setRenaming(true);
-              requestAnimationFrame(() => renameRef.current?.select());
+      {canAppearance &&
+        contextMenu &&
+        createPortal(
+          <div
+            ref={menuRef}
+            data-testid="sidebar-group-context-menu"
+            className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px] overflow-y-auto"
+            style={{
+              left: contextMenu.x,
+              top: contextMenu.y,
+              maxHeight: "calc(100vh - 16px)",
             }}
-            data-testid="sidebar-group-context-menu-rename"
-            className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
           >
-            Rename
-          </button>
-          {group.alias && (
             <button
               onClick={() => {
                 setContextMenu(null);
-                onUpdateAppearance(group.id, { alias: null });
+                setRenameValue(group.alias ?? group.defaultDisplayName);
+                setRenaming(true);
+                requestAnimationFrame(() => renameRef.current?.select());
               }}
+              data-testid="sidebar-group-context-menu-rename"
               className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
             >
-              Clear alias
+              Rename
             </button>
-          )}
-          <div className="border-t border-surface-700/20 my-1" />
-          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-            Background
-          </div>
-          <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
-            {REPO_COLOR_OPTIONS.map((option) => (
+            {group.alias && (
               <button
-                key={option.id}
+                onClick={() => {
+                  setContextMenu(null);
+                  onUpdateAppearance(group.id, { alias: null });
+                }}
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Clear alias
+              </button>
+            )}
+            <div className="border-t border-surface-700/20 my-1" />
+            <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+              Background
+            </div>
+            <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
+              {REPO_COLOR_OPTIONS.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => {
+                    setContextMenu(null);
+                    onUpdateAppearance(group.id, { color: option.id });
+                  }}
+                  data-testid={`sidebar-group-color-${option.id}`}
+                  aria-label={`Set ${option.label} background`}
+                  className={`h-8 rounded-md border cursor-pointer transition-colors ${
+                    group.color === option.id
+                      ? "border-text-primary"
+                      : "border-surface-700"
+                  }`}
+                  style={repoSwatchStyle(option.id)}
+                />
+              ))}
+              <button
                 type="button"
                 onClick={() => {
                   setContextMenu(null);
-                  onUpdateAppearance(group.id, { color: option.id });
+                  onUpdateAppearance(group.id, { color: null });
                 }}
-                data-testid={`sidebar-group-color-${option.id}`}
-                aria-label={`Set ${option.label} background`}
-                className={`h-8 rounded-md border cursor-pointer transition-colors ${
-                  group.color === option.id ? "border-text-primary" : "border-surface-700"
-                }`}
-                style={repoSwatchStyle(option.id)}
-              />
-            ))}
-            <button
-              type="button"
-              onClick={() => {
-                setContextMenu(null);
-                onUpdateAppearance(group.id, { color: null });
-              }}
-              data-testid="sidebar-group-color-clear"
-              aria-label="Clear background"
-              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
-            >
-              None
-            </button>
-          </div>
-        </div>,
-        document.body,
-      )}
+                data-testid="sidebar-group-color-clear"
+                aria-label="Clear background"
+                className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+              >
+                None
+              </button>
+            </div>
+          </div>,
+          document.body,
+        )}
     </>
   );
 });
@@ -2037,14 +2087,18 @@ export function WorkspaceSidebar({
     setOptimisticActive(null);
   }
   const displayedActiveId =
-    optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
+    optimisticActive?.fromActiveId === activeId
+      ? optimisticActive.id
+      : activeId;
 
   // Whole-row drag. Desktop uses distance activation so a deliberate
   // but stationary click still navigates; touch keeps a long-press delay
   // so scroll-flicks and taps do not reorder rows.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
+    useSensor(TouchSensor, {
+      activationConstraint: { delay: 150, tolerance: 8 },
+    }),
   );
 
   const handleDragEnd = useCallback(
@@ -2130,9 +2184,10 @@ export function WorkspaceSidebar({
     ? groups
         .map((g) => ({
           ...g,
-          workspaces: g.workspaces.filter((v) =>
-            workspaceMatchesFilter(v.workspace, q) ||
-            g.displayName.toLowerCase().includes(q),
+          workspaces: g.workspaces.filter(
+            (v) =>
+              workspaceMatchesFilter(v.workspace, q) ||
+              g.displayName.toLowerCase().includes(q),
           ),
         }))
         .filter((g) => g.workspaces.length > 0)
@@ -2283,7 +2338,10 @@ export function WorkspaceSidebar({
   // (today's behavior), modifier clicks build the selection instead. The row
   // has already guarded button / deleting / drag, and called preventDefault.
   const handleRowActivate = useCallback(
-    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+    (
+      workspaceId: string,
+      e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    ) => {
       // Read-only: ignore modifier gestures entirely and always navigate, so
       // no hidden selection state can build up.
       if (readOnly) {
@@ -2495,136 +2553,137 @@ export function WorkspaceSidebar({
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
           {!isNested && (
-          <DragSuppressContext.Provider value={dragSuppressRef}>
-          <DndContext
-            sensors={sensors}
-            collisionDetection={typedClosestCenter}
-            onDragEnd={reorderDisabled ? undefined : handleDragEnd}
-          >
-            {(() => {
-              const liveGroups = filteredGroups.filter(
-                sidebarGroupHasLiveWorkspace,
-              );
-              // Every visible group is sortable, synthetic Multi-repo /
-              // Scratch included: they default to the bottom but can be
-              // dragged to any position. Group drag is off while a filter
-              // is active (the visible list is a partial projection),
-              // whenever row drag is off (read-only or last-activity
-              // sort), or on the user-group axis (no manual order). See
-              // #1644, #1234.
-              const sortableGroupIds = liveGroups.map((g) => g.id);
-              const groupDragDisabled = reorderDisabled || q.length > 0;
+            <DragSuppressContext.Provider value={dragSuppressRef}>
+              <DndContext
+                sensors={sensors}
+                collisionDetection={typedClosestCenter}
+                onDragEnd={reorderDisabled ? undefined : handleDragEnd}
+              >
+                {(() => {
+                  const liveGroups = filteredGroups.filter(
+                    sidebarGroupHasLiveWorkspace,
+                  );
+                  // Every visible group is sortable, synthetic Multi-repo /
+                  // Scratch included: they default to the bottom but can be
+                  // dragged to any position. Group drag is off while a filter
+                  // is active (the visible list is a partial projection),
+                  // whenever row drag is off (read-only or last-activity
+                  // sort), or on the user-group axis (no manual order). See
+                  // #1644, #1234.
+                  const sortableGroupIds = liveGroups.map((g) => g.id);
+                  const groupDragDisabled = reorderDisabled || q.length > 0;
 
-              const renderGroupBody = (
-                group: SidebarGroup,
-                dragHandle?: DragHandleProps,
-              ) => {
-                const showExpanded = q ? true : !group.collapsed;
-                const hasActiveChild = group.workspaces.some(
-                  (v) => v.workspace.id === displayedActiveId,
-                );
-                return (
-                  <>
-                    <SidebarGroupHeader
-                      group={{ ...group, collapsed: !showExpanded }}
-                      hasActiveChild={!showExpanded && hasActiveChild}
-                      onClick={() => !q && onToggleGroup(group.id)}
-                      onUpdateAppearance={onUpdateRepoAppearance}
-                      onNewSession={() =>
-                        group.capabilities.create === "repo" && group.repoPath
-                          ? onCreateSession(group.repoPath)
-                          : onNew()
-                      }
-                      offline={offline}
-                      dragHandle={dragHandle}
-                    />
-                    {showExpanded &&
-                      (() => {
-                        // Each group renders only its live tier. Sunk
-                        // workspaces (archived or actively snoozed across
-                        // every session) are pulled out into a single
-                        // global "Snoozed & archived" section at the very
-                        // bottom of the sidebar, rather than one footer
-                        // per repo group. See #1581.
-                        const liveWorkspaces = group.workspaces.filter(
-                          (v) => !workspaceIsSunk(v.workspace),
-                        );
-                        return (
-                          <SortableContext
-                            items={liveWorkspaces.map((v) => v.key)}
-                            strategy={verticalListSortingStrategy}
-                          >
-                            {liveWorkspaces.map((v) => (
-                              <SortableSessionRow
-                                key={v.key}
-                                rowKey={v.key}
-                                workspace={v.workspace}
-                                isActive={
-                                  v.workspace.id === displayedActiveId
-                                }
-                                isSelected={
-                                  !readOnly &&
-                                  selection.selectedIds.has(v.workspace.id)
-                                }
-                                onActivate={(e) =>
-                                  handleRowActivate(v.workspace.id, e)
-                                }
-                                onDelete={onDeleteSession}
-                                readOnly={readOnly}
-                                optimistic={triage.optimisticFor(
-                                  v.workspace.id,
-                                )}
-                                onPinToggle={triage.pinToggle}
-                                onArchiveToggle={triage.archiveToggle}
-                                onSnooze={triage.snooze}
-                                // Drag is disabled when the tier
-                                // comparator already controls placement:
-                                // lastActivity mode has no manual
-                                // concept, pinned rows always float to
-                                // the top of their group, and the
-                                // user-group axis has no manual order.
-                                // See #1581, #1234.
-                                dragDisabled={
-                                  reorderDisabled ||
-                                  workspaceIsPinned(v.workspace)
-                                }
-                              />
-                            ))}
-                          </SortableContext>
-                        );
-                      })()}
-                  </>
-                );
-              };
+                  const renderGroupBody = (
+                    group: SidebarGroup,
+                    dragHandle?: DragHandleProps,
+                  ) => {
+                    const showExpanded = q ? true : !group.collapsed;
+                    const hasActiveChild = group.workspaces.some(
+                      (v) => v.workspace.id === displayedActiveId,
+                    );
+                    return (
+                      <>
+                        <SidebarGroupHeader
+                          group={{ ...group, collapsed: !showExpanded }}
+                          hasActiveChild={!showExpanded && hasActiveChild}
+                          onClick={() => !q && onToggleGroup(group.id)}
+                          onUpdateAppearance={onUpdateRepoAppearance}
+                          onNewSession={() =>
+                            group.capabilities.create === "repo" &&
+                            group.repoPath
+                              ? onCreateSession(group.repoPath)
+                              : onNew()
+                          }
+                          offline={offline}
+                          dragHandle={dragHandle}
+                        />
+                        {showExpanded &&
+                          (() => {
+                            // Each group renders only its live tier. Sunk
+                            // workspaces (archived or actively snoozed across
+                            // every session) are pulled out into a single
+                            // global "Snoozed & archived" section at the very
+                            // bottom of the sidebar, rather than one footer
+                            // per repo group. See #1581.
+                            const liveWorkspaces = group.workspaces.filter(
+                              (v) => !workspaceIsSunk(v.workspace),
+                            );
+                            return (
+                              <SortableContext
+                                items={liveWorkspaces.map((v) => v.key)}
+                                strategy={verticalListSortingStrategy}
+                              >
+                                {liveWorkspaces.map((v) => (
+                                  <SortableSessionRow
+                                    key={v.key}
+                                    rowKey={v.key}
+                                    workspace={v.workspace}
+                                    isActive={
+                                      v.workspace.id === displayedActiveId
+                                    }
+                                    isSelected={
+                                      !readOnly &&
+                                      selection.selectedIds.has(v.workspace.id)
+                                    }
+                                    onActivate={(e) =>
+                                      handleRowActivate(v.workspace.id, e)
+                                    }
+                                    onDelete={onDeleteSession}
+                                    readOnly={readOnly}
+                                    optimistic={triage.optimisticFor(
+                                      v.workspace.id,
+                                    )}
+                                    onPinToggle={triage.pinToggle}
+                                    onArchiveToggle={triage.archiveToggle}
+                                    onSnooze={triage.snooze}
+                                    // Drag is disabled when the tier
+                                    // comparator already controls placement:
+                                    // lastActivity mode has no manual
+                                    // concept, pinned rows always float to
+                                    // the top of their group, and the
+                                    // user-group axis has no manual order.
+                                    // See #1581, #1234.
+                                    dragDisabled={
+                                      reorderDisabled ||
+                                      workspaceIsPinned(v.workspace)
+                                    }
+                                  />
+                                ))}
+                              </SortableContext>
+                            );
+                          })()}
+                      </>
+                    );
+                  };
 
-              return (
-                <SortableContext
-                  items={sortableGroupIds}
-                  strategy={verticalListSortingStrategy}
-                >
-                  {liveGroups.map((group) => (
-                    <SortableRepoGroup
-                      key={group.id}
-                      groupId={group.id}
-                      disabled={groupDragDisabled}
+                  return (
+                    <SortableContext
+                      items={sortableGroupIds}
+                      strategy={verticalListSortingStrategy}
                     >
-                      {(handle) =>
-                        // Hide the grip when group drag is off (the
-                        // visible order is computed or filtered) so
-                        // there is no dead affordance, mirroring how
-                        // session rows drop their drag wiring.
-                        renderGroupBody(
-                          group,
-                          groupDragDisabled ? undefined : handle,
-                        )
-                      }
-                    </SortableRepoGroup>
-                  ))}
-                </SortableContext>
-              );
-            })()}
-          </DndContext>
-          </DragSuppressContext.Provider>
+                      {liveGroups.map((group) => (
+                        <SortableRepoGroup
+                          key={group.id}
+                          groupId={group.id}
+                          disabled={groupDragDisabled}
+                        >
+                          {(handle) =>
+                            // Hide the grip when group drag is off (the
+                            // visible order is computed or filtered) so
+                            // there is no dead affordance, mirroring how
+                            // session rows drop their drag wiring.
+                            renderGroupBody(
+                              group,
+                              groupDragDisabled ? undefined : handle,
+                            )
+                          }
+                        </SortableRepoGroup>
+                      ))}
+                    </SortableContext>
+                  );
+                })()}
+              </DndContext>
+            </DragSuppressContext.Provider>
           )}
           {isNested &&
             filteredNested
@@ -2768,9 +2827,7 @@ export function WorkspaceSidebar({
                       strokeLinejoin="round"
                     />
                   </svg>
-                  <span>
-                    Snoozed &amp; archived ({sunkWorkspaces.length})
-                  </span>
+                  <span>Snoozed &amp; archived ({sunkWorkspaces.length})</span>
                 </button>
                 {sunkExpanded &&
                   sunkWorkspaces.map((v) => (

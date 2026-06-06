@@ -285,9 +285,7 @@ describe("updateSessionGroup", () => {
 
 describe("markWebTourSeen", () => {
   it("POSTs /api/app-state/web-tour-seen with no body", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      jsonResponse({ has_seen_web_tour: true }),
-    );
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ has_seen_web_tour: true }));
     const ok = await markWebTourSeen();
     expect(ok).toBe(true);
     const [url, init] = fetchSpy.mock.calls[0]!;

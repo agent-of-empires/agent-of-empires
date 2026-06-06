@@ -17,9 +17,7 @@ async function openSession(page: Page, handle: MockHandle) {
 }
 
 function sentText(handle: MockHandle, start: number) {
-  return handle.wsMessages
-    .slice(start)
-    .map((msg) => msg.toString("utf8"));
+  return handle.wsMessages.slice(start).map((msg) => msg.toString("utf8"));
 }
 
 test.describe("Terminal IME input", () => {

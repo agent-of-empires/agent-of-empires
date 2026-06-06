@@ -85,7 +85,9 @@ describe("useHighlightedLines", () => {
     await waitFor(() => {
       expect(result.current.tokens).not.toBeNull();
     });
-    expect(result.current.tokens).toEqual([[[{ content: "x", color: "#abcdef" }]]]);
+    expect(result.current.tokens).toEqual([
+      [[{ content: "x", color: "#abcdef" }]],
+    ]);
     expect(codeToTokens).toHaveBeenCalledWith(
       "x",
       expect.objectContaining({ lang: "tsx", theme: "github-dark" }),
@@ -94,7 +96,9 @@ describe("useHighlightedLines", () => {
 
   it("falls back to empty grid when the highlighter rejects", async () => {
     useShikiTheme.mockReturnValue({ theme: "github-dark", appearance: "dark" });
-    langImportForPath.mockReturnValue(() => Promise.resolve({ default: [{ name: "tsx" }] }));
+    langImportForPath.mockReturnValue(() =>
+      Promise.resolve({ default: [{ name: "tsx" }] }),
+    );
     ensureThemeLoaded.mockResolvedValue("github-dark");
     // Simulates the real-world CSP WASM block: createHighlighterCore
     // rejects with a CompileError, so the IIFE must enter the catch

@@ -25,7 +25,8 @@ function setup(overrides?: {
   isSandboxed?: boolean;
   isScratch?: boolean;
 }) {
-  const onConfirm = overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
+  const onConfirm =
+    overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
   const onCancel = overrides?.onCancel ?? vi.fn();
   const utils = render(
     <DeleteSessionDialog
@@ -50,7 +51,9 @@ describe("DeleteSessionDialog keyboard affordances", () => {
   it("focuses the Delete button on mount so Enter activates it natively", () => {
     const { container } = setup();
     const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
+      (b) =>
+        b.textContent?.includes("Delete") &&
+        !b.textContent.includes("Deleting"),
     );
     expect(deleteBtn).toBeTruthy();
     expect(document.activeElement).toBe(deleteBtn);
@@ -101,7 +104,9 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm });
     const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
+      (b) =>
+        b.textContent?.includes("Delete") &&
+        !b.textContent.includes("Deleting"),
     )!;
     expect(document.activeElement).toBe(deleteBtn);
     // Dispatch keydown from the focused button (bubbles up to document)
@@ -222,7 +227,9 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     });
 
     expect(
-      container.querySelector('[data-testid="delete-session-checkbox-worktree"]'),
+      container.querySelector(
+        '[data-testid="delete-session-checkbox-worktree"]',
+      ),
     ).toBeNull();
     expect(
       container.querySelector('[data-testid="delete-session-checkbox-branch"]'),

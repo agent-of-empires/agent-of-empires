@@ -15,10 +15,7 @@ function mk(id: string, text: string): QueuedPrompt {
   return { id, text, queuedAt: "2026-05-21T00:00:00.000Z" };
 }
 
-function renderWithProfile(
-  toolKey: string,
-  queued: QueuedPrompt[],
-) {
+function renderWithProfile(toolKey: string, queued: QueuedPrompt[]) {
   return render(
     <AgentProfileProvider toolKey={toolKey}>
       <QueuedPromptsStrip

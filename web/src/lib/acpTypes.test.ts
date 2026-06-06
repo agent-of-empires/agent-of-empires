@@ -176,9 +176,7 @@ describe("applyEvent / UserPromptSent", () => {
     const done = state.activity.find((a) => a.id === "done-tc-bash");
     expect(done).toBeDefined();
     expect(done!.kind).toBe("tool_complete");
-    expect(done!.text).toBe(
-      "abc1234 first commit\ndef5678 second commit\n",
-    );
+    expect(done!.text).toBe("abc1234 first commit\ndef5678 second commit\n");
     expect(state.inFlightTool).toBeNull();
   });
 
@@ -343,9 +341,7 @@ describe("applyEvent / UserPromptSent", () => {
     const startRow = state.activity.find(
       (a) => a.kind === "tool_start" && a.toolCallId === "tc-bash",
     );
-    expect(startRow?.tool?.args_preview).toBe(
-      '{"command":"git log -n 10"}',
-    );
+    expect(startRow?.tool?.args_preview).toBe('{"command":"git log -n 10"}');
     expect(startRow?.tool?.name).toBe("Terminal");
     expect(state.inFlightTool?.args_preview).toBe(
       '{"command":"git log -n 10"}',
@@ -658,13 +654,20 @@ describe("applyEvent / AvailableCommandsUpdated", () => {
         AvailableCommandsUpdated: {
           commands: [
             { name: "review", description: "Review PR", accepts_input: true },
-            { name: "clear", description: "Clear context", accepts_input: false },
+            {
+              name: "clear",
+              description: "Clear context",
+              accepts_input: false,
+            },
           ],
         },
       },
     };
     const s2 = applyEvent(s1, f2);
-    expect(s2.availableCommands.map((c) => c.name)).toEqual(["review", "clear"]);
+    expect(s2.availableCommands.map((c) => c.name)).toEqual([
+      "review",
+      "clear",
+    ]);
     expect(s2.availableCommands[0].accepts_input).toBe(true);
   });
 });
@@ -853,7 +856,9 @@ describe("applyEvent / Stopped empty-output fallback", () => {
       seq: 3,
       event: { Stopped: {} },
     });
-    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
+    expect(
+      state.activity.find((r) => r.kind === "empty_output"),
+    ).toBeUndefined();
   });
 
   it("does not append the notice when a tool call ran during the turn", () => {
@@ -882,7 +887,9 @@ describe("applyEvent / Stopped empty-output fallback", () => {
       seq: 3,
       event: { Stopped: {} },
     });
-    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
+    expect(
+      state.activity.find((r) => r.kind === "empty_output"),
+    ).toBeUndefined();
   });
 });
 
@@ -1369,7 +1376,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 10_000,
             size: 200_000,
-            cost: { amount: 0.10, currency: "USD" },
+            cost: { amount: 0.1, currency: "USD" },
           },
         },
       },
@@ -1427,7 +1434,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 20_000,
             size: 200_000,
-            cost: { amount: 0.30, currency: "USD" },
+            cost: { amount: 0.3, currency: "USD" },
           },
         },
       },
@@ -1437,7 +1444,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
       seq: 2,
       event: "ConversationCompacted",
     });
-    expect(state.usageBaseline?.cost).toBeCloseTo(0.30, 6);
+    expect(state.usageBaseline?.cost).toBeCloseTo(0.3, 6);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
@@ -1509,7 +1516,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 10_000,
             size: 200_000,
-            cost: { amount: 0.20, currency: "USD" },
+            cost: { amount: 0.2, currency: "USD" },
           },
         },
       },
@@ -1519,7 +1526,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
       seq: 2,
       event: "SessionCleared",
     });
-    expect(state.usageBaseline?.cost).toBeCloseTo(0.20, 6);
+    expect(state.usageBaseline?.cost).toBeCloseTo(0.2, 6);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
@@ -1561,7 +1568,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 10_000,
             size: 200_000,
-            cost: { amount: 0.10, currency: "USD" },
+            cost: { amount: 0.1, currency: "USD" },
           },
         },
       },
@@ -1571,7 +1578,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
       seq: 2,
       event: "SessionCleared",
     });
-    expect(state.usageBaseline?.cost).toBeCloseTo(0.10, 6);
+    expect(state.usageBaseline?.cost).toBeCloseTo(0.1, 6);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
@@ -1623,7 +1630,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 10_000,
             size: 200_000,
-            cost: { amount: 0.10, currency: "USD" },
+            cost: { amount: 0.1, currency: "USD" },
           },
         },
       },
@@ -1633,7 +1640,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
       seq: 2,
       event: "SessionCleared",
     });
-    expect(state.usageBaseline?.cost).toBeCloseTo(0.10, 6);
+    expect(state.usageBaseline?.cost).toBeCloseTo(0.1, 6);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
@@ -1673,7 +1680,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 10_000,
             size: 200_000,
-            cost: { amount: 0.50, currency: "USD" },
+            cost: { amount: 0.5, currency: "USD" },
           },
         },
       },
@@ -1691,7 +1698,7 @@ describe("applyEvent / usageBaseline (#1354)", () => {
           usage: {
             used: 100,
             size: 200_000,
-            cost: { amount: 0.10, currency: "USD" },
+            cost: { amount: 0.1, currency: "USD" },
           },
         },
       },
@@ -1810,15 +1817,15 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
   // are the source of truth a late `Stopped` cannot clobber.
 
   it("isTurnActive flips on / off when counters cross", () => {
-    expect(
-      isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 }),
-    ).toBe(true);
-    expect(
-      isTurnActive({ pendingUserPromptSeq: 1, lastStoppedSeq: 1 }),
-    ).toBe(false);
-    expect(
-      isTurnActive({ pendingUserPromptSeq: 0, lastStoppedSeq: 0 }),
-    ).toBe(false);
+    expect(isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 })).toBe(
+      true,
+    );
+    expect(isTurnActive({ pendingUserPromptSeq: 1, lastStoppedSeq: 1 })).toBe(
+      false,
+    );
+    expect(isTurnActive({ pendingUserPromptSeq: 0, lastStoppedSeq: 0 })).toBe(
+      false,
+    );
   });
 
   it("Stopped advances lastStoppedSeq by one and recomputes turnActive", () => {

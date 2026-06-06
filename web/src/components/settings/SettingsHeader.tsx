@@ -30,9 +30,13 @@ export function SettingsHeader({
       >
         &larr; Back
       </button>
-      <span className="text-xs font-mono text-text-bright shrink-0">Settings</span>
+      <span className="text-xs font-mono text-text-bright shrink-0">
+        Settings
+      </span>
       {saving && (
-        <span className="text-[11px] font-mono text-text-dim shrink-0">Saving...</span>
+        <span className="text-[11px] font-mono text-text-dim shrink-0">
+          Saving...
+        </span>
       )}
       {saveError && (
         <span

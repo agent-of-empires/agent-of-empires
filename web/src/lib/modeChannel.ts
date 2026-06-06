@@ -22,11 +22,7 @@
 // When none apply (a non-claude agent that advertised nothing), the
 // picker renders nothing rather than a vocabulary the agent rejects.
 
-import type {
-  AcpState,
-  ConfigOptionDescriptor,
-  SessionMode,
-} from "./acpTypes";
+import type { AcpState, ConfigOptionDescriptor, SessionMode } from "./acpTypes";
 
 /** Claude's historical four-mode taxonomy. Used only as the
  *  `capabilities.legacyModeFallback` fallback; not an ACP default. */
@@ -36,10 +32,30 @@ export const LEGACY_MODES: ReadonlyArray<{
   name: string;
   description: string;
 }> = [
-  { id: "default", legacyId: "Default", name: "Default", description: "Approve each tool individually" },
-  { id: "plan", legacyId: "Plan", name: "Plan", description: "Plan first, no edits applied" },
-  { id: "accept_edits", legacyId: "AcceptEdits", name: "Accept edits", description: "Auto-approve safe file edits" },
-  { id: "bypass_permissions", legacyId: "BypassPermissions", name: "Yolo", description: "Skip all approvals (destructive)" },
+  {
+    id: "default",
+    legacyId: "Default",
+    name: "Default",
+    description: "Approve each tool individually",
+  },
+  {
+    id: "plan",
+    legacyId: "Plan",
+    name: "Plan",
+    description: "Plan first, no edits applied",
+  },
+  {
+    id: "accept_edits",
+    legacyId: "AcceptEdits",
+    name: "Accept edits",
+    description: "Auto-approve safe file edits",
+  },
+  {
+    id: "bypass_permissions",
+    legacyId: "BypassPermissions",
+    name: "Yolo",
+    description: "Skip all approvals (destructive)",
+  },
 ];
 
 export interface ModeOption {
@@ -87,9 +103,7 @@ export interface ResolveModeChannelArgs {
 function findModeConfig(
   options: ConfigOptionDescriptor[],
 ): ConfigOptionDescriptor | undefined {
-  return options.find(
-    (o) => o.category === "mode" && o.options.length > 0,
-  );
+  return options.find((o) => o.category === "mode" && o.options.length > 0);
 }
 
 /** Resolve the mode-picker channel, or null when the picker should not

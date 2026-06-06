@@ -369,10 +369,7 @@ function initialState(sessionId: string | null): AcpState {
   return cacheGet(sessionId) ?? emptyAcpState();
 }
 
-export function acpHookReducer(
-  state: AcpState,
-  action: Action,
-): AcpState {
+export function acpHookReducer(state: AcpState, action: Action): AcpState {
   return reducer(state, action);
 }
 
@@ -808,10 +805,7 @@ export function useAcpSession(
       window.removeEventListener("pageshow", handler);
     };
   }, []);
-  const getVisibilitySnapshot = useCallback(
-    () => visCounterRef.current,
-    [],
-  );
+  const getVisibilitySnapshot = useCallback(() => visCounterRef.current, []);
   const visCounter = useSyncExternalStore(
     subscribeVisibility,
     getVisibilitySnapshot,
@@ -1231,8 +1225,7 @@ export function useAcpSession(
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
-          message:
-            "Acp disconnected; message not sent. Reconnect to retry.",
+          message: "Acp disconnected; message not sent. Reconnect to retry.",
         });
         return "retryable_failure";
       }

@@ -43,10 +43,9 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
     // Bring the worker up. The supervisor's spawn is `tokio::spawn`'d
     // inside enable, so the worker entry may not yet exist when enable
     // returns; poll up to 5s for the registry insert.
-    await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-      { method: "POST" },
-    );
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, {
+      method: "POST",
+    });
 
     let postDeleteStatus = 0;
     for (let attempt = 0; attempt < 25; attempt++) {
@@ -64,7 +63,9 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
     // still true on the session record. That's the contract that
     // distinguishes shutdown from disable.
     const after = await listSessions(serve.baseUrl);
-    expect(after.find((s) => s.id === sessionId)!.view === "structured").toBe(true);
+    expect(after.find((s) => s.id === sessionId)!.view === "structured").toBe(
+      true,
+    );
 
     // The reconciler may re-spawn the worker for a session whose
     // structured_view is still true, so a second DELETE can land on either

@@ -156,7 +156,8 @@ export function getQueuedCount(sessionId: string): number {
   if (typeof window === "undefined") return 0;
   let count: number;
   try {
-    count = parseQueuedCount(window.localStorage.getItem(storageKey(sessionId))) ?? 0;
+    count =
+      parseQueuedCount(window.localStorage.getItem(storageKey(sessionId))) ?? 0;
   } catch {
     // localStorage blocked/threw: don't memoise a transient failure.
     return 0;

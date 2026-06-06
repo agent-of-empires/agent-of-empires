@@ -83,7 +83,10 @@ export function ContentSplit({
   }, [collapsed]);
 
   return (
-    <div ref={containerRef} className="flex-1 flex min-h-0 overflow-hidden relative">
+    <div
+      ref={containerRef}
+      className="flex-1 flex min-h-0 overflow-hidden relative"
+    >
       {/* Terminal pane */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">{left}</div>
 

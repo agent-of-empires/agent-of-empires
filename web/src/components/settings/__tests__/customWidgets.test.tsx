@@ -110,7 +110,10 @@ describe("LoggingTargetsWidget", () => {
     const save = vi.fn(() => Promise.resolve(true));
     const { rerender } = render(
       <LoggingTargetsWidget
-        descriptor={descriptor({ field: "targets", label: "Per-target overrides" })}
+        descriptor={descriptor({
+          field: "targets",
+          label: "Per-target overrides",
+        })}
         value={{}}
         save={save}
       />,
@@ -122,7 +125,10 @@ describe("LoggingTargetsWidget", () => {
 
     rerender(
       <LoggingTargetsWidget
-        descriptor={descriptor({ field: "targets", label: "Per-target overrides" })}
+        descriptor={descriptor({
+          field: "targets",
+          label: "Per-target overrides",
+        })}
         value={{ "acp.protocol": "debug" }}
         save={save}
       />,
@@ -206,7 +212,10 @@ describe("DefaultToolWidget", () => {
     const save = vi.fn(() => Promise.resolve(true));
     const { container } = render(
       <DefaultToolWidget
-        descriptor={descriptor({ field: "default_tool", label: "Default agent" })}
+        descriptor={descriptor({
+          field: "default_tool",
+          label: "Default agent",
+        })}
         value="claude"
         save={save}
       />,

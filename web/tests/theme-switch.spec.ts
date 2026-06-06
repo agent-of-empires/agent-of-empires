@@ -230,10 +230,10 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     // so dataset.theme + --color-surface-900 should be visible
     // immediately after navigation.
     await expect
-      .poll(
-        () => readCssVar(page, "--color-surface-900"),
-        { timeout: 1500, intervals: [50, 100, 200] },
-      )
+      .poll(() => readCssVar(page, "--color-surface-900"), {
+        timeout: 1500,
+        intervals: [50, 100, 200],
+      })
       .toBe("#282a36");
     const dataTheme = await page.evaluate(
       () => document.documentElement.dataset.theme,

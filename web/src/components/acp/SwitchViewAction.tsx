@@ -81,7 +81,9 @@ export function SwitchViewAction({
     }
   };
 
-  const triggerLabel = structuredView ? "Switch to terminal view" : "Switch to structured view";
+  const triggerLabel = structuredView
+    ? "Switch to terminal view"
+    : "Switch to structured view";
   const triggerDisabled = (!structuredView && !acpCapable) || offline;
 
   return (

@@ -14,7 +14,13 @@
 //   - offline + rolled-back states disable the action surface.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
@@ -222,9 +228,7 @@ describe("ApprovalCard (benign)", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Allow"));
     });
-    expect(
-      screen.getByText(/Could not reach the server/i),
-    ).toBeTruthy();
+    expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
   });
 });
 

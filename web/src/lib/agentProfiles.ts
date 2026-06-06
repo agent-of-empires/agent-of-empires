@@ -82,7 +82,13 @@ export interface AgentProfile {
 
 const CLAUDE: AgentProfile = {
   key: "claude",
-  capabilities: { todos: true, skills: true, wakeup: true, subagents: true, legacyModeFallback: true },
+  capabilities: {
+    todos: true,
+    skills: true,
+    wakeup: true,
+    subagents: true,
+    legacyModeFallback: true,
+  },
   parentMetaNamespaces: ["claudeCode"],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/clear"],
@@ -100,7 +106,13 @@ const CLAUDE_CODE: AgentProfile = {
 
 const CODEX: AgentProfile = {
   key: "codex",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/new"],
@@ -114,7 +126,13 @@ const CODEX: AgentProfile = {
 
 const OPENCODE: AgentProfile = {
   key: "opencode",
-  capabilities: { todos: true, skills: false, wakeup: false, subagents: true, legacyModeFallback: false },
+  capabilities: {
+    todos: true,
+    skills: false,
+    wakeup: false,
+    subagents: true,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: ["/new"],
@@ -131,7 +149,13 @@ const OPENCODE: AgentProfile = {
 
 const GEMINI: AgentProfile = {
   key: "gemini",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
@@ -147,7 +171,13 @@ const GEMINI: AgentProfile = {
 
 const VIBE: AgentProfile = {
   key: "vibe",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
@@ -157,7 +187,13 @@ const VIBE: AgentProfile = {
 
 const PI: AgentProfile = {
   key: "pi",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],
@@ -175,7 +211,13 @@ const AOE_AGENT: AgentProfile = {
  *  through the generic card path rather than crashing. */
 export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   key: "default",
-  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+  },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
   clearAliases: [],

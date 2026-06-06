@@ -38,7 +38,8 @@ const test = base.extend<{ servePreauthed: ServeHandle }>({
 function authHeaders(handle: ServeHandle): Record<string, string> {
   const out: Record<string, string> = {};
   if (handle.sessionCookie) {
-    out["Cookie"] = `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
+    out["Cookie"] =
+      `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
   }
   if (handle.deviceBindingSecret) {
     out["X-Aoe-Device-Binding"] = handle.deviceBindingSecret;
@@ -78,7 +79,13 @@ test("login session survives an aoe serve restart with no re-prompt", async ({
   expect(devices.length).toBeGreaterThan(0);
   const mine = devices.find((d) => d.current === true);
   expect(mine, "the requesting session is flagged current").toBeTruthy();
-  for (const field of ["session_id", "user_agent", "created_ip", "created_at", "last_seen"]) {
+  for (const field of [
+    "session_id",
+    "user_agent",
+    "created_ip",
+    "created_at",
+    "last_seen",
+  ]) {
     expect(mine).toHaveProperty(field);
   }
 });
@@ -87,11 +94,17 @@ test("elevation does not survive restart: high-risk actions re-prompt", async ({
   servePreauthed,
 }) => {
   // Elevate the live session.
-  const elevateRes = await fetch(`${servePreauthed.baseUrl}/api/login/elevate`, {
-    method: "POST",
-    headers: { ...authHeaders(servePreauthed), "Content-Type": "application/json" },
-    body: JSON.stringify({ passphrase: servePreauthed.passphrase }),
-  });
+  const elevateRes = await fetch(
+    `${servePreauthed.baseUrl}/api/login/elevate`,
+    {
+      method: "POST",
+      headers: {
+        ...authHeaders(servePreauthed),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ passphrase: servePreauthed.passphrase }),
+    },
+  );
   expect(elevateRes.ok).toBe(true);
   expect((await loginStatus(servePreauthed)).elevated).toBe(true);
 
@@ -118,7 +131,9 @@ test("revoke removes one device and sign-out-all clears every session", async ({
   const passphrase = servePreauthed.passphrase!;
 
   // Create a second device by logging in with a distinct binding secret.
-  const otherBinding = Buffer.from(new Uint8Array(32).fill(0x5a)).toString("base64url");
+  const otherBinding = Buffer.from(new Uint8Array(32).fill(0x5a)).toString(
+    "base64url",
+  );
   const loginRes = await fetch(`${servePreauthed.baseUrl}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -126,10 +141,10 @@ test("revoke removes one device and sign-out-all clears every session", async ({
   });
   expect(loginRes.ok).toBe(true);
 
-  const devicesBefore: Array<{ session_id: string; current: boolean }> = await fetch(
-    `${servePreauthed.baseUrl}/api/devices`,
-    { headers: authHeaders(servePreauthed) },
-  ).then((r) => r.json());
+  const devicesBefore: Array<{ session_id: string; current: boolean }> =
+    await fetch(`${servePreauthed.baseUrl}/api/devices`, {
+      headers: authHeaders(servePreauthed),
+    }).then((r) => r.json());
   expect(devicesBefore.length).toBe(2);
   const otherSession = devicesBefore.find((d) => !d.current);
   expect(otherSession).toBeTruthy();
@@ -145,7 +160,9 @@ test("revoke removes one device and sign-out-all clears every session", async ({
     `${servePreauthed.baseUrl}/api/devices`,
     { headers: authHeaders(servePreauthed) },
   ).then((r) => r.json());
-  expect(devicesAfter.some((d) => d.session_id === otherSession!.session_id)).toBe(false);
+  expect(
+    devicesAfter.some((d) => d.session_id === otherSession!.session_id),
+  ).toBe(false);
 
   // Sign out everyone. The current session is dropped too.
   const all = await fetch(`${servePreauthed.baseUrl}/api/login/logout-all`, {

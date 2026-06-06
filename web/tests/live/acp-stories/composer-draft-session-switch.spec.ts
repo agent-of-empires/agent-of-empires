@@ -96,7 +96,9 @@ base("composer draft survives a session switch", async ({ page }, testInfo) => {
       await enableStructuredViewAndWait(serve.baseUrl, id);
     }
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });
@@ -113,14 +115,18 @@ base("composer draft survives a session switch", async ({ page }, testInfo) => {
       )
       .toBe("draft-on-session-a");
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionB.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionB.id)}`,
+    );
     await waitForStructuredView(page);
     // Session B starts with an empty composer.
     await expect(
       page.getByRole("textbox", { name: /Send a message/i }),
     ).toHaveValue("");
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`,
+    );
     await waitForStructuredView(page);
     await expect(
       page.getByRole("textbox", { name: /Send a message/i }),

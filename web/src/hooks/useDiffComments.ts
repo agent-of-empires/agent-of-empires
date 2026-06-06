@@ -95,44 +95,59 @@ export function useDiffComments(
     [bumpSave],
   );
 
-  const updateComment = useCallback((id: string, body: string) => {
-    const ts = new Date().toISOString();
-    setState((s) => ({
-      ...s,
-      comments: s.comments.map((c) =>
-        c.id === id ? { ...c, body, updatedAt: ts } : c,
-      ),
-    }));
-    bumpSave();
-  }, [bumpSave]);
+  const updateComment = useCallback(
+    (id: string, body: string) => {
+      const ts = new Date().toISOString();
+      setState((s) => ({
+        ...s,
+        comments: s.comments.map((c) =>
+          c.id === id ? { ...c, body, updatedAt: ts } : c,
+        ),
+      }));
+      bumpSave();
+    },
+    [bumpSave],
+  );
 
-  const deleteComment = useCallback((id: string) => {
-    setState((s) => ({
-      ...s,
-      comments: s.comments.filter((c) => c.id !== id),
-    }));
-    bumpSave();
-  }, [bumpSave]);
+  const deleteComment = useCallback(
+    (id: string) => {
+      setState((s) => ({
+        ...s,
+        comments: s.comments.filter((c) => c.id !== id),
+      }));
+      bumpSave();
+    },
+    [bumpSave],
+  );
 
   const clearComments = useCallback(() => {
     setState((s) => ({ ...s, comments: [] }));
     bumpSave();
   }, [bumpSave]);
 
-  const setClearAfterSend = useCallback((v: boolean) => {
-    setState((s) => ({ ...s, clearAfterSend: v }));
-    bumpSave();
-  }, [bumpSave]);
+  const setClearAfterSend = useCallback(
+    (v: boolean) => {
+      setState((s) => ({ ...s, clearAfterSend: v }));
+      bumpSave();
+    },
+    [bumpSave],
+  );
 
-  const setIntroDraft = useCallback((v: string) => {
-    setState((s) => ({ ...s, introDraft: v }));
-    bumpSave();
-  }, [bumpSave]);
+  const setIntroDraft = useCallback(
+    (v: string) => {
+      setState((s) => ({ ...s, introDraft: v }));
+      bumpSave();
+    },
+    [bumpSave],
+  );
 
-  const setOutroDraft = useCallback((v: string) => {
-    setState((s) => ({ ...s, outroDraft: v }));
-    bumpSave();
-  }, [bumpSave]);
+  const setOutroDraft = useCallback(
+    (v: string) => {
+      setState((s) => ({ ...s, outroDraft: v }));
+      bumpSave();
+    },
+    [bumpSave],
+  );
 
   return useMemo(
     () => ({

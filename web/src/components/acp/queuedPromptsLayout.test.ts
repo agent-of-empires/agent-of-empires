@@ -6,10 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  isQueuedPromptLong,
-  queuedStripLayout,
-} from "./queuedPromptsLayout";
+import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 
 describe("queuedStripLayout (#1232)", () => {
   describe("desktop default N=2", () => {

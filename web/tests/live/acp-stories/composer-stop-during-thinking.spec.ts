@@ -15,7 +15,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../../helpers/acp";
 
 const SCRIPT = {
   turns: [
@@ -51,11 +54,14 @@ base("Stop button cancels a thinking turn", async ({ page }, testInfo) => {
 
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "story-stop-thinking");
-    if (!seeded) throw new Error("seeded session 'story-stop-thinking' missing");
+    if (!seeded)
+      throw new Error("seeded session 'story-stop-thinking' missing");
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });

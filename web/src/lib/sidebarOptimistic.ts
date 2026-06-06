@@ -1,5 +1,8 @@
 import type { Workspace } from "./types";
-import { resolveEffectiveSnoozedUntil, snoozeTimestampCloseEnough } from "./sidebarSort";
+import {
+  resolveEffectiveSnoozedUntil,
+  snoozeTimestampCloseEnough,
+} from "./sidebarSort";
 
 /** Wall-clock target for an optimistic snooze: `Date.now() + minutes *
  *  60_000` as an RFC3339 ISO string. Sits outside any component so the
@@ -72,7 +75,10 @@ export function effectiveSnoozedUntilOf(
   optimistic: OptimisticTriage,
   serverSnoozedUntil: string | null | undefined,
 ): string | null | undefined {
-  return resolveEffectiveSnoozedUntil(optimistic.snoozedUntil, serverSnoozedUntil);
+  return resolveEffectiveSnoozedUntil(
+    optimistic.snoozedUntil,
+    serverSnoozedUntil,
+  );
 }
 
 /** True when an override has been caught up to by the server and can be
@@ -124,7 +130,10 @@ export function reconcileOptimistic(
     const archived = fieldCaughtUp(override.archived, server.isArchived)
       ? null
       : override.archived;
-    const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, server.snoozedUntil)
+    const snoozedUntil = snoozeCaughtUp(
+      override.snoozedUntil,
+      server.snoozedUntil,
+    )
       ? undefined
       : override.snoozedUntil;
     if (
@@ -157,6 +166,6 @@ export function withOverride(
     snoozedUntil:
       "snoozedUntil" in patch
         ? patch.snoozedUntil
-        : prev?.snoozedUntil ?? undefined,
+        : (prev?.snoozedUntil ?? undefined),
   };
 }

@@ -149,10 +149,7 @@ function trimToBudget(batch: ClientLogEntry[]): ClientLogEntry[] {
   return out;
 }
 
-export function reportError(
-  err: unknown,
-  ctx?: Partial<ClientLogEntry>,
-): void {
+export function reportError(err: unknown, ctx?: Partial<ClientLogEntry>): void {
   const { message, stack } = normalizeError(err);
   enqueue({
     level: ctx?.level ?? "error",

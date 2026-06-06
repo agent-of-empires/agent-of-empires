@@ -1,4 +1,12 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
@@ -116,12 +124,14 @@ export default function App() {
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
-  const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
+  const [idleDecayWindowMs, setIdleDecayWindowMs] =
+    useState(IDLE_DECAY_WINDOW_MS);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
     window.addEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
-    return () => window.removeEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
+    return () =>
+      window.removeEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
   }, []);
 
   // Clearing tokenExpired here matters: the render order below shows
@@ -197,8 +207,7 @@ export default function App() {
  *  typing in an `<input>`, `<textarea>`, or contenteditable element
  *  (or any contenteditable ancestor of a deeper rich-text widget). */
 function isInsideEditable(target: EventTarget | null): boolean {
-  let el: HTMLElement | null =
-    target instanceof HTMLElement ? target : null;
+  let el: HTMLElement | null = target instanceof HTMLElement ? target : null;
   while (el) {
     const tag = el.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable) {
@@ -209,7 +218,13 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
-function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
+function AppContent({
+  loginRequired,
+  onLogout,
+}: {
+  loginRequired: boolean;
+  onLogout: () => void;
+}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
@@ -274,8 +289,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     updateRepoAppearance,
     reorderRepoGroups,
   } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
-  const { groups: sessionGroups, toggleGroupCollapsed } =
-    useSessionGroups(workspaces, sidebarSortMode);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
+    workspaces,
+    sidebarSortMode,
+  );
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
@@ -338,8 +355,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // pane shows one of agent / diff / paired, chosen via the picker (#1452).
   const isMdUp = useIsWideViewport();
   const singlePane = !isMdUp;
-  const [rightPanelView, setRightPanelView] =
-    useState<RightPanelView>("agent");
+  const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
@@ -394,7 +410,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   useEffect(() => {
     if (!commentSendEnabled) return;
     const onKey = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")) {
+      if (
+        !((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")
+      ) {
         return;
       }
       if (isInsideEditable(e.target)) return;
@@ -421,7 +439,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Inline derivation for diffFiles validation: if the selected file is no
   // longer in the diff, clear the selection.
-  if (activeSessionId && selectedFilePath && !diffFilesLoading && !diffFiles.some((f) => f.path === selectedFilePath)) {
+  if (
+    activeSessionId &&
+    selectedFilePath &&
+    !diffFilesLoading &&
+    !diffFiles.some((f) => f.path === selectedFilePath)
+  ) {
     setSelectedFile(null);
   }
 
@@ -458,18 +481,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     [isCoarse],
   );
 
-  const handleSelectSession = useCallback((sessionId: string) => {
-    const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
-    if (ws) {
-      navigate(`/session/${encodeURIComponent(sessionId)}`);
-      // The proxy is a real textarea; focusing it inside the click gesture
-      // would pop the soft keyboard on touch devices, so skip it on coarse
-      // pointers (#1178), matching the focusAgentInput suppression.
-      if (!isCoarse) focusKeyboardProxy();
-      focusAgentInput(ws.sessions.find((s) => s.id === sessionId));
-      if (window.innerWidth < 768) setSidebarOpen(false);
-    }
-  }, [navigate, workspaces, focusAgentInput, isCoarse]);
+  const handleSelectSession = useCallback(
+    (sessionId: string) => {
+      const ws = workspaces.find((w) =>
+        w.sessions.some((s) => s.id === sessionId),
+      );
+      if (ws) {
+        navigate(`/session/${encodeURIComponent(sessionId)}`);
+        // The proxy is a real textarea; focusing it inside the click gesture
+        // would pop the soft keyboard on touch devices, so skip it on coarse
+        // pointers (#1178), matching the focusAgentInput suppression.
+        if (!isCoarse) focusKeyboardProxy();
+        focusAgentInput(ws.sessions.find((s) => s.id === sessionId));
+        if (window.innerWidth < 768) setSidebarOpen(false);
+      }
+    },
+    [navigate, workspaces, focusAgentInput, isCoarse],
+  );
 
   const handleSelectWorkspace = (workspaceId: string) => {
     const ws = workspaces.find((w) => w.id === workspaceId);
@@ -506,8 +534,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   }, [handleSelectSession]);
 
-  const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
+  const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(
+    undefined,
+  );
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(
+    null,
+  );
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -573,63 +605,71 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
-  const handleConfirmDelete = useCallback(async (options: DeleteSessionOptions) => {
-    if (!deletingSession) return;
-    const sessionId = deletingSession.id;
-    const wasActive = sessionId === activeSessionId;
+  const handleConfirmDelete = useCallback(
+    async (options: DeleteSessionOptions) => {
+      if (!deletingSession) return;
+      const sessionId = deletingSession.id;
+      const wasActive = sessionId === activeSessionId;
 
-    // Close dialog and show "Deleting" status immediately
-    setDeletingWorkspaceId(null);
-    setSessionStatus(sessionId, "Deleting");
+      // Close dialog and show "Deleting" status immediately
+      setDeletingWorkspaceId(null);
+      setSessionStatus(sessionId, "Deleting");
 
-    if (wasActive) {
-      navigate("/");
-    }
+      if (wasActive) {
+        navigate("/");
+      }
 
-    const result = await deleteSession(sessionId, options);
-    if (!result.ok) {
-      // Revert status on failure
-      setSessionStatus(sessionId, "Error");
-      toastBus.handler?.error(result.error || "Failed to delete session");
-      return;
-    }
+      const result = await deleteSession(sessionId, options);
+      if (!result.ok) {
+        // Revert status on failure
+        setSessionStatus(sessionId, "Error");
+        toastBus.handler?.error(result.error || "Failed to delete session");
+        return;
+      }
 
-    // Drop the per-session acp cache so a recreated session with
-    // the same id doesn't briefly show the prior transcript on
-    // remount before fetchReplay clears it.
-    clearAcpCache(sessionId);
-    // Drop the persisted composer draft for the deleted session so its
-    // localStorage key doesn't linger (#1358). Cross-tab / cross-device
-    // deletes go through the startup sweep instead.
-    clearDraft(sessionId);
-    // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
-    // cross-device deletes still fall to the startup sweep.
-    clearStoredComments(sessionId);
+      // Drop the per-session acp cache so a recreated session with
+      // the same id doesn't briefly show the prior transcript on
+      // remount before fetchReplay clears it.
+      clearAcpCache(sessionId);
+      // Drop the persisted composer draft for the deleted session so its
+      // localStorage key doesn't linger (#1358). Cross-tab / cross-device
+      // deletes go through the startup sweep instead.
+      clearDraft(sessionId);
+      // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
+      // cross-device deletes still fall to the startup sweep.
+      clearStoredComments(sessionId);
 
-    // Server returns `messages` from `perform_deletion` when there's something
-    // user-facing to report (e.g. "Scratch directory kept at: <path>" when
-    // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-    const toast = result.messages?.[0] ?? "Session deleted";
-    toastBus.handler?.info(toast);
-  }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
+      // Server returns `messages` from `perform_deletion` when there's something
+      // user-facing to report (e.g. "Scratch directory kept at: <path>" when
+      // `keep_scratch` is set). Surface the first one so the kept-path is visible.
+      const toast = result.messages?.[0] ?? "Session deleted";
+      toastBus.handler?.info(toast);
+    },
+    [deletingSession, activeSessionId, setSessionStatus, navigate],
+  );
 
-  const handleCreateSession = useCallback((repoPath: string) => {
-    const projectSessions = sessions
-      .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
-      .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
-    const latest = projectSessions[0];
+  const handleCreateSession = useCallback(
+    (repoPath: string) => {
+      const projectSessions = sessions
+        .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
+        .sort((a, b) =>
+          (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""),
+        );
+      const latest = projectSessions[0];
 
-    setWizardPrefill({
-      path: repoPath,
-      tool: latest?.tool ?? "claude",
-      yoloMode: latest?.yolo_mode ?? false,
-      sandboxEnabled: latest?.is_sandboxed ?? false,
-      profile: latest?.profile || undefined,
-      group: latest?.group_path || undefined,
-      skipToReview: true,
-    });
-    setShowSessionWizard(true);
-  }, [sessions]);
+      setWizardPrefill({
+        path: repoPath,
+        tool: latest?.tool ?? "claude",
+        yoloMode: latest?.yolo_mode ?? false,
+        sandboxEnabled: latest?.is_sandboxed ?? false,
+        profile: latest?.profile || undefined,
+        group: latest?.group_path || undefined,
+        skipToReview: true,
+      });
+      setShowSessionWizard(true);
+    },
+    [sessions],
+  );
 
   // The right-panel control toggles the desktop split, but on mobile there
   // is no split to collapse: it opens the view picker instead (#1452).
@@ -646,12 +686,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setPickerOpen(false);
   }, []);
 
-  const handleSelectFile = useCallback(
-    (path: string, repoName?: string) => {
-      setSelectedFile({ path, repoName });
-    },
-    [],
-  );
+  const handleSelectFile = useCallback((path: string, repoName?: string) => {
+    setSelectedFile({ path, repoName });
+  }, []);
 
   // Open a local file reference cited in an acp transcript (Codex
   // `path:line` markdown links). Resolve the absolute path back to a
@@ -859,7 +896,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
-        onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
+        onSettings: () =>
+          showSettings ? handleCloseSettings() : navigate("/settings"),
         onPalette: () => setShowPalette((p) => !p),
         onToggleSidebar: () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleDiff(),
@@ -1022,7 +1060,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                     <StructuredView
                       key={activeSessionId}
                       sessionId={activeSessionId!}
-                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                      acpWorkerState={
+                        activeSession.acp_worker_state ?? "absent"
+                      }
                       tool={activeSession.tool}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
@@ -1032,11 +1072,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                 ) : (
                   <TerminalSessionStack
                     activeSessionId={activeSessionId!}
-                    sessions={sessions.filter((session) => session.view !== "structured")}
+                    sessions={sessions.filter(
+                      (session) => session.view !== "structured",
+                    )}
                     persistent={webSettings.persistentTerminals}
-                    maxPersistentTerminals={
-                      webSettings.maxPersistentTerminals
-                    }
+                    maxPersistentTerminals={webSettings.maxPersistentTerminals}
                   />
                 )}
               </div>
@@ -1232,126 +1272,132 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-    <div
-      className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
-      style={rootStyle}
-    >
-      <TopBar
-        activeWorkspace={activeWorkspace}
-        activeSession={activeSession ?? null}
-        onToggleSidebar={handleToggleSidebar}
-        onOpenPalette={() => setShowPalette(true)}
-        onToggleDiff={toggleDiff}
-        diffCollapsed={diffCollapsed}
-        onOpenHelp={handleOpenHelp}
-        onOpenAbout={handleOpenAbout}
-        onStartTutorial={tour.startTour}
-        onLogout={onLogout}
-        loginRequired={loginRequired}
-        isOffline={!!error}
-        isDevBuild={isDebugBuild(serverAbout)}
-        onGoDashboard={handleGoDashboard}
-      />
+      <div
+        className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset"
+        style={rootStyle}
+      >
+        <TopBar
+          activeWorkspace={activeWorkspace}
+          activeSession={activeSession ?? null}
+          onToggleSidebar={handleToggleSidebar}
+          onOpenPalette={() => setShowPalette(true)}
+          onToggleDiff={toggleDiff}
+          diffCollapsed={diffCollapsed}
+          onOpenHelp={handleOpenHelp}
+          onOpenAbout={handleOpenAbout}
+          onStartTutorial={tour.startTour}
+          onLogout={onLogout}
+          loginRequired={loginRequired}
+          isOffline={!!error}
+          isDevBuild={isDebugBuild(serverAbout)}
+          onGoDashboard={handleGoDashboard}
+        />
 
-      <DisconnectBanner />
-      <UpdateBanner />
+        <DisconnectBanner />
+        <UpdateBanner />
 
-      <div className="flex flex-1 min-h-0">
-        {!showSettings && !showProjects && (
-          <WorkspaceSidebar
-            groups={sidebarGroups}
-            nestedGroups={nestedGroups}
-            onToggleSubgroup={toggleSubgroupCollapsed}
-            onReorderWorkspaces={handleReorderWorkspaces}
-            onReorderGroups={reorderRepoGroups}
-            activeId={activeWorkspace?.id ?? null}
-            open={sidebarOpen}
-            onToggle={() => setSidebarOpen(false)}
-            onSelect={handleSelectWorkspace}
-            onToggleGroup={toggleSidebarGroup}
-            onUpdateRepoAppearance={updateRepoAppearance}
-            onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
-            onCreateSession={handleCreateSession}
-            onSettings={handleOpenSettings}
-            onProjects={handleOpenProjects}
-            onProfiles={handleOpenProfiles}
-            onDeleteSession={handleDeleteSession}
-            readOnly={serverAbout?.read_only}
-            sortMode={sidebarSortMode}
-            onSortModeChange={setSidebarSortMode}
-            axis={sidebarAxis}
-            onAxisChange={setSidebarAxis}
+        <div className="flex flex-1 min-h-0">
+          {!showSettings && !showProjects && (
+            <WorkspaceSidebar
+              groups={sidebarGroups}
+              nestedGroups={nestedGroups}
+              onToggleSubgroup={toggleSubgroupCollapsed}
+              onReorderWorkspaces={handleReorderWorkspaces}
+              onReorderGroups={reorderRepoGroups}
+              activeId={activeWorkspace?.id ?? null}
+              open={sidebarOpen}
+              onToggle={() => setSidebarOpen(false)}
+              onSelect={handleSelectWorkspace}
+              onToggleGroup={toggleSidebarGroup}
+              onUpdateRepoAppearance={updateRepoAppearance}
+              onNew={() => {
+                setWizardPrefill(undefined);
+                setShowSessionWizard(true);
+              }}
+              onCreateSession={handleCreateSession}
+              onSettings={handleOpenSettings}
+              onProjects={handleOpenProjects}
+              onProfiles={handleOpenProfiles}
+              onDeleteSession={handleDeleteSession}
+              readOnly={serverAbout?.read_only}
+              sortMode={sidebarSortMode}
+              onSortModeChange={setSidebarSortMode}
+              axis={sidebarAxis}
+              onAxisChange={setSidebarAxis}
+            />
+          )}
+
+          <div className="flex-1 flex flex-col min-h-0 min-w-0">
+            {renderContent()}
+          </div>
+        </div>
+
+        {showSessionWizard && (
+          <SessionWizard
+            onClose={() => {
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            onCreated={(session?: SessionResponse) => {
+              if (session) {
+                injectSession(session);
+                navigate(`/session/${encodeURIComponent(session.id)}`);
+                if (window.innerWidth < 768) setSidebarOpen(false);
+              }
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            prefill={wizardPrefill}
           />
         )}
 
-        <div className="flex-1 flex flex-col min-h-0 min-w-0">
-          {renderContent()}
-        </div>
+        {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
+
+        {tour.tourElement}
+
+        {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+
+        {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+        {telemetryConsentNeeded && (
+          <TelemetryConsentModal onChoose={handleTelemetryConsent} />
+        )}
+
+        {deletingSession && (
+          <DeleteSessionDialog
+            sessionTitle={deletingSession.title}
+            branchName={deletingSession.branch}
+            hasManagedWorktree={deletingSession.has_managed_worktree}
+            isSandboxed={deletingSession.is_sandboxed}
+            isScratch={deletingSession.scratch}
+            cleanupDefaults={deletingSession.cleanup_defaults}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setDeletingWorkspaceId(null)}
+          />
+        )}
+
+        <CommandPalette
+          open={showPalette}
+          onClose={() => setShowPalette(false)}
+          actions={commandActions}
+        />
+
+        {activeWorkspace && activeSession && (
+          <MobileRightPanelPicker
+            open={pickerOpen && singlePane}
+            active={rightPanelView}
+            onSelect={handlePickView}
+            onClose={() => setPickerOpen(false)}
+          />
+        )}
+
+        <textarea
+          ref={keyboardProxyRef}
+          aria-hidden="true"
+          tabIndex={-1}
+          className="fixed opacity-0 w-0 h-0 pointer-events-none"
+          style={{ top: -9999, left: -9999 }}
+        />
       </div>
-
-      {showSessionWizard && (
-        <SessionWizard
-          onClose={() => { setShowSessionWizard(false); setWizardPrefill(undefined); }}
-          onCreated={(session?: SessionResponse) => {
-            if (session) {
-              injectSession(session);
-              navigate(`/session/${encodeURIComponent(session.id)}`);
-              if (window.innerWidth < 768) setSidebarOpen(false);
-            }
-            setShowSessionWizard(false);
-            setWizardPrefill(undefined);
-          }}
-          prefill={wizardPrefill}
-        />
-      )}
-
-      {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
-
-      {tour.tourElement}
-
-      {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
-
-      {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
-      {telemetryConsentNeeded && (
-        <TelemetryConsentModal onChoose={handleTelemetryConsent} />
-      )}
-
-      {deletingSession && (
-        <DeleteSessionDialog
-          sessionTitle={deletingSession.title}
-          branchName={deletingSession.branch}
-          hasManagedWorktree={deletingSession.has_managed_worktree}
-          isSandboxed={deletingSession.is_sandboxed}
-          isScratch={deletingSession.scratch}
-          cleanupDefaults={deletingSession.cleanup_defaults}
-          onConfirm={handleConfirmDelete}
-          onCancel={() => setDeletingWorkspaceId(null)}
-        />
-      )}
-
-      <CommandPalette
-        open={showPalette}
-        onClose={() => setShowPalette(false)}
-        actions={commandActions}
-      />
-
-      {activeWorkspace && activeSession && (
-        <MobileRightPanelPicker
-          open={pickerOpen && singlePane}
-          active={rightPanelView}
-          onSelect={handlePickView}
-          onClose={() => setPickerOpen(false)}
-        />
-      )}
-
-      <textarea
-        ref={keyboardProxyRef}
-        aria-hidden="true"
-        tabIndex={-1}
-        className="fixed opacity-0 w-0 h-0 pointer-events-none"
-        style={{ top: -9999, left: -9999 }}
-      />
-    </div>
     </AcpPrefsProvider>
   );
 }

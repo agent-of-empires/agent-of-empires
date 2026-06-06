@@ -42,12 +42,42 @@ const DIFF_FILE_RESPONSE = {
       new_start: 1,
       new_lines: 5,
       lines: [
-        { type: "equal", old_line_num: 1, new_line_num: 1, content: 'import { useState } from "react";\n' },
-        { type: "delete", old_line_num: 2, new_line_num: null, content: "const x = 42;\n" },
-        { type: "add", old_line_num: null, new_line_num: 2, content: "const x: number = 42;\n" },
-        { type: "add", old_line_num: null, new_line_num: 3, content: "function greet(name: string): string {\n" },
-        { type: "add", old_line_num: null, new_line_num: 4, content: "  return `Hello, ${name}`;\n" },
-        { type: "equal", old_line_num: 3, new_line_num: 5, content: "export default x;\n" },
+        {
+          type: "equal",
+          old_line_num: 1,
+          new_line_num: 1,
+          content: 'import { useState } from "react";\n',
+        },
+        {
+          type: "delete",
+          old_line_num: 2,
+          new_line_num: null,
+          content: "const x = 42;\n",
+        },
+        {
+          type: "add",
+          old_line_num: null,
+          new_line_num: 2,
+          content: "const x: number = 42;\n",
+        },
+        {
+          type: "add",
+          old_line_num: null,
+          new_line_num: 3,
+          content: "function greet(name: string): string {\n",
+        },
+        {
+          type: "add",
+          old_line_num: null,
+          new_line_num: 4,
+          content: "  return `Hello, ${name}`;\n",
+        },
+        {
+          type: "equal",
+          old_line_num: 3,
+          new_line_num: 5,
+          content: "export default x;\n",
+        },
       ],
     },
   ],
@@ -80,7 +110,10 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
+          path === "docker/status" ||
+          path === "about" ||
+          path === "settings" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -130,9 +163,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     r.fulfill({ json: DIFF_FILE_RESPONSE }),
   );
   // Structured view panel endpoints — content irrelevant for these tests.
-  await page.route("**/api/sessions/*/acp/**", (r) =>
-    r.fulfill({ json: {} }),
-  );
+  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {
     // No-op: we don't need a working stream for diff comment tests.
   });
@@ -242,13 +273,10 @@ test.describe("Diff comments (#928)", () => {
       assembledMarkdown?: string;
     }
     let captured: CapturedBody | null = null;
-    await page.route(
-      "**/api/sessions/*/acp/prompt/diff-comments",
-      (r) => {
-        captured = JSON.parse(r.request().postData() || "{}");
-        return r.fulfill({ json: {} });
-      },
-    );
+    await page.route("**/api/sessions/*/acp/prompt/diff-comments", (r) => {
+      captured = JSON.parse(r.request().postData() || "{}");
+      return r.fulfill({ json: {} });
+    });
     // Capture the usage-signal pings so we can assert `diff_comments` fires
     // on a confirmed send (#1881).
     const seenSignals: string[] = [];
@@ -268,12 +296,18 @@ test.describe("Diff comments (#928)", () => {
       .fill("**rename** this please");
     await page.getByRole("button", { name: "Save" }).click();
     // Open the send dialog via the banner's Send button.
-    await page.getByRole("button", { name: /^Send$/ }).first().click();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .first()
+      .click();
     // Dialog open: heading "Send diff comments"
     await expect(page.getByText("Send diff comments")).toBeVisible();
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
     // Confirm send (dialog's own Send button is the last one in the DOM).
-    await page.getByRole("button", { name: /^Send$/ }).last().click();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .last()
+      .click();
     await expect.poll(() => captured?.assembledMarkdown).toBeTruthy();
     // Structured fields the transcript card renders from.
     expect(captured?.intro).toBe("Hey:");

@@ -76,9 +76,7 @@ export function humanizeServer(server: string): string {
   return server
     .split(/[-_]/)
     .filter(Boolean)
-    .map((c) =>
-      /[A-Z]/.test(c) ? c : c.charAt(0).toUpperCase() + c.slice(1),
-    )
+    .map((c) => (/[A-Z]/.test(c) ? c : c.charAt(0).toUpperCase() + c.slice(1)))
     .join(" ");
 }
 

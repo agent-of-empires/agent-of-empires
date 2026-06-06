@@ -6,7 +6,9 @@
 import { test, expect } from "@playwright/test";
 import { listSessions, spawnAoeServe } from "../helpers/aoeServe";
 
-test("wizard with Use structured view on creates a structured_view session", async ({ page }, testInfo) => {
+test("wizard with Use structured view on creates a structured_view session", async ({
+  page,
+}, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
@@ -40,7 +42,9 @@ test("wizard with Use structured view on creates a structured_view session", asy
     // master switch is on, so the "Use structured view" toggle is shown and
     // defaults on. The docs tell the user to leave it on; assert that,
     // then advance.
-    const acpToggle = wizard.getByRole("switch", { name: "Use structured view" });
+    const acpToggle = wizard.getByRole("switch", {
+      name: "Use structured view",
+    });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: "Next" }).click();

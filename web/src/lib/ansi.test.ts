@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  collapseCarriageReturns,
-  hasAnsi,
-  parseAnsi,
-  stripAnsi,
-} from "./ansi";
+import { collapseCarriageReturns, hasAnsi, parseAnsi, stripAnsi } from "./ansi";
 
 const ESC = String.fromCharCode(0x1b);
 

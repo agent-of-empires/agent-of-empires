@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -28,10 +34,7 @@ interface Props {
 const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
-export function TerminalView({
-  session,
-  active = true,
-}: Props) {
+export function TerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
     "pending",
   );
@@ -262,21 +265,24 @@ export function TerminalView({
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">
-            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/{maxRetries})
+            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/
+            {maxRetries})
           </span>
         </div>
       )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Connection lost</span>
-          <button
-            onClick={manualReconnect}
-            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      {!state.connected &&
+        !state.reconnecting &&
+        state.retryCount >= maxRetries && (
+          <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+            <span className="text-xs text-status-error">Connection lost</span>
+            <button
+              onClick={manualReconnect}
+              className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
       <div
         data-term="agent"

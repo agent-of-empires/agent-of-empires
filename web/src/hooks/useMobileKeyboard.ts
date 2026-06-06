@@ -108,10 +108,12 @@ export function useMobileKeyboard() {
     let lastOpen = false;
     let lastPadding = 0;
 
-    const safeBottom = parseFloat(
-      getComputedStyle(document.documentElement)
-        .getPropertyValue("--safe-area-bottom"),
-    ) || 0;
+    const safeBottom =
+      parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue(
+          "--safe-area-bottom",
+        ),
+      ) || 0;
 
     const scheduleOcclusionCommit = (target: number) => {
       if (target === committedOcclusionRef.current) return;
@@ -167,7 +169,10 @@ export function useMobileKeyboard() {
           stableCountRef.current = 0;
         }
         lastOcclusionRef.current = occlusion;
-        if (stableCountRef.current < STABLE_THRESHOLD && frameCount < MAX_POLL_FRAMES) {
+        if (
+          stableCountRef.current < STABLE_THRESHOLD &&
+          frameCount < MAX_POLL_FRAMES
+        ) {
           rafRef.current = requestAnimationFrame(poll);
         }
       };

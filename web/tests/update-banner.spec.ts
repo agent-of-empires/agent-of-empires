@@ -40,13 +40,16 @@ async function mock(page: Page, status: UpdateStatusFixture) {
 }
 
 test.describe("Update banner (#984, #1140)", () => {
-  test("renders when update_available is true and mode is notify", async ({ page }) => {
+  test("renders when update_available is true and mode is notify", async ({
+    page,
+  }) => {
     await mock(page, {
       update_check_mode: "notify",
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
+      release_url:
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -57,13 +60,17 @@ test.describe("Update banner (#984, #1140)", () => {
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("v0.5.0");
     await expect(banner).toContainText("v0.6.0");
-    await expect(banner.getByRole("link", { name: "Release notes" })).toHaveAttribute(
+    await expect(
+      banner.getByRole("link", { name: "Release notes" }),
+    ).toHaveAttribute(
       "href",
       "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
     );
   });
 
-  test("hidden when update_check_mode is off (server suppresses)", async ({ page }) => {
+  test("hidden when update_check_mode is off (server suppresses)", async ({
+    page,
+  }) => {
     await mock(page, {
       update_check_mode: "off",
       current_version: "0.5.0",
@@ -81,13 +88,16 @@ test.describe("Update banner (#984, #1140)", () => {
     ).toHaveCount(0);
   });
 
-  test("hidden when update_check_mode is auto (background install)", async ({ page }) => {
+  test("hidden when update_check_mode is auto (background install)", async ({
+    page,
+  }) => {
     await mock(page, {
       update_check_mode: "auto",
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
+      release_url:
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -105,7 +115,8 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.6.0",
       latest_version: "0.6.0",
       update_available: false,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
+      release_url:
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -123,7 +134,8 @@ test.describe("Update banner (#984, #1140)", () => {
       current_version: "0.5.0",
       latest_version: "0.6.0",
       update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
+      release_url:
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       web_poll_interval_minutes: 60,
       error: null,
     });
@@ -144,13 +156,16 @@ test.describe("Update banner (#984, #1140)", () => {
     ).toHaveCount(0);
   });
 
-  test("dismissed version no longer suppresses newer release", async ({ page }) => {
+  test("dismissed version no longer suppresses newer release", async ({
+    page,
+  }) => {
     await mock(page, {
       update_check_mode: "notify",
       current_version: "0.5.0",
       latest_version: "0.7.0",
       update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.7.0",
+      release_url:
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.7.0",
       web_poll_interval_minutes: 60,
       error: null,
     });

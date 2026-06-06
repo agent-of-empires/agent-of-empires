@@ -22,12 +22,12 @@ test("per-profile setting override leaves global state untouched", async ({
 
   // Capture baselines for the default-profile read and the work-profile
   // read. The work read should mirror defaults until we patch it.
-  const globalBefore: { session?: { default_tool?: string | null } } = await fetch(
-    `${serve.baseUrl}/api/settings`,
-  ).then((r) => r.json());
-  const workBefore: { session?: { default_tool?: string | null } } = await fetch(
-    `${serve.baseUrl}/api/profiles/work/settings`,
-  ).then((r) => r.json());
+  const globalBefore: { session?: { default_tool?: string | null } } =
+    await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
+  const workBefore: { session?: { default_tool?: string | null } } =
+    await fetch(`${serve.baseUrl}/api/profiles/work/settings`).then((r) =>
+      r.json(),
+    );
 
   const sentinel = "claude-code-override-test";
   expect(globalBefore?.session?.default_tool).not.toBe(sentinel);
@@ -47,7 +47,9 @@ test("per-profile setting override leaves global state untouched", async ({
 
   // Land on the Session settings tab and pick the `work` profile.
   await page.goto(`${serve.baseUrl}/settings/session`);
-  await expect(page.getByTestId("settings-header").getByText("Profile", { exact: true })).toBeVisible();
+  await expect(
+    page.getByTestId("settings-header").getByText("Profile", { exact: true }),
+  ).toBeVisible();
 
   const profileSelect = page
     .locator("label", { hasText: /^Profile$/ })
@@ -76,9 +78,8 @@ test("per-profile setting override leaves global state untouched", async ({
   // Global profile: unchanged. This is the isolation property the issue
   // asks us to assert. Normalize both sides to `null` because the server
   // omits the field entirely when it has no value.
-  const globalAfter: { session?: { default_tool?: string | null } } = await fetch(
-    `${serve.baseUrl}/api/settings`,
-  ).then((r) => r.json());
+  const globalAfter: { session?: { default_tool?: string | null } } =
+    await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
   expect(globalAfter?.session?.default_tool ?? null).toBe(
     globalBefore?.session?.default_tool ?? null,
   );

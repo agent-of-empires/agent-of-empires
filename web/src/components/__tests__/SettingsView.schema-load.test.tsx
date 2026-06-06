@@ -65,9 +65,7 @@ describe("SettingsView schema load", () => {
 
     // Retry refetches; the second call returns the schema and fields render.
     fireEvent.click(retry);
-    await waitFor(() =>
-      expect(screen.getByText("Path Template")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText("Path Template")).toBeTruthy());
     expect(screen.queryByText("Failed to load settings schema.")).toBeNull();
     expect(vi.mocked(api.getSettingsSchema)).toHaveBeenCalledTimes(2);
   });

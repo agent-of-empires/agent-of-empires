@@ -52,7 +52,9 @@ function cardFor(page: import("@playwright/test").Page) {
     .locator("xpath=ancestor::div[contains(@class,'rounded-md')][1]");
 }
 
-test("stopping mid-tool settles the card and survives reload", async ({ page }, testInfo) => {
+test("stopping mid-tool settles the card and survives reload", async ({
+  page,
+}, testInfo) => {
   let serveHandle: { home: string } | undefined;
   let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-stuck-tool-"));
@@ -76,7 +78,9 @@ test("stopping mid-tool settles the card and survives reload", async ({ page }, 
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });

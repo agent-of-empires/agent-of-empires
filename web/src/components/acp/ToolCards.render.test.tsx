@@ -616,12 +616,16 @@ describe("ToolCards failed-card folding (#1467)", () => {
       name: "Read",
       kind: "read",
       args_preview: JSON.stringify({
-        file_path: "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
+        file_path:
+          "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
       }),
     });
     const { container, getAllByRole } = render(
       <Wrap toolKey="claude">
-        <ToolCard tool={tool} result={makeError({ text: "memory read boom" })} />
+        <ToolCard
+          tool={tool}
+          result={makeError({ text: "memory read boom" })}
+        />
       </Wrap>,
     );
     expect(container.textContent).toContain("tool failed");
@@ -637,7 +641,9 @@ describe("ToolCards failed-card folding (#1467)", () => {
         <ToolCard
           tool={fixtures.generic}
           result={makeCompletion({
-            output: [{ kind: "image", mime_type: "image/png", data: "BASE64IMG" }],
+            output: [
+              { kind: "image", mime_type: "image/png", data: "BASE64IMG" },
+            ],
           })}
         />
       </Wrap>,
@@ -667,7 +673,9 @@ describe("ToolCards failed-card folding (#1467)", () => {
     );
     const audio = container.querySelector("audio");
     expect(audio).not.toBeNull();
-    expect(audio!.getAttribute("src")).toBe("data:audio/wav;base64,BASE64AUDIO");
+    expect(audio!.getAttribute("src")).toBe(
+      "data:audio/wav;base64,BASE64AUDIO",
+    );
     const link = container.querySelector('a[href="file:///report.pdf"]');
     expect(link).not.toBeNull();
     expect(container.textContent).toContain("report.pdf");

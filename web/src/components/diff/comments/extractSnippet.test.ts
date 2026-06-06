@@ -11,7 +11,12 @@ function hunk(): RichDiffHunk {
     lines: [
       { type: "equal", old_line_num: 10, new_line_num: 10, content: "a\n" },
       { type: "equal", old_line_num: 11, new_line_num: 11, content: "b\n" },
-      { type: "delete", old_line_num: 12, new_line_num: null, content: "old\n" },
+      {
+        type: "delete",
+        old_line_num: 12,
+        new_line_num: null,
+        content: "old\n",
+      },
       { type: "add", old_line_num: null, new_line_num: 12, content: "new1\n" },
       { type: "add", old_line_num: null, new_line_num: 13, content: "new2\n" },
       { type: "equal", old_line_num: 13, new_line_num: 14, content: "c\n" },

@@ -1,4 +1,7 @@
-import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
+import type {
+  SettingsFieldDescriptor,
+  SettingsValidation,
+} from "../../lib/types";
 import {
   CollapsibleSection,
   ListField,
@@ -66,7 +69,13 @@ function describe(d: SettingsFieldDescriptor): string {
 /** Visible placeholder for a `custom` widget whose `id` has no registered web
  *  component. Rendering this (rather than silently dropping the field) keeps a
  *  schema/web mismatch obvious instead of letting a setting vanish. */
-function UnsupportedCustomWidget({ d, id }: { d: SettingsFieldDescriptor; id: string }) {
+function UnsupportedCustomWidget({
+  d,
+  id,
+}: {
+  d: SettingsFieldDescriptor;
+  id: string;
+}) {
   return (
     <div className="text-xs text-status-error bg-status-error/10 rounded-lg p-3">
       No web control registered for "{d.label}" (custom widget "{id}"). Edit it

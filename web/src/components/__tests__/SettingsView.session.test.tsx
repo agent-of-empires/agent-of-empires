@@ -72,7 +72,10 @@ function commit(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-function textareaByLabel(container: HTMLElement, label: string): HTMLTextAreaElement {
+function textareaByLabel(
+  container: HTMLElement,
+  label: string,
+): HTMLTextAreaElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
   const textarea = match?.parentElement?.querySelector("textarea");
@@ -135,12 +138,18 @@ describe("Session tab auto-stop idle field", () => {
     );
     await screen.findByText("Auto-stop idle sessions (s)");
 
-    commit(numberInputByLabel(container, "Auto-stop idle sessions (s)"), "7200");
+    commit(
+      numberInputByLabel(container, "Auto-stop idle sessions (s)"),
+      "7200",
+    );
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: { auto_stop_idle_secs: 7200 },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          session: { auto_stop_idle_secs: 7200 },
+        },
+      ),
     );
   });
 
@@ -161,13 +170,16 @@ describe("Session tab auto-stop idle field", () => {
     );
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: {
-          acp_defaults: {
-            opencode: { model: "openai/gpt-5.5", effort: "high" },
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          session: {
+            acp_defaults: {
+              opencode: { model: "openai/gpt-5.5", effort: "high" },
+            },
           },
         },
-      }),
+      ),
     );
   });
 });

@@ -22,7 +22,9 @@ async function mockApis(page: Page) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "settings" || path === "about" || path === "system/update-status"
+          path === "settings" ||
+          path === "about" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -34,7 +36,13 @@ async function mockApis(page: Page) {
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
-        { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" },
+        {
+          name: "claude",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+        },
       ],
     }),
   );
@@ -73,8 +81,13 @@ async function mockApis(page: Page) {
 async function openSessionStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
+  const recent = page
+    .getByRole("button")
+    .filter({ hasText: "/tmp/example" })
+    .first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   const next = page.getByRole("button", { name: "Next" });
@@ -91,7 +104,9 @@ async function expandAdvanced(page: Page) {
 }
 
 test.describe("Wizard attach-existing toggle (#969)", () => {
-  test("toggle is off by default; Base branch section visible", async ({ page }) => {
+  test("toggle is off by default; Base branch section visible", async ({
+    page,
+  }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -104,12 +119,12 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await expect(attachToggle).toHaveAttribute("aria-checked", "false");
     // The base-branch picker (only meaningful for new-branch creates) is
     // its own "Base branch" disclosure inside Advanced.
-    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Base branch" }),
+    ).toBeVisible();
   });
 
-  test("turning attach on hides the Base branch section", async ({
-    page,
-  }) => {
+  test("turning attach on hides the Base branch section", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -120,12 +135,17 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
       .locator("role=switch");
     await attachToggle.click();
     await expect(attachToggle).toHaveAttribute("aria-checked", "true");
-    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(
+      0,
+    );
   });
 
-  test("submit with attach off sends create_new_branch=true", async ({ page }) => {
+  test("submit with attach off sends create_new_branch=true", async ({
+    page,
+  }) => {
     await mockApis(page);
-    let captured: { create_new_branch?: boolean; base_branch?: string } | null = null;
+    let captured: { create_new_branch?: boolean; base_branch?: string } | null =
+      null;
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") {
         captured = JSON.parse(r.request().postData() || "{}");
@@ -174,7 +194,8 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     page,
   }) => {
     await mockApis(page);
-    let captured: { create_new_branch?: boolean; base_branch?: string } | null = null;
+    let captured: { create_new_branch?: boolean; base_branch?: string } | null =
+      null;
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") {
         captured = JSON.parse(r.request().postData() || "{}");

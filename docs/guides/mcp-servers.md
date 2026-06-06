@@ -50,6 +50,35 @@ Each entry is one of:
 The forwarded list is the same for fresh sessions (`session/new`) and resumed
 ones (`session/load`).
 
+## Native agent config (no double maintenance)
+
+If you already declared MCP servers in your agent's own config, AoE reads them
+too, so you do not have to copy them into `mcp.json`. At session start AoE reads
+the active agent's native config live (so edits are picked up on the next
+session) and merges those servers with your `mcp.json`. AoE only reads these
+files; it never writes to them.
+
+The native config read per agent:
+
+- **Claude**: `~/.claude.json` (top-level `mcpServers`).
+- **Gemini**: `~/.gemini/settings.json` (`mcpServers`; an entry's transport is
+  chosen by which key it sets, `command` for stdio, `httpUrl` for http, `url`
+  for sse).
+- **Codex**: `~/.codex/config.toml` (`[mcp_servers.<name>]` tables).
+
+### Precedence
+
+When the same server name appears in more than one source, the higher-precedence
+source wins (per server, not whole file):
+
+```text
+agent-native  <  mcp.json (global)
+```
+
+So a server defined in both your agent's native config and `mcp.json` is taken
+from `mcp.json`. The override is logged. Per-profile and project-local sources
+are planned higher layers on top of this stack and are tracked separately.
+
 ## Capability gating
 
 Not every agent supports every transport. `stdio` works everywhere. `http` and
@@ -59,11 +88,13 @@ AoE never sends a request the agent would reject.
 
 ## Errors
 
-A missing `mcp.json` is normal and means no servers are forwarded, identical to
-the behavior before this feature. A malformed `mcp.json` is logged as a warning
-and no servers are forwarded, so a single typo never blocks your sessions from
-starting. Check the log (`debug.log` in the app directory) if a configured
-server does not show up.
+A missing `mcp.json` is normal and means no servers are forwarded from it,
+identical to the behavior before this feature. A malformed `mcp.json` is logged
+as a warning and contributes nothing, so a single typo never blocks your
+sessions from starting. The same isolation applies to native configs: a missing
+native file is normal, and a broken one (or a single broken entry inside it) is
+warned and skipped without dropping the rest or blocking the spawn. Check the
+log (`debug.log` in the app directory) if a configured server does not show up.
 
 ## Security
 

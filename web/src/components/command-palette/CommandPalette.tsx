@@ -122,7 +122,9 @@ export function CommandPalette({ open, onClose, actions }: Props) {
                         </span>
                       )}
                       {action.icon && (
-                        <span className="shrink-0 text-text-muted">{action.icon}</span>
+                        <span className="shrink-0 text-text-muted">
+                          {action.icon}
+                        </span>
                       )}
                       <span className="truncate">{action.title}</span>
                       {action.subtitle && (
@@ -146,7 +148,9 @@ export function CommandPalette({ open, onClose, actions }: Props) {
 
         <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
           <span>↑↓ navigate · ↵ select · esc close</span>
-          <span>{actions.length} action{actions.length === 1 ? "" : "s"}</span>
+          <span>
+            {actions.length} action{actions.length === 1 ? "" : "s"}
+          </span>
         </div>
       </Command>
     </div>

@@ -199,9 +199,10 @@ describe("useAcpSession / setConfigOption", () => {
           }
           postBodies.push({
             url,
-            body: typeof init?.body === "string"
-              ? JSON.parse(init.body)
-              : init?.body,
+            body:
+              typeof init?.body === "string"
+                ? JSON.parse(init.body)
+                : init?.body,
           });
           if (typeof postShouldFail === "number") {
             return new Response("simulated failure", {
@@ -223,7 +224,9 @@ describe("useAcpSession / setConfigOption", () => {
   });
 
   it("setConfigOption posts to the structured view config-option endpoint with the right body shape", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-cfg-1"), { wrapper });
+    const { result } = renderHook(() => useAcpSession("sess-cfg-1"), {
+      wrapper,
+    });
     await flushAsync();
     await act(async () => {
       await result.current.setConfigOption("model", "claude-sonnet-4-6");
@@ -239,7 +242,9 @@ describe("useAcpSession / setConfigOption", () => {
   });
 
   it("setConfigOption posts the effort body shape", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-cfg-2"), { wrapper });
+    const { result } = renderHook(() => useAcpSession("sess-cfg-2"), {
+      wrapper,
+    });
     await flushAsync();
     await act(async () => {
       await result.current.setConfigOption("effort", "high");
@@ -253,7 +258,9 @@ describe("useAcpSession / setConfigOption", () => {
 
   it("setConfigOption clears pending and records lastError on non-OK response", async () => {
     postShouldFail = 500;
-    const { result } = renderHook(() => useAcpSession("sess-cfg-3"), { wrapper });
+    const { result } = renderHook(() => useAcpSession("sess-cfg-3"), {
+      wrapper,
+    });
     await flushAsync();
     await act(async () => {
       await result.current.setConfigOption("model", "claude-sonnet-4-6");
@@ -264,17 +271,23 @@ describe("useAcpSession / setConfigOption", () => {
 
   it("setConfigOption clears pending and records lastError on network failure (throw)", async () => {
     postShouldFail = "throw";
-    const { result } = renderHook(() => useAcpSession("sess-cfg-4"), { wrapper });
+    const { result } = renderHook(() => useAcpSession("sess-cfg-4"), {
+      wrapper,
+    });
     await flushAsync();
     await act(async () => {
       await result.current.setConfigOption("effort", "low");
     });
     expect(result.current.state.pendingConfigOption).toBeNull();
-    expect(result.current.state.lastError).toMatch(/Network error setting effort/);
+    expect(result.current.state.lastError).toMatch(
+      /Network error setting effort/,
+    );
   });
 
   it("dismissConfigOptionSwitchFailed clears a populated notice", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-cfg-5"), { wrapper });
+    const { result } = renderHook(() => useAcpSession("sess-cfg-5"), {
+      wrapper,
+    });
     await flushAsync();
 
     // Seed the notice through the WS broadcast path: drive a

@@ -148,9 +148,9 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
       />,
     );
     // SoundModeWidget renders a select with the Random/Specific options.
-    const select = screen.getByText("Mode").parentElement?.querySelector(
-      "select",
-    ) as HTMLSelectElement;
+    const select = screen
+      .getByText("Mode")
+      .parentElement?.querySelector("select") as HTMLSelectElement;
     expect(select).toBeTruthy();
     expect(select.value).toBe("random");
   });
@@ -197,7 +197,10 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
     fireEvent.click(container.querySelector("button[role=switch]")!);
     await waitFor(() =>
       expect(onAfterSave).toHaveBeenCalledWith(
-        expect.objectContaining({ section: "acp", field: "show_tool_durations" }),
+        expect.objectContaining({
+          section: "acp",
+          field: "show_tool_durations",
+        }),
         true,
       ),
     );
@@ -240,9 +243,8 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
         onSaveField={onSaveField}
       />,
     );
-    const root = screen
-      .getByText("Environment variables")
-      .parentElement?.parentElement as HTMLElement;
+    const root = screen.getByText("Environment variables").parentElement
+      ?.parentElement as HTMLElement;
     const addBtn = screen
       .getByText("Environment variables")
       .parentElement?.querySelector("button") as HTMLButtonElement;

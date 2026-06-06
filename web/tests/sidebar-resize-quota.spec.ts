@@ -18,35 +18,40 @@ const SPLIT_STORAGE_KEY = "aoe-split-ratio";
 const RIGHT_PANEL_KEY = "aoe-right-collapsed";
 
 async function stubQuotaForKey(page: Page, key: string) {
-  await page.addInitScript(({ key: _key }) => {
-    (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor =
-      new Set();
-    const original = Storage.prototype.setItem;
-    Storage.prototype.setItem = function (k: string, v: string) {
-      const throwSet = (
-        window as unknown as { __throwQuotaFor?: Set<string> }
-      ).__throwQuotaFor;
-      if (throwSet && throwSet.has(k)) {
-        throw new DOMException(
-          "The quota has been exceeded.",
-          "QuotaExceededError",
-        );
-      }
-      return original.call(this, k, v);
-    };
-    (
-      window as unknown as { __enableQuotaThrow: (k: string) => void }
-    ).__enableQuotaThrow = (k: string) => {
-      const set = (window as unknown as { __throwQuotaFor?: Set<string> })
-        .__throwQuotaFor;
-      if (set) set.add(k);
-    };
-  }, { key });
+  await page.addInitScript(
+    ({ key: _key }) => {
+      (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor =
+        new Set();
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (k: string, v: string) {
+        const throwSet = (
+          window as unknown as { __throwQuotaFor?: Set<string> }
+        ).__throwQuotaFor;
+        if (throwSet && throwSet.has(k)) {
+          throw new DOMException(
+            "The quota has been exceeded.",
+            "QuotaExceededError",
+          );
+        }
+        return original.call(this, k, v);
+      };
+      (
+        window as unknown as { __enableQuotaThrow: (k: string) => void }
+      ).__enableQuotaThrow = (k: string) => {
+        const set = (window as unknown as { __throwQuotaFor?: Set<string> })
+          .__throwQuotaFor;
+        if (set) set.add(k);
+      };
+    },
+    { key },
+  );
 }
 
 async function enableThrow(page: Page, key: string) {
   await page.evaluate((k) => {
-    (window as unknown as { __enableQuotaThrow: (k: string) => void }).__enableQuotaThrow(k);
+    (
+      window as unknown as { __enableQuotaThrow: (k: string) => void }
+    ).__enableQuotaThrow(k);
   }, key);
 }
 

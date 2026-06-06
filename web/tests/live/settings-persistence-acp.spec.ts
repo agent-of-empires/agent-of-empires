@@ -22,8 +22,7 @@ test("structured view settings persist through PATCH + reload, node_path is stri
     typeof baselineAcp.node_path === "string"
       ? (baselineAcp.node_path as string)
       : "";
-  const newIdle =
-    baselineAcp.auto_stop_idle_secs === 28800 ? 14400 : 28800;
+  const newIdle = baselineAcp.auto_stop_idle_secs === 28800 ? 14400 : 28800;
 
   // PATCH a safe knob plus a malicious node_path through the same endpoint
   // the dashboard hits. The section must be accepted (regression) and

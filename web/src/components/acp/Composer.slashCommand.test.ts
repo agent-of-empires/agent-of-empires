@@ -68,10 +68,7 @@ describe("insertSlashCommand (#1512)", () => {
 
   it("is a no-op when the runtime is null", () => {
     const setText = vi.fn();
-    insertSlashCommand(
-      null as unknown as RuntimeStub,
-      makeItem("help", false),
-    );
+    insertSlashCommand(null as unknown as RuntimeStub, makeItem("help", false));
     expect(setText).not.toHaveBeenCalled();
   });
 });

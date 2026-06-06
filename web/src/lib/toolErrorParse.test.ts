@@ -15,7 +15,9 @@ describe("parseToolError", () => {
 
   it("strips the <tool_use_error> wrapper and reports the tag", () => {
     expect(
-      parseToolError("<tool_use_error>File has not been read yet</tool_use_error>"),
+      parseToolError(
+        "<tool_use_error>File has not been read yet</tool_use_error>",
+      ),
     ).toEqual({
       body: "File has not been read yet",
       tag: "tool_use_error",
@@ -43,16 +45,15 @@ describe("parseToolError", () => {
   });
 
   it("does not match mismatched open/close tags", () => {
-    expect(
-      parseToolError("<tool_use_error>oops</different_tag>"),
-    ).toEqual({
+    expect(parseToolError("<tool_use_error>oops</different_tag>")).toEqual({
       body: "<tool_use_error>oops</different_tag>",
       tag: null,
     });
   });
 
   it("preserves inner-text linebreaks", () => {
-    const raw = "<tool_use_error>line one\nline two\nline three</tool_use_error>";
+    const raw =
+      "<tool_use_error>line one\nline two\nline three</tool_use_error>";
     const parsed = parseToolError(raw);
     expect(parsed.tag).toBe("tool_use_error");
     expect(parsed.body).toBe("line one\nline two\nline three");
@@ -105,7 +106,9 @@ describe("describeToolErrorTag", () => {
 
   it("maps known agent wrappers to a friendly label", () => {
     expect(describeToolErrorTag("tool_use_error")).toBe("agent-reported error");
-    expect(describeToolErrorTag("tool_result_error")).toBe("agent-reported error");
+    expect(describeToolErrorTag("tool_result_error")).toBe(
+      "agent-reported error",
+    );
     expect(describeToolErrorTag("error")).toBe("error");
   });
 

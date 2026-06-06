@@ -14,12 +14,7 @@
 //   - the manual trigger swaps the copy and drops the codex preference.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -42,7 +37,11 @@ const mockPrimer = vi.mocked(fetchContextPrimer);
 beforeEach(() => {
   vi.clearAllMocks();
   mockFetchAgents.mockResolvedValue([
-    { name: "claude", description: "Claude (Sonnet)", command: "claude-agent-acp" },
+    {
+      name: "claude",
+      description: "Claude (Sonnet)",
+      command: "claude-agent-acp",
+    },
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
   ]);
@@ -115,7 +114,12 @@ describe("SwitchAgentModal (rate_limit)", () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(mockSwitch).toHaveBeenCalledTimes(1));
     // reason "rate_limited" so the transcript divider reads correctly.
-    expect(mockSwitch).toHaveBeenCalledWith("s-1", "codex", null, "rate_limited");
+    expect(mockSwitch).toHaveBeenCalledWith(
+      "s-1",
+      "codex",
+      null,
+      "rate_limited",
+    );
     await waitFor(() => expect(mockPrimer).toHaveBeenCalledTimes(1));
     // Primer must be invoked with before_seq from the switch response
     // (41), not switch_seq, so the recap excludes the AgentSwitched

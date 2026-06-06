@@ -267,11 +267,16 @@ export function SettingsView({
   }, [loadSettings]);
 
   const sendSave = useCallback(
-    async (section: string, data: Record<string, unknown>): Promise<boolean> => {
+    async (
+      section: string,
+      data: Record<string, unknown>,
+    ): Promise<boolean> => {
       if (!selectedProfile) return false;
       setSaving(true);
       setSaveError(null);
-      const ok = await updateProfileSettings(selectedProfile, { [section]: data });
+      const ok = await updateProfileSettings(selectedProfile, {
+        [section]: data,
+      });
       setSaving(false);
       if (!ok) {
         setSaveError("Failed to save, please try again");
@@ -294,26 +299,40 @@ export function SettingsView({
   const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
   const web = (settings?.web ?? {}) as Record<string, unknown>;
 
-  const saveField = useCallback((
-    section: string,
-    sectionData: Record<string, unknown>,
-    field: string,
-    value: unknown,
-  ): Promise<boolean> => {
-    updateLocal({ [section]: { ...sectionData, [field]: value } });
-    return sendSave(section, { [field]: value });
-  }, [updateLocal, sendSave]);
+  const saveField = useCallback(
+    (
+      section: string,
+      sectionData: Record<string, unknown>,
+      field: string,
+      value: unknown,
+    ): Promise<boolean> => {
+      updateLocal({ [section]: { ...sectionData, [field]: value } });
+      return sendSave(section, { [field]: value });
+    },
+    [updateLocal, sendSave],
+  );
 
   const saveSubField = useCallback(
     (section: string, field: string, value: unknown): Promise<boolean> => {
-      const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
+      const sectionData = (settings?.[section] ?? {}) as Record<
+        string,
+        unknown
+      >;
       return saveField(section, sectionData, field, value);
     },
     [settings, saveField],
   );
 
   const renderTabContent = () => {
-    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices" && activeTab !== "structured-view" && activeTab !== "telemetry") {
+    if (
+      !settings &&
+      activeTab !== "notifications" &&
+      activeTab !== "terminal" &&
+      activeTab !== "security" &&
+      activeTab !== "devices" &&
+      activeTab !== "structured-view" &&
+      activeTab !== "telemetry"
+    ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
     }
 
@@ -321,7 +340,11 @@ export function SettingsView({
     // loads or after it fails. Returns null once the schema is ready.
     const schemaGuard = () => {
       if (schemaLoading) {
-        return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        return (
+          <div className="text-sm text-text-dim">
+            Loading settings schema...
+          </div>
+        );
       }
       if (schemaError) {
         return (
@@ -466,7 +489,8 @@ export function SettingsView({
                 Server Defaults
               </h4>
               <p className="text-xs text-text-dim">
-                Controls which session events trigger push notifications on the server.
+                Controls which session events trigger push notifications on the
+                server.
               </p>
               {schemaGuard() ??
                 (settings && (
@@ -489,7 +513,9 @@ export function SettingsView({
         return <ConnectedDevices />;
       case "structured-view": {
         if (!settings) {
-          return <div className="text-sm text-text-dim">Loading settings...</div>;
+          return (
+            <div className="text-sm text-text-dim">Loading settings...</div>
+          );
         }
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
@@ -526,7 +552,10 @@ export function SettingsView({
         <div className="flex items-center">
           {sidebar.map((item) =>
             item.kind === "divider" ? (
-              <div key={item.label} className="h-4 w-px bg-surface-700 mx-1 shrink-0" />
+              <div
+                key={item.label}
+                className="h-4 w-px bg-surface-700 mx-1 shrink-0"
+              />
             ) : (
               <button
                 key={item.id}
@@ -575,7 +604,9 @@ export function SettingsView({
         {/* Content area */}
         <div className="flex-1 overflow-y-auto">
           <div className="p-6 max-w-2xl mx-auto space-y-5">
-            <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
+            <h2 className="text-lg font-semibold text-text-bright">
+              {currentTabLabel}
+            </h2>
 
             {offline && (
               <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">

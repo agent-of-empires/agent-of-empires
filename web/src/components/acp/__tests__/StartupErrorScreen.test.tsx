@@ -50,7 +50,9 @@ describe("StartupErrorScreen", () => {
         }}
       />,
     );
-    expect(container.textContent).toContain("did not report its package version");
+    expect(container.textContent).toContain(
+      "did not report its package version",
+    );
     expect(container.textContent).toContain(
       "@agentclientprotocol/claude-agent-acp",
     );

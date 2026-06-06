@@ -6,12 +6,7 @@
 // terminal access (Tailscale Funnel, remote setups). See #1449.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { StartupErrorBanner } from "../StructuredView";
 
@@ -93,9 +88,7 @@ describe("AgentLogDisclosure", () => {
       }),
     });
     vi.stubGlobal("fetch", fetchSpy);
-    render(
-      <StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />,
-    );
+    render(<StartupErrorBanner sessionId="s-1" message={NATIVE_BINARY_MSG} />);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -123,9 +116,7 @@ describe("AgentLogDisclosure", () => {
       "/api/sessions/abc-123/acp/worker-log?tail=200",
     );
     await waitFor(() => {
-      expect(getByTestId("acp-agent-log-pre").textContent).toContain(
-        "ENOEXEC",
-      );
+      expect(getByTestId("acp-agent-log-pre").textContent).toContain("ENOEXEC");
     });
   });
 

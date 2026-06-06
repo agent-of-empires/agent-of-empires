@@ -25,7 +25,12 @@ const diff: RichFileDiffResponse = {
       new_lines: 2,
       lines: [
         { type: "equal", old_line_num: 1, new_line_num: 1, content: "ctx\n" },
-        { type: "delete", old_line_num: 2, new_line_num: null, content: "old\n" },
+        {
+          type: "delete",
+          old_line_num: 2,
+          new_line_num: null,
+          content: "old\n",
+        },
         { type: "add", old_line_num: null, new_line_num: 2, content: "new\n" },
       ],
     },
@@ -88,7 +93,9 @@ describe("DiffFileViewer split layout", () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
     expect(
-      screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+      screen
+        .getByRole("button", { name: "Split" })
+        .getAttribute("aria-pressed"),
     ).toBe("false");
   });
 
@@ -100,12 +107,15 @@ describe("DiffFileViewer split layout", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+        screen
+          .getByRole("button", { name: "Split" })
+          .getAttribute("aria-pressed"),
       ).toBe("true");
     });
 
     expect(
-      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}").diffViewLayout,
+      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}")
+        .diffViewLayout,
     ).toBe("split");
   });
 
@@ -113,7 +123,9 @@ describe("DiffFileViewer split layout", () => {
     // Start in the loading phase: the scroll container is behind the early
     // returns, so it is not mounted and the observer must not have attached.
     mock.diff = undefined;
-    const { rerender } = render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
+    const { rerender } = render(
+      <DiffFileViewer sessionId="s1" filePath="a.ts" />,
+    );
     expect(mock.observe).not.toHaveBeenCalled();
 
     // Diff arrives: the container mounts and the callback ref must attach the

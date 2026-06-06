@@ -6,9 +6,11 @@
 import { useEffect, useMemo, useState } from "react";
 
 /** Lightweight fuzzy filter: prefer prefix matches, then substring. */
-export function fuzzyFilter<
-  T extends { label: string; description?: string },
->(items: T[], query: string, cap = 30): T[] {
+export function fuzzyFilter<T extends { label: string; description?: string }>(
+  items: T[],
+  query: string,
+  cap = 30,
+): T[] {
   const q = query.toLowerCase();
   if (!q) return items.slice(0, cap);
   return items
@@ -46,9 +48,7 @@ export function useFilesIndex(sessionId: string): {
   useEffect(() => {
     let cancelled = false;
     // loading is set to true in render-time above when sessionId changes
-    fetch(
-      `/api/sessions/${encodeURIComponent(sessionId)}/acp/files`,
-    )
+    fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/files`)
       .then((r) => (r.ok ? r.json() : { files: [] }))
       .then((data: { files?: string[] }) => {
         if (cancelled) return;

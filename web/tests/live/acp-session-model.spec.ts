@@ -128,10 +128,13 @@ base(
       const sessionId: string = sessions[0]!.id;
       await enableAndSpawn(serve.baseUrl, sessionId);
 
-      const sawInitial = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
-        frameEvents(replay, "ConfigOptionsUpdated").some((e) =>
-          modelChoiceValues(e).includes("fake-sonnet"),
-        ),
+      const sawInitial = await waitForReplay(
+        serve.baseUrl,
+        sessionId,
+        (replay) =>
+          frameEvents(replay, "ConfigOptionsUpdated").some((e) =>
+            modelChoiceValues(e).includes("fake-sonnet"),
+          ),
       );
       expect(sawInitial).toBe(true);
 
@@ -152,10 +155,13 @@ base(
       // The fake only acks set_model; aoe synthesizes the confirming
       // snapshot from the cached state, so the synthetic selector's
       // current_value must flip to the requested model.
-      const sawConfirm = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
-        frameEvents(replay, "ConfigOptionsUpdated").some(
-          (e) => modelOption(e)?.current_value === "fake-opus",
-        ),
+      const sawConfirm = await waitForReplay(
+        serve.baseUrl,
+        sessionId,
+        (replay) =>
+          frameEvents(replay, "ConfigOptionsUpdated").some(
+            (e) => modelOption(e)?.current_value === "fake-opus",
+          ),
       );
       expect(sawConfirm).toBe(true);
     } finally {
@@ -183,10 +189,13 @@ base(
       const sessionId: string = sessions[0]!.id;
       await enableAndSpawn(serve.baseUrl, sessionId);
 
-      const sawInitial = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
-        frameEvents(replay, "ConfigOptionsUpdated").some(
-          (e) => modelOption(e) != null,
-        ),
+      const sawInitial = await waitForReplay(
+        serve.baseUrl,
+        sessionId,
+        (replay) =>
+          frameEvents(replay, "ConfigOptionsUpdated").some(
+            (e) => modelOption(e) != null,
+          ),
       );
       expect(sawInitial).toBe(true);
 
@@ -204,12 +213,15 @@ base(
       expect(setRes.status).toBeGreaterThanOrEqual(200);
       expect(setRes.status).toBeLessThan(300);
 
-      const sawFailure = await waitForReplay(serve.baseUrl, sessionId, (replay) =>
-        frameEvents(replay, "ConfigOptionSwitchFailed").some(
-          (e) =>
-            e.config_id === SYNTHETIC_MODEL_ID &&
-            String(e.reason).includes("model unavailable"),
-        ),
+      const sawFailure = await waitForReplay(
+        serve.baseUrl,
+        sessionId,
+        (replay) =>
+          frameEvents(replay, "ConfigOptionSwitchFailed").some(
+            (e) =>
+              e.config_id === SYNTHETIC_MODEL_ID &&
+              String(e.reason).includes("model unavailable"),
+          ),
       );
       expect(sawFailure).toBe(true);
     } finally {

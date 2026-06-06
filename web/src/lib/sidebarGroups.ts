@@ -152,7 +152,10 @@ export function buildSessionGroups(
           ? "active"
           : "idle",
       };
-      const view: SidebarWorkspaceView = { key: `${gp}::${ws.id}`, workspace: sliced };
+      const view: SidebarWorkspaceView = {
+        key: `${gp}::${ws.id}`,
+        workspace: sliced,
+      };
       const bucket = byGroup.get(gp);
       if (bucket) {
         bucket.push(view);

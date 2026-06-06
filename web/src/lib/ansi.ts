@@ -119,8 +119,22 @@ const BG: Record<number, string> = {
 function palette256(n: number): string {
   if (n < 16) {
     const ordered = [
-      FG[30], FG[31], FG[32], FG[33], FG[34], FG[35], FG[36], FG[37],
-      FG[90], FG[91], FG[92], FG[93], FG[94], FG[95], FG[96], FG[97],
+      FG[30],
+      FG[31],
+      FG[32],
+      FG[33],
+      FG[34],
+      FG[35],
+      FG[36],
+      FG[37],
+      FG[90],
+      FG[91],
+      FG[92],
+      FG[93],
+      FG[94],
+      FG[95],
+      FG[96],
+      FG[97],
     ];
     return ordered[n] ?? "#888888";
   }

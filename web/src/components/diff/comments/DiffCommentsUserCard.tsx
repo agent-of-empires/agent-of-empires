@@ -84,7 +84,7 @@ function HighlightedSnippet({
     const hint =
       language && language.length > 0
         ? language
-        : filePath.split(".").pop() ?? "";
+        : (filePath.split(".").pop() ?? "");
     if (!hint) return;
     (async () => {
       try {
@@ -97,9 +97,7 @@ function HighlightedSnippet({
         const hl = await getHighlighter();
         if (cancelled) return;
         if (!hl.getLoadedLanguages().includes(langKey)) return;
-        setHtml(
-          hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }),
-        );
+        setHtml(hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }));
       } catch {
         // Unknown lang → fall through to plain rendering.
       }

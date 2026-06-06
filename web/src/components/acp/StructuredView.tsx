@@ -51,10 +51,7 @@ import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
-import {
-  isQueuedPromptLong,
-  queuedStripLayout,
-} from "./queuedPromptsLayout";
+import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
 import {
@@ -238,9 +235,10 @@ function AcpChrome({
   // Composer prefill keyed for re-fires; set by the
   // ContextPrimerBanner on click. Local rather than on AcpState
   // because it's a one-shot UI action, not part of the event log.
-  const [primerPrefill, setPrimerPrefill] = useState<
-    { id: string; text: string } | null
-  >(null);
+  const [primerPrefill, setPrimerPrefill] = useState<{
+    id: string;
+    text: string;
+  } | null>(null);
   // Rate-limit recovery modal toggle. Opened from the rate-limit row
   // in `SystemNotices`; the modal owns the agent picker and the
   // switch / primer-fetch round-trip. Wrapped in a tiny exported
@@ -328,7 +326,10 @@ function AcpChrome({
         onPrefill={recoveryHandoffPrefill}
       >
         {({ onSwitchAgent }) =>
-          (status !== "open" || state.lagged || state.rateLimit || reconnecting) ? (
+          status !== "open" ||
+          state.lagged ||
+          state.rateLimit ||
+          reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
@@ -346,7 +347,10 @@ function AcpChrome({
       </RateLimitRecoverySection>
 
       {state.startupError && (
-        <StartupErrorBanner sessionId={sessionId} message={state.startupError} />
+        <StartupErrorBanner
+          sessionId={sessionId}
+          message={state.startupError}
+        />
       )}
       {(() => {
         const variant = pickWorkerStoppedVariant({
@@ -371,12 +375,14 @@ function AcpChrome({
         }
         return null;
       })()}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
-        <WorkerRestartingBanner
-          agentUnresponsive={state.agentUnresponsive}
-          agentOrphaned={state.agentOrphaned}
-        />
-      )}
+      {state.workerRestarting &&
+        !state.startupError &&
+        !state.workerStopped && (
+          <WorkerRestartingBanner
+            agentUnresponsive={state.agentUnresponsive}
+            agentOrphaned={state.agentOrphaned}
+          />
+        )}
       {acpWorkerState === "resuming" &&
         !state.startupError &&
         !state.workerStopped &&
@@ -464,7 +470,12 @@ function AcpChrome({
             onRemove={removeQueuedPrompt}
             onEdit={editQueuedPrompt}
             onClear={clearQueue}
-            pendingResume={status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting}
+            pendingResume={
+              status !== "open" ||
+              acpWorkerState !== "running" ||
+              state.workerStopped ||
+              state.workerRestarting
+            }
           />
 
           <RejectedPromptsStrip
@@ -512,7 +523,11 @@ function AcpChrome({
             setConfigOption={setConfigOption}
             sessionUsage={state.sessionUsage}
             availableCommands={state.availableCommands}
-            connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+            connected={
+              status === "open" &&
+              !state.workerStopped &&
+              !state.workerRestarting
+            }
             turnActive={state.turnActive}
             queuedCount={state.queuedPrompts.length}
             enqueuePrompt={sendPrompt}
@@ -549,7 +564,8 @@ function UserMessage() {
 function UserText({ text }: { text: string }) {
   const typedPayload = useMessage(
     (m) =>
-      (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments,
+      (m.metadata?.custom as { diffComments?: unknown } | undefined)
+        ?.diffComments,
   );
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
@@ -936,11 +952,7 @@ function safeStringify(v: unknown): string {
 
 /* ── Empty state ─────────────────────────────────────────────────── */
 
-function EmptyState({
-  onPick,
-}: {
-  onPick: (text: string) => Promise<void>;
-}) {
+function EmptyState({ onPick }: { onPick: (text: string) => Promise<void> }) {
   return (
     <div className="mt-12 flex flex-col items-center gap-4 text-center">
       <div className="text-sm text-text-muted">
@@ -988,7 +1000,10 @@ function ClearedTurnsBanner({
       <span className="flex-1 text-left">
         {expanded ? "Hide" : "Show"} {hiddenCount} earlier turn
         {hiddenCount === 1 ? "" : "s"}
-        <span className="text-text-dim"> (cleared, not in the model's memory)</span>
+        <span className="text-text-dim">
+          {" "}
+          (cleared, not in the model's memory)
+        </span>
       </span>
     </button>
   );
@@ -1024,7 +1039,9 @@ export function WorkingSpinner({
   onForceEndTurn: () => Promise<void>;
 }) {
   const [frame, setFrame] = useState(0);
-  const [seed, setSeed] = useState(() => Math.floor(Math.random() * 0xffffffff));
+  const [seed, setSeed] = useState(() =>
+    Math.floor(Math.random() * 0xffffffff),
+  );
   // 1s-tick clock for the force-end-turn watchdog. We compare against
   // `lastActivityRef.current` (a ref bumped on every incoming frame)
   // and surface the escape hatch when the gap exceeds the configured
@@ -1215,7 +1232,10 @@ function PlanStrip({ plan }: PlanStripProps) {
         <div className="max-h-64 overflow-y-auto border-t border-surface-800 px-4 py-2 text-sm">
           <ul className="space-y-1">
             {plan.steps.map((step) => (
-              <li key={step.id} className="flex items-start gap-2 text-text-secondary">
+              <li
+                key={step.id}
+                className="flex items-start gap-2 text-text-secondary"
+              >
                 <StepGlyph status={step.status} />
                 <span
                   className={
@@ -1250,7 +1270,6 @@ function StepGlyph({ status }: { status: Plan["steps"][number]["status"] }) {
       return <span className="text-text-dim">○</span>;
   }
 }
-
 
 /* ── Approvals ───────────────────────────────────────────────────── */
 
@@ -1340,8 +1359,7 @@ export function SystemNotices({
     // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
     // "Reconnecting…" copy with concrete progress so the user knows
     // the tab isn't frozen and roughly how long until the next dial.
-    const countdownPart =
-      retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
+    const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
     messages.push({
       kind: "warn",
       text: `Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`,
@@ -1349,7 +1367,9 @@ export function SystemNotices({
   } else if (status === "connecting") {
     messages.push({
       kind: "info",
-      text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
+      text: hasEverOpened
+        ? "Reconnecting to structured view…"
+        : "Starting structured view…",
     });
   } else if (status === "error") {
     messages.push({
@@ -1367,7 +1387,10 @@ export function SystemNotices({
     });
   }
   if (lagged) {
-    messages.push({ kind: "warn", text: "Some events were missed during reconnect." });
+    messages.push({
+      kind: "warn",
+      text: "Some events were missed during reconnect.",
+    });
   }
   if (rateLimit) {
     const reset = new Date(rateLimit.resets_at).toLocaleTimeString();
@@ -1425,7 +1448,9 @@ function InteractionErrorBanner({
     <div className="flex items-start justify-between gap-3 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-amber-200">
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">Action did not complete</div>
-        <div className="mt-0.5 text-xs text-amber-100/90 break-words">{message}</div>
+        <div className="mt-0.5 text-xs text-amber-100/90 break-words">
+          {message}
+        </div>
       </div>
       <button
         type="button"
@@ -1506,8 +1531,8 @@ function WorkerResumingBanner() {
         aria-hidden
       />
       <span>
-        Resuming structured view worker… cached transcript still available. Queued
-        prompts will send once the agent is back online.
+        Resuming structured view worker… cached transcript still available.
+        Queued prompts will send once the agent is back online.
       </span>
     </div>
   );
@@ -1561,9 +1586,7 @@ function ScheduledWakeupBanner({
       </span>
       <span className="truncate">
         {label}
-        {reason ? (
-          <span className="text-sky-300/70">: {reason}</span>
-        ) : null}
+        {reason ? <span className="text-sky-300/70">: {reason}</span> : null}
       </span>
     </div>
   );
@@ -1606,7 +1629,9 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
     <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">Structured view worker stopped</div>
+          <div className="text-sm font-medium">
+            Structured view worker stopped
+          </div>
           <div className="mt-1 text-xs text-amber-100/90">
             The agent was terminated via{" "}
             <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code>{" "}
@@ -1657,8 +1682,8 @@ export function ArchivedWorkerStoppedBanner({
       <div className="text-sm font-medium">Session archived</div>
       <div className="mt-1 text-xs text-amber-100/90">
         This session is parked. The structured view worker was shut down and the
-        reconciler will not respawn it. Unarchive from the sidebar
-        (right-click the row, then Unarchive) to bring it back.
+        reconciler will not respawn it. Unarchive from the sidebar (right-click
+        the row, then Unarchive) to bring it back.
       </div>
     </div>
   );
@@ -1689,8 +1714,8 @@ export function SnoozedWorkerStoppedBanner({
       <div className="mt-1 text-xs text-amber-100/90">
         The structured view worker was shut down until{" "}
         <span className="font-mono">{wallClock}</span>. The reconciler will
-        respawn it automatically once the snooze expires, or you can
-        Unsnooze from the sidebar (right-click the row) to wake it sooner.
+        respawn it automatically once the snooze expires, or you can Unsnooze
+        from the sidebar (right-click the row) to wake it sooner.
       </div>
     </div>
   );
@@ -1709,9 +1734,8 @@ export function StartupErrorBanner({
   // Capture the path so the banner can echo it back to the user; the
   // path lets them spot whether a rename or a delete is the cause and
   // jump straight to the right fix. See #1089.
-  const projectPathMissingMatch = /project path no longer exists:\s*(\S.*)$/im.exec(
-    message,
-  );
+  const projectPathMissingMatch =
+    /project path no longer exists:\s*(\S.*)$/im.exec(message);
   const isProjectPathMissing = projectPathMissingMatch !== null;
   const missingPath = projectPathMissingMatch?.[1]?.trim() ?? null;
   // The adapter found the bundled Claude Code native sub-binary at the
@@ -1758,7 +1782,9 @@ export function StartupErrorBanner({
     <div className="border-b border-rose-900/60 bg-rose-950/40 px-4 py-3 text-rose-200">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">Structured view agent failed to start</div>
+          <div className="text-sm font-medium">
+            Structured view agent failed to start
+          </div>
           <pre className="mt-1 whitespace-pre-wrap text-xs text-rose-100/90">
             {message}
           </pre>
@@ -1786,22 +1812,29 @@ export function StartupErrorBanner({
         {isAuth ? (
           <>
             The adapter is installed but has no Claude credentials. Either set{" "}
-            <code className="rounded bg-rose-900/60 px-1">ANTHROPIC_API_KEY</code>{" "}
-            in the env that runs <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
-            or run <code className="rounded bg-rose-900/60 px-1">claude /login</code>{" "}
+            <code className="rounded bg-rose-900/60 px-1">
+              ANTHROPIC_API_KEY
+            </code>{" "}
+            in the env that runs{" "}
+            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
+            run{" "}
+            <code className="rounded bg-rose-900/60 px-1">claude /login</code>{" "}
             in a terminal to write credentials to{" "}
-            <code className="rounded bg-rose-900/60 px-1">~/.claude</code>,
-            then restart aoe.
+            <code className="rounded bg-rose-900/60 px-1">~/.claude</code>, then
+            restart aoe.
           </>
         ) : isCapacity ? (
           <>
             All structured view worker slots are in use. Either raise{" "}
-            <code className="rounded bg-rose-900/60 px-1">[acp] max_concurrent_workers</code>{" "}
+            <code className="rounded bg-rose-900/60 px-1">
+              [acp] max_concurrent_workers
+            </code>{" "}
             in <code className="rounded bg-rose-900/60 px-1">config.toml</code>{" "}
-            and restart <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
-            or free a slot by deleting an existing structured view session
-            or switching one to the tmux view. Reinstalling the adapter
-            won't help; the adapter is fine, the cap is the limit.
+            and restart{" "}
+            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
+            free a slot by deleting an existing structured view session or
+            switching one to the tmux view. Reinstalling the adapter won't help;
+            the adapter is fine, the cap is the limit.
           </>
         ) : isProjectPathMissing ? (
           <>
@@ -1811,23 +1844,28 @@ export function StartupErrorBanner({
                 {missingPath}
               </pre>
             )}
-            Reinstalling the adapter won't help; the adapter is fine, the cwd
-            is gone. Two paths forward:
+            Reinstalling the adapter won't help; the adapter is fine, the cwd is
+            gone. Two paths forward:
             <ol className="mt-1 list-decimal space-y-0.5 pl-5">
               <li>
                 Restore the directory at the path above (e.g.{" "}
-                <code className="rounded bg-rose-900/60 px-1">git worktree move</code>{" "}
+                <code className="rounded bg-rose-900/60 px-1">
+                  git worktree move
+                </code>{" "}
                 it back, or recreate it), then click <strong>Retry</strong>.
               </li>
               <li>
-                Stop <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
+                Stop{" "}
+                <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
                 edit{" "}
-                <code className="rounded bg-rose-900/60 px-1">project_path</code>{" "}
+                <code className="rounded bg-rose-900/60 px-1">
+                  project_path
+                </code>{" "}
                 for this session in{" "}
                 <code className="rounded bg-rose-900/60 px-1">
                   ~/.agent-of-empires/profiles/&lt;profile&gt;/sessions.json
-                </code>
-                {" "}to point at the new location, then start{" "}
+                </code>{" "}
+                to point at the new location, then start{" "}
                 <code className="rounded bg-rose-900/60 px-1">aoe serve</code>{" "}
                 again.
               </li>
@@ -1836,29 +1874,32 @@ export function StartupErrorBanner({
         ) : isNativeBinaryLaunchFail ? (
           <>
             The adapter is installed but its bundled Claude Code native
-            sub-binary couldn't launch. The binary exists on disk, the
-            kernel rejected the <code className="rounded bg-rose-900/60 px-1">execve</code>.
-            Reinstalling the adapter won't help; the binary is already
-            there. Likely causes:
+            sub-binary couldn't launch. The binary exists on disk, the kernel
+            rejected the{" "}
+            <code className="rounded bg-rose-900/60 px-1">execve</code>.
+            Reinstalling the adapter won't help; the binary is already there.
+            Likely causes:
             <ul className="mt-1 list-disc space-y-0.5 pl-5">
               <li>
                 Architecture mismatch (e.g. an{" "}
-                <code className="rounded bg-rose-900/60 px-1">arm64</code> binary
-                inside an <code className="rounded bg-rose-900/60 px-1">amd64</code>{" "}
+                <code className="rounded bg-rose-900/60 px-1">arm64</code>{" "}
+                binary inside an{" "}
+                <code className="rounded bg-rose-900/60 px-1">amd64</code>{" "}
                 sandbox container, or vice versa).
               </li>
               <li>
-                Container image missing the dynamic loader or a glibc
-                version old enough to refuse the binary.
+                Container image missing the dynamic loader or a glibc version
+                old enough to refuse the binary.
               </li>
               <li>
                 Host{" "}
-                <code className="rounded bg-rose-900/60 px-1">node_modules</code>{" "}
+                <code className="rounded bg-rose-900/60 px-1">
+                  node_modules
+                </code>{" "}
                 bind-mounted into a container of a different arch.
               </li>
             </ul>
-            Open the agent log below for the verbatim adapter error, or
-            see{" "}
+            Open the agent log below for the verbatim adapter error, or see{" "}
             <a
               href="https://agent-of-empires.com/docs/structured-view#native-binary-launch-failure"
               target="_blank"
@@ -1871,7 +1912,10 @@ export function StartupErrorBanner({
           </>
         ) : (
           <>
-            Run <code className="rounded bg-rose-900/60 px-1">aoe acp doctor --fix</code>{" "}
+            Run{" "}
+            <code className="rounded bg-rose-900/60 px-1">
+              aoe acp doctor --fix
+            </code>{" "}
             from a terminal, or install the adapter manually:
             <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
               npm install -g @agentclientprotocol/claude-agent-acp@latest
@@ -1893,9 +1937,9 @@ export function StartupErrorBanner({
  */
 function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
   const [open, setOpen] = useState(false);
-  const [state, setState] = useState<
-    "idle" | "loading" | "ok" | "failed"
-  >("idle");
+  const [state, setState] = useState<"idle" | "loading" | "ok" | "failed">(
+    "idle",
+  );
   const [tail, setTail] = useState<string>("");
   const [exists, setExists] = useState<boolean>(false);
   const [truncated, setTruncated] = useState<boolean>(false);
@@ -1974,8 +2018,8 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
           )}
           {state === "ok" && !exists && (
             <div className="text-xs text-rose-200/80">
-              No log output yet. The worker may not have written anything
-              before exiting.
+              No log output yet. The worker may not have written anything before
+              exiting.
             </div>
           )}
           {state === "ok" && exists && tail.length === 0 && (
@@ -2183,7 +2227,9 @@ export function QueuedPromptsStrip({
         <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
           <span className="inline-flex items-center gap-1">
             <Clock className="h-3 w-3" />
-            {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
+            {pendingResume
+              ? `Pending until session resumes (${queued.length})`
+              : `Queued (${queued.length})`}
           </span>
           {queued.length > 1 && (
             <button
@@ -2289,9 +2335,7 @@ function QueuedPromptRow({
               below stays a sibling of this box, so capping the height also
               keeps "Show less" reachable. See #1642. */}
           <div
-            className={
-              isLong && rowExpanded ? "max-h-48 overflow-y-auto" : ""
-            }
+            className={isLong && rowExpanded ? "max-h-48 overflow-y-auto" : ""}
           >
             <button
               type="button"
@@ -2321,14 +2365,19 @@ function QueuedPromptRow({
               }}
               className="mt-0.5 text-[11px] font-medium text-sky-300 hover:text-sky-200"
               aria-label={
-                rowExpanded ? "Collapse queued prompt" : "Show full queued prompt"
+                rowExpanded
+                  ? "Collapse queued prompt"
+                  : "Show full queued prompt"
               }
             >
               {rowExpanded ? "Show less" : "…"}
             </button>
           )}
           {prompt.attachments && prompt.attachments.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1.5" data-testid="queued-attachments">
+            <div
+              className="mt-1 flex flex-wrap gap-1.5"
+              data-testid="queued-attachments"
+            >
               {prompt.attachments.map((att, i) => (
                 <span
                   key={`${att.name ?? att.kind}-${i}`}

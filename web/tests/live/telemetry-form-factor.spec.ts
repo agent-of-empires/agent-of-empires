@@ -21,10 +21,7 @@ function captureSeenPings(
 ): Array<{ surface?: string; form_factor?: string }> {
   const pings: Array<{ surface?: string; form_factor?: string }> = [];
   page.on("request", (req) => {
-    if (
-      req.method() === "POST" &&
-      req.url().includes("/api/telemetry/seen")
-    ) {
+    if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
       const body = req.postData();
       if (!body) return;
       try {
@@ -116,9 +113,9 @@ test("desktop and mobile-PWA clients report distinct form-factor classes", async
       .toBe(true);
 
     // The two classes are genuinely distinct, not one undifferentiated client.
-    expect(
-      desktopPings.some((p) => p.form_factor === "mobile_pwa"),
-    ).toBe(false);
+    expect(desktopPings.some((p) => p.form_factor === "mobile_pwa")).toBe(
+      false,
+    );
 
     await desktopCtx.close();
     await mobileCtx.close();

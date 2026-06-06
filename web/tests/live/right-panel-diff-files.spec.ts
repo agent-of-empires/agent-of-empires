@@ -11,11 +11,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, resolveAoeBinary } from "../helpers/aoeServe";
-import {
-  commitAll,
-  initWorkingRepo,
-  writeFiles,
-} from "../helpers/gitFixture";
+import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 
 base(
   "right panel diff list: counts, tree/flat toggle, keyboard select",
@@ -69,7 +65,9 @@ base(
       // mounts both a desktop and a mobile copy of the right panel
       // (one hidden via CSS), so the chip appears twice; first() is
       // unambiguous and matches the desktop pane on the test viewport.
-      await expect(page.getByText("5 files", { exact: true }).first()).toBeVisible({
+      await expect(
+        page.getByText("5 files", { exact: true }).first(),
+      ).toBeVisible({
         timeout: 15_000,
       });
 
@@ -77,7 +75,12 @@ base(
       // is currently shown so we land deterministically in tree mode.
       const toTree = page.locator('button[title="Switch to tree view"]');
       const toFlat = page.locator('button[title="Switch to flat list"]');
-      if (await toTree.first().isVisible().catch(() => false)) {
+      if (
+        await toTree
+          .first()
+          .isVisible()
+          .catch(() => false)
+      ) {
         await toTree.first().click();
       }
       await expect(toFlat.first()).toBeVisible();
@@ -85,7 +88,9 @@ base(
       // Tree mode collapses parent dirs into rows. With files under
       // `src/`, `src/nested/`, and `lib/`, expect at least the three
       // top-level dir rows. Match a recognisable one.
-      await expect(page.getByRole("button", { name: /^src/ }).first()).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: /^src/ }).first(),
+      ).toBeVisible();
 
       // Flip back to flat so subsequent assertions hit the plain
       // index-based list.

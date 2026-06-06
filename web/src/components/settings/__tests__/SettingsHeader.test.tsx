@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  fetchProfiles: vi.fn().mockResolvedValue([{ name: "default", is_default: true }]),
+  fetchProfiles: vi
+    .fn()
+    .mockResolvedValue([{ name: "default", is_default: true }]),
   createProfile: vi.fn(),
   renameProfile: vi.fn(),
   deleteProfile: vi.fn(),

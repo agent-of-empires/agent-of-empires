@@ -14,7 +14,9 @@ import { describe, expect, it } from "vitest";
 import { collectRecentProjects } from "../steps/ProjectStep";
 import type { SessionResponse } from "../../../lib/types";
 
-function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function mockSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: overrides.id ?? "s1",
     title: overrides.title ?? "session",

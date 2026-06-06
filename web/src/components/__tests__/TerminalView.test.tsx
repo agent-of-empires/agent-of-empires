@@ -67,7 +67,9 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 
 import { TerminalView } from "../TerminalView";
 
-function makeSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function makeSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: "sess-1",
     title: "test-session",

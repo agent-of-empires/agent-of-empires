@@ -7,12 +7,7 @@
 // mocks; this test pins the wiring directly.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { RateLimitRecoverySection } from "./StructuredView";
 

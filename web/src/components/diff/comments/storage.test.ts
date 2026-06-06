@@ -120,8 +120,26 @@ describe("storage", () => {
         outroDraft: "",
         comments: [
           mkComment({ id: "good" }),
-          { id: "bad", filePath: 12, side: "new", startLine: 1, endLine: 1, body: "", capturedSnippet: "", createdAt: "x" },
-          { id: "no-side", filePath: "x", side: "left", startLine: 1, endLine: 1, body: "", capturedSnippet: "", createdAt: "x" },
+          {
+            id: "bad",
+            filePath: 12,
+            side: "new",
+            startLine: 1,
+            endLine: 1,
+            body: "",
+            capturedSnippet: "",
+            createdAt: "x",
+          },
+          {
+            id: "no-side",
+            filePath: "x",
+            side: "left",
+            startLine: 1,
+            endLine: 1,
+            body: "",
+            capturedSnippet: "",
+            createdAt: "x",
+          },
         ],
       }),
     );

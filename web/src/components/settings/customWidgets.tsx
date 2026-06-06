@@ -36,7 +36,11 @@ async function didSave(result: Promise<boolean> | unknown): Promise<boolean> {
  *  dashboard chrome. The repaint only fires after the PATCH lands so a failed
  *  save (elevation missing, read-only, network) does not paint a theme that
  *  is not on disk (#1510). */
-export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function ThemeNameWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   const [themes, setThemes] = useState<string[]>([]);
   useEffect(() => {
     // Degrade to an empty list if the theme fetch fails; never leave an
@@ -62,7 +66,11 @@ export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) 
 
 /** Default agent picker. The web keeps a free-text field (empty = auto-detect)
  *  rather than the TUI's agent-name select, matching prior behavior. */
-export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function DefaultToolWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   return (
     <TextField
       label={descriptor.label}
@@ -78,7 +86,11 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
 
 /** Sound mode. Persisted as the string `"random"` or the tagged object
  *  `{ specific: "..." }`; this maps that enum onto a two-option select. */
-export function SoundModeWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function SoundModeWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   const mode =
     typeof value === "string"
       ? value
@@ -101,7 +113,11 @@ export function SoundModeWidget({ descriptor, value, save }: CustomWidgetProps) 
 
 /** Playback volume. A float slider (0.1 to 1.5); the generic `slider` widget
  *  is integer-only, so this stays a custom control. */
-export function SoundVolumeWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function SoundVolumeWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   return (
     <SliderField
       label={descriptor.label}
@@ -138,7 +154,11 @@ function parseAcpDefaults(value: string): Record<string, unknown> | null {
 /** Per-agent structured-view defaults. A map of `{ agent: { model, effort } }`,
  *  with no flat widget, so it is edited as raw JSON; an invalid edit is not
  *  saved (the field stays at its last valid value). */
-export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function AcpDefaultsWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   return (
     <TextField
       label={descriptor.label}
@@ -203,7 +223,11 @@ const LEVELS = [
 /** Per-target log-level matrix. The `targets` field is a `{ target: level }`
  *  map; setting a row to "(default)" removes its override and inherits the
  *  baseline level. */
-export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function LoggingTargetsWidget({
+  descriptor,
+  value,
+  save,
+}: CustomWidgetProps) {
   const targets = (value ?? {}) as Record<string, string>;
   const saveTarget = (target: string, level: string) => {
     const next = { ...targets };

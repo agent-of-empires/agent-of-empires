@@ -46,7 +46,9 @@ base("mobile toolbar Esc sends ESC", async ({ page }, testInfo) => {
       };
     });
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
 
     const esc = page.getByRole("button", { name: "Escape" });
     await expect(esc).toBeVisible({ timeout: 15_000 });

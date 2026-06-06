@@ -25,10 +25,14 @@ describe("TerminalSettings localStorage contract", () => {
     const { getByText } = render(<TerminalSettings />);
 
     expect(
-      getByText(/web terminal sessions on mobile devices, including tmux-backed sessions/i),
+      getByText(
+        /web terminal sessions on mobile devices, including tmux-backed sessions/i,
+      ),
     ).toBeTruthy();
     expect(
-      getByText(/web terminal sessions on desktop, including tmux-backed sessions/i),
+      getByText(
+        /web terminal sessions on desktop, including tmux-backed sessions/i,
+      ),
     ).toBeTruthy();
   });
 
@@ -43,9 +47,7 @@ describe("TerminalSettings localStorage contract", () => {
 
   it("mobile font select writes mobileFontSize", () => {
     const { container } = render(<TerminalSettings />);
-    const select = container.querySelectorAll(
-      "select",
-    )[0] as HTMLSelectElement;
+    const select = container.querySelectorAll("select")[0] as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "16" } });
     expect(readStored().mobileFontSize).toBe(16);
   });
@@ -61,9 +63,7 @@ describe("TerminalSettings localStorage contract", () => {
 
   it("desktop font select writes desktopFontSize", () => {
     const { container } = render(<TerminalSettings />);
-    const select = container.querySelectorAll(
-      "select",
-    )[1] as HTMLSelectElement;
+    const select = container.querySelectorAll("select")[1] as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "20" } });
     expect(readStored().desktopFontSize).toBe(20);
   });

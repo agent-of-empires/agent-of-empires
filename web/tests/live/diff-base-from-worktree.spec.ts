@@ -62,7 +62,9 @@ async function setDiffBase(serve: ServeHandle, id: string, baseBranch: string) {
     body: JSON.stringify({ base_branch: baseBranch }),
   });
   if (!res.ok) {
-    throw new Error(`PATCH diff-base failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `PATCH diff-base failed: ${res.status} ${await res.text()}`,
+    );
   }
 }
 
@@ -107,7 +109,9 @@ base(
         }),
       });
       if (!res.ok) {
-        throw new Error(`POST /api/sessions failed: ${res.status} ${await res.text()}`);
+        throw new Error(
+          `POST /api/sessions failed: ${res.status} ${await res.text()}`,
+        );
       }
       const created = (await res.json()) as { id: string };
 

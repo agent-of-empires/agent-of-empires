@@ -93,7 +93,9 @@ function DiffLineImpl({
             {showPlus && (
               <button
                 type="button"
-                onClick={() => onPlusClick(plusHunkIndex, plusSide, plusLineNum)}
+                onClick={() =>
+                  onPlusClick(plusHunkIndex, plusSide, plusLineNum)
+                }
                 aria-label={`Add comment on ${plusSide} line ${plusLineNum}`}
                 // `tabIndex={-1}` keeps the hover-revealed button out of
                 // the tab order; otherwise keyboard users would land on

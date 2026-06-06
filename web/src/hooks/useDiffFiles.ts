@@ -44,7 +44,8 @@ export function useDiffFiles(
     const capturedSessionId = sessionId;
     const resp = await getSessionDiffFiles(capturedSessionId);
     // Drop stale responses: another fetch started, or session changed mid-flight
-    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId) return;
+    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId)
+      return;
     if (resp) {
       const fingerprint = JSON.stringify(resp.files);
       if (fingerprint !== lastFingerprintRef.current) {

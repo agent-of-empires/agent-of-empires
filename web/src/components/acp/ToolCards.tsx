@@ -173,13 +173,7 @@ function safeUri(uri: string, schemes: ReadonlySet<string>): string | null {
   }
 }
 
-function MediaPlaceholder({
-  icon,
-  label,
-}: {
-  icon: ReactNode;
-  label: string;
-}) {
+function MediaPlaceholder({ icon, label }: { icon: ReactNode; label: string }) {
   return (
     <div className="flex items-center gap-2 text-[11px] text-text-dim italic">
       <span className="text-text-dim">{icon}</span>
@@ -271,7 +265,10 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
         const filename = block.uri.split("/").pop() || "resource";
         return (
           <a
-            href={dataUri(block.mime_type ?? "application/octet-stream", block.data)}
+            href={dataUri(
+              block.mime_type ?? "application/octet-stream",
+              block.data,
+            )}
             download={filename}
             className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
           >
@@ -473,8 +470,7 @@ function useToolCardExpansion(status: Status, defaultOpen = false) {
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
       setOverride((prev) => {
-        const current =
-          prev && prev.density === density ? prev.open : baseline;
+        const current = prev && prev.density === density ? prev.open : baseline;
         const next = typeof action === "function" ? action(current) : action;
         return { density, open: next };
       });
@@ -660,10 +656,7 @@ function DurationLabel({
     ? `running ${text}; counts from the agent's first tool_call frame, which can fire before the subprocess actually starts (upstream limitation)`
     : `${text}; counts from the agent's first tool_call frame, which can fire before the subprocess actually starts (upstream limitation)`;
   return (
-    <span
-      className="text-[11px] text-text-dim tabular-nums"
-      title={tooltip}
-    >
+    <span className="text-[11px] text-text-dim tabular-nums" title={tooltip}>
       {text}
     </span>
   );
@@ -680,7 +673,10 @@ export function formatDurationMs(ms: number): string {
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-function truncateLines(text: string, max: number): {
+function truncateLines(
+  text: string,
+  max: number,
+): {
   shown: string;
   truncated: number;
 } {
@@ -1139,7 +1135,9 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
       }
       expanded={open}
       onToggle={
-        status === "err" || lines.length > 0 ? () => setOpen((v) => !v) : undefined
+        status === "err" || lines.length > 0
+          ? () => setOpen((v) => !v)
+          : undefined
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
@@ -1334,7 +1332,9 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
         <>
           <span>{todos.length} items</span>
           {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>
+            <span className="ml-2 text-text-dim">
+              · {breakdown.join(" · ")}
+            </span>
           )}
         </>
       }
@@ -1397,8 +1397,7 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
       .reverse()
       .find(
         (s) =>
-          s.result?.kind !== "tool_error" &&
-          s.result?.kind !== "tool_stopped",
+          s.result?.kind !== "tool_error" && s.result?.kind !== "tool_stopped",
       ) ?? null;
   const previewSnapshot = latestSuccessful ?? latestAttempt;
   const latestFailed = latestAttempt.result?.kind === "tool_error";
@@ -1435,7 +1434,9 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
         <>
           <span>updated {snapshots.length} times</span>
           {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>
+            <span className="ml-2 text-text-dim">
+              · {breakdown.join(" · ")}
+            </span>
           )}
         </>
       }
@@ -1528,17 +1529,19 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       endedAt={result?.at}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
-            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                <span>input</span>
-                <CopyButton text={inputJson} />
+          {args &&
+            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
+              0 && (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                  <span>input</span>
+                  <CopyButton text={inputJson} />
+                </div>
+                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                  {inputJson}
+                </pre>
               </div>
-              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                {inputJson}
-              </pre>
-            </div>
-          )}
+            )}
           {output && status !== "err" && (
             <HighlightedBlock text={output} language="markdown" maxLines={16} />
           )}
@@ -1678,13 +1681,9 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   const startedAt = [tool.started_at, ...children.map((c) => c.tool.started_at)]
     .sort()
     .at(0);
-  const allDone =
-    parentDone && children.every((c) => c.result !== undefined);
+  const allDone = parentDone && children.every((c) => c.result !== undefined);
   const endedAt = allDone
-    ? [
-        result?.at ?? null,
-        ...children.map((c) => c.result?.at ?? null),
-      ]
+    ? [result?.at ?? null, ...children.map((c) => c.result?.at ?? null)]
         .filter((v): v is string => v !== null)
         .sort()
         .at(-1)
@@ -1842,17 +1841,19 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
-            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                <span>input</span>
-                <CopyButton text={inputJson} />
+          {args &&
+            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
+              0 && (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                  <span>input</span>
+                  <CopyButton text={inputJson} />
+                </div>
+                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                  {inputJson}
+                </pre>
               </div>
-              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                {inputJson}
-              </pre>
-            </div>
-          )}
+            )}
           {output && status !== "err" && (
             <HighlightedBlock text={output} language="markdown" maxLines={24} />
           )}
@@ -1894,9 +1895,8 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
     [content],
   );
 
-  const verbLabel = hit.isIndex && hit.verb === "recalled"
-    ? "read index"
-    : hit.verb;
+  const verbLabel =
+    hit.isIndex && hit.verb === "recalled" ? "read index" : hit.verb;
   const headerLabel = hit.isIndex ? "Memory index" : "Memory";
 
   const meta = parsed?.type && (
@@ -1928,39 +1928,39 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {hasBody && parsed && status !== "err" ? (
-          <div className="border-t border-surface-800 bg-surface-950">
-            {(parsed.name || parsed.description || parsed.type) && (
-              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 text-[11px]">
-                {parsed.name && (
-                  <>
-                    <dt className="text-text-dim">name</dt>
-                    <dd className="text-text-secondary">{parsed.name}</dd>
-                  </>
-                )}
-                {parsed.type && (
-                  <>
-                    <dt className="text-text-dim">type</dt>
-                    <dd className="text-text-secondary">{parsed.type}</dd>
-                  </>
-                )}
-                {parsed.description && (
-                  <>
-                    <dt className="text-text-dim">description</dt>
-                    <dd className="text-text-secondary">
-                      {parsed.description}
-                    </dd>
-                  </>
-                )}
-              </dl>
-            )}
-            {parsed.body && (
-              <HighlightedBlock
-                text={parsed.body}
-                language="markdown"
-                maxLines={24}
-              />
-            )}
-          </div>
+            <div className="border-t border-surface-800 bg-surface-950">
+              {(parsed.name || parsed.description || parsed.type) && (
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 text-[11px]">
+                  {parsed.name && (
+                    <>
+                      <dt className="text-text-dim">name</dt>
+                      <dd className="text-text-secondary">{parsed.name}</dd>
+                    </>
+                  )}
+                  {parsed.type && (
+                    <>
+                      <dt className="text-text-dim">type</dt>
+                      <dd className="text-text-secondary">{parsed.type}</dd>
+                    </>
+                  )}
+                  {parsed.description && (
+                    <>
+                      <dt className="text-text-dim">description</dt>
+                      <dd className="text-text-secondary">
+                        {parsed.description}
+                      </dd>
+                    </>
+                  )}
+                </dl>
+              )}
+              {parsed.body && (
+                <HighlightedBlock
+                  text={parsed.body}
+                  language="markdown"
+                  maxLines={24}
+                />
+              )}
+            </div>
           ) : null}
         </ToolErrorBody>
       }
@@ -2152,8 +2152,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
   const hasRawInput = useMemo(() => {
     if (!args) return Boolean(tool.args_preview);
     return Object.keys(args).some(
-      (k) =>
-        !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"),
+      (k) => !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"),
     );
   }, [args, tool.args_preview, kind]);
 
@@ -2183,9 +2182,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
         {Number.isFinite(delaySeconds)
           ? `in ${formatDurationSeconds(delaySeconds)}`
           : "scheduled"}
-        {reason ? (
-          <span className="text-text-dim">: {reason}</span>
-        ) : null}
+        {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
     if (wakeAt) {
@@ -2207,9 +2204,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
         ) : (
           "schedule created"
         )}
-        {reason ? (
-          <span className="text-text-dim">: {reason}</span>
-        ) : null}
+        {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
   } else if (kind === "cron_list") {

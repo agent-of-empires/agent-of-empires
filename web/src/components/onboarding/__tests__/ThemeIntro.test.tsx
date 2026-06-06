@@ -68,16 +68,18 @@ describe("ThemeIntro", () => {
     );
     expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi");
     expect(
-      screen.getByRole("option", { name: "modus-vivendi" }).getAttribute(
-        "aria-selected",
-      ),
+      screen
+        .getByRole("option", { name: "modus-vivendi" })
+        .getAttribute("aria-selected"),
     ).toBe("true");
   });
 
   it("lets the user re-pick another theme", async () => {
     await mount();
     fireEvent.click(screen.getByRole("option", { name: "modus-vivendi" }));
-    await waitFor(() => expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi"));
+    await waitFor(() =>
+      expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi"),
+    );
     fireEvent.click(screen.getByRole("option", { name: "empire" }));
     await waitFor(() => expect(dispatchSpy).toHaveBeenCalledWith("empire"));
     expect(updateProfileSettings).toHaveBeenCalledTimes(2);
@@ -91,9 +93,9 @@ describe("ThemeIntro", () => {
     expect(dispatchSpy).not.toHaveBeenCalled();
     // Highlight reverts so the grid never claims an unsaved theme is active.
     expect(
-      screen.getByRole("option", { name: "empire" }).getAttribute(
-        "aria-selected",
-      ),
+      screen
+        .getByRole("option", { name: "empire" })
+        .getAttribute("aria-selected"),
     ).toBe("false");
   });
 

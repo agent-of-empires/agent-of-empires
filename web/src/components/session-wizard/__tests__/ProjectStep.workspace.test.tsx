@@ -29,7 +29,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function mockSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: overrides.id ?? "s1",
     title: overrides.title ?? "session",

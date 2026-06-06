@@ -31,8 +31,8 @@ function writeDismissed(version: string) {
  */
 export function UpdateBanner() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
-  const [dismissedVersion, setDismissedVersion] = useState<string | null>(
-    () => readDismissed(),
+  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() =>
+    readDismissed(),
   );
 
   useEffect(() => {

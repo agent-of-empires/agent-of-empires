@@ -16,7 +16,4 @@ import { test as base, devices } from "@playwright/test";
 
 base.use({ ...devices["iPhone 13"] });
 
-base.skip(
-  "mobile plain Enter does not dispatch the prompt",
-  async () => {},
-);
+base.skip("mobile plain Enter does not dispatch the prompt", async () => {});

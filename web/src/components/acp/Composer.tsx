@@ -27,14 +27,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import {
-  AtSign,
-  ChevronUp,
-  Paperclip,
-  Slash,
-  Square,
-  X,
-} from "lucide-react";
+import { AtSign, ChevronUp, Paperclip, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
@@ -226,10 +219,7 @@ interface Props {
    *  on the just-clicked option. */
   pendingConfigOption: AcpState["pendingConfigOption"];
   /** Send `session/set_config_option` for the given pair. */
-  setConfigOption: (
-    configId: string,
-    value: string,
-  ) => void | Promise<void>;
+  setConfigOption: (configId: string, value: string) => void | Promise<void>;
   /** Latest agent-reported context-window usage. Null until the agent
    *  has emitted at least one ACP `UsageUpdate`. */
   sessionUsage: AcpState["sessionUsage"];
@@ -317,7 +307,10 @@ export function Composer({
     async (files: FileList | File[]) => {
       // Only encode up to the remaining slots: base64 work on files the
       // cap would discard anyway stalls the composer on large drops.
-      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
+      const remaining = Math.max(
+        0,
+        MAX_ATTACHMENTS - pendingAttachments.length,
+      );
       if (remaining === 0) return;
       const list = Array.from(files).slice(0, remaining);
       const accepted: PromptAttachmentInput[] = [];
@@ -642,7 +635,9 @@ export function Composer({
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {
-          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes("Files");
+          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes(
+            "Files",
+          );
           if (!hasFiles) return;
           e.preventDefault();
         }}
@@ -757,7 +752,9 @@ export function Composer({
                 // `composeEventHandlers` (used by ComposerPrimitive.Input)
                 // skips the downstream handler when `defaultPrevented`
                 // is set on the SyntheticEvent.
-                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) {
+                if (
+                  dictationGuard.shouldSuppressUpstream(e.currentTarget.value)
+                ) {
                   e.preventDefault();
                 }
               }}
@@ -1097,8 +1094,7 @@ export function insertAtCaret(
   const before = ta.value.slice(0, start);
   // Trigger detection requires whitespace (or start-of-string) before
   // the trigger char; pad if we're mid-word.
-  const needsSpace =
-    before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
+  const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
   const next = before + needsSpace + text + ta.value.slice(end);
   const setter = Object.getOwnPropertyDescriptor(
     HTMLTextAreaElement.prototype,
@@ -1249,7 +1245,11 @@ function ModePicker({
   };
 
   return (
-    <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
+    <div
+      ref={ref}
+      {...tourAnchor(TOUR_ANCHORS.modePicker)}
+      className="relative"
+    >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -1397,7 +1397,9 @@ function SendButton({
   const title = connected
     ? "Send, Enter"
     : "Session not active, will send on resume";
-  const label = connected ? "Send message" : "Queue message until session resumes";
+  const label = connected
+    ? "Send message"
+    : "Queue message until session resumes";
   return (
     <button
       type="button"

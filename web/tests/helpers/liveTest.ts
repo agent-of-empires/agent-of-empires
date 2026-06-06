@@ -56,10 +56,7 @@ type LiveFixtures = {
  * passphrase-mode `aoe serve` accepts subsequent navigations. Call
  * before `page.goto(handle.baseUrl)`.
  */
-export async function seedAuth(
-  page: Page,
-  handle: ServeHandle,
-): Promise<void> {
+export async function seedAuth(page: Page, handle: ServeHandle): Promise<void> {
   if (!handle.sessionCookie) return;
   const url = new URL(handle.baseUrl);
   await page.context().addCookies([

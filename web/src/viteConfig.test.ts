@@ -16,10 +16,9 @@ async function loadProxy(
   }
   try {
     const mod = await import("../vite.config");
-    const factory = mod.default as (e: {
-      command: string;
-      mode: string;
-    }) => { server: { proxy?: Record<string, ProxyEntry> } };
+    const factory = mod.default as (e: { command: string; mode: string }) => {
+      server: { proxy?: Record<string, ProxyEntry> };
+    };
     const cfg = await factory({ command: "serve", mode: "development" });
     return cfg.server.proxy;
   } finally {

@@ -23,13 +23,16 @@ test("theme setting persists through PATCH + reload", async ({
     r.json(),
   );
   const baselineTheme: string | undefined = before?.theme?.name;
-  const newTheme = baselineTheme === "modus-vivendi" ? "default" : "modus-vivendi";
+  const newTheme =
+    baselineTheme === "modus-vivendi" ? "default" : "modus-vivendi";
 
   // PATCH the theme via the same endpoint the dashboard hits.
   const patchRes = await fetch(`${serve.baseUrl}/api/settings`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ theme: { ...(before?.theme ?? {}), name: newTheme } }),
+    body: JSON.stringify({
+      theme: { ...(before?.theme ?? {}), name: newTheme },
+    }),
   });
   expect(patchRes.ok).toBeTruthy();
 
@@ -81,9 +84,11 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
   await expect
     .poll(
       async () =>
-        await themeSelect.evaluate((sel: HTMLSelectElement, target) =>
-          Array.from(sel.options).some((o) => o.value === target),
-        SWITCH_TO),
+        await themeSelect.evaluate(
+          (sel: HTMLSelectElement, target) =>
+            Array.from(sel.options).some((o) => o.value === target),
+          SWITCH_TO,
+        ),
       { timeout: 5_000 },
     )
     .toBe(true);
@@ -103,7 +108,9 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
     .poll(
       () =>
         page.evaluate(() =>
-          document.documentElement.style.getPropertyValue("--color-surface-900").trim(),
+          document.documentElement.style
+            .getPropertyValue("--color-surface-900")
+            .trim(),
         ),
       { timeout: 5_000, intervals: [100, 200, 400] },
     )

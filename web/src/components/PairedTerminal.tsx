@@ -35,8 +35,7 @@ function PairedTerminal({
   fullViewport?: boolean;
 }) {
   const [ready, setReady] = useState(false);
-  const wsPath =
-    mode === "container" ? "container-terminal/ws" : "terminal/ws";
+  const wsPath = mode === "container" ? "container-terminal/ws" : "terminal/ws";
   const {
     containerRef,
     termRef,
@@ -184,7 +183,10 @@ function PairedTerminal({
   } as const;
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800" style={rootStyle}>
+    <div
+      className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800"
+      style={rootStyle}
+    >
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-3 py-1 shrink-0">
           <span className="text-xs text-status-waiting">
@@ -192,17 +194,19 @@ function PairedTerminal({
           </span>
         </div>
       )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Disconnected</span>
-          <button
-            onClick={manualReconnect}
-            className="text-xs text-brand-500 cursor-pointer underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      {!state.connected &&
+        !state.reconnecting &&
+        state.retryCount >= maxRetries && (
+          <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
+            <span className="text-xs text-status-error">Disconnected</span>
+            <button
+              onClick={manualReconnect}
+              className="text-xs text-brand-500 cursor-pointer underline"
+            >
+              Retry
+            </button>
+          </div>
+        )}
       <div
         data-term="paired"
         className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}

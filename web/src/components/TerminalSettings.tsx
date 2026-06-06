@@ -108,9 +108,7 @@ export function TerminalSettings() {
             <input
               type="checkbox"
               checked={settings.autoOpenKeyboard}
-              onChange={(e) =>
-                update({ autoOpenKeyboard: e.target.checked })
-              }
+              onChange={(e) => update({ autoOpenKeyboard: e.target.checked })}
               className="accent-brand-600 w-4 h-4 shrink-0"
             />
           </label>
@@ -127,9 +125,9 @@ export function TerminalSettings() {
                   </span>
                 </div>
                 <p className="text-[11px] text-text-muted mt-1">
-                  Keep recently viewed web terminals mounted for faster switching
-                  across many sessions. Uses more browser memory and keeps extra
-                  terminal connections open.
+                  Keep recently viewed web terminals mounted for faster
+                  switching across many sessions. Uses more browser memory and
+                  keeps extra terminal connections open.
                 </p>
               </div>
               <input

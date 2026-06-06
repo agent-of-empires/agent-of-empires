@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import type { ProjectInfo } from "../lib/types";
-import { fetchProjects, createProject, deleteProject, updateProject } from "../lib/api";
+import {
+  fetchProjects,
+  createProject,
+  deleteProject,
+  updateProject,
+} from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
@@ -119,7 +124,10 @@ export function ProjectsView({ onClose, readOnly }: Props) {
 
   const handleRemove = async (project: ProjectInfo) => {
     if (submitting) return;
-    if (!confirm(`Remove project '${project.name}' from ${project.scope} scope?`)) return;
+    if (
+      !confirm(`Remove project '${project.name}' from ${project.scope} scope?`)
+    )
+      return;
     setError(null);
     const result = await deleteProject(project.name, project.scope);
     if (!result.ok) {
@@ -220,14 +228,20 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               </>
             )}
 
-            <label className="block text-[12px] text-text-dim mb-1">Name{isEdit ? "" : " (optional)"}</label>
+            <label className="block text-[12px] text-text-dim mb-1">
+              Name{isEdit ? "" : " (optional)"}
+            </label>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               disabled={isEdit}
               placeholder={isEdit ? undefined : "defaults to directory name"}
-              title={isEdit ? "Rename is not supported yet; remove and re-add to rename" : undefined}
+              title={
+                isEdit
+                  ? "Rename is not supported yet; remove and re-add to rename"
+                  : undefined
+              }
               className={
                 isEdit
                   ? lockedFieldClass
@@ -235,7 +249,9 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               }
             />
 
-            <label className="block text-[12px] text-text-dim mb-1">Default base branch (optional)</label>
+            <label className="block text-[12px] text-text-dim mb-1">
+              Default base branch (optional)
+            </label>
             <input
               type="text"
               value={baseBranch}
@@ -249,9 +265,13 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               then the repo's detected default branch.
             </p>
 
-            <label className="block text-[12px] text-text-dim mb-1">Scope</label>
+            <label className="block text-[12px] text-text-dim mb-1">
+              Scope
+            </label>
             {isEdit ? (
-              <p className="mb-4 text-sm text-text-secondary capitalize">{scope}</p>
+              <p className="mb-4 text-sm text-text-secondary capitalize">
+                {scope}
+              </p>
             ) : (
               <div className="flex gap-2 mb-4">
                 {(["global", "profile"] as const).map((s) => (
@@ -326,17 +346,25 @@ export function ProjectsView({ onClose, readOnly }: Props) {
         {loading && (
           <div className="space-y-2 animate-pulse">
             {[...Array(3)].map((_, i) => (
-              <div key={i} className="h-[60px] bg-surface-800/40 border border-surface-700/40 rounded-md" />
+              <div
+                key={i}
+                className="h-[60px] bg-surface-800/40 border border-surface-700/40 rounded-md"
+              />
             ))}
           </div>
         )}
 
         {!loading && projects.length === 0 && (
           <div className="flex flex-col items-center justify-center py-16 text-center">
-            <p className="text-sm text-text-secondary mb-1">No registered projects yet.</p>
+            <p className="text-sm text-text-secondary mb-1">
+              No registered projects yet.
+            </p>
             <p className="text-xs text-text-dim">
               Add one above, or use{" "}
-              <code className="text-text-secondary">aoe project add &lt;path&gt;</code> from the CLI.
+              <code className="text-text-secondary">
+                aoe project add &lt;path&gt;
+              </code>{" "}
+              from the CLI.
             </p>
           </div>
         )}
@@ -350,7 +378,9 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               >
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-text-primary">{p.name}</span>
+                    <span className="text-sm font-medium text-text-primary">
+                      {p.name}
+                    </span>
                     <span
                       className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${
                         p.scope === "global"
@@ -361,13 +391,18 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                       {p.scope}
                     </span>
                   </div>
-                  <p className="text-[11px] font-mono text-text-dim truncate mt-0.5" title={p.path}>
+                  <p
+                    className="text-[11px] font-mono text-text-dim truncate mt-0.5"
+                    title={p.path}
+                  >
                     {p.path}
                   </p>
                   {p.default_base_branch && (
                     <p className="text-[11px] text-text-dim mt-0.5">
                       base branch:{" "}
-                      <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
+                      <span className="font-mono text-text-secondary">
+                        {p.default_base_branch}
+                      </span>
                     </p>
                   )}
                 </div>

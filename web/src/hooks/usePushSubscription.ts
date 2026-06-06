@@ -34,11 +34,10 @@ const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
   // iOS uses navigator.standalone; other platforms use the display-mode
   // media query. Both are worth checking.
-  const ios = (window.navigator as unknown as { standalone?: boolean })
-    .standalone === true;
-  const displayMode = window.matchMedia?.(
-    "(display-mode: standalone)",
-  ).matches;
+  const ios =
+    (window.navigator as unknown as { standalone?: boolean }).standalone ===
+    true;
+  const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
 

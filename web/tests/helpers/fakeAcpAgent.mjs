@@ -108,7 +108,9 @@ process.on("SIGPIPE", () => {
 process.on("SIGHUP", () => {
   fakeDebug("SIGHUP received (ignored)");
 });
-fakeDebug(`fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`);
+fakeDebug(
+  `fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`,
+);
 
 const DEFAULT_TURN = {
   updates: [
@@ -200,9 +202,7 @@ function sendRequest(method, params) {
 function resolveOutbound(msg) {
   const entry = pendingOutbound.get(msg.id);
   if (!entry) {
-    process.stderr.write(
-      `[fakeAcpAgent] response for unknown id ${msg.id}\n`,
-    );
+    process.stderr.write(`[fakeAcpAgent] response for unknown id ${msg.id}\n`);
     return;
   }
   pendingOutbound.delete(msg.id);
@@ -278,7 +278,8 @@ async function emitSessionUpdates(sessionId, updates) {
       // Clamp the raw value: NaN, Infinity, or negative numbers would
       // make setTimeout fire immediately or behave unpredictably and
       // mask bad fixture data. Cap at 60s so a typo can't hang CI.
-      const raw = typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
+      const raw =
+        typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
       const ms = Math.min(60_000, Math.max(0, Math.floor(raw)));
       // Sleep in 50ms slices so a cancel notification arriving during
       // a long wait_ms doesn't have to wait for the full duration
@@ -601,7 +602,10 @@ async function handleRequest(msg) {
                   configId === "model"
                     ? [
                         { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-                        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+                        {
+                          value: "claude-sonnet-4-6",
+                          name: "Claude Sonnet 4.6",
+                        },
                       ]
                     : [
                         { value: "default", name: "Default" },
@@ -640,7 +644,9 @@ async function handleRequest(msg) {
         return;
       }
       sendResult(id, {
-        stopReason: wasCancelled ? "cancelled" : (turn.stopReason ?? "end_turn"),
+        stopReason: wasCancelled
+          ? "cancelled"
+          : (turn.stopReason ?? "end_turn"),
       });
       return;
     }
@@ -655,7 +661,9 @@ async function main() {
   const rl = createInterface({ input: process.stdin });
   process.stdin.on("end", () => fakeDebug("stdin end"));
   process.stdin.on("close", () => fakeDebug("stdin close"));
-  process.stdin.on("error", (err) => fakeDebug(`stdin error: ${err.code ?? err.message}`));
+  process.stdin.on("error", (err) =>
+    fakeDebug(`stdin error: ${err.code ?? err.message}`),
+  );
   rl.on("line", async (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -673,7 +681,10 @@ async function main() {
         process.stderr.write(`[fakeAcpAgent] handler error: ${err}\n`);
         sendError(msg.id, -32603, `internal: ${err}`);
       }
-    } else if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+    } else if (
+      msg.id !== undefined &&
+      (msg.result !== undefined || msg.error !== undefined)
+    ) {
       // Response to one of our outbound requests (e.g.
       // session/request_permission). Resolve the awaiting Promise.
       resolveOutbound(msg);

@@ -111,9 +111,7 @@ describe("chooseVerb", () => {
   it("returns the same label for the same (state, seed, toolName)", () => {
     expect(chooseVerb("working", 42)).toBe(chooseVerb("working", 42));
     expect(chooseVerb("thinking", 42)).toBe(chooseVerb("thinking", 42));
-    expect(chooseVerb("tool", 42, "Read")).toBe(
-      chooseVerb("tool", 42, "Read"),
-    );
+    expect(chooseVerb("tool", 42, "Read")).toBe(chooseVerb("tool", 42, "Read"));
   });
 });
 

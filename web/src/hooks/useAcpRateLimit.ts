@@ -10,10 +10,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
-import {
-  getRateLimit,
-  subscribeAcpState,
-} from "../lib/acpStateStorage";
+import { getRateLimit, subscribeAcpState } from "../lib/acpStateStorage";
 
 export interface SidebarRateLimit {
   /** How many of the given sessions are currently rate-limited. */

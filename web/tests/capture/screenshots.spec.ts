@@ -25,7 +25,10 @@ import {
   seedSessionViaAoeAdd,
 } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../helpers/acp";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -152,14 +155,29 @@ const ACP_SCRIPT = {
         {
           sessionUpdate: "plan",
           entries: [
-            { content: "Add a /health route", status: "completed", priority: "high" },
-            { content: "Wire auth into login()", status: "in_progress", priority: "high" },
-            { content: "Add a regression test", status: "pending", priority: "medium" },
+            {
+              content: "Add a /health route",
+              status: "completed",
+              priority: "high",
+            },
+            {
+              content: "Wire auth into login()",
+              status: "in_progress",
+              priority: "high",
+            },
+            {
+              content: "Add a regression test",
+              status: "pending",
+              priority: "medium",
+            },
           ],
         },
         {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "I'll wire authentication into the login handler and add a health route." },
+          content: {
+            type: "text",
+            text: "I'll wire authentication into the login handler and add a health route.",
+          },
         },
         {
           sessionUpdate: "tool_call",
@@ -178,7 +196,8 @@ const ACP_SCRIPT = {
           rawInput: {
             file_path: "src/auth.ts",
             old_string: "export function login() {}",
-            new_string: "export function login(user: string) {\n  return issueToken(user);\n}",
+            new_string:
+              "export function login(user: string) {\n  return issueToken(user);\n}",
           },
         },
         {
@@ -191,7 +210,10 @@ const ACP_SCRIPT = {
         },
         {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "Done. Auth is wired in and the health route is live; tests pass." },
+          content: {
+            type: "text",
+            text: "Done. Auth is wired in and the health route is live; tests pass.",
+          },
         },
       ],
       stopReason: "end_turn",
@@ -222,10 +244,14 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'wire-auth' missing");
     await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
+    );
     await waitForStructuredView(page);
 
-    const composer = page.getByRole("textbox", { name: /Send a message|Queue a follow-up/i });
+    const composer = page.getByRole("textbox", {
+      name: /Send a message|Queue a follow-up/i,
+    });
     await composer.fill("Wire auth into login() and add a health route.");
     await composer.press("Enter");
 
@@ -240,14 +266,18 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     // Reload at the phone width so the layout mounts in mobile mode with
     // the sidebar collapsed, rather than mid-switch with the drawer open.
     await page.setViewportSize(MOBILE);
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
+    );
     await waitForStructuredView(page);
     // The mobile drawer mounts open; tap the content area to the right of
     // it (the backdrop) so it slides away and the structured view is clear.
     const projects = page.getByText("Projects", { exact: true });
     if (await projects.isVisible().catch(() => false)) {
       await page.mouse.click(340, 450);
-      await projects.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => {});
+      await projects
+        .waitFor({ state: "hidden", timeout: 5_000 })
+        .catch(() => {});
     }
     await page.waitForTimeout(600);
     await shot(page, "structured view/interface.png");
@@ -264,7 +294,10 @@ const APPROVAL_SCRIPT = {
       updates: [
         {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "This will force-push to main. Confirm to proceed." },
+          content: {
+            type: "text",
+            text: "This will force-push to main. Confirm to proceed.",
+          },
         },
         {
           sessionUpdate: "permission_request",
@@ -308,10 +341,14 @@ base("structured view approval card", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'approve-push' missing");
     await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
+    );
     await waitForStructuredView(page);
 
-    const composer = page.getByRole("textbox", { name: /Send a message|Queue a follow-up/i });
+    const composer = page.getByRole("textbox", {
+      name: /Send a message|Queue a follow-up/i,
+    });
     await composer.fill("push my changes");
     await composer.press("Enter");
 

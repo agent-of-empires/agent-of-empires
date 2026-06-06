@@ -8,12 +8,56 @@ import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
-interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useStructuredView: boolean; [key: string]: unknown; }
-interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; commandMaps?: CommandMaps; }
+interface WizardData {
+  path: string;
+  title: string;
+  worktreeBranch: string;
+  useWorktree: boolean;
+  attachExisting: boolean;
+  baseBranch: string;
+  group: string;
+  tool: string;
+  profile: string;
+  profileDirty: boolean;
+  yoloMode: boolean;
+  sandboxEnabled: boolean;
+  sandboxImage: string;
+  extraArgs: string;
+  customInstruction: string;
+  commandOverride: string;
+  scratch: boolean;
+  useStructuredView: boolean;
+  [key: string]: unknown;
+}
+interface Props {
+  data: WizardData;
+  onChange: (field: string, value: unknown) => void;
+  agents: AgentInfo[];
+  isSubmitting: boolean;
+  error: string | null;
+  onSubmit: () => void;
+  onJumpTo: (stepId: StepId) => void;
+  steps: StepDef[];
+  commandMaps?: CommandMaps;
+}
 
-const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
+const isMac =
+  typeof navigator !== "undefined" &&
+  /Mac|iPhone|iPad/.test(navigator.userAgent);
 
-function Row({ label, value, stepId, onJumpTo, accent }: { label: string; value: ReactNode; stepId?: StepId; onJumpTo?: (id: StepId) => void; accent?: boolean }) {
+function Row({
+  label,
+  value,
+  stepId,
+  onJumpTo,
+  accent,
+}: {
+  label: string;
+  value: ReactNode;
+  stepId?: StepId;
+  onJumpTo?: (id: StepId) => void;
+  accent?: boolean;
+}) {
   const interactive = stepId && onJumpTo;
   return (
     <button
@@ -21,11 +65,17 @@ function Row({ label, value, stepId, onJumpTo, accent }: { label: string; value:
       onClick={() => interactive && onJumpTo(stepId)}
       disabled={!interactive}
       className={`flex justify-between items-center w-full py-3 border-b border-surface-800 last:border-0 text-left ${
-        interactive ? "cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md" : "-mx-2 px-2"
+        interactive
+          ? "cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md"
+          : "-mx-2 px-2"
       }`}
     >
       <span className="text-sm text-text-dim">{label}</span>
-      <span className={`text-sm font-mono truncate ml-4 ${accent ? "text-accent-600" : "text-text-primary"}`}>{value}</span>
+      <span
+        className={`text-sm font-mono truncate ml-4 ${accent ? "text-accent-600" : "text-text-primary"}`}
+      >
+        {value}
+      </span>
     </button>
   );
 }
@@ -42,7 +92,14 @@ function AgentReviewValue({ name, custom }: { name: string; custom: boolean }) {
   );
 }
 
-function EditableRow({ label, value, displayValue, placeholder, onChange, accent }: {
+function EditableRow({
+  label,
+  value,
+  displayValue,
+  placeholder,
+  onChange,
+  accent,
+}: {
   label: string;
   value: string;
   displayValue: string;
@@ -103,7 +160,11 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
       className="flex justify-between items-center w-full py-3 border-b border-surface-800 last:border-0 text-left cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md"
     >
       <span className="text-sm text-text-dim">{label}</span>
-      <span className={`text-sm font-mono truncate ml-4 ${isPlaceholder ? "text-text-dim italic" : accent ? "text-accent-600" : "text-text-primary"}`}>{displayValue}</span>
+      <span
+        className={`text-sm font-mono truncate ml-4 ${isPlaceholder ? "text-text-dim italic" : accent ? "text-accent-600" : "text-text-primary"}`}
+      >
+        {displayValue}
+      </span>
     </button>
   );
 }
@@ -113,7 +174,12 @@ function EditableRow({ label, value, displayValue, placeholder, onChange, accent
  *  override. The arg suffix (structured view registry args or tmux extra args) is
  *  always-appended and rendered read-only, so editing can never duplicate
  *  it (e.g. "opencode acp" never becomes "opencode acp acp"). See #1911. */
-function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
+function EditableCommandRow({
+  label,
+  prefix,
+  suffix,
+  onChangePrefix,
+}: {
   label: string;
   prefix: string;
   suffix: string;
@@ -192,7 +258,17 @@ function EditableCommandRow({ label, prefix, suffix, onChangePrefix }: {
   );
 }
 
-export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubmit, onJumpTo, steps, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
+export function ReviewStep({
+  data,
+  onChange,
+  agents,
+  isSubmitting,
+  error,
+  onSubmit,
+  onJumpTo,
+  steps,
+  commandMaps = EMPTY_COMMAND_MAPS,
+}: Props) {
   const hasStep = (id: StepId) => steps.some((s) => s.id === id);
   const offline = useServerDown();
   // Scratch sessions intentionally carry no path until the server
@@ -239,8 +315,12 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">Review & Launch</h2>
-      <p className="text-sm text-text-muted mb-5">Here's what will be created. Make sure everything looks right.</p>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">
+        Review & Launch
+      </h2>
+      <p className="text-sm text-text-muted mb-5">
+        Here's what will be created. Make sure everything looks right.
+      </p>
       <div className="bg-surface-900 border border-surface-700 rounded-lg p-4 mb-5">
         <Row
           label="Project"
@@ -271,7 +351,11 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
             />
             <Row
               label="Mode"
-              value={data.attachExisting ? "Attach to existing branch" : "Create new branch"}
+              value={
+                data.attachExisting
+                  ? "Attach to existing branch"
+                  : "Create new branch"
+              }
             />
             {!data.attachExisting && data.baseBranch.trim() && (
               <Row label="Base branch" value={data.baseBranch.trim()} />
@@ -284,20 +368,48 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
         )}
         <Row
           label="Agent"
-          value={<AgentReviewValue name={data.tool || "(not set)"} custom={selectedCustomAgent} />}
+          value={
+            <AgentReviewValue
+              name={data.tool || "(not set)"}
+              custom={selectedCustomAgent}
+            />
+          }
           stepId="agent"
           onJumpTo={onJumpTo}
         />
-        {(
-          <Row label="Interface" value={willUseStructuredView ? "Structured view" : "Terminal"} stepId="agent" onJumpTo={onJumpTo} />
-        )}
+        {
+          <Row
+            label="Interface"
+            value={willUseStructuredView ? "Structured view" : "Terminal"}
+            stepId="agent"
+            onJumpTo={onJumpTo}
+          />
+        }
         {data.profile && (
-          <Row label="Profile" value={data.profileDirty ? `${data.profile} (Custom)` : data.profile} stepId="agent" onJumpTo={onJumpTo} accent />
+          <Row
+            label="Profile"
+            value={
+              data.profileDirty ? `${data.profile} (Custom)` : data.profile
+            }
+            stepId="agent"
+            onJumpTo={onJumpTo}
+            accent
+          />
         )}
         {data.sandboxEnabled && (
-          <Row label="Container" value={data.sandboxImage || "default"} stepId={hasStep("container") ? "container" : undefined} onJumpTo={onJumpTo} />
+          <Row
+            label="Container"
+            value={data.sandboxImage || "default"}
+            stepId={hasStep("container") ? "container" : undefined}
+            onJumpTo={onJumpTo}
+          />
         )}
-        <Row label="Auto-approve" value={data.yoloMode ? "On" : "Off"} stepId="agent" onJumpTo={onJumpTo} />
+        <Row
+          label="Auto-approve"
+          value={data.yoloMode ? "On" : "Off"}
+          stepId="agent"
+          onJumpTo={onJumpTo}
+        />
         {data.group && <Row label="Group" value={data.group} />}
         {data.customInstruction && <Row label="Instructions" value="(set)" />}
         {data.tool && (
@@ -309,12 +421,19 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
           />
         )}
         {willUseStructuredView && data.extraArgs.trim() && (
-          <p className="pt-2 text-xs text-status-warning" data-testid="extra-args-ignored-review">
+          <p
+            className="pt-2 text-xs text-status-warning"
+            data-testid="extra-args-ignored-review"
+          >
             Extra args are ignored for structured view sessions.
           </p>
         )}
       </div>
-      {error && <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">{error}</div>}
+      {error && (
+        <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">
+          {error}
+        </div>
+      )}
       {offline && (
         <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">
           {OFFLINE_TITLE}
@@ -331,11 +450,31 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
       >
         {isSubmitting ? (
           <span className="flex items-center justify-center gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+                fill="none"
+              />
+              <path
+                className="opacity-75"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+              />
+            </svg>
             Creating session...
           </span>
         ) : (
-          <span>Launch session <span className="opacity-60">({isMac ? "\u2318" : "Ctrl"}+Enter)</span></span>
+          <span>
+            Launch session{" "}
+            <span className="opacity-60">
+              ({isMac ? "\u2318" : "Ctrl"}+Enter)
+            </span>
+          </span>
         )}
       </button>
     </div>

@@ -12,8 +12,7 @@ import { fireEvent, render, waitFor } from "@testing-library/react";
 import type { TelemetryStatus } from "../../../lib/api";
 
 const fetchTelemetryStatus = vi.fn<[], Promise<TelemetryStatus | null>>();
-const setTelemetryConsent =
-  vi.fn<[boolean], Promise<TelemetryStatus | null>>();
+const setTelemetryConsent = vi.fn<[boolean], Promise<TelemetryStatus | null>>();
 
 vi.mock("../../../lib/api", () => ({
   fetchTelemetryStatus: () => fetchTelemetryStatus(),

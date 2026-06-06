@@ -123,9 +123,9 @@ describe("ToolDensityToggle", () => {
     expect(onToggle).toHaveBeenCalledTimes(1);
     rerender(<ToolDensityToggle density="compact" onToggle={onToggle} />);
     expect(
-      screen.getByRole("button", { name: /compact tools/i }).getAttribute(
-        "aria-pressed",
-      ),
+      screen
+        .getByRole("button", { name: /compact tools/i })
+        .getAttribute("aria-pressed"),
     ).toBe("true");
   });
 });

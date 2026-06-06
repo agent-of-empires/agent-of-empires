@@ -74,9 +74,7 @@ async function loadSettings(): Promise<SoundSettings | null> {
   return cachedSettings;
 }
 
-async function resolveSoundName(
-  sound: SoundSettings,
-): Promise<string | null> {
+async function resolveSoundName(sound: SoundSettings): Promise<string | null> {
   const override = sound.on_approval?.trim();
   if (override) return override;
   if (typeof sound.mode === "object" && sound.mode !== null) {

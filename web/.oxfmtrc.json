@@ -2,5 +2,10 @@
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "printWidth": 80,
   "sortPackageJson": false,
-  "ignorePatterns": ["dist/", "coverage/", "node_modules/", "eslint-suppressions.json"]
+  "ignorePatterns": [
+    "dist/",
+    "coverage/",
+    "node_modules/",
+    "eslint-suppressions.json"
+  ]
 }

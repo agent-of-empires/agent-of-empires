@@ -29,7 +29,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../../helpers/acp";
 
 base(
   "iOS dictation commits each partial exactly once, syncs on blur",
@@ -45,12 +48,15 @@ base(
     try {
       const sessions = await listSessions(serve.baseUrl);
       const seeded = sessions.find((s) => s.title === "story-ios-dictation");
-      if (!seeded) throw new Error("seeded session 'story-ios-dictation' missing");
+      if (!seeded)
+        throw new Error("seeded session 'story-ios-dictation' missing");
       const sessionId = seeded.id;
 
       await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-      await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
       await waitForStructuredView(page);
 
       const composer = page.getByRole("textbox", { name: /Send a message/i });
@@ -150,12 +156,16 @@ base(
         (s) => s.title === "story-ios-dictation-then-type",
       );
       if (!seeded)
-        throw new Error("seeded session 'story-ios-dictation-then-type' missing");
+        throw new Error(
+          "seeded session 'story-ios-dictation-then-type' missing",
+        );
       const sessionId = seeded.id;
 
       await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-      await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
       await waitForStructuredView(page);
 
       const composer = page.getByRole("textbox", { name: /Send a message/i });

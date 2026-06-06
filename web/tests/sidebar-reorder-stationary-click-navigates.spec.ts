@@ -10,7 +10,9 @@ import {
   threeSessionsInOneRepo,
 } from "./helpers/sidebarMocks";
 
-test("stationary click on a row navigates without reordering", async ({ page }) => {
+test("stationary click on a row navigates without reordering", async ({
+  page,
+}) => {
   const handle = await installSidebarMocks(page, {
     sessions: threeSessionsInOneRepo(),
   });

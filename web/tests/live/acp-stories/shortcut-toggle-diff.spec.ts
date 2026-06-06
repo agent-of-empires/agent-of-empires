@@ -34,7 +34,9 @@ base.fixme("D key toggles the diff panel", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'story-diff-toggle' missing");
     const sessionId = seeded.id;
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     const handle = page.locator('[data-testid="content-split-resize-handle"]');
     await expect(handle).toBeVisible({ timeout: 10_000 });
     // Click outside the terminal so focus moves to body and the

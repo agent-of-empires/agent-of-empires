@@ -22,7 +22,15 @@ interface Props {
   onChange: (field: string, value: unknown) => void;
 }
 
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
@@ -53,13 +61,19 @@ export function SessionStep({ data, onChange }: Props) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">Name your session</h2>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">
+        Name your session
+      </h2>
       <p className="text-sm text-text-muted mb-5">
-        Give it a title; defaults to a new git worktree branched off the current HEAD. Expand Advanced to change the branch, attach to an existing one, or set a group.
+        Give it a title; defaults to a new git worktree branched off the current
+        HEAD. Expand Advanced to change the branch, attach to an existing one,
+        or set a group.
       </p>
 
       <div className="mb-5">
-        <label className="block text-sm text-text-dim mb-1.5">Session title</label>
+        <label className="block text-sm text-text-dim mb-1.5">
+          Session title
+        </label>
         <input
           type="text"
           value={data.title}
@@ -67,7 +81,10 @@ export function SessionStep({ data, onChange }: Props) {
           placeholder="Auto-generated if empty"
           className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
         />
-        <p className="text-xs text-text-dim mt-1">Shown in the dashboard. Renaming it later does not rename the git branch.</p>
+        <p className="text-xs text-text-dim mt-1">
+          Shown in the dashboard. Renaming it later does not rename the git
+          branch.
+        </p>
       </div>
 
       <button
@@ -116,9 +133,12 @@ export function SessionStep({ data, onChange }: Props) {
               }}
             >
               <div className="flex-1">
-                <div className="text-sm font-medium text-text-primary">Create a worktree</div>
+                <div className="text-sm font-medium text-text-primary">
+                  Create a worktree
+                </div>
                 <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                  Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo folder.
+                  Run the agent in a new git worktree branched off the current
+                  HEAD. Off = run directly in the repo folder.
                 </div>
               </div>
               <Toggle
@@ -130,7 +150,9 @@ export function SessionStep({ data, onChange }: Props) {
 
           {!data.scratch && data.useWorktree && (
             <div className="mb-5">
-              <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
+              <label className="block text-sm text-text-dim mb-1.5">
+                Branch / worktree name
+              </label>
               <input
                 type="text"
                 value={data.worktreeBranch}
@@ -138,16 +160,22 @@ export function SessionStep({ data, onChange }: Props) {
                 placeholder="Uses session title if empty"
                 className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
               />
-              <p className="text-xs text-text-dim mt-1">The branch name is also the worktree directory name. Leave blank to use the session title.</p>
+              <p className="text-xs text-text-dim mt-1">
+                The branch name is also the worktree directory name. Leave blank
+                to use the session title.
+              </p>
 
               <label
                 className="mt-3 flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
                 onClick={() => onChange("attachExisting", !data.attachExisting)}
               >
                 <div className="flex-1">
-                  <div className="text-sm font-medium text-text-primary">Attach to existing branch</div>
+                  <div className="text-sm font-medium text-text-primary">
+                    Attach to existing branch
+                  </div>
                   <div className="text-xs text-text-dim mt-0.5 leading-snug">
-                    Re-use a branch + worktree that already exists. Off = create a new branch.
+                    Re-use a branch + worktree that already exists. Off = create
+                    a new branch.
                   </div>
                 </div>
                 <Toggle
@@ -200,7 +228,8 @@ function AdvancedWorktreeOptions({
   const [hasFocus, setHasFocus] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const branchLoadKey = open ? data.path : null;
-  const [trackedBranchLoadKey, setTrackedBranchLoadKey] = useState(branchLoadKey);
+  const [trackedBranchLoadKey, setTrackedBranchLoadKey] =
+    useState(branchLoadKey);
   if (branchLoadKey !== trackedBranchLoadKey) {
     setTrackedBranchLoadKey(branchLoadKey);
     setBranches(null);
@@ -249,7 +278,9 @@ function AdvancedWorktreeOptions({
       </button>
       {open && (
         <div className="mt-2 pl-4 border-l border-surface-700/40">
-          <label className="block text-xs text-text-dim mb-1.5">Base branch</label>
+          <label className="block text-xs text-text-dim mb-1.5">
+            Base branch
+          </label>
           <div className="relative">
             <input
               type="text"
@@ -268,7 +299,9 @@ function AdvancedWorktreeOptions({
               onKeyDown={(e) => {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
-                  setHighlightIdx((i) => Math.min(i + 1, suggestions.length - 1));
+                  setHighlightIdx((i) =>
+                    Math.min(i + 1, suggestions.length - 1),
+                  );
                 } else if (e.key === "ArrowUp") {
                   e.preventDefault();
                   setHighlightIdx((i) => Math.max(i - 1, 0));
@@ -279,7 +312,11 @@ function AdvancedWorktreeOptions({
                   setHasFocus(false);
                 }
               }}
-              placeholder={loading ? "Loading branches..." : "Defaults to project default branch"}
+              placeholder={
+                loading
+                  ? "Loading branches..."
+                  : "Defaults to project default branch"
+              }
               aria-label="Base branch"
               autoComplete="off"
               className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
@@ -308,7 +345,11 @@ function AdvancedWorktreeOptions({
                   >
                     <span className="truncate">{b.name}</span>
                     <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
-                      {b.is_current ? "current" : b.remote_only ? "remote" : "local"}
+                      {b.is_current
+                        ? "current"
+                        : b.remote_only
+                          ? "remote"
+                          : "local"}
                     </span>
                   </li>
                 ))}
@@ -316,7 +357,9 @@ function AdvancedWorktreeOptions({
             )}
           </div>
           <p className="text-xs text-text-dim mt-1">
-            Stack a new worktree on top of a different branch (an in-flight PR, a release branch, a teammate's branch). Leave blank for the repo's default.
+            Stack a new worktree on top of a different branch (an in-flight PR,
+            a release branch, a teammate's branch). Leave blank for the repo's
+            default.
           </p>
         </div>
       )}

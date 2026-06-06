@@ -10,7 +10,14 @@
 // Optimistic state shows a spinner until the server's broadcast removes
 // the approval from AcpState.pendingApprovals.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
@@ -79,9 +86,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       }
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
-          (navigator as Navigator & { vibrate?: (p: number) => void }).vibrate?.(
-            20,
-          );
+          (
+            navigator as Navigator & { vibrate?: (p: number) => void }
+          ).vibrate?.(20);
         } catch {
           // ignore
         }
@@ -175,7 +182,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
                 ? "bg-rose-600 hover:bg-rose-500"
                 : "bg-rose-700 opacity-70 cursor-wait",
             ].join(" ")}
-            disabled={offline || (phase !== "pending" && phase !== "rolled-back")}
+            disabled={
+              offline || (phase !== "pending" && phase !== "rolled-back")
+            }
             onMouseDown={startLongPress}
             onMouseUp={cancelLongPress}
             onMouseLeave={cancelLongPress}
@@ -223,7 +232,11 @@ export function ApprovalCard({ approval, onResolve }: Props) {
                 .join(" ")}
               disabled={offline || phase === "submitting"}
               onClick={() => void submit("AllowAlways")}
-              title={offline ? OFFLINE_TITLE : "Allow this tool for the whole session"}
+              title={
+                offline
+                  ? OFFLINE_TITLE
+                  : "Allow this tool for the whole session"
+              }
             >
               Always
             </button>
@@ -278,7 +291,9 @@ function ArgsView({ raw }: { raw: string }) {
     );
   }
 
-  const entries = Object.entries(parsed).filter(([k]) => !k.startsWith("_aoe_"));
+  const entries = Object.entries(parsed).filter(
+    ([k]) => !k.startsWith("_aoe_"),
+  );
   if (entries.length === 0) return null;
 
   return (
@@ -299,7 +314,8 @@ function ArgsView({ raw }: { raw: string }) {
 
 function ArgValue({ value }: { value: unknown }) {
   if (value === null) return <span className="text-text-dim italic">null</span>;
-  if (value === undefined) return <span className="text-text-dim italic">—</span>;
+  if (value === undefined)
+    return <span className="text-text-dim italic">—</span>;
   if (typeof value === "string") {
     return <>{value}</>;
   }

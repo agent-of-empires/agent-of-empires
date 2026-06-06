@@ -36,10 +36,9 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     const sessions = await listSessions(serve.baseUrl);
     const sessionId = sessions[0]!.id;
 
-    await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-      { method: "POST" },
-    );
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, {
+      method: "POST",
+    });
 
     for (let i = 0; i < SEED_EVENTS; i++) {
       const r = await fetch(
@@ -67,9 +66,7 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
           );
           if (!res.ok) return -1;
           body = await res.json();
-          return (
-            JSON.stringify(body!.frames).split('"user_forced"').length - 1
-          );
+          return JSON.stringify(body!.frames).split('"user_forced"').length - 1;
         },
         { timeout: 15_000, intervals: [100, 200, 500, 1000] },
       )
@@ -102,9 +99,7 @@ test("structured view/replay surfaces seeded events and signals lost frames", as
     // make the two reads disagree.
     const full = body!;
     const target = full.highest_seq!;
-    const fullSeqs = full.frames
-      .map((f) => f.seq)
-      .filter((s) => s <= target);
+    const fullSeqs = full.frames.map((f) => f.seq).filter((s) => s <= target);
 
     const PAGE = 2;
     const pagedSeqs: number[] = [];

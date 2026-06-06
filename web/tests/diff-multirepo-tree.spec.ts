@@ -119,15 +119,19 @@ test.describe("Diff multi-repo subfolder folding", () => {
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
     await clickSidebarSession(page, "multi-repo");
-    await expect(page.getByText("2 repos", { exact: true }).first()).toBeVisible({
+    await expect(
+      page.getByText("2 repos", { exact: true }).first(),
+    ).toBeVisible({
       timeout: 10000,
     });
     // Toggle title flips based on the current mode. Match either so the
     // assertion stays robust against the desktop default.
     await expect(
-      page.locator(
-        'button[title="Switch to tree view"], button[title="Switch to flat list"]',
-      ).first(),
+      page
+        .locator(
+          'button[title="Switch to tree view"], button[title="Switch to flat list"]',
+        )
+        .first(),
     ).toBeVisible();
   });
 
@@ -137,7 +141,9 @@ test.describe("Diff multi-repo subfolder folding", () => {
     await setupMultiRepoSession(page);
     await page.goto("/");
     await clickSidebarSession(page, "multi-repo");
-    await expect(page.getByText("2 repos", { exact: true }).first()).toBeVisible({
+    await expect(
+      page.getByText("2 repos", { exact: true }).first(),
+    ).toBeVisible({
       timeout: 10000,
     });
     // Force tree mode regardless of viewport default: if the toggle

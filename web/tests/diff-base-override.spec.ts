@@ -56,7 +56,9 @@ test.describe("Diff base override (#970)", () => {
     await chip.click();
     await expect(page.getByPlaceholder("Search branches...")).toBeVisible();
     await expect(page.getByRole("option", { name: /^main/ })).toBeVisible();
-    await expect(page.getByRole("option", { name: /upstream\/main/ })).toBeVisible();
+    await expect(
+      page.getByRole("option", { name: /upstream\/main/ }),
+    ).toBeVisible();
   });
 
   test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({
@@ -103,7 +105,9 @@ test.describe("Diff base override (#970)", () => {
     await page.getByRole("option", { name: /develop/ }).click();
     await expect.poll(() => patched?.base_branch).toBe("develop");
     await expect(
-      page.getByRole("button", { name: /Change diff base \(current: develop\)/ }),
+      page.getByRole("button", {
+        name: /Change diff base \(current: develop\)/,
+      }),
     ).toBeVisible({ timeout: 5000 });
   });
 

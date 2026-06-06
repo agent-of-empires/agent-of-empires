@@ -13,7 +13,13 @@
 // web/tests/live/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -23,7 +29,10 @@ const PROFILES = [
 ];
 
 const ALLOW = { policy: "allow" } as const;
-const ELEV = { policy: "requires_elevation", reason: "host filesystem" } as const;
+const ELEV = {
+  policy: "requires_elevation",
+  reason: "host filesystem",
+} as const;
 const NONE = { rule: "none" } as const;
 
 // Representative slice of the real schema: a few primary + advanced fields per
@@ -39,33 +48,204 @@ const RAW_SCHEMA: Array<{
   validation?: Record<string, unknown>;
 }> = [
   // worktree
-  { section: "worktree", field: "enabled", label: "Enabled by Default", widget: { kind: "toggle" }, advanced: false, web_write: ELEV },
-  { section: "worktree", field: "path_template", label: "Path Template", widget: { kind: "text" }, advanced: false, web_write: ELEV },
-  { section: "worktree", field: "auto_cleanup", label: "Auto Cleanup", widget: { kind: "toggle" }, advanced: false, web_write: ELEV },
-  { section: "worktree", field: "bare_repo_path_template", label: "Bare Repo Template", widget: { kind: "text" }, advanced: true, web_write: ELEV },
-  { section: "worktree", field: "workspace_path_template", label: "Workspace Path Template", widget: { kind: "text" }, advanced: true, web_write: ELEV },
-  { section: "worktree", field: "delete_branch_on_cleanup", label: "Delete Branch on Cleanup", widget: { kind: "toggle" }, advanced: true, web_write: ELEV },
-  { section: "worktree", field: "init_submodules", label: "Init Submodules", widget: { kind: "toggle" }, advanced: true, web_write: ELEV },
+  {
+    section: "worktree",
+    field: "enabled",
+    label: "Enabled by Default",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "path_template",
+    label: "Path Template",
+    widget: { kind: "text" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "auto_cleanup",
+    label: "Auto Cleanup",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "bare_repo_path_template",
+    label: "Bare Repo Template",
+    widget: { kind: "text" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "workspace_path_template",
+    label: "Workspace Path Template",
+    widget: { kind: "text" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "delete_branch_on_cleanup",
+    label: "Delete Branch on Cleanup",
+    widget: { kind: "toggle" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "init_submodules",
+    label: "Init Submodules",
+    widget: { kind: "toggle" },
+    advanced: true,
+    web_write: ELEV,
+  },
   // sandbox
-  { section: "sandbox", field: "enabled_by_default", label: "Sandbox enabled by default", widget: { kind: "toggle" }, advanced: false, web_write: ELEV },
-  { section: "sandbox", field: "cpu_limit", label: "CPU limit", widget: { kind: "optional_text" }, advanced: true },
-  { section: "sandbox", field: "memory_limit", label: "Memory limit", widget: { kind: "optional_text" }, advanced: true, validation: { rule: "memory_limit" } },
-  { section: "sandbox", field: "custom_instruction", label: "Custom instruction", widget: { kind: "text", multiline: true }, advanced: true },
-  { section: "sandbox", field: "environment", label: "Environment variables", widget: { kind: "list" }, advanced: true, web_write: ELEV, validation: { rule: "env_list" } },
-  { section: "sandbox", field: "extra_volumes", label: "Extra volumes", widget: { kind: "list" }, advanced: true, web_write: ELEV, validation: { rule: "volume_list" } },
-  { section: "sandbox", field: "port_mappings", label: "Port mappings", widget: { kind: "list" }, advanced: true, web_write: ELEV, validation: { rule: "port_mapping_list" } },
-  { section: "sandbox", field: "volume_ignores", label: "Volume ignores", widget: { kind: "list" }, advanced: true },
+  {
+    section: "sandbox",
+    field: "enabled_by_default",
+    label: "Sandbox enabled by default",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "sandbox",
+    field: "cpu_limit",
+    label: "CPU limit",
+    widget: { kind: "optional_text" },
+    advanced: true,
+  },
+  {
+    section: "sandbox",
+    field: "memory_limit",
+    label: "Memory limit",
+    widget: { kind: "optional_text" },
+    advanced: true,
+    validation: { rule: "memory_limit" },
+  },
+  {
+    section: "sandbox",
+    field: "custom_instruction",
+    label: "Custom instruction",
+    widget: { kind: "text", multiline: true },
+    advanced: true,
+  },
+  {
+    section: "sandbox",
+    field: "environment",
+    label: "Environment variables",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "env_list" },
+  },
+  {
+    section: "sandbox",
+    field: "extra_volumes",
+    label: "Extra volumes",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "volume_list" },
+  },
+  {
+    section: "sandbox",
+    field: "port_mappings",
+    label: "Port mappings",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "port_mapping_list" },
+  },
+  {
+    section: "sandbox",
+    field: "volume_ignores",
+    label: "Volume ignores",
+    widget: { kind: "list" },
+    advanced: true,
+  },
   // acp (structured view)
-  { section: "acp", field: "show_tool_durations", label: "Show tool-call durations", widget: { kind: "toggle" }, advanced: false },
-  { section: "acp", field: "queue_drain_mode", label: "Queue drain mode", widget: { kind: "select", options: [ { value: "combined", label: "Combined" }, { value: "serial", label: "Serial" } ] }, advanced: false },
-  { section: "acp", field: "rate_limit_auto_resume", label: "Auto-resume after rate limit", widget: { kind: "toggle" }, advanced: false },
-  { section: "acp", field: "replay_events", label: "History cap (events)", widget: { kind: "number", min: 0 }, advanced: true },
-  { section: "acp", field: "replay_bytes", label: "Replay buffer bytes", widget: { kind: "number", min: 0 }, advanced: true },
-  { section: "acp", field: "max_concurrent_resumes", label: "Max concurrent resumes", widget: { kind: "number", min: 1 }, advanced: true },
-  { section: "acp", field: "silent_orphan_grace_secs", label: "Silent-orphan grace (s)", widget: { kind: "number", min: 0 }, advanced: true },
-  { section: "acp", field: "silent_orphan_fast_grace_secs", label: "Silent-orphan fast grace (s)", widget: { kind: "number", min: 0 }, advanced: true },
-  { section: "acp", field: "auto_stop_idle_secs", label: "Auto-stop idle workers (s)", widget: { kind: "number", min: 0 }, advanced: true },
-  { section: "acp", field: "rate_limit_auto_resume_grace_secs", label: "Auto-resume grace (s)", widget: { kind: "number", min: 0 }, advanced: true },
+  {
+    section: "acp",
+    field: "show_tool_durations",
+    label: "Show tool-call durations",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "queue_drain_mode",
+    label: "Queue drain mode",
+    widget: {
+      kind: "select",
+      options: [
+        { value: "combined", label: "Combined" },
+        { value: "serial", label: "Serial" },
+      ],
+    },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "rate_limit_auto_resume",
+    label: "Auto-resume after rate limit",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "replay_events",
+    label: "History cap (events)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "replay_bytes",
+    label: "Replay buffer bytes",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "max_concurrent_resumes",
+    label: "Max concurrent resumes",
+    widget: { kind: "number", min: 1 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "silent_orphan_grace_secs",
+    label: "Silent-orphan grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "silent_orphan_fast_grace_secs",
+    label: "Silent-orphan fast grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "auto_stop_idle_secs",
+    label: "Auto-stop idle workers (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "rate_limit_auto_resume_grace_secs",
+    label: "Auto-resume grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
 ];
 
 const MOCK_SCHEMA = RAW_SCHEMA.map((d) => ({
@@ -125,7 +305,10 @@ function fieldInputByLabel(
   return input as HTMLInputElement | HTMLTextAreaElement;
 }
 
-function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
+function selectByLabel(
+  container: HTMLElement,
+  label: string,
+): HTMLSelectElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
   const select = match?.parentElement?.querySelector("select");
@@ -237,7 +420,10 @@ describe("Settings Advanced fold", () => {
     await screen.findByText("Queue drain mode");
 
     expandAdvanced(container);
-    commit(fieldInputByLabel(container, "Replay buffer bytes", "number"), "4096");
+    commit(
+      fieldInputByLabel(container, "Replay buffer bytes", "number"),
+      "4096",
+    );
     commit(
       fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"),
       "30",
@@ -246,12 +432,18 @@ describe("Settings Advanced fold", () => {
       fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"),
       "28800",
     );
-    commit(fieldInputByLabel(container, "Auto-resume grace (s)", "number"), "20");
+    commit(
+      fieldInputByLabel(container, "Auto-resume grace (s)", "number"),
+      "20",
+    );
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { replay_bytes: 4096 },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          acp: { replay_bytes: 4096 },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { silent_orphan_fast_grace_secs: 30 },
@@ -274,9 +466,12 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { queue_drain_mode: "serial" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          acp: { queue_drain_mode: "serial" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { rate_limit_auto_resume: true },
@@ -303,9 +498,12 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        worktree: { workspace_path_template: "../wt-{branch}" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          worktree: { workspace_path_template: "../wt-{branch}" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       worktree: { delete_branch_on_cleanup: true },
@@ -319,7 +517,10 @@ describe("Settings Advanced fold", () => {
     expandAdvanced(container);
     commit(fieldInputByLabel(container, "CPU limit", "text"), "4");
     commit(fieldInputByLabel(container, "Memory limit", "text"), "8g");
-    commit(fieldInputByLabel(container, "Custom instruction", "text"), "be terse");
+    commit(
+      fieldInputByLabel(container, "Custom instruction", "text"),
+      "be terse",
+    );
 
     // Lists exercise both the add (onChange) and validate paths: an invalid
     // entry trips the schema-derived validator, then a valid one commits.
@@ -332,9 +533,12 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sandbox: { cpu_limit: "4" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          sandbox: { cpu_limit: "4" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       sandbox: { environment: ["FOO=bar"] },

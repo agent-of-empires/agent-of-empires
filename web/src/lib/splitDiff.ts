@@ -46,7 +46,12 @@ export function buildSplitRows(hunk: RichDiffHunk): SplitRow[] {
   hunk.lines.forEach((line, index) => {
     if (line.type === "equal") {
       flush();
-      rows.push({ left: line, right: line, leftIndex: index, rightIndex: index });
+      rows.push({
+        left: line,
+        right: line,
+        leftIndex: index,
+        rightIndex: index,
+      });
     } else if (line.type === "delete") {
       dels.push({ line, index });
     } else {

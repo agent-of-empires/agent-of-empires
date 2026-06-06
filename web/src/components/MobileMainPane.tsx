@@ -117,7 +117,9 @@ export function MobileMainPane({
           ) : (
             <TerminalSessionStack
               activeSessionId={activeSessionId!}
-              sessions={sessions.filter((session) => session.view !== "structured")}
+              sessions={sessions.filter(
+                (session) => session.view !== "structured",
+              )}
               persistent={webSettings.persistentTerminals}
               maxPersistentTerminals={webSettings.maxPersistentTerminals}
             />
@@ -174,7 +176,9 @@ export function MobileMainPane({
                     activeSession?.project_path ??
                     null
                   }
-                  baseBranchOverride={activeSession?.base_branch_override ?? null}
+                  baseBranchOverride={
+                    activeSession?.base_branch_override ?? null
+                  }
                   onBaseBranchChanged={onDiffRefresh}
                 />
               </div>

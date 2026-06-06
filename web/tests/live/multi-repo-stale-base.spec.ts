@@ -36,7 +36,12 @@ const GIT_ENV = {
   GIT_CONFIG_SYSTEM: "/dev/null",
 } as const;
 
-function run(cmd: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
+function run(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  extraEnv: Record<string, string> = {},
+) {
   const res = spawnSync(cmd, args, {
     cwd,
     env: { ...process.env, ...GIT_ENV, ...extraEnv },
@@ -70,7 +75,11 @@ interface ForkUpstreamLayout {
  * Returns paths and tip commit OIDs. The local clone is what the user
  * passes to `aoe add` / `extra_repo_paths`.
  */
-function seedForkUpstreamLayout(root: string, name: string, branch: string): ForkUpstreamLayout {
+function seedForkUpstreamLayout(
+  root: string,
+  name: string,
+  branch: string,
+): ForkUpstreamLayout {
   const upstreamDir = join(root, `${name}-upstream`);
   const originDir = join(root, `${name}-origin`);
   const localDir = join(root, name);
@@ -78,8 +87,16 @@ function seedForkUpstreamLayout(root: string, name: string, branch: string): For
   mkdirSync(upstreamDir, { recursive: true });
   mkdirSync(originDir, { recursive: true });
 
-  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir], root);
-  run("git", ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir], root);
+  run(
+    "git",
+    ["init", "--bare", "-q", `--initial-branch=${branch}`, upstreamDir],
+    root,
+  );
+  run(
+    "git",
+    ["init", "--bare", "-q", `--initial-branch=${branch}`, originDir],
+    root,
+  );
 
   // Seed both with commit A from a scratch clone of upstream.
   const seedA = join(root, `${name}-seed-a`);
@@ -105,11 +122,7 @@ function seedForkUpstreamLayout(root: string, name: string, branch: string): For
   run("git", ["push", "-q", "origin", `HEAD:${branch}`], seedA);
 
   const upstreamTip = run("git", ["rev-parse", `${branch}`], seedA);
-  const originTip = run(
-    "git",
-    ["rev-parse", `fork-origin/${branch}`],
-    seedA,
-  );
+  const originTip = run("git", ["rev-parse", `fork-origin/${branch}`], seedA);
   expect(upstreamTip).not.toBe(originTip);
 
   // Now make the local clone the user will use. Clone from origin (the
@@ -147,7 +160,9 @@ async function createSession(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`POST /api/sessions failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `POST /api/sessions failed: ${res.status} ${await res.text()}`,
+    );
   }
   // Server returns the SessionResponse directly (web/src/lib/api.ts:615
   // wraps it as `{ session }` client-side). Don't wrap here.
@@ -259,8 +274,16 @@ base(
 
       const primary = join(serve.home, "primary");
       const secondary = join(serve.home, "secondary");
-      const primaryUpstream = run("git", ["rev-parse", "upstream/main"], primary);
-      const secondaryUpstream = run("git", ["rev-parse", "upstream/main"], secondary);
+      const primaryUpstream = run(
+        "git",
+        ["rev-parse", "upstream/main"],
+        primary,
+      );
+      const secondaryUpstream = run(
+        "git",
+        ["rev-parse", "upstream/main"],
+        secondary,
+      );
 
       const created = await createSession(serve, {
         path: primary,

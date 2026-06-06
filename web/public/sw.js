@@ -4,16 +4,17 @@
 // a burst of auth-failing 404s on install and contributed to rate-limit
 // lockouts for mobile PWA users.
 
-self.addEventListener('install', () => {
+self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
-self.addEventListener('activate', (e) => {
+self.addEventListener("activate", (e) => {
   // Clear any cache from the old precache-all strategy.
   e.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.map((k) => caches.delete(k))),
-    ).then(() => self.clients.claim()),
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.map((k) => caches.delete(k))))
+      .then(() => self.clients.claim()),
   );
 });
 
@@ -36,60 +37,63 @@ self.addEventListener('activate', (e) => {
 // focused tab is rare enough for pushes that revocation hasn't been
 // an issue. If it becomes one, fall back to showing the notification
 // anyway and let the client suppress its own toast.
-self.addEventListener('push', (event) => {
+self.addEventListener("push", (event) => {
   let payload = {};
   if (event.data) {
     try {
       payload = event.data.json();
     } catch {
-      payload = { title: 'Agent of Empires', body: event.data.text() };
+      payload = { title: "Agent of Empires", body: event.data.text() };
     }
   }
-  const title = payload.title || 'Agent of Empires';
+  const title = payload.title || "Agent of Empires";
   const options = {
-    body: payload.body || '',
-    tag: payload.tag || 'aoe',
+    body: payload.body || "",
+    tag: payload.tag || "aoe",
     renotify: true,
-    data: { url: payload.url || '/' },
-    icon: '/icon-192.png',
-    badge: '/icon-192.png',
+    data: { url: payload.url || "/" },
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
   };
 
-  event.waitUntil((async () => {
-    const clientList = await self.clients.matchAll({
-      type: 'window',
-      includeUncontrolled: true,
-    });
-    const focused = clientList.find(
-      (c) => c.visibilityState === 'visible' && c.focused,
-    );
-    if (focused) {
-      // User is already in the app, forward the payload for an in-app
-      // toast, skip the OS notification. If the client has no handler,
-      // the message is silently dropped which is fine.
-      try {
-        focused.postMessage({ type: 'aoe-push', payload });
-      } catch {
-        /* ignore */
+  event.waitUntil(
+    (async () => {
+      const clientList = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      const focused = clientList.find(
+        (c) => c.visibilityState === "visible" && c.focused,
+      );
+      if (focused) {
+        // User is already in the app, forward the payload for an in-app
+        // toast, skip the OS notification. If the client has no handler,
+        // the message is silently dropped which is fine.
+        try {
+          focused.postMessage({ type: "aoe-push", payload });
+        } catch {
+          /* ignore */
+        }
+        return;
       }
-      return;
-    }
-    await self.registration.showNotification(title, options);
-  })());
+      await self.registration.showNotification(title, options);
+    })(),
+  );
 });
 
 // Tap-to-open. Look for an existing PWA window first so we focus it
 // (and navigate if needed) rather than opening a second instance.
-self.addEventListener('notificationclick', (event) => {
+self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || '/';
+  const target =
+    (event.notification.data && event.notification.data.url) || "/";
   event.waitUntil(
     self.clients
-      .matchAll({ type: 'window', includeUncontrolled: true })
+      .matchAll({ type: "window", includeUncontrolled: true })
       .then(async (clientList) => {
         for (const client of clientList) {
-          if ('focus' in client) {
-            if (client.url !== target && 'navigate' in client) {
+          if ("focus" in client) {
+            if (client.url !== target && "navigate" in client) {
               try {
                 await client.navigate(target);
               } catch {

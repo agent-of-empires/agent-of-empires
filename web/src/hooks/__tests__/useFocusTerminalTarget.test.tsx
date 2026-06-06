@@ -23,7 +23,10 @@ afterEach(() => {
   consumePendingTerminalFocus("agent");
 });
 
-function renderWithElement(target: "composer" | "agent", el: HTMLElement | null) {
+function renderWithElement(
+  target: "composer" | "agent",
+  el: HTMLElement | null,
+) {
   return renderHook(() => {
     const ref = useRef<HTMLElement | null>(el);
     useFocusTerminalTarget(target, ref);

@@ -23,50 +23,55 @@ import {
 const MALFORMED_NAME = "aoe-story-malformed";
 const SWITCH_TO = "dracula";
 
-base("malformed custom theme TOML does not break the dropdown", async ({ page }, testInfo) => {
-  const serve = await spawnAoeServe({
-    authMode: "none",
-    workerIndex: testInfo.workerIndex,
-    parallelIndex: testInfo.parallelIndex,
-    seedFn: ({ home, xdg }) => {
-      seedCustomTheme(home, xdg, MALFORMED_NAME, MALFORMED_CUSTOM_THEME_TOML);
-    },
-  });
+base(
+  "malformed custom theme TOML does not break the dropdown",
+  async ({ page }, testInfo) => {
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: ({ home, xdg }) => {
+        seedCustomTheme(home, xdg, MALFORMED_NAME, MALFORMED_CUSTOM_THEME_TOML);
+      },
+    });
 
-  try {
-    await page.goto(`${serve.baseUrl}/settings`);
-    await openSettingsTab(page, "Theme");
+    try {
+      await page.goto(`${serve.baseUrl}/settings`);
+      await openSettingsTab(page, "Theme");
 
-    const themeSelect = settingsSelectByLabel(page, "Theme");
-    await expect(themeSelect).toBeVisible({ timeout: 10_000 });
+      const themeSelect = settingsSelectByLabel(page, "Theme");
+      await expect(themeSelect).toBeVisible({ timeout: 10_000 });
 
-    // Dropdown still populates: builtins are there and can be picked.
-    // We assert dracula specifically because the rest of the suite
-    // uses it as the switch-target; if the builtin set ever changes,
-    // pick any non-default builtin instead.
-    await expect
-      .poll(
-        async () =>
-          await themeSelect.evaluate((sel: HTMLSelectElement, target) =>
-            Array.from(sel.options).some((o) => o.value === target),
-          SWITCH_TO),
-        { timeout: 10_000 },
-      )
-      .toBe(true);
+      // Dropdown still populates: builtins are there and can be picked.
+      // We assert dracula specifically because the rest of the suite
+      // uses it as the switch-target; if the builtin set ever changes,
+      // pick any non-default builtin instead.
+      await expect
+        .poll(
+          async () =>
+            await themeSelect.evaluate(
+              (sel: HTMLSelectElement, target) =>
+                Array.from(sel.options).some((o) => o.value === target),
+              SWITCH_TO,
+            ),
+          { timeout: 10_000 },
+        )
+        .toBe(true);
 
-    // Switching to a builtin lands. The PATCH succeeds (the server
-    // does not validate names server-side; it would simply resolve
-    // through `resolve_theme`).
-    await themeSelect.selectOption(SWITCH_TO);
-    await expect(themeSelect).toHaveValue(SWITCH_TO);
-    await expect
-      .poll(
-        async () =>
-          await page.evaluate(() => document.documentElement.dataset.theme),
-        { timeout: 10_000 },
-      )
-      .toBe(SWITCH_TO);
-  } finally {
-    await serve.stop();
-  }
-});
+      // Switching to a builtin lands. The PATCH succeeds (the server
+      // does not validate names server-side; it would simply resolve
+      // through `resolve_theme`).
+      await themeSelect.selectOption(SWITCH_TO);
+      await expect(themeSelect).toHaveValue(SWITCH_TO);
+      await expect
+        .poll(
+          async () =>
+            await page.evaluate(() => document.documentElement.dataset.theme),
+          { timeout: 10_000 },
+        )
+        .toBe(SWITCH_TO);
+    } finally {
+      await serve.stop();
+    }
+  },
+);

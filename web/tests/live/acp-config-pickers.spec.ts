@@ -95,10 +95,8 @@ base(
 
       // Wait for the initial snapshot so we know the supervisor saw
       // session/new complete before issuing set_config_option.
-      const sawInitial = await waitForReplay(
-        serve.baseUrl,
-        sessionId,
-        (json) => json.includes("ConfigOptionsUpdated"),
+      const sawInitial = await waitForReplay(serve.baseUrl, sessionId, (json) =>
+        json.includes("ConfigOptionsUpdated"),
       );
       expect(sawInitial).toBe(true);
 

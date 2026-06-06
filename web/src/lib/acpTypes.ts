@@ -6,11 +6,7 @@
 
 import type { DiffComment } from "../components/diff/comments/types";
 
-export type ApprovalDecision =
-  | "Allow"
-  | "AllowAlways"
-  | "Deny"
-  | "Cancelled";
+export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
 export type SessionMode =
   | "Default"
@@ -89,9 +85,19 @@ export interface DiffPreview {
  *  the status word. See #1818. */
 export type ToolOutputBlock =
   | { kind: "text"; text: string }
-  | { kind: "image"; mime_type: string; data?: string | null; uri?: string | null }
+  | {
+      kind: "image";
+      mime_type: string;
+      data?: string | null;
+      uri?: string | null;
+    }
   | { kind: "audio"; mime_type: string; data?: string | null }
-  | { kind: "resource_link"; uri: string; name: string; mime_type?: string | null }
+  | {
+      kind: "resource_link";
+      uri: string;
+      name: string;
+      mime_type?: string | null;
+    }
   | {
       kind: "resource";
       uri: string;
@@ -231,7 +237,11 @@ export type IncompatibleAgentDetail =
 // { "ApprovalRequested": { "approval": ... } }.
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
-  | { TodoListUpdated: { todos: Array<{ id: string; text: string; completed: boolean }> } }
+  | {
+      TodoListUpdated: {
+        todos: Array<{ id: string; text: string; completed: boolean }>;
+      };
+    }
   | { ToolCallStarted: { tool_call: ToolCall } }
   | {
       ToolCallCompleted: {
@@ -320,7 +330,9 @@ export type AcpEvent =
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
-  | { UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] } }
+  | {
+      UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] };
+    }
   | {
       UserDiffCommentsPrompt: {
         intro: string;
@@ -482,7 +494,11 @@ export interface AcpState {
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
    *  four-mode taxonomy in that case. */
-  availableModes: Array<{ id: string; name: string; description?: string | null }>;
+  availableModes: Array<{
+    id: string;
+    name: string;
+    description?: string | null;
+  }>;
   currentModeId: string | null;
   /** Slash commands the agent advertised in its most recent
    *  `AvailableCommandsUpdate`. Empty until the agent emits one; the
@@ -812,10 +828,7 @@ function applyNewTurnResets(next: AcpState): void {
  *  so reconnect/replay can re-deliver buffered frames without
  *  double-applying them (duplicate tool cards, doubled message
  *  chunks, etc.). */
-export function applyEvent(
-  state: AcpState,
-  frame: AcpFrame,
-): AcpState {
+export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if (frame.seq <= state.lastSeq) {
     return state;
   }
@@ -1099,9 +1112,19 @@ export function applyEvent(
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
     if (next.usageBaseline && incoming.cost) {
-      const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
-      const rebasedCost = { amount: rebasedAmount, currency: incoming.cost.currency };
-      next.sessionUsage = { used: incoming.used, size: incoming.size, cost: rebasedCost };
+      const rebasedAmount = Math.max(
+        0,
+        incoming.cost.amount - next.usageBaseline.cost,
+      );
+      const rebasedCost = {
+        amount: rebasedAmount,
+        currency: incoming.cost.currency,
+      };
+      next.sessionUsage = {
+        used: incoming.used,
+        size: incoming.size,
+        cost: rebasedCost,
+      };
     } else {
       next.sessionUsage = incoming;
     }
@@ -1173,7 +1196,8 @@ export function applyEvent(
     return next;
   }
   if ("AgentMessageChunk" in event) {
-    next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
+    next.assistantMessage =
+      next.assistantMessage + event.AgentMessageChunk.text;
     // Visible assistant text means the agent is answering, not thinking.
     // A later reasoning block re-sets `thinking` via ThinkingStarted. See
     // #1213.
@@ -1420,7 +1444,8 @@ export function applyEvent(
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
-        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
+        attachments:
+          serverAttachments.length > 0 ? serverAttachments : undefined,
         at: new Date().toISOString(),
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
@@ -1693,9 +1718,7 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
         : prev.args_preview,
     started_at: startedAt,
     diffs:
-      incoming.diffs && incoming.diffs.length > 0
-        ? incoming.diffs
-        : prev.diffs,
+      incoming.diffs && incoming.diffs.length > 0 ? incoming.diffs : prev.diffs,
     parent_tool_call_id:
       incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
     memory_recall: incoming.memory_recall ?? prev.memory_recall,

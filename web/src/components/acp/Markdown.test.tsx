@@ -152,7 +152,7 @@ describe("Blockquote override", () => {
 
   it("strips leading whitespace before checking for the warning glyph", () => {
     const Blockquote = getBlockquote();
-    const { container } = render(<Blockquote>   ⚠️ warning</Blockquote>);
+    const { container } = render(<Blockquote> ⚠️ warning</Blockquote>);
     const bq = container.querySelector("blockquote");
     expect(bq?.className).toContain("acp-callout-warn");
   });

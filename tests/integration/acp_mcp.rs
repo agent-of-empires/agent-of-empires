@@ -97,6 +97,88 @@ async fn configured_mcp_servers_reach_new_session() {
 }
 
 #[tokio::test]
+async fn native_and_global_merge_reaches_new_session() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    // Native layer (lowest precedence): the agent's own `~/.claude.json`. It
+    // defines "shared" (collides with global) and "native-only".
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".claude.json"),
+        r#"{ "mcpServers": {
+            "shared": { "command": "from-native" },
+            "native-only": { "command": "n" }
+        } }"#,
+    )
+    .unwrap();
+    let native = mcp_config::load_native_mcp_servers("claude", home.path()).unwrap();
+
+    // Global layer (higher precedence): `<app_dir>/mcp.json`. It overrides
+    // "shared" and adds "global-only".
+    let app_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        app_dir.path().join("mcp.json"),
+        r#"{ "mcpServers": {
+            "shared": { "command": "from-global" },
+            "global-only": { "command": "g" }
+        } }"#,
+    )
+    .unwrap();
+    let global = mcp_config::load_global_mcp_servers(app_dir.path()).unwrap();
+
+    let merged = mcp_config::merge_by_precedence(vec![
+        mcp_config::McpLayer {
+            label: "agent-native",
+            servers: native,
+        },
+        mcp_config::McpLayer {
+            label: "global",
+            servers: global,
+        },
+    ]);
+
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.json");
+    let mut config = base_config(std::env::temp_dir(), &record_path);
+    config.mcp_servers = merged;
+
+    let client = AcpClient::spawn(config, AcpSessionId("mcp-native-merge".into()))
+        .await
+        .expect("spawn shim agent");
+
+    let body = read_record(&record_path);
+    let _ = client.shutdown().await;
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("record is JSON");
+    let arr = parsed.as_array().expect("mcp_servers is an array");
+    assert_eq!(
+        arr.len(),
+        3,
+        "expected merged union of three servers, got {body}"
+    );
+
+    let shared = arr
+        .iter()
+        .find(|s| s["name"] == "shared")
+        .expect("shared server present");
+    assert_eq!(
+        shared["command"], "from-global",
+        "global must override native on name collision, got {body}"
+    );
+    assert!(
+        arr.iter().any(|s| s["name"] == "native-only"),
+        "native-only server must survive the merge, got {body}"
+    );
+    assert!(
+        arr.iter().any(|s| s["name"] == "global-only"),
+        "global-only server must survive the merge, got {body}"
+    );
+}
+
+#[tokio::test]
 async fn no_config_forwards_empty_list() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

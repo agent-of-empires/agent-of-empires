@@ -32,7 +32,8 @@ export function useEdgeSwipe({
     let tracking = false;
 
     const onTouchStart = (e: TouchEvent) => {
-      if (window.innerWidth >= MOBILE_BREAKPOINT || e.touches.length !== 1) return;
+      if (window.innerWidth >= MOBILE_BREAKPOINT || e.touches.length !== 1)
+        return;
       const t = e.touches[0];
       if (!t) return;
       const inEdge =
@@ -57,7 +58,10 @@ export function useEdgeSwipe({
           document.activeElement.blur();
         }
         onSwipe();
-      } else if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > VERTICAL_CANCEL_PX) {
+      } else if (
+        Math.abs(dy) > Math.abs(dx) &&
+        Math.abs(dy) > VERTICAL_CANCEL_PX
+      ) {
         tracking = false;
       }
     };

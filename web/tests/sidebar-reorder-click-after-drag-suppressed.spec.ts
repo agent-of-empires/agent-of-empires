@@ -13,7 +13,9 @@ import {
   threeSessionsInOneRepo,
 } from "./helpers/sidebarMocks";
 
-test("click-after-drag suppression keeps the URL on the source row", async ({ page }) => {
+test("click-after-drag suppression keeps the URL on the source row", async ({
+  page,
+}) => {
   const handle = await installSidebarMocks(page, {
     sessions: threeSessionsInOneRepo(),
   });

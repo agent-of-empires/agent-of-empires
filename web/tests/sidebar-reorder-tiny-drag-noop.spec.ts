@@ -36,10 +36,7 @@ test("4px movement does not start a drag", async ({ page }) => {
   await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2);
   await page.mouse.down();
   // 4px below the activation threshold; sensor should not promote.
-  await page.mouse.move(
-    box.x + box.width - 4,
-    box.y + box.height / 2 + 4,
-  );
+  await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2 + 4);
   await page.mouse.up();
 
   // Give the sensor a tick; a regression that drops the threshold

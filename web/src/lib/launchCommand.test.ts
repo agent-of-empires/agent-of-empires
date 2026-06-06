@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { resolveLaunchCommand } from "./launchCommand";
 
 describe("resolveLaunchCommand (structured view)", () => {
-  const base = { tool: "opencode", useStructuredView: true, binary: "opencode" };
+  const base = {
+    tool: "opencode",
+    useStructuredView: true,
+    binary: "opencode",
+  };
 
   it("appends the registry args to the structured view command (the #1911 case)", () => {
     expect(
@@ -78,13 +82,17 @@ describe("resolveLaunchCommand (structured view)", () => {
       acpArgs: ["acp"],
       manualOverride: "opencode acp",
     });
-    expect(r).toEqual({ prefix: "opencode", suffix: "acp", full: "opencode acp" });
+    expect(r).toEqual({
+      prefix: "opencode",
+      suffix: "acp",
+      full: "opencode acp",
+    });
   });
 
   it("falls back to the tool name when no command is known", () => {
-    expect(resolveLaunchCommand({ tool: "opencode", useStructuredView: true })).toEqual(
-      { prefix: "opencode", suffix: "", full: "opencode" },
-    );
+    expect(
+      resolveLaunchCommand({ tool: "opencode", useStructuredView: true }),
+    ).toEqual({ prefix: "opencode", suffix: "", full: "opencode" });
   });
 
   it("ignores a whitespace-only manual override", () => {
@@ -109,7 +117,11 @@ describe("resolveLaunchCommand (tmux)", () => {
         binary: "claude",
         extraArgs: "--model opus",
       }),
-    ).toEqual({ prefix: "claude", suffix: "--model opus", full: "claude --model opus" });
+    ).toEqual({
+      prefix: "claude",
+      suffix: "--model opus",
+      full: "claude --model opus",
+    });
   });
 
   it("ignores acp_args when not in structured view", () => {
