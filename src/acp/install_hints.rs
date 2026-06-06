@@ -15,6 +15,9 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         }
         "opencode" => "curl -fsSL https://opencode.ai/install | bash  (then `opencode acp`)",
         "gemini" => "npm install -g @google/gemini-cli  (then `gemini --acp`)",
+        "cursor-agent" => {
+            "curl https://cursor.com/install -fsS | bash  (then `cursor-agent login`)"
+        }
         "vibe-acp" => {
             "follow https://github.com/mistralai/mistral-vibe (ships the `vibe-acp` binary)"
         }
@@ -31,6 +34,7 @@ mod tests {
         for binary in [
             "claude-agent-acp",
             "codex-acp",
+            "cursor-agent",
             "opencode",
             "gemini",
             "vibe-acp",

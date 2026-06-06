@@ -30,6 +30,7 @@ use super::state::StartupErrorDetail;
 pub enum ExpectedAgent {
     ClaudeAgentAcp,
     CodexAcp,
+    Cursor,
     OpenCode,
     AoeAgent,
     Gemini,
@@ -69,6 +70,7 @@ impl ExpectedAgent {
                 match stem {
                     "claude-agent-acp" => Some(Self::ClaudeAgentAcp),
                     "codex-acp" => Some(Self::CodexAcp),
+                    "cursor-agent" | "agent" => Some(Self::Cursor),
                     "opencode" => Some(Self::OpenCode),
                     "aoe-agent" => Some(Self::AoeAgent),
                     "gemini" => Some(Self::Gemini),
@@ -106,6 +108,7 @@ impl ExpectedAgent {
             // Other adapters: protocol check only. aoe doesn't yet
             // depend on a version-gated behavior in any of them.
             Self::CodexAcp
+            | Self::Cursor
             | Self::OpenCode
             | Self::AoeAgent
             | Self::Gemini
@@ -349,6 +352,7 @@ fn install_command_for(expected: ExpectedAgent) -> Option<String> {
     let bin = match expected {
         ExpectedAgent::ClaudeAgentAcp => "claude-agent-acp",
         ExpectedAgent::CodexAcp => "codex-acp",
+        ExpectedAgent::Cursor => "cursor-agent",
         ExpectedAgent::OpenCode => "opencode",
         ExpectedAgent::AoeAgent => return None,
         ExpectedAgent::Gemini => "gemini",
@@ -432,6 +436,7 @@ mod tests {
     fn non_claude_permissive_on_missing_info() {
         let init = make_init_no_info();
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
+        validate(ExpectedAgent::Cursor, &init).unwrap();
         validate(ExpectedAgent::OpenCode, &init).unwrap();
         validate(ExpectedAgent::AoeAgent, &init).unwrap();
         validate(ExpectedAgent::Other, &init).unwrap();
@@ -456,6 +461,22 @@ mod tests {
         assert_eq!(
             ExpectedAgent::from_command("unknown-bin"),
             ExpectedAgent::Other
+        );
+    }
+
+    #[test]
+    fn from_command_recognises_cursor_agent_binaries() {
+        assert_eq!(
+            ExpectedAgent::from_command("cursor-agent"),
+            ExpectedAgent::Cursor
+        );
+        assert_eq!(
+            ExpectedAgent::from_command("/home/main/.local/bin/cursor-agent acp"),
+            ExpectedAgent::Cursor
+        );
+        assert_eq!(
+            ExpectedAgent::from_command("agent acp"),
+            ExpectedAgent::Cursor
         );
     }
 

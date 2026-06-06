@@ -959,16 +959,24 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             // Reconstruct sandbox context from the live instance state
             // so the reattached session's fs/terminal handlers can
             // still route across the container boundary.
-            let sandbox_for_attach = {
+            let (sandbox_for_attach, yolo_mode_for_attach) = {
                 let instances = state.instances.read().await;
                 instances
                     .iter()
                     .find(|i| i.id == id)
-                    .and_then(|i| i.sandbox_info.clone())
+                    .map(|i| (i.sandbox_info.clone(), i.yolo_mode))
+                    .unwrap_or((None, false))
             };
             let attach_res = timeout(
                 Duration::from_secs(3),
-                supervisor.attach(id.clone(), cwd, vec![], in_flight_turn, sandbox_for_attach),
+                supervisor.attach(
+                    id.clone(),
+                    cwd,
+                    vec![],
+                    in_flight_turn,
+                    sandbox_for_attach,
+                    yolo_mode_for_attach,
+                ),
             )
             .await;
             match attach_res {

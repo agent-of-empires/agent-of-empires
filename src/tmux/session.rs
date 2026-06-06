@@ -8,14 +8,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{
     refresh_session_cache, session_exists_from_cache,
     utils::{
-        append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_clipboard_passthrough_args, append_history_limit_args, append_mouse_on_args,
+        append_pane_base_index_args, append_remain_on_exit_args, append_window_size_args,
+        is_pane_dead, is_pane_running_shell,
     },
     SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::should_apply_tmux_clipboard;
+use crate::session::config::{should_apply_tmux_clipboard, Config};
 use crate::session::Status;
 
 pub struct Session {
@@ -76,6 +77,11 @@ impl Session {
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
+        append_history_limit_args(
+            &mut args,
+            &self.name,
+            Config::load_or_warn().tmux.history_limit,
+        );
         if should_apply_tmux_clipboard() {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }

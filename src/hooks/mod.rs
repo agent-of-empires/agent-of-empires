@@ -282,6 +282,64 @@ pub fn install_hooks(
     Ok(())
 }
 
+/// Install AoE status hooks into Cursor's `.cursor/hooks.json` file.
+///
+/// Cursor's hook file is not Claude-style `settings.json`: event values are
+/// arrays of command objects directly under a versioned `hooks.json` root.
+pub fn install_cursor_hooks(hooks_path: &Path, events: &[crate::agents::HookEvent]) -> Result<()> {
+    let mut settings: Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(hooks_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|e| {
+            tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", hooks_path.display(), e);
+            serde_json::json!({})
+        })
+    } else {
+        serde_json::json!({})
+    };
+
+    let root = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Cursor hooks file root is not a JSON object"))?;
+    root.entry("version".to_string())
+        .or_insert_with(|| serde_json::json!(1));
+    root.entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+
+    let hooks = root
+        .get_mut("hooks")
+        .and_then(|h| h.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("Cursor hooks key is not a JSON object"))?;
+
+    for event in events {
+        let Some(status) = event.status else {
+            continue;
+        };
+        let entry = serde_json::json!({ "command": hook_command(status) });
+        match hooks.get_mut(event.name).and_then(|v| v.as_array_mut()) {
+            Some(arr) => {
+                arr.retain(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_none_or(|cmd| !is_aoe_hook_command(cmd))
+                });
+                arr.push(entry);
+            }
+            None => {
+                hooks.insert(event.name.to_string(), Value::Array(vec![entry]));
+            }
+        }
+    }
+
+    if let Some(parent) = hooks_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(hooks_path, formatted)?;
+
+    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", hooks_path.display());
+    Ok(())
+}
+
 const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -1210,6 +1268,46 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Remove AoE status hooks from Cursor's `.cursor/hooks.json` file.
+pub fn uninstall_cursor_hooks(hooks_path: &Path) -> Result<bool> {
+    if !hooks_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(hooks_path)?;
+    let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+        tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", hooks_path.display(), e);
+        serde_json::json!({})
+    });
+
+    let before = settings.clone();
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(false);
+    };
+
+    hooks.retain(|_, event_hooks| {
+        if let Some(arr) = event_hooks.as_array_mut() {
+            arr.retain(|hook| {
+                hook.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_none_or(|cmd| !is_aoe_hook_command(cmd))
+            });
+            !arr.is_empty()
+        } else {
+            true
+        }
+    });
+
+    if settings == before {
+        return Ok(false);
+    }
+
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(hooks_path, formatted)?;
+    tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", hooks_path.display());
+    Ok(true)
+}
+
 /// Remove all AoE hooks from all known agent settings files and clean up
 /// the hook status base directory. Called during `aoe uninstall`.
 pub fn uninstall_all_hooks() {
@@ -1262,6 +1360,8 @@ pub fn uninstall_all_hooks() {
             for settings_path in resolved_paths {
                 let result = if agent.name == "codex" {
                     uninstall_codex_hooks(&settings_path)
+                } else if agent.name == "cursor" {
+                    uninstall_cursor_hooks(&settings_path)
                 } else {
                     uninstall_hooks(&settings_path)
                 };
@@ -1275,6 +1375,22 @@ pub fn uninstall_all_hooks() {
                     ),
                 }
             }
+        }
+    }
+
+    if let Some(home) = home {
+        let legacy_cursor_settings = home.join(".cursor").join("settings.json");
+        match uninstall_hooks(&legacy_cursor_settings) {
+            Ok(true) => println!(
+                "Removed legacy AoE hooks from {}",
+                legacy_cursor_settings.display()
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(target: "hooks.uninstall",
+                "Failed to remove legacy Cursor hooks from {}: {}",
+                legacy_cursor_settings.display(),
+                e
+            ),
         }
     }
 
@@ -1343,6 +1459,15 @@ mod tests {
 
     fn codex_events() -> &'static [crate::agents::HookEvent] {
         crate::agents::get_agent("codex")
+            .unwrap()
+            .hook_config
+            .as_ref()
+            .unwrap()
+            .events
+    }
+
+    fn cursor_events() -> &'static [crate::agents::HookEvent] {
+        crate::agents::get_agent("cursor")
             .unwrap()
             .hook_config
             .as_ref()
@@ -1469,6 +1594,89 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(content["apiKey"], "test-key");
         assert_eq!(content["model"], "opus");
+    }
+
+    #[test]
+    fn test_install_cursor_hooks_writes_hooks_json_schema() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_path = tmp.path().join(".cursor").join("hooks.json");
+
+        install_cursor_hooks(&hooks_path, cursor_events()).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert_eq!(content["version"], 1);
+        let hooks = content["hooks"].as_object().unwrap();
+        assert!(hooks.contains_key("sessionStart"));
+        assert!(hooks.contains_key("beforeShellExecution"));
+        assert!(hooks.contains_key("afterShellExecution"));
+        assert!(hooks.contains_key("afterFileEdit"));
+        assert!(hooks.contains_key("postToolUse"));
+        assert!(hooks.contains_key("stop"));
+        assert!(hooks["beforeShellExecution"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("printf running"));
+        assert!(hooks["stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("printf idle"));
+        assert!(!tmp.path().join(".cursor").join("settings.json").exists());
+    }
+
+    #[test]
+    fn test_install_cursor_hooks_preserves_user_hooks_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_path = tmp.path().join("hooks.json");
+        let existing = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "beforeShellExecution": [
+                    { "command": "echo user-hook" },
+                    { "command": "sh -c 'mkdir -p /tmp/aoe-hooks/old && printf running > /tmp/aoe-hooks/old/status'" }
+                ]
+            }
+        });
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        install_cursor_hooks(&hooks_path, cursor_events()).unwrap();
+        install_cursor_hooks(&hooks_path, cursor_events()).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let before_shell = content["hooks"]["beforeShellExecution"].as_array().unwrap();
+        assert_eq!(before_shell.len(), 2);
+        assert_eq!(before_shell[0]["command"], "echo user-hook");
+        assert!(is_aoe_hook_command(
+            before_shell[1]["command"].as_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_uninstall_cursor_hooks_removes_only_aoe_entries() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_path = tmp.path().join("hooks.json");
+        install_cursor_hooks(&hooks_path, cursor_events()).unwrap();
+
+        let mut content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        content["hooks"]["stop"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({ "command": "echo user-stop" }));
+        std::fs::write(&hooks_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+
+        assert!(uninstall_cursor_hooks(&hooks_path).unwrap());
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = content["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks["stop"][0]["command"], "echo user-stop");
     }
 
     #[test]

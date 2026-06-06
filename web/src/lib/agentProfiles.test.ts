@@ -14,6 +14,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("gemini").key).toBe("gemini");
     expect(resolveAgentProfile("vibe").key).toBe("vibe");
     expect(resolveAgentProfile("pi").key).toBe("pi");
+    expect(resolveAgentProfile("cursor").key).toBe("cursor");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
 
@@ -32,8 +33,8 @@ describe("resolveAgentProfile", () => {
     expect(p.parentMetaNamespaces).toEqual(["claudeCode"]);
   });
 
-  it("codex / gemini disable claude-specific cards", () => {
-    for (const key of ["codex", "gemini"] as const) {
+  it("codex / gemini / cursor disable claude-specific cards", () => {
+    for (const key of ["codex", "gemini", "cursor"] as const) {
       const p = resolveAgentProfile(key);
       expect(p.capabilities.todos).toBe(false);
       expect(p.capabilities.skills).toBe(false);
@@ -79,6 +80,15 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("codex").clearAliases).toEqual(["/new"]);
     expect(resolveAgentProfile("opencode").clearAliases).toEqual(["/new"]);
     expect(resolveAgentProfile("gemini").clearAliases).toEqual([]);
+    expect(resolveAgentProfile("cursor").clearAliases).toEqual([]);
+  });
+
+  it("cursor profile is conservative until its tool wire shape is verified", () => {
+    const p = resolveAgentProfile("cursor");
+    expect(p.mcpPrefixes).toEqual(["mcp__"]);
+    expect(p.parentMetaNamespaces).toEqual([]);
+    expect(p.aliases).toEqual({});
+    expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [] });
   });
 });
 

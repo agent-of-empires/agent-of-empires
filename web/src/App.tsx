@@ -479,31 +479,41 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       focusAgentInput(ws.sessions.find((s) => s.id === sessionId));
       if (window.innerWidth < 768) setSidebarOpen(false);
     }
-  }, [navigate, workspaces, focusAgentInput, isCoarse]);
+  }, [focusAgentInput, focusKeyboardProxy, isCoarse, navigate, workspaces]);
 
-  const handleSelectWorkspace = (workspaceId: string) => {
-    const ws = workspaces.find((w) => w.id === workspaceId);
-    if (ws) {
-      const running = ws.sessions.find((s) =>
-        isSessionActive(s, idleDecayWindowMs),
-      );
-      const picked = running ?? ws.sessions[0] ?? null;
-      if (picked) {
-        navigate(`/session/${encodeURIComponent(picked.id)}`);
-        focusAgentInput(picked);
-      } else {
-        navigate("/");
+  const handleSelectWorkspace = useCallback(
+    (workspaceId: string) => {
+      const ws = workspaces.find((w) => w.id === workspaceId);
+      if (ws) {
+        const running = ws.sessions.find((s) =>
+          isSessionActive(s, idleDecayWindowMs),
+        );
+        const picked = running ?? ws.sessions[0] ?? null;
+        if (picked) {
+          navigate(`/session/${encodeURIComponent(picked.id)}`);
+          focusAgentInput(picked);
+        } else {
+          navigate("/");
+        }
       }
-    }
-    if (!isCoarse) focusKeyboardProxy();
-    if (window.innerWidth < 768) {
-      setSidebarOpen(false);
-    }
-  };
+      if (!isCoarse) focusKeyboardProxy();
+      if (window.innerWidth < 768) {
+        setSidebarOpen(false);
+      }
+    },
+    [
+      focusAgentInput,
+      focusKeyboardProxy,
+      idleDecayWindowMs,
+      isCoarse,
+      navigate,
+      workspaces,
+    ],
+  );
 
   const handleProjectStripStep = useCallback(
     (direction: -1 | 1) => {
-      const selectableGroups = groups.filter((g) => g.workspaces.length > 0);
+      const selectableGroups = repoGroups.filter((g) => g.workspaces.length > 0);
       if (selectableGroups.length === 0) return;
       const activeIndex = selectableGroups.findIndex((group) =>
         group.workspaces.some((w) => w.id === activeWorkspace?.id),
@@ -516,7 +526,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       const nextWorkspace = selectableGroups[nextIndex]?.workspaces[0];
       if (nextWorkspace) handleSelectWorkspace(nextWorkspace.id);
     },
-    [activeWorkspace?.id, groups, handleSelectWorkspace],
+    [activeWorkspace?.id, repoGroups, handleSelectWorkspace],
   );
 
   // In-app toast forwarded from the service worker sets this event when
@@ -1066,6 +1076,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                       sessionId={activeSessionId!}
                       acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                       tool={activeSession.tool}
+                      agentModel={activeSession.agent_model ?? null}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
                       onOpenFileRef={handleOpenFileRef}
@@ -1299,7 +1310,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
       {webSettings.projectStrip && !showSettings && !showProjects && !showProfiles && (
         <ProjectStrip
-          groups={groups}
+          groups={repoGroups}
           activeSessionId={activeSessionId}
           activeWorkspaceId={activeWorkspace?.id ?? null}
           onSelectWorkspace={handleSelectWorkspace}

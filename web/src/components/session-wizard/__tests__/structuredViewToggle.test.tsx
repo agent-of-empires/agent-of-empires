@@ -65,10 +65,23 @@ const custom: AgentInfo = {
   install_hint: "Configured custom agent",
 };
 
+const cursor: AgentInfo = {
+  kind: "builtin",
+  name: "cursor",
+  binary: "cursor-agent",
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+  acp_command: "cursor-agent",
+  acp_args: ["acp"],
+};
+
 function renderAgentStep(overrides: {
   tool?: string;
   agents?: AgentInfo[];
   useStructuredView?: boolean;
+  agentModel?: string;
 }) {
   const onChange = vi.fn();
   const utils = render(
@@ -77,6 +90,7 @@ function renderAgentStep(overrides: {
         ...initialData,
         tool: overrides.tool ?? "claude",
         useStructuredView: overrides.useStructuredView ?? true,
+        agentModel: overrides.agentModel ?? "",
       }}
       onChange={onChange}
       agents={overrides.agents ?? [claude, nonAcpBuiltin, custom]}
@@ -108,6 +122,16 @@ describe("AgentStep structured-view view card", () => {
   it("reflects useStructuredView=false as an unchecked switch", () => {
     const { getByRole } = renderAgentStep({ tool: "claude", useStructuredView: false });
     expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("does not render Cursor model controls in the session wizard", () => {
+    const { queryByRole } = renderAgentStep({
+      tool: "cursor",
+      agents: [cursor],
+    });
+
+    expect(queryByRole("combobox", { name: "Model" })).toBeNull();
+    expect(queryByRole("switch", { name: "Fast mode" })).toBeNull();
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {
@@ -200,5 +224,29 @@ describe("SessionWizard structured_view payload", () => {
         agent_effort: "high",
       }),
     );
+  });
+
+  it("does not send Cursor model defaults from the session wizard", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: {
+        default_tool: "cursor",
+        acp_defaults: {
+          cursor: { model: "composer-2.5-fast", effort: "high" },
+        },
+      },
+      sandbox: {},
+    } as never);
+    const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
+    await waitFor(() => expect(getAllByText(/cursor/).length).toBeGreaterThan(0));
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "cursor",
+        view: "structured",
+      }),
+    );
+    expect(createSession.mock.calls[0][0].agent_model).toBeUndefined();
+    expect(createSession.mock.calls[0][0].agent_effort).toBeUndefined();
   });
 });

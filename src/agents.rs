@@ -152,43 +152,6 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-/// Cursor CLI hook events. No `session_id_capture`: Cursor's session id is
-/// not consumed by AoE pollers, and Cursor's hook payload uses a different
-/// schema, so installing the capture command would do useless work on every
-/// `UserPromptSubmit`.
-const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
-    HookEvent {
-        name: "PreToolUse",
-        matcher: None,
-        status: Some("running"),
-        session_id_capture: false,
-    },
-    HookEvent {
-        name: "UserPromptSubmit",
-        matcher: None,
-        status: Some("running"),
-        session_id_capture: false,
-    },
-    HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some("idle"),
-        session_id_capture: false,
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some("waiting"),
-        session_id_capture: false,
-    },
-    HookEvent {
-        name: "ElicitationResult",
-        matcher: None,
-        status: Some("running"),
-        session_id_capture: false,
-    },
-];
-
 /// Qwen Code uses the same Claude-style event schema and `permission_prompt`/
 /// `elicitation_dialog` notification types, but does not emit `ElicitationResult`.
 /// `PostToolUse` is used instead to clear the waiting state after the user
@@ -222,6 +185,49 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
+    },
+];
+
+/// Cursor CLI uses `.cursor/hooks.json` with Cursor-native event names.
+///
+/// Current CLI hook support is tool-oriented, so pane parsing still covers
+/// live model thinking. These hooks pin shell/file activity and completion.
+const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "sessionStart",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "beforeShellExecution",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "afterShellExecution",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "afterFileEdit",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "postToolUse",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "stop",
+        matcher: None,
+        status: Some("idle"),
         session_id_capture: false,
     },
 ];
@@ -392,22 +398,22 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "cursor",
-        binary: "agent",
-        aliases: &["agent"],
-        detection: DetectionMethod::Which("agent"),
+        binary: "cursor-agent",
+        aliases: &["agent", "cursor-agent"],
+        detection: DetectionMethod::Which("cursor-agent"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
         set_default_command: false,
         detect_status: status_detection::detect_cursor_status,
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".cursor/settings.json",
+            settings_rel_path: ".cursor/hooks.json",
             events: CURSOR_HOOK_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
-        install_hint: "see https://docs.cursor.com/cli",
+        install_hint: "curl https://cursor.com/install -fsS | bash",
     },
     AgentDef {
         name: "copilot",
@@ -636,7 +642,7 @@ mod tests {
         assert_eq!(get_agent("vibe").unwrap().binary, "vibe");
         assert_eq!(get_agent("codex").unwrap().binary, "codex");
         assert_eq!(get_agent("gemini").unwrap().binary, "gemini");
-        assert_eq!(get_agent("cursor").unwrap().binary, "agent");
+        assert_eq!(get_agent("cursor").unwrap().binary, "cursor-agent");
         assert_eq!(get_agent("copilot").unwrap().binary, "copilot");
         assert_eq!(get_agent("pi").unwrap().binary, "pi");
         assert_eq!(get_agent("droid").unwrap().binary, "droid");
@@ -717,6 +723,7 @@ mod tests {
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
+        assert_eq!(resolve_tool_name("cursor-agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 

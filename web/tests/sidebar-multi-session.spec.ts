@@ -450,7 +450,7 @@ test.describe("Sidebar multi-session (#956)", () => {
       "/tmp/alpha": { alias: "Alpha Client", color: "amber" },
     });
 
-    await expect(projectTab("Alpha Client").getByLabel("Running session in project")).toBeVisible();
+    await expect(projectTab("Alpha Client").getByLabel("Project session status Running")).toBeVisible();
 
     const alphaBox = await projectTab("Alpha Client").boundingBox();
     const betaBox = await projectTab("beta").boundingBox();

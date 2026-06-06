@@ -54,6 +54,12 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
+    pub auth: AuthConfig,
+
+    #[serde(default)]
+    pub discord: DiscordConfig,
+
+    #[serde(default)]
     pub acp: AcpConfig,
 
     #[serde(default)]
@@ -242,6 +248,74 @@ fn default_keep_count() -> u8 {
 
 fn default_show_spans() -> bool {
     false
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "auth", category = "Auth")]
+pub struct AuthConfig {
+    /// Failed token-auth attempts allowed per client IP before lockout. A
+    /// stale PWA token can make several API calls, so raise this if mobile
+    /// clients lock themselves out too easily. `0` disables lockouts.
+    #[serde(default = "default_auth_max_failures")]
+    #[setting(
+        label = "Max auth failures (restart req.)",
+        widget = "number",
+        min = 0,
+        global_only,
+        advanced
+    )]
+    pub max_failures: u32,
+
+    /// Sliding window for failed token-auth attempts. Failures older than this
+    /// are discarded. Default 900s. Restart aoe for changes.
+    #[serde(default = "default_auth_failure_window_secs")]
+    #[setting(
+        label = "Failure window (s, restart req.)",
+        widget = "number",
+        min = 1,
+        global_only,
+        advanced
+    )]
+    pub failure_window_secs: u64,
+
+    /// Lockout duration after the failed-auth threshold is reached. `0`
+    /// disables lockouts while still allowing normal token validation.
+    /// Restart aoe for changes.
+    #[serde(default = "default_auth_lockout_secs")]
+    #[setting(
+        label = "Lockout duration (s, restart req.)",
+        widget = "number",
+        min = 0,
+        global_only,
+        advanced
+    )]
+    pub lockout_secs: u64,
+}
+
+pub const DEFAULT_AUTH_MAX_FAILURES: u32 = 5;
+pub const DEFAULT_AUTH_LOCKOUT_SECS: u64 = 15 * 60;
+pub const DEFAULT_AUTH_WINDOW_SECS: u64 = 15 * 60;
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: default_auth_max_failures(),
+            failure_window_secs: default_auth_failure_window_secs(),
+            lockout_secs: default_auth_lockout_secs(),
+        }
+    }
+}
+
+fn default_auth_max_failures() -> u32 {
+    DEFAULT_AUTH_MAX_FAILURES
+}
+
+fn default_auth_failure_window_secs() -> u64 {
+    DEFAULT_AUTH_WINDOW_SECS
+}
+
+fn default_auth_lockout_secs() -> u64 {
+    DEFAULT_AUTH_LOCKOUT_SECS
 }
 
 /// Configuration for the acp (ACP-based native rendering of agent
@@ -1275,6 +1349,84 @@ impl Default for WebConfig {
     }
 }
 
+/// Discord webhook notifications. This is intentionally one-way: AoE posts
+/// session status notifications to Discord and never accepts commands from it.
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "discord", category = "Discord Beta")]
+pub struct DiscordConfig {
+    /// Enable Discord webhook notifications.
+    #[serde(default)]
+    #[setting(
+        label = "Discord webhook notifications",
+        widget = "toggle",
+        global_only
+    )]
+    pub enabled: bool,
+
+    /// Discord webhook URL. Stored in config.toml for this beta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Webhook URL",
+        widget = "optional_text",
+        mono,
+        global_only,
+        desc = "Discord channel webhook URL. AoE uses this only for one-way notifications."
+    )]
+    pub webhook_url: Option<String>,
+
+    /// Optional username override for webhook messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "Webhook username", widget = "optional_text", global_only)]
+    pub username: Option<String>,
+
+    /// Optional mention prefix, e.g. `<@123>` or `<@&456>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Mention",
+        widget = "optional_text",
+        global_only,
+        desc = "Optional mention text prepended to notifications, such as a user or role mention.",
+        advanced
+    )]
+    pub mention: Option<String>,
+
+    /// Send a notification when an agent waits for input.
+    #[serde(default = "default_true")]
+    #[setting(label = "Notify on waiting", widget = "toggle", global_only)]
+    pub notify_on_waiting: bool,
+
+    /// Send a notification when an agent finishes and becomes idle.
+    #[serde(default = "default_true")]
+    #[setting(label = "Notify on finished", widget = "toggle", global_only)]
+    pub notify_on_idle: bool,
+
+    /// Send a notification when a session enters Error.
+    #[serde(default = "default_true")]
+    #[setting(label = "Notify on error", widget = "toggle", global_only)]
+    pub notify_on_error: bool,
+
+    /// Send a notification when a session stops. Off by default because
+    /// manual stops are usually intentional.
+    #[serde(default)]
+    #[setting(label = "Notify on stopped", widget = "toggle", global_only, advanced)]
+    pub notify_on_stopped: bool,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: None,
+            username: None,
+            mention: None,
+            notify_on_waiting: true,
+            notify_on_idle: true,
+            notify_on_error: true,
+            notify_on_stopped: false,
+        }
+    }
+}
+
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
 /// chosen"; the active profile is then resolved at runtime by
 /// `resolve_default_profile`, which picks the first existing profile or
@@ -1874,6 +2026,11 @@ pub struct TmuxConfig {
         options = "auto:Auto,enabled:Enabled,disabled:Disabled"
     )]
     pub clipboard: TmuxClipboardMode,
+
+    /// Number of scrollback lines tmux keeps for each AoE session.
+    #[serde(default = "default_tmux_history_limit")]
+    #[setting(label = "History Limit", widget = "number", min = 0, max = 200000)]
+    pub history_limit: u32,
 }
 
 impl Default for TmuxConfig {
@@ -1882,8 +2039,15 @@ impl Default for TmuxConfig {
             status_bar: TmuxStatusBarMode::Auto,
             mouse: TmuxMouseMode::Auto,
             clipboard: TmuxClipboardMode::Auto,
+            history_limit: default_tmux_history_limit(),
         }
     }
+}
+
+pub const DEFAULT_TMUX_HISTORY_LIMIT: u32 = 2000;
+
+fn default_tmux_history_limit() -> u32 {
+    DEFAULT_TMUX_HISTORY_LIMIT
 }
 
 /// Check if user has a tmux configuration file.
@@ -2507,6 +2671,7 @@ mod tests {
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
         assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
+        assert_eq!(tmux.history_limit, DEFAULT_TMUX_HISTORY_LIMIT);
     }
 
     #[test]
@@ -2517,9 +2682,13 @@ mod tests {
 
     #[test]
     fn test_tmux_config_deserialize() {
-        let toml = r#"status_bar = "enabled""#;
+        let toml = r#"
+            status_bar = "enabled"
+            history_limit = 50000
+        "#;
         let tmux: TmuxConfig = toml::from_str(toml).unwrap();
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Enabled);
+        assert_eq!(tmux.history_limit, 50000);
     }
 
     #[test]
@@ -2585,6 +2754,7 @@ mod tests {
         let toml = r#""#;
         let tmux: TmuxConfig = toml::from_str(toml).unwrap();
         assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
+        assert_eq!(tmux.history_limit, DEFAULT_TMUX_HISTORY_LIMIT);
     }
 
     #[test]

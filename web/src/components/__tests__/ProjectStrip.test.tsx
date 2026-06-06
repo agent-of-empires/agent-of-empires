@@ -8,6 +8,7 @@ import type { RepoAppearanceUpdate } from "../../lib/repoAppearance";
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 function session(
@@ -177,21 +178,34 @@ describe("ProjectStrip", () => {
     );
   });
 
-  it("marks projects with recently finished sessions", () => {
+  it("shows the sidebar status glyph for idle projects", () => {
     const alpha = group("Alpha", "/tmp/alpha", "Idle");
     alpha.workspaces[0]!.sessions[0]!.idle_entered_at = new Date().toISOString();
 
     const { getByLabelText } = renderProjectStrip({ groups: [alpha] });
 
-    expect(getByLabelText("Recently finished session in project")).toBeTruthy();
+    expect(getByLabelText("Project session status Idle")).toBeTruthy();
   });
 
-  it("marks projects with running sessions distinctly", () => {
+  it("shows compact idle age next to idle project status", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:30:00Z"));
+    const alpha = group("Alpha", "/tmp/alpha", "Idle");
+    alpha.workspaces[0]!.sessions[0]!.idle_entered_at =
+      "2026-05-25T12:00:00Z";
+
+    const { getByLabelText, getByText } = renderProjectStrip({ groups: [alpha] });
+
+    expect(getByLabelText("Idle for 30M")).toBeTruthy();
+    expect(getByText("30M")).toBeTruthy();
+  });
+
+  it("shows the sidebar status glyph for running projects", () => {
     const { getByLabelText } = renderProjectStrip({
       groups: [group("Alpha", "/tmp/alpha", "Running")],
     });
 
-    expect(getByLabelText("Running session in project")).toBeTruthy();
+    expect(getByLabelText("Project session status Running")).toBeTruthy();
   });
 
   it("deduplicates repeated sessions in the selected project session row", () => {
@@ -408,7 +422,7 @@ describe("ProjectStrip", () => {
     expect(queryByText(/projects/i)).toBeNull();
     expect(queryByText(/sessions/i)).toBeNull();
     expect(queryByLabelText("Filter project strip")).toBeNull();
-    expect(getByTestId("project-strip-tab").textContent).toBe("Alpha");
+    expect(getByTestId("project-strip-tab").textContent).toContain("Alpha");
   });
 
   it("does not render agent tool names in the compact strip", () => {

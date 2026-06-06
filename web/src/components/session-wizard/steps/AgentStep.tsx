@@ -1,8 +1,14 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
+import {
+  agentBaseModelOptions,
+  composeAgentModel,
+  modelSupportsFast,
+  splitAgentModel,
+} from "../../../lib/agentModelOptions";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
 interface WizardData {
@@ -126,6 +132,150 @@ function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onCh
         }`}
       />
     </button>
+  );
+}
+
+function optionMatches(
+  option: { id: string; label: string },
+  query: string,
+  extraSearchText = "",
+): boolean {
+  const terms = query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (terms.length === 0) return true;
+  const haystack = `${option.id} ${option.label} ${extraSearchText}`.toLowerCase();
+  return terms.every((term) => haystack.includes(term));
+}
+
+function AgentModelPicker({
+  tool,
+  value,
+  onChange,
+}: {
+  tool: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const split = splitAgentModel(tool, value);
+  const draftKey = `${tool}\0${value}`;
+  const [draftState, setDraftState] = useState(() => ({
+    key: draftKey,
+    value: split.model,
+  }));
+  const [open, setOpen] = useState(false);
+  const options = agentBaseModelOptions(tool);
+  const listId = `agent-model-options-${tool}`;
+  const draft = draftState.key === draftKey ? draftState.value : split.model;
+  const fastSupported = modelSupportsFast(tool, draft);
+  const setDraft = (nextDraft: string) =>
+    setDraftState({ key: draftKey, value: nextDraft });
+
+  const visibleOptions = useMemo(
+    () =>
+      options
+        .filter((option) =>
+          optionMatches(
+            option,
+            draft,
+            modelSupportsFast(tool, option.id)
+              ? `${option.id}-fast ${option.label} Fast`
+              : "",
+          ),
+        )
+        .slice(0, 10),
+    [draft, options, tool],
+  );
+
+  if (options.length === 0 && !value) return null;
+
+  const placeholder =
+    tool === "cursor" ? "Auto (Cursor default)" : "Auto (agent default)";
+  const fastChecked = splitAgentModel(tool, value).fast;
+  const commitModel = (model: string, fast: boolean) => {
+    onChange(composeAgentModel(tool, model, fast));
+  };
+
+  return (
+    <div className="mb-5 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <label htmlFor="agent-model-input" className="text-sm font-semibold text-text-primary">
+          Model
+        </label>
+        {value && (
+          <button
+            type="button"
+            onClick={() => {
+              setDraft("");
+              onChange("");
+            }}
+            className="text-xs text-text-dim hover:text-text-secondary cursor-pointer"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+      <div className="relative mt-2">
+        <input
+          id="agent-model-input"
+          type="text"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded={open}
+          aria-controls={listId}
+          value={draft}
+          onFocus={() => setOpen(true)}
+          onBlur={() => window.setTimeout(() => setOpen(false), 100)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            commitModel(e.target.value, fastChecked);
+            setOpen(true);
+          }}
+          placeholder={placeholder}
+          className="w-full bg-surface-950 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+        />
+        {open && visibleOptions.length > 0 && (
+          <div
+            id={listId}
+            role="listbox"
+            className="absolute z-20 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-surface-700 bg-surface-950 shadow-xl"
+          >
+            {visibleOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                role="option"
+                aria-selected={option.id === value}
+                data-testid={`agent-model-option-${option.id}`}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  setDraft(option.id);
+                  commitModel(option.id, fastChecked);
+                  setOpen(false);
+                }}
+                className="block w-full px-3 py-2 text-left hover:bg-surface-800 focus:bg-surface-800 focus:outline-none"
+              >
+                <span className="block truncate text-sm text-text-primary">{option.label}</span>
+                <span className="block truncate text-xs font-mono text-text-dim">{option.id}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {tool === "cursor" && (
+        <label className="mt-2 flex items-center justify-between gap-3 rounded-md border border-surface-800 bg-surface-950 px-3 py-2">
+          <span className="text-xs font-medium text-text-secondary">Fast mode</span>
+          <Toggle
+            checked={fastChecked}
+            disabled={!fastSupported}
+            label="Fast mode"
+            onChange={(enabled) => commitModel(draft, enabled)}
+          />
+        </label>
+      )}
+    </div>
   );
 }
 
@@ -258,6 +408,14 @@ export function AgentStep({ data, onChange, agents, profiles, dockerAvailable, o
         ) : (
           <ViewNotice tool={data.tool} customAgent={selectedCustomAgent} />
         ))}
+
+      {willUseStructuredView && data.tool !== "cursor" && (
+        <AgentModelPicker
+          tool={data.tool}
+          value={String(data.agentModel ?? "")}
+          onChange={(v) => onChange("agentModel", v)}
+        />
+      )}
 
       {/* Profile selector. We render a card list (rather than a native
           <select>) so each profile can carry a short description beneath

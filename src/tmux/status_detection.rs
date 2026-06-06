@@ -437,6 +437,19 @@ pub(crate) fn reconcile_codex_hook_status(hook_status: Status, raw_content: &str
     detect_codex_hook_gap_status(raw_content).unwrap_or(hook_status)
 }
 
+pub(crate) fn reconcile_cursor_hook_status(hook_status: Status, raw_content: &str) -> Status {
+    if hook_status != Status::Running {
+        return hook_status;
+    }
+
+    let detected = detect_cursor_status(raw_content);
+    if detected == Status::Running {
+        hook_status
+    } else {
+        detected
+    }
+}
+
 fn detect_codex_hook_gap_status(raw_content: &str) -> Option<Status> {
     let clean = strip_ansi(raw_content);
     let content = clean.to_lowercase();
@@ -1479,6 +1492,34 @@ enter to select · esc to cancel";
 
   Composer 2.5 · 56.1% · 26 files edited  Auto-run";
         assert_eq!(detect_cursor_status(content), Status::Idle);
+    }
+
+    #[test]
+    fn test_reconcile_cursor_hook_status_clears_stale_running_at_prompt() {
+        let content = "\
+  Finished the requested changes.
+
+  → Add a follow-up
+
+  Composer 2.5 · 60.9% · 4 files edited  Auto-run";
+        assert_eq!(
+            reconcile_cursor_hook_status(Status::Running, content),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_cursor_hook_status_keeps_live_running() {
+        let content = "\
+ ⠰⠳ Running  5.92k tokens
+
+  → Add a follow-up                                      ctrl+c to stop
+
+  Composer 2.5 · 36.3% · 22 files edited                Auto-run";
+        assert_eq!(
+            reconcile_cursor_hook_status(Status::Running, content),
+            Status::Running
+        );
     }
 
     #[test]

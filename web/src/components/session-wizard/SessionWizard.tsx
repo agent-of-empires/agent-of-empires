@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
+import { suppressAgentEffort } from "../../lib/agentModelOptions";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { StepIndicator } from "./StepIndicator";
@@ -133,8 +134,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // #1911.
   const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
 
-  const steps = useMemo(() => computeSteps(state.data),
-    [state.data.sandboxEnabled, state.data.advancedEnabled]);
+  const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
   const currentStepDef = steps[state.currentStep];
   const isFirst = state.currentStep === 0;
@@ -266,11 +266,17 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       view:
         selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
       agent_model:
-        selectedAgentAcpCapable && d.useStructuredView && d.agentModel
+        selectedAgentAcpCapable &&
+        d.useStructuredView &&
+        d.tool !== "cursor" &&
+        d.agentModel
           ? d.agentModel
           : undefined,
       agent_effort:
-        selectedAgentAcpCapable && d.useStructuredView && d.agentEffort
+        selectedAgentAcpCapable &&
+        d.useStructuredView &&
+        d.agentEffort &&
+        !suppressAgentEffort(d.tool)
           ? d.agentEffort
           : undefined,
       scratch: d.scratch || undefined,

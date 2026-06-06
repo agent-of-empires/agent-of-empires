@@ -1895,6 +1895,16 @@ impl Instance {
                     Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
                 }
             }
+        } else if agent.is_some_and(|a| a.name == "cursor") && !self.is_sandboxed() {
+            if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
+                if let Some(home) = dirs::home_dir() {
+                    let hooks_path = home.join(hook_cfg.settings_rel_path);
+                    if let Err(e) = crate::hooks::install_cursor_hooks(&hooks_path, hook_cfg.events)
+                    {
+                        tracing::warn!(target: "session.store", "Failed to install Cursor hooks: {}", e);
+                    }
+                }
+            }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
             if self.is_sandboxed() {
                 // For sandboxed sessions, hooks are installed via build_container_config
@@ -3263,6 +3273,20 @@ impl Instance {
                         Err(e) => {
                             tracing::trace!(
                                 "status '{}': codex hook fallback pane capture failed: {}",
+                                self.title,
+                                e
+                            );
+                            hook_status
+                        }
+                    }
+                } else if detection_tool == "cursor" && hook_status == Status::Running {
+                    match session.capture_pane(50) {
+                        Ok(pane_content) => {
+                            tmux::reconcile_cursor_hook_status(hook_status, &pane_content)
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                "status '{}': cursor hook fallback pane capture failed: {}",
                                 self.title,
                                 e
                             );

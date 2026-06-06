@@ -1529,7 +1529,6 @@ export function useTerminal(
       window.removeEventListener("focus", onWindowFocus);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("pageshow", onPageShow);
-      termEl.removeEventListener("copy", onCopy);
       viewport.removeEventListener("touchstart", onTouchStart, touchOpts);
       viewport.removeEventListener("touchmove", onTouchMove, touchOpts);
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);
@@ -1656,7 +1655,7 @@ export function useTerminal(
     } else {
       ws.close();
     }
-  };
+  }, []);
   useEffect(() => {
     manualReconnectRef.current = manualReconnect;
     return () => {

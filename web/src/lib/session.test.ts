@@ -3,6 +3,7 @@ import {
   IDLE_DECAY_WINDOW_MS,
   getStatusDotClass,
   getStatusTextClass,
+  formatIdleAgeLabel,
   idleAgeMs,
   isFreshIdle,
   isSessionActive,
@@ -63,6 +64,50 @@ describe("idleAgeMs", () => {
     expect(
       idleAgeMs(session("Idle", new Date(NOW - 5_000).toISOString())),
     ).toBe(5_000);
+  });
+});
+
+describe("formatIdleAgeLabel", () => {
+  it("returns null for non-idle and sub-minute idle sessions", () => {
+    expect(
+      formatIdleAgeLabel(
+        session("Running", new Date(NOW - 5 * 60_000).toISOString()),
+        NOW,
+      ),
+    ).toBeNull();
+    expect(
+      formatIdleAgeLabel(
+        session("Idle", new Date(NOW - 59_000).toISOString()),
+        NOW,
+      ),
+    ).toBeNull();
+  });
+
+  it("formats idle duration as compact minutes, hours, and days", () => {
+    expect(
+      formatIdleAgeLabel(
+        session("Idle", new Date(NOW - 60_000).toISOString()),
+        NOW,
+      ),
+    ).toBe("1M");
+    expect(
+      formatIdleAgeLabel(
+        session("Idle", new Date(NOW - 30 * 60_000).toISOString()),
+        NOW,
+      ),
+    ).toBe("30M");
+    expect(
+      formatIdleAgeLabel(
+        session("Idle", new Date(NOW - 2 * 60 * 60_000).toISOString()),
+        NOW,
+      ),
+    ).toBe("2H");
+    expect(
+      formatIdleAgeLabel(
+        session("Idle", new Date(NOW - 26 * 60 * 60_000).toISOString()),
+        NOW,
+      ),
+    ).toBe("1D");
   });
 });
 

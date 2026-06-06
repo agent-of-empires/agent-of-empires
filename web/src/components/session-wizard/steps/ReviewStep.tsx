@@ -8,7 +8,7 @@ import { isAcpCapable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 
-interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useStructuredView: boolean; [key: string]: unknown; }
+interface WizardData { path: string; title: string; worktreeBranch: string; useWorktree: boolean; attachExisting: boolean; baseBranch: string; group: string; tool: string; profile: string; profileDirty: boolean; yoloMode: boolean; sandboxEnabled: boolean; sandboxImage: string; extraArgs: string; customInstruction: string; commandOverride: string; scratch: boolean; useStructuredView: boolean; agentModel: string; [key: string]: unknown; }
 interface Props { data: WizardData; onChange: (field: string, value: unknown) => void; agents: AgentInfo[]; isSubmitting: boolean; error: string | null; onSubmit: () => void; onJumpTo: (stepId: StepId) => void; steps: StepDef[]; commandMaps?: CommandMaps; }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
@@ -296,6 +296,9 @@ export function ReviewStep({ data, onChange, agents, isSubmitting, error, onSubm
         />
         {(
           <Row label="Interface" value={willUseStructuredView ? "Structured view" : "Terminal"} stepId="agent" onJumpTo={onJumpTo} />
+        )}
+        {willUseStructuredView && data.agentModel && (
+          <Row label="Model" value={data.agentModel} stepId="agent" onJumpTo={onJumpTo} />
         )}
         {data.profile && (
           <Row label="Profile" value={data.profileDirty ? `${data.profile} (Custom)` : data.profile} stepId="agent" onJumpTo={onJumpTo} accent />

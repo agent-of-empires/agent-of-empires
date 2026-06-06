@@ -32,7 +32,16 @@ export interface ShortcutActions {
   onToggleSidebar: () => void;
   onToggleRightPanel: () => void;
   onToggleTerminalFocus: () => void;
+  onPreviousProject?: () => void;
+  onNextProject?: () => void;
+  projectStripShortcut?: ProjectStripShortcut;
 }
+
+export type ProjectStripShortcut =
+  | "disabled"
+  | "ctrl-alt-hl"
+  | "ctrl-hl"
+  | "alt-hl";
 
 export type ShortcutId =
   | "palette"
@@ -45,6 +54,11 @@ export type ShortcutId =
   | "settings"
   | "escape"
   | "help";
+
+type ShortcutActionKey = Exclude<
+  keyof ShortcutActions,
+  "onPreviousProject" | "onNextProject" | "projectStripShortcut"
+>;
 
 /** The display model: which modifier glyphs to show, plus the base label. */
 export interface ShortcutChord {
@@ -76,7 +90,7 @@ interface ShortcutTrigger {
 
 export interface ShortcutDef {
   id: ShortcutId;
-  action: keyof ShortcutActions;
+  action: ShortcutActionKey;
   description: string;
   chord: ShortcutChord;
   trigger: ShortcutTrigger;
@@ -336,4 +350,41 @@ export function matchShortcut(
     if (e.key === s.trigger.key) return toMatched(s);
   }
   return null;
+}
+
+export function matchProjectNavigationShortcut(
+  e: ShortcutKeyEvent,
+  shortcut: ProjectStripShortcut,
+  {
+    isInput,
+    isTerminalInput,
+    isProjectStripInput,
+  }: {
+    isInput: boolean;
+    isTerminalInput: boolean;
+    isProjectStripInput: boolean;
+  },
+): "previous" | "next" | null {
+  if (shortcut === "disabled") return null;
+  if (e.metaKey || (e.code !== "KeyH" && e.code !== "KeyL")) return null;
+
+  const matches =
+    shortcut === "alt-hl"
+      ? e.altKey && !e.ctrlKey && !e.shiftKey
+      : shortcut === "ctrl-alt-hl"
+        ? (e.ctrlKey && e.altKey && !e.shiftKey) ||
+          (e.shiftKey && e.altKey && !e.ctrlKey)
+        : e.ctrlKey && !e.altKey && !e.shiftKey;
+  if (!matches) return null;
+
+  if (
+    isInput &&
+    !isTerminalInput &&
+    !isProjectStripInput &&
+    shortcut !== "ctrl-alt-hl"
+  ) {
+    return null;
+  }
+
+  return e.code === "KeyH" ? "previous" : "next";
 }

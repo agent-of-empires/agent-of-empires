@@ -1,7 +1,8 @@
 //! IP-based auth failure rate limiting.
 //!
-//! After 5 failed authentication attempts from an IP within 15 minutes,
-//! subsequent requests from that IP are locked out for 15 minutes.
+//! By default, after 5 failed authentication attempts from an IP within
+//! 15 minutes, subsequent requests from that IP are locked out for 15 minutes.
+//! The threshold/window/lockout duration are configurable via `auth.*`.
 //! State is in-memory only; restarting the server clears all lockouts.
 
 use std::collections::HashMap;
@@ -12,9 +13,9 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-const MAX_FAILURES: u32 = 5;
-const LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-const WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub const DEFAULT_MAX_FAILURES: u32 = crate::session::config::DEFAULT_AUTH_MAX_FAILURES;
+pub const DEFAULT_LOCKOUT_SECS: u64 = crate::session::config::DEFAULT_AUTH_LOCKOUT_SECS;
+pub const DEFAULT_WINDOW_SECS: u64 = crate::session::config::DEFAULT_AUTH_WINDOW_SECS;
 const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TRACKED_IPS: usize = 10_000;
 // Failures within this window of the last recorded failure collapse into one.
@@ -39,6 +40,9 @@ struct FailureRecord {
 
 pub struct RateLimiter {
     failures: RwLock<HashMap<IpAddr, FailureRecord>>,
+    max_failures: u32,
+    lockout_duration: std::time::Duration,
+    window_duration: std::time::Duration,
 }
 
 impl Default for RateLimiter {
@@ -49,8 +53,23 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_FAILURES,
+            std::time::Duration::from_secs(DEFAULT_LOCKOUT_SECS),
+            std::time::Duration::from_secs(DEFAULT_WINDOW_SECS),
+        )
+    }
+
+    pub fn with_limits(
+        max_failures: u32,
+        lockout_duration: std::time::Duration,
+        window_duration: std::time::Duration,
+    ) -> Self {
         Self {
             failures: RwLock::new(HashMap::new()),
+            max_failures,
+            lockout_duration,
+            window_duration,
         }
     }
 
@@ -73,6 +92,10 @@ impl RateLimiter {
     pub async fn record_failure(&self, ip: IpAddr) -> bool {
         let mut failures = self.failures.write().await;
         let now = Instant::now();
+
+        if self.max_failures == 0 || self.lockout_duration.is_zero() {
+            return false;
+        }
 
         if failures.len() >= MAX_TRACKED_IPS && !failures.contains_key(&ip) {
             return false;
@@ -98,7 +121,7 @@ impl RateLimiter {
         }
 
         // If the failure window expired, reset counter
-        if now.duration_since(record.first_failure) > WINDOW_DURATION {
+        if now.duration_since(record.first_failure) > self.window_duration {
             record.count = 0;
             record.first_failure = now;
         }
@@ -116,24 +139,25 @@ impl RateLimiter {
         record.count += 1;
         record.last_failure = now;
 
-        if record.count >= MAX_FAILURES {
-            record.locked_until = Some(now + LOCKOUT_DURATION);
+        if record.count >= self.max_failures {
+            record.locked_until = Some(now + self.lockout_duration);
             tracing::warn!(
                 target: "auth.rate_limit",
                 ip = %ip,
                 failures = record.count,
-                lockout_secs = LOCKOUT_DURATION.as_secs(),
+                lockout_secs = self.lockout_duration.as_secs(),
                 "ip locked out after failed auth threshold"
             );
             return true;
         }
 
-        if record.count >= 3 {
+        let warn_threshold = self.max_failures.saturating_sub(2).max(1);
+        if record.count >= warn_threshold {
             tracing::info!(
                 target: "auth.rate_limit",
                 ip = %ip,
                 failures = record.count,
-                max = MAX_FAILURES,
+                max = self.max_failures,
                 "auth failures approaching lockout threshold"
             );
         }
@@ -169,7 +193,7 @@ impl RateLimiter {
                                 }
                             }
                             // Keep entries with recent failures (within window)
-                            now.duration_since(record.first_failure) < WINDOW_DURATION
+                            now.duration_since(record.first_failure) < limiter.window_duration
                         });
                     }
                     _ = shutdown.cancelled() => break,
@@ -276,5 +300,34 @@ mod tests {
         }
         // Additional failures while locked return false (no new lockout triggered)
         assert!(!limiter.record_failure(ip).await);
+    }
+
+    #[tokio::test]
+    async fn custom_threshold_controls_lockout() {
+        let limiter = RateLimiter::with_limits(
+            2,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        assert!(!record_spaced(&limiter, ip).await);
+        assert!(record_spaced(&limiter, ip).await);
+        assert!(limiter.check_locked(ip).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn zero_threshold_disables_lockout() {
+        let limiter = RateLimiter::with_limits(
+            0,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        for _ in 0..10 {
+            assert!(!record_spaced(&limiter, ip).await);
+        }
+        assert!(limiter.check_locked(ip).await.is_none());
     }
 }

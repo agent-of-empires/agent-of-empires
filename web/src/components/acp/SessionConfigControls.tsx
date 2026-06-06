@@ -21,7 +21,7 @@
 //   shares the dismiss callback's home.
 
 import { ChevronUp } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   ConfigOptionDescriptor,
@@ -41,6 +41,20 @@ const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+function optionMatches(
+  option: ConfigOptionDescriptor["options"][number],
+  query: string,
+): boolean {
+  const terms = query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (terms.length === 0) return true;
+  const haystack = `${option.value} ${option.name} ${option.description ?? ""}`.toLowerCase();
+  return terms.every((term) => haystack.includes(term));
 }
 
 function findByCategory(
@@ -103,20 +117,29 @@ interface SubProps {
 
 function ModelDropdown({ option, pending, onSelect }: SubProps) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
   const current =
     option.options.find((o) => o.value === option.current_value) ??
     option.options[0];
   const label = current?.name ?? option.current_value;
+  const filteredOptions = option.options.filter((opt) =>
+    optionMatches(opt, query),
+  );
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    setQuery("");
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
-      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+      if (!ref.current?.contains(e.target as Node)) closeMenu();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") closeMenu();
     };
     document.addEventListener("mousedown", onClick);
     document.addEventListener("keydown", onKey);
@@ -124,13 +147,19 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
       document.removeEventListener("mousedown", onClick);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [closeMenu, open]);
 
   return (
     <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
+        <button
+          type="button"
+          onClick={() => {
+            if (open) {
+              closeMenu();
+            } else {
+              setOpen(true);
+            }
+          }}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -155,7 +184,26 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
             {option.name}
           </div>
-          {option.options.map((opt) => {
+          {option.category === "model" && option.options.length > 2 && (
+            <div className="border-b border-surface-800 p-2">
+              <input
+                type="text"
+                role="combobox"
+                aria-label={`Search ${option.name}`}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeMenu();
+                  }
+                }}
+                placeholder="Search models"
+                className="w-full rounded border border-surface-700 bg-surface-950 px-2 py-1.5 text-[12px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+              />
+            </div>
+          )}
+          {filteredOptions.map((opt) => {
             const isCurrent = opt.value === option.current_value;
             const isPending = pending === opt.value;
             return (
@@ -166,10 +214,10 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
                 disabled={isPending}
                 onClick={() => {
                   if (isPending || isCurrent) {
-                    setOpen(false);
+                    closeMenu();
                     return;
                   }
-                  setOpen(false);
+                  closeMenu();
                   void onSelect(opt.value);
                 }}
                 data-testid={`config-option-${option.id}-value-${opt.value}`}
@@ -202,6 +250,11 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
               </button>
             );
           })}
+          {filteredOptions.length === 0 && (
+            <div className="px-3 py-2 text-[12px] text-text-dim">
+              No matching models
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -4,8 +4,8 @@
 
 use super::FieldDescriptor;
 use crate::session::config::{
-    AcpConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, TelemetryConfig,
-    ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
+    AcpConfig, AuthConfig, DiffConfig, DiscordConfig, LoggingConfig, SandboxConfig, SessionConfig,
+    TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
 };
 use crate::sound::SoundConfig;
 use crate::status_hooks::StatusHookConfig;
@@ -23,6 +23,8 @@ pub fn schema() -> Vec<FieldDescriptor> {
     out.extend(SoundConfig::settings_descriptors());
     out.extend(StatusHookConfig::settings_descriptors());
     out.extend(WebConfig::settings_descriptors());
+    out.extend(AuthConfig::settings_descriptors());
+    out.extend(DiscordConfig::settings_descriptors());
     out.extend(AcpConfig::settings_descriptors());
     out.extend(DiffConfig::settings_descriptors());
     out.extend(LoggingConfig::settings_descriptors());
@@ -98,6 +100,52 @@ mod tests {
             }
             other => panic!("expected select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn discord_section_exposes_beta_settings() {
+        let fields: Vec<_> = schema()
+            .into_iter()
+            .filter(|d| d.section == "discord")
+            .map(|d| d.field)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "enabled",
+                "webhook_url",
+                "username",
+                "mention",
+                "notify_on_waiting",
+                "notify_on_idle",
+                "notify_on_error",
+                "notify_on_stopped"
+            ]
+        );
+        assert!(
+            !descriptor("discord", "enabled")
+                .expect("discord.enabled descriptor")
+                .profile_overridable
+        );
+    }
+
+    #[test]
+    fn auth_section_exposes_lockout_settings() {
+        let fields: Vec<_> = schema()
+            .into_iter()
+            .filter(|d| d.section == "auth")
+            .map(|d| d.field)
+            .collect();
+
+        assert_eq!(
+            fields,
+            ["max_failures", "failure_window_secs", "lockout_secs"]
+        );
+        assert!(
+            !descriptor("auth", "max_failures")
+                .expect("auth.max_failures descriptor")
+                .profile_overridable
+        );
     }
 
     #[test]

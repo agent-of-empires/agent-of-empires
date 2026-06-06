@@ -161,6 +161,36 @@ describe("SessionConfigControls", () => {
     expect(fn).toHaveBeenCalledWith("model", "claude-sonnet-4-6");
   });
 
+  it("filters model options with the menu search field", () => {
+    const manyModels: ConfigOptionDescriptor = {
+      ...modelOption(),
+      options: [
+        { value: "composer-2.5", name: "Composer 2.5" },
+        { value: "composer-2.5-fast", name: "Composer 2.5 Fast" },
+        { value: "gpt-5.3-codex-high-fast", name: "Codex 5.3 High Fast" },
+      ],
+    };
+    render(
+      <SessionConfigControls
+        configOptions={[manyModels]}
+        pendingConfigOption={null}
+        onSetConfigOption={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("config-option-model"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Search Model" }), {
+      target: { value: "composer fast" },
+    });
+
+    expect(
+      screen.getByTestId("config-option-model-value-composer-2.5-fast"),
+    ).toBeTruthy();
+    expect(
+      screen.queryByTestId("config-option-model-value-gpt-5.3-codex-high-fast"),
+    ).toBeNull();
+  });
+
   it("clicking an effort segment invokes onSetConfigOption with the value (not the label)", () => {
     const fn = vi.fn();
     render(

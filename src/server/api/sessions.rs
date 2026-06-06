@@ -23,6 +23,8 @@ pub struct SessionResponse {
     pub project_path: String,
     pub group_path: String,
     pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
     pub status: String,
     pub yolo_mode: bool,
     pub created_at: String,
@@ -218,6 +220,7 @@ impl SessionResponse {
             project_path: inst.project_path.clone(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
+            agent_model: inst.agent_model.clone(),
             status: format!("{:?}", inst.status),
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
@@ -2387,6 +2390,12 @@ pub async fn create_session(
                 .agent_model
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.model.clone()));
+            if agent_key == "cursor" {
+                instance.agent_model = instance
+                    .agent_model
+                    .as_deref()
+                    .and_then(crate::acp::supervisor::normalize_cursor_model_override);
+            }
             let mut agent_effort = body
                 .agent_effort
                 .filter(|s| !s.trim().is_empty())
@@ -3737,6 +3746,7 @@ mod tests {
         assert_eq!(resp.title, "test-session");
         assert_eq!(resp.project_path, "/tmp/test-project");
         assert_eq!(resp.tool, "claude");
+        assert_eq!(resp.agent_model, inst.agent_model);
         assert_eq!(resp.status, "Running");
         assert_eq!(resp.group_path, "work/projects");
         assert!(!resp.is_sandboxed);
@@ -3761,6 +3771,20 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn send_started_marks_idle_session_running() {
+        let mut inst = make_test_instance();
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+
+        let change = mark_send_started(&mut inst, chrono::Utc::now()).expect("status change");
+
+        assert_eq!(change, (Status::Idle, Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert!(inst.last_accessed_at.is_some());
+        assert_eq!(inst.idle_entered_at, None);
     }
 
     #[test]
@@ -4692,6 +4716,23 @@ enum SendKeysError {
 type SendKeysResult =
     Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
 
+#[derive(Debug)]
+pub enum SendTextError {
+    ReadOnly,
+    EmptyMessage,
+    NotFound,
+    NotRunning,
+    Transient(Status),
+    StructuredView,
+    Tmux,
+    Internal,
+}
+
+#[derive(Debug, Default)]
+pub struct SendTextOutcome {
+    pub stale_session_id: Option<String>,
+}
+
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -4704,26 +4745,83 @@ pub async fn send_message(
         )
             .into_response();
     }
+
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
 
-    if req.message.trim().is_empty() {
-        return (
+    match send_text_to_session(state, &id, req.message, req.revive).await {
+        Ok(outcome) => {
+            let mut body = serde_json::json!({"sent": true});
+            if let Some(sid) = outcome.stale_session_id {
+                body["stale_session_id"] = serde_json::Value::String(sid);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(SendTextError::ReadOnly) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "read_only"})),
+        )
+            .into_response(),
+        Err(SendTextError::EmptyMessage) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "message_empty"})),
         )
-            .into_response();
+            .into_response(),
+        Err(SendTextError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
+            .into_response(),
+        Err(SendTextError::NotRunning) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "session_not_running"})),
+        )
+            .into_response(),
+        Err(SendTextError::Transient(status)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "session_transient",
+                "status": format!("{status:?}"),
+            })),
+        )
+            .into_response(),
+        Err(SendTextError::StructuredView) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "acp_mode_unsupported"})),
+        )
+            .into_response(),
+        Err(SendTextError::Tmux) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "tmux_error"})),
+        )
+            .into_response(),
+        Err(SendTextError::Internal) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal"})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn send_text_to_session(
+    state: Arc<AppState>,
+    id: &str,
+    message: String,
+    revive: bool,
+) -> Result<SendTextOutcome, SendTextError> {
+    if state.read_only {
+        return Err(SendTextError::ReadOnly);
+    }
+
+    if message.trim().is_empty() {
+        return Err(SendTextError::EmptyMessage);
     }
 
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+        return Err(SendTextError::NotFound);
     };
     drop(instances);
 
@@ -4731,12 +4829,10 @@ pub async fn send_message(
     // Without this, two POSTs racing against the same session would issue
     // overlapping `tmux send-keys -l` invocations and the bytes can interleave
     // inside the pane.
-    let inst_lock = state.instance_lock(&id).await;
+    let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
 
     let tool = instance.tool.clone();
-    let message = req.message;
-    let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
         // Revive the pane before sending. Without this, a send to a dead
         // pane silently writes keystrokes to a corpse with no agent.
@@ -4814,14 +4910,23 @@ pub async fn send_message(
                     apply_post_restart_sync(i, &started);
                 }
                 i.touch_last_accessed();
+                if let Some((old, new)) = mark_send_started(i, chrono::Utc::now()) {
+                    let _ = state.status_tx.send(crate::server::push::StatusChange {
+                        instance_id: i.id.clone(),
+                        instance_title: i.title.clone(),
+                        old,
+                        new,
+                        at: chrono::Utc::now(),
+                    });
+                }
                 i.source_profile.clone()
             } else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return Ok(SendTextOutcome::default());
             };
             drop(instances);
-            let id_for_save = id.clone();
+            let id_for_save = id.to_string();
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
@@ -4839,7 +4944,6 @@ pub async fn send_message(
                     }
                 }
             });
-            let mut body = serde_json::json!({"sent": true});
             let stale_sid = match &outcome {
                 EnsureReadyOutcome::Respawned {
                     stale_sid: Some(sid),
@@ -4849,10 +4953,9 @@ pub async fn send_message(
                 } => Some(sid.clone()),
                 _ => None,
             };
-            if let Some(sid) = stale_sid {
-                body["stale_session_id"] = serde_json::Value::String(sid);
-            }
-            (StatusCode::OK, Json(body)).into_response()
+            Ok(SendTextOutcome {
+                stale_session_id: stale_sid,
+            })
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
@@ -4883,25 +4986,10 @@ pub async fn send_message(
                             apply_cascade_state_sync(i, &started);
                         }
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": "session_not_running"})),
-                    )
-                        .into_response()
+                    Err(SendTextError::NotRunning)
                 }
-                SendKeysError::Transient(status) => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "session_transient",
-                        "status": format!("{status:?}"),
-                    })),
-                )
-                    .into_response(),
-                SendKeysError::StructuredView => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
-                )
-                    .into_response(),
+                SendKeysError::Transient(status) => Err(SendTextError::Transient(status)),
+                SendKeysError::StructuredView => Err(SendTextError::StructuredView),
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
@@ -4920,23 +5008,29 @@ pub async fn send_message(
                         i.status = crate::session::Status::Error;
                         i.last_error = Some(msg);
                     }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tmux_error"})),
-                    )
-                        .into_response()
+                    Err(SendTextError::Tmux)
                 }
             }
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response()
+            Err(SendTextError::Internal)
         }
     }
+}
+
+fn mark_send_started(
+    inst: &mut Instance,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(Status, Status)> {
+    let old = inst.status;
+    inst.last_accessed_at = Some(now);
+    if old == Status::Running {
+        return None;
+    }
+    inst.status = Status::Running;
+    inst.idle_entered_at = None;
+    Some((old, Status::Running))
 }
 
 #[derive(Deserialize)]
@@ -5061,6 +5155,7 @@ mod workspace_ordering_tests {
             project_path: project_path.to_string(),
             group_path: String::new(),
             tool: "claude".to_string(),
+            agent_model: None,
             status: "Idle".to_string(),
             yolo_mode: false,
             created_at: "2025-01-01T00:00:00Z".to_string(),

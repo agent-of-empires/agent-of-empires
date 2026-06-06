@@ -165,6 +165,16 @@ const PI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
+const CURSOR: AgentProfile = {
+  key: "cursor",
+  capabilities: { todos: false, skills: false, wakeup: false, subagents: false, legacyModeFallback: false },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  clearAliases: [],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [] },
+};
+
 const AOE_AGENT: AgentProfile = {
   ...CLAUDE,
   key: "aoe-agent",
@@ -191,6 +201,7 @@ const PROFILES: Record<string, AgentProfile> = {
   gemini: GEMINI,
   vibe: VIBE,
   pi: PI,
+  cursor: CURSOR,
   "aoe-agent": AOE_AGENT,
 };
 

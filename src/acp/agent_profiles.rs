@@ -2,8 +2,8 @@
 //!
 //! The structured view historically text-matched against `claude-agent-acp`'s tool
 //! titles, `_meta.claudeCode` namespace, and `/clear` slash command. Other
-//! ACP adapters (codex-acp, `opencode acp`, `gemini --acp`, vibe-acp,
-//! pi-acp) have their own conventions. This module owns the subset of
+//! ACP adapters (codex-acp, `opencode acp`, `gemini --acp`,
+//! `cursor-agent acp`, vibe-acp, pi-acp) have their own conventions. This module owns the subset of
 //! per-agent data the Rust server needs: subagent linkage namespace,
 //! conversation-reset slash aliases, and capability gates for the few
 //! semantic events the server synthesises from tool calls (ExitPlanMode
@@ -158,6 +158,16 @@ pub const PI: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
 };
 
+/// Cursor Agent CLI via native `cursor-agent acp`. Defaults until its
+/// tool-title and `_meta` conventions are verified in the structured view.
+pub const CURSOR: AgentProfile = AgentProfile {
+    key: "cursor",
+    parent_meta_namespaces: &[],
+    clear_aliases: &[],
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+};
+
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
@@ -190,6 +200,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "gemini" => &GEMINI,
         "vibe" => &VIBE,
         "pi" => &PI,
+        "cursor" => &CURSOR,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -208,6 +219,7 @@ mod tests {
         assert_eq!(resolve("gemini").key, "gemini");
         assert_eq!(resolve("vibe").key, "vibe");
         assert_eq!(resolve("pi").key, "pi");
+        assert_eq!(resolve("cursor").key, "cursor");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -300,9 +312,20 @@ mod tests {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
-        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &DEFAULT] {
+        let cursor = resolve("cursor");
+        for profile in [&CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, cursor, &DEFAULT] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);
         }
+    }
+
+    #[test]
+    fn cursor_profile_is_conservative_until_wire_shape_is_verified() {
+        let profile = resolve("cursor");
+        assert_eq!(profile.key, "cursor");
+        assert_eq!(profile.parent_meta_namespaces, &[] as &[&str]);
+        assert_eq!(profile.clear_aliases, &[] as &[&str]);
+        assert!(!profile.supports_exit_plan_mode);
+        assert!(!profile.supports_wakeup_tools);
     }
 }

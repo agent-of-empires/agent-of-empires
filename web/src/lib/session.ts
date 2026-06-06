@@ -42,13 +42,34 @@ export const STATUS_TEXT_CLASS: Record<SessionStatus, string> = {
  *  (clock skew). */
 export function idleAgeMs(
   session: Pick<SessionResponse, "status" | "idle_entered_at">,
+  nowMs: number = Date.now(),
 ): number | null {
   if (session.status !== "Idle") return null;
   if (!session.idle_entered_at) return null;
   const since = Date.parse(session.idle_entered_at);
   if (Number.isNaN(since)) return null;
-  const age = Date.now() - since;
+  const age = nowMs - since;
   return age >= 0 ? age : null;
+}
+
+/** Short label for how long an Idle session has been waiting.
+ *  Deliberately starts at 1M so newly-idle rows don't flash a noisy
+ *  counter before a full minute has elapsed. */
+export function formatIdleAgeLabel(
+  session: Pick<SessionResponse, "status" | "idle_entered_at">,
+  nowMs: number = Date.now(),
+): string | null {
+  const age = idleAgeMs(session, nowMs);
+  if (age === null) return null;
+
+  const minutes = Math.floor(age / 60_000);
+  if (minutes < 1) return null;
+  if (minutes < 60) return `${minutes}M`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}H`;
+
+  return `${Math.floor(hours / 24)}D`;
 }
 
 /** True when the session is Idle and within `windowMs` of the Stop hook.

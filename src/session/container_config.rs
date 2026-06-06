@@ -1220,6 +1220,8 @@ pub(crate) fn build_container_config(
                         let settings_file = sandbox_dir.join(config_file_name);
                         let result = if agent.name == "codex" {
                             crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                        } else if agent.name == "cursor" {
+                            crate::hooks::install_cursor_hooks(&settings_file, hook_cfg.events)
                         } else {
                             crate::hooks::install_hooks(
                                 &settings_file,

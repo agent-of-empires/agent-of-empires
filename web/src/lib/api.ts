@@ -263,6 +263,7 @@ export const PROFILE_WRITABLE_SECTIONS = [
   "sandbox",
   "worktree",
   "web",
+  "discord",
   "logging",
   "acp",
   "description",

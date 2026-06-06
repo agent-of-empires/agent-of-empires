@@ -18,6 +18,7 @@ vi.mock("../../lib/api", () => ({
     Promise.resolve({ session: {}, acp: {}, sandbox: {}, worktree: {} }),
   ),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),

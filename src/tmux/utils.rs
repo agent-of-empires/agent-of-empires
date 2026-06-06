@@ -144,6 +144,19 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
     ]);
 }
 
+/// Append `; set-option -t <target> history-limit <lines>` so scrollback
+/// capacity is set atomically with session creation.
+pub fn append_history_limit_args(args: &mut Vec<String>, target: &str, history_limit: u32) {
+    args.extend([
+        ";".to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        target.to_string(),
+        "history-limit".to_string(),
+        history_limit.to_string(),
+    ]);
+}
+
 /// Append the two tmux options required for OSC 52 clipboard escapes from
 /// the wrapped agent (Claude Code, OpenCode, Codex, etc.) to reach the outer
 /// terminal. Without these, "select to copy" inside the agent silently fails
@@ -561,6 +574,24 @@ mod tests {
         assert!(
             !exists,
             "session should be gone after kill_session_if_present"
+        );
+    }
+
+    #[test]
+    fn test_append_history_limit_args() {
+        let mut args: Vec<String> = vec!["new-session".into()];
+        append_history_limit_args(&mut args, "aoe_test", 50000);
+        assert_eq!(
+            args,
+            vec![
+                "new-session",
+                ";",
+                "set-option",
+                "-t",
+                "aoe_test",
+                "history-limit",
+                "50000",
+            ]
         );
     }
 }

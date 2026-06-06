@@ -36,10 +36,11 @@ pub use log_level::{get_log_level, patch_log_level};
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    list_sessions, read_output, rename_session, send_message, session_diff_file,
-    session_diff_files, set_worktree_name, update_session_archive, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
-    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+    list_sessions, read_output, rename_session, send_message, send_text_to_session,
+    session_diff_file, session_diff_files, set_worktree_name, update_session_archive,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_workspace_ordering, CleanupDefaults,
+    OutputQuery, SendMessageRequest, SendTextError, SendTextOutcome, SessionResponse,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,

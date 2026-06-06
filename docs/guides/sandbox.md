@@ -151,7 +151,7 @@ Agent-view sessions can run inside the sandbox container. When both are enabled,
 - `codex-acp` (`@zed-industries/codex-acp`)
 - `pi-acp`
 
-Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the structured view handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
+Native adapters that share a binary with the underlying CLI (`opencode acp`, `gemini --acp`, `cursor-agent acp`, `vibe-acp`) work because the CLI itself is already installed in the image. If you build a **custom sandbox image**, install the same adapters or the structured view handshake will fail with `agent did not complete the ACP initialize handshake within 30s` (the agent process exits with status 127 the moment the runner exec's it).
 
 ## How It Works
 

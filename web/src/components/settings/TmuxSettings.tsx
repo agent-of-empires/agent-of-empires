@@ -1,4 +1,17 @@
-import { SelectField } from "./FormFields";
+import { NumberField, SelectField } from "./FormFields";
+
+const DEFAULT_TMUX_HISTORY_LIMIT = 2000;
+const MAX_TMUX_HISTORY_LIMIT = 200000;
+
+function readHistoryLimit(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : DEFAULT_TMUX_HISTORY_LIMIT;
+}
+
+function normalizeHistoryLimit(value: number): number {
+  return Math.max(0, Math.min(MAX_TMUX_HISTORY_LIMIT, Math.floor(value)));
+}
 
 interface Props {
   settings: Record<string, unknown>;
@@ -40,6 +53,14 @@ export function TmuxSettings({ settings, onSaveField, onUpdate }: Props) {
         value={(tmux.mouse as string) ?? "auto"}
         onChange={(v) => save("mouse", v)}
         options={modeOptions}
+      />
+      <NumberField
+        label="History limit"
+        description="Scrollback lines kept by tmux for each AoE session"
+        value={readHistoryLimit(tmux.history_limit)}
+        min={0}
+        max={MAX_TMUX_HISTORY_LIMIT}
+        onChange={(v) => save("history_limit", normalizeHistoryLimit(v))}
       />
     </div>
   );

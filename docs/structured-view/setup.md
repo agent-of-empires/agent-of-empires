@@ -50,6 +50,8 @@ Configured agents:
     install: npm install -g @google/gemini-cli  (then `gemini --acp`)
 [!! ] opencode  (OpenCode (SST); native ACP via `opencode acp`)
     install: curl -fsSL https://opencode.ai/install | bash  (then `opencode acp`)
+[!! ] cursor  (Cursor Agent CLI; native ACP via `cursor-agent acp`)
+    install: curl https://cursor.com/install -fsS | bash  (then `cursor-agent login`)
 [!! ] pi  (Pi coding agent (`pi`) via the pi-acp adapter …)
     install: npm install -g pi-acp (also requires `npm install -g @earendil-works/pi-coding-agent`)
 [!! ] vibe  (Mistral Vibe; native ACP via the bundled `vibe-acp` binary)
@@ -59,7 +61,7 @@ Overall: partial
 ```
 
 `aoe acp doctor --fix` will `npm install -g` the npm-distributed
-adapters (claude / codex / pi). The native CLIs (opencode / gemini /
+adapters (claude / codex / pi). The native CLIs (opencode / gemini / cursor /
 vibe) you install through their own channels.
 
 If Node is missing the report exits 1; if some agents are unreachable

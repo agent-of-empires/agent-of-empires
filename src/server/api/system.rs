@@ -220,12 +220,19 @@ pub async fn update_settings(
         return reject_response(rej);
     }
 
+    let active_profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load_or_warn();
         let mut current = serde_json::to_value(&config)?;
         crate::session::settings_schema::merge_json(&mut current, &body);
         let config: crate::session::Config = serde_json::from_value(current)?;
         crate::session::save_config(&config)?;
+        let effective = crate::session::profile_config::resolve_config_or_warn(&active_profile);
+        if let Err(e) = crate::tmux::status_bar::apply_history_limit_to_live_sessions(
+            effective.tmux.history_limit,
+        ) {
+            tracing::debug!(target: "http.api.system", "Failed to live-apply tmux history-limit: {}", e);
+        }
         Ok::<_, anyhow::Error>(config)
     })
     .await;
@@ -1080,6 +1087,7 @@ pub async fn update_profile_settings(
         return reject_response(rej);
     }
 
+    let active_profile = crate::session::config::effective_profile(&state.profile);
     let result = tokio::task::spawn_blocking(move || {
         // The `logging` section is process-global (no profile overrides
         // for v1), so peel it off the patch and write it into the
@@ -1157,6 +1165,14 @@ pub async fn update_profile_settings(
         }
         let config: crate::session::ProfileConfig = serde_json::from_value(current)?;
         crate::session::save_profile_config(&name, &config)?;
+        if name == active_profile {
+            let effective = crate::session::profile_config::resolve_config_or_warn(&name);
+            if let Err(e) = crate::tmux::status_bar::apply_history_limit_to_live_sessions(
+                effective.tmux.history_limit,
+            ) {
+                tracing::debug!(target: "http.api.system", "Failed to live-apply tmux history-limit: {}", e);
+            }
+        }
         Ok::<_, anyhow::Error>(config)
     })
     .await;

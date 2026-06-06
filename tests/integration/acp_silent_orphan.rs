@@ -147,6 +147,7 @@ async fn silent_orphan_fires_on_cost_then_silence() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for silent-orphan positive test");
@@ -208,6 +209,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for silent-orphan negative test");
@@ -270,6 +272,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for silent-orphan disabled test");
@@ -328,6 +331,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for async-agent silent-orphan test");
@@ -387,6 +391,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for backgrounded-bash silent-orphan test");
@@ -440,6 +445,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         None,
         "claude".into(),
         None,
+        false,
     )
     .await
     .expect("attach for wakeup silent-orphan test");

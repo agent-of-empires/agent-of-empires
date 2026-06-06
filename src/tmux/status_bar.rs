@@ -98,6 +98,40 @@ pub fn apply_mouse_option(session_name: &str, enabled: bool) -> Result<()> {
     set_session_option(session_name, "mouse", value)
 }
 
+/// Apply the configured tmux scrollback limit to a session.
+pub fn apply_history_limit_option(session_name: &str, history_limit: u32) -> Result<()> {
+    set_session_option(session_name, "history-limit", &history_limit.to_string())
+}
+
+fn is_aoe_tmux_session_name(session_name: &str) -> bool {
+    session_name.starts_with(crate::tmux::SESSION_PREFIX)
+        || session_name.starts_with(crate::tmux::TERMINAL_PREFIX)
+        || session_name.starts_with(crate::tmux::CONTAINER_TERMINAL_PREFIX)
+        || session_name.starts_with(crate::tmux::TOOL_PREFIX)
+}
+
+/// Apply the configured scrollback limit to all currently running AoE tmux sessions.
+pub fn apply_history_limit_to_live_sessions(history_limit: u32) -> Result<usize> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::debug!(target: "tmux.status", "Failed to list tmux sessions for history-limit apply: {}", stderr);
+        return Ok(0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut applied = 0;
+    for session_name in stdout.lines().filter(|name| is_aoe_tmux_session_name(name)) {
+        apply_history_limit_option(session_name, history_limit)?;
+        applied += 1;
+    }
+    crate::tmux::refresh_session_cache();
+    Ok(applied)
+}
+
 /// Apply all configured tmux options to a session.
 /// This is a unified entry point that applies status bar styling and mouse settings.
 pub fn apply_all_tmux_options(
@@ -106,11 +140,12 @@ pub fn apply_all_tmux_options(
     branch: Option<&str>,
     sandbox: Option<&SandboxDisplay>,
 ) {
-    use crate::session::config::{should_apply_tmux_mouse, should_apply_tmux_status_bar};
+    use crate::session::config::{should_apply_tmux_mouse, should_apply_tmux_status_bar, Config};
     use crate::tui::styles::load_theme;
 
+    let config = Config::load_or_warn();
+
     if should_apply_tmux_status_bar() {
-        let config = crate::session::config::Config::load_or_warn();
         let theme_name = if config.theme.name.is_empty() {
             "empire"
         } else {
@@ -130,6 +165,10 @@ pub fn apply_all_tmux_options(
         if let Err(e) = apply_mouse_option(session_name, mouse_enabled) {
             tracing::debug!(target: "tmux.status", "Failed to apply tmux mouse option: {}", e);
         }
+    }
+
+    if let Err(e) = apply_history_limit_option(session_name, config.tmux.history_limit) {
+        tracing::debug!(target: "tmux.status", "Failed to apply tmux history-limit option: {}", e);
     }
 }
 
@@ -234,6 +273,27 @@ mod tests {
     #[test]
     fn test_color_to_tmux_non_rgb_fallback() {
         assert_eq!(color_to_tmux(Color::Red), "default");
+    }
+
+    #[test]
+    fn test_is_aoe_tmux_session_name_matches_managed_prefixes() {
+        assert!(is_aoe_tmux_session_name(&format!(
+            "{}Example_12345678",
+            crate::tmux::SESSION_PREFIX
+        )));
+        assert!(is_aoe_tmux_session_name(&format!(
+            "{}Example_12345678",
+            crate::tmux::TERMINAL_PREFIX
+        )));
+        assert!(is_aoe_tmux_session_name(&format!(
+            "{}Example_12345678",
+            crate::tmux::CONTAINER_TERMINAL_PREFIX
+        )));
+        assert!(is_aoe_tmux_session_name(&format!(
+            "{}Example_12345678",
+            crate::tmux::TOOL_PREFIX
+        )));
+        assert!(!is_aoe_tmux_session_name("user_session"));
     }
 
     #[test]

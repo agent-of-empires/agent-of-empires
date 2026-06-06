@@ -55,7 +55,8 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
 
       if (matched.preventDefault) e.preventDefault();
       if (matched.stopPropagation) e.stopPropagation();
-      actions[matched.shortcut.action]();
+      const action = actions[matched.shortcut.action];
+      action();
     };
 
     // Capture phase so we observe the keydown before xterm.js's helper

@@ -26,6 +26,21 @@ const WORKTREE_SCHEMA = [
   },
 ];
 
+const DISCORD_SCHEMA = [
+  {
+    section: "discord",
+    field: "webhook_url",
+    category: "Discord Beta",
+    label: "Webhook URL",
+    description: "Discord webhook URL for status notifications.",
+    widget: { kind: "optional_text" },
+    web_write: { policy: "writable" },
+    profile_overridable: false,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+];
+
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {} })),
@@ -36,6 +51,7 @@ vi.mock("../../lib/api", () => ({
     return vi.fn(() => Promise.resolve(calls++ === 0 ? null : WORKTREE_SCHEMA));
   })(),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -60,6 +76,17 @@ function renderView(tab: string) {
   );
 }
 
+function findTextInputByLabel(container: HTMLElement, label: string): HTMLInputElement {
+  const labels = container.querySelectorAll("label");
+  for (const node of labels) {
+    if (node.textContent === label) {
+      const input = node.parentElement?.querySelector("input[type='text']");
+      if (input instanceof HTMLInputElement) return input;
+    }
+  }
+  throw new Error(`text input with label ${label} not found`);
+}
+
 describe("SettingsView schema load", () => {
   it("shows an error + retry when the schema fails, then recovers", async () => {
     renderView("worktree");
@@ -77,5 +104,32 @@ describe("SettingsView schema load", () => {
     );
     expect(screen.queryByText("Failed to load settings schema.")).toBeNull();
     expect(vi.mocked(api.getSettingsSchema)).toHaveBeenCalledTimes(2);
+  });
+
+  it("saves non-profile-overridable schema fields through the global settings path", async () => {
+    vi.mocked(api.getSettingsSchema).mockResolvedValueOnce(DISCORD_SCHEMA as never);
+    vi.mocked(api.fetchSettings).mockResolvedValueOnce({
+      discord: { webhook_url: null },
+    } as never);
+
+    const { container } = renderView("discord");
+    await screen.findByText("Webhook URL");
+
+    const input = findTextInputByLabel(container, "Webhook URL");
+    fireEvent.focus(input);
+    fireEvent.change(input, {
+      target: { value: "https://discord.com/api/webhooks/123/abc" },
+    });
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
+        discord: { webhook_url: "https://discord.com/api/webhooks/123/abc" },
+      }),
+    );
+    expect(vi.mocked(api.updateProfileSettings)).not.toHaveBeenCalledWith(
+      "main",
+      expect.objectContaining({ discord: expect.anything() }),
+    );
   });
 });

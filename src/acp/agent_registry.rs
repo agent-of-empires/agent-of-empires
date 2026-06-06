@@ -68,6 +68,7 @@ impl AgentRegistry {
     ///   opencode → `opencode acp`       (native, SST)
     ///   gemini   → `gemini --acp`       (native, Google)
     ///   codex    → codex-acp            (Zed adapter, OpenAI Codex CLI)
+    ///   cursor   → `cursor-agent acp`   (native, Cursor Agent CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
     ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///
@@ -132,6 +133,15 @@ impl AgentRegistry {
             },
         );
         reg.agents.insert(
+            "cursor".into(),
+            AgentSpec {
+                command: "cursor-agent".into(),
+                args: vec!["acp".into()],
+                description: "Cursor Agent CLI — native ACP via `cursor-agent acp`".into(),
+                env_allowlist: None,
+            },
+        );
+        reg.agents.insert(
             "vibe".into(),
             AgentSpec {
                 command: "vibe-acp".into(),
@@ -190,6 +200,18 @@ mod tests {
         let reg = AgentRegistry::with_defaults();
         assert!(reg.get("claude-code").is_some());
         assert!(reg.get("aoe-agent").is_some());
+    }
+
+    #[test]
+    fn defaults_include_cursor_agent_acp() {
+        let reg = AgentRegistry::with_defaults();
+        let cursor = reg
+            .get("cursor")
+            .expect("cursor agent should be registered");
+        assert_eq!(cursor.command, "cursor-agent");
+        assert_eq!(cursor.args, vec!["acp"]);
+        assert!(cursor.description.contains("Cursor Agent"));
+        assert!(cursor.env_allowlist.is_none());
     }
 
     #[test]

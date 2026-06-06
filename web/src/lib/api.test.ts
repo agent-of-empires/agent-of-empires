@@ -205,6 +205,7 @@ describe("updateProfileSettings write guard", () => {
       "sandbox",
       "worktree",
       "web",
+      "discord",
       "logging",
       "acp",
       "description",

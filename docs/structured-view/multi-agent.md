@@ -13,6 +13,7 @@ are first-class but lighter on per-tool polish.
 | Codex (OpenAI) | `codex-acp` (Zed adapter) | `npm install -g @zed-industries/codex-acp` |
 | OpenCode (SST) | `opencode acp` (native) | `curl -fsSL https://opencode.ai/install \| bash` |
 | Gemini (Google) | `gemini --acp` (native) | `npm install -g @google/gemini-cli` |
+| Cursor Agent | `cursor-agent acp` (native) | `curl https://cursor.com/install -fsS \| bash` |
 | Vibe (Mistral) | `vibe-acp` (native) | See https://github.com/mistralai/mistral-vibe |
 | Pi | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) |
 | aoe-agent | bundled | shipped with `aoe` |
@@ -25,23 +26,23 @@ step 8 (Structured view Profile).
 Each structured view feature either fires for any ACP agent, fires only when the
 agent's profile opts in, or is currently claude-only.
 
-| Feature | Claude | Codex | OpenCode | Gemini | Other ACP |
-|---------|:------:|:-----:|:--------:|:------:|:---------:|
-| Streaming agent text | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Tool-call cards (`execute` / `read` / `edit` / `search` / `fetch`) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Generic tool card fallback | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Permission / approval flow | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Mode picker | ✓ | depends | ✓ | depends | depends |
-| Slash command palette | ✓ | depends | ✓ | ✓ | depends |
-| Usage / context-window display | ✓ | depends | ✓ | ✓ | depends |
-| MCP tool grouping | ✓ | claimed* | claimed* | claimed* | claimed* |
-| `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
-| TodoWrite card | ✓ | — | — | — | — |
-| Skill card | ✓ | — | — | — | — |
-| ExitPlanMode synthesis | ✓ | — | — | — | — |
-| ScheduleWakeup (`/loop`) | ✓ | — | — | — | — |
-| Subagent indentation | ✓ | — | unverified | — | — |
-| Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
+| Feature | Claude | Codex | OpenCode | Gemini | Cursor | Other ACP |
+|---------|:------:|:-----:|:--------:|:------:|:------:|:---------:|
+| Streaming agent text | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Tool-call cards (`execute` / `read` / `edit` / `search` / `fetch`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Generic tool card fallback | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Permission / approval flow | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Mode picker | ✓ | depends | ✓ | depends | depends | depends |
+| Slash command palette | ✓ | depends | ✓ | ✓ | depends | depends |
+| Usage / context-window display | ✓ | depends | ✓ | ✓ | depends | depends |
+| MCP tool grouping | ✓ | claimed* | claimed* | claimed* | claimed* | claimed* |
+| `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none | none |
+| TodoWrite card | ✓ | — | — | — | — | — |
+| Skill card | ✓ | — | — | — | — | — |
+| ExitPlanMode synthesis | ✓ | — | — | — | — | — |
+| ScheduleWakeup (`/loop`) | ✓ | — | — | — | — | — |
+| Subagent indentation | ✓ | — | unverified | — | unverified | — |
+| Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends | depends |
 
 \* All profiles default to the `mcp__` prefix. If your agent uses a
 different MCP naming scheme, file an issue or PR adjusting the profile's
@@ -111,7 +112,7 @@ This is what you reach for after a rate-limit hand-off: switch claude to codex w
 
 ## Known Limitations
 
-- Codex / opencode / gemini structured view support has been built from adapter
+- Codex / opencode / gemini / cursor structured view support has been built from adapter
   docs and code reading rather than hands-on session walkthroughs. Some
   tool aliases may need adjustment once each agent has been exercised
   end-to-end. File an issue with the wire `tool.kind` + `tool.name`

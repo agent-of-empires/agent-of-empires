@@ -29,7 +29,12 @@ import {
 } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
+import { CursorModelControls } from "./CursorModelControls";
 import { SessionConfigControls } from "./SessionConfigControls";
+import {
+  configOptionsForComposerControls,
+  showModePickerForComposerControls,
+} from "./configOptionsForComposerControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   OPEN_SWITCH_AGENT_EVENT,
@@ -205,6 +210,8 @@ interface Props {
   /** Registry key of the agent the session currently runs. Drives the
    *  "Switch agent" control's filtered target list and handoff copy. */
   currentAgent: AcpState["agent"];
+  sessionTool?: string | null;
+  currentModel?: string | null;
   availableModes: AcpState["availableModes"];
   currentModeId: AcpState["currentModeId"];
   /** Legacy enum-based mode used as fallback when the agent does not
@@ -275,6 +282,8 @@ interface Props {
 export function Composer({
   sessionId,
   currentAgent,
+  sessionTool,
+  currentModel,
   availableModes,
   currentModeId,
   legacyMode,
@@ -295,6 +304,26 @@ export function Composer({
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { files } = useFilesIndex(sessionId);
+  const toolbarConfigOptions = useMemo(
+    () =>
+      configOptionsForComposerControls(configOptions, {
+        currentAgent,
+        sessionTool,
+      }),
+    [configOptions, currentAgent, sessionTool],
+  );
+  const cursorModelConfigOption = useMemo(
+    () => configOptions.find((option) => option.category === "model") ?? null,
+    [configOptions],
+  );
+  const cursorFastConfigOption = useMemo(
+    () => configOptions.find((option) => option.id === "fast") ?? null,
+    [configOptions],
+  );
+  const showModePicker = showModePickerForComposerControls({
+    currentAgent,
+    sessionTool,
+  });
 
   const attachmentsEnabled =
     !!promptCapabilities &&
@@ -904,18 +933,29 @@ export function Composer({
                   }}
                 />
                 <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
-                <ModePicker
-                  sessionId={sessionId}
-                  availableModes={availableModes}
-                  currentModeId={currentModeId}
-                  legacyMode={legacyMode}
-                  configOptions={configOptions}
-                  pendingConfigOption={pendingConfigOption}
-                  setConfigOption={setConfigOption}
-                />
+                {showModePicker && (
+                  <ModePicker
+                    sessionId={sessionId}
+                    availableModes={availableModes}
+                    currentModeId={currentModeId}
+                    legacyMode={legacyMode}
+                    configOptions={configOptions}
+                    pendingConfigOption={pendingConfigOption}
+                    setConfigOption={setConfigOption}
+                  />
+                )}
                 <SessionConfigControls
-                  configOptions={configOptions}
+                  configOptions={toolbarConfigOptions}
                   pendingConfigOption={pendingConfigOption}
+                  onSetConfigOption={setConfigOption}
+                />
+                <CursorModelControls
+                  sessionId={sessionId}
+                  currentAgent={currentAgent}
+                  sessionTool={sessionTool}
+                  currentModel={currentModel}
+                  modelConfigOption={cursorModelConfigOption}
+                  fastConfigOption={cursorFastConfigOption}
                   onSetConfigOption={setConfigOption}
                 />
               </div>

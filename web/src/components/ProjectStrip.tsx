@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { Activity, CheckCircle2, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import {
   DndContext,
   MouseSensor,
@@ -34,7 +34,11 @@ import {
   type RepoAppearanceUpdate,
   type RepoColor,
 } from "../lib/repoAppearance";
-import { getStatusTextClass, isSessionActive } from "../lib/session";
+import {
+  formatIdleAgeLabel,
+  getStatusTextClass,
+  isSessionActive,
+} from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { renameSession, setSessionNotifications } from "../lib/api";
 import { StatusGlyph } from "./StatusGlyph";
@@ -63,8 +67,6 @@ const STATUS_PRIORITY: SessionStatus[] = [
   "Unknown",
   "Deleting",
 ];
-
-const RECENT_FINISH_WINDOW_MS = 5 * 60 * 1000;
 
 type NotifyPreset = "off" | "default" | "all";
 
@@ -136,28 +138,6 @@ function repoSwatchStyle(color: RepoColor): CSSProperties {
   return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
 }
 
-function hasRecentlyFinishedSession(
-  sessions: SessionResponse[],
-  idleDecayWindowMs: number,
-): boolean {
-  const now = Date.now();
-  const windowMs = Math.max(idleDecayWindowMs, RECENT_FINISH_WINDOW_MS);
-  return sessions.some((session) => {
-    if (session.status !== "Idle" || !session.idle_entered_at) return false;
-    const idleAt = Date.parse(session.idle_entered_at);
-    if (!Number.isFinite(idleAt)) return false;
-    const age = now - idleAt;
-    return age >= 0 && age <= windowMs;
-  });
-}
-
-function hasRunningSession(
-  sessions: SessionResponse[],
-  idleDecayWindowMs: number,
-): boolean {
-  return sessions.some((session) => isSessionActive(session, idleDecayWindowMs));
-}
-
 function SortableProjectChip({
   id,
   readOnly,
@@ -220,8 +200,7 @@ export function ProjectStrip({
     Record<string, NotifyPreset>
   >({});
   const [renameValue, setRenameValue] = useState("");
-  const renameRef = useRef<HTMLInputElement | null>(null);
-  const sessionRenameRef = useRef<HTMLInputElement | null>(null);
+  const [minuteTick, setMinuteTick] = useState(() => Date.now());
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
@@ -251,11 +230,6 @@ export function ProjectStrip({
             session,
             active,
             workspaceId: group.workspaces[0]!.id,
-            hasRunning: hasRunningSession(sessions, idleDecayWindowMs),
-            recentlyFinished: hasRecentlyFinishedSession(
-              sessions,
-              idleDecayWindowMs,
-            ),
           };
         }),
     [groups, activeWorkspaceId, idleDecayWindowMs],
@@ -290,12 +264,9 @@ export function ProjectStrip({
   }, [activeWorkspaceId]);
 
   useEffect(() => {
-    if (renamingGroupId) renameRef.current?.select();
-  }, [renamingGroupId]);
-
-  useEffect(() => {
-    if (renamingSessionId) sessionRenameRef.current?.select();
-  }, [renamingSessionId]);
+    const id = window.setInterval(() => setMinuteTick(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (!menu) return;
@@ -424,8 +395,24 @@ export function ProjectStrip({
             aria-label="Projects"
             className="flex h-8 items-center gap-1 overflow-x-auto border-b border-surface-800/80 px-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
-            {items.map(({ group, session, active, workspaceId, hasRunning, recentlyFinished }) => {
+            {items.map(({ group, session, active, workspaceId }) => {
               const status = session?.status ?? "Unknown";
+              const textClass = getStatusTextClass(
+                {
+                  status,
+                  idle_entered_at: session?.idle_entered_at ?? null,
+                },
+                idleDecayWindowMs,
+              );
+              const idleLabel = session
+                ? formatIdleAgeLabel(
+                    {
+                      status,
+                      idle_entered_at: session.idle_entered_at,
+                    },
+                    minuteTick,
+                  )
+                : null;
               return (
                 <SortableProjectChip
                   key={group.id}
@@ -473,10 +460,11 @@ export function ProjectStrip({
                     >
                       {renamingGroupId === group.id ? (
                         <input
-                          ref={renameRef}
+                          autoFocus
                           type="text"
                           value={renameValue}
                           onChange={(e) => setRenameValue(e.target.value)}
+                          onFocus={(e) => e.currentTarget.select()}
                           onClick={(e) => e.stopPropagation()}
                           onDoubleClick={(e) => e.stopPropagation()}
                           onBlur={() => commitRename(group)}
@@ -490,20 +478,25 @@ export function ProjectStrip({
                         />
                       ) : (
                         <>
-                          <span className="mr-1 flex shrink-0 items-center gap-0.5">
-                            {hasRunning && (
-                              <Activity
-                                aria-label="Running session in project"
-                                className="h-3 w-3 text-status-running"
-                              />
-                            )}
-                            {recentlyFinished && (
-                              <CheckCircle2
-                                aria-label="Recently finished session in project"
-                                className="h-3 w-3 text-status-running"
-                              />
-                            )}
+                          <span
+                            className={`mr-1 w-3 shrink-0 text-center font-mono text-[9px] leading-none ${textClass}`}
+                            aria-label={`Project session status ${status}`}
+                          >
+                            <StatusGlyph
+                              status={status}
+                              createdAt={session?.created_at ?? null}
+                              idleEnteredAt={session?.idle_entered_at}
+                            />
                           </span>
+                          {idleLabel && (
+                            <span
+                              className={`mr-1 shrink-0 font-mono text-[9px] leading-none tabular-nums ${textClass}`}
+                              title={`Idle for ${idleLabel}`}
+                              aria-label={`Idle for ${idleLabel}`}
+                            >
+                              {idleLabel}
+                            </span>
+                          )}
                           <span className="min-w-0 flex-1 text-center">
                             <span className="block truncate text-[11px] font-medium leading-4">
                               {group.displayName}
@@ -641,10 +634,11 @@ export function ProjectStrip({
             >
               {isRenaming ? (
                 <input
-                  ref={sessionRenameRef}
+                  autoFocus
                   type="text"
                   value={renameValue}
                   onChange={(e) => setRenameValue(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
                   onBlur={() => void commitSessionRename(session)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void commitSessionRename(session);

@@ -79,6 +79,9 @@ export interface SessionResponse {
   /** True when this session uses ACP acp rendering instead of a
    *  tmux-backed PTY. Absent on builds without the acp feature. */
   view?: "structured" | "terminal";
+  /** Stored structured-view model override. Omitted/null means the
+   *  adapter default is used. */
+  agent_model?: string | null;
   /** Live acp worker lifecycle. `absent` for tmux sessions or
    *  acp sessions whose worker has not been spawned yet; `resuming`
    *  while the reconciler is mid-spawn or mid-attach; `running` once

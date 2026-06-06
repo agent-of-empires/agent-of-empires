@@ -286,6 +286,9 @@ pub struct SpawnConfig {
     /// structured view sandbox env mirrors the tmux view. `None` for
     /// non-sandboxed sessions.
     pub source_profile: Option<String>,
+    /// When true, ACP permission requests are answered with the first
+    /// allow-compatible option instead of being surfaced as approval cards.
+    pub yolo_mode: bool,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -1240,6 +1243,7 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
+        let yolo_mode = config.yolo_mode;
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would
@@ -1266,6 +1270,7 @@ impl AcpClient {
                 install_binary,
                 source_profile_for_task,
                 default_effort.clone(),
+                yolo_mode,
             )
             .await;
         }
@@ -1288,6 +1293,7 @@ impl AcpClient {
             install_binary,
             source_profile_for_task,
             default_effort,
+            yolo_mode,
         )
         .await
     }
@@ -1309,6 +1315,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        yolo_mode: bool,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -1365,6 +1372,7 @@ impl AcpClient {
             expected_agent,
             source_profile,
             default_effort,
+            yolo_mode,
         ));
 
         wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
@@ -1401,6 +1409,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        yolo_mode: bool,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
@@ -1449,6 +1458,7 @@ impl AcpClient {
             expected_agent,
             source_profile,
             default_effort,
+            yolo_mode,
         ));
 
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
@@ -1494,6 +1504,7 @@ impl AcpClient {
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
+        yolo_mode: bool,
     ) -> Result<Self, AcpError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (event_tx, event_rx) = mpsc::channel::<Event>(64);
@@ -1532,6 +1543,7 @@ impl AcpClient {
             install_binary,
             source_profile,
             None,
+            yolo_mode,
         )
         .await
     }
@@ -2496,6 +2508,12 @@ fn pick_option_id(
         }
     }
     None
+}
+
+fn yolo_permission_option_id(
+    options: &[agent_client_protocol::schema::PermissionOption],
+) -> Option<agent_client_protocol::schema::PermissionOptionId> {
+    pick_option_id(options, ApprovalDecision::AllowAlways)
 }
 
 /// True when the event would reproduce a prior turn's visible
@@ -3539,6 +3557,25 @@ fn is_mode_advertised(
     }
 }
 
+fn build_client_capabilities(expected_agent: ExpectedAgent) -> ClientCapabilities {
+    let mut capabilities = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true);
+
+    if matches!(expected_agent, ExpectedAgent::Cursor) {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "parameterizedModelPicker".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        capabilities = capabilities.meta(meta);
+    }
+
+    capabilities
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection_task<W, R>(
     transport: ByteStreams<W, R>,
@@ -3556,6 +3593,7 @@ async fn run_connection_task<W, R>(
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    yolo_mode: bool,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -3754,8 +3792,10 @@ async fn run_connection_task<W, R>(
                 let event_tx = event_tx_for_perm.clone();
                 let pending = pending_for_perm.clone();
                 async move {
-                    handle_permission_request(request, responder, event_tx, pending, profile)
-                        .await
+                    handle_permission_request(
+                        request, responder, event_tx, pending, profile, yolo_mode,
+                    )
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3825,11 +3865,7 @@ async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            let capabilities = ClientCapabilities::new()
-                .fs(FileSystemCapabilities::new()
-                    .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true);
+            let capabilities = build_client_capabilities(expected_agent);
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
             // (aoe-agent, claude-agent-acp); the response only carries
@@ -5468,6 +5504,7 @@ async fn handle_permission_request(
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
+    yolo_mode: bool,
 ) -> agent_client_protocol::Result<()> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -5517,6 +5554,35 @@ async fn handle_permission_request(
             tool_call: tool_call.clone(),
         })
         .await;
+
+    if yolo_mode {
+        if let Some(option_id) = yolo_permission_option_id(&request.options) {
+            let exit_ns = enter_timestamp_ns();
+            trace!(
+                target: "acp.protocol.tool_dispatch",
+                handler = "permission_request",
+                tool_call_id = %tool_call_id,
+                enter_ns,
+                elapsed_ns = exit_ns - enter_ns,
+                outcome = "yolo_selected",
+                "auto-approving permission request"
+            );
+            return responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+            ));
+        }
+
+        warn!(
+            target: "acp.protocol",
+            tool_call_id = %tool_call_id,
+            "auto-approve mode was enabled, but the agent offered no allow-compatible permission option; cancelling"
+        );
+        emit_permission_denied(&event_tx, &tool_call_id, "permission cancelled").await;
+        return responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+    }
+
     let approval = build_approval(tool_call);
     let nonce = approval.nonce.clone();
 
@@ -6159,6 +6225,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            yolo_mode: false,
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6225,6 +6292,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            yolo_mode: false,
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6293,6 +6361,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
+            yolo_mode: false,
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6338,6 +6407,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
@@ -6369,6 +6439,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         match result {
@@ -6621,6 +6692,46 @@ mod tests {
         // AllowAlways. Falls back gracefully.
         let id = pick_option_id(&options, ApprovalDecision::Allow).unwrap();
         assert_eq!(id.0.as_ref(), "always");
+    }
+
+    #[test]
+    fn yolo_permission_prefers_allow_always_then_allow_once() {
+        use agent_client_protocol::schema::{PermissionOption, PermissionOptionId};
+        let options = vec![
+            PermissionOption::new(
+                PermissionOptionId::new("once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("always"),
+                "Always",
+                PermissionOptionKind::AllowAlways,
+            ),
+        ];
+
+        let selected = yolo_permission_option_id(&options).expect("allow option");
+        assert_eq!(selected.0.as_ref(), "always");
+
+        let options = vec![PermissionOption::new(
+            PermissionOptionId::new("once"),
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        )];
+        let selected = yolo_permission_option_id(&options).expect("allow option");
+        assert_eq!(selected.0.as_ref(), "once");
+    }
+
+    #[test]
+    fn yolo_permission_does_not_select_reject_only_options() {
+        use agent_client_protocol::schema::{PermissionOption, PermissionOptionId};
+        let options = vec![PermissionOption::new(
+            PermissionOptionId::new("reject"),
+            "Reject",
+            PermissionOptionKind::RejectOnce,
+        )];
+
+        assert!(yolo_permission_option_id(&options).is_none());
     }
 
     #[test]
@@ -7629,6 +7740,34 @@ mod tests {
         assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
+    }
+
+    #[test]
+    fn cursor_initialize_capabilities_advertise_parameterized_model_picker() {
+        let capabilities = build_client_capabilities(ExpectedAgent::Cursor);
+        let value = serde_json::to_value(capabilities).expect("capabilities serialize");
+
+        assert_eq!(
+            value
+                .get("_meta")
+                .and_then(|meta| meta.get("parameterizedModelPicker"))
+                .and_then(|flag| flag.as_bool()),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn non_cursor_initialize_capabilities_do_not_advertise_cursor_model_picker() {
+        let capabilities = build_client_capabilities(ExpectedAgent::ClaudeAgentAcp);
+        let value = serde_json::to_value(capabilities).expect("capabilities serialize");
+
+        assert!(
+            value
+                .get("_meta")
+                .and_then(|meta| meta.get("parameterizedModelPicker"))
+                .is_none(),
+            "Cursor-specific model picker capability must not leak to other agents",
+        );
     }
 
     #[test]

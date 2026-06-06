@@ -449,7 +449,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(".cursor/settings.json"));
+        assert!(text.contains(".cursor/hooks.json"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
+pub mod discord;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -545,7 +546,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_grace,
     ));
     let login_manager = Arc::new(login::LoginManager::new(passphrase));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let rate_limiter = Arc::new(RateLimiter::with_limits(
+        config.auth.max_failures,
+        Duration::from_secs(config.auth.lockout_secs),
+        Duration::from_secs(config.auth.failure_window_secs.max(1)),
+    ));
 
     if login_manager.is_enabled() {
         info!("Passphrase login enabled (second-factor authentication)");
@@ -562,7 +568,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Push notifications: initialize only when the operator flag is on at
     // startup. Flipping it later requires a server restart to take effect.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
     let push_enabled = config.web.notifications_enabled;
     let push_state = if push_enabled {
         match crate::session::get_app_dir() {
@@ -960,6 +965,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
+    discord::spawn_consumer(state.clone(), config.discord.clone());
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());

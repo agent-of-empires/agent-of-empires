@@ -411,6 +411,24 @@ pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(entries).into_response()
 }
 
+fn resolve_switch_agent_model(
+    target: &str,
+    requested: Option<&str>,
+    existing: Option<&str>,
+) -> Option<String> {
+    match requested.map(str::trim) {
+        Some(model) if target == "cursor" && (model.is_empty() || model == "auto") => None,
+        Some(model) if target == "cursor" => {
+            crate::acp::supervisor::normalize_cursor_model_override(model)
+        }
+        Some(model) => Some(model.to_string()),
+        None if target == "cursor" => {
+            existing.and_then(crate::acp::supervisor::normalize_cursor_model_override)
+        }
+        None => existing.map(str::to_string),
+    }
+}
+
 /// Atomically move a structured view session from one ACP backend to another.
 /// Two callers drive this: the rate-limit recovery flow (#1282), which
 /// hands a Claude-rate-limited session off to `codex` (or another
@@ -474,7 +492,13 @@ pub async fn switch_acp_agent(
             std::path::Path::new(&instance.project_path),
         )
         .await;
-    if from_agent == target {
+    let model_requested = req.model.is_some();
+    let model = resolve_switch_agent_model(
+        &target,
+        req.model.as_deref(),
+        instance.agent_model.as_deref(),
+    );
+    if from_agent == target && !model_requested {
         return (
             StatusCode::BAD_REQUEST,
             format!("session is already using {target}"),
@@ -519,7 +543,6 @@ pub async fn switch_acp_agent(
     // profile for non-sandbox sessions too.
     let source_profile = Some(instance.source_profile.clone());
 
-    let model = req.model.clone().or(instance.agent_model.clone());
     let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {
@@ -530,8 +553,8 @@ pub async fn switch_acp_agent(
             provider_env: vec![],
             model: model.clone(),
             effort: None,
-            // Different ACP backend; the cached Claude session id would
-            // be rejected by codex / opencode.
+            // A different ACP backend, or the same backend with a new
+            // model, must start a fresh agent-side session.
             stored_acp_session_id: None,
             sandbox_info,
             source_profile,
@@ -586,16 +609,16 @@ pub async fn switch_acp_agent(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             inst.agent_name = Some(target_for_save.clone());
             inst.acp_session_id = None;
-            if let Some(m) = &model {
-                inst.agent_model = Some(m.clone());
-            }
+            inst.agent_model = model.clone();
         }
     }
     if let Ok(storage) = crate::session::Storage::new(&profile_for_save) {
+        let model_for_save = model.clone();
         if let Err(e) = storage.update(|instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
                 inst.agent_name = Some(target_for_save.clone());
                 inst.acp_session_id = None;
+                inst.agent_model = model_for_save.clone();
             }
             Ok(())
         }) {
@@ -1797,6 +1820,30 @@ pub async fn acp_replay(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cursor_auto_model_clears_switch_override() {
+        assert_eq!(
+            resolve_switch_agent_model("cursor", Some("auto"), Some("composer-2.5-fast")),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_requested_model_replaces_existing_override() {
+        assert_eq!(
+            resolve_switch_agent_model("cursor", Some("composer-2.5"), Some("composer-2.5-fast")),
+            Some("composer-2.5".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_requested_model_keeps_existing_override() {
+        assert_eq!(
+            resolve_switch_agent_model("cursor", None, Some("composer-2.5-fast")),
+            Some("composer-2.5".to_string())
+        );
+    }
 
     #[test]
     fn mime_allowlist_gates_by_kind() {

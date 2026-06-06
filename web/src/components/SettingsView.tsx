@@ -10,6 +10,7 @@ import {
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
+  updateSettings,
   type ServerAbout,
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
@@ -42,6 +43,8 @@ type TabId =
   | "updates"
   | "telemetry"
   | "notifications"
+  | "discord"
+  | "auth"
   | "terminal"
   | "security"
   | "devices"
@@ -76,7 +79,10 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "divider", label: "Notifications" },
     { kind: "tab", id: "sound", label: "Sound" },
     { kind: "tab", id: "notifications", label: "Notifications" },
+    { kind: "divider", label: "Integrations Beta" },
+    { kind: "tab", id: "discord", label: "Discord" },
     { kind: "divider", label: "Web Dashboard" },
+    { kind: "tab", id: "auth", label: "Auth" },
     { kind: "tab", id: "terminal", label: "Terminal" },
     { kind: "tab", id: "security", label: "Security" },
     { kind: "tab", id: "devices", label: "Devices" },
@@ -112,6 +118,8 @@ const ALL_TAB_IDS = new Set<TabId>([
   "updates",
   "telemetry",
   "notifications",
+  "discord",
+  "auth",
   "terminal",
   "security",
   "devices",
@@ -306,22 +314,40 @@ export function SettingsView({
   const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
   const web = (settings?.web ?? {}) as Record<string, unknown>;
 
-  const saveField = (
-    section: string,
-    sectionData: Record<string, unknown>,
-    field: string,
-    value: unknown,
-  ): Promise<boolean> => {
-    updateLocal({ [section]: { ...sectionData, [field]: value } });
-    return sendSave(section, { [field]: value });
-  };
+  const saveField = useCallback(
+    (
+      section: string,
+      sectionData: Record<string, unknown>,
+      field: string,
+      value: unknown,
+    ): Promise<boolean> => {
+      updateLocal({ [section]: { ...sectionData, [field]: value } });
+      return sendSave(section, { [field]: value });
+    },
+    [sendSave, updateLocal],
+  );
 
   const saveSubField = useCallback(
-    (section: string, field: string, value: unknown): Promise<boolean> => {
+    async (section: string, field: string, value: unknown): Promise<boolean> => {
       const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
+      const descriptor = schema.find(
+        (d) => d.section === section && d.field === field,
+      );
+      if (descriptor && !descriptor.profile_overridable) {
+        updateLocal({ [section]: { ...sectionData, [field]: value } });
+        setSaving(true);
+        setSaveError(null);
+        const ok = await updateSettings({ [section]: { [field]: value } });
+        setSaving(false);
+        if (!ok) {
+          setSaveError("Failed to save, please try again");
+          loadSettings();
+        }
+        return ok;
+      }
       return saveField(section, sectionData, field, value);
     },
-    [settings, selectedProfile, sendSave, loadSettings],
+    [settings, schema, updateLocal, loadSettings, saveField],
   );
 
   const renderTabContent = () => {
@@ -367,13 +393,13 @@ export function SettingsView({
             />
             <TextField
               label="Structured view defaults"
-              description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              description='Per-agent acp model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"},"cursor":{"model":"composer-2.5-fast"}}'
               value={formatJsonSetting(session.acp_defaults)}
               onChange={(v) => {
                 const parsed = parseJsonObjectSetting(v);
                 if (parsed) void saveField("session", session, "acp_defaults", parsed);
               }}
-              placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              placeholder='{"cursor":{"model":"composer-2.5-fast"}}'
               mono
               multiline
             />
@@ -588,6 +614,39 @@ export function SettingsView({
               </div>
             )}
           </div>
+        );
+
+      case "discord":
+      case "auth":
+        if (schemaLoading) {
+          return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        }
+        if (schemaError) {
+          return (
+            <div className="space-y-3">
+              <div className="text-sm text-status-error">{schemaError}</div>
+              <button
+                type="button"
+                onClick={() => void loadSchema()}
+                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
+              >
+                Retry
+              </button>
+            </div>
+          );
+        }
+        return (
+          <SchemaSection
+            section={activeTab}
+            schema={schema}
+            values={((settings?.[activeTab] ?? {}) as Record<string, unknown>)}
+            onSaveField={saveSubField}
+            advancedSubtitle={
+              activeTab === "discord"
+                ? "Webhook-only Discord notifications for session status changes."
+                : "Authentication lockout settings. Restart the AoE server for changes to take effect."
+            }
+          />
         );
 
       case "terminal":

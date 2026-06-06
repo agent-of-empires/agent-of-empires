@@ -109,6 +109,7 @@ export function MobileMainPane({
                 sessionId={activeSessionId!}
                 acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                 tool={activeSession.tool}
+                agentModel={activeSession.agent_model ?? null}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
                 onOpenFileRef={onOpenFileRef}

@@ -13,7 +13,7 @@
 // AcpRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   MessagePrimitive,
   ThreadPrimitive,
@@ -23,6 +23,7 @@ import {
   AlertTriangle,
   Check,
   ChevronDown,
+  ChevronUp,
   Clock,
   Info,
   ListChecks,
@@ -33,6 +34,7 @@ import {
 
 import { ApprovalCard } from "./ApprovalCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
+import { scrollLatestAssistantMessageIntoView } from "./scrollLatestAssistantMessageIntoView";
 import type { FileRef } from "../../lib/fileRef";
 import {
   ToolDensityToggle,
@@ -104,6 +106,7 @@ interface Props {
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
   tool: string | null | undefined;
+  agentModel?: string | null;
   /** RFC3339 archived-at timestamp, or null. Drives the
    *  archived-specific "worker stopped" banner that replaces the
    *  generic `aoe acp stop`-style message when the user has
@@ -134,6 +137,7 @@ export function StructuredView({
   sessionId,
   acpWorkerState,
   tool,
+  agentModel,
   archivedAt,
   snoozedUntil,
   onOpenFileRef,
@@ -161,12 +165,14 @@ export function StructuredView({
               <AcpChrome
                 sessionId={sessionId}
                 acpWorkerState={acpWorkerState}
+                tool={tool}
                 showClearedTurns={showClearedTurns}
                 onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
                 toolDensity={toolDensity}
                 onToggleToolDensity={toggleToolDensity}
                 archivedAt={archivedAt}
                 snoozedUntil={snoozedUntil}
+                agentModel={agentModel}
                 {...ctx}
               />
             )}
@@ -180,12 +186,14 @@ export function StructuredView({
 function AcpChrome({
   sessionId,
   acpWorkerState,
+  tool,
   showClearedTurns,
   onToggleClearedTurns,
   toolDensity,
   onToggleToolDensity,
   archivedAt,
   snoozedUntil,
+  agentModel,
   state,
   status,
   hasEverOpened,
@@ -212,12 +220,14 @@ function AcpChrome({
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
+  tool: string | null | undefined;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
   toolDensity: "detailed" | "compact";
   onToggleToolDensity: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  agentModel?: string | null;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -276,6 +286,9 @@ function AcpChrome({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  const jumpToLatestAssistant = useCallback(() => {
+    scrollLatestAssistantMessageIntoView(viewportRef.current);
+  }, []);
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
@@ -399,7 +412,7 @@ function AcpChrome({
         />
       )}
 
-      <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
+      <ThreadPrimitive.Root className="relative flex flex-1 flex-col min-h-0">
         <ThreadPrimitive.Viewport
           autoScroll
           ref={viewportRef}
@@ -458,6 +471,19 @@ function AcpChrome({
           </div>
         </ThreadPrimitive.Viewport>
 
+        {state.activity.length > 0 && (
+          <button
+            type="button"
+            aria-label="Jump to latest answer"
+            title="Jump to latest answer"
+            data-testid="jump-latest-assistant"
+            onClick={jumpToLatestAssistant}
+            className="absolute bottom-28 right-4 z-20 inline-flex h-8 w-8 items-center justify-center rounded-full border border-surface-700 bg-surface-850/95 text-text-secondary shadow-lg transition-colors hover:border-brand-600/60 hover:text-text-primary"
+          >
+            <ChevronUp className="h-4 w-4" />
+          </button>
+        )}
+
         <div ref={belowViewportRef}>
           <QueuedPromptsStrip
             queued={state.queuedPrompts}
@@ -504,6 +530,8 @@ function AcpChrome({
           <Composer
             sessionId={sessionId}
             currentAgent={state.agent}
+            sessionTool={tool}
+            currentModel={agentModel}
             availableModes={state.availableModes}
             currentModeId={state.currentModeId}
             legacyMode={state.mode}
@@ -531,7 +559,10 @@ function AcpChrome({
 
 function UserMessage() {
   return (
-    <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
+    <MessagePrimitive.Root
+      data-acp-message-role="user"
+      className="group mt-4 flex flex-col items-end gap-1"
+    >
       <MessagePrimitive.Parts
         components={{
           Text: UserText,
@@ -577,7 +608,10 @@ function UserText({ text }: { text: string }) {
 
 function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="group mt-4 mr-auto w-full">
+    <MessagePrimitive.Root
+      data-acp-message-role="assistant"
+      className="group mt-4 mr-auto w-full"
+    >
       <div className="text-sm text-text-primary leading-relaxed">
         <MessagePrimitive.Parts
           components={{

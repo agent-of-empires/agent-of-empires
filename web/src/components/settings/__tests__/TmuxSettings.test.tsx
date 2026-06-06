@@ -72,11 +72,12 @@ describe("TmuxSettings contract", () => {
     const { onUpdate, container } = mount({
       status_bar: "auto",
       mouse: "enabled",
+      history_limit: 2000,
     });
     const select = container.querySelectorAll("select")[0];
     fireEvent.change(select, { target: { value: "disabled" } });
     expect(onUpdate).toHaveBeenCalledWith({
-      tmux: { status_bar: "disabled", mouse: "enabled" },
+      tmux: { status_bar: "disabled", mouse: "enabled", history_limit: 2000 },
     });
   });
 
@@ -87,5 +88,55 @@ describe("TmuxSettings contract", () => {
     ) as NodeListOf<HTMLSelectElement>;
     expect(selects[0].value).toBe("auto");
     expect(selects[1].value).toBe("auto");
+  });
+
+  it("defaults history_limit to 2000 when absent on initial mount", () => {
+    const { container } = mount({});
+    const input = container.querySelector(
+      'input[type="number"]',
+    ) as HTMLInputElement;
+
+    expect(input.value).toBe("2000");
+  });
+
+  it("history_limit emits tmux.history_limit with a normalized integer", () => {
+    const { onSaveField, onUpdate, container } = mount({
+      status_bar: "auto",
+      mouse: "enabled",
+      history_limit: 2000,
+    });
+    const input = container.querySelector(
+      'input[type="number"]',
+    ) as HTMLInputElement;
+
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "50000.8" } });
+    fireEvent.blur(input);
+
+    expect(onSaveField).toHaveBeenCalledWith("tmux", "history_limit", 50000);
+    expect(onUpdate).toHaveBeenCalledWith({
+      tmux: { status_bar: "auto", mouse: "enabled", history_limit: 50000 },
+    });
+  });
+
+  it("history_limit clamps to the maximum supported value", () => {
+    const { onSaveField, container } = mount({
+      status_bar: "auto",
+      mouse: "enabled",
+      history_limit: 2000,
+    });
+    const input = container.querySelector(
+      'input[type="number"]',
+    ) as HTMLInputElement;
+
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "999999" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onSaveField).toHaveBeenCalledWith(
+      "tmux",
+      "history_limit",
+      200000,
+    );
   });
 });

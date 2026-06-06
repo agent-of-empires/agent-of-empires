@@ -513,6 +513,49 @@ pub(crate) fn apply_agent_command_override(
     Ok(())
 }
 
+pub(crate) fn apply_agent_model_override(
+    selected_agent: &str,
+    model: &str,
+    spec: &mut AgentSpec,
+    env: &mut Vec<(String, String)>,
+) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
+    }
+
+    if selected_agent == "cursor" {
+        let Some(model) = normalize_cursor_model_override(model) else {
+            return;
+        };
+        spec.args.splice(0..0, ["--model".to_string(), model]);
+        return;
+    }
+
+    env.push(("AOE_AGENT_MODEL".into(), model.to_string()));
+}
+
+pub(crate) fn normalize_cursor_model_override(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed == "auto" || trimmed == "default" || trimmed == "default[]" {
+        return None;
+    }
+
+    let without_metadata = trimmed
+        .split_once('[')
+        .map(|(base, _)| base)
+        .unwrap_or(trimmed);
+    let normalized = without_metadata
+        .strip_suffix("-fast")
+        .unwrap_or(without_metadata)
+        .trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap. Used in tests; production
     /// callers should use [`Supervisor::with_capacity`] so the
@@ -1230,7 +1273,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         let mut env = provider_env;
         if let Some(model) = model {
-            env.push(("AOE_AGENT_MODEL".into(), model));
+            apply_agent_model_override(&agent, &model, &mut spec, &mut env);
         }
 
         // Every structured view worker runs through `aoe __acp-runner` so it
@@ -1251,6 +1294,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_acp_session_id: stored_acp_session_id.clone(),
             sandbox_info,
             source_profile,
+            yolo_mode,
         };
 
         debug!(
@@ -2157,6 +2201,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
+        yolo_mode: bool,
     ) -> Result<(), SupervisorError> {
         // Reserve a `pending_resumes` slot for the duration of the
         // attach so the UI shows "Resuming…" while the socket dial +
@@ -2227,6 +2272,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_resources,
             attach_agent_key,
             record.source_profile.clone(),
+            yolo_mode,
         )
         .await?;
         super::worker_registry::mark_attached(&session_id);
@@ -2734,6 +2780,41 @@ mod tests {
     }
 
     #[test]
+    fn cursor_model_override_normalizes_legacy_fast_variant_for_parameterized_picker() {
+        let mut s = spec("cursor-agent", &["acp"]);
+        let mut env = Vec::new();
+        apply_agent_model_override("cursor", "composer-2.5-fast", &mut s, &mut env);
+
+        assert_eq!(s.command, "cursor-agent");
+        assert_eq!(s.args, vec!["--model", "composer-2.5", "acp"]);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn cursor_model_override_skips_auto_values() {
+        let mut s = spec("cursor-agent", &["acp"]);
+        let mut env = Vec::new();
+        apply_agent_model_override("cursor", "default[]", &mut s, &mut env);
+
+        assert_eq!(s.command, "cursor-agent");
+        assert_eq!(s.args, vec!["acp"]);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn non_cursor_model_override_keeps_env_path() {
+        let mut s = spec("opencode", &["acp"]);
+        let mut env = Vec::new();
+        apply_agent_model_override("opencode", "openai/gpt-5.5", &mut s, &mut env);
+
+        assert_eq!(s.args, vec!["acp"]);
+        assert_eq!(
+            env,
+            vec![("AOE_AGENT_MODEL".to_string(), "openai/gpt-5.5".to_string())]
+        );
+    }
+
+    #[test]
     fn command_override_skips_non_registry_spec() {
         let mut s = spec("opencode", &["acp"]);
         apply_agent_command_override(
@@ -2914,6 +2995,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         // Save a registry record so the runner-managed `registry_gone`
         // check returns false and we exercise the budget path.
@@ -3004,6 +3086,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3077,6 +3160,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3150,6 +3234,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         {
             let mut workers = sup.workers.lock().await;
@@ -3276,6 +3361,7 @@ mod tests {
             stored_acp_session_id: None,
             sandbox_info: None,
             source_profile: None,
+            yolo_mode: false,
         };
         {
             let mut workers = sup.workers.lock().await;

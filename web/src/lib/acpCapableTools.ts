@@ -12,6 +12,7 @@ export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set([
   "opencode",
   "gemini",
   "codex",
+  "cursor",
   "vibe",
   "pi",
 ]);

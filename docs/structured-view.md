@@ -43,10 +43,11 @@ no toggle and always run in the terminal view.
 | `opencode` | `opencode acp` (native, SST)                               | `OPENCODE_API_KEY` env var; or provider-specific env (set up via `opencode auth`) |
 | `gemini`   | `gemini --acp` (native, Google)                            | `GEMINI_API_KEY` env var, OAuth via `gemini auth`, or Vertex `GOOGLE_API_KEY` |
 | `codex`    | `codex-acp` (Zed adapter, npm `@zed-industries/codex-acp`) | `OPENAI_API_KEY` env var, or ChatGPT login (local-only) |
+| `cursor`   | `cursor-agent acp` (native, Cursor Agent CLI)              | `cursor-agent login` writes Cursor CLI auth; or `CURSOR_API_KEY` |
 | `vibe`     | `vibe-acp` (native, Mistral)                               | Mistral API key; set up via `vibe` first |
 | `pi`       | `pi-acp` (adapter, requires `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login` for OAuth, or env vars per provider |
 | `aoe-agent`| Bundled multi-provider agent (Vercel AI SDK 6)             | Whatever provider env vars Vercel AI SDK expects |
-| *aider, cursor, copilot, droid, settl, hermes* | not yet wired into the ACP registry; always run in the terminal view |
+| *aider, copilot, droid, settl, hermes* | not yet wired into the ACP registry; always run in the terminal view |
 
 A **custom agent** can use the structured view too: give it an ACP launch command via `agent_acp_cmd` in config (or the TUI settings screen). See [Running a custom agent in the structured view](guides/configuration.md#running-a-custom-agent-in-the-structured-view). The wizard reads each agent's `acp_capable` flag from the server, so a custom agent with an `agent_acp_cmd` offers the structured view just like a built-in; without one it stays terminal-only.
 
@@ -96,7 +97,7 @@ structured view or terminal view per session, lives in [Setup](structured-view/s
 | Gemini CLI    | yes          | `gemini acp` (Google reference impl)               |
 | OpenCode      | optional     | requires `opencode` with ACP support               |
 | Codex CLI     | optional     | tracking upstream ACP support                      |
-| Cursor CLI    | terminal only| no ACP support today                               |
+| Cursor CLI    | optional     | native ACP via `cursor-agent acp`                  |
 | Factory Droid | terminal only| no ACP support today                               |
 | OpenClaw      | terminal only| no ACP support today                               |
 
