@@ -64,7 +64,7 @@ aoe theme list                      # show all available themes
 aoe theme dir                       # print the custom themes directory
 ```
 
-The schema is flat and every field is optional; missing fields fall back to the Empire baseline. Color fields cover background, borders, text, status semantics, diff colors, branch/sandbox chips, and accent. Optional `appearance = "dark" | "light"` and a `[syntax].shiki_theme` field control the web dashboard's surface ramp and code-block syntax theme.
+The schema is flat and every field is optional. Missing color fields fall back to the Empire baseline; an omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance rather than copied from Empire. Color fields cover background, borders, text, status semantics, diff colors, branch/sandbox chips, and accent. `appearance = "dark" | "light"` and `[syntax].shiki_theme` control the web dashboard's surface ramp and code-block syntax theme.
 
 ## Session
 

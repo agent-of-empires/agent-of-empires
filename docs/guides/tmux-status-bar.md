@@ -7,7 +7,7 @@ Agent of Empires can display session information in your tmux status bar, showin
 
 ## How It Works
 
-When you start a session, aoe configures the tmux status bar to display this information with its phosphor green theme.
+When you start a session, aoe configures the tmux status bar to display this information in your active theme's colors (Empire by default).
 
 **Example status bars:**
 ```

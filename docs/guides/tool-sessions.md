@@ -166,7 +166,7 @@ command = "btm"
 
 ## tmux session naming
 
-Tool sessions are named `aoe_tool_<tool>_<title>_<id8>` (`<id8>` is the
+Tool sessions are named `aoe_tool_<tool>_<title>_<id8>` (`aoe_dev_tool_` in debug builds; `<id8>` is the
 first 8 characters of the agent session ID). You can attach manually
 with `tmux attach -t <name>`, though AoE's three access paths are
 faster.
