@@ -21,14 +21,15 @@ use agent_client_protocol::schema::{
     AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    KillTerminalResponse, LoadSessionRequest, McpServer, ModelId, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId, SessionModelState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModelRequest, StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
@@ -37,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 use super::agent_compat::{self, ExpectedAgent};
 use super::agent_profiles;
@@ -45,12 +46,13 @@ use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
 use super::event_store::AttachmentBlob;
 use super::fs_handler::{self, FsPolicy, SandboxPathMap};
+use super::mcp_config;
 use super::permissions::build_approval;
 use super::state::{
     AcpSessionId, AvailableCommand, ConfigOptionCategory, ConfigOptionChoice,
     ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
     PlanStepStatus, PromptAttachmentKind, RateLimitInfo, SessionMode, SessionUsage,
-    StartupErrorDetail, ToolCall, UsageCost,
+    StartupErrorDetail, ToolCall, ToolOutputBlock, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
 use crate::session::SandboxInfo;
@@ -289,6 +291,12 @@ pub struct SpawnConfig {
     /// When true, ACP permission requests are answered with the first
     /// allow-compatible option instead of being surfaced as approval cards.
     pub yolo_mode: bool,
+    /// MCP servers to forward to the agent on `session/new` and
+    /// `session/load`, resolved from the global `<app_dir>/mcp.json` by the
+    /// supervisor. Capability gating (dropping `http`/`sse` the agent did not
+    /// advertise) happens later, against the `initialize` response. Empty when
+    /// no config file exists, which preserves pre-feature behavior.
+    pub mcp_servers: Vec<McpServer>,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -1244,6 +1252,7 @@ impl AcpClient {
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
         let yolo_mode = config.yolo_mode;
+        let mcp_servers = config.mcp_servers.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would
@@ -1271,6 +1280,7 @@ impl AcpClient {
                 source_profile_for_task,
                 default_effort.clone(),
                 yolo_mode,
+                mcp_servers,
             )
             .await;
         }
@@ -1294,6 +1304,7 @@ impl AcpClient {
             source_profile_for_task,
             default_effort,
             yolo_mode,
+            mcp_servers,
         )
         .await
     }
@@ -1316,6 +1327,7 @@ impl AcpClient {
         source_profile: Option<String>,
         default_effort: Option<String>,
         yolo_mode: bool,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -1356,24 +1368,33 @@ impl AcpClient {
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
-        tokio::spawn(run_connection_task(
-            transport,
-            event_tx,
-            cmd_rx,
-            cwd,
-            session_label.clone(),
-            Some(child_for_task),
-            pending_for_task,
-            resources,
-            None,
-            mode,
-            Some(ready_tx),
-            profile,
-            expected_agent,
-            source_profile,
-            default_effort,
-            yolo_mode,
-        ));
+        // Wrap the per-session connection task in a span carrying the
+        // session id so every nested event inherits it; the daemon's
+        // per-session log tee routes by that field (#1864). The span name
+        // must match `crate::acp::session_tee::SESSION_SPAN`.
+        let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        tokio::spawn(
+            run_connection_task(
+                transport,
+                event_tx,
+                cmd_rx,
+                cwd,
+                session_label.clone(),
+                Some(child_for_task),
+                pending_for_task,
+                resources,
+                None,
+                mode,
+                Some(ready_tx),
+                profile,
+                expected_agent,
+                source_profile,
+                default_effort,
+                yolo_mode,
+                mcp_servers,
+            )
+            .instrument(conn_span),
+        );
 
         wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
 
@@ -1410,6 +1431,7 @@ impl AcpClient {
         source_profile: Option<String>,
         default_effort: Option<String>,
         yolo_mode: bool,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
@@ -1442,24 +1464,32 @@ impl AcpClient {
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
-        tokio::spawn(run_connection_task(
-            transport,
-            event_tx,
-            cmd_rx,
-            cwd,
-            session_label.clone(),
-            None,
-            pending_for_task,
-            resources,
-            None,
-            mode,
-            Some(ready_tx),
-            profile,
-            expected_agent,
-            source_profile,
-            default_effort,
-            yolo_mode,
-        ));
+        // See the sibling spawn in `spawn`: the connection task runs inside
+        // an `acp_session` span so per-session log teeing (#1864) catches
+        // events that do not set the `session` field explicitly.
+        let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        tokio::spawn(
+            run_connection_task(
+                transport,
+                event_tx,
+                cmd_rx,
+                cwd,
+                session_label.clone(),
+                None,
+                pending_for_task,
+                resources,
+                None,
+                mode,
+                Some(ready_tx),
+                profile,
+                expected_agent,
+                source_profile,
+                default_effort,
+                yolo_mode,
+                mcp_servers,
+            )
+            .instrument(conn_span),
+        );
 
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
 
@@ -1544,6 +1574,10 @@ impl AcpClient {
             source_profile,
             None,
             yolo_mode,
+            // Reattach uses ConnectMode::Resume, which reuses the stored ACP
+            // session id without sending session/new or session/load, so no
+            // MCP servers are forwarded here (they were sent on first connect).
+            Vec::new(),
         )
         .await
     }
@@ -2941,6 +2975,19 @@ fn map_update_to_events(
                 .as_ref()
                 .filter(|value| !value.is_null())
                 .map(preview_args);
+            // Structured completion payload: media/resource blocks that the
+            // text concat above drops. Only extracted on the terminal frame
+            // (the card renders it once on completion). See #1818.
+            let output_blocks = if completed {
+                update
+                    .fields
+                    .content
+                    .as_ref()
+                    .map(|blocks| extract_tool_output_blocks(blocks))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
             if new_title.is_some()
@@ -2965,6 +3012,7 @@ fn map_update_to_events(
                     tool_call_id: id,
                     is_error,
                     content: content_text,
+                    output: output_blocks,
                     completed_at: chrono::Utc::now(),
                 });
             } else if !content_text.is_empty() {
@@ -3062,6 +3110,7 @@ fn map_update_to_events(
                     tool_call_id: tool_id,
                     is_error: false,
                     content: String::new(),
+                    output: Vec::new(),
                     completed_at: now,
                 },
             ]
@@ -3071,11 +3120,19 @@ fn map_update_to_events(
             // Emit both events: CurrentModeChanged (the real id) and
             // a best-effort ModeChanged (for the legacy enum-based
             // UI, in case that path is still used somewhere).
+            // Gemini surfaces its approval modes over `gemini --acp` with the
+            // gemini-cli `ApprovalMode` ids (`auto_edit`, `yolo`); fold them
+            // onto the existing semantic equivalents so a Gemini session is
+            // classified the same as the claude-agent-acp modes. See #1819.
             let mode = match id.as_str() {
                 "default" => SessionMode::Default,
                 "plan" => SessionMode::Plan,
-                "accept_edits" | "acceptEdits" => SessionMode::AcceptEdits,
-                "bypass_permissions" | "bypassPermissions" => SessionMode::BypassPermissions,
+                "accept_edits" | "acceptEdits" | "auto_edit" | "autoEdit" => {
+                    SessionMode::AcceptEdits
+                }
+                "bypass_permissions" | "bypassPermissions" | "yolo" => {
+                    SessionMode::BypassPermissions
+                }
                 _ => SessionMode::Default,
             };
             vec![
@@ -3134,21 +3191,242 @@ fn map_update_to_events(
     }
 }
 
-/// Map a snapshot of ACP `SessionConfigOption`s (typically pulled
-/// from `NewSessionResponse.config_options` or
-/// `LoadSessionResponse.config_options`) into one
-/// `Event::ConfigOptionsUpdated`. Returns `None` only when the
-/// snapshot itself is absent (the adapter did not include the field).
-/// A present-but-empty snapshot is still a real full replacement and
-/// must be propagated, otherwise stale cached selectors never clear
-/// when an adapter intentionally drops them. See #1403.
-fn config_options_event(
-    options: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+/// Reserved id for the synthetic model selector AoE injects when an
+/// agent advertises its model via the ACP `unstable_session_model`
+/// capability (`SessionModelState`) instead of a generic
+/// `config_option` with `category: Model`. The set path recognizes
+/// this id and routes to `session/set_model` rather than
+/// `session/set_config_option`. See #1820.
+const ACP_SESSION_MODEL_CONFIG_ID: &str = "__aoe_acp_session_model__";
+
+/// Per-connection cache of the two ACP channels that can carry a model
+/// selector: the generic `config_option` list and the unstable
+/// `SessionModelState`. The cockpit exposes a single model dropdown, so
+/// these are normalized into one `ConfigOptionsUpdated` snapshot before
+/// reaching the UI. Held behind a `std::sync::Mutex` shared between the
+/// notification handler and the command loop; never locked across an
+/// `.await`. See #1820.
+#[derive(Default)]
+struct ModelChannelCache {
+    raw_config_options: Vec<ConfigOptionDescriptor>,
+    session_model: Option<SessionModelState>,
+}
+
+impl ModelChannelCache {
+    /// Build the config-option list the UI sees: the agent's raw options
+    /// plus a synthetic model selector derived from `session_model`, but
+    /// only when the agent did not already expose a real
+    /// `category: Model` option. The generic config_option wins because
+    /// it has a push/echo path (`set_config_option` returns the updated
+    /// snapshot); `unstable_session_model` is silent and only acked, so
+    /// surfacing both would risk two dropdowns and divergent state.
+    fn normalized(&self) -> Vec<ConfigOptionDescriptor> {
+        let mut out = self.raw_config_options.clone();
+        let has_real_model = out
+            .iter()
+            .any(|o| o.category == ConfigOptionCategory::Model);
+        // A real option already wins if it occupies the reserved id; adding
+        // the synthetic selector under the same id would shadow it and the
+        // dispatch path would misroute its set to session/set_model. See
+        // #1820 review.
+        let reserved_taken = self.reserved_id_is_real();
+        if !has_real_model && !reserved_taken {
+            if let Some(model) = &self.session_model {
+                out.push(session_model_to_config_option(model));
+            }
+        }
+        out
+    }
+
+    /// True when the agent's raw config options already include one whose id
+    /// equals the reserved synthetic-model id. In that (pathological) case
+    /// the real option owns the id and the session_model channel must not be
+    /// synthesized or routed to `session/set_model`.
+    fn reserved_id_is_real(&self) -> bool {
+        self.raw_config_options
+            .iter()
+            .any(|o| o.id == ACP_SESSION_MODEL_CONFIG_ID)
+    }
+}
+
+/// Map an ACP `SessionModelState` into the synthetic model
+/// `ConfigOptionDescriptor` the cockpit dropdown renders. See #1820.
+fn session_model_to_config_option(model: &SessionModelState) -> ConfigOptionDescriptor {
+    ConfigOptionDescriptor {
+        id: ACP_SESSION_MODEL_CONFIG_ID.to_string(),
+        name: "Model".to_string(),
+        description: None,
+        category: ConfigOptionCategory::Model,
+        current_value: model.current_model_id.0.to_string(),
+        options: model
+            .available_models
+            .iter()
+            .map(|m| ConfigOptionChoice {
+                value: m.model_id.0.to_string(),
+                name: m.name.clone(),
+                description: m.description.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Fold a session response's `config_options` and `models` into the
+/// cache and return the normalized `ConfigOptionsUpdated` event, or
+/// `None` when the response carried neither (so cached selectors
+/// persist). A present-but-empty `config_options` is a real full
+/// replacement and must propagate, otherwise stale selectors never
+/// clear when an adapter intentionally drops them (see #1403). This is
+/// the single entry point that merges the two model channels at the
+/// boundary. See #1820.
+fn fold_session_options(
+    cache: &std::sync::Mutex<ModelChannelCache>,
+    raw: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+    models: Option<SessionModelState>,
 ) -> Option<Event> {
-    let raw = options?;
-    let mapped: Vec<ConfigOptionDescriptor> =
-        raw.into_iter().filter_map(map_acp_config_option).collect();
-    Some(Event::ConfigOptionsUpdated { options: mapped })
+    if raw.is_none() && models.is_none() {
+        return None;
+    }
+    let mut cache = cache.lock().expect("model channel cache poisoned");
+    if let Some(raw) = raw {
+        cache.raw_config_options = raw.into_iter().filter_map(map_acp_config_option).collect();
+    }
+    if let Some(models) = models {
+        cache.session_model = Some(models);
+    }
+    Some(Event::ConfigOptionsUpdated {
+        options: cache.normalized(),
+    })
+}
+
+/// Re-normalize any `ConfigOptionsUpdated` event produced by
+/// `map_update_to_events` so a `config_option_update` notification that
+/// omits the model (e.g. a `thought_level`-only refresh) cannot wipe
+/// the synthetic model selector out of the UI's full-replacement
+/// snapshot. The notification carries the fresh raw option list; the
+/// cached `session_model` is merged back in. See #1820.
+fn renormalize_model_events(
+    events: Vec<Event>,
+    cache: &std::sync::Mutex<ModelChannelCache>,
+) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|event| match event {
+            Event::ConfigOptionsUpdated { options } => {
+                let mut cache = cache.lock().expect("model channel cache poisoned");
+                cache.raw_config_options = options;
+                Event::ConfigOptionsUpdated {
+                    options: cache.normalized(),
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Route a `SetConfigOption` command to the right ACP request and emit
+/// the resulting UI update. The synthetic model selector
+/// (`ACP_SESSION_MODEL_CONFIG_ID`) goes to `session/set_model`; every
+/// other id goes to `session/set_config_option`. Because ACP has no
+/// agent-push model-change notification (only an ack), the success path
+/// for `set_model` mutates the cached `current_model_id` and re-emits a
+/// normalized snapshot so the dropdown reflects the new model. The
+/// round-trip is spawned detached, mirroring the existing config-option
+/// set path, so the command loop never blocks on it. See #1820.
+fn dispatch_set_config_option(
+    connection: &ConnectionTo<Agent>,
+    acp_session_id: &SessionId,
+    config_id: String,
+    value: String,
+    event_tx: mpsc::Sender<Event>,
+    model_cache: Arc<std::sync::Mutex<ModelChannelCache>>,
+) {
+    // Route to session/set_model only for the SYNTHETIC selector. If a real
+    // ACP option happens to occupy the reserved id, it wins and goes through
+    // the generic set_config_option path below. See #1820 review.
+    let is_synthetic_model = config_id == ACP_SESSION_MODEL_CONFIG_ID && {
+        let cache = model_cache.lock().expect("model channel cache poisoned");
+        !cache.reserved_id_is_real()
+    };
+    if is_synthetic_model {
+        info!(target: "cockpit.acp", "sending session/set_model model={value}");
+        let sent = connection.send_request(SetSessionModelRequest::new(
+            acp_session_id.clone(),
+            value.clone(),
+        ));
+        tokio::spawn(async move {
+            match sent.block_task().await {
+                Ok(_) => {
+                    // No state echo from set_model; synthesize the
+                    // confirmation by updating the cached current model
+                    // and re-normalizing.
+                    let event = {
+                        let mut cache = model_cache.lock().expect("model channel cache poisoned");
+                        if let Some(model) = cache.session_model.as_mut() {
+                            model.current_model_id = ModelId::from(value.clone());
+                        }
+                        Event::ConfigOptionsUpdated {
+                            options: cache.normalized(),
+                        }
+                    };
+                    let _ = event_tx.send(event).await;
+                }
+                Err(e) => {
+                    let reason = format!("{e}");
+                    warn!(target: "cockpit.acp", "session/set_model failed: {reason}");
+                    let _ = event_tx
+                        .send(Event::ConfigOptionSwitchFailed {
+                            config_id,
+                            value,
+                            reason,
+                        })
+                        .await;
+                }
+            }
+        });
+        return;
+    }
+
+    info!(
+        target: "cockpit.acp",
+        "sending session/set_config_option {config_id}={value}"
+    );
+    let sent = connection.send_request(SetSessionConfigOptionRequest::new(
+        acp_session_id.clone(),
+        SessionConfigId::new(config_id.clone()),
+        SessionConfigValueId::new(value.clone()),
+    ));
+    tokio::spawn(async move {
+        match sent.block_task().await {
+            Ok(resp) => {
+                // claude-agent-acp's setSessionConfigOption returns the
+                // full updated config_options list in the response but
+                // does NOT emit a follow-up `config_option_update`
+                // notification (see acp-agent.js:1003-1057). Fold the
+                // response back through the cache so the synthetic model
+                // selector (if any) survives and the frontend reducer
+                // clears pending state. See #1403, #1820.
+                if let Some(event) =
+                    fold_session_options(&model_cache, Some(resp.config_options), None)
+                {
+                    let _ = event_tx.send(event).await;
+                }
+            }
+            Err(e) => {
+                let reason = format!("{e}");
+                warn!(
+                    target: "cockpit.acp",
+                    "session/set_config_option failed: {reason}"
+                );
+                let _ = event_tx
+                    .send(Event::ConfigOptionSwitchFailed {
+                        config_id,
+                        value,
+                        reason,
+                    })
+                    .await;
+            }
+        }
+    });
 }
 
 fn thought_level_config_id(
@@ -3335,6 +3613,7 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
             tool_call_id: tool_call_id.to_string(),
             is_error: true,
             content: content.to_string(),
+            output: Vec::new(),
             completed_at: chrono::Utc::now(),
         })
         .await;
@@ -3358,6 +3637,105 @@ fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallCo
         }
     }
     out
+}
+
+/// Max base64 length kept for an inline image/audio payload. Media this
+/// large is persisted in the event store and reshipped on every WS replay,
+/// so an oversized blob would bloat both; past the cap the inline data is
+/// dropped (a placeholder/uri is surfaced instead). ~4 MiB of base64 is
+/// ~3 MiB of bytes, comfortably above a typical screenshot.
+const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
+
+/// Bridge an ACP `ToolCallContent` array into the cockpit's renderable
+/// `ToolOutputBlock` list, preserving non-text completion payloads (images,
+/// audio, resource links/contents) that `extract_tool_content_text` drops.
+/// Diff blocks are bridged separately (`extract_diffs_from_content`) and are
+/// skipped here; an embedded terminal surfaces as a text placeholder since
+/// cockpit does not own ACP terminals. Returns an EMPTY vec when every block
+/// is plain text (or diff): the existing `content` text path renders those,
+/// so the structured list only carries weight when real media is present.
+/// See #1818.
+fn extract_tool_output_blocks(
+    blocks: &[agent_client_protocol::schema::ToolCallContent],
+) -> Vec<ToolOutputBlock> {
+    use agent_client_protocol::schema::{EmbeddedResourceResource, ToolCallContent};
+    let mut out: Vec<ToolOutputBlock> = Vec::new();
+    let mut has_media = false;
+    let cap =
+        |data: String| -> Option<String> { (data.len() <= MAX_INLINE_MEDIA_B64).then_some(data) };
+    for block in blocks {
+        match block {
+            ToolCallContent::Content(c) => match &c.content {
+                ContentBlock::Text(t) => out.push(ToolOutputBlock::Text {
+                    text: t.text.clone(),
+                }),
+                ContentBlock::Image(img) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::Image {
+                        mime_type: img.mime_type.clone(),
+                        data: cap(img.data.clone()),
+                        uri: img.uri.clone(),
+                    });
+                }
+                ContentBlock::Audio(audio) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::Audio {
+                        mime_type: audio.mime_type.clone(),
+                        data: cap(audio.data.clone()),
+                    });
+                }
+                ContentBlock::ResourceLink(link) => {
+                    has_media = true;
+                    out.push(ToolOutputBlock::ResourceLink {
+                        uri: link.uri.clone(),
+                        name: link.name.clone(),
+                        mime_type: link.mime_type.clone(),
+                    });
+                }
+                ContentBlock::Resource(res) => {
+                    has_media = true;
+                    let block = match &res.resource {
+                        EmbeddedResourceResource::TextResourceContents(t) => {
+                            ToolOutputBlock::Resource {
+                                uri: t.uri.clone(),
+                                mime_type: t.mime_type.clone(),
+                                text: Some(t.text.clone()),
+                                data: None,
+                            }
+                        }
+                        EmbeddedResourceResource::BlobResourceContents(b) => {
+                            // Keep the inline bytes (capped) so a blob without
+                            // a fetchable uri is still recoverable as a
+                            // download instead of an empty placeholder. See
+                            // #1818 review.
+                            ToolOutputBlock::Resource {
+                                uri: b.uri.clone(),
+                                mime_type: b.mime_type.clone(),
+                                text: None,
+                                data: cap(b.blob.clone()),
+                            }
+                        }
+                        _ => continue,
+                    };
+                    out.push(block);
+                }
+                _ => {}
+            },
+            ToolCallContent::Terminal(term) => {
+                has_media = true;
+                out.push(ToolOutputBlock::Text {
+                    text: format!("[terminal {}]", term.terminal_id.0),
+                });
+            }
+            ToolCallContent::Diff(_) => {}
+            _ => {}
+        }
+    }
+    if has_media {
+        out
+    } else {
+        Vec::new()
+    }
 }
 
 /// Inspect a `tool_call` payload for the `memory_recall` shape
@@ -3594,6 +3972,7 @@ async fn run_connection_task<W, R>(
     source_profile: Option<String>,
     default_effort: Option<String>,
     yolo_mode: bool,
+    mcp_servers: Vec<McpServer>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -3605,6 +3984,12 @@ async fn run_connection_task<W, R>(
     let event_tx_for_notif = event_tx.clone();
     let event_tx_for_perm = event_tx.clone();
     let event_tx_for_block = event_tx.clone();
+    // Shared model-selector cache: the notification handler and the
+    // command loop both fold their model channels through it so the UI
+    // sees a single normalized model dropdown. See #1820.
+    let model_cache = Arc::new(std::sync::Mutex::new(ModelChannelCache::default()));
+    let model_cache_for_notif = model_cache.clone();
+    let model_cache_for_block = model_cache.clone();
     let pending_for_perm = pending_responders.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
@@ -3691,6 +4076,7 @@ async fn run_connection_task<W, R>(
                     first_event_after_attach_for_notif.clone();
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
+                let model_cache = model_cache_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -3723,7 +4109,13 @@ async fn run_connection_task<W, R>(
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
                     }
-                    let mapped_events = map_update_to_events(notification.update, profile);
+                    // Merge any config_option_update through the shared
+                    // model cache so a model-less refresh cannot wipe the
+                    // synthetic model selector. See #1820.
+                    let mapped_events = renormalize_model_events(
+                        map_update_to_events(notification.update, profile),
+                        &model_cache,
+                    );
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
                     // ToolStarted / ToolCompleted / WakeupPending /
@@ -3956,6 +4348,16 @@ async fn run_connection_task<W, R>(
             let mut available_mode_ids: Option<Vec<String>> = None;
             let mut has_config_option_mode: bool = false;
 
+            // Drop any http/sse servers the agent did not advertise before they
+            // reach session/new or session/load; stdio is always kept. Computed
+            // once here so both the load-attempt and the fresh-session fallback
+            // forward the same gated list.
+            let mcp_servers = mcp_config::filter_for_capabilities(
+                mcp_servers,
+                &init.agent_capabilities.mcp_capabilities,
+                &session_label,
+            );
+
             let acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -4026,7 +4428,8 @@ async fn run_connection_task<W, R>(
                             // key toolCallId-..."). Cleared on Err below if we fall
                             // back to session/new, which has no replay payload.
                             suppress_for_block.store(true, Ordering::Relaxed);
-                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone());
+                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
+                                .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
                                 Ok(resp) => {
                                     info!(
@@ -4074,12 +4477,17 @@ async fn run_connection_task<W, R>(
                                         })
                                         .await;
                                     // Per ACP schema 0.12, LoadSessionResponse
-                                    // carries config_options. Surface them so
-                                    // the structured view picker hydrates on resume
+                                    // carries config_options and (with
+                                    // unstable_session_model) a models field.
+                                    // Fold both through the cache so the
+                                    // structured view picker hydrates on resume
                                     // without waiting for a notification. See
-                                    // #1403.
-                                    if let Some(event) = config_options_event(resp.config_options)
-                                    {
+                                    // #1403, #1820.
+                                    if let Some(event) = fold_session_options(
+                                        &model_cache_for_block,
+                                        resp.config_options,
+                                        resp.models,
+                                    ) {
                                         let _ = event_tx_for_block.send(event).await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
@@ -4111,7 +4519,7 @@ async fn run_connection_task<W, R>(
                             "creating fresh session via session/new"
                         );
                         let new_session = connection
-                            .send_request(NewSessionRequest::new(cwd))
+                            .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
                             .block_task()
                             .await?;
                         let id = new_session.session_id.clone();
@@ -4176,10 +4584,16 @@ async fn run_connection_task<W, R>(
                         // Per ACP schema 0.12, NewSessionResponse carries
                         // config_options (claude-agent-acp v0.37.0 emits the
                         // initial model + effort + mode set here, not as a
-                        // subsequent notification). Surface them so the
-                        // structured view pickers render immediately. See #1403.
+                        // subsequent notification) and, with
+                        // unstable_session_model, a models field. Fold both
+                        // so the structured view pickers render immediately.
+                        // See #1403, #1820.
                         let config_options = new_session.config_options.clone();
-                        if let Some(event) = config_options_event(config_options.clone()) {
+                        if let Some(event) = fold_session_options(
+                            &model_cache_for_block,
+                            config_options.clone(),
+                            new_session.models.clone(),
+                        ) {
                             let _ = event_tx_for_block.send(event).await;
                         }
 
@@ -4203,9 +4617,11 @@ async fn run_connection_task<W, R>(
                                     .await
                                 {
                                     Ok(resp) => {
-                                        if let Some(event) =
-                                            config_options_event(Some(resp.config_options))
-                                        {
+                                        if let Some(event) = fold_session_options(
+                                            &model_cache_for_block,
+                                            Some(resp.config_options),
+                                            None,
+                                        ) {
                                             let _ = event_tx_for_block.send(event).await;
                                         }
                                     }
@@ -4659,52 +5075,14 @@ async fn run_connection_task<W, R>(
                                             break;
                                         }
                                         Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                                            info!(
-                                                target: "acp.protocol",
-                                                "sending session/set_config_option {config_id}={value} during in-flight prompt"
+                                            dispatch_set_config_option(
+                                                &connection,
+                                                &acp_session_id,
+                                                config_id,
+                                                value,
+                                                event_tx_for_block.clone(),
+                                                model_cache_for_block.clone(),
                                             );
-                                            let sent = connection.send_request(
-                                                SetSessionConfigOptionRequest::new(
-                                                    acp_session_id.clone(),
-                                                    SessionConfigId::new(config_id.clone()),
-                                                    SessionConfigValueId::new(value.clone()),
-                                                ),
-                                            );
-                                            let tx = event_tx_for_block.clone();
-                                            tokio::spawn(async move {
-                                                match sent.block_task().await {
-                                                    Ok(resp) => {
-                                                        // claude-agent-acp's setSessionConfigOption
-                                                        // returns the full updated config_options
-                                                        // list in the response but does NOT emit a
-                                                        // follow-up `config_option_update`
-                                                        // notification (see acp-agent.js:1003-1057).
-                                                        // Synthesize ConfigOptionsUpdated from the
-                                                        // response so the frontend reducer clears
-                                                        // pending state and shows the new current
-                                                        // value. See #1403.
-                                                        if let Some(event) =
-                                                            config_options_event(Some(resp.config_options))
-                                                        {
-                                                            let _ = tx.send(event).await;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        let reason = format!("{e}");
-                                                        warn!(
-                                                            target: "acp.protocol",
-                                                            "session/set_config_option failed mid-turn: {reason}"
-                                                        );
-                                                        let _ = tx
-                                                            .send(Event::ConfigOptionSwitchFailed {
-                                                                config_id,
-                                                                value,
-                                                                reason,
-                                                            })
-                                                            .await;
-                                                    }
-                                                }
-                                            });
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
                                             // Skip when the agent has not
@@ -4973,48 +5351,14 @@ async fn run_connection_task<W, R>(
                         handle_delete_session_cmd(&connection, target_id, respond_to);
                     }
                     Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                        info!(
-                            target: "acp.protocol",
-                            "sending session/set_config_option {config_id}={value}"
+                        dispatch_set_config_option(
+                            &connection,
+                            &acp_session_id,
+                            config_id,
+                            value,
+                            event_tx_for_block.clone(),
+                            model_cache_for_block.clone(),
                         );
-                        let sent = connection.send_request(SetSessionConfigOptionRequest::new(
-                            acp_session_id.clone(),
-                            SessionConfigId::new(config_id.clone()),
-                            SessionConfigValueId::new(value.clone()),
-                        ));
-                        let tx = event_tx_for_block.clone();
-                        tokio::spawn(async move {
-                            match sent.block_task().await {
-                                Ok(resp) => {
-                                    // claude-agent-acp's setSessionConfigOption returns the
-                                    // full updated config_options list in the response but
-                                    // does NOT emit a follow-up `config_option_update`
-                                    // notification (see acp-agent.js:1003-1057). Synthesize
-                                    // ConfigOptionsUpdated from the response so the frontend
-                                    // reducer clears pending state and shows the new
-                                    // current value. See #1403.
-                                    if let Some(event) =
-                                        config_options_event(Some(resp.config_options))
-                                    {
-                                        let _ = tx.send(event).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    let reason = format!("{e}");
-                                    warn!(
-                                        target: "acp.protocol",
-                                        "session/set_config_option failed: {reason}"
-                                    );
-                                    let _ = tx
-                                        .send(Event::ConfigOptionSwitchFailed {
-                                            config_id,
-                                            value,
-                                            reason,
-                                        })
-                                        .await;
-                                }
-                            }
-                        });
                     }
                     Some(ClientCmd::Shutdown) | None => {
                         info!(target: "acp.protocol", "shutdown received, exiting connection loop");
@@ -6226,6 +6570,7 @@ mod tests {
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             yolo_mode: false,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6293,6 +6638,7 @@ mod tests {
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             yolo_mode: false,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6362,6 +6708,7 @@ mod tests {
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             yolo_mode: false,
+            mcp_servers: Vec::new(),
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
@@ -6408,6 +6755,7 @@ mod tests {
             sandbox_info: None,
             source_profile: None,
             yolo_mode: false,
+            mcp_servers: Vec::new(),
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
@@ -6440,6 +6788,7 @@ mod tests {
             sandbox_info: None,
             source_profile: None,
             yolo_mode: false,
+            mcp_servers: Vec::new(),
         };
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         match result {
@@ -7238,6 +7587,7 @@ mod tests {
                 is_error,
                 content,
                 completed_at: _,
+                ..
             } => {
                 assert_eq!(tool_call_id, "tc-1");
                 assert!(!*is_error);
@@ -7245,6 +7595,90 @@ mod tests {
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
         }
+    }
+
+    fn mode_from_current_mode_update(id: &str) -> SessionMode {
+        use agent_client_protocol::schema::CurrentModeUpdate;
+        let events = map_update_to_events(
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(id.to_string())),
+            &agent_profiles::CLAUDE,
+        );
+        // The arm always emits the raw id alongside the legacy enum, in order.
+        match events.as_slice() {
+            [Event::CurrentModeChanged { current_mode_id }, Event::ModeChanged { mode }] => {
+                assert_eq!(current_mode_id, id, "raw mode id must be preserved");
+                *mode
+            }
+            other => panic!("expected [CurrentModeChanged, ModeChanged], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_mode_update_classifies_gemini_mode_ids() {
+        // Gemini-cli ApprovalMode ids surfaced over `gemini --acp`. See #1819.
+        assert_eq!(
+            mode_from_current_mode_update("yolo"),
+            SessionMode::BypassPermissions
+        );
+        assert_eq!(
+            mode_from_current_mode_update("auto_edit"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("autoEdit"),
+            SessionMode::AcceptEdits
+        );
+    }
+
+    #[test]
+    fn current_mode_update_keeps_existing_mode_ids() {
+        // Regression guard: non-Gemini classification is unchanged.
+        assert_eq!(
+            mode_from_current_mode_update("default"),
+            SessionMode::Default
+        );
+        assert_eq!(mode_from_current_mode_update("plan"), SessionMode::Plan);
+        assert_eq!(
+            mode_from_current_mode_update("accept_edits"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("acceptEdits"),
+            SessionMode::AcceptEdits
+        );
+        assert_eq!(
+            mode_from_current_mode_update("bypass_permissions"),
+            SessionMode::BypassPermissions
+        );
+        assert_eq!(
+            mode_from_current_mode_update("bypassPermissions"),
+            SessionMode::BypassPermissions
+        );
+        // Unknown ids still fall back to Default.
+        assert_eq!(
+            mode_from_current_mode_update("some_future_mode"),
+            SessionMode::Default
+        );
+    }
+
+    #[test]
+    fn is_mode_advertised_matches_normalized_ids() {
+        let ids = Some(vec!["acceptEdits".to_string(), "plan".to_string()]);
+        // Underscore + case folding both sides.
+        assert!(is_mode_advertised("accept_edits", &ids, false));
+        assert!(is_mode_advertised("acceptEdits", &ids, false));
+        assert!(is_mode_advertised("PLAN", &ids, false));
+        // Not in the advertised set.
+        assert!(!is_mode_advertised("bypassPermissions", &ids, false));
+    }
+
+    #[test]
+    fn is_mode_advertised_without_mode_list_defers_to_config_option() {
+        // No SessionMode list: the agent steers mode through a config option,
+        // so set_mode must NOT be sent (returns false). Without a config-option
+        // mode either, fall back to allowing the legacy set_mode (true).
+        assert!(!is_mode_advertised("plan", &None, true));
+        assert!(is_mode_advertised("plan", &None, false));
     }
 
     #[test]
@@ -7362,6 +7796,121 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("[truncated]"));
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_empty_for_text_only() {
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        // Pure text completion: the `content` string path renders it, so the
+        // structured list stays empty and the existing path is untouched.
+        let blocks = vec![ToolCallContent::Content(Content::new("just text"))];
+        assert!(extract_tool_output_blocks(&blocks).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_preserves_media_and_resources() {
+        use agent_client_protocol::schema::{
+            AudioContent, Content, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
+            ImageContent, ResourceLink, TextResourceContents, ToolCallContent,
+        };
+        let blocks =
+            vec![
+                ToolCallContent::Content(Content::new("a caption")),
+                ToolCallContent::Content(Content::new(ContentBlock::Image(
+                    ImageContent::new("BASE64IMG", "image/png").uri("file:///shot.png".to_string()),
+                ))),
+                ToolCallContent::Content(Content::new(ContentBlock::Audio(AudioContent::new(
+                    "BASE64AUDIO",
+                    "audio/wav",
+                )))),
+                ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
+                    ResourceLink::new("report.pdf", "file:///report.pdf"),
+                ))),
+                ToolCallContent::Content(Content::new(ContentBlock::Resource(
+                    EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+                        TextResourceContents::new("inline body", "file:///note.txt"),
+                    )),
+                ))),
+            ];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 5, "all blocks preserved in order: {out:?}");
+        assert!(matches!(&out[0], ToolOutputBlock::Text { text } if text == "a caption"));
+        match &out[1] {
+            ToolOutputBlock::Image {
+                mime_type,
+                data,
+                uri,
+            } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data.as_deref(), Some("BASE64IMG"));
+                assert_eq!(uri.as_deref(), Some("file:///shot.png"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        assert!(
+            matches!(&out[2], ToolOutputBlock::Audio { mime_type, .. } if mime_type == "audio/wav")
+        );
+        assert!(
+            matches!(&out[3], ToolOutputBlock::ResourceLink { name, uri, .. } if name == "report.pdf" && uri == "file:///report.pdf")
+        );
+        assert!(
+            matches!(&out[4], ToolOutputBlock::Resource { text: Some(t), .. } if t == "inline body")
+        );
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_keeps_blob_resource_payload() {
+        // #1818 review: a binary (blob) embedded resource must keep its
+        // inline bytes so it stays recoverable as a download.
+        use agent_client_protocol::schema::{
+            BlobResourceContents, Content, ContentBlock, EmbeddedResource,
+            EmbeddedResourceResource, ToolCallContent,
+        };
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new("QkxPQg==", "file:///out.bin")
+                        .mime_type(Some("application/octet-stream".to_string())),
+                ),
+            )),
+        ))];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ToolOutputBlock::Resource {
+                uri,
+                data,
+                text,
+                mime_type,
+            } => {
+                assert_eq!(uri, "file:///out.bin");
+                assert_eq!(data.as_deref(), Some("QkxPQg=="));
+                assert!(text.is_none());
+                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+            }
+            other => panic!("expected Resource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_tool_output_blocks_drops_oversized_inline_media() {
+        use agent_client_protocol::schema::{Content, ContentBlock, ImageContent, ToolCallContent};
+        let huge = "A".repeat(MAX_INLINE_MEDIA_B64 + 1);
+        let blocks = vec![ToolCallContent::Content(Content::new(ContentBlock::Image(
+            ImageContent::new(huge, "image/png"),
+        )))];
+        let out = extract_tool_output_blocks(&blocks);
+        assert_eq!(out.len(), 1);
+        // Oversized inline data is dropped (no uri to fall back on) but the
+        // block survives so the card still shows the media placeholder.
+        assert!(matches!(
+            &out[0],
+            ToolOutputBlock::Image {
+                data: None,
+                uri: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -7679,22 +8228,153 @@ mod tests {
     }
 
     #[test]
-    fn config_options_event_propagates_empty_snapshot() {
-        // A present-but-empty snapshot from the adapter is a real
-        // full replacement and must clear stale cached selectors, so
-        // `config_options_event(Some(vec![]))` returns
-        // `Some(ConfigOptionsUpdated { options: [] })` (not `None`).
-        let event =
-            config_options_event(Some(Vec::new())).expect("Some(vec![]) should produce an event");
+    fn fold_session_options_propagates_empty_snapshot() {
+        let cache = std::sync::Mutex::new(ModelChannelCache::default());
+        // A present-but-empty config_options snapshot from the adapter is
+        // a real full replacement and must clear stale cached selectors,
+        // so it returns `Some(ConfigOptionsUpdated { options: [] })`
+        // (not `None`). See #1403.
+        let event = fold_session_options(&cache, Some(Vec::new()), None)
+            .expect("Some(vec![]) should produce an event");
         match event {
             Event::ConfigOptionsUpdated { options } => {
                 assert!(options.is_empty());
             }
             other => panic!("expected empty ConfigOptionsUpdated, got {other:?}"),
         }
-        // Absent snapshot (the adapter omitted the field) still
-        // returns None so callers skip the emit.
-        assert!(config_options_event(None).is_none());
+        // Neither channel present (the adapter omitted both fields) still
+        // returns None so callers skip the emit and cached selectors
+        // persist.
+        assert!(fold_session_options(&cache, None, None).is_none());
+    }
+
+    fn sample_session_model() -> SessionModelState {
+        SessionModelState::new(
+            "sonnet",
+            vec![
+                agent_client_protocol::schema::ModelInfo::new("sonnet", "Claude Sonnet"),
+                agent_client_protocol::schema::ModelInfo::new("opus", "Claude Opus"),
+            ],
+        )
+    }
+
+    fn model_config_option(current: &str) -> ConfigOptionDescriptor {
+        ConfigOptionDescriptor {
+            id: "real-model".to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: ConfigOptionCategory::Model,
+            current_value: current.to_string(),
+            options: vec![ConfigOptionChoice {
+                value: current.to_string(),
+                name: current.to_string(),
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn normalize_synthesizes_model_selector_from_unstable_state() {
+        let cache = ModelChannelCache {
+            raw_config_options: Vec::new(),
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1);
+        let model = &out[0];
+        assert_eq!(model.id, ACP_SESSION_MODEL_CONFIG_ID);
+        assert_eq!(model.category, ConfigOptionCategory::Model);
+        assert_eq!(model.current_value, "sonnet");
+        assert_eq!(model.options.len(), 2);
+        assert_eq!(model.options[1].value, "opus");
+        assert_eq!(model.options[1].name, "Claude Opus");
+    }
+
+    #[test]
+    fn normalize_prefers_real_config_option_over_unstable_state() {
+        // When the agent exposes BOTH a real config_option model and the
+        // unstable session_model, the config_option wins and the
+        // synthetic selector is dropped so the UI shows one dropdown.
+        let cache = ModelChannelCache {
+            raw_config_options: vec![model_config_option("real-current")],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real-model");
+        assert!(out.iter().all(|o| o.id != ACP_SESSION_MODEL_CONFIG_ID));
+    }
+
+    #[test]
+    fn normalize_yields_to_real_option_on_reserved_id_collision() {
+        // Pathological: a real ACP option occupies the reserved synthetic id.
+        // The real option wins; the synthetic selector is not added (which
+        // would otherwise shadow it and misroute its set). See #1820 review.
+        let reserved_real = ConfigOptionDescriptor {
+            id: ACP_SESSION_MODEL_CONFIG_ID.to_string(),
+            name: "Not really the model".to_string(),
+            description: None,
+            category: ConfigOptionCategory::Other("misc".to_string()),
+            current_value: "x".to_string(),
+            options: Vec::new(),
+        };
+        let cache = ModelChannelCache {
+            raw_config_options: vec![reserved_real],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 1, "no synthetic selector appended: {out:?}");
+        assert_eq!(out[0].current_value, "x");
+        assert!(cache.reserved_id_is_real());
+    }
+
+    #[test]
+    fn normalize_appends_model_to_non_model_options() {
+        let cache = ModelChannelCache {
+            raw_config_options: vec![ConfigOptionDescriptor {
+                id: "effort".to_string(),
+                name: "Reasoning".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "medium".to_string(),
+                options: Vec::new(),
+            }],
+            session_model: Some(sample_session_model()),
+        };
+        let out = cache.normalized();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "effort");
+        assert_eq!(out[1].id, ACP_SESSION_MODEL_CONFIG_ID);
+    }
+
+    #[test]
+    fn renormalize_keeps_model_when_update_omits_it() {
+        // Regression: a config_option_update that carries only an
+        // unrelated option must NOT wipe the synthetic model selector,
+        // because the UI treats ConfigOptionsUpdated as a full
+        // replacement. See #1820.
+        let cache = std::sync::Mutex::new(ModelChannelCache {
+            raw_config_options: Vec::new(),
+            session_model: Some(sample_session_model()),
+        });
+        let update = vec![Event::ConfigOptionsUpdated {
+            options: vec![ConfigOptionDescriptor {
+                id: "effort".to_string(),
+                name: "Reasoning".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "high".to_string(),
+                options: Vec::new(),
+            }],
+        }];
+        let out = renormalize_model_events(update, &cache);
+        match &out[0] {
+            Event::ConfigOptionsUpdated { options } => {
+                assert!(options.iter().any(|o| o.id == ACP_SESSION_MODEL_CONFIG_ID));
+                assert!(options.iter().any(|o| o.id == "effort"));
+            }
+            other => panic!("expected ConfigOptionsUpdated, got {other:?}"),
+        }
     }
 
     #[test]

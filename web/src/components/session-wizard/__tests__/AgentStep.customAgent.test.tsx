@@ -72,10 +72,7 @@ const uninstalledBuiltin: AgentInfo = {
   acp_capable: false,
 };
 
-function renderAgentStep(overrides: {
-  tool?: string;
-  agents?: AgentInfo[];
-}) {
+function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[] }) {
   const onChange = vi.fn();
   const utils = render(
     <AgentStep
@@ -103,7 +100,9 @@ describe("AgentStep custom-agent selection (#1252)", () => {
 
     expect(getByRole("button", { name: /claude/ })).toBeTruthy();
     expect(getByRole("button", { name: /remote-helper/ })).toBeTruthy();
-    expect(queryByRole("button", { name: "uninstalled-builtin", exact: true })).toBeNull();
+    expect(
+      queryByRole("button", { name: "uninstalled-builtin", exact: true }),
+    ).toBeNull();
     expect(queryAllByText("Custom").length).toBeGreaterThan(0);
   });
 
@@ -120,7 +119,11 @@ describe("AgentStep custom-agent selection (#1252)", () => {
       tool: "remote-helper",
       agents: [builtin, custom],
     });
-    expect(getByText(/Custom agents run in the terminal unless they define agent_acp_cmd/)).toBeTruthy();
+    expect(
+      getByText(
+        /Custom agents run in the terminal unless they define agent_acp_cmd/,
+      ),
+    ).toBeTruthy();
   });
 
   it("renders the structured view card for a custom agent that is acp_capable", () => {
@@ -131,7 +134,9 @@ describe("AgentStep custom-agent selection (#1252)", () => {
       agents: [builtin, acpCustom],
     });
     expect(getByRole("switch", { name: "Use structured view" })).toBeTruthy();
-    expect(getByText(/Renders the agent's plan, tool calls, and diffs/)).toBeTruthy();
+    expect(
+      getByText(/Renders the agent's plan, tool calls, and diffs/),
+    ).toBeTruthy();
     expect(queryByText(/Custom agents run in the terminal/)).toBeNull();
   });
 
@@ -178,8 +183,16 @@ describe("AgentStep profile description (#949)", () => {
 
   it("renders each profile's description as helper text under its name", () => {
     const { getByText } = renderWithProfiles([
-      { name: "default", is_default: true, description: "Stock setup, no overrides" },
-      { name: "yolo-sandbox", is_default: false, description: "Auto-approve in a container" },
+      {
+        name: "default",
+        is_default: true,
+        description: "Stock setup, no overrides",
+      },
+      {
+        name: "yolo-sandbox",
+        is_default: false,
+        description: "Auto-approve in a container",
+      },
     ]);
     expect(getByText("Stock setup, no overrides")).toBeTruthy();
     expect(getByText("Auto-approve in a container")).toBeTruthy();
@@ -253,7 +266,9 @@ describe("AgentStep profile description (#949)", () => {
       ],
       { profile: "work", profileDirty: true },
     );
-    expect(getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
+    expect(
+      getByText(/\(Custom\) Settings differ from preset defaults/),
+    ).toBeTruthy();
   });
 
   it("confirms before switching profiles when settings are dirty (canceled)", () => {
@@ -286,10 +301,7 @@ describe("AgentStep profile description (#949)", () => {
 });
 
 describe("ReviewStep agent row (#1252)", () => {
-  function renderReviewStep(overrides: {
-    tool: string;
-    agents?: AgentInfo[];
-  }) {
+  function renderReviewStep(overrides: { tool: string; agents?: AgentInfo[] }) {
     return render(
       <ReviewStep
         data={{
@@ -304,7 +316,11 @@ describe("ReviewStep agent row (#1252)", () => {
         error={null}
         onSubmit={() => {}}
         onJumpTo={() => {}}
-        steps={[{ id: "agent", label: "Agent" }] as Parameters<typeof ReviewStep>[0]["steps"]}
+        steps={
+          [{ id: "agent", label: "Agent" }] as Parameters<
+            typeof ReviewStep
+          >[0]["steps"]
+        }
       />,
     );
   }

@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 
 import { switchAcpAgent } from "../../lib/api";
 import { CursorModelControls } from "./CursorModelControls";
@@ -103,14 +109,21 @@ describe("CursorModelControls", () => {
     );
 
     fireEvent.click(screen.getByTestId("cursor-model-trigger"));
-    fireEvent.change(screen.getByRole("combobox", { name: "Search Cursor model" }), {
-      target: { value: "codex high" },
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Search Cursor model" }),
+      {
+        target: { value: "codex high" },
+      },
+    );
 
-    expect(screen.getByTestId("cursor-model-option-gpt-5.3-codex-high")).toBeTruthy();
+    expect(
+      screen.getByTestId("cursor-model-option-gpt-5.3-codex-high"),
+    ).toBeTruthy();
     expect(screen.queryByTestId("cursor-model-option-composer-2.5")).toBeNull();
 
-    fireEvent.click(screen.getByTestId("cursor-model-option-gpt-5.3-codex-high"));
+    fireEvent.click(
+      screen.getByTestId("cursor-model-option-gpt-5.3-codex-high"),
+    );
 
     await waitFor(() =>
       expect(setConfigOption).toHaveBeenCalledWith(
@@ -175,13 +188,18 @@ describe("CursorModelControls", () => {
     );
 
     expect(
-      screen.getByRole("switch", { name: "Cursor Fast mode" }).getAttribute("aria-checked"),
+      screen
+        .getByRole("switch", { name: "Cursor Fast mode" })
+        .getAttribute("aria-checked"),
     ).toBe("false");
 
     fireEvent.click(screen.getByTestId("cursor-model-trigger"));
-    fireEvent.change(screen.getByRole("combobox", { name: "Search Cursor model" }), {
-      target: { value: "composer" },
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Search Cursor model" }),
+      {
+        target: { value: "composer" },
+      },
+    );
 
     expect(screen.queryByTestId("cursor-model-option-composer-2.5")).toBeNull();
     expect(setConfigOption).not.toHaveBeenCalled();
@@ -202,13 +220,19 @@ describe("CursorModelControls", () => {
 
     fireEvent.click(screen.getByRole("switch", { name: "Cursor Fast mode" }));
     fireEvent.click(screen.getByTestId("cursor-model-trigger"));
-    fireEvent.change(screen.getByRole("combobox", { name: "Search Cursor model" }), {
-      target: { value: "composer" },
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Search Cursor model" }),
+      {
+        target: { value: "composer" },
+      },
+    );
     fireEvent.click(screen.getByTestId("cursor-model-option-composer-2.5"));
 
     await waitFor(() =>
-      expect(setConfigOption).toHaveBeenCalledWith("model", "composer-2.5[fast=true]"),
+      expect(setConfigOption).toHaveBeenCalledWith(
+        "model",
+        "composer-2.5[fast=true]",
+      ),
     );
   });
 
@@ -227,13 +251,18 @@ describe("CursorModelControls", () => {
     );
 
     expect(
-      screen.getByRole("switch", { name: "Cursor Fast mode" }).getAttribute("aria-checked"),
+      screen
+        .getByRole("switch", { name: "Cursor Fast mode" })
+        .getAttribute("aria-checked"),
     ).toBe("false");
 
     fireEvent.click(screen.getByTestId("cursor-model-trigger"));
-    fireEvent.change(screen.getByRole("combobox", { name: "Search Cursor model" }), {
-      target: { value: "composer" },
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Search Cursor model" }),
+      {
+        target: { value: "composer" },
+      },
+    );
     fireEvent.click(screen.getByTestId("cursor-model-option-composer-2.5"));
 
     await waitFor(() =>
@@ -260,8 +289,13 @@ describe("CursorModelControls", () => {
 
     fireEvent.click(fast);
 
-    await waitFor(() => expect(setConfigOption).toHaveBeenCalledWith("fast", "true"));
-    expect(setConfigOption).not.toHaveBeenCalledWith("model", expect.any(String));
+    await waitFor(() =>
+      expect(setConfigOption).toHaveBeenCalledWith("fast", "true"),
+    );
+    expect(setConfigOption).not.toHaveBeenCalledWith(
+      "model",
+      expect.any(String),
+    );
   });
 
   it("keeps the parameterized Fast switch optimistic until the adapter confirms", async () => {
@@ -284,7 +318,9 @@ describe("CursorModelControls", () => {
     const fast = screen.getByRole("switch", { name: "Cursor Fast mode" });
     fireEvent.click(fast);
 
-    await waitFor(() => expect(setConfigOption).toHaveBeenCalledWith("fast", "true"));
+    await waitFor(() =>
+      expect(setConfigOption).toHaveBeenCalledWith("fast", "true"),
+    );
     expect(fast.getAttribute("aria-checked")).toBe("true");
 
     rerender(
@@ -293,7 +329,11 @@ describe("CursorModelControls", () => {
         fastConfigOption={cursorFastOption("false")}
       />,
     );
-    expect(screen.getByRole("switch", { name: "Cursor Fast mode" }).getAttribute("aria-checked")).toBe("true");
+    expect(
+      screen
+        .getByRole("switch", { name: "Cursor Fast mode" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
 
     rerender(
       <CursorModelControls
@@ -301,6 +341,10 @@ describe("CursorModelControls", () => {
         fastConfigOption={cursorFastOption("true")}
       />,
     );
-    expect(screen.getByRole("switch", { name: "Cursor Fast mode" }).getAttribute("aria-checked")).toBe("true");
+    expect(
+      screen
+        .getByRole("switch", { name: "Cursor Fast mode" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
   });
 });

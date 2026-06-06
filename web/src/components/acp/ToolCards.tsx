@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Per-kind tool call renderers. Each component takes the started tool
 // and (optionally) the completion row, and renders a card that fits
 // the shape of the tool's inputs and outputs.
@@ -24,10 +25,14 @@ import {
   ChevronDown,
   Clock,
   Copy as CopyIcon,
+  FileDown,
   FileText,
   Globe,
+  Image as ImageIcon,
   Layers,
+  Link as LinkIcon,
   ListChecks,
+  Music,
   Pencil,
   Plug,
   Search,
@@ -51,7 +56,11 @@ import {
   todoItemsFromArgs,
 } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import type {
+  ActivityRow,
+  ToolCall,
+  ToolOutputBlock,
+} from "../../lib/acpTypes";
 import { diffPair } from "../../lib/diffPair";
 import { StringDiff } from "../diff/StringDiff";
 import { ToolErrorBody } from "./ToolErrorBody";
@@ -105,10 +114,193 @@ interface ToolCardProps extends Props {
 export function ToolCard({ tool, result, nested }: ToolCardProps) {
   const profile = useAgentProfile();
   const card = renderToolCard(tool, result, profile);
+  // Structured media/resources the agent shipped at completion render
+  // below the per-kind card, regardless of tool kind. See #1818.
+  const media = result?.output?.length ? (
+    <ToolOutputMedia blocks={result.output} />
+  ) : null;
+  const content = media ? (
+    <>
+      {card}
+      {media}
+    </>
+  ) : (
+    card
+  );
   if (!nested && hasSubagentParent(tool)) {
-    return <SubagentChildWrap>{card}</SubagentChildWrap>;
+    return <SubagentChildWrap>{content}</SubagentChildWrap>;
   }
-  return card;
+  return content;
+}
+
+/** Render a tool call's structured completion payload (#1818). Images and
+ *  audio render inline (preferring an embedded base64 payload, falling back
+ *  to a `uri`); resource links and binary resources become download links;
+ *  text and text-resources render as plain blocks. A media block with no
+ *  inline data and no uri degrades to a labelled placeholder so the output
+ *  is never silently dropped. */
+function ToolOutputMedia({ blocks }: { blocks: ToolOutputBlock[] }) {
+  return (
+    <div className="my-1 space-y-2 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 p-3 text-sm">
+      {blocks.map((block, i) => (
+        <ToolOutputBlockView key={i} block={block} />
+      ))}
+    </div>
+  );
+}
+
+function dataUri(mimeType: string, data: string): string {
+  return `data:${mimeType};base64,${data}`;
+}
+
+// Tool output uris are agent-controlled, so a `javascript:` uri must never
+// reach the DOM where a click could execute it. The allowlist is split by
+// sink: clickable links accept the broader set (a `mailto:` link is valid,
+// a `mailto:` image is not), while media `src` values accept only schemes a
+// browser can actually load over the dashboard's http origin. See #1818
+// review.
+const SAFE_LINK_SCHEMES = new Set(["http:", "https:", "file:", "mailto:"]);
+const SAFE_MEDIA_SCHEMES = new Set(["http:", "https:"]);
+
+/** Return `uri` unchanged when its scheme is in `schemes` (resolved against
+ *  the current origin so relative paths keep working), else null. */
+function safeUri(uri: string, schemes: ReadonlySet<string>): string | null {
+  try {
+    const parsed = new URL(uri, window.location.href);
+    return schemes.has(parsed.protocol) ? uri : null;
+  } catch {
+    return null;
+  }
+}
+
+function MediaPlaceholder({ icon, label }: { icon: ReactNode; label: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-text-dim italic">
+      <span className="text-text-dim">{icon}</span>
+      {label}
+    </div>
+  );
+}
+
+function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
+  switch (block.kind) {
+    case "text":
+      return (
+        <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
+          {block.text}
+        </pre>
+      );
+    case "image": {
+      const src = block.data
+        ? dataUri(block.mime_type, block.data)
+        : block.uri
+          ? safeUri(block.uri, SAFE_MEDIA_SCHEMES)
+          : null;
+      if (!src) {
+        return (
+          <MediaPlaceholder
+            icon={<ImageIcon className="h-3.5 w-3.5" />}
+            label={`image (${block.mime_type})`}
+          />
+        );
+      }
+      return (
+        <img
+          src={src}
+          alt={`tool output image (${block.mime_type})`}
+          className="max-h-80 max-w-full rounded border border-surface-700 object-contain"
+        />
+      );
+    }
+    case "audio": {
+      if (!block.data) {
+        return (
+          <MediaPlaceholder
+            icon={<Music className="h-3.5 w-3.5" />}
+            label={`audio (${block.mime_type})`}
+          />
+        );
+      }
+      return (
+        <audio
+          controls
+          src={dataUri(block.mime_type, block.data)}
+          className="w-full"
+        />
+      );
+    }
+    case "resource_link": {
+      const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
+      if (!href) {
+        return (
+          <MediaPlaceholder
+            icon={<LinkIcon className="h-3.5 w-3.5" />}
+            label={`${block.name} (${block.uri})`}
+          />
+        );
+      }
+      return (
+        <a
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+        >
+          <LinkIcon className="h-3.5 w-3.5" />
+          {block.name}
+        </a>
+      );
+    }
+    case "resource": {
+      if (block.text != null) {
+        return (
+          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">
+            {block.text}
+          </pre>
+        );
+      }
+      // A binary (blob) resource ships its bytes inline; offer them as a
+      // download even when the uri isn't fetchable. See #1818.
+      if (block.data) {
+        const filename = block.uri.split("/").pop() || "resource";
+        return (
+          <a
+            href={dataUri(
+              block.mime_type ?? "application/octet-stream",
+              block.data,
+            )}
+            download={filename}
+            className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            {filename}
+          </a>
+        );
+      }
+      const href = safeUri(block.uri, SAFE_LINK_SCHEMES);
+      if (!href) {
+        return (
+          <MediaPlaceholder
+            icon={<FileDown className="h-3.5 w-3.5" />}
+            label={block.uri}
+          />
+        );
+      }
+      return (
+        <a
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 text-xs text-accent-500 hover:underline"
+        >
+          <FileDown className="h-3.5 w-3.5" />
+          {block.uri}
+        </a>
+      );
+    }
+    default:
+      return null;
+  }
 }
 
 function renderToolCard(
@@ -278,8 +470,7 @@ function useToolCardExpansion(status: Status, defaultOpen = false) {
   const setOpen = useCallback(
     (action: SetStateAction<boolean>) => {
       setOverride((prev) => {
-        const current =
-          prev && prev.density === density ? prev.open : baseline;
+        const current = prev && prev.density === density ? prev.open : baseline;
         const next = typeof action === "function" ? action(current) : action;
         return { density, open: next };
       });
@@ -465,10 +656,7 @@ function DurationLabel({
     ? `running ${text}; counts from the agent's first tool_call frame, which can fire before the subprocess actually starts (upstream limitation)`
     : `${text}; counts from the agent's first tool_call frame, which can fire before the subprocess actually starts (upstream limitation)`;
   return (
-    <span
-      className="text-[11px] text-text-dim tabular-nums"
-      title={tooltip}
-    >
+    <span className="text-[11px] text-text-dim tabular-nums" title={tooltip}>
       {text}
     </span>
   );
@@ -485,7 +673,10 @@ export function formatDurationMs(ms: number): string {
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-function truncateLines(text: string, max: number): {
+function truncateLines(
+  text: string,
+  max: number,
+): {
   shown: string;
   truncated: number;
 } {
@@ -944,7 +1135,9 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
       }
       expanded={open}
       onToggle={
-        status === "err" || lines.length > 0 ? () => setOpen((v) => !v) : undefined
+        status === "err" || lines.length > 0
+          ? () => setOpen((v) => !v)
+          : undefined
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
@@ -1139,7 +1332,9 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
         <>
           <span>{todos.length} items</span>
           {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>
+            <span className="ml-2 text-text-dim">
+              · {breakdown.join(" · ")}
+            </span>
           )}
         </>
       }
@@ -1202,8 +1397,7 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
       .reverse()
       .find(
         (s) =>
-          s.result?.kind !== "tool_error" &&
-          s.result?.kind !== "tool_stopped",
+          s.result?.kind !== "tool_error" && s.result?.kind !== "tool_stopped",
       ) ?? null;
   const previewSnapshot = latestSuccessful ?? latestAttempt;
   const latestFailed = latestAttempt.result?.kind === "tool_error";
@@ -1240,7 +1434,9 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
         <>
           <span>updated {snapshots.length} times</span>
           {breakdown.length > 0 && (
-            <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>
+            <span className="ml-2 text-text-dim">
+              · {breakdown.join(" · ")}
+            </span>
           )}
         </>
       }
@@ -1333,17 +1529,19 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       endedAt={result?.at}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
-            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                <span>input</span>
-                <CopyButton text={inputJson} />
+          {args &&
+            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
+              0 && (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                  <span>input</span>
+                  <CopyButton text={inputJson} />
+                </div>
+                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                  {inputJson}
+                </pre>
               </div>
-              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                {inputJson}
-              </pre>
-            </div>
-          )}
+            )}
           {output && status !== "err" && (
             <HighlightedBlock text={output} language="markdown" maxLines={16} />
           )}
@@ -1483,13 +1681,9 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
   const startedAt = [tool.started_at, ...children.map((c) => c.tool.started_at)]
     .sort()
     .at(0);
-  const allDone =
-    parentDone && children.every((c) => c.result !== undefined);
+  const allDone = parentDone && children.every((c) => c.result !== undefined);
   const endedAt = allDone
-    ? [
-        result?.at ?? null,
-        ...children.map((c) => c.result?.at ?? null),
-      ]
+    ? [result?.at ?? null, ...children.map((c) => c.result?.at ?? null)]
         .filter((v): v is string => v !== null)
         .sort()
         .at(-1)
@@ -1647,17 +1841,19 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
       }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {args && Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length > 0 && (
-            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-              <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
-                <span>input</span>
-                <CopyButton text={inputJson} />
+          {args &&
+            Object.keys(args).filter((k) => !isAcpBookkeepingKey(k)).length >
+              0 && (
+              <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+                <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-text-dim">
+                  <span>input</span>
+                  <CopyButton text={inputJson} />
+                </div>
+                <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
+                  {inputJson}
+                </pre>
               </div>
-              <pre className="overflow-x-auto font-mono text-[11px] text-text-muted whitespace-pre-wrap break-all">
-                {inputJson}
-              </pre>
-            </div>
-          )}
+            )}
           {output && status !== "err" && (
             <HighlightedBlock text={output} language="markdown" maxLines={24} />
           )}
@@ -1699,9 +1895,8 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
     [content],
   );
 
-  const verbLabel = hit.isIndex && hit.verb === "recalled"
-    ? "read index"
-    : hit.verb;
+  const verbLabel =
+    hit.isIndex && hit.verb === "recalled" ? "read index" : hit.verb;
   const headerLabel = hit.isIndex ? "Memory index" : "Memory";
 
   const meta = parsed?.type && (
@@ -1733,39 +1928,39 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {hasBody && parsed && status !== "err" ? (
-          <div className="border-t border-surface-800 bg-surface-950">
-            {(parsed.name || parsed.description || parsed.type) && (
-              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 text-[11px]">
-                {parsed.name && (
-                  <>
-                    <dt className="text-text-dim">name</dt>
-                    <dd className="text-text-secondary">{parsed.name}</dd>
-                  </>
-                )}
-                {parsed.type && (
-                  <>
-                    <dt className="text-text-dim">type</dt>
-                    <dd className="text-text-secondary">{parsed.type}</dd>
-                  </>
-                )}
-                {parsed.description && (
-                  <>
-                    <dt className="text-text-dim">description</dt>
-                    <dd className="text-text-secondary">
-                      {parsed.description}
-                    </dd>
-                  </>
-                )}
-              </dl>
-            )}
-            {parsed.body && (
-              <HighlightedBlock
-                text={parsed.body}
-                language="markdown"
-                maxLines={24}
-              />
-            )}
-          </div>
+            <div className="border-t border-surface-800 bg-surface-950">
+              {(parsed.name || parsed.description || parsed.type) && (
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 text-[11px]">
+                  {parsed.name && (
+                    <>
+                      <dt className="text-text-dim">name</dt>
+                      <dd className="text-text-secondary">{parsed.name}</dd>
+                    </>
+                  )}
+                  {parsed.type && (
+                    <>
+                      <dt className="text-text-dim">type</dt>
+                      <dd className="text-text-secondary">{parsed.type}</dd>
+                    </>
+                  )}
+                  {parsed.description && (
+                    <>
+                      <dt className="text-text-dim">description</dt>
+                      <dd className="text-text-secondary">
+                        {parsed.description}
+                      </dd>
+                    </>
+                  )}
+                </dl>
+              )}
+              {parsed.body && (
+                <HighlightedBlock
+                  text={parsed.body}
+                  language="markdown"
+                  maxLines={24}
+                />
+              )}
+            </div>
           ) : null}
         </ToolErrorBody>
       }
@@ -1957,8 +2152,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
   const hasRawInput = useMemo(() => {
     if (!args) return Boolean(tool.args_preview);
     return Object.keys(args).some(
-      (k) =>
-        !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"),
+      (k) => !isAcpBookkeepingKey(k) && !(kind === "wakeup" && k === "prompt"),
     );
   }, [args, tool.args_preview, kind]);
 
@@ -1988,9 +2182,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
         {Number.isFinite(delaySeconds)
           ? `in ${formatDurationSeconds(delaySeconds)}`
           : "scheduled"}
-        {reason ? (
-          <span className="text-text-dim">: {reason}</span>
-        ) : null}
+        {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
     if (wakeAt) {
@@ -2012,9 +2204,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
         ) : (
           "schedule created"
         )}
-        {reason ? (
-          <span className="text-text-dim">: {reason}</span>
-        ) : null}
+        {reason ? <span className="text-text-dim">: {reason}</span> : null}
       </span>
     );
   } else if (kind === "cron_list") {

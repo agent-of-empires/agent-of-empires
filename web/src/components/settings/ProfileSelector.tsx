@@ -24,6 +24,20 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     fetchProfiles().then(setProfiles);
   }, []);
 
+  const validateName = (name: string): string | null => {
+    if (!name) return "Name is required";
+    if (!/^[a-zA-Z0-9_-]+$/.test(name))
+      return "Only letters, digits, hyphens, and underscores";
+    return null;
+  };
+
+  const closeInput = () => {
+    setCreating(false);
+    setRenaming(false);
+    setInputValue("");
+    setError(null);
+  };
+
   useEffect(() => {
     load();
   }, [load]);
@@ -42,30 +56,37 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     return () => document.removeEventListener("mousedown", handler);
   }, [creating, renaming]);
 
-  const validateName = (name: string): string | null => {
-    if (!name) return "Name is required";
-    if (!/^[a-zA-Z0-9_-]+$/.test(name))
-      return "Only letters, digits, hyphens, and underscores";
-    return null;
-  };
-
   const handleCreate = async () => {
     const trimmed = inputValue.trim();
     const err = validateName(trimmed);
-    if (err) { setError(err); return; }
+    if (err) {
+      setError(err);
+      return;
+    }
     const ok = await createProfile(trimmed);
-    if (ok) { closeInput(); load(); }
-    else setError("Failed to create profile");
+    if (ok) {
+      closeInput();
+      load();
+    } else setError("Failed to create profile");
   };
 
   const handleRename = async () => {
     const trimmed = inputValue.trim();
-    if (trimmed === selectedProfile) { closeInput(); return; }
+    if (trimmed === selectedProfile) {
+      closeInput();
+      return;
+    }
     const err = validateName(trimmed);
-    if (err) { setError(err); return; }
+    if (err) {
+      setError(err);
+      return;
+    }
     const ok = await renameProfile(selectedProfile, trimmed);
-    if (ok) { onSelect(trimmed); closeInput(); load(); }
-    else setError("Failed to rename profile");
+    if (ok) {
+      onSelect(trimmed);
+      closeInput();
+      load();
+    } else setError("Failed to rename profile");
   };
 
   const handleDelete = async (name: string) => {
@@ -74,16 +95,10 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     if (ok) {
       // Fall back to the default profile
       const fallback = activeProfile?.name ?? "default";
-      if (selectedProfile === name) onSelect(fallback === name ? "default" : fallback);
+      if (selectedProfile === name)
+        onSelect(fallback === name ? "default" : fallback);
       load();
     }
-  };
-
-  const closeInput = () => {
-    setCreating(false);
-    setRenaming(false);
-    setInputValue("");
-    setError(null);
   };
 
   const startRename = () => {
@@ -108,7 +123,9 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
   return (
     <div className="relative" ref={panelRef}>
       <div className="flex items-center gap-2 flex-nowrap">
-        <label className="text-sm font-medium text-text-secondary shrink-0">Profile</label>
+        <label className="text-sm font-medium text-text-secondary shrink-0">
+          Profile
+        </label>
         <select
           value={selectedProfile}
           onChange={(e) => onSelect(e.target.value)}
@@ -155,7 +172,10 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
             <input
               type="text"
               value={inputValue}
-              onChange={(e) => { setInputValue(e.target.value); setError(null); }}
+              onChange={(e) => {
+                setInputValue(e.target.value);
+                setError(null);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") submitInput();
                 if (e.key === "Escape") closeInput();

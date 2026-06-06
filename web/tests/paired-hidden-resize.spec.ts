@@ -42,34 +42,33 @@ function resizesFor(handle: MockHandle): ResizeMsg[] {
 }
 
 test.describe("Paired terminal hidden-container resize gating", () => {
-  test(
-    "the hidden mobile slide-in's paired terminal does NOT ship a tiny resize",
-    async ({ page }) => {
-      const handle = await mockTerminalApis(page);
-      await page.goto("/");
-      await clickSidebarSession(page, "pinch-test");
-      // Wait for both .xterm panels to mount (agent + the two paired
-      // copies the ContentSplit + RightPanel chain renders).
-      await page
-        .locator(".xterm")
-        .first()
-        .waitFor({ state: "visible", timeout: 10_000 });
-      await page.waitForTimeout(1500);
+  test("the hidden mobile slide-in's paired terminal does NOT ship a tiny resize", async ({
+    page,
+  }) => {
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    // Wait for both .xterm panels to mount (agent + the two paired
+    // copies the ContentSplit + RightPanel chain renders).
+    await page
+      .locator(".xterm")
+      .first()
+      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.waitForTimeout(1500);
 
-      const allResizes = resizesFor(handle);
-      // Every resize that the dashboard ships has to be plausible.
-      // The visible agent + visible paired both clear 20 cols, 5 rows
-      // at this viewport. A 10x4 or smaller message means a hidden
-      // container's measurement leaked through.
-      const tiny = allResizes.filter((r) => r.cols < 20 || r.rows < 5);
-      expect(
-        tiny,
-        `Hidden-container measurement leaked: ${JSON.stringify(tiny)}. ` +
-          `Full list: ${JSON.stringify(allResizes)}`,
-      ).toHaveLength(0);
-      // At least one real resize must have shipped so we know the
-      // visible terminals connected.
-      expect(allResizes.length).toBeGreaterThan(0);
-    },
-  );
+    const allResizes = resizesFor(handle);
+    // Every resize that the dashboard ships has to be plausible.
+    // The visible agent + visible paired both clear 20 cols, 5 rows
+    // at this viewport. A 10x4 or smaller message means a hidden
+    // container's measurement leaked through.
+    const tiny = allResizes.filter((r) => r.cols < 20 || r.rows < 5);
+    expect(
+      tiny,
+      `Hidden-container measurement leaked: ${JSON.stringify(tiny)}. ` +
+        `Full list: ${JSON.stringify(allResizes)}`,
+    ).toHaveLength(0);
+    // At least one real resize must have shipped so we know the
+    // visible terminals connected.
+    expect(allResizes.length).toBeGreaterThan(0);
+  });
 });

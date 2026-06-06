@@ -47,9 +47,9 @@ describe("isMemoryPath", () => {
 
   it("rejects unrelated paths that merely contain the word memory", () => {
     expect(isMemoryPath("/Users/jules/memory/notes.md")).toBe(false);
-    expect(
-      isMemoryPath("/Users/jules/.claude/projects/foo/memory.md"),
-    ).toBe(false);
+    expect(isMemoryPath("/Users/jules/.claude/projects/foo/memory.md")).toBe(
+      false,
+    );
   });
 
   it("rejects paths outside the .claude/projects root", () => {
@@ -125,9 +125,7 @@ describe("parseMemoryFrontmatter", () => {
     ].join("\n");
     const r = parseMemoryFrontmatter(text);
     expect(r.name).toBe("Testing approach");
-    expect(r.description).toBe(
-      "integration tests must hit a real database",
-    );
+    expect(r.description).toBe("integration tests must hit a real database");
     expect(r.type).toBe("feedback");
     expect(r.body).toBe("Body content here.");
   });

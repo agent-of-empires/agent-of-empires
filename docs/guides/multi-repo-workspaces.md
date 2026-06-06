@@ -67,23 +67,13 @@ Saved repo paths the multi-repo pickers draw from. Two scopes:
 
 `<app_dir>` is `$XDG_CONFIG_HOME/agent-of-empires/` on Linux, `~/.agent-of-empires/` on macOS.
 
-When both scopes hold the same canonical path, the **profile entry wins** in merged views (this is how `--allow-override` is meant to be used: stage a profile-specific name on top of a global default).
+`aoe project add <path>` defaults to global; `aoe -p <profile> project add <path>` defaults to profile. Pass `--scope global` or `--scope profile` to override.
 
-### Default scope
-
-| Invocation | Default scope |
-|---|---|
-| `aoe project add <path>` | Global |
-| `aoe -p <profile> project add <path>` | Profile |
-
-Pass `--scope global` or `--scope profile` to override.
-
-### Cross-scope collisions
+Adding a path that already exists in another scope is an error unless you pass `--allow-override`, which lets a profile entry shadow the global one (the profile entry then wins in merged views):
 
 ```bash
-aoe project add /repo/foo                     # global
-aoe -p other project add /repo/foo            # ERROR: same path in global scope
-aoe -p other project add /repo/foo --allow-override  # OK, profile shadows global
+aoe project add /repo/foo                              # global
+aoe -p other project add /repo/foo --allow-override    # profile shadows global
 ```
 
 ## CLI Reference
@@ -129,12 +119,10 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 
 ## Limitations
 
-These are out of scope for the current release; tracked separately:
-
-- **One branch name per workspace**: every repo gets the same `-w <branch>` value. Per-repo branch names is a future feature.
-- **No agent-driven repo pull-in mid-session**: if the agent realizes it needs another repo, you have to start a new session. Tracked alongside the orchestrator work.
-- **No saved workspace templates** ("named bundles of repos"): each session picks the set fresh. If your bundle is fixed, register the repos and select them all from the picker.
-- **No per-repo PR tracking**: AoE does not track PRs today. Coordinated PR workflow happens outside AoE.
+- **One branch name per workspace**: every repo gets the same `-w <branch>` value.
+- **No agent-driven repo pull-in mid-session**: to add a repo, start a new session.
+- **No saved workspace templates**: each session picks the repo set fresh.
+- **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
 
 ## Related
 

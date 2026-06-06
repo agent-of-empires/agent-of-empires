@@ -224,7 +224,9 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     void context;
   });
 
-  test("drag affordances are absent in last-activity mode", async ({ page }) => {
+  test("drag affordances are absent in last-activity mode", async ({
+    page,
+  }) => {
     const sessions: MockSession[] = [
       {
         id: "s1",
@@ -300,7 +302,11 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
         last_accessed_at: "2025-12-01T00:00:00Z",
         workspace_repos: [
           { name: "repo-a", source_path: "/tmp/repo", branch: "feature/multi" },
-          { name: "repo-b", source_path: "/tmp/other", branch: "feature/multi" },
+          {
+            name: "repo-b",
+            source_path: "/tmp/other",
+            branch: "feature/multi",
+          },
         ],
       },
       {

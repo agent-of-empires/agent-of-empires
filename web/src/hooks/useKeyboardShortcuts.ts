@@ -29,7 +29,9 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       const isTerminalInput =
         !!target?.closest(".xterm") ||
         !!target?.classList.contains("xterm-helper-textarea");
-      const isProjectStripInput = !!target?.closest("[data-project-strip='true']");
+      const isProjectStripInput = !!target?.closest(
+        "[data-project-strip='true']",
+      );
 
       const actions = getActions();
       const projectNavigation = matchProjectNavigationShortcut(

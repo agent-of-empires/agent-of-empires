@@ -32,14 +32,18 @@ describe("Dashboard tour anchors", () => {
   it("renders the new-session anchor exactly once when writable", () => {
     const { container } = renderDashboard(false);
     expect(
-      container.querySelectorAll(tourSelector(TOUR_ANCHORS.dashboardNewSession)),
+      container.querySelectorAll(
+        tourSelector(TOUR_ANCHORS.dashboardNewSession),
+      ),
     ).toHaveLength(1);
   });
 
   it("hides the new-session anchor in read-only mode", () => {
     const { container } = renderDashboard(true);
     expect(
-      container.querySelectorAll(tourSelector(TOUR_ANCHORS.dashboardNewSession)),
+      container.querySelectorAll(
+        tourSelector(TOUR_ANCHORS.dashboardNewSession),
+      ),
     ).toHaveLength(0);
   });
 });

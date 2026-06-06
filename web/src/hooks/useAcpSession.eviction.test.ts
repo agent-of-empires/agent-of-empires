@@ -61,7 +61,9 @@ describe("structured view cache eviction (#1345)", () => {
 
     expect(setItem).toHaveBeenCalled();
     // Oldest entry was evicted.
-    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`)).toBeNull();
+    expect(
+      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`),
+    ).toBeNull();
     // Newer entry survives.
     expect(
       window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-new`),
@@ -185,7 +187,9 @@ describe("structured view cache eviction (#1345)", () => {
       `${STORAGE_KEY_PREFIX}sess-current`,
     );
     expect(removed).toBe(false);
-    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-a`)).toBe("draft");
+    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-a`)).toBe(
+      "draft",
+    );
   });
 });
 
@@ -235,7 +239,9 @@ describe("persistState strips attachment-bearing queued rows (#1833)", () => {
       ],
     };
     persistState("sess-textonly", state);
-    const raw = window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-textonly`);
+    const raw = window.localStorage.getItem(
+      `${STORAGE_KEY_PREFIX}sess-textonly`,
+    );
     const parsed = JSON.parse(raw!) as {
       state: { queuedPrompts: Array<{ id: string }> };
     };

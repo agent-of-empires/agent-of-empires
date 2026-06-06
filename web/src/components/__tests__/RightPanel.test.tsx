@@ -120,7 +120,9 @@ describe("RightPanel PairedTerminal", () => {
     // The "Host" picker is rendered twice -- once for desktop, once
     // for the mobile slide-in. Either match is fine; what matters is
     // that the shell-mode toggle made it into the DOM.
-    expect(screen.getAllByRole("button", { name: /^Host$/ }).length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByRole("button", { name: /^Host$/ }).length,
+    ).toBeGreaterThan(0);
   });
 
   it("renders 'Select a session' when sessionId is null", () => {

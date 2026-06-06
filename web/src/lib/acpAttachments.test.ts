@@ -9,11 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  applyEvent,
-  emptyAcpState,
-  type AcpFrame,
-} from "./acpTypes";
+import { applyEvent, emptyAcpState, type AcpFrame } from "./acpTypes";
 
 describe("structured view attachments reducer", () => {
   it("stores prompt capabilities from the PromptCapabilities event", () => {
@@ -41,7 +37,11 @@ describe("structured view attachments reducer", () => {
       session_id: "s-1",
       seq: 1,
       event: {
-        PromptCapabilities: { image: true, audio: true, embedded_context: true },
+        PromptCapabilities: {
+          image: true,
+          audio: true,
+          embedded_context: true,
+        },
       },
     });
     state = applyEvent(state, {

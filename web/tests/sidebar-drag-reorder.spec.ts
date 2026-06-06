@@ -90,7 +90,9 @@ async function readWorkspaceOrder(page: Page): Promise<string[]> {
 }
 
 test.describe("Sidebar drag-to-reorder (#1169)", () => {
-  test("applies the server-supplied ordering on first paint", async ({ page }) => {
+  test("applies the server-supplied ordering on first paint", async ({
+    page,
+  }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -111,10 +113,11 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     // Server pins old-ws above new-ws even though new-ws has a later
     // created_at. Without the ordering plumbing the default would put
     // new-ws first.
-    await mockApis(page, () => sessions, () => [
-      "/tmp/repo::feature/old",
-      "/tmp/repo::feature/new",
-    ]);
+    await mockApis(
+      page,
+      () => sessions,
+      () => ["/tmp/repo::feature/old", "/tmp/repo::feature/new"],
+    );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
@@ -154,10 +157,11 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     // The real server prepends unseen workspace ids newest-first; the
     // mock simulates that by returning the merged list. The client
     // honors it directly without further sorting.
-    await mockApis(page, () => sessions, () => [
-      "/tmp/repo::feature/new",
-      "/tmp/repo::feature/old",
-    ]);
+    await mockApis(
+      page,
+      () => sessions,
+      () => ["/tmp/repo::feature/new", "/tmp/repo::feature/old"],
+    );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
@@ -203,7 +207,11 @@ test.describe("Sidebar drag-to-reorder (#1169)", () => {
     ];
 
     const puts: string[][] = [];
-    await mockApis(page, () => sessions, () => initialOrdering);
+    await mockApis(
+      page,
+      () => sessions,
+      () => initialOrdering,
+    );
     await page.route("**/api/workspace-ordering", (r) => {
       const body = JSON.parse(r.request().postData() || "{}") as {
         order?: string[];

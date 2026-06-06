@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import {
   hasSeenWelcome,
   isAutomatedSession,
@@ -48,14 +48,9 @@ export function useWelcomePhase({
   tourSeenKnown,
 }: UseWelcomePhaseOptions): UseWelcomePhaseResult {
   const [phase, setPhase] = useState<Phase>("pending");
-  const decidedRef = useRef(false);
 
-  // Decide exactly once, the first frame the dashboard is settled and the
-  // backend tour-seen state is known, mirroring the tour's auto-start latch so a
-  // later re-render cannot re-open the modal.
-  useEffect(() => {
-    if (decidedRef.current || !autoLaunchReady || !tourSeenKnown) return;
-    decidedRef.current = true;
+  // Decide exactly once, the first render where the conditions are met.
+  if (phase === "pending" && autoLaunchReady && tourSeenKnown) {
     const show = shouldShowWelcome({
       autoLaunchReady,
       scope,
@@ -65,7 +60,7 @@ export function useWelcomePhase({
       welcomeSeen: hasSeenWelcome(),
     });
     setPhase(show ? "showing" : "done");
-  }, [autoLaunchReady, tourSeenKnown, tourSeen, scope, readOnly]);
+  }
 
   const dismissWelcome = useCallback(() => {
     markWelcomeSeen();

@@ -65,18 +65,30 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
             crate::session::validate_memory_limit(s).map_err(ValidationError::new)
         }
         ValidationKind::VolumeList => {
-            let arr = value
-                .as_array()
-                .ok_or_else(|| ValidationError::new("expected a list"))?;
-            for entry in arr {
-                let s = entry
-                    .as_str()
-                    .ok_or_else(|| ValidationError::new("list entries must be strings"))?;
-                crate::session::validate_volume_format(s).map_err(ValidationError::new)?;
-            }
-            Ok(())
+            validate_string_list(value, crate::session::validate_volume_format)
+        }
+        ValidationKind::EnvList => validate_string_list(value, crate::session::validate_env_format),
+        ValidationKind::PortMappingList => {
+            validate_string_list(value, crate::session::validate_port_mapping_format)
         }
     }
+}
+
+/// Validate that `value` is a JSON array of strings and each passes `check`.
+fn validate_string_list(
+    value: &Value,
+    check: impl Fn(&str) -> Result<(), String>,
+) -> Result<(), ValidationError> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| ValidationError::new("expected a list"))?;
+    for entry in arr {
+        let s = entry
+            .as_str()
+            .ok_or_else(|| ValidationError::new("list entries must be strings"))?;
+        check(s).map_err(ValidationError::new)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -120,5 +132,23 @@ mod tests {
     fn volume_list_grammar() {
         assert!(validate_value(&ValidationKind::VolumeList, &json!(["/h:/c"])).is_ok());
         assert!(validate_value(&ValidationKind::VolumeList, &json!(["bad"])).is_err());
+    }
+
+    #[test]
+    fn env_list_grammar() {
+        assert!(validate_value(&ValidationKind::EnvList, &json!(["KEY"])).is_ok());
+        assert!(validate_value(&ValidationKind::EnvList, &json!(["KEY=value"])).is_ok());
+        assert!(validate_value(&ValidationKind::EnvList, &json!(["_K=v", "A1=b"])).is_ok());
+        assert!(validate_value(&ValidationKind::EnvList, &json!(["1BAD=v"])).is_err());
+        assert!(validate_value(&ValidationKind::EnvList, &json!(["has space"])).is_err());
+        assert!(validate_value(&ValidationKind::EnvList, &json!("notalist")).is_err());
+    }
+
+    #[test]
+    fn port_mapping_list_grammar() {
+        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["3000:3000"])).is_ok());
+        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["8080:80"])).is_ok());
+        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["3000"])).is_err());
+        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["a:b"])).is_err());
     }
 }

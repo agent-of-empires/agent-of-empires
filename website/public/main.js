@@ -62,19 +62,24 @@ function toggleMobileSidebar(btn) {
   menu.classList.toggle('hidden');
 }
 
-// Fetch GitHub star count
-fetch('https://api.github.com/repos/agent-of-empires/agent-of-empires')
-  .then(res => res.json())
-  .then(data => {
-    const count = data.stargazers_count;
-    if (count !== undefined) {
-      const formatted = count >= 1000 ? (count / 1000).toFixed(1) + 'k' : count;
-      document.getElementById('star-count').textContent = formatted;
-    }
-  })
-  .catch(() => {
-    document.getElementById('star-count').textContent = '';
-  });
+// Fetch GitHub star count (only when the badge is on the page; it isn't on docs pages)
+const starCountEl = document.getElementById('star-count');
+if (starCountEl) {
+  fetch('https://api.github.com/repos/agent-of-empires/agent-of-empires')
+    .then(res => {
+      if (!res.ok) throw new Error('star count fetch failed: ' + res.status);
+      return res.json();
+    })
+    .then(data => {
+      const count = data.stargazers_count;
+      if (count !== undefined) {
+        starCountEl.textContent = count >= 1000 ? (count / 1000).toFixed(1) + 'k' : count;
+      }
+    })
+    .catch(() => {
+      starCountEl.textContent = '';
+    });
+}
 
 // Theme toggle
 function initThemeToggle() {

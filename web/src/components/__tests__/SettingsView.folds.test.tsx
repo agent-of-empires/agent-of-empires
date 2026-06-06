@@ -1,16 +1,25 @@
 // @vitest-environment jsdom
 //
 // Behavioral coverage for the Settings "Advanced" folds (#1515):
-//   Story #2 - advanced structured-view knobs are hidden behind a default-collapsed
-//              fold while high-level controls stay visible.
+//   Story #2 - advanced knobs are hidden behind a default-collapsed fold while
+//              high-level controls stay visible.
 //   Story #4 - the fold collapses back to default when the user changes tabs
 //              or switches profiles (component-local state, not persisted).
 //
-// The end-to-end persist-after-expand path (story #3) lives in live Playwright
-// at web/tests/live/settings-advanced-fold.spec.ts.
+// Every config-backed section is schema-driven (#1692): SchemaSection builds
+// its rows (and the advanced fold) from the descriptor list below, so this
+// mock mirrors the real worktree / sandbox / acp `#[setting(...)]` shapes. The
+// end-to-end persist-after-expand path (story #3) lives in live Playwright at
+// web/tests/live/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -19,26 +28,232 @@ const PROFILES = [
   { name: "work", is_default: false },
 ];
 
-// Worktree is schema-driven (#1692): the generic SchemaSection builds its rows
-// from this descriptor list, so labels + the advanced fold come from the schema
-// (matching the TUI), not hand-written JSX. Mirrors the real WorktreeConfig
-// `#[setting(...)]` annotations: 3 primary fields, 4 advanced.
-const elev = { policy: "requires_elevation", reason: "host filesystem" } as const;
-const WORKTREE_SCHEMA = [
-  { field: "enabled", label: "Enabled by Default", widget: { kind: "toggle" }, advanced: false },
-  { field: "path_template", label: "Path Template", widget: { kind: "text" }, advanced: false },
-  { field: "auto_cleanup", label: "Auto Cleanup", widget: { kind: "toggle" }, advanced: false },
-  { field: "bare_repo_path_template", label: "Bare Repo Template", widget: { kind: "text" }, advanced: true },
-  { field: "workspace_path_template", label: "Workspace Path Template", widget: { kind: "text" }, advanced: true },
-  { field: "delete_branch_on_cleanup", label: "Delete Branch on Cleanup", widget: { kind: "toggle" }, advanced: true },
-  { field: "init_submodules", label: "Init Submodules", widget: { kind: "toggle" }, advanced: true },
-].map((d) => ({
-  section: "worktree",
-  category: "Worktree",
+const ALLOW = { policy: "allow" } as const;
+const ELEV = {
+  policy: "requires_elevation",
+  reason: "host filesystem",
+} as const;
+const NONE = { rule: "none" } as const;
+
+// Representative slice of the real schema: a few primary + advanced fields per
+// section, enough to exercise the fold across sections without mirroring every
+// field. Labels match the real `#[setting(label = ...)]` values.
+const RAW_SCHEMA: Array<{
+  section: string;
+  field: string;
+  label: string;
+  widget: Record<string, unknown>;
+  advanced: boolean;
+  web_write?: typeof ALLOW | typeof ELEV;
+  validation?: Record<string, unknown>;
+}> = [
+  // worktree
+  {
+    section: "worktree",
+    field: "enabled",
+    label: "Enabled by Default",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "path_template",
+    label: "Path Template",
+    widget: { kind: "text" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "auto_cleanup",
+    label: "Auto Cleanup",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "bare_repo_path_template",
+    label: "Bare Repo Template",
+    widget: { kind: "text" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "workspace_path_template",
+    label: "Workspace Path Template",
+    widget: { kind: "text" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "delete_branch_on_cleanup",
+    label: "Delete Branch on Cleanup",
+    widget: { kind: "toggle" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  {
+    section: "worktree",
+    field: "init_submodules",
+    label: "Init Submodules",
+    widget: { kind: "toggle" },
+    advanced: true,
+    web_write: ELEV,
+  },
+  // sandbox
+  {
+    section: "sandbox",
+    field: "enabled_by_default",
+    label: "Sandbox enabled by default",
+    widget: { kind: "toggle" },
+    advanced: false,
+    web_write: ELEV,
+  },
+  {
+    section: "sandbox",
+    field: "cpu_limit",
+    label: "CPU limit",
+    widget: { kind: "optional_text" },
+    advanced: true,
+  },
+  {
+    section: "sandbox",
+    field: "memory_limit",
+    label: "Memory limit",
+    widget: { kind: "optional_text" },
+    advanced: true,
+    validation: { rule: "memory_limit" },
+  },
+  {
+    section: "sandbox",
+    field: "custom_instruction",
+    label: "Custom instruction",
+    widget: { kind: "text", multiline: true },
+    advanced: true,
+  },
+  {
+    section: "sandbox",
+    field: "environment",
+    label: "Environment variables",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "env_list" },
+  },
+  {
+    section: "sandbox",
+    field: "extra_volumes",
+    label: "Extra volumes",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "volume_list" },
+  },
+  {
+    section: "sandbox",
+    field: "port_mappings",
+    label: "Port mappings",
+    widget: { kind: "list" },
+    advanced: true,
+    web_write: ELEV,
+    validation: { rule: "port_mapping_list" },
+  },
+  {
+    section: "sandbox",
+    field: "volume_ignores",
+    label: "Volume ignores",
+    widget: { kind: "list" },
+    advanced: true,
+  },
+  // acp (structured view)
+  {
+    section: "acp",
+    field: "show_tool_durations",
+    label: "Show tool-call durations",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "queue_drain_mode",
+    label: "Queue drain mode",
+    widget: {
+      kind: "select",
+      options: [
+        { value: "combined", label: "Combined" },
+        { value: "serial", label: "Serial" },
+      ],
+    },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "rate_limit_auto_resume",
+    label: "Auto-resume after rate limit",
+    widget: { kind: "toggle" },
+    advanced: false,
+  },
+  {
+    section: "acp",
+    field: "replay_events",
+    label: "History cap (events)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "replay_bytes",
+    label: "Replay buffer bytes",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "max_concurrent_resumes",
+    label: "Max concurrent resumes",
+    widget: { kind: "number", min: 1 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "silent_orphan_grace_secs",
+    label: "Silent-orphan grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "silent_orphan_fast_grace_secs",
+    label: "Silent-orphan fast grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "auto_stop_idle_secs",
+    label: "Auto-stop idle workers (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+  {
+    section: "acp",
+    field: "rate_limit_auto_resume_grace_secs",
+    label: "Auto-resume grace (s)",
+    widget: { kind: "number", min: 0 },
+    advanced: true,
+  },
+];
+
+const MOCK_SCHEMA = RAW_SCHEMA.map((d) => ({
+  category: d.section,
   description: "",
-  web_write: elev,
+  web_write: d.web_write ?? ALLOW,
   profile_overridable: true,
-  validation: { rule: "none" },
+  validation: d.validation ?? NONE,
   ...d,
 }));
 
@@ -47,7 +262,7 @@ vi.mock("../../lib/api", () => ({
   fetchSettings: vi.fn(() =>
     Promise.resolve({ acp: {}, sandbox: {}, worktree: {} }),
   ),
-  getSettingsSchema: vi.fn(() => Promise.resolve(WORKTREE_SCHEMA)),
+  getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -56,12 +271,6 @@ vi.mock("../../lib/api", () => ({
   deleteProfile: vi.fn(() => Promise.resolve(true)),
 }));
 
-const SERVER_ABOUT = {
-  acp_show_tool_durations: true,
-  acp_queue_drain_mode: "combined" as const,
-  acp_max_concurrent_resumes: 4,
-};
-
 function renderView(tab: string) {
   const onSelectTab = vi.fn();
   const utils = render(
@@ -69,7 +278,6 @@ function renderView(tab: string) {
       onClose={() => {}}
       tab={tab}
       onSelectTab={onSelectTab}
-      serverAbout={SERVER_ABOUT as never}
       onServerAboutRefresh={() => {}}
     />,
   );
@@ -91,7 +299,6 @@ function fieldInputByLabel(
 ): HTMLInputElement | HTMLTextAreaElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
-  // TextField renders a textarea when multiline (e.g. Custom instruction).
   const selector =
     type === "text" ? 'input[type="text"], textarea' : `input[type="${type}"]`;
   const input = match?.parentElement?.querySelector(selector);
@@ -99,10 +306,18 @@ function fieldInputByLabel(
   return input as HTMLInputElement | HTMLTextAreaElement;
 }
 
-function commit(
-  input: HTMLInputElement | HTMLTextAreaElement,
-  value: string,
-) {
+function selectByLabel(
+  container: HTMLElement,
+  label: string,
+): HTMLSelectElement {
+  const labels = Array.from(container.querySelectorAll("label"));
+  const match = labels.find((l) => l.textContent === label);
+  const select = match?.parentElement?.querySelector("select");
+  expect(select).toBeTruthy();
+  return select as HTMLSelectElement;
+}
+
+function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value } });
   fireEvent.blur(input);
@@ -121,15 +336,12 @@ function clickToggle(container: HTMLElement, label: string) {
 }
 
 // ListField: open its add input, type a value, submit with Enter. Scoped to
-// the ListField whose header carries `label` so the right "+ Add" / input pair
-// is used when several lists render together.
+// the ListField whose header carries `label`.
 function addListItem(container: HTMLElement, label: string, value: string) {
   const labelEl = Array.from(container.querySelectorAll("label")).find(
     (l) => l.textContent === label,
   );
   const root = labelEl?.parentElement?.parentElement as HTMLElement;
-  // "+ Add" is hidden while the add input is already open (e.g. after a
-  // rejected invalid entry); only click it when present, then reuse the input.
   const addBtn = labelEl?.parentElement?.querySelector("button");
   if (addBtn) fireEvent.click(addBtn);
   const input = root.querySelector('input[type="text"]') as HTMLInputElement;
@@ -153,6 +365,7 @@ describe("Settings Advanced fold", () => {
 
   it("hides structured-view advanced knobs until the fold is expanded (#2)", async () => {
     const { container } = renderView("structured-view");
+    await screen.findByText("Show tool-call durations");
 
     // High-level controls are always visible.
     expect(screen.getByText("Show tool-call durations")).toBeTruthy();
@@ -184,7 +397,6 @@ describe("Settings Advanced fold", () => {
         onClose={() => {}}
         tab="worktree"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -197,7 +409,6 @@ describe("Settings Advanced fold", () => {
         onClose={() => {}}
         tab="sandbox"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -205,15 +416,15 @@ describe("Settings Advanced fold", () => {
     expect(screen.queryByText("CPU limit")).toBeNull();
   });
 
-  it("saves every structured-view advanced knob through the normal path", async () => {
+  it("saves structured-view advanced knobs through the normal path", async () => {
     const { container } = renderView("structured-view");
-    await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
+    await screen.findByText("Queue drain mode");
 
     expandAdvanced(container);
-    commit(fieldInputByLabel(container, "History cap (events)", "number"), "500");
-    commit(fieldInputByLabel(container, "Replay buffer bytes", "number"), "4096");
-    commit(fieldInputByLabel(container, "Max concurrent resumes", "number"), "8");
-    commit(fieldInputByLabel(container, "Silent-orphan grace (s)", "number"), "90");
+    commit(
+      fieldInputByLabel(container, "Replay buffer bytes", "number"),
+      "4096",
+    );
     commit(
       fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"),
       "30",
@@ -230,7 +441,9 @@ describe("Settings Advanced fold", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
         "main",
-        { acp: { replay_bytes: 4096 } },
+        {
+          acp: { replay_bytes: 4096 },
+        },
       ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
@@ -244,28 +457,22 @@ describe("Settings Advanced fold", () => {
     });
   });
 
-  it("exercises the structured-view high-level toggles outside the fold", async () => {
+  it("exercises the structured-view high-level controls outside the fold", async () => {
     const { container } = renderView("structured-view");
-    await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
+    await screen.findByText("Queue drain mode");
 
-    const durations = container.querySelector(
-      'button[aria-label="Show tool-call durations"]',
-    ) as HTMLButtonElement;
-    fireEvent.click(durations);
-
-    const serial = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent === "Serial",
-    ) as HTMLButtonElement;
-    fireEvent.click(serial);
-
-    // Rate-limit auto-resume is a high-level toggle now: reachable without
-    // expanding the Advanced fold. See #1722.
+    fireEvent.change(selectByLabel(container, "Queue drain mode"), {
+      target: { value: "serial" },
+    });
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { queue_drain_mode: "serial" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          acp: { queue_drain_mode: "serial" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { rate_limit_auto_resume: true },
@@ -292,26 +499,32 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        worktree: { workspace_path_template: "../wt-{branch}" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          worktree: { workspace_path_template: "../wt-{branch}" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       worktree: { delete_branch_on_cleanup: true },
     });
   });
 
-  it("saves every sandbox advanced field through the normal path", async () => {
+  it("saves sandbox advanced fields, including the derived list validators", async () => {
     const { container } = renderView("sandbox");
     await screen.findByText("Sandbox enabled by default");
 
     expandAdvanced(container);
     commit(fieldInputByLabel(container, "CPU limit", "text"), "4");
     commit(fieldInputByLabel(container, "Memory limit", "text"), "8g");
-    commit(fieldInputByLabel(container, "Custom instruction", "text"), "be terse");
+    commit(
+      fieldInputByLabel(container, "Custom instruction", "text"),
+      "be terse",
+    );
 
     // Lists exercise both the add (onChange) and validate paths: an invalid
-    // entry trips the validator, then a valid one commits.
+    // entry trips the schema-derived validator, then a valid one commits.
     addListItem(container, "Environment variables", "1bad");
     addListItem(container, "Environment variables", "FOO=bar");
     addListItem(container, "Extra volumes", "nocolon");
@@ -321,21 +534,26 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sandbox: { cpu_limit: "4" },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          sandbox: { cpu_limit: "4" },
+        },
+      ),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       sandbox: { environment: ["FOO=bar"] },
+    });
+    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+      sandbox: { port_mappings: ["3000:3000"] },
     });
   });
 
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile
   // from its "" seed to the default. That transition must NOT remount the
   // content fieldset, or a fold expanded during the load window collapses out
-  // from under the user. This is the deterministic mirror of the live flake in
-  // tests/live/settings-advanced-fold.spec.ts (the structured view "Advanced" fold
-  // vanishing right after a click).
+  // from under the user (the deterministic mirror of the live flake in
+  // tests/live/settings-advanced-fold.spec.ts).
   it("keeps an expanded fold open when the initial profile resolves", async () => {
     let resolveProfiles!: (p: typeof PROFILES) => void;
     vi.mocked(api.fetchProfiles).mockImplementationOnce(
@@ -346,9 +564,8 @@ describe("Settings Advanced fold", () => {
     );
 
     const { container } = renderView("structured-view");
+    await screen.findByText("Queue drain mode");
 
-    // Structured view renders without waiting on profiles/settings, so the fold is
-    // interactive during the load window. Open it before profiles resolve.
     expandAdvanced(container);
     expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
 
@@ -366,7 +583,7 @@ describe("Settings Advanced fold", () => {
 
   it("collapses the fold when switching profiles (#4)", async () => {
     const { container } = renderView("structured-view");
-    await waitFor(() => expect(screen.getByText("Queue drain mode")).toBeTruthy());
+    await screen.findByText("Queue drain mode");
 
     expandAdvanced(container);
     expect(screen.getByText("Replay buffer bytes")).toBeTruthy();

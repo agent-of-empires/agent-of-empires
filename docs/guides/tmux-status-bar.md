@@ -7,7 +7,7 @@ Agent of Empires can display session information in your tmux status bar, showin
 
 ## How It Works
 
-When you start a session, aoe sets tmux user options (`@aoe_title`, `@aoe_branch`, `@aoe_sandbox`) and configures the status bar to display this information with aoe's phosphor green theme.
+When you start a session, aoe configures the tmux status bar to display this information in your active theme's colors (Empire by default).
 
 **Example status bars:**
 ```
@@ -50,29 +50,18 @@ clipboard = "auto" # Same modes: auto, enabled, disabled
 
 ## Clipboard Pass-through
 
-Modern TUI agents (Claude Code, OpenCode, Codex, Gemini CLI, etc.) write to the system clipboard by emitting OSC 52 escape sequences. tmux intercepts those by default, so "select to copy" inside the wrapped agent silently fails: the notification appears, but nothing reaches your terminal's clipboard.
+TUI agents copy to the system clipboard via OSC 52 escape sequences, which tmux swallows by default, so "select to copy" inside the agent silently fails. With clipboard pass-through (the default in `auto` mode when you have no `~/.tmux.conf`), aoe lets those sequences reach your terminal emulator.
 
-When clipboard pass-through is enabled (the default in `auto` mode if you have no `~/.tmux.conf`), aoe sets two options on every aoe-managed tmux session:
+Set `clipboard = "disabled"` if you don't trust the wrapped agent's terminal output (pass-through lets the inner program write arbitrary escape sequences to your outer terminal).
 
-```tmux
-set-option -t <session> set-clipboard on
-set-option -t <session> allow-passthrough on
-```
-
-These let the agent's OSC 52 sequence reach your terminal emulator (Windows Terminal, iTerm2, Ghostty, etc.) instead of being swallowed by tmux.
-
-### When to disable
-
-If you're running aoe in an environment where you don't trust the wrapped agent's terminal output, set `clipboard = "disabled"`. `allow-passthrough on` lets the inner program write arbitrary escape sequences to your outer terminal; for most aoe users this is fine (you're already letting the agent run code), but it's worth knowing.
-
-If you have your own `~/.tmux.conf` and want to manage these options yourself, you'll need:
+If you manage your own `~/.tmux.conf`, set these yourself:
 
 ```tmux
 set -g set-clipboard on
 set -g allow-passthrough on
 ```
 
-Some terminal emulators also need clipboard write permission enabled on their side (Ghostty's `clipboard-write = allow`, etc.).
+Some terminal emulators also need clipboard write permission enabled (Ghostty's `clipboard-write = allow`, etc.).
 
 ## Custom Integration
 
@@ -117,15 +106,7 @@ set -g status-right "#{?#{==:#(aoe tmux status),},,%#(aoe tmux status) | }%H:%M"
 
 ## tmux User Options
 
-When aoe starts a session with status bar enabled, it sets these tmux options:
-
-| Option | Description |
-|--------|-------------|
-| `@aoe_title` | Session title |
-| `@aoe_branch` | Git branch (worktree sessions only) |
-| `@aoe_sandbox` | Container name (sandboxed sessions only) |
-
-You can reference these in your own tmux config:
+aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), and `@aoe_sandbox` (sandboxed sessions) on each session, which you can reference in your own config:
 
 ```tmux
 set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"

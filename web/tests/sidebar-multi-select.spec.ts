@@ -101,7 +101,10 @@ test.describe("Sidebar multi-select (#1724)", () => {
     await mockApis(page, THREE);
     const archived: Array<{ id: string; body: unknown }> = [];
     await page.route("**/api/sessions/*/archive", (r) => {
-      const m = r.request().url().match(/\/api\/sessions\/([^/]+)\/archive$/);
+      const m = r
+        .request()
+        .url()
+        .match(/\/api\/sessions\/([^/]+)\/archive$/);
       archived.push({ id: m?.[1] ?? "?", body: r.request().postDataJSON() });
       return r.fulfill({ json: { id: m?.[1] ?? "?", archived_at: "now" } });
     });

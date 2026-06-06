@@ -53,20 +53,16 @@ function seedSequentialSessions(sessions: SeededSession[]) {
       const projectDir = join(home, dir);
       mkdirSync(projectDir, { recursive: true });
       spawnSync("git", ["init", "-q"], { cwd: projectDir });
-      spawnSync(
-        "git",
-        ["commit", "--allow-empty", "-q", "-m", "init"],
-        {
-          cwd: projectDir,
-          env: {
-            ...env,
-            GIT_AUTHOR_NAME: "t",
-            GIT_AUTHOR_EMAIL: "t@t",
-            GIT_COMMITTER_NAME: "t",
-            GIT_COMMITTER_EMAIL: "t@t",
-          },
+      spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
+        cwd: projectDir,
+        env: {
+          ...env,
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@t",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@t",
         },
-      );
+      });
       const res = spawnSync(
         binary,
         ["add", projectDir, "-t", title, "-c", "claude"],
@@ -156,11 +152,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
 
         await expect
           .poll(() => readWorkspaceTitles(page), { timeout: 5000 })
-          .toEqual([
-            "newest-session",
-            "middle-session",
-            "oldest-session",
-          ]);
+          .toEqual(["newest-session", "middle-session", "oldest-session"]);
 
         // Reload: localStorage carries the picker state across reloads
         // even against the live server.
@@ -172,11 +164,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
         );
         await expect
           .poll(() => readWorkspaceTitles(page), { timeout: 5000 })
-          .toEqual([
-            "newest-session",
-            "middle-session",
-            "oldest-session",
-          ]);
+          .toEqual(["newest-session", "middle-session", "oldest-session"]);
 
         // Attention is reachable end-to-end and persists. All three live
         // sessions share a status, so the rendered order is not asserted

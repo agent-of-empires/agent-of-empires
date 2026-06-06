@@ -26,9 +26,9 @@ base("s key opens the Settings view", async ({ page }, testInfo) => {
     // URL flipping is not enough; assert the SettingsView actually
     // rendered so a broken route guard or render error fails loudly.
     // The Profile selector is unique to the Settings page.
-    await expect(
-      page.getByRole("button", { name: "+ New" }),
-    ).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("button", { name: "+ New" })).toBeVisible({
+      timeout: 5_000,
+    });
   } finally {
     await serve.stop();
   }

@@ -287,11 +287,9 @@ describe("sweepOrphanDrafts", () => {
 
   it("swallows localStorage iteration errors", () => {
     setDraft("s-orphan", "gone");
-    const spy = vi
-      .spyOn(Storage.prototype, "key")
-      .mockImplementation(() => {
-        throw new Error("blocked");
-      });
+    const spy = vi.spyOn(Storage.prototype, "key").mockImplementation(() => {
+      throw new Error("blocked");
+    });
     expect(() => sweepOrphanDrafts(new Set())).not.toThrow();
     spy.mockRestore();
   });

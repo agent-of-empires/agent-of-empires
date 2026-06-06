@@ -141,7 +141,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // Within 3s the ensureTerminal mock returns, ready flips true,
     // the consume-on-ready effect fires, focus lands in paired.
-    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("paired");
+    await expect
+      .poll(() => focusedKind(page), { timeout: 3000 })
+      .toBe("paired");
   });
 
   test("agent latch fires once ensureSession resolves (slow agent)", async ({
@@ -236,9 +238,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await openSession(page);
 
     await focusKind(page, "agent");
-    await expect(
-      page.locator('[data-term="agent"]').first(),
-    ).toHaveClass(/term-focused/);
+    await expect(page.locator('[data-term="agent"]').first()).toHaveClass(
+      /term-focused/,
+    );
 
     await page.keyboard.press("ControlOrMeta+`");
     // The visible paired panel should pick up term-focused.

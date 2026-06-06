@@ -63,7 +63,9 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
     expandAdvanced();
     expect(getByRole("switch", { name: /Create a worktree/ })).toBeTruthy();
     expect(getByPlaceholderText("Uses session title if empty")).toBeTruthy();
-    expect(getByRole("switch", { name: /Attach to existing branch/ })).toBeTruthy();
+    expect(
+      getByRole("switch", { name: /Attach to existing branch/ }),
+    ).toBeTruthy();
     // The base-branch picker's disclosure button (its input shares the
     // same accessible name but is not a button).
     expect(getByRole("button", { name: "Base branch" })).toBeTruthy();
@@ -89,7 +91,9 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
   });
 
   it("hides the Base branch picker once attach-existing is on", () => {
-    const { expandAdvanced, queryByRole } = renderStep({ attachExisting: true });
+    const { expandAdvanced, queryByRole } = renderStep({
+      attachExisting: true,
+    });
     expandAdvanced();
     expect(queryByRole("button", { name: "Base branch" })).toBeNull();
   });

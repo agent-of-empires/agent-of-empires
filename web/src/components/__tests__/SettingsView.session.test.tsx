@@ -12,11 +12,42 @@ import * as api from "../../lib/api";
 
 const PROFILES = [{ name: "main", is_default: true }];
 
+// The session tab is schema-driven (#1692): auto_stop_idle_secs is a number
+// field and acp_defaults is the acp-defaults custom widget, both built from
+// these descriptors. The default-profile selector is the only non-schema row.
+const SESSION_SCHEMA = [
+  {
+    section: "session",
+    field: "auto_stop_idle_secs",
+    category: "Interaction",
+    label: "Auto-stop idle sessions (s)",
+    description: "",
+    widget: { kind: "number", min: 0 },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+  {
+    section: "session",
+    field: "acp_defaults",
+    category: "Session",
+    label: "Structured View Defaults",
+    description: "",
+    widget: { kind: "custom", id: "acp-defaults" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  },
+];
+
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchSettings: vi.fn(() =>
     Promise.resolve({ session: {}, acp: {}, sandbox: {}, worktree: {} }),
   ),
+  getSettingsSchema: vi.fn(() => Promise.resolve(SESSION_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -24,12 +55,6 @@ vi.mock("../../lib/api", () => ({
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
 }));
-
-const SERVER_ABOUT = {
-  acp_show_tool_durations: true,
-  acp_queue_drain_mode: "combined" as const,
-  acp_max_concurrent_resumes: 4,
-};
 
 function numberInputByLabel(
   container: HTMLElement,
@@ -48,7 +73,10 @@ function commit(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-function textareaByLabel(container: HTMLElement, label: string): HTMLTextAreaElement {
+function textareaByLabel(
+  container: HTMLElement,
+  label: string,
+): HTMLTextAreaElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
   const textarea = match?.parentElement?.querySelector("textarea");
@@ -88,7 +116,6 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
@@ -107,18 +134,23 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
     await screen.findByText("Auto-stop idle sessions (s)");
 
-    commit(numberInputByLabel(container, "Auto-stop idle sessions (s)"), "7200");
+    commit(
+      numberInputByLabel(container, "Auto-stop idle sessions (s)"),
+      "7200",
+    );
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: { auto_stop_idle_secs: 7200 },
-      }),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          session: { auto_stop_idle_secs: 7200 },
+        },
+      ),
     );
   });
 
@@ -128,25 +160,27 @@ describe("Session tab auto-stop idle field", () => {
         onClose={() => {}}
         tab="session"
         onSelectTab={() => {}}
-        serverAbout={SERVER_ABOUT as never}
         onServerAboutRefresh={() => {}}
       />,
     );
-    await screen.findByText("Structured view defaults");
+    await screen.findByText("Structured View Defaults");
 
     commitTextarea(
-      textareaByLabel(container, "Structured view defaults"),
+      textareaByLabel(container, "Structured View Defaults"),
       '{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}',
     );
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: {
-          acp_defaults: {
-            opencode: { model: "openai/gpt-5.5", effort: "high" },
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
+        "main",
+        {
+          session: {
+            acp_defaults: {
+              opencode: { model: "openai/gpt-5.5", effort: "high" },
+            },
           },
         },
-      }),
+      ),
     );
   });
 });

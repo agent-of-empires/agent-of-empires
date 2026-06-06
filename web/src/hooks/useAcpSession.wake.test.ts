@@ -60,11 +60,7 @@ async function flushAsync(): Promise<void> {
 }
 
 const wrapper = ({ children }: { children: ReactNode }) =>
-  createElement(
-    AgentProfileProvider,
-    { toolKey: "claude" },
-    children,
-  );
+  createElement(AgentProfileProvider, { toolKey: "claude" }, children);
 
 describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
   interface Call {
@@ -105,7 +101,10 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
         }
         if (url.endsWith("/snooze") && method === "PATCH") {
           return new Response(
-            JSON.stringify({ id: "sess-wake-PLACEHOLDER", snoozed_until: null }),
+            JSON.stringify({
+              id: "sess-wake-PLACEHOLDER",
+              snoozed_until: null,
+            }),
             { status: 200 },
           );
         }
@@ -270,8 +269,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     );
 
     const { result } = renderHook(
-      () =>
-        useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"),
+      () => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"),
       { wrapper },
     );
     await flushAsync();

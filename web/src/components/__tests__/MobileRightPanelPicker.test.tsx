@@ -5,7 +5,9 @@ import { fireEvent, render, screen } from "@testing-library/react";
 
 import { MobileRightPanelPicker } from "../MobileRightPanelPicker";
 
-function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {}) {
+function setup(
+  overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {},
+) {
   const onSelect = vi.fn();
   const onClose = vi.fn();
   render(

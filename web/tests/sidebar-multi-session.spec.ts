@@ -60,7 +60,9 @@ async function mockApis(page: Page, sessions: MockSession[]) {
     return r.fulfill({ json: { ok: true } });
   });
   await page.route("**/api/sessions/**", async (r) => {
-    const id = (r.request().url().split("/api/sessions/")[1] ?? "").split("/")[0];
+    const id = (r.request().url().split("/api/sessions/")[1] ?? "").split(
+      "/",
+    )[0];
     if (r.request().method() === "PATCH") {
       observed.sessionPatch = {
         id,
@@ -310,7 +312,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await projectHeader.click({ button: "right" });
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
-    await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
+    await menu
+      .locator("[data-testid='sidebar-group-context-menu-rename']")
+      .click();
 
     const input = page.locator("[data-testid='sidebar-group-rename-input']");
     await input.fill("Client Alpha");
@@ -320,7 +324,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.getByLabel("Filter sessions").click();
     const filter = page.locator("[data-testid='sidebar-filter-input']");
     await filter.fill("client alpha");
-    await expect(page.locator("[data-testid='sidebar-group-header']")).toHaveCount(1);
+    await expect(
+      page.locator("[data-testid='sidebar-group-header']"),
+    ).toHaveCount(1);
     await filter.fill("");
 
     await projectHeader.click({ button: "right" });
@@ -365,7 +371,9 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
+    await expect(
+      menu.locator("[data-testid='sidebar-group-context-menu-rename']"),
+    ).toBeVisible();
   });
 
   test("project strip is opt-in and supports configurable project navigation", async ({
@@ -407,7 +415,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.reload();
     const strip = page.locator("[data-testid='project-strip']");
     const projectTab = (name: string) =>
-      strip.locator("[data-testid='project-strip-tab']").filter({ hasText: name });
+      strip
+        .locator("[data-testid='project-strip-tab']")
+        .filter({ hasText: name });
     await expect(strip).toBeVisible();
     await page.goto("/");
     await expect(strip).toBeVisible();
@@ -424,13 +434,19 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page).toHaveURL(/\/session\/sess-a$/);
 
     await projectTab("alpha").dblclick();
-    await expect(page.locator("[data-testid='project-strip-menu']")).toBeVisible();
+    await expect(
+      page.locator("[data-testid='project-strip-menu']"),
+    ).toBeVisible();
     await page.mouse.click(8, 8);
-    await expect(page.locator("[data-testid='project-strip-menu']")).toHaveCount(0);
+    await expect(
+      page.locator("[data-testid='project-strip-menu']"),
+    ).toHaveCount(0);
 
     await projectTab("alpha").dblclick();
     await page.getByRole("menuitem", { name: /Rename project/i }).click();
-    const renameInput = page.locator("[data-testid='project-strip-rename-input']");
+    const renameInput = page.locator(
+      "[data-testid='project-strip-rename-input']",
+    );
     await renameInput.fill("Alpha Client");
     await renameInput.press("Enter");
     await expect(projectTab("Alpha Client")).toBeVisible();
@@ -450,7 +466,9 @@ test.describe("Sidebar multi-session (#956)", () => {
       "/tmp/alpha": { alias: "Alpha Client", color: "amber" },
     });
 
-    await expect(projectTab("Alpha Client").getByLabel("Project session status Running")).toBeVisible();
+    await expect(
+      projectTab("Alpha Client").getByLabel("Project session status Running"),
+    ).toBeVisible();
 
     const alphaBox = await projectTab("Alpha Client").boundingBox();
     const betaBox = await projectTab("beta").boundingBox();
@@ -474,18 +492,26 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.keyboard.press("Control+Alt+L");
     await expect(page).toHaveURL(/\/session\/sess-c$/);
 
-    const sessionChip = page.locator("[data-testid='project-strip-session']").filter({
-      hasText: "Goths",
-    });
+    const sessionChip = page
+      .locator("[data-testid='project-strip-session']")
+      .filter({
+        hasText: "Goths",
+      });
     await expect(sessionChip).toHaveCount(1);
     await expect(sessionChip).not.toContainText("gamma");
     await sessionChip.click({ button: "right" });
-    await expect(page.locator("[data-testid='project-strip-session-menu']")).toBeVisible();
+    await expect(
+      page.locator("[data-testid='project-strip-session-menu']"),
+    ).toBeVisible();
     await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
     await expect(page.getByRole("menuitem", { name: "Off" })).toBeVisible();
     await expect(page.getByRole("menuitem", { name: /Default/ })).toBeVisible();
-    await expect(page.getByRole("menuitem", { name: "All events" })).toBeVisible();
-    await expect(page.locator("[data-testid='project-strip-session-menu-delete']")).toBeVisible();
+    await expect(
+      page.getByRole("menuitem", { name: "All events" }),
+    ).toBeVisible();
+    await expect(
+      page.locator("[data-testid='project-strip-session-menu-delete']"),
+    ).toBeVisible();
     await page.getByRole("menuitem", { name: "All events" }).click();
     await expect
       .poll(() => observed.sessionPatch)
@@ -499,8 +525,12 @@ test.describe("Sidebar multi-session (#956)", () => {
       });
     await sessionChip.click({ button: "right" });
     await page.getByRole("menuitem", { name: "Rename" }).click();
-    await page.locator("[data-testid='project-strip-session-rename-input']").fill("Goths Renamed");
-    await page.locator("[data-testid='project-strip-session-rename-input']").press("Enter");
+    await page
+      .locator("[data-testid='project-strip-session-rename-input']")
+      .fill("Goths Renamed");
+    await page
+      .locator("[data-testid='project-strip-session-rename-input']")
+      .press("Enter");
     await expect
       .poll(() => observed.sessionPatch)
       .toMatchObject({ id: "sess-c", body: { title: "Goths Renamed" } });

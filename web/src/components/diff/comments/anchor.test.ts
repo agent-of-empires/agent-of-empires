@@ -33,12 +33,9 @@ function mkComment(overrides: Partial<DiffComment>): DiffComment {
 
 describe("anchorComments", () => {
   it("marks comments active when the range resolves", () => {
-    const [a] = anchorComments(
-      [mkComment({})],
-      "src/foo.rs",
-      undefined,
-      [mkHunk()],
-    );
+    const [a] = anchorComments([mkComment({})], "src/foo.rs", undefined, [
+      mkHunk(),
+    ]);
     expect(a.status).toBe("active");
     expect(a.hunkIndex).toBe(0);
     expect(a.contentChanged).toBe(false);

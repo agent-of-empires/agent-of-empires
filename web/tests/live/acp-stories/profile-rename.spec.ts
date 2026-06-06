@@ -22,7 +22,9 @@ base("rename a profile via ProfileSelector", async ({ page }, testInfo) => {
     await page.getByRole("button", { name: "+ New" }).click();
     await page.getByPlaceholder("Profile name").fill("rename-source");
     await page.getByRole("button", { name: "Create", exact: true }).click();
-    await expect(select.locator("option", { hasText: "rename-source" })).toHaveCount(1, {
+    await expect(
+      select.locator("option", { hasText: "rename-source" }),
+    ).toHaveCount(1, {
       timeout: 5_000,
     });
 
@@ -39,10 +41,14 @@ base("rename a profile via ProfileSelector", async ({ page }, testInfo) => {
     await input.fill("rename-target");
     await page.getByRole("button", { name: "Rename", exact: true }).click();
 
-    await expect(select.locator("option", { hasText: "rename-target" })).toHaveCount(1, {
+    await expect(
+      select.locator("option", { hasText: "rename-target" }),
+    ).toHaveCount(1, {
       timeout: 5_000,
     });
-    await expect(select.locator("option", { hasText: "rename-source" })).toHaveCount(0);
+    await expect(
+      select.locator("option", { hasText: "rename-source" }),
+    ).toHaveCount(0);
   } finally {
     await serve.stop();
   }

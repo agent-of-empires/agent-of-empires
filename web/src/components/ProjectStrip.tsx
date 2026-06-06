@@ -24,11 +24,7 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type {
-  RepoGroup,
-  SessionResponse,
-  SessionStatus,
-} from "../lib/types";
+import type { RepoGroup, SessionResponse, SessionStatus } from "../lib/types";
 import {
   REPO_COLOR_OPTIONS,
   type RepoAppearanceUpdate,
@@ -192,7 +188,9 @@ export function ProjectStrip({
     y: number;
   } | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
-  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(
+    null,
+  );
   const [sessionTitleOverrides, setSessionTitleOverrides] = useState<
     Record<string, string>
   >({});
@@ -203,7 +201,9 @@ export function ProjectStrip({
   const [minuteTick, setMinuteTick] = useState(() => Date.now());
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
+    useSensor(TouchSensor, {
+      activationConstraint: { delay: 150, tolerance: 8 },
+    }),
   );
 
   const openMenuForGroup = (groupId: string, element: HTMLElement) => {
@@ -224,7 +224,9 @@ export function ProjectStrip({
         .map((group) => {
           const sessions = groupSessions(group);
           const session = bestSession(sessions, idleDecayWindowMs);
-          const active = group.workspaces.some((w) => w.id === activeWorkspaceId);
+          const active = group.workspaces.some(
+            (w) => w.id === activeWorkspaceId,
+          );
           return {
             group,
             session,
@@ -236,12 +238,16 @@ export function ProjectStrip({
   );
 
   const activeItem =
-    items.find((item) => item.group.workspaces.some((w) => w.id === activeWorkspaceId)) ??
+    items.find((item) =>
+      item.group.workspaces.some((w) => w.id === activeWorkspaceId),
+    ) ??
     items[0] ??
     null;
 
   const activeWorkspaceItems = activeItem?.group.workspaces ?? [];
-  const activeSessions = activeItem ? uniqueGroupSessions(activeItem.group) : [];
+  const activeSessions = activeItem
+    ? uniqueGroupSessions(activeItem.group)
+    : [];
 
   const handleProjectDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -330,7 +336,8 @@ export function ProjectStrip({
     if (readOnly) return;
     setSessionMenu(null);
     setRenameValue(
-      sessionTitleOverrides[session.id] ?? (session.title.trim() || session.tool),
+      sessionTitleOverrides[session.id] ??
+        (session.title.trim() || session.tool),
     );
     setRenamingSessionId(session.id);
   };
@@ -339,7 +346,8 @@ export function ProjectStrip({
     setRenamingSessionId(null);
     if (readOnly) return;
     const trimmed = renameValue.trim();
-    const currentTitle = sessionTitleOverrides[session.id] ?? session.title.trim();
+    const currentTitle =
+      sessionTitleOverrides[session.id] ?? session.title.trim();
     if (!trimmed || trimmed === currentTitle) return;
     if (await renameSession(session.id, trimmed)) {
       setSessionTitleOverrides((titles) => ({
@@ -564,7 +572,9 @@ export function ProjectStrip({
                                 onClick={() => {
                                   if (readOnly) return;
                                   setMenu(null);
-                                  onUpdateAppearance(group.id, { color: option.id });
+                                  onUpdateAppearance(group.id, {
+                                    color: option.id,
+                                  });
                                 }}
                                 data-testid={`project-strip-color-${option.id}`}
                                 aria-label={`Set ${option.label} background`}
@@ -628,10 +638,7 @@ export function ProjectStrip({
             );
           const isRenaming = renamingSessionId === session.id;
           return (
-            <div
-              key={session.id}
-              className="relative shrink-0"
-            >
+            <div key={session.id} className="relative shrink-0">
               {isRenaming ? (
                 <input
                   autoFocus
@@ -650,7 +657,9 @@ export function ProjectStrip({
               ) : (
                 <button
                   type="button"
-                  aria-current={session.id === activeSessionId ? "page" : undefined}
+                  aria-current={
+                    session.id === activeSessionId ? "page" : undefined
+                  }
                   aria-haspopup="menu"
                   data-testid="project-strip-session"
                   onClick={() => onSelectSession(session.id)}
@@ -667,7 +676,11 @@ export function ProjectStrip({
                     }
                     e.preventDefault();
                     const rect = e.currentTarget.getBoundingClientRect();
-                    openMenuForSession(session.id, rect.left + 12, rect.bottom + 4);
+                    openMenuForSession(
+                      session.id,
+                      rect.left + 12,
+                      rect.bottom + 4,
+                    );
                   }}
                   className={`flex h-7 w-[8.5rem] items-center gap-1 rounded-md px-1.5 text-left transition-colors ${
                     session.id === activeSessionId
@@ -732,7 +745,9 @@ export function ProjectStrip({
                           disabled={readOnly}
                           onClick={() => void setNotifyPreset(session, preset)}
                           className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-surface-700/50 ${
-                            selected ? "text-text-primary" : "text-text-secondary"
+                            selected
+                              ? "text-text-primary"
+                              : "text-text-secondary"
                           } disabled:cursor-not-allowed disabled:opacity-40`}
                         >
                           <span className="w-3 text-brand-500">

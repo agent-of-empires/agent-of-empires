@@ -108,9 +108,7 @@ async function setup(page: Page) {
   );
   // Structured view REST endpoints (replay/snapshot/prompt): empty is fine, the
   // tool frame arrives over the WebSocket below.
-  await page.route("**/api/sessions/*/acp/**", (r) =>
-    r.fulfill({ json: {} }),
-  );
+  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
 
   // Terminal WS (only opened outside structured view mode): swallow it.
   await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {

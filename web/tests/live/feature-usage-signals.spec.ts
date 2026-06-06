@@ -20,10 +20,7 @@ function captureSeenPings(
 ): Array<{ surface?: string }> {
   const pings: Array<{ surface?: string }> = [];
   page.on("request", (req) => {
-    if (
-      req.method() === "POST" &&
-      req.url().includes("/api/telemetry/seen")
-    ) {
+    if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
       const body = req.postData();
       if (!body) return;
       try {

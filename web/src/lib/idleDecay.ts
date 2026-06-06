@@ -20,7 +20,11 @@ export function parseIdleDecayWindowMs(
   }
 
   const minutes = (theme as Record<string, unknown>).idle_decay_minutes;
-  if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) {
+  if (
+    typeof minutes !== "number" ||
+    !Number.isFinite(minutes) ||
+    minutes <= 0
+  ) {
     return DEFAULT_IDLE_DECAY_WINDOW_MS;
   }
 

@@ -18,7 +18,10 @@ export interface MockSessionInput {
 
 type MockSession = Required<MockSessionInput>;
 
-function fillCreatedAt(s: MockSessionInput, fallbackIndex: number): MockSession {
+function fillCreatedAt(
+  s: MockSessionInput,
+  fallbackIndex: number,
+): MockSession {
   return {
     ...s,
     // Stagger fallback timestamps a day apart so a list seeded in
@@ -55,7 +58,11 @@ function sessionResponse(s: MockSession) {
 /** Workspace id format used by the server: `<project_path>::<branch>`
  *  for branched sessions, `<project_path>::__session__::<id>` for
  *  ones without a branch. Mirrors `useWorkspaces.ts:31`. */
-export function workspaceId(s: { project_path: string; branch: string | null; id: string }): string {
+export function workspaceId(s: {
+  project_path: string;
+  branch: string | null;
+  id: string;
+}): string {
   return s.branch
     ? `${s.project_path}::${s.branch}`
     : `${s.project_path}::__session__::${s.id}`;
@@ -103,7 +110,10 @@ export async function installSidebarMocks(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: { sessions: filled.map(sessionResponse), workspace_ordering: ordering },
+      json: {
+        sessions: filled.map(sessionResponse),
+        workspace_ordering: ordering,
+      },
     });
   });
   await page.route("**/api/workspace-ordering", (r: Route) => {
@@ -134,13 +144,9 @@ export async function installSidebarMocks(
     "groups",
     "devices",
   ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: [] }),
-    );
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: {} }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: {} }));
 
   return handle;
 }

@@ -23,10 +23,7 @@
 import { ChevronUp } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type {
-  ConfigOptionDescriptor,
-  AcpState,
-} from "../../lib/acpTypes";
+import type { ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
 
 interface Props {
   configOptions: AcpState["configOptions"];
@@ -47,13 +44,10 @@ function optionMatches(
   option: ConfigOptionDescriptor["options"][number],
   query: string,
 ): boolean {
-  const terms = query
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean);
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return true;
-  const haystack = `${option.value} ${option.name} ${option.description ?? ""}`.toLowerCase();
+  const haystack =
+    `${option.value} ${option.name} ${option.description ?? ""}`.toLowerCase();
   return terms.every((term) => haystack.includes(term));
 }
 
@@ -151,15 +145,15 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
 
   return (
     <div ref={ref} className="relative">
-        <button
-          type="button"
-          onClick={() => {
-            if (open) {
-              closeMenu();
-            } else {
-              setOpen(true);
-            }
-          }}
+      <button
+        type="button"
+        onClick={() => {
+          if (open) {
+            closeMenu();
+          } else {
+            setOpen(true);
+          }
+        }}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -243,9 +237,7 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
                   </span>
                 )}
                 {isPending && (
-                  <span className="text-[10px] uppercase text-text-dim">
-                    …
-                  </span>
+                  <span className="text-[10px] uppercase text-text-dim">…</span>
                 )}
               </button>
             );

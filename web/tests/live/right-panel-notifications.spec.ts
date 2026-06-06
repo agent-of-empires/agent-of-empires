@@ -23,11 +23,7 @@ import {
   seedSessionViaAoeAdd,
   spawnAoeServe,
 } from "../helpers/aoeServe";
-import {
-  commitAll,
-  initWorkingRepo,
-  writeFiles,
-} from "../helpers/gitFixture";
+import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 
 base(
   "right panel paired terminal: Host shown, Container hidden on non-sandboxed session",
@@ -53,7 +49,9 @@ base(
       // first to scope subsequent selectors to that pane. The dashboard
       // mounts both a desktop and a mobile right panel (one hidden via
       // CSS), so use first() on visible-anywhere assertions.
-      await expect(page.getByText("Shell", { exact: true }).first()).toBeVisible({
+      await expect(
+        page.getByText("Shell", { exact: true }).first(),
+      ).toBeVisible({
         timeout: 10_000,
       });
       // Host button is rendered unconditionally; Container only when
@@ -105,7 +103,9 @@ base(
       const sessions = await listSessions(serve.baseUrl);
       const sessionId = sessions.find((s) => s.title === "rp-notif")?.id;
       if (!sessionId) {
-        throw new Error("seeded structured view session not visible in /api/sessions");
+        throw new Error(
+          "seeded structured view session not visible in /api/sessions",
+        );
       }
 
       // Flip per-session structured_view so the SPA renders the comments
@@ -135,10 +135,15 @@ base(
       // Wait for the file list to populate; one modified file expected.
       // first() picks the desktop right-panel copy (the dashboard also
       // mounts a mobile copy hidden via CSS).
-      await expect(page.getByText("1 file", { exact: true }).first()).toBeVisible({
+      await expect(
+        page.getByText("1 file", { exact: true }).first(),
+      ).toBeVisible({
         timeout: 15_000,
       });
-      await page.getByRole("button", { name: /notes\.md/ }).first().click();
+      await page
+        .getByRole("button", { name: /notes\.md/ })
+        .first()
+        .click();
 
       // First gutter "+" click sets range start; the same line again
       // closes the range and opens the inline form. The buttons are
@@ -174,9 +179,10 @@ base(
         .getByRole("button", { name: "Discard all", exact: true })
         .first()
         .click();
-      await expect(
-        page.getByText("1 comment", { exact: true }),
-      ).toHaveCount(0, { timeout: 10_000 });
+      await expect(page.getByText("1 comment", { exact: true })).toHaveCount(
+        0,
+        { timeout: 10_000 },
+      );
     } finally {
       await serve.stop();
     }

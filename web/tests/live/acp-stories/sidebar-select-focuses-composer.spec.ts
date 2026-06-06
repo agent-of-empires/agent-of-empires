@@ -10,7 +10,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { enableStructuredViewAndWait, waitForStructuredView } from "../../helpers/acp";
+import {
+  enableStructuredViewAndWait,
+  waitForStructuredView,
+} from "../../helpers/acp";
 
 base(
   "desktop: re-selecting the active structured view session refocuses the composer",
@@ -32,9 +35,7 @@ base(
       await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
       await page.goto(serve.baseUrl);
-      const row = page
-        .locator('[data-testid="sidebar-session-row"]')
-        .first();
+      const row = page.locator('[data-testid="sidebar-session-row"]').first();
       await expect(row).toBeVisible({ timeout: 10_000 });
 
       // First select: navigates into the structured view session and mounts the
@@ -115,9 +116,7 @@ base(
       await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
       await page.goto(serve.baseUrl);
-      const row = page
-        .locator('[data-testid="sidebar-session-row"]')
-        .first();
+      const row = page.locator('[data-testid="sidebar-session-row"]').first();
       await expect(row).toBeVisible({ timeout: 10_000 });
 
       await row.click();

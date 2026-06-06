@@ -78,7 +78,10 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     );
     const assistant = messages.find((m) => m.role === "assistant");
     expect(assistant).toBeDefined();
-    const parts = (assistant!.content as Array<{ type: string; toolName?: string }>);
+    const parts = assistant!.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
     const toolParts = parts.filter((p) => p.type === "tool-call");
     expect(toolParts).toHaveLength(1);
     expect(toolParts[0]!.toolName).toBe(TOOL_GROUP_NAME);
@@ -90,7 +93,10 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       false,
     );
     const assistant = messages.find((m) => m.role === "assistant")!;
-    const parts = (assistant.content as Array<{ type: string; toolName?: string }>);
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
     const toolParts = parts.filter((p) => p.type === "tool-call");
     expect(toolParts).toHaveLength(2);
     for (const p of toolParts) expect(p.toolName).not.toBe(TOOL_GROUP_NAME);
@@ -111,7 +117,10 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       false,
     );
     const assistant = messages.find((m) => m.role === "assistant")!;
-    const parts = (assistant.content as Array<{ type: string; toolName?: string }>);
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
     const groups = parts.filter(
       (p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME,
     );
@@ -144,7 +153,10 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       false,
     );
     const assistant = messages.find((m) => m.role === "assistant")!;
-    const parts = (assistant.content as Array<{ type: string; toolName?: string }>);
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
     const groups = parts.filter(
       (p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME,
     );
@@ -459,7 +471,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     const assistants = messages.filter((m) => m.role === "assistant");
     expect(assistants).toHaveLength(2);
     for (const m of assistants) {
-      const parts = (m.content as Array<{ type: string; toolName?: string }>);
+      const parts = m.content as Array<{ type: string; toolName?: string }>;
       for (const p of parts.filter((p) => p.type === "tool-call")) {
         expect(p.toolName).not.toBe(TOOL_GROUP_NAME);
       }

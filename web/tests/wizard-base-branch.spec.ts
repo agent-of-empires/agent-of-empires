@@ -23,7 +23,9 @@ async function mockApis(page: Page) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "settings" || path === "about" || path === "system/update-status"
+          path === "settings" ||
+          path === "about" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -83,7 +85,9 @@ async function mockApis(page: Page) {
 async function openWizardOnSessionStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
   // Wait for the seeded recent project to populate (driven by
   // /api/sessions which the test mocks).
   const recentBtn = page
@@ -107,7 +111,9 @@ async function expandAdvanced(page: Page) {
 }
 
 test.describe("Wizard base branch (#948)", () => {
-  test("Base branch section is collapsed by default on the session step", async ({ page }) => {
+  test("Base branch section is collapsed by default on the session step", async ({
+    page,
+  }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -153,9 +159,9 @@ test.describe("Wizard base branch (#948)", () => {
     await expandAdvanced(page);
     await page.getByRole("button", { name: "Base branch" }).click();
     await expect(page.getByLabel("Base branch")).toBeVisible();
-    await expect.poll(() => capturedUrl?.searchParams.get("include_remote")).toBe(
-      "true",
-    );
+    await expect
+      .poll(() => capturedUrl?.searchParams.get("include_remote"))
+      .toBe("true");
   });
 
   test("selecting a remote-only branch populates the base-branch input", async ({

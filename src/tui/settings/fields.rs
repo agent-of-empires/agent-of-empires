@@ -262,6 +262,25 @@ impl SettingField {
             {
                 validate_snooze_duration(*n)
             }
+            // acp_defaults is edited as raw JSON; require a JSON object so a
+            // typo is rejected at commit instead of wiping the map.
+            (
+                FieldKind::Schema {
+                    widget: WidgetKind::Custom { id },
+                    ..
+                },
+                FieldValue::Text(s),
+            ) if id == "acp-defaults" => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(());
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) if v.is_object() => Ok(()),
+                    Ok(_) => Err("Must be a JSON object (agent -> {model, effort})".to_string()),
+                    Err(e) => Err(format!("Invalid JSON: {e}")),
+                }
+            }
             // Sound files must exist on disk if named.
             (FieldKind::Schema { section, .. }, FieldValue::OptionalText(Some(name)))
                 if section == "sound" =>
@@ -443,6 +462,17 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             let selected = volume_to_index(current.as_f64().unwrap_or(1.0));
             FieldValue::Select { selected, options }
         }
+        "acp-defaults" => {
+            // Edited as raw JSON in an inline field; validation on commit
+            // rejects anything that is not a JSON object, so a typo cannot
+            // wipe the map.
+            let text = if current.is_null() {
+                "{}".to_string()
+            } else {
+                serde_json::to_string(current).unwrap_or_else(|_| "{}".to_string())
+            };
+            FieldValue::Text(text)
+        }
         // logging-targets is expanded into per-target rows during build and
         // never lands here.
         _ => FieldValue::Text(String::new()),
@@ -538,6 +568,18 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             .get(*selected)
             .map(|s| json!(volume_from_option(s)))
             .unwrap_or(Value::Null),
+        ("acp-defaults", FieldValue::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return json!({});
+            }
+            // Commit-time validation guarantees a valid object here; fall back
+            // to an empty map rather than corrupt the leaf if it ever slips.
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(v) if v.is_object() => v,
+                _ => json!({}),
+            }
+        }
         _ => Value::Null,
     }
 }
@@ -992,6 +1034,37 @@ mod tests {
 
     fn profile_from(value: serde_json::Value) -> ProfileConfig {
         serde_json::from_value(value).expect("profile override deserializes")
+    }
+
+    #[test]
+    fn acp_defaults_custom_widget_round_trips_json() {
+        let current = json!({"opencode": {"model": "x", "effort": "high"}});
+        let fv = custom_value_from_json("acp-defaults", &current);
+        let FieldValue::Text(s) = &fv else {
+            panic!("acp-defaults must build a Text field");
+        };
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text(s.clone())),
+            current,
+        );
+
+        // Empty text and a null current both resolve to an empty map, never a
+        // corrupt leaf.
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text(String::new())),
+            json!({}),
+        );
+        assert!(matches!(
+            custom_value_from_json("acp-defaults", &Value::Null),
+            FieldValue::Text(t) if t == "{}"
+        ));
+
+        // Non-object JSON (which validation rejects before commit) degrades to
+        // an empty map rather than writing a string/array into the field.
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
+            json!({}),
+        );
     }
 
     #[test]

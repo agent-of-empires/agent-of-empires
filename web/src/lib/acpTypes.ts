@@ -6,11 +6,7 @@
 
 import type { DiffComment } from "../components/diff/comments/types";
 
-export type ApprovalDecision =
-  | "Allow"
-  | "AllowAlways"
-  | "Deny"
-  | "Cancelled";
+export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
 export type SessionMode =
   | "Default"
@@ -81,6 +77,36 @@ export interface DiffPreview {
   new_text?: string | null;
   created_at: string;
 }
+
+/** One renderable block of a tool call's completion payload, bridged from
+ *  an ACP `ToolCallContent` block (mirrors the Rust `ToolOutputBlock`).
+ *  Carries the structured media shape so the card renders images / audio /
+ *  resources that arrive only at completion instead of collapsing them to
+ *  the status word. See #1818. */
+export type ToolOutputBlock =
+  | { kind: "text"; text: string }
+  | {
+      kind: "image";
+      mime_type: string;
+      data?: string | null;
+      uri?: string | null;
+    }
+  | { kind: "audio"; mime_type: string; data?: string | null }
+  | {
+      kind: "resource_link";
+      uri: string;
+      name: string;
+      mime_type?: string | null;
+    }
+  | {
+      kind: "resource";
+      uri: string;
+      mime_type?: string | null;
+      text?: string | null;
+      /** Base64 bytes for a binary (blob) resource, offered as a download
+       *  when present. Absent for text resources or oversized blobs. */
+      data?: string | null;
+    };
 
 export interface RateLimitInfo {
   status: string;
@@ -211,7 +237,11 @@ export type IncompatibleAgentDetail =
 // { "ApprovalRequested": { "approval": ... } }.
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
-  | { TodoListUpdated: { todos: Array<{ id: string; text: string; completed: boolean }> } }
+  | {
+      TodoListUpdated: {
+        todos: Array<{ id: string; text: string; completed: boolean }>;
+      };
+    }
   | { ToolCallStarted: { tool_call: ToolCall } }
   | {
       ToolCallCompleted: {
@@ -221,6 +251,10 @@ export type AcpEvent =
          *  ACP `ToolCallUpdate.fields.content`. Empty when the agent
          *  emitted no content blocks on completion. */
         content: string;
+        /** Structured completion payload (images / audio / resources +
+         *  text) bridged from the ACP content blocks. Empty/absent for
+         *  text-only completions, which render from `content`. See #1818. */
+        output?: ToolOutputBlock[];
         /** Server-side ISO-8601 wall clock at which the completion
          *  was minted. Used to stamp the activity row's `at` so the
          *  duration label survives page reload; without it, the
@@ -296,7 +330,9 @@ export type AcpEvent =
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
-  | { UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] } }
+  | {
+      UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] };
+    }
   | {
       UserDiffCommentsPrompt: {
         intro: string;
@@ -458,7 +494,11 @@ export interface AcpState {
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
    *  four-mode taxonomy in that case. */
-  availableModes: Array<{ id: string; name: string; description?: string | null }>;
+  availableModes: Array<{
+    id: string;
+    name: string;
+    description?: string | null;
+  }>;
   currentModeId: string | null;
   /** Slash commands the agent advertised in its most recent
    *  `AvailableCommandsUpdate`. Empty until the agent emits one; the
@@ -660,6 +700,11 @@ export interface ActivityRow {
    *  Set from the optimistic local preview on send, or from the
    *  server `UserPromptSent` refs on replay. See #1000 / #965. */
   attachments?: AcpAttachment[];
+  /** Structured completion payload on `tool_complete` / `tool_error`
+   *  rows: media/resource blocks the card renders richly when the agent
+   *  ships them only at completion. Absent for text-only completions
+   *  (those render from `text`). See #1818. */
+  output?: ToolOutputBlock[];
   at: string; // ISO-8601
 }
 
@@ -783,10 +828,7 @@ function applyNewTurnResets(next: AcpState): void {
  *  so reconnect/replay can re-deliver buffered frames without
  *  double-applying them (duplicate tool cards, doubled message
  *  chunks, etc.). */
-export function applyEvent(
-  state: AcpState,
-  frame: AcpFrame,
-): AcpState {
+export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if (frame.seq <= state.lastSeq) {
     return state;
   }
@@ -915,7 +957,7 @@ export function applyEvent(
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, completed_at } =
+    const { tool_call_id, is_error, content, output, completed_at } =
       event.ToolCallCompleted;
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
@@ -959,6 +1001,7 @@ export function applyEvent(
       kind: is_error ? "tool_error" : "tool_complete",
       text,
       toolCallId: tool_call_id,
+      output: output && output.length > 0 ? output : undefined,
       at: completed_at ?? new Date().toISOString(),
     });
     return next;
@@ -1069,9 +1112,19 @@ export function applyEvent(
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
     if (next.usageBaseline && incoming.cost) {
-      const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
-      const rebasedCost = { amount: rebasedAmount, currency: incoming.cost.currency };
-      next.sessionUsage = { used: incoming.used, size: incoming.size, cost: rebasedCost };
+      const rebasedAmount = Math.max(
+        0,
+        incoming.cost.amount - next.usageBaseline.cost,
+      );
+      const rebasedCost = {
+        amount: rebasedAmount,
+        currency: incoming.cost.currency,
+      };
+      next.sessionUsage = {
+        used: incoming.used,
+        size: incoming.size,
+        cost: rebasedCost,
+      };
     } else {
       next.sessionUsage = incoming;
     }
@@ -1143,7 +1196,8 @@ export function applyEvent(
     return next;
   }
   if ("AgentMessageChunk" in event) {
-    next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
+    next.assistantMessage =
+      next.assistantMessage + event.AgentMessageChunk.text;
     // Visible assistant text means the agent is answering, not thinking.
     // A later reasoning block re-sets `thinking` via ThinkingStarted. See
     // #1213.
@@ -1390,7 +1444,8 @@ export function applyEvent(
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
-        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
+        attachments:
+          serverAttachments.length > 0 ? serverAttachments : undefined,
         at: new Date().toISOString(),
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
@@ -1663,9 +1718,7 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
         : prev.args_preview,
     started_at: startedAt,
     diffs:
-      incoming.diffs && incoming.diffs.length > 0
-        ? incoming.diffs
-        : prev.diffs,
+      incoming.diffs && incoming.diffs.length > 0 ? incoming.diffs : prev.diffs,
     parent_tool_call_id:
       incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
     memory_recall: incoming.memory_recall ?? prev.memory_recall,

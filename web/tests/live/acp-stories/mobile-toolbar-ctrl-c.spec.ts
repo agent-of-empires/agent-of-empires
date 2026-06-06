@@ -21,7 +21,8 @@ base("mobile toolbar Ctrl+C button sends ETX", async ({ page }, testInfo) => {
   try {
     const sessions = await listSessions(serve.baseUrl);
     const seeded = sessions.find((s) => s.title === "story-mobile-ctrl-c");
-    if (!seeded) throw new Error("seeded session 'story-mobile-ctrl-c' missing");
+    if (!seeded)
+      throw new Error("seeded session 'story-mobile-ctrl-c' missing");
     const sessionId = seeded.id;
 
     await page.addInitScript(() => {
@@ -46,7 +47,9 @@ base("mobile toolbar Ctrl+C button sends ETX", async ({ page }, testInfo) => {
       };
     });
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
 
     const ctrlC = page.getByRole("button", { name: "Ctrl+C interrupt" });
     await expect(ctrlC).toBeVisible({ timeout: 15_000 });

@@ -6,9 +6,7 @@
       "id": "dashboard.golden-path",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/golden-path.spec.ts"
-      ],
+      "specs": ["tests/live/golden-path.spec.ts"],
       "components": [
         "web/src/components/Dashboard.tsx",
         "web/src/components/TerminalView.tsx",
@@ -19,84 +17,56 @@
       "id": "session.create-duplicate-worktree-error",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/session-create-duplicate-worktree.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
-      ]
+      "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
     },
     {
       "id": "terminal.live-output-resize",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/useTerminal.lifecycle.test.ts"
-      ],
-      "components": [
-        "web/src/hooks/useTerminal.ts"
-      ]
+      "specs": ["src/hooks/useTerminal.lifecycle.test.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
       "id": "terminal.copy-on-select",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/terminal-copy-select.spec.ts"
-      ],
-      "components": [
-        "web/src/hooks/useTerminal.ts"
-      ]
+      "specs": ["tests/live/terminal-copy-select.spec.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
       "id": "terminal.ws-reconnect",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/ws-reconnect.spec.ts"
-      ],
-      "components": [
-        "web/src/hooks/useTerminal.ts"
-      ]
+      "specs": ["tests/ws-reconnect.spec.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
       "id": "terminal.mobile-backspace-autorepeat",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/backspace-autorepeat.spec.ts"
-      ],
-      "components": [
-        "web/src/hooks/useTerminal.ts"
-      ]
+      "specs": ["tests/backspace-autorepeat.spec.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/auth-no-auth.spec.ts"
-      ],
+      "specs": ["tests/live/auth-no-auth.spec.ts"],
       "components": []
     },
     {
       "id": "auth.passphrase-login",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/auth-login-passphrase.spec.ts"
-      ],
-      "components": [
-        "web/src/components/LoginPage.tsx"
-      ]
+      "specs": ["tests/live/auth-login-passphrase.spec.ts"],
+      "components": ["web/src/components/LoginPage.tsx"]
     },
     {
       "id": "auth.token-entry",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/auth-token-entry.spec.ts"
-      ],
+      "specs": ["tests/live/auth-token-entry.spec.ts"],
       "components": [
         "web/src/components/TokenEntryPage.tsx",
         "web/src/lib/token.ts"
@@ -106,32 +76,24 @@
       "id": "auth.token-rotation",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/auth-token-rotation.spec.ts"
-      ],
-      "components": [
-        "src/server/mod.rs"
-      ]
+      "specs": ["tests/live/auth-token-rotation.spec.ts"],
+      "components": ["src/server/mod.rs"]
     },
     {
       "id": "settings.theme-persistence",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/settings-persistence-theme.spec.ts"
-      ],
+      "specs": ["tests/live/settings-persistence-theme.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/ThemeSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/mobile-settings-header.spec.ts"
-      ],
+      "specs": ["tests/mobile-settings-header.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsHeader.tsx",
@@ -142,12 +104,8 @@
       "id": "settings.header-branches",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/SettingsHeader.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/SettingsHeader.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/SettingsHeader.test.tsx"],
+      "components": ["web/src/components/settings/SettingsHeader.tsx"]
     },
     {
       "id": "settings.telemetry-consent",
@@ -166,12 +124,8 @@
       "id": "telemetry.acp-seen",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-telemetry-seen.spec.ts"
-      ],
-      "components": [
-        "web/src/App.tsx"
-      ]
+      "specs": ["tests/live/acp-telemetry-seen.spec.ts"],
+      "components": ["web/src/App.tsx"]
     },
     {
       "id": "telemetry.form-factor",
@@ -181,22 +135,14 @@
         "tests/live/telemetry-form-factor.spec.ts",
         "src/lib/__tests__/formFactor.test.ts"
       ],
-      "components": [
-        "web/src/lib/formFactor.ts",
-        "web/src/lib/api.ts"
-      ]
+      "components": ["web/src/lib/formFactor.ts", "web/src/lib/api.ts"]
     },
     {
       "id": "telemetry.structured-interaction",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/useAcpSession.queue.test.ts"
-      ],
-      "components": [
-        "web/src/hooks/useAcpSession.ts",
-        "web/src/lib/api.ts"
-      ]
+      "specs": ["src/hooks/useAcpSession.queue.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
       "id": "telemetry.feature-usage-signals",
@@ -217,96 +163,57 @@
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/settings-persistence-theme-passphrase.spec.ts"
-      ],
+      "specs": ["tests/live/settings-persistence-theme-passphrase.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/ElevationPrompt.tsx",
         "web/src/lib/fetchInterceptor.ts"
       ]
     },
     {
-      "id": "settings.sound-payload",
+      "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/SoundSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/SoundSettings.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
+      "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
-      "id": "settings.update-payload",
-      "kind": "vitest",
+      "id": "settings.schema-persistence",
+      "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/UpdateSettings.test.tsx"
-      ],
+      "specs": ["tests/live/settings-persistence-schema.spec.ts"],
       "components": [
-        "web/src/components/settings/UpdateSettings.tsx"
-      ]
-    },
-    {
-      "id": "settings.tmux-payload",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/TmuxSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/TmuxSettings.tsx"
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
       "id": "settings.tmux-persistence",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/settings-persistence-tmux.spec.ts"
-      ],
+      "specs": ["tests/live/settings-persistence-tmux.spec.ts"],
       "components": []
     },
     {
       "id": "settings.acp-persistence",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/settings-persistence-acp.spec.ts"
-      ],
-      "components": [
-        "web/src/components/SettingsView.tsx"
-      ]
-    },
-    {
-      "id": "settings.theme-payload",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/ThemeSettings.test.tsx"
-      ],
-      "components": []
+      "specs": ["tests/live/settings-persistence-acp.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx"]
     },
     {
       "id": "settings.sidebar-tui-grouping",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/__tests__/SettingsView.test.tsx"
-      ],
-      "components": [
-        "web/src/components/SettingsView.tsx"
-      ]
+      "specs": ["src/components/__tests__/SettingsView.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx"]
     },
     {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SettingsView.folds.test.tsx"
-      ],
+      "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/FormFields.tsx"
@@ -316,9 +223,7 @@
       "id": "settings.session-auto-stop-idle",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SettingsView.session.test.tsx"
-      ],
+      "specs": ["src/components/__tests__/SettingsView.session.test.tsx"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/FormFields.tsx"
@@ -328,22 +233,18 @@
       "id": "settings.advanced-fold-persistence",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/settings-advanced-fold.spec.ts"
-      ],
+      "specs": ["tests/live/settings-advanced-fold.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/FormFields.tsx",
-        "web/src/components/settings/LoggingSettings.tsx"
+        "web/src/components/settings/SchemaSection.tsx"
       ]
     },
     {
       "id": "settings.schema-renderer",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/SchemaSection.test.tsx"
-      ],
+      "specs": ["src/components/settings/__tests__/SchemaSection.test.tsx"],
       "components": [
         "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
@@ -351,46 +252,24 @@
       ]
     },
     {
-      "id": "settings.logging-payload",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/LoggingSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/LoggingSettings.tsx",
-        "web/src/components/settings/FormFields.tsx"
-      ]
-    },
-    {
       "id": "settings.notifications",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/NotificationSettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/NotificationSettings.tsx"
-      ]
+      "specs": ["src/components/__tests__/NotificationSettings.test.tsx"],
+      "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/__tests__/SecuritySettings.test.tsx"
-      ],
-      "components": [
-        "web/src/components/SecuritySettings.tsx"
-      ]
+      "specs": ["src/components/__tests__/SecuritySettings.test.tsx"],
+      "components": ["web/src/components/SecuritySettings.tsx"]
     },
     {
       "id": "settings.terminal-localstorage",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/TerminalSettings.test.tsx"
-      ],
+      "specs": ["src/components/__tests__/TerminalSettings.test.tsx"],
       "components": [
         "web/src/components/TerminalSettings.tsx",
         "web/src/components/TerminalSessionStack.tsx"
@@ -400,52 +279,36 @@
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/__tests__/TopBar.test.tsx"
-      ],
-      "components": [
-        "web/src/components/TopBar.tsx"
-      ]
+      "specs": ["src/components/__tests__/TopBar.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx"]
     },
     {
       "id": "app-shell.routing",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/routing.spec.ts"
-      ],
+      "specs": ["tests/routing.spec.ts"],
       "components": []
     },
     {
       "id": "app-shell.sessions-loaded-sentinel",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/hooks/useSessions.test.ts"
-      ],
+      "specs": ["src/hooks/useSessions.test.ts"],
       "components": []
     },
     {
       "id": "profiles.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/profile-lifecycle.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ProfileSelector.tsx"
-      ]
+      "specs": ["tests/live/profile-lifecycle.spec.ts"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
       "id": "profiles.page",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/profiles-page.spec.ts"
-      ],
-      "components": [
-        "web/src/components/profiles/ProfilesPage.tsx"
-      ]
+      "specs": ["tests/live/profiles-page.spec.ts"],
+      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
     },
     {
       "id": "profiles.hooks-readonly",
@@ -455,9 +318,7 @@
         "src/components/profiles/__tests__/HooksReadOnlyPanel.test.tsx",
         "src/lib/profileHooks.test.ts"
       ],
-      "components": [
-        "web/src/components/profiles/HooksReadOnlyPanel.tsx"
-      ]
+      "components": ["web/src/components/profiles/HooksReadOnlyPanel.tsx"]
     },
     {
       "id": "profiles.write-guard",
@@ -467,35 +328,27 @@
         "src/lib/api.test.ts",
         "src/components/profiles/__tests__/ProfilesPage.test.tsx"
       ],
-      "components": [
-        "web/src/components/profiles/ProfilesPage.tsx"
-      ]
+      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
     },
     {
       "id": "profiles.override",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/profile-override.spec.ts"
-      ],
+      "specs": ["tests/live/profile-override.spec.ts"],
       "components": []
     },
     {
       "id": "profiles.name-validation",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/ProfileSelector.test.tsx"
-      ],
+      "specs": ["src/components/settings/__tests__/ProfileSelector.test.tsx"],
       "components": []
     },
     {
       "id": "profiles.selection-resolve",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SettingsView.test.tsx"
-      ],
+      "specs": ["src/components/__tests__/SettingsView.test.tsx"],
       "components": []
     },
     {
@@ -542,20 +395,14 @@
       "id": "wizard.multi-repo-stale-base",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/multi-repo-stale-base.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx"
-      ]
+      "specs": ["tests/live/multi-repo-stale-base.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
       "id": "wizard.resolved-launch-command",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/wizard-resolved-launch-command.spec.ts"
-      ],
+      "specs": ["tests/live/wizard-resolved-launch-command.spec.ts"],
       "components": [
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
@@ -565,9 +412,7 @@
       "id": "acp.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-custom-agent.spec.ts"
-      ],
+      "specs": ["tests/live/acp-custom-agent.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
@@ -578,21 +423,15 @@
       "id": "wizard.profile-description",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/wizard-agent-step.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/AgentStep.tsx"
-      ]
+      "specs": ["tests/wizard-agent-step.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/AgentStep.tsx"]
     },
     {
       "id": "wizard.scratch-toggle-visible",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/wizard-scratch-toggle-visible.spec.ts"],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "wizard.scratch-enables-next",
@@ -610,9 +449,7 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/wizard-scratch-hides-worktree.spec.ts"],
-      "components": [
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
-      ]
+      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
       "id": "wizard.scratch-launch",
@@ -641,9 +478,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/wizard-scratch-delete-cleans-tempdir.spec.ts"],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx"
-      ]
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
       "id": "wizard.recent-hides-workspaces",
@@ -652,9 +487,7 @@
       "specs": [
         "src/components/session-wizard/__tests__/ProjectStep.workspace.test.tsx"
       ],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "wizard.scratch-shortcut",
@@ -695,53 +528,35 @@
       "id": "directory-browser",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/directory-browser.spec.ts"
-      ],
-      "components": [
-        "web/src/components/DirectoryBrowser.tsx"
-      ]
+      "specs": ["tests/live/directory-browser.spec.ts"],
+      "components": ["web/src/components/DirectoryBrowser.tsx"]
     },
     {
       "id": "sidebar.groups",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/sidebar-groups.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/sidebar-groups.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
-      "specs": [
-        "tests/sidebar-multi-session.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.workspace-ordering",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/workspace-ordering.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/workspace-ordering.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.group-reorder",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/sidebar-group-reorder.spec.ts"
-      ],
+      "specs": ["tests/live/sidebar-group-reorder.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useRepoGroups.ts"
@@ -751,100 +566,64 @@
       "id": "sidebar.empty-state",
       "kind": "mocked-playwright",
       "risk": "low",
-      "specs": [
-        "tests/sidebar-empty-state.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-empty-state.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-stationary-click",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-reorder-stationary-click-navigates.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-stationary-click-navigates.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-tiny-drag-noop",
       "kind": "mocked-playwright",
       "risk": "low",
-      "specs": [
-        "tests/sidebar-reorder-tiny-drag-noop.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-tiny-drag-noop.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-click-after-drag-suppressed",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/sidebar-reorder-click-after-drag-suppressed.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-click-after-drag-suppressed.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-cross-group-noop",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-reorder-cross-group-noop.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-cross-group-noop.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-read-only",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-reorder-read-only.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-read-only.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-mobile-tap-navigates",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-reorder-mobile-tap-navigates.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-mobile-tap-navigates.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-mobile-flick-scrolls",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-reorder-mobile-flick-scrolls.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-mobile-flick-scrolls.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.reorder-mobile-press-hold",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/sidebar-reorder-mobile-press-hold-reorders.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-reorder-mobile-press-hold-reorders.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-reorder-reload-persists",
@@ -853,20 +632,14 @@
       "specs": [
         "tests/live/acp-stories/sidebar-reorder-reload-persists.spec.ts"
       ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.client-side-navigation",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/sidebar-multi-session.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "project-strip.navigation",
@@ -886,56 +659,42 @@
       "id": "sidebar.ios-callout-suppression",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/ios-callout-suppression.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/ios-callout-suppression.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.favorite-indicator",
       "kind": "deferred",
       "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/986",
       "risk": "low",
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.sort-pure",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/__tests__/sidebarSort.test.ts"
-      ],
+      "specs": ["src/lib/__tests__/sidebarSort.test.ts"],
       "components": []
     },
     {
       "id": "sidebar.sort-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/useSidebarSortMode.test.ts"
-      ],
+      "specs": ["src/hooks/useSidebarSortMode.test.ts"],
       "components": []
     },
     {
       "id": "sidebar.repo-groups-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/useRepoGroups.test.ts"
-      ],
+      "specs": ["src/hooks/useRepoGroups.test.ts"],
       "components": []
     },
     {
       "id": "sidebar.sort-toggle-ui",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/sidebar-sort-mode.spec.ts"
-      ],
+      "specs": ["tests/sidebar-sort-mode.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SidebarSortPicker.tsx",
@@ -946,9 +705,7 @@
       "id": "sidebar.sort-live",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/sidebar-sort-mode.spec.ts"
-      ],
+      "specs": ["tests/live/sidebar-sort-mode.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SidebarSortPicker.tsx"
@@ -958,31 +715,21 @@
       "id": "sidebar.group-axis-pure",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/__tests__/sidebarGroups.test.ts"
-      ],
-      "components": [
-        "web/src/lib/sidebarGroups.ts"
-      ]
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
     },
     {
       "id": "sidebar.axis-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/useSidebarAxis.test.ts"
-      ],
-      "components": [
-        "web/src/hooks/useSidebarAxis.ts"
-      ]
+      "specs": ["src/hooks/useSidebarAxis.test.ts"],
+      "components": ["web/src/hooks/useSidebarAxis.ts"]
     },
     {
       "id": "sidebar.group-axis-live",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/sidebar-groups-axis.spec.ts"
-      ],
+      "specs": ["tests/live/sidebar-groups-axis.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useSessionGroups.ts",
@@ -993,20 +740,14 @@
       "id": "sidebar.nested-axis-pure",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/__tests__/sidebarGroups.test.ts"
-      ],
-      "components": [
-        "web/src/lib/sidebarGroups.ts"
-      ]
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
     },
     {
       "id": "sidebar.nested-axis-live",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/sidebar-nested-axis.spec.ts"
-      ],
+      "specs": ["tests/live/sidebar-nested-axis.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useNestedSidebarGroups.ts",
@@ -1030,10 +771,7 @@
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/session-group-edit.spec.ts",
-        "src/lib/api.test.ts"
-      ],
+      "specs": ["tests/live/session-group-edit.spec.ts", "src/lib/api.test.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SessionGroupModal.tsx",
@@ -1044,12 +782,8 @@
       "id": "session.delete-dialog-keyboard",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/__tests__/DeleteSessionDialog.test.tsx"
-      ],
-      "components": [
-        "web/src/components/DeleteSessionDialog.tsx"
-      ]
+      "specs": ["src/components/__tests__/DeleteSessionDialog.test.tsx"],
+      "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
       "id": "storage.quota-crash-regression",
@@ -1107,9 +841,7 @@
       "id": "diff-comments.send-flow",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/diff-comments.spec.ts"
-      ],
+      "specs": ["tests/diff-comments.spec.ts"],
       "components": [
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
@@ -1141,17 +873,13 @@
         "src/components/diff/comments/storage.sweep.test.ts",
         "src/hooks/useDiffComments.rtl.test.tsx"
       ],
-      "components": [
-        "web/src/components/diff/comments/storage.ts"
-      ]
+      "components": ["web/src/components/diff/comments/storage.ts"]
     },
     {
       "id": "right-panel.mobile-picker",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/mobile-right-panel-picker.spec.ts"
-      ],
+      "specs": ["tests/mobile-right-panel-picker.spec.ts"],
       "components": [
         "web/src/components/MobileRightPanelPicker.tsx",
         "web/src/components/MobileMainPane.tsx",
@@ -1209,9 +937,7 @@
       "id": "settings.diff-section",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/settings/__tests__/DiffSettings.test.tsx"
-      ],
+      "specs": ["src/components/settings/__tests__/DiffSettings.test.tsx"],
       "components": [
         "web/src/components/settings/DiffSettings.tsx",
         "web/src/components/SettingsView.tsx"
@@ -1220,43 +946,32 @@
     {
       "id": "devices",
       "kind": "live-playwright",
-      "risk": "low",
+      "risk": "medium",
       "specs": [
-        "tests/live/devices.spec.ts"
+        "tests/live/devices.spec.ts",
+        "tests/live/login-session-persistence.spec.ts"
       ],
-      "components": [
-        "web/src/components/ConnectedDevices.tsx"
-      ]
+      "components": ["web/src/components/ConnectedDevices.tsx"]
     },
     {
       "id": "connectivity.disconnect-banner",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/disconnect-banner.spec.ts"
-      ],
-      "components": [
-        "web/src/components/DisconnectBanner.tsx"
-      ]
+      "specs": ["tests/live/disconnect-banner.spec.ts"],
+      "components": ["web/src/components/DisconnectBanner.tsx"]
     },
     {
       "id": "git-clone",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/git-clone.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "specs": ["tests/live/git-clone.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "acp.spawn-prompt",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-spawn-prompt.spec.ts"
-      ],
+      "specs": ["tests/live/acp-spawn-prompt.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
@@ -1270,9 +985,7 @@
       "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-attachment.spec.ts"
-      ],
+      "specs": ["tests/live/acp-attachment.spec.ts"],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
@@ -1283,20 +996,21 @@
       "id": "acp.approval",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-approval.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/ApprovalCard.tsx"
-      ]
+      "specs": ["tests/live/acp-approval.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
+    },
+    {
+      "id": "acp.approval-resolve-clear",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/__tests__/useAcpResolveApproval.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts"]
     },
     {
       "id": "acp.force-end-turn-gate",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/__tests__/WorkingSpinner.test.tsx"
-      ],
+      "specs": ["src/components/acp/__tests__/WorkingSpinner.test.tsx"],
       "components": []
     },
     {
@@ -1308,26 +1022,20 @@
         "src/lib/acpTypes.test.ts",
         "src/lib/acpRattle.test.ts"
       ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.escape-no-cancel",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-escape-no-cancel.spec.ts"
-      ],
+      "specs": ["tests/live/acp-escape-no-cancel.spec.ts"],
       "components": []
     },
     {
       "id": "acp.escape-no-cancel-contract",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/Composer.escape.test.tsx"
-      ],
+      "specs": ["src/components/acp/Composer.escape.test.tsx"],
       "components": []
     },
     {
@@ -1337,6 +1045,7 @@
       "specs": [
         "tests/live/acp-config-pickers.spec.ts",
         "tests/live/acp-config-pickers-ui.spec.ts",
+        "tests/live/acp-session-model.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
         "src/hooks/useAcpSession.configOption.test.ts"
       ],
@@ -1353,9 +1062,7 @@
       "id": "acp.mode-switch",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-mode-switch.spec.ts"
-      ],
+      "specs": ["tests/live/acp-mode-switch.spec.ts"],
       "components": [
         "web/src/components/acp/SwitchViewAction.tsx",
         "web/src/components/acp/ContextPrimerBanner.tsx"
@@ -1381,6 +1088,19 @@
       ]
     },
     {
+      "id": "acp.tool-output-media",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
       "id": "acp.rate-limit-recovery",
       "kind": "vitest",
       "risk": "high",
@@ -1388,9 +1108,7 @@
         "src/lib/acpTypes.test.ts",
         "src/components/acp/SwitchAgentModal.test.tsx"
       ],
-      "components": [
-        "web/src/components/acp/SwitchAgentModal.tsx"
-      ]
+      "components": ["web/src/components/acp/SwitchAgentModal.tsx"]
     },
     {
       "id": "acp.switch-agent-manual",
@@ -1433,23 +1151,15 @@
       "id": "acp.usage-baseline",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/acpTypes.test.ts"
-      ],
-      "components": [
-        "web/src/lib/acpTypes.ts"
-      ]
+      "specs": ["src/lib/acpTypes.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts"]
     },
     {
       "id": "acp.drafts",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/acpDrafts.test.ts"
-      ],
-      "components": [
-        "web/src/lib/acpDrafts.ts"
-      ]
+      "specs": ["src/lib/acpDrafts.test.ts"],
+      "components": ["web/src/lib/acpDrafts.ts"]
     },
     {
       "id": "acp.queue-drain-clear-split",
@@ -1482,23 +1192,15 @@
       "id": "acp.files-index",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/useFilesIndex.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/useFilesIndex.ts"
-      ]
+      "specs": ["src/components/acp/useFilesIndex.test.tsx"],
+      "components": ["web/src/components/acp/useFilesIndex.ts"]
     },
     {
       "id": "acp.rattle",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/acpRattle.test.ts"
-      ],
-      "components": [
-        "web/src/lib/acpRattle.ts"
-      ]
+      "specs": ["src/lib/acpRattle.test.ts"],
+      "components": ["web/src/lib/acpRattle.ts"]
     },
     {
       "id": "acp.cancel-force-stop",
@@ -1519,23 +1221,15 @@
       "id": "acp.args",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/acpArgs.test.ts"
-      ],
-      "components": [
-        "web/src/lib/acpArgs.ts"
-      ]
+      "specs": ["src/lib/acpArgs.test.ts"],
+      "components": ["web/src/lib/acpArgs.ts"]
     },
     {
       "id": "acp.approval-card",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/components/acp/ApprovalCard.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/ApprovalCard.tsx"
-      ]
+      "specs": ["src/components/acp/ApprovalCard.test.tsx"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
       "id": "acp.markdown",
@@ -1545,17 +1239,13 @@
         "src/components/acp/Markdown.test.tsx",
         "src/components/acp/Markdown.breaks.test.tsx"
       ],
-      "components": [
-        "web/src/components/acp/Markdown.tsx"
-      ]
+      "components": ["web/src/components/acp/Markdown.tsx"]
     },
     {
       "id": "acp.file-links",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-file-links.spec.ts"
-      ],
+      "specs": ["tests/live/acp-file-links.spec.ts"],
       "components": [
         "web/src/components/acp/AcpFileRefContext.tsx",
         "web/src/components/acp/Markdown.tsx",
@@ -1580,34 +1270,22 @@
       "id": "acp.tool-cards",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/components/acp/ToolCards.render.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/ToolCards.tsx"
-      ]
+      "specs": ["src/components/acp/ToolCards.render.test.tsx"],
+      "components": ["web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.tool-density",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/ToolDisplayMode.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/ToolDisplayMode.tsx"
-      ]
+      "specs": ["src/components/acp/ToolDisplayMode.test.tsx"],
+      "components": ["web/src/components/acp/ToolDisplayMode.tsx"]
     },
     {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/QueuedPromptsStrip.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.tool-stopped-sweep",
@@ -1629,9 +1307,7 @@
       "id": "acp.story.stop-tool-card-terminal",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/stop-tool-card-terminal.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/stop-tool-card-terminal.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/ToolCards.tsx"
@@ -1673,56 +1349,36 @@
       "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/ContextPrimerBanner.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/ContextPrimerBanner.tsx"
-      ]
+      "specs": ["src/components/acp/ContextPrimerBanner.test.tsx"],
+      "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
     },
     {
       "id": "acp.switch-view-action",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/SwitchViewAction.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/SwitchViewAction.tsx"
-      ]
+      "specs": ["src/components/acp/SwitchViewAction.test.tsx"],
+      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "acp.tool-error-body",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/ToolErrorBody.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/ToolErrorBody.tsx"
-      ]
+      "specs": ["src/components/acp/ToolErrorBody.test.tsx"],
+      "components": ["web/src/components/acp/ToolErrorBody.tsx"]
     },
     {
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/components/acp/__tests__/StartupErrorScreen.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/StartupErrorScreen.tsx"
-      ]
+      "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx"]
     },
     {
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/components/acp/__tests__/StartupErrorBanner.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -1742,20 +1398,14 @@
       "id": "read-only.mode",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/read-only-mode.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/read-only-mode.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "ensure-session-restart",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/ensure-session-restart.spec.ts"
-      ],
+      "specs": ["tests/live/ensure-session-restart.spec.ts"],
       "components": []
     },
     {
@@ -1773,22 +1423,16 @@
       "id": "projects-view",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/__tests__/ProjectsView.test.tsx"
-      ],
-      "components": [
-        "web/src/components/ProjectsView.tsx"
-      ]
+      "specs": ["src/components/__tests__/ProjectsView.test.tsx"],
+      "components": ["web/src/components/ProjectsView.tsx"]
     },
     {
       "id": "story.settings-tmux-select",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/settings-tmux-select.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/settings-tmux-select.spec.ts"],
       "components": [
-        "web/src/components/settings/TmuxSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/settings/FormFields.tsx"
       ]
     },
@@ -1796,20 +1440,14 @@
       "id": "story.settings-tmux-mouse",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/settings-tmux-mouse.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/TmuxSettings.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/settings-tmux-mouse.spec.ts"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.profile-settings-isolation",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/profile-settings-isolation.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/profile-settings-isolation.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/ProfileSelector.tsx"
@@ -1819,9 +1457,7 @@
       "id": "story.shortcut-palette",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/shortcut-palette.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-palette.spec.ts"],
       "components": [
         "web/src/components/command-palette/CommandPalette.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1831,9 +1467,7 @@
       "id": "story.shortcut-toggle-sidebar",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/shortcut-toggle-sidebar.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-toggle-sidebar.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1843,9 +1477,7 @@
       "id": "story.shortcut-help-key",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-help-key.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-help-key.spec.ts"],
       "components": [
         "web/src/components/HelpOverlay.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1855,20 +1487,14 @@
       "id": "story.shortcut-settings-key",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-settings-key.spec.ts"
-      ],
-      "components": [
-        "web/src/hooks/useKeyboardShortcuts.ts"
-      ]
+      "specs": ["tests/live/acp-stories/shortcut-settings-key.spec.ts"],
+      "components": ["web/src/hooks/useKeyboardShortcuts.ts"]
     },
     {
       "id": "story.shortcut-new-session-key",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-new-session-key.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-new-session-key.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1878,9 +1504,7 @@
       "id": "story.shortcut-toggle-diff",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-toggle-diff.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-toggle-diff.spec.ts"],
       "components": [
         "web/src/components/ContentSplit.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1902,42 +1526,28 @@
       "id": "story.sidebar-filter",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/sidebar-filter.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-filter.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-fold-group",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/sidebar-fold-group.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-fold-group.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-topbar-toggle",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/sidebar-topbar-toggle.spec.ts"
-      ],
-      "components": [
-        "web/src/components/TopBar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-topbar-toggle.spec.ts"],
+      "components": ["web/src/components/TopBar.tsx"]
     },
     {
       "id": "story.shortcut-toggle-right-panel",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-toggle-right-panel.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/shortcut-toggle-right-panel.spec.ts"],
       "components": [
         "web/src/components/ContentSplit.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
@@ -1947,9 +1557,7 @@
       "id": "story.palette-session-switch",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/palette-session-switch.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/palette-session-switch.spec.ts"],
       "components": [
         "web/src/components/command-palette/CommandPalette.tsx",
         "web/src/hooks/useCommandActions.ts"
@@ -1959,100 +1567,64 @@
       "id": "story.sidebar-resize-persist",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/sidebar-resize-persist.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-resize-persist.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.topbar-go-to-dashboard",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/topbar-go-to-dashboard.spec.ts"
-      ],
-      "components": [
-        "web/src/components/TopBar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/topbar-go-to-dashboard.spec.ts"],
+      "components": ["web/src/components/TopBar.tsx"]
     },
     {
       "id": "story.shortcut-terminal-focus",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/shortcut-terminal-focus.spec.ts"
-      ],
-      "components": [
-        "web/src/hooks/useKeyboardShortcuts.ts"
-      ]
+      "specs": ["tests/live/acp-stories/shortcut-terminal-focus.spec.ts"],
+      "components": ["web/src/hooks/useKeyboardShortcuts.ts"]
     },
     {
       "id": "story.sidebar-row-click-navigate",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/sidebar-row-click-navigate.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-row-click-navigate.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-plan-progress",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/sidebar-plan-progress.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-plan-progress.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-queued-count",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/sidebar-queued-count.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-queued-count.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.queued-count-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/__tests__/useAcpQueueCount.test.tsx"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-rate-limit",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/sidebar-rate-limit.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/sidebar-rate-limit.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.rate-limit-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/hooks/__tests__/useAcpRateLimit.test.tsx"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "story.sidebar-select-focuses-input",
@@ -2072,20 +1644,14 @@
       "id": "acp.story.view-switch-to-acp",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/view-switch-to-acp.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/SwitchViewAction.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/view-switch-to-acp.spec.ts"],
+      "components": ["web/src/components/acp/SwitchViewAction.tsx"]
     },
     {
       "id": "story.auth-sign-out",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/auth-sign-out.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/auth-sign-out.spec.ts"],
       "components": [
         "web/src/components/OverflowMenu.tsx",
         "web/src/components/TopBar.tsx"
@@ -2095,121 +1661,79 @@
       "id": "story.modal-about",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/modal-about.spec.ts"
-      ],
-      "components": [
-        "web/src/components/AboutModal.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/modal-about.spec.ts"],
+      "components": ["web/src/components/AboutModal.tsx"]
     },
     {
       "id": "story.modal-help",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/modal-help.spec.ts"
-      ],
-      "components": [
-        "web/src/components/HelpOverlay.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/modal-help.spec.ts"],
+      "components": ["web/src/components/HelpOverlay.tsx"]
     },
     {
       "id": "story.projects-open",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/projects-open.spec.ts"
-      ],
-      "components": [
-        "web/src/components/ProjectsView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/projects-open.spec.ts"],
+      "components": ["web/src/components/ProjectsView.tsx"]
     },
     {
       "id": "story.profile-create",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/profile-create.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ProfileSelector.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/profile-create.spec.ts"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
       "id": "story.profile-rename",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/profile-rename.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ProfileSelector.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/profile-rename.spec.ts"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
       "id": "story.projects-add",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/projects-add.spec.ts"
-      ],
-      "components": [
-        "web/src/components/ProjectsView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/projects-add.spec.ts"],
+      "components": ["web/src/components/ProjectsView.tsx"]
     },
     {
       "id": "story.projects-edit",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/projects-edit.spec.ts"
-      ],
-      "components": [
-        "web/src/components/ProjectsView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/projects-edit.spec.ts"],
+      "components": ["web/src/components/ProjectsView.tsx"]
     },
     {
       "id": "story.projects-remove",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/projects-remove.spec.ts"
-      ],
-      "components": [
-        "web/src/components/ProjectsView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/projects-remove.spec.ts"],
+      "components": ["web/src/components/ProjectsView.tsx"]
     },
     {
       "id": "story.right-panel-resize-persist",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/right-panel-resize-persist.spec.ts"
-      ],
-      "components": [
-        "web/src/components/ContentSplit.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/right-panel-resize-persist.spec.ts"],
+      "components": ["web/src/components/ContentSplit.tsx"]
     },
     {
       "id": "story.settings-theme-select",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/settings-theme-select.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ThemeSettings.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/settings-theme-select.spec.ts"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.settings-theme-custom",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/settings-theme-custom.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/settings-theme-custom.spec.ts"],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/lib/theme.ts"
       ]
     },
@@ -2220,19 +1744,15 @@
       "specs": [
         "tests/live/acp-stories/settings-theme-custom-malformed.spec.ts"
       ],
-      "components": [
-        "web/src/components/settings/ThemeSettings.tsx"
-      ]
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.settings-theme-color-mode",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/settings-theme-color-mode.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/settings-theme-color-mode.spec.ts"],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/hooks/useResolvedTheme.ts"
       ]
     },
@@ -2240,11 +1760,9 @@
       "id": "story.settings-theme-failure-revert",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/settings-theme-failure-revert.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/settings-theme-failure-revert.spec.ts"],
       "components": [
-        "web/src/components/settings/ThemeSettings.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/hooks/useResolvedTheme.ts"
       ]
@@ -2253,130 +1771,87 @@
       "id": "story.settings-logging-level",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/settings-logging-level.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/LoggingSettings.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/settings-logging-level.spec.ts"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.settings-update-interval",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/settings-update-interval.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/UpdateSettings.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/settings-update-interval.spec.ts"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.settings-sound-toggle",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/settings-sound-toggle.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/SoundSettings.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/settings-sound-toggle.spec.ts"],
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
       "id": "story.profile-delete",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/profile-delete.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ProfileSelector.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/profile-delete.spec.ts"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
       "id": "story.profile-switch-view",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/profile-switch-view.spec.ts"
-      ],
-      "components": [
-        "web/src/components/settings/ProfileSelector.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/profile-switch-view.spec.ts"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
       "id": "story.modal-about-escape",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/modal-about-escape.spec.ts"
-      ],
-      "components": [
-        "web/src/components/AboutModal.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/modal-about-escape.spec.ts"],
+      "components": ["web/src/components/AboutModal.tsx"]
     },
     {
       "id": "acp.story.approval-allow",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/approval-allow.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/ApprovalCard.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/approval-allow.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
       "id": "acp.story.approval-deny",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/approval-deny.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/ApprovalCard.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/approval-deny.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
       "id": "acp.story.mode-picker",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/acp-mode-picker.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/acp-mode-picker.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "story.diff-base-picker",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
-        "tests/live/acp-stories/diff-base-picker.spec.ts"
+        "tests/live/acp-stories/diff-base-picker.spec.ts",
+        "tests/live/diff-base-from-worktree.spec.ts"
       ],
-      "components": [
-        "web/src/components/diff/DiffFileList.tsx"
-      ]
+      "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
       "id": "story.delete-session-with-worktree",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/delete-session-with-worktree.spec.ts"
-      ],
-      "components": [
-        "web/src/components/DeleteSessionDialog.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/delete-session-with-worktree.spec.ts"],
+      "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
       "id": "story.delete-active-session",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/delete-active-session.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/delete-active-session.spec.ts"],
       "components": [
         "web/src/components/DeleteSessionDialog.tsx",
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2386,56 +1861,36 @@
       "id": "story.mobile-toolbar-arrow-up",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/mobile-toolbar-arrow-up.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/mobile-toolbar-arrow-up.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "story.mobile-toolbar-tab",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/mobile-toolbar-tab.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/mobile-toolbar-tab.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "story.mobile-toolbar-escape",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/mobile-toolbar-escape.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/mobile-toolbar-escape.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "story.mobile-toolbar-ctrl-modifier",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/mobile-toolbar-ctrl-modifier.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/mobile-toolbar-ctrl-modifier.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "story.mobile-toolbar-ctrl-c",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/mobile-toolbar-ctrl-c.spec.ts"
-      ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/mobile-toolbar-ctrl-c.spec.ts"],
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "story.mobile-toolbar-hidden-on-desktop",
@@ -2444,39 +1899,27 @@
       "specs": [
         "tests/live/acp-stories/mobile-toolbar-hidden-on-desktop.spec.ts"
       ],
-      "components": [
-        "web/src/components/MobileTerminalToolbar.tsx"
-      ]
+      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
       "id": "acp.story.plan-strip",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/acp-plan-strip.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/acp-plan-strip.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "story.diff-viewer-shows-files",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/diff-viewer-shows-files.spec.ts"
-      ],
-      "components": [
-        "web/src/components/diff/DiffFileList.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/diff-viewer-shows-files.spec.ts"],
+      "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
       "id": "story.diff-hunk-comment",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/diff-hunk-comment.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/diff-hunk-comment.spec.ts"],
       "components": [
         "web/src/components/diff/DiffFileViewer.tsx",
         "web/src/components/diff/DiffLine.tsx",
@@ -2488,9 +1931,7 @@
       "id": "acp.story.composer-send-enter",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/composer-send-enter.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/composer-send-enter.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/Composer.tsx"
@@ -2500,42 +1941,28 @@
       "id": "acp.story.composer-mobile-enter-newline",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/composer-mobile-enter-newline.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-mobile-enter-newline.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.composer-ios-dictation",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/composer-ios-dictation.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-ios-dictation.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.composer-ios-dictation-state-machine",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/Composer.dictation.test.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["src/components/acp/Composer.dictation.test.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.composer-streamed-response",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/composer-streamed-response.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/composer-streamed-response.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/Markdown.tsx"
@@ -2545,9 +1972,7 @@
       "id": "acp.story.chat-bubble-overflow",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/chat-bubble-overflow.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/chat-bubble-overflow.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/Markdown.tsx"
@@ -2569,31 +1994,21 @@
       "id": "acp.story.composer-stop-mid-turn",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/composer-stop-mid-turn.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-stop-mid-turn.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.composer-queue-follow-up",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/composer-queue-follow-up.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-queue-follow-up.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.composer-draft-reload",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/composer-draft-reload.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/composer-draft-reload.spec.ts"],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/lib/acpDrafts.ts"
@@ -2603,9 +2018,7 @@
       "id": "acp.story.composer-draft-session-switch",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/composer-draft-session-switch.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/composer-draft-session-switch.spec.ts"],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/lib/acpDrafts.ts"
@@ -2615,34 +2028,22 @@
       "id": "acp.story.queue-edit-message",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/queue-edit-message.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/queue-edit-message.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.story.queue-delete-message",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/queue-delete-message.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/queue-delete-message.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.story.composer-toolbar-insert",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/composer-toolbar-insert.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-toolbar-insert.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.composer-slash-pick-no-arg",
@@ -2652,31 +2053,21 @@
         "tests/live/acp-stories/composer-slash-pick-no-arg.spec.ts",
         "src/components/acp/Composer.slashCommand.test.ts"
       ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.queue-fold-unfold",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/queue-fold-unfold.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/queue-fold-unfold.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.story.stop-during-thinking",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/composer-stop-during-thinking.spec.ts"
-      ],
-      "components": [
-        "web/src/components/acp/Composer.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/composer-stop-during-thinking.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx"]
     },
     {
       "id": "acp.story.stop-during-tool-call",
@@ -2698,9 +2089,7 @@
         "tests/live/acp-stories/fold-failed-tool-card.spec.ts",
         "src/components/acp/ToolCards.render.test.tsx"
       ],
-      "components": [
-        "web/src/components/acp/ToolCards.tsx"
-      ]
+      "components": ["web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.story.edit-card-diff-scroll",
@@ -2719,9 +2108,7 @@
       "id": "acp.edit-card-diff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/acp-edit-card-diff.spec.ts"
-      ],
+      "specs": ["tests/acp-edit-card-diff.spec.ts"],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/components/diff/StringDiff.tsx"
@@ -2731,9 +2118,7 @@
       "id": "acp.story.queue-follow-up-with-nav",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/queue-follow-up-with-nav.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/queue-follow-up-with-nav.spec.ts"],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/hooks/useAcpSession.ts"
@@ -2755,75 +2140,49 @@
       "id": "story.wizard-open-close",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-open-close.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-open-close.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
       "id": "story.wizard-tabs-visible",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-tabs-visible.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-tabs-visible.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "story.wizard-clone-url-input",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-clone-url-input.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-clone-url-input.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "story.wizard-browse-disk",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-browse-disk.spec.ts"
-      ],
-      "components": [
-        "web/src/components/DirectoryBrowser.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-browse-disk.spec.ts"],
+      "components": ["web/src/components/DirectoryBrowser.tsx"]
     },
     {
       "id": "story.wizard-recent-project",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-recent-project.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-recent-project.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
     },
     {
       "id": "story.wizard-close-via-escape",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-close-via-escape.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-close-via-escape.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
       "id": "story.wizard-prefill-from-group",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-prefill-from-group.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/wizard-prefill-from-group.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/WorkspaceSidebar.tsx"
@@ -2833,42 +2192,28 @@
       "id": "story.wizard-session-title-edit",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-session-title-edit.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-session-title-edit.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
       "id": "story.wizard-worktree-toggle",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-worktree-toggle.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-worktree-toggle.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
       "id": "story.wizard-group-field",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-group-field.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-group-field.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
       "id": "story.wizard-extra-repos",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-extra-repos.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/wizard-extra-repos.spec.ts"],
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
       ]
@@ -2877,9 +2222,7 @@
       "id": "story.wizard-launch-cmd-enter",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/wizard-launch-cmd-enter.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/wizard-launch-cmd-enter.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
@@ -2889,42 +2232,28 @@
       "id": "story.wizard-creating-banner",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-creating-banner.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-creating-banner.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
     },
     {
       "id": "story.wizard-last-tool-persists",
       "kind": "live-playwright",
       "risk": "low",
-      "specs": [
-        "tests/live/acp-stories/wizard-last-tool-persists.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/SessionWizard.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-last-tool-persists.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
       "id": "story.wizard-launch-button",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/acp-stories/wizard-launch-button.spec.ts"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/ReviewStep.tsx"
-      ]
+      "specs": ["tests/live/acp-stories/wizard-launch-button.spec.ts"],
+      "components": ["web/src/components/session-wizard/steps/ReviewStep.tsx"]
     },
     {
       "id": "story.wizard-branch-from-title",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/acp-stories/wizard-branch-from-title.spec.ts"
-      ],
+      "specs": ["tests/live/acp-stories/wizard-branch-from-title.spec.ts"],
       "components": [
         "web/src/components/session-wizard/sessionNames.ts",
         "web/src/components/session-wizard/steps/ReviewStep.tsx"
@@ -2934,9 +2263,7 @@
       "id": "triage.pin-toggle",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/triage-pin.spec.ts"
-      ],
+      "specs": ["tests/live/triage-pin.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/sidebarSort.ts"
@@ -2946,45 +2273,29 @@
       "id": "triage.archive-toggle",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/triage-archive.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/triage-archive.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "triage.snooze-toggle",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/triage-snooze.spec.ts"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["tests/live/triage-snooze.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "triage.api-wire-format",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/lib/api.test.ts"
-      ],
-      "components": [
-        "web/src/lib/api.ts"
-      ]
+      "specs": ["src/lib/api.test.ts"],
+      "components": ["web/src/lib/api.ts"]
     },
     {
       "id": "triage.snooze-modal",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SnoozeModal.test.tsx"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["src/components/__tests__/SnoozeModal.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "triage.empty-group-hide",
@@ -3003,9 +2314,7 @@
       "id": "sidebar.edit-workdir-name",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/WorkdirNameEdit.test.tsx"
-      ],
+      "specs": ["src/components/__tests__/WorkdirNameEdit.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/api.ts"
@@ -3028,12 +2337,8 @@
       "id": "triage.session-row-chips",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SessionRowTriage.test.tsx"
-      ],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx"
-      ]
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.multi-select-logic",
@@ -3053,9 +2358,7 @@
       "id": "sidebar.multi-select-gestures",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": [
-        "tests/sidebar-multi-select.spec.ts"
-      ],
+      "specs": ["tests/sidebar-multi-select.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/BulkActionBar.tsx"
@@ -3065,9 +2368,7 @@
       "id": "sidebar.bulk-triage-live",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": [
-        "tests/live/sidebar-bulk-triage.spec.ts"
-      ],
+      "specs": ["tests/live/sidebar-bulk-triage.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/BulkActionBar.tsx"
@@ -3077,20 +2378,14 @@
       "id": "triage.acp-banners",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/acp/__tests__/TriageBanners.test.tsx"
-      ],
-      "components": [
-        "web/src/components/acp/StructuredView.tsx"
-      ]
+      "specs": ["src/components/acp/__tests__/TriageBanners.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "onboarding.first-run-tutorial",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/tutorial.spec.ts"
-      ],
+      "specs": ["tests/live/tutorial.spec.ts"],
       "components": [
         "web/src/components/tour/TourRunner.tsx",
         "web/src/components/TopBar.tsx",
@@ -3120,12 +2415,8 @@
       "id": "onboarding.theme-welcome",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/live/theme-onboarding.spec.ts"
-      ],
-      "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx"
-      ]
+      "specs": ["tests/live/theme-onboarding.spec.ts"],
+      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
     },
     {
       "id": "onboarding.theme-welcome-unit",
@@ -3135,9 +2426,7 @@
         "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
         "src/lib/__tests__/onboarding.test.ts"
       ],
-      "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx"
-      ]
+      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
     },
     {
       "id": "shortcuts.single-source",

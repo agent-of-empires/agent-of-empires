@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // React context exposing the active session's AgentProfile to the
 // structured view's deeply-nested renderers. The wizard's `tool` field flows
 // into `SessionResponse.tool`, which the structured view reads at view-mount

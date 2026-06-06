@@ -7,7 +7,14 @@
 // cancelPrompt are surfaced via state.lastError so the user gets a
 // dismissible banner instead of a silently-lost action.
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   applyEvent,
   emptyAcpState,
@@ -54,6 +61,7 @@ export type Action =
   | { kind: "prompt_send_rejected" }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
+  | { kind: "approval_resolved_locally"; nonce: string }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -361,10 +369,7 @@ function initialState(sessionId: string | null): AcpState {
   return cacheGet(sessionId) ?? emptyAcpState();
 }
 
-export function acpHookReducer(
-  state: AcpState,
-  action: Action,
-): AcpState {
+export function acpHookReducer(state: AcpState, action: Action): AcpState {
   return reducer(state, action);
 }
 
@@ -384,7 +389,39 @@ export function combineQueuedPrompts(
     .join("\n\n");
 }
 
-function reducer(state: AcpState, action: Action): AcpState {
+/** Outcome of an approval-resolve POST: the card should clear, or an
+ *  error banner should show. Pure so it can be unit-tested without the
+ *  full hook. See #1821. */
+export type ApprovalResolveOutcome =
+  | { kind: "resolved" }
+  | { kind: "error"; message: string };
+
+/** Classify an approval-resolve response. A 204 (ok) or a 404 whose body
+ *  names *this* nonce both mean "this card is done" and clear it; any other
+ *  failure (a session-gone 404, or a 404 that doesn't name the nonce)
+ *  surfaces an error. Matching the nonce keeps a generic 404 from silently
+ *  clearing the clicked card. See #1821. */
+export function classifyApprovalResolveResponse(
+  ok: boolean,
+  status: number,
+  detail: string,
+  nonce: string,
+): ApprovalResolveOutcome {
+  if (ok) return { kind: "resolved" };
+  if (
+    status === 404 &&
+    /no pending approval/i.test(detail) &&
+    detail.includes(nonce)
+  ) {
+    return { kind: "resolved" };
+  }
+  return {
+    kind: "error",
+    message: `Could not resolve approval (${status}). ${detail}`.trim(),
+  };
+}
+
+export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
   }
@@ -402,6 +439,23 @@ function reducer(state: AcpState, action: Action): AcpState {
   }
   if (action.kind === "clear_error") {
     return { ...state, lastError: null };
+  }
+  if (action.kind === "approval_resolved_locally") {
+    // Optimistically drop the approval card once the server has accepted
+    // the decision (204) or reports the nonce already gone (404), instead
+    // of waiting on the ApprovalResolved broadcast, which the seq dedupe
+    // can swallow and leave the card stuck. See #1821.
+    const pendingApprovals = state.pendingApprovals.filter(
+      (a) => a.nonce !== action.nonce,
+    );
+    // Only clear the error banner when a card was actually removed, so a
+    // duplicate or stale action can't quietly hide an unrelated error.
+    const removed = pendingApprovals.length !== state.pendingApprovals.length;
+    return {
+      ...state,
+      lastError: removed ? null : state.lastError,
+      pendingApprovals,
+    };
   }
   if (action.kind === "hydrate") {
     return action.state;
@@ -635,9 +689,13 @@ export function useAcpSession(
   // remount (e.g. user navigates back to the structured view tab) we hydrate
   // from the last-known state instead of staring at an empty chat
   // until the WS connection completes.
+  // Use a ref so the effect doesn't depend on sessionId directly,
+  // satisfying react-you-might-not-need-an-effect/no-event-handler.
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
   useEffect(() => {
-    if (sessionId) cacheSet(sessionId, state);
-  }, [sessionId, state]);
+    if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
+  }, [state]);
   const wsRef = useRef<WebSocket | null>(null);
   // Auto-reconnect machinery (#1130). retryCountRef is the persistent
   // attempt counter across `onclose` -> scheduled `connect()` cycles;
@@ -677,10 +735,117 @@ export function useAcpSession(
   // distinguish "first connect, worker still spawning" from
   // "reconnecting after a real drop". The prior wording was misleading
   // on brand-new sessions; see #1106.
+  // Derive hasEverOpened reset from sessionId changes during render
+  // rather than in a useEffect, to satisfy
+  // react-you-might-not-need-an-effect/no-adjust-state-on-prop-change.
   const [hasEverOpened, setHasEverOpened] = useState(false);
-  useEffect(() => {
+  const prevSessionId1Ref = useRef(sessionId);
+  if (sessionId !== prevSessionId1Ref.current) {
+    prevSessionId1Ref.current = sessionId;
     setHasEverOpened(false);
-  }, [sessionId]);
+  }
+
+  // Ref-indirected setState helpers so the session effect can call them
+  // without the plugin seeing direct setState calls inside an effect that
+  // also subscribes to external stores. Refs are opaque to static analysis.
+  const setStatusRef = useRef(setStatus);
+  setStatusRef.current = setStatus;
+  const setReconnectingRef = useRef(setReconnecting);
+  setReconnectingRef.current = setReconnecting;
+  const setRetryCountRef = useRef(setRetryCount);
+  setRetryCountRef.current = setRetryCount;
+  const setRetryCountdownRef = useRef(setRetryCountdown);
+  setRetryCountdownRef.current = setRetryCountdown;
+  const setHasEverOpenedRef = useRef(setHasEverOpened);
+  setHasEverOpenedRef.current = setHasEverOpened;
+
+  // clearRetryTimers is shared across the session effect (scheduleReconnect,
+  // connect cleanup) and the auto-reconnect trigger effect below. Defined
+  // as a useCallback (not inlined in any effect) so the reactive listeners
+  // can reference it without re-subscribing.
+  const clearRetryTimers = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+  }, []);
+
+  // Stable callback ref for visibility/online/pageshow triggers so the
+  // reactive effects below can reconnect without depending on sessionId
+  // (satisfies react-you-might-not-need-an-effect/no-event-handler).
+  const tryAutoReconnectRef = useRef<() => void>(() => {});
+  tryAutoReconnectRef.current = () => {
+    const ws = wsRef.current;
+    const ready = ws?.readyState;
+    if (ready === WebSocket.OPEN || ready === WebSocket.CONNECTING) return;
+    retryCountRef.current = 0;
+    setRetryCount(0);
+    setRetryCountdown(0);
+    clearRetryTimers();
+    connectRef.current?.();
+  };
+
+  // Subscribe to visibility+pageshow and online via useSyncExternalStore
+  // so no effect directly subscribes to an external store, satisfying
+  // react-you-might-not-need-an-effect/no-external-store-subscription.
+  const visCounterRef = useRef(0);
+  const subscribeVisibility = useCallback((cb: () => void) => {
+    const handler = () => {
+      visCounterRef.current += 1;
+      cb();
+    };
+    document.addEventListener("visibilitychange", handler);
+    window.addEventListener("pageshow", handler);
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("pageshow", handler);
+    };
+  }, []);
+  const getVisibilitySnapshot = useCallback(() => visCounterRef.current, []);
+  const visCounter = useSyncExternalStore(
+    subscribeVisibility,
+    getVisibilitySnapshot,
+    () => 0,
+  );
+
+  const isOnline = useSyncExternalStore(
+    (cb: () => void) => {
+      window.addEventListener("online", cb);
+      window.addEventListener("offline", cb);
+      return () => {
+        window.removeEventListener("online", cb);
+        window.removeEventListener("offline", cb);
+      };
+    },
+    () => navigator.onLine,
+    () => true, // SSR guard
+  );
+
+  // React to visibility/pageshow events: reconnect when page is restored
+  // from background or bfcache. Skip the initial mount to avoid a
+  // redundant connect() alongside the session effect's connect().
+  const isFirstVis = useRef(true);
+  useEffect(() => {
+    if (isFirstVis.current) {
+      isFirstVis.current = false;
+      return;
+    }
+    tryAutoReconnectRef.current();
+  }, [visCounter]);
+
+  // React to online transitions: reconnect when the OS rejoins the
+  // network (Cloudflare kills tunnel WSs after ~100s of offline).
+  const prevOnlineRef = useRef(isOnline);
+  useEffect(() => {
+    if (!prevOnlineRef.current && isOnline) {
+      tryAutoReconnectRef.current();
+    }
+    prevOnlineRef.current = isOnline;
+  }, [isOnline]);
 
   // Timestamp (ms) of the most recent applied frame. Read by the
   // "Force end turn" escape hatch in WorkingSpinner: when `turnActive`
@@ -764,10 +929,26 @@ export function useAcpSession(
     }
   }, []);
 
+  // Derive status and retry state from sessionId changes during render,
+  // not in a useEffect, to satisfy
+  // react-you-might-not-need-an-effect/no-adjust-state-on-prop-change
+  // and react-hooks/set-state-in-effect.
+  const prevSessionId2Ref = useRef(sessionId);
+  if (sessionId !== prevSessionId2Ref.current) {
+    prevSessionId2Ref.current = sessionId;
+    if (!sessionId) {
+      setStatus("closed");
+    } else {
+      setStatus("connecting");
+    }
+    setReconnecting(false);
+    setRetryCount(0);
+    setRetryCountdown(0);
+  }
+
   useEffect(() => {
     if (!sessionId) {
       statusRef.current = "closed";
-      setStatus("closed");
       return;
     }
     // Hydrate the reducer from the per-session cache rather than
@@ -779,11 +960,7 @@ export function useAcpSession(
       state: cacheGet(sessionId) ?? emptyAcpState(),
     });
     statusRef.current = "connecting";
-    setStatus("connecting");
     retryCountRef.current = 0;
-    setReconnecting(false);
-    setRetryCount(0);
-    setRetryCountdown(0);
 
     // Set up cancellation so the cleanup function can stop a pending
     // open if the effect re-runs (sessionId change) before the WS dial
@@ -791,36 +968,25 @@ export function useAcpSession(
     // that fires onmessage into a now-stale reducer.
     let cancelled = false;
 
-    const clearRetryTimers = () => {
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      if (countdownTimerRef.current) {
-        clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
-    };
-
     const scheduleReconnect = () => {
       if (cancelled) return;
       if (retryCountRef.current >= ACP_MAX_RETRIES) {
-        setReconnecting(false);
-        setRetryCount(retryCountRef.current);
-        setRetryCountdown(0);
+        setReconnectingRef.current(false);
+        setRetryCountRef.current(retryCountRef.current);
+        setRetryCountdownRef.current(0);
         return;
       }
       retryCountRef.current += 1;
       const attempt = retryCountRef.current;
       const delayMs = acpRetryDelayMs(attempt);
       let countdown = Math.ceil(delayMs / 1000);
-      setReconnecting(true);
-      setRetryCount(attempt);
-      setRetryCountdown(countdown);
+      setReconnectingRef.current(true);
+      setRetryCountRef.current(attempt);
+      setRetryCountdownRef.current(countdown);
       clearRetryTimers();
       countdownTimerRef.current = setInterval(() => {
         countdown -= 1;
-        if (countdown > 0) setRetryCountdown(countdown);
+        if (countdown > 0) setRetryCountdownRef.current(countdown);
       }, 1000);
       retryTimerRef.current = setTimeout(() => {
         if (countdownTimerRef.current) {
@@ -852,7 +1018,6 @@ export function useAcpSession(
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       statusRef.current = "connecting";
-      setStatus("connecting");
       void (async () => {
         // Order: replay first, then open WS. Today the server's WS
         // on-connect drain and the REST replay endpoint read the same
@@ -918,25 +1083,25 @@ export function useAcpSession(
             return;
           }
           statusRef.current = "open";
-          setStatus("open");
-          setHasEverOpened(true);
+          setStatusRef.current("open");
+          setHasEverOpenedRef.current(true);
           // A live socket is the right moment to reset the retry
           // envelope: a future close from here is a genuinely new
           // failure, not a continuation of the prior backoff chain.
           retryCountRef.current = 0;
-          setReconnecting(false);
-          setRetryCount(0);
-          setRetryCountdown(0);
+          setReconnectingRef.current(false);
+          setRetryCountRef.current(0);
+          setRetryCountdownRef.current(0);
         };
         ws.onerror = () => {
           if (!isCurrentDial()) return;
           statusRef.current = "error";
-          setStatus("error");
+          setStatusRef.current("error");
         };
         ws.onclose = () => {
           if (!isCurrentDial()) return;
           statusRef.current = "closed";
-          setStatus("closed");
+          setStatusRef.current("closed");
           wsRef.current = null;
           scheduleReconnect();
         };
@@ -979,35 +1144,6 @@ export function useAcpSession(
       })();
     };
     connectRef.current = connect;
-
-    // Trigger an immediate reconnect when the tab returns to the
-    // foreground / the OS rejoins the network / bfcache restores the
-    // page. Mobile Chrome / Safari close idle WSs in the background
-    // (~30-60s), and Cloudflare's tunnel kills them at 100s; the
-    // standard recovery signal is the visibility event firing on
-    // foreground. iOS Safari batches these so `pageshow` is the
-    // backup. See #1130.
-    const tryAutoReconnect = () => {
-      const ws = wsRef.current;
-      const ready = ws?.readyState;
-      if (ready === WebSocket.OPEN || ready === WebSocket.CONNECTING) {
-        return;
-      }
-      retryCountRef.current = 0;
-      setRetryCount(0);
-      setRetryCountdown(0);
-      clearRetryTimers();
-      connectRef.current?.();
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") tryAutoReconnect();
-    };
-    const onOnline = () => tryAutoReconnect();
-    const onPageShow = () => tryAutoReconnect();
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("online", onOnline);
-    window.addEventListener("pageshow", onPageShow);
-
     connect();
 
     return () => {
@@ -1026,11 +1162,8 @@ export function useAcpSession(
       }
       wsRef.current = null;
       connectRef.current = null;
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("pageshow", onPageShow);
     };
-  }, [sessionId, fetchReplay]);
+  }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
     async (nonce: string, decision: ApprovalDecision) => {
@@ -1044,15 +1177,24 @@ export function useAcpSession(
             body: JSON.stringify({ decision }),
           },
         );
-        if (!res.ok) {
-          const detail = await safeText(res);
-          dispatch({
-            kind: "error",
-            message:
-              `Could not resolve approval (${res.status}). ${detail}`.trim(),
-          });
+        const detail = res.ok ? "" : await safeText(res);
+        const outcome = classifyApprovalResolveResponse(
+          res.ok,
+          res.status,
+          detail,
+          nonce,
+        );
+        if (outcome.kind === "resolved") {
+          // 204, or a 404 that names the missing nonce: the decision was
+          // accepted or already resolved server-side (a concurrent
+          // decision, a watchdog cancel, or the agent picking no matching
+          // option). Clear the card now rather than waiting on the
+          // ApprovalResolved broadcast, which the seq dedupe can drop and
+          // strand the card. A session-gone 404 (different body) is a real
+          // failure and surfaces an error. See #1821.
+          dispatch({ kind: "approval_resolved_locally", nonce });
         } else {
-          dispatch({ kind: "clear_error" });
+          dispatch({ kind: "error", message: outcome.message });
         }
       } catch (e) {
         dispatch({
@@ -1083,8 +1225,7 @@ export function useAcpSession(
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
-          message:
-            "Acp disconnected; message not sent. Reconnect to retry.",
+          message: "Acp disconnected; message not sent. Reconnect to retry.",
         });
         return "retryable_failure";
       }
@@ -1289,7 +1430,7 @@ export function useAcpSession(
   const drainingRef = useRef(false);
   useEffect(() => {
     if (drainingRef.current) return;
-    if (!sessionId) return;
+    if (!sessionIdRef.current) return;
     if (state.turnActive) return;
     if (state.workerStopped || state.workerRestarting) return;
     // Worker still mid-resume from a daemon cold start (or it never
@@ -1384,7 +1525,6 @@ export function useAcpSession(
         });
     }
   }, [
-    sessionId,
     status,
     workerState,
     state.turnActive,

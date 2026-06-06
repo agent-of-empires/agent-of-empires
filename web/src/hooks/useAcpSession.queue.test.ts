@@ -610,7 +610,9 @@ describe("useAcpSession drain race (#1144)", () => {
   });
 
   it("keeps an idle-dormant prompt queued without an error banner on a worker_not_ready 503 (#1748)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-idle-503", "absent"));
+    const { result } = renderHook(() =>
+      useAcpSession("sess-idle-503", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {
@@ -655,7 +657,9 @@ describe("useAcpSession drain race (#1144)", () => {
     // Control: the capacity 503 needs operator action, so unlike
     // worker_not_ready it must keep its banner rather than being silently
     // swallowed as a transient.
-    const { result } = renderHook(() => useAcpSession("sess-idle-cap", "absent"));
+    const { result } = renderHook(() =>
+      useAcpSession("sess-idle-cap", "absent"),
+    );
     await flushAsync();
     const ws = sockets[0]!;
     act(() => {

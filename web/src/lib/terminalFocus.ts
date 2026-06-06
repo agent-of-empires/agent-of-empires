@@ -47,9 +47,8 @@ export function requestSessionInputFocus(
   isCoarse: boolean,
 ): void {
   if (!session || isCoarse) return;
-  const target: TerminalFocusTarget = session.view === "structured"
-    ? "composer"
-    : "agent";
+  const target: TerminalFocusTarget =
+    session.view === "structured" ? "composer" : "agent";
   setPendingTerminalFocus(target);
   dispatchFocusTerminal(target);
 }

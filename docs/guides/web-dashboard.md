@@ -1,46 +1,35 @@
 # Web Dashboard
 
-The web dashboard lets you monitor and interact with agent sessions from any browser, including your phone, tablet, or another computer. It runs as an embedded web server inside the `aoe` binary.
+Monitor and interact with agent sessions from any browser (phone, tablet, or another computer). The dashboard runs as an embedded server inside the `aoe` binary; start it with `aoe serve`. Sessions run server-side (a real `tmux` session for terminal sessions, a persistent worker for structured-view sessions), so your work survives browser crashes, network drops, and reconnects.
 
 ![The web dashboard on desktop: workspace sidebar, live agent terminal, and diff panel](../assets/web/dashboard.png)
 
 ## In this section
 
-This page is the overview: how to run `aoe serve`, the access and auth modes, the security model, and PWA install. The rest of the surface has its own pages:
+This page covers running the server, access modes, the security model, and PWA install. The rest of the surface has its own pages:
 
-- **[Dashboard & workspaces](web/dashboard.md)**: the layout, status glyphs, the session-creation wizard, sidebar sort, triage (pin / archive / snooze), command palette, and the first-run tutorial.
-- **[Terminal view](web/terminal.md)**: the agent and paired terminals, reconnect behavior, the WebSocket close-code reference, and read-only mode.
-- **[Diff view](web/diff.md)**: reviewing changed files, the flat / tree file list, per-session base override, and inline review comments.
-- **[Settings & profiles](web/settings.md)**: the settings tabs, profile picker, connected-device tracking, and step-up elevation.
+- **[Dashboard & workspaces](web/dashboard.md)**: layout, status glyphs, session-creation wizard, sidebar sort/grouping, triage (pin / archive / snooze), command palette, first-run tutorial.
+- **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnect behavior, WebSocket close codes, read-only mode.
+- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-session base override, inline review comments.
+- **[Settings & profiles](web/settings.md)**: settings tabs, profile picker, connected-device tracking, step-up elevation.
 
-Mobile and touch behavior is documented inline on each page, next to the surface it applies to.
+Mobile and touch behavior is documented inline on each page.
 
 ## Availability
 
-The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
+The dashboard ships in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). Just run `aoe serve`.
 
-If you build from source, the dashboard requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
+Building from source requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
 
 ## Starting the server
 
 ```bash
-# Localhost only (safe, default)
-aoe serve
-
-# Remote access over HTTPS (Tailscale Funnel if available, else Cloudflare quick tunnel)
-aoe serve --remote
-
-# Accessible from other devices on your LAN/VPN (HTTP, requires VPN)
-aoe serve --host 0.0.0.0
-
-# Run in background
-aoe serve --daemon
-
-# Open the printed URL in the default browser once the server is ready
-aoe serve --open
-
-# Read-only monitoring (no terminal input)
-aoe serve --remote --read-only
+aoe serve                       # Localhost only (safe, default)
+aoe serve --remote              # Remote over HTTPS (Tailscale Funnel, else Cloudflare quick tunnel)
+aoe serve --host 0.0.0.0        # LAN/VPN access (HTTP, requires VPN)
+aoe serve --daemon              # Run in background
+aoe serve --open                # Open the URL in the default browser when ready
+aoe serve --remote --read-only  # Monitor without terminal input
 ```
 
 The server prints a URL with an auth token:
@@ -50,79 +39,56 @@ aoe web dashboard running at:
   http://localhost:8080/?token=a1b2c3...
 ```
 
-Open this URL in any browser to access the dashboard. The token is set as a cookie on first visit so you don't need to keep it in the URL.
+Open it in any browser. The token is set as a cookie on first visit, so you don't need to keep it in the URL.
 
-`--open` is opt-in. It is suppressed when you also pass `--daemon` or `--remote`, when running over SSH (`SSH_CONNECTION` / `SSH_TTY` set), and on Linux/BSD with no `DISPLAY` / `WAYLAND_DISPLAY`.
+`--open` is suppressed with `--daemon` or `--remote`, over SSH (`SSH_CONNECTION` / `SSH_TTY` set), and on Linux/BSD with no `DISPLAY` / `WAYLAND_DISPLAY`.
 
-## Retrieving the live URL
+### Retrieving the live URL
 
-In `--remote` mode the auth token rotates every 4 hours, so a URL captured at startup eventually stops working. Use `aoe url` to print the current dashboard URL of a running daemon:
+In `--remote` mode the auth token rotates every 4 hours, so a URL captured at startup eventually stops working. Use `aoe url` against a running daemon (exits non-zero if none is running):
 
 ```bash
-# Print the primary URL with the live token
-aoe url
-
-# Print every labeled URL (Tailscale / LAN / localhost), tab-separated
-aoe url --all
-
-# Print only the auth token (useful for scripted login flows)
-aoe url --token-only
+aoe url               # Primary URL with the live token
+aoe url --all         # Every labeled URL (Tailscale / LAN / localhost), tab-separated
+aoe url --token-only  # Just the token (for scripted login)
 ```
 
-`aoe url` exits non-zero if no daemon is running.
-
-In `--remote` mode, a QR code is also printed for easy phone pairing.
+`--remote` mode also prints a QR code for phone pairing.
 
 ## Remote access
 
-The `--remote` flag is the recommended way to access the dashboard from your phone or another device:
-
-```bash
-aoe serve --remote
-```
-
-aoe picks a transport automatically in this order:
+`--remote` is the recommended way to reach the dashboard from your phone. aoe picks a transport automatically, in this order. For the end-to-end phone setup, see [Remote Access from Your Phone](remote-phone-access.md).
 
 ### 1. Tailscale Funnel (preferred when available)
 
-If `tailscale` is on the host's PATH and the daemon is logged in, aoe runs `tailscale funnel --bg --yes <port>` (the Tailscale 1.52+ single-command Funnel syntax) and exposes the dashboard at your stable `https://<machine>.<tailnet>.ts.net` URL. No domain, no Cloudflare account, no rotating URLs. **This is the only option where a PWA installed on your phone keeps working across server restarts** (the URL is stable).
+If `tailscale` is on PATH and logged in, aoe runs `tailscale funnel --bg --yes <port>` and exposes the dashboard at your stable `https://<machine>.<tailnet>.ts.net` URL. No domain, no Cloudflare account, no rotating URLs. **This is the only option where a PWA installed on your phone keeps working across server restarts** (the URL is stable).
 
-Setup (two one-time gates; aoe surfaces the fix if either is missing):
-1. Install Tailscale on the host ([tailscale.com/download](https://tailscale.com/download))
-2. `tailscale up`
-3. **Enable the Funnel feature for your tailnet** (tailnet-wide switch): [login.tailscale.com/f/funnel](https://login.tailscale.com/f/funnel). When this isn't enabled, `tailscale funnel` prints a node-specific activation URL; aoe detects that URL in stderr and bails in seconds with the link instead of timing out.
-4. **Grant the `funnel` nodeAttr to this node** in your tailnet ACL: [login.tailscale.com/admin/acls/file](https://login.tailscale.com/admin/acls/file). A default rule like `{ "target": ["autogroup:member"], "attr": ["funnel"] }` works for personal tailnets; if your node is tagged, target the tag instead (`autogroup:member` excludes tagged devices).
-5. `aoe serve --remote`
+One-time setup (aoe surfaces the fix if a gate is missing):
+1. Install Tailscale ([tailscale.com/download](https://tailscale.com/download)) and run `tailscale up`.
+2. Enable Funnel for your tailnet: [login.tailscale.com/f/funnel](https://login.tailscale.com/f/funnel).
+3. Grant the `funnel` nodeAttr to this node in your ACL: [login.tailscale.com/admin/acls/file](https://login.tailscale.com/admin/acls/file). A rule like `{ "target": ["autogroup:member"], "attr": ["funnel"] }` works for personal tailnets; target the tag instead if your node is tagged.
+4. `aoe serve --remote`.
 
-Caveat: `aoe serve --remote` runs `tailscale funnel --bg --yes <port>`, which configures port 443 to proxy to the dashboard. If you already have a non-loopback service on port 443 of this node's Funnel config (your own webapp pointing at a tailnet IP, a remote service), aoe refuses to start rather than silently replace it. A stale loopback config from a prior aoe run is fine, aoe overwrites that cleanly. Clear any conflict with `tailscale funnel reset` (the Error dialog offers this as `[R]`) and re-run, or pass `--no-tailscale` to use Cloudflare instead.
+If port 443 already has a non-loopback Funnel service on this node, aoe refuses to start rather than replace it (a stale loopback config from a prior aoe run is overwritten cleanly). Clear the conflict with `tailscale funnel reset` (the Error dialog offers `[R]`), or pass `--no-tailscale` to use Cloudflare.
 
 ### 2. Named Cloudflare tunnel
 
-Stable hostname on your own Cloudflare-managed domain. Takes precedence over Tailscale auto-detection when you pass the flags:
+Stable hostname on your own Cloudflare-managed domain. Takes precedence over Tailscale when you pass the flags:
 
 ```bash
-# One-time setup
 cloudflared tunnel create my-tunnel
-# Add a CNAME record: aoe.example.com -> <tunnel-id>.cfargotunnel.com
-
-# Run with stable URL
+# Add a CNAME: aoe.example.com -> <tunnel-id>.cfargotunnel.com
 aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com
 ```
 
 ### 3. Cloudflare quick tunnel (fallback)
 
-Zero-config but the URL rotates on every restart. Fine for one-off remote sessions, **bad for installed PWAs**: the home-screen app is bound to the URL it was installed from, so every restart costs you a delete-and-reinstall.
-
-```bash
-aoe serve --remote
-```
+Zero-config but the URL rotates on every restart. Fine for one-off sessions, **bad for installed PWAs** (the home-screen app is bound to its install URL, so a restart means delete-and-reinstall). aoe prints a notice when it falls back here.
 
 Requires `cloudflared` on the host:
 - macOS: `brew install cloudflared`
 - Linux: `sudo apt install cloudflared`
 - Other: [Cloudflare's downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-
-aoe prints a notice when it falls back to this path so you don't accidentally install a PWA from a rotating URL.
 
 ## Flags
 
@@ -130,9 +96,9 @@ aoe prints a notice when it falls back to this path so you don't accidentally in
 |------|---------|-------------|
 | `--port` | 8080 | Port to listen on |
 | `--host` | 127.0.0.1 | Bind address. Use `0.0.0.0` for LAN/VPN access |
-| `--auth` | `token` | Auth mode: `token` (URL token, default), `passphrase` (passphrase login wall only), `none` (no auth, loopback only unless `--behind-proxy`) |
+| `--auth` | `token` | Auth mode: `token` (URL token), `passphrase` (passphrase login wall only), `none` (no auth, loopback only unless `--behind-proxy`) |
 | `--passphrase` | | Passphrase for the login wall. Valid with `--auth=token` (token + passphrase) and `--auth=passphrase`. Also reads `AOE_SERVE_PASSPHRASE` |
-| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets cookies as `; Secure` and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel |
+| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel |
 | `--no-auth` | off | Alias for `--auth=none` (kept for backwards compatibility) |
 | `--remote` | off | Expose over HTTPS tunnel (Tailscale Funnel if available, else Cloudflare quick tunnel) |
 | `--tunnel-name` | | Use a named Cloudflare tunnel (requires `--remote`; overrides Tailscale auto-detection) |
@@ -150,87 +116,66 @@ aoe prints a notice when it falls back to this path so you don't accidentally in
 | `--auth=passphrase --passphrase X` | none | required | Reverse-proxy deployments where pasting a token URL on mobile is too high friction |
 | `--auth=none` (alias `--no-auth`) | none | none | Localhost-only quick testing |
 
-Notes:
-
-- `--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy`. The flag asserts that an upstream reverse proxy terminates TLS and forwards the client IP. Without it, reduced-auth modes refuse to bind to a routable address.
-- `--auth=passphrase` requires `--passphrase <VALUE>` (or `AOE_SERVE_PASSPHRASE`) since the passphrase becomes the only human gate.
-- `--auth=none --passphrase X` is rejected explicitly; the previous silent acceptance of `--no-auth --passphrase` was a footgun. Use `--auth=passphrase` if the passphrase wall is what you want.
+- `--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy` (which asserts an upstream proxy terminates TLS and forwards the client IP). Without it, reduced-auth modes refuse to bind to a routable address.
+- `--auth=passphrase` requires `--passphrase <VALUE>` (or `AOE_SERVE_PASSPHRASE`).
+- `--auth=none --passphrase X` is rejected; use `--auth=passphrase` for a passphrase wall.
 - `--remote` is incompatible with `--auth=none` and `--auth=passphrase`; the public tunnel mandates both token auth and a passphrase.
 
 ### Behind a reverse proxy
 
-When TLS is terminated by an external reverse proxy (Traefik, nginx, Caddy) that forwards traffic to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys requests by the real client IP:
+When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys by the real client IP:
 
 ```bash
-# Loopback bind, passphrase login wall, TLS terminated upstream.
 aoe serve \
   --host 127.0.0.1 --port 42041 \
   --auth=passphrase --passphrase "$AOE_PASSPHRASE" \
   --behind-proxy
 ```
 
-The upstream proxy must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
+The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
 
 ## Security
 
-**The web dashboard exposes terminal access.** Anyone who authenticates can send keystrokes to your agent sessions, which run as your user.
+**The dashboard exposes terminal access.** Anyone who authenticates can send keystrokes to your agent sessions, which run as your user.
 
 ### Authentication
 
-- **Token auth** (`--auth=token`, default): A random 256-bit token is generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). The token is passed via URL on first visit, then stored as an `HttpOnly; SameSite=Strict` cookie.
-- **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): An argon2-hashed passphrase gates `/login`. Sessions are bound to a per-device secret stored in the client's `localStorage`; a leaked session cookie alone is insufficient.
-- **Rate limiting:** 5 failed login attempts from an IP trigger a 15-minute lockout. Uses `Cf-Connecting-IP` / `X-Forwarded-For` from loopback peers (covers `--remote` tunnel mode and `--behind-proxy` reverse-proxy mode) to prevent IP spoofing.
-- **Token rotation:** In `--remote` mode, the token rotates every 4 hours with a 5-minute grace period for active sessions.
-- **Device tracking:** Connected devices (IP, browser, last seen) are visible in Settings > Security.
-- **Step-up elevation:** A "Confirm passphrase" prompt appears on writes whose payload can plant code for the next session spawn: the `sandbox` and `worktree` sections. Confirmation lasts 15 minutes. User-preference writes (theme, sound, updates, notification toggles, logging filter, profile description, and safe session fields like `yolo_mode_default`) save without the prompt; saving a theme should not feel like signing in again.
-- **Local-only fields:** The agent-command surface (`session.agent_command_override`, `session.agent_extra_args`, `session.custom_agents`, `session.agent_detect_as`) and the status-hook shell commands (`status_hooks.on_*`) map names to arbitrary host commands, so the dashboard never writes them: the server rejects a PATCH that touches them and they are editable only in the TUI on the host. The per-field policy is derived from the settings schema (#1692), so this list stays in sync automatically.
+- **Token auth** (`--auth=token`, default): a random 256-bit token, generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). Passed via URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie.
+- **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): an argon2-hashed passphrase gates `/login`. Sessions bind to a per-device secret in `localStorage`, so a leaked cookie alone is insufficient.
+- **Rate limiting**: 5 failed logins from an IP trigger a 15-minute lockout.
+- **Token rotation**: in `--remote` mode the token rotates every 4 hours with a 5-minute grace period for active sessions.
+- **Device tracking**: connected devices (the signed-in login sessions, with browser, origin IP, and last seen) are visible in Settings > Web Dashboard > Connected Devices, where you can revoke one device or sign every device out.
+- **Session persistence**: login sessions are persisted to an owner-only `login_sessions.toml` in the app dir, so signed-in devices survive an `aoe serve` restart instead of being re-prompted for the passphrase. A passphrase change drops every persisted session; set `auth.persist_sessions = false` to force re-authentication on every restart.
+- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for the next session spawn (the `sandbox` and `worktree` sections); confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. See [Settings & profiles](web/settings.md#step-up-elevation).
+- **Local-only fields**: the agent-command surface and status-hook shell commands map names to arbitrary host commands, so the server rejects any PATCH touching them; they are editable only in the TUI on the host.
 
-### Security headers
-
-The server sets `X-Frame-Options: DENY` (prevents clickjacking), `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (prevents token leaking via Referer headers).
+The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).
 
 ### Safe usage patterns
 
-- **Localhost** (`aoe serve`): Same security as the TUI. Fine.
-- **Remote via tunnel** (`aoe serve --remote`): Encrypted via HTTPS. Recommended for phone access.
-- **Over Tailscale/WireGuard** (`aoe serve --host 0.0.0.0`): The VPN encrypts traffic.
-- **Behind a reverse proxy** (`aoe serve --auth=passphrase --passphrase ... --behind-proxy`): TLS terminated upstream by Traefik / nginx / Caddy. Passphrase is the only human gate.
-- **Read-only** (`aoe serve --remote --read-only`): Monitor sessions without input capability.
+- **Localhost** (`aoe serve`): same security as the TUI.
+- **Remote via tunnel** (`aoe serve --remote`): encrypted via HTTPS. Recommended for phone access.
+- **Over Tailscale/WireGuard** (`aoe serve --host 0.0.0.0`): the VPN encrypts traffic.
+- **Behind a reverse proxy** (`--auth=passphrase --behind-proxy`): TLS terminated upstream; passphrase is the only human gate.
+- **Read-only** (`aoe serve --remote --read-only`): monitor without input.
 
-### Dangerous
+### Dangerous (blocked)
 
-- `aoe serve --host 0.0.0.0` on public WiFi without a VPN: traffic is unencrypted HTTP
-- `aoe serve --auth=none --host 0.0.0.0` (or alias `--no-auth --host 0.0.0.0`): blocked (refuses to start without `--behind-proxy`)
-- `aoe serve --auth=none --remote` or `--auth=passphrase --remote`: blocked (refuses to start)
+- `aoe serve --host 0.0.0.0` on public WiFi without a VPN: traffic is unencrypted HTTP.
+- `aoe serve --auth=none --host 0.0.0.0` (or `--no-auth --host 0.0.0.0`): refuses to start without `--behind-proxy`.
+- `aoe serve --auth=none --remote` or `--auth=passphrase --remote`: refuses to start.
 
 ## Installing as a PWA
 
-The dashboard supports Progressive Web App (PWA) installation for an app-like experience:
+The dashboard installs as a Progressive Web App for an app-like, standalone window:
 
-**macOS (Chrome):** Three-dot menu > "Install Agent of Empires" -- creates a standalone window with a Dock icon.
+- **macOS (Chrome)**: three-dot menu > "Install Agent of Empires".
+- **macOS (Safari)**: File > Add to Dock.
+- **iOS**: Share > Add to Home Screen.
+- **Android (Chrome)**: "Add to Home Screen" prompt or install banner.
 
-**macOS (Safari):** File > Add to Dock.
+The PWA needs the server running; use `--daemon` to keep it up (`aoe serve --stop` to stop). For a stable URL that survives restarts, install from a Tailscale Funnel or named-Cloudflare URL, not a quick tunnel.
 
-**iOS:** Share > Add to Home Screen.
-
-**Android:** Chrome will prompt "Add to Home Screen" or show an install banner.
-
-The PWA requires the server to be running. Use `--daemon` to keep it running in the background:
-
-```bash
-aoe serve --daemon
-# Server runs in background, prints PID
-# Stop with: aoe serve --stop
-```
-
-### Shutdown behavior
-
-`Ctrl-C` on a foreground `aoe serve`, and `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open dashboard tabs. Live structured view and terminal WebSocket clients receive a close frame with code `1001` ("going away") so the browser logs a clean reason and skips its transient-error reconnect backoff for one cycle. The reconnect resumes normally once a fresh `aoe serve` is running. A 5-second hard cap acts as a safety net: if any handler fails to honor the shutdown signal, the process still exits and emits `WARN shutdown: graceful shutdown exceeded grace window, forcing exit`.
-
-## How it works
-
-`aoe serve` runs an embedded server inside the `aoe` process; your browser connects to it to list sessions, stream terminal output, and (when write access is enabled) send input. Each terminal is backed by a real `tmux` session, so your work survives browser crashes, network drops, and reconnects.
-
-The terminal disconnect banner surfaces a WebSocket close code when it can't reach a working pane. The decoder ring for those codes lives on the [Terminal view](web/terminal.md#terminal-websocket-close-codes) page.
+`Ctrl-C` on a foreground server, or `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open tabs. Live clients receive a `1001` ("going away") close frame and reconnect once a fresh server is running.
 
 For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

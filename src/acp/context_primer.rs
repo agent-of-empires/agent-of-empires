@@ -763,6 +763,7 @@ mod tests {
                 tool_call_id: id.to_string(),
                 is_error: error,
                 content: String::new(),
+                output: Vec::new(),
                 completed_at: Utc::now(),
             },
         )

@@ -26,10 +26,7 @@ describe("fuzzyFilter", () => {
   });
 
   it("ranks prefix match above substring match", () => {
-    const items: Item[] = [
-      { label: "zfoo" },
-      { label: "foobar" },
-    ];
+    const items: Item[] = [{ label: "zfoo" }, { label: "foobar" }];
     const out = fuzzyFilter(items, "foo");
     expect(out.map((i) => i.label)).toEqual(["foobar", "zfoo"]);
   });
@@ -40,10 +37,7 @@ describe("fuzzyFilter", () => {
       { label: "has-foo-in-label" },
     ];
     const out = fuzzyFilter(items, "foo");
-    expect(out.map((i) => i.label)).toEqual([
-      "has-foo-in-label",
-      "other",
-    ]);
+    expect(out.map((i) => i.label)).toEqual(["has-foo-in-label", "other"]);
   });
 
   it("breaks score ties by shorter label", () => {
@@ -53,11 +47,7 @@ describe("fuzzyFilter", () => {
       { label: "foo" },
     ];
     const out = fuzzyFilter(items, "foo");
-    expect(out.map((i) => i.label)).toEqual([
-      "foo",
-      "foobar",
-      "foobarbaz",
-    ]);
+    expect(out.map((i) => i.label)).toEqual(["foo", "foobar", "foobarbaz"]);
   });
 
   it("caps results at the cap limit", () => {
@@ -105,9 +95,7 @@ describe("useFilesIndex hook", () => {
     expect(result.current.files).toEqual([]);
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.files).toEqual(["a.txt", "b.rs"]);
-    expect(fetchSpy).toHaveBeenCalledWith(
-      "/api/sessions/s-1/acp/files",
-    );
+    expect(fetchSpy).toHaveBeenCalledWith("/api/sessions/s-1/acp/files");
   });
 
   it("URL-encodes the session id", async () => {

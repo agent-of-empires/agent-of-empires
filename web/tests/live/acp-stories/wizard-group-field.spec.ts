@@ -1,10 +1,7 @@
 // User story: enter a Group value in the wizard's session step.
 
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 
 base("wizard session step records Group", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({

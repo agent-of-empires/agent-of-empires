@@ -51,89 +51,99 @@ const SCRIPT = {
   ],
 };
 
-base("edit card diff scrolls horizontally on a narrow viewport", async ({ page }, testInfo) => {
-  let serveHandle: { home: string } | undefined;
-  let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
-  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-edit-scroll-"));
-  const scriptPath = join(scriptDir, "script.json");
-  writeFileSync(scriptPath, JSON.stringify(SCRIPT));
+base(
+  "edit card diff scrolls horizontally on a narrow viewport",
+  async ({ page }, testInfo) => {
+    let serveHandle: { home: string } | undefined;
+    let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
+    const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-edit-scroll-"));
+    const scriptPath = join(scriptDir, "script.json");
+    writeFileSync(scriptPath, JSON.stringify(SCRIPT));
 
-  try {
-    // Narrow viewport so the long line is wider than the card.
-    await page.setViewportSize({ width: 480, height: 800 });
-
-    serve = await spawnAoeServe({
-      authMode: "none",
-      acp: true,
-      fakeAcpScript: scriptPath,
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title: "story-edit-scroll" }),
-    });
-    serveHandle = serve;
-
-    const sessions = await listSessions(serve.baseUrl);
-    const seeded = sessions.find((s) => s.title === "story-edit-scroll");
-    if (!seeded) throw new Error("seeded session 'story-edit-scroll' missing");
-    const sessionId = seeded.id;
-    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
-
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
-    await waitForStructuredView(page);
-
-    const composer = page.getByRole("textbox", { name: /Send a message/i });
-    await composer.fill("edit the file");
-    await composer.press("Enter");
-
-    // The edit card renders collapsed; its header carries the file path.
-    const cardHeader = page
-      .getByRole("button")
-      .filter({ hasText: "big.txt" })
-      .first();
-    await expect(cardHeader).toBeVisible({ timeout: 10_000 });
-    await cardHeader.click();
-
-    // The diff body is now expanded.
-    const diff = page.getByTestId("string-diff");
-    await expect(diff).toBeVisible({ timeout: 10_000 });
-
-    // Core regression: the diff container is an `overflow-x` scroll context
-    // (pre-fix it was the default `visible`, so the long line was clipped by
-    // the card's `overflow-hidden` and unreachable).
-    const overflowX = await diff.evaluate((el) => getComputedStyle(el).overflowX);
-    expect(["auto", "scroll"]).toContain(overflowX);
-
-    // And the content actually overflows that container, so the scroll
-    // affordance is real rather than vacuous.
-    await expect
-      .poll(async () =>
-        diff.evaluate(
-          (el) => (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth,
-        ),
-      )
-      .toBeGreaterThan(0);
-
-    // Chrome stays put: scrolling lives on the diff body, not the transcript
-    // viewport, so the whole panel never gains a horizontal scrollbar.
-    const viewport = page.getByTestId("acp-viewport");
-    await expect(viewport).toBeVisible();
-    await expect
-      .poll(async () =>
-        viewport.evaluate(
-          (el) => (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth,
-        ),
-      )
-      .toBeLessThanOrEqual(0);
-  } finally {
     try {
-      if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);
-    } catch {
-      // best-effort diagnostics; do not block cleanup
-    }
-    try {
-      if (serve) await serve.stop();
+      // Narrow viewport so the long line is wider than the card.
+      await page.setViewportSize({ width: 480, height: 800 });
+
+      serve = await spawnAoeServe({
+        authMode: "none",
+        acp: true,
+        fakeAcpScript: scriptPath,
+        workerIndex: testInfo.workerIndex,
+        parallelIndex: testInfo.parallelIndex,
+        seedFn: seedSessionViaAoeAdd({ title: "story-edit-scroll" }),
+      });
+      serveHandle = serve;
+
+      const sessions = await listSessions(serve.baseUrl);
+      const seeded = sessions.find((s) => s.title === "story-edit-scroll");
+      if (!seeded)
+        throw new Error("seeded session 'story-edit-scroll' missing");
+      const sessionId = seeded.id;
+      await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
+      await waitForStructuredView(page);
+
+      const composer = page.getByRole("textbox", { name: /Send a message/i });
+      await composer.fill("edit the file");
+      await composer.press("Enter");
+
+      // The edit card renders collapsed; its header carries the file path.
+      const cardHeader = page
+        .getByRole("button")
+        .filter({ hasText: "big.txt" })
+        .first();
+      await expect(cardHeader).toBeVisible({ timeout: 10_000 });
+      await cardHeader.click();
+
+      // The diff body is now expanded.
+      const diff = page.getByTestId("string-diff");
+      await expect(diff).toBeVisible({ timeout: 10_000 });
+
+      // Core regression: the diff container is an `overflow-x` scroll context
+      // (pre-fix it was the default `visible`, so the long line was clipped by
+      // the card's `overflow-hidden` and unreachable).
+      const overflowX = await diff.evaluate(
+        (el) => getComputedStyle(el).overflowX,
+      );
+      expect(["auto", "scroll"]).toContain(overflowX);
+
+      // And the content actually overflows that container, so the scroll
+      // affordance is real rather than vacuous.
+      await expect
+        .poll(async () =>
+          diff.evaluate(
+            (el) =>
+              (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth,
+          ),
+        )
+        .toBeGreaterThan(0);
+
+      // Chrome stays put: scrolling lives on the diff body, not the transcript
+      // viewport, so the whole panel never gains a horizontal scrollbar.
+      const viewport = page.getByTestId("acp-viewport");
+      await expect(viewport).toBeVisible();
+      await expect
+        .poll(async () =>
+          viewport.evaluate(
+            (el) =>
+              (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth,
+          ),
+        )
+        .toBeLessThanOrEqual(0);
     } finally {
-      rmSync(scriptDir, { recursive: true, force: true });
+      try {
+        if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);
+      } catch {
+        // best-effort diagnostics; do not block cleanup
+      }
+      try {
+        if (serve) await serve.stop();
+      } finally {
+        rmSync(scriptDir, { recursive: true, force: true });
+      }
     }
-  }
-});
+  },
+);

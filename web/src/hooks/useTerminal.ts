@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -109,8 +109,7 @@ const RESIZE_DEBOUNCE_MS = 50;
 // RESIZE_DEBOUNCE_MS so live splitter drags still feel responsive.
 const INITIAL_SETTLE_MS = 250;
 
-const FONT_FAMILY =
-  "'Geist Mono', ui-monospace, 'SFMono-Regular', monospace";
+const FONT_FAMILY = "'Geist Mono', ui-monospace, 'SFMono-Regular', monospace";
 
 export interface TerminalState {
   connected: boolean;
@@ -232,18 +231,55 @@ export function useTerminal(
   // inside the connect-effect can call manualReconnect (defined below
   // the effect) without re-running the effect itself.
   const manualReconnectRef = useRef<(() => void) | null>(null);
-  const [state, setState] = useState<TerminalState>({
-    connected: false,
-    reconnecting: false,
-    retryCount: 0,
-    retryCountdown: 0,
-    isPrimary: true,
-    isInScrollback: false,
-  });
+  const terminalStoreRef = useRef<{
+    snapshot: TerminalState;
+    listeners: Set<() => void>;
+  } | null>(null);
+  if (terminalStoreRef.current == null) {
+    terminalStoreRef.current = {
+      snapshot: {
+        connected: false,
+        reconnecting: false,
+        retryCount: 0,
+        retryCountdown: 0,
+        isPrimary: true,
+        isInScrollback: false,
+      },
+      listeners: new Set(),
+    };
+  }
+  const terminalSetState = useCallback(
+    (fn: (prev: TerminalState) => TerminalState) => {
+      const store = terminalStoreRef.current!;
+      store.snapshot = fn(store.snapshot);
+      store.listeners.forEach((l) => l());
+    },
+    [],
+  );
+  const terminalSubscribe = useCallback((listener: () => void) => {
+    terminalStoreRef.current!.listeners.add(listener);
+    return () => {
+      terminalStoreRef.current!.listeners.delete(listener);
+    };
+  }, []);
+  const terminalGetSnapshot = useCallback(
+    () => terminalStoreRef.current!.snapshot,
+    [],
+  );
+  const state = useSyncExternalStore(terminalSubscribe, terminalGetSnapshot);
+
+  const settingsRef = useRef(settings);
+  const updateRef = useRef(update);
+  const autoFocusRef = useRef(autoFocus);
+  const claudeFullscreenRef = useRef(claudeFullscreen);
 
   useEffect(() => {
     claimPrimaryRef.current = claimPrimary;
-  }, [claimPrimary]);
+    settingsRef.current = settings;
+    updateRef.current = update;
+    autoFocusRef.current = autoFocus;
+    claudeFullscreenRef.current = claudeFullscreen;
+  }, [claimPrimary, settings, update, autoFocus, claudeFullscreen]);
 
   useEffect(() => {
     if (!sessionId || !containerRef.current) return;
@@ -272,10 +308,12 @@ export function useTerminal(
 
     const isMobileViewport = () => window.innerWidth < MOBILE_BREAKPOINT_PX;
     const readFontSize = () =>
-      isMobileViewport() ? settings.mobileFontSize : settings.desktopFontSize;
+      isMobileViewport()
+        ? settingsRef.current.mobileFontSize
+        : settingsRef.current.desktopFontSize;
     const persistFontSize = (size: number) => {
-      if (isMobileViewport()) update({ mobileFontSize: size });
-      else update({ desktopFontSize: size });
+      if (isMobileViewport()) updateRef.current({ mobileFontSize: size });
+      else updateRef.current({ desktopFontSize: size });
     };
     const fontSize = readFontSize();
 
@@ -663,13 +701,13 @@ export function useTerminal(
         // so the client-side flag should too — otherwise a WiFi blip
         // mid-scroll would hide the "Back to live" button while tmux
         // is still in copy-mode, leaving the user with no way out.
-        setState((prev) => ({
+        terminalSetState((prev) => ({
           ...prev,
           connected: true,
           reconnecting: false,
           isPrimary: true,
         }));
-        if (autoFocus) term.focus();
+        if (autoFocusRef.current) term.focus();
         // Claim primary immediately for visible terminals so this
         // client's resize is applied. Hidden persistent terminals keep
         // their socket warm without stealing primary from the active tab.
@@ -709,7 +747,11 @@ export function useTerminal(
           // the counter pinned at 1 forever. See #1107.
           hasReceivedData = true;
           retryCountRef.current = 0;
-          setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
+          terminalSetState((prev) => ({
+            ...prev,
+            retryCount: 0,
+            retryCountdown: 0,
+          }));
         }
         if (event.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(event.data);
@@ -737,7 +779,10 @@ export function useTerminal(
             }
             if (msg.type === "primary_status") {
               const status = msg as PrimaryStatusMessage;
-              setState((prev) => ({ ...prev, isPrimary: status.is_primary }));
+              terminalSetState((prev) => ({
+                ...prev,
+                isPrimary: status.is_primary,
+              }));
               return;
             }
           } catch {
@@ -755,7 +800,7 @@ export function useTerminal(
           wasClean: event.wasClean,
           attempt: retryCountRef.current,
         };
-        setState((prev) => ({ ...prev, connected: false }));
+        terminalSetState((prev) => ({ ...prev, connected: false }));
         // Server-signalled "stop retrying" (close code 4001): the PTY
         // relay is permanently broken (pane killed, tmux session
         // destroyed, etc.) and another reconnect would just immediately
@@ -777,7 +822,7 @@ export function useTerminal(
             delayMs,
           });
 
-          setState((prev) => ({
+          terminalSetState((prev) => ({
             ...prev,
             connected: false,
             reconnecting: true,
@@ -792,7 +837,10 @@ export function useTerminal(
           countdownRef.current = setInterval(() => {
             countdown -= 1;
             if (countdown > 0) {
-              setState((prev) => ({ ...prev, retryCountdown: countdown }));
+              terminalSetState((prev) => ({
+                ...prev,
+                retryCountdown: countdown,
+              }));
             }
           }, 1000);
 
@@ -806,7 +854,7 @@ export function useTerminal(
           term.write(
             `\r\n\x1b[31m[Connection lost (code=${event.code}${event.reason ? ` ${event.reason}` : ""}). Click retry or press Enter to reconnect.]\x1b[0m\r\n`,
           );
-          setState((prev) => ({
+          terminalSetState((prev) => ({
             ...prev,
             connected: false,
             reconnecting: false,
@@ -900,10 +948,8 @@ export function useTerminal(
     //
     // Pause/resume apply to BOTH platforms: claude's continued output
     // shifts scrollback under the reader regardless of client size.
-    const wheelSeq = (
-      dir: "up" | "down",
-      cell: { col: number; row: number },
-    ) => `\x1b[<${dir === "up" ? 64 : 65};${cell.col};${cell.row}M`;
+    const wheelSeq = (dir: "up" | "down", cell: { col: number; row: number }) =>
+      `\x1b[<${dir === "up" ? 64 : 65};${cell.col};${cell.row}M`;
     const wheelGrid = () => {
       const sentGrid =
         lastSentCols > 0 && lastSentRows > 0
@@ -924,8 +970,7 @@ export function useTerminal(
       clientY: number,
       eventTarget?: EventTarget | null,
     ) => {
-      const targetEl =
-        eventTarget instanceof HTMLElement ? eventTarget : null;
+      const targetEl = eventTarget instanceof HTMLElement ? eventTarget : null;
       const targetRect = targetEl?.getBoundingClientRect();
       const el =
         targetRect && targetRect.width > 0 && targetRect.height > 0
@@ -967,7 +1012,7 @@ export function useTerminal(
       // Just emit raw wheel sequences and let Claude's renderer handle
       // them. isInScrollback stays false; downstream UI (BackToLiveButton)
       // hides itself accordingly.
-      if (claudeFullscreen) {
+      if (claudeFullscreenRef.current) {
         const seq = wheelSeq(dir, cell);
         for (let i = 0; i < count; i++) {
           ws.send(new TextEncoder().encode(seq));
@@ -995,7 +1040,7 @@ export function useTerminal(
       }
       // Transition into scrollback on first wheel-up (desktop + mobile).
       if (dir === "up") {
-        setState((prev) => {
+        terminalSetState((prev) => {
           if (prev.isInScrollback) return prev;
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
@@ -1009,7 +1054,7 @@ export function useTerminal(
         // resume the pane's process. On mobile this branch never fires
         // because the clamp keeps depth >= 1; mobile exits via the
         // explicit "Back to live" button (see exitScrollback).
-        setState((prev) => {
+        terminalSetState((prev) => {
           if (!prev.isInScrollback) return prev;
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
@@ -1331,7 +1376,10 @@ export function useTerminal(
         if (osc52ArmSeq === armSeq) osc52Resolve = null;
       };
       try {
-        if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+        if (
+          typeof ClipboardItem !== "undefined" &&
+          navigator.clipboard?.write
+        ) {
           const pending = new Promise<Blob>((resolve, reject) => {
             osc52Resolve = (text) => {
               if (settled || osc52ArmSeq !== armSeq) return;
@@ -1348,11 +1396,13 @@ export function useTerminal(
           // unhandled rejection if the clipboard implementation drops the
           // promise (the write() consumer below also sees it; both fire).
           pending.catch(() => {});
-          navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {
-            // Rejected when no OSC 52 arrived within the timeout (drag
-            // selected nothing) or the engine declined the async write.
-            // Harmless.
-          });
+          navigator.clipboard
+            .write([new ClipboardItem({ "text/plain": pending })])
+            .catch(() => {
+              // Rejected when no OSC 52 arrived within the timeout (drag
+              // selected nothing) or the engine declined the async write.
+              // Harmless.
+            });
           return;
         }
       } catch {
@@ -1389,7 +1439,9 @@ export function useTerminal(
     // mousedown on the viewport so only drags that begin inside the terminal
     // count; mouseup on the window so a release outside the terminal bounds
     // (the user dragged past the top edge into scrollback) still arms.
-    viewport.addEventListener("mousedown", onMouseDownCapture, { capture: true });
+    viewport.addEventListener("mousedown", onMouseDownCapture, {
+      capture: true,
+    });
     window.addEventListener("mouseup", onWindowMouseUp, { capture: true });
 
     // Mouse wheel: Ctrl+wheel = zoom (trackpad pinch), plain wheel =
@@ -1454,11 +1506,7 @@ export function useTerminal(
           eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell
             ? lastCapturedWheelCell
             : eventCell;
-        sendWheel(
-          wheels > 0 ? "down" : "up",
-          Math.abs(wheels),
-          cell,
-        );
+        sendWheel(wheels > 0 ? "down" : "up", Math.abs(wheels), cell);
         scrollWheelAccum -= wheels * step;
       }
       return false;
@@ -1572,8 +1620,7 @@ export function useTerminal(
       fitRef.current = null;
       wsRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, wsPath]);
+  }, [sessionId, terminalSetState, wsPath]);
 
   // Repaint the live terminal when the user picks a new theme. The
   // resolved theme's --term-* variables live on documentElement; xterm.js
@@ -1617,7 +1664,7 @@ export function useTerminal(
     const wasInScrollback = isInScrollbackRef.current;
     isInScrollbackRef.current = state.isInScrollback;
     if (wasInScrollback && !state.isInScrollback) {
-      flushPendingResizeRef.current?.();
+      setTimeout(() => flushPendingResizeRef.current?.(), 0);
     }
   }, [state.isInScrollback]);
 
@@ -1638,7 +1685,7 @@ export function useTerminal(
       countdownRef.current = null;
     }
     retryCountRef.current = 0;
-    setState((prev) => ({
+    terminalSetState((prev) => ({
       ...prev,
       connected: false,
       reconnecting: true,
@@ -1695,16 +1742,14 @@ export function useTerminal(
     cancelMomentumRef.current?.();
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({ type: "resume_output" } as ResumeOutputMessage),
-      );
+      ws.send(JSON.stringify({ type: "resume_output" } as ResumeOutputMessage));
       ws.send(new TextEncoder().encode("\x1b"));
     }
     resetScrollbackDepthRef.current?.();
-    setState((prev) =>
+    terminalSetState((prev) =>
       prev.isInScrollback ? { ...prev, isInScrollback: false } : prev,
     );
-  }, []);
+  }, [terminalSetState]);
 
   return {
     containerRef,

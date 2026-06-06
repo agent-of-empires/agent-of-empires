@@ -56,7 +56,9 @@ base(
 
     try {
       const sessions = await listSessions(serve.baseUrl);
-      const seeded = sessions.find((s) => s.title === "story-slash-pick-no-arg");
+      const seeded = sessions.find(
+        (s) => s.title === "story-slash-pick-no-arg",
+      );
       if (!seeded) {
         throw new Error("seeded session 'story-slash-pick-no-arg' missing");
       }
@@ -89,7 +91,9 @@ base(
         "AvailableCommandsUpdated",
       );
 
-      await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
       await waitForStructuredView(page);
 
       const composer = page.getByRole("textbox", { name: /Send a message/i });
@@ -105,9 +109,7 @@ base(
       // the label, and the description, so filter by `/help` substring
       // rather than relying on the visually-only data-highlighted
       // attribute (which assistant-ui sets to "" not "true").
-      const helpItem = page
-        .getByRole("option")
-        .filter({ hasText: /\/help/ });
+      const helpItem = page.getByRole("option").filter({ hasText: /\/help/ });
       await expect(helpItem).toBeVisible({ timeout: 15_000 });
 
       // Pick `/help` via Enter. removeOnExecute strips the typed
@@ -194,7 +196,9 @@ base(
         "AvailableCommandsUpdated",
       );
 
-      await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
       await waitForStructuredView(page);
 
       const composer = page.getByRole("textbox", { name: /Send a message/i });

@@ -23,12 +23,14 @@ pub mod context_primer;
 pub mod event_store;
 pub mod fs_handler;
 pub mod install_hints;
+pub mod mcp_config;
 pub mod node;
 pub mod permissions;
 pub mod protocol;
 pub mod runner;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;

@@ -66,10 +66,13 @@ export function isLoginAttemptPath(path: string): boolean {
  * Safe to call multiple times; only the first call installs the wrapper.
  */
 export function installFetchErrorToasts(): void {
-  if ((window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched) {
+  if (
+    (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched
+  ) {
     return;
   }
-  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched = true;
+  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched =
+    true;
 
   const original = window.fetch.bind(window);
 
@@ -152,9 +155,7 @@ export function installFetchErrorToasts(): void {
       // When the server is known to be down, suppress per-request toasts.
       // The DisconnectBanner handles the user-facing notification instead.
       if (isApi && !isServerDown()) {
-        reportError(
-          `Network error contacting ${path}. Check your connection.`,
-        );
+        reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;
     }
@@ -228,7 +229,9 @@ function attachAuthHeader(
 function isSameOrigin(url: string): boolean {
   if (url.startsWith("/")) return true;
   try {
-    return new URL(url, window.location.origin).origin === window.location.origin;
+    return (
+      new URL(url, window.location.origin).origin === window.location.origin
+    );
   } catch {
     return false;
   }

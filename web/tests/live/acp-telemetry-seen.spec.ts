@@ -13,7 +13,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../helpers/aoeServe";
-import { enableStructuredViewAndWait, waitForStructuredView } from "../helpers/acp";
+import {
+  enableStructuredViewAndWait,
+  waitForStructuredView,
+} from "../helpers/acp";
 
 /** Capture every `POST /api/telemetry/seen` body the browser sends, parsed
  *  into `{ surface }`. Attach before `page.goto` so the on-load `"web"`
@@ -23,10 +26,7 @@ function captureSeenPings(
 ): Array<{ surface?: string }> {
   const pings: Array<{ surface?: string }> = [];
   page.on("request", (req) => {
-    if (
-      req.method() === "POST" &&
-      req.url().includes("/api/telemetry/seen")
-    ) {
+    if (req.method() === "POST" && req.url().includes("/api/telemetry/seen")) {
       const body = req.postData();
       if (!body) return;
       try {

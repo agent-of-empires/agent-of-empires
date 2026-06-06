@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useMemo, useRef, useState } from "react";
 import { useFileDiff } from "../../hooks/useFileDiff";
 import {
   useHighlightedLines,
@@ -109,15 +109,15 @@ function HunkView({
         <span className="shrink-0 w-[50px] border-r border-surface-700/30" />
         <span className="shrink-0 w-4" />
         <span className="flex-1 font-mono text-[11px] text-accent-600 py-0.5 px-1">
-          @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
+          @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},
+          {hunk.new_lines} @@
         </span>
       </div>
       {hunk.lines.map((line, i) => {
         const rowKey = `h${hunkIndex}-r${i}`;
         const { isHighlighted, isRangeEndpoint, side, lineNum } =
           highlightForRow(line, hunkIndex, rangeStart, draft);
-        const plusEnabled =
-          commentsEnabled && lineNum != null && side != null;
+        const plusEnabled = commentsEnabled && lineNum != null && side != null;
         const plusActive =
           plusEnabled &&
           rangeStart != null &&
@@ -177,10 +177,8 @@ function highlightForRow(
   lineNum: number | null;
 } {
   // Side preference: added → new, deleted → old, equal → new.
-  const sideForRow: DiffSide =
-    line.type === "delete" ? "old" : "new";
-  const lineNum =
-    sideForRow === "new" ? line.new_line_num : line.old_line_num;
+  const sideForRow: DiffSide = line.type === "delete" ? "old" : "new";
+  const lineNum = sideForRow === "new" ? line.new_line_num : line.old_line_num;
   if (lineNum == null) {
     return {
       isHighlighted: false,
@@ -264,13 +262,25 @@ export function DiffFileViewer({
   // file / repo / session, or the diff refreshes. Without this an
   // unfinished selection or open draft from file A would render in
   // file B (and save the wrong filePath against the wrong snippet).
-  useEffect(() => {
+  // Synced at render time (not in an effect) to avoid set-state-in-effect.
+  const syncKey = JSON.stringify([
+    sessionId,
+    repoName ?? null,
+    filePath,
+    revision,
+  ]);
+  const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
+  if (syncKey !== handledSyncKey) {
+    setHandledSyncKey(syncKey);
     setRangeStart(null);
     setDraft(null);
-  }, [sessionId, repoName, filePath, revision]);
+  }
 
-  const hunks = diff?.hunks ?? [];
-  const comments = commentsStore?.comments ?? [];
+  const hunks = useMemo(() => diff?.hunks ?? [], [diff]);
+  const comments = useMemo(
+    () => commentsStore?.comments ?? [],
+    [commentsStore],
+  );
 
   const anchored: AnchoredComment[] = useMemo(
     () => anchorComments(comments, filePath, repoName, hunks),
@@ -326,12 +336,7 @@ export function DiffFileViewer({
         // Range failed to resolve (probably straddled a non-side row at
         // the boundary). Fall back to single-line on the clicked row.
         setRangeStart(null);
-        const fallback = extractSnippetFromHunks(
-          hunks,
-          side,
-          lineNum,
-          lineNum,
-        );
+        const fallback = extractSnippetFromHunks(hunks, side, lineNum, lineNum);
         if (!fallback) return;
         setDraft({
           hunkIndex,
@@ -431,7 +436,16 @@ export function DiffFileViewer({
             title="Back to terminal"
             aria-label="Back to terminal"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <path d="M15 18l-6-6 6-6" />
             </svg>
             <span className="hidden sm:inline">Terminal</span>
@@ -541,9 +555,13 @@ export function DiffFileViewer({
                   lineTokens={tokenGrid?.[hi]}
                   commentsEnabled={commentsEnabled && !!commentsStore}
                   cardsByEndRow={cardsByHunkRow.get(hi) ?? EMPTY_MAP}
-                  formRowIndex={draft?.hunkIndex === hi ? draft.endRowIndex : null}
+                  formRowIndex={
+                    draft?.hunkIndex === hi ? draft.endRowIndex : null
+                  }
                   draftSide={draft?.hunkIndex === hi ? draft.side : null}
-                  draftStartLine={draft?.hunkIndex === hi ? draft.startLine : null}
+                  draftStartLine={
+                    draft?.hunkIndex === hi ? draft.startLine : null
+                  }
                   draftEndLine={draft?.hunkIndex === hi ? draft.endLine : null}
                   rangeStart={
                     rangeStart?.hunkIndex === hi

@@ -11,7 +11,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../../helpers/acp";
 
 base("composer draft survives a full reload", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -30,7 +33,9 @@ base("composer draft survives a full reload", async ({ page }, testInfo) => {
 
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });

@@ -15,7 +15,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../../helpers/acp";
 
 const STOP_SCRIPT = {
   turns: [
@@ -64,7 +67,9 @@ base("Stop button cancels a running turn", async ({ page }, testInfo) => {
 
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });
@@ -73,7 +78,9 @@ base("Stop button cancels a running turn", async ({ page }, testInfo) => {
 
     // First chunk arrives, then the fake waits. The Stop affordance is
     // mounted while the turn is active.
-    await expect(page.getByText("Thinking...")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Thinking...")).toBeVisible({
+      timeout: 10_000,
+    });
     const stopButton = page.getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 5_000 });
     await stopButton.click();

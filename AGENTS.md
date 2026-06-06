@@ -21,6 +21,7 @@
 - `tests/e2e/`: end-to-end tests exercising the full `aoe` binary (see E2E Tests below).
 - `docs/`: user-facing documentation and guides.
 - `docs/development/adding-agents.md`: guide for adding a new agent to AoE.
+- `docs/development/adding-settings.md`: guide for adding a setting via the single-source schema.
 - `scripts/`: installation and utility scripts.
 - `xtask/`: build automation workspace.
 
@@ -67,9 +68,12 @@ there everything is automatic:
   `merge_json` / `clear_path`. No `FieldKey`, `build_*_fields`, or
   `apply_field_*` to touch.
 - **Web** fetches `GET /api/settings/schema` and renders generic FormFields
-  (`web/src/components/settings/SchemaSection.tsx`). (Migration is incremental;
-  some sections are still hand-written and consume the schema as they move
-  over.)
+  (`web/src/components/settings/SchemaSection.tsx`). Every config-backed
+  section is schema-driven; `custom:<id>` fields resolve through the web
+  custom-widget registry (`web/src/components/settings/customWidgetRegistry.ts`)
+  and a section may pass an `onAfterSave` hook for cross-surface effects (the
+  acp section refreshes `serverAbout`). Only `diff` (client-local) and
+  `telemetry` (separate consent endpoint) stay hand-written.
 - **Server** validates each PATCH leaf against the schema's `web_write` policy
   and `validation` rule (`settings_schema::validate_patch`); no hand-kept
   allowlist.
@@ -80,13 +84,19 @@ Attribute keys: `label`, `desc` (defaults to the doc comment), `widget`
 (`toggle` / `text` / `optional_text` / `number` / `slider` / `select` /
 `list` / `custom:<id>`), `options` (for `select`, `value:Label,...`),
 `min` / `max` / `step`, `validate` (`range:MIN[:MAX]` / `nonempty` /
-`memory_limit` / `volume_list`), `web` (`elevation:<reason>` /
+`memory_limit` / `volume_list` / `env_list` / `port_mapping_list`), `web`
+(`elevation:<reason>` /
 `local_only:<reason>`; omit for plain allow), `category` (override the
 section's default tab), `advanced` (group under an Advanced fold), `global_only`
 (shown but not profile-overridable), and `skip` (exclude from the schema). The
 section itself is declared with `#[setting_section(name = "...", category =
 "...")]`. A `custom:<id>` widget keeps a bespoke control: register the id in the
-TUI custom-widget map (and, when the web renders that section, the web one too).
+TUI custom-widget map AND the web one
+(`web/src/components/settings/customWidgetRegistry.ts`); an unregistered web id
+renders a visible "no control" placeholder rather than silently dropping the
+field. `Config.environment` (the host env list) stays a TUI-only extra row: it
+is a root-level `Vec<String>` with no `SettingsSection`, so schematizing it
+would need a breaking config-layout migration; the web does not surface it.
 
 ## Coding Style & Naming Conventions
 
@@ -188,6 +198,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
   - `serve.mode`: `tunnel` / `tailscale` / `local`.
   - `serve.passphrase`: plaintext Tunnel passphrase, so the TUI can show it on reopen across restarts.
   - `serve.last_mode`, `serve.last_port`: picker defaults across launches.
+  - `login_sessions.toml`: persisted dashboard login sessions (0600), so signed-in devices survive a daemon restart (#1235). Unlike the `serve.*` files it is intentionally NOT cleaned up on `--stop`; that would reproduce the re-prompt bug. Dropped on a passphrase change; gated by `auth.persist_sessions`.
 
 Daemon tracing and stdout/stderr now land in the configured `[logging].file_path` (default `~/.agent-of-empires/debug.log`) alongside the TUI and structured-view runners; see `docs/development/logging.md` for sinks and rotation.
 

@@ -16,26 +16,26 @@ function state(ids: string[], anchorId: string | null): SidebarSelectionState {
 
 describe("classifyClick", () => {
   it("maps modifier combinations to intents", () => {
-    expect(classifyClick({ metaKey: false, ctrlKey: false, shiftKey: false })).toBe(
-      "navigate",
-    );
-    expect(classifyClick({ metaKey: true, ctrlKey: false, shiftKey: false })).toBe(
-      "toggle",
-    );
-    expect(classifyClick({ metaKey: false, ctrlKey: true, shiftKey: false })).toBe(
-      "toggle",
-    );
-    expect(classifyClick({ metaKey: false, ctrlKey: false, shiftKey: true })).toBe(
-      "range",
-    );
-    expect(classifyClick({ metaKey: true, ctrlKey: false, shiftKey: true })).toBe(
-      "additive-range",
-    );
+    expect(
+      classifyClick({ metaKey: false, ctrlKey: false, shiftKey: false }),
+    ).toBe("navigate");
+    expect(
+      classifyClick({ metaKey: true, ctrlKey: false, shiftKey: false }),
+    ).toBe("toggle");
+    expect(
+      classifyClick({ metaKey: false, ctrlKey: true, shiftKey: false }),
+    ).toBe("toggle");
+    expect(
+      classifyClick({ metaKey: false, ctrlKey: false, shiftKey: true }),
+    ).toBe("range");
+    expect(
+      classifyClick({ metaKey: true, ctrlKey: false, shiftKey: true }),
+    ).toBe("additive-range");
     // Ctrl+Shift on Windows/Linux is the same additive-range gesture as
     // Cmd+Shift on macOS.
-    expect(classifyClick({ metaKey: false, ctrlKey: true, shiftKey: true })).toBe(
-      "additive-range",
-    );
+    expect(
+      classifyClick({ metaKey: false, ctrlKey: true, shiftKey: true }),
+    ).toBe("additive-range");
   });
 });
 
@@ -66,7 +66,10 @@ describe("selectionReducer", () => {
   });
 
   it("range replaces the selection from the anchor to the target", () => {
-    const anchored = selectionReducer(EMPTY_SELECTION, { type: "toggle", id: "b" });
+    const anchored = selectionReducer(EMPTY_SELECTION, {
+      type: "toggle",
+      id: "b",
+    });
     const ranged = selectionReducer(anchored, {
       type: "range",
       targetId: "d",
@@ -148,7 +151,10 @@ describe("selectionReducer", () => {
   it("prune returns the same reference when nothing changed", () => {
     const s = state(["a", "b"], "a");
     expect(
-      selectionReducer(s, { type: "prune", validIds: new Set(["a", "b", "c"]) }),
+      selectionReducer(s, {
+        type: "prune",
+        validIds: new Set(["a", "b", "c"]),
+      }),
     ).toBe(s);
   });
 });

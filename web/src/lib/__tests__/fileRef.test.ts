@@ -113,9 +113,9 @@ describe("resolveToRepoRelative", () => {
   });
 
   it("falls back to the main repo path", () => {
-    expect(
-      resolveToRepoRelative("/Users/me/repo/src/app.ts", single),
-    ).toEqual({ relativePath: "src/app.ts" });
+    expect(resolveToRepoRelative("/Users/me/repo/src/app.ts", single)).toEqual({
+      relativePath: "src/app.ts",
+    });
   });
 
   it("does not match a sibling dir with a shared prefix", () => {
@@ -126,9 +126,7 @@ describe("resolveToRepoRelative", () => {
   });
 
   it("returns null when the path is outside any known root", () => {
-    expect(
-      resolveToRepoRelative("/etc/passwd", single),
-    ).toBeNull();
+    expect(resolveToRepoRelative("/etc/passwd", single)).toBeNull();
   });
 
   it("treats a relative path as already repo-relative", () => {

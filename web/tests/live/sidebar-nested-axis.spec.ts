@@ -23,10 +23,15 @@ import {
   resolveAoeBinary,
 } from "../helpers/aoeServe";
 
-function seedNestedSessions(
-  sessions: { title: string; group?: string }[],
-) {
-  return ({ home, env }: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => {
+function seedNestedSessions(sessions: { title: string; group?: string }[]) {
+  return ({
+    home,
+    env,
+  }: {
+    home: string;
+    shimBin: string;
+    env: NodeJS.ProcessEnv;
+  }) => {
     const binary = resolveAoeBinary();
     const projectDir = join(home, "project");
     mkdirSync(projectDir, { recursive: true });
@@ -80,113 +85,119 @@ async function cycleAxisTo(
 }
 
 base.describe("sidebar nested repo+group axis (#1720)", () => {
-  base("nests user groups inside the repo block", async ({ page }, testInfo) => {
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: SEED,
-    });
-
-    try {
-      expect(await listSessions(serve.baseUrl)).toHaveLength(4);
-      await page.goto(`${serve.baseUrl}/`);
-
-      const axisToggle = page.locator("[data-testid='sidebar-axis-toggle']");
-      await expect(axisToggle).toHaveAttribute("data-axis", "repo", {
-        timeout: 10_000,
+  base(
+    "nests user groups inside the repo block",
+    async ({ page }, testInfo) => {
+      const serve = await spawnAoeServe({
+        authMode: "none",
+        workerIndex: testInfo.workerIndex,
+        parallelIndex: testInfo.parallelIndex,
+        seedFn: SEED,
       });
-      await cycleAxisTo(axisToggle, "repo+group");
 
-      // One repository block holds all four sessions, split into three
-      // nested subgroups: feature, fix, and Ungrouped.
-      const repoBlocks = page.locator("[data-testid='sidebar-nested-repo']");
-      await expect(repoBlocks).toHaveCount(1);
-      const repo = repoBlocks.first();
+      try {
+        expect(await listSessions(serve.baseUrl)).toHaveLength(4);
+        await page.goto(`${serve.baseUrl}/`);
 
-      await expect(
-        repo.locator("[data-testid='sidebar-nested-subgroup']"),
-      ).toHaveCount(3);
-      await expect(
-        repo.locator(
-          "[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']",
-        ),
-      ).toBeVisible();
-      await expect(
-        repo.locator(
-          "[data-testid='sidebar-nested-subgroup'] [data-group-id='fix']",
-        ),
-      ).toBeVisible();
-      await expect(
-        repo.locator(
-          "[data-testid='sidebar-nested-subgroup'] [data-group-id='__ungrouped__']",
-        ),
-      ).toBeVisible();
+        const axisToggle = page.locator("[data-testid='sidebar-axis-toggle']");
+        await expect(axisToggle).toHaveAttribute("data-axis", "repo", {
+          timeout: 10_000,
+        });
+        await cycleAxisTo(axisToggle, "repo+group");
 
-      // Every session stays visible, now nested under its subgroup.
-      await expect(
-        page.locator("[data-testid='sidebar-session-row']"),
-      ).toHaveCount(4);
-    } finally {
-      await serve.stop();
-    }
-  });
+        // One repository block holds all four sessions, split into three
+        // nested subgroups: feature, fix, and Ungrouped.
+        const repoBlocks = page.locator("[data-testid='sidebar-nested-repo']");
+        await expect(repoBlocks).toHaveCount(1);
+        const repo = repoBlocks.first();
 
-  base("subgroup collapse is independent of repo collapse and persists", async ({ page }, testInfo) => {
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: SEED,
-    });
-
-    try {
-      await page.goto(`${serve.baseUrl}/`);
-
-      const axisToggle = page.locator("[data-testid='sidebar-axis-toggle']");
-      await expect(axisToggle).toHaveAttribute("data-axis", "repo", {
-        timeout: 10_000,
-      });
-      await cycleAxisTo(axisToggle, "repo+group");
-
-      const featureSub = page.locator(
-        "[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']",
-      );
-      const featureExpand = featureSub.locator("button[aria-expanded]");
-      await expect(featureExpand).toHaveAttribute("aria-expanded", "true");
-
-      // Collapse just the feature subgroup: its rows hide, the fix
-      // subgroup's rows stay, and the repo header stays expanded.
-      await featureExpand.click();
-      await expect(featureExpand).toHaveAttribute("aria-expanded", "false");
-      await expect(page.getByText("feat-one")).toBeHidden();
-      await expect(page.getByText("fix-one")).toBeVisible();
-
-      // The subgroup collapse survives a reload (per-repo localStorage key).
-      await page.reload();
-      await expect(axisToggle).toHaveAttribute("data-axis", "repo+group", {
-        timeout: 10_000,
-      });
-      await expect(
-        page
-          .locator(
+        await expect(
+          repo.locator("[data-testid='sidebar-nested-subgroup']"),
+        ).toHaveCount(3);
+        await expect(
+          repo.locator(
             "[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']",
-          )
-          .locator("button[aria-expanded]"),
-      ).toHaveAttribute("aria-expanded", "false");
+          ),
+        ).toBeVisible();
+        await expect(
+          repo.locator(
+            "[data-testid='sidebar-nested-subgroup'] [data-group-id='fix']",
+          ),
+        ).toBeVisible();
+        await expect(
+          repo.locator(
+            "[data-testid='sidebar-nested-subgroup'] [data-group-id='__ungrouped__']",
+          ),
+        ).toBeVisible();
 
-      // Collapsing the repo header hides every nested subgroup.
-      const repoHeader = page
-        .locator("[data-testid='sidebar-nested-repo']")
-        .first()
-        .locator("[data-testid='sidebar-group-header']")
-        .first();
-      await repoHeader.locator("button[aria-expanded]").click();
-      await expect(
-        page.locator("[data-testid='sidebar-nested-subgroup']"),
-      ).toHaveCount(0);
-    } finally {
-      await serve.stop();
-    }
-  });
+        // Every session stays visible, now nested under its subgroup.
+        await expect(
+          page.locator("[data-testid='sidebar-session-row']"),
+        ).toHaveCount(4);
+      } finally {
+        await serve.stop();
+      }
+    },
+  );
+
+  base(
+    "subgroup collapse is independent of repo collapse and persists",
+    async ({ page }, testInfo) => {
+      const serve = await spawnAoeServe({
+        authMode: "none",
+        workerIndex: testInfo.workerIndex,
+        parallelIndex: testInfo.parallelIndex,
+        seedFn: SEED,
+      });
+
+      try {
+        await page.goto(`${serve.baseUrl}/`);
+
+        const axisToggle = page.locator("[data-testid='sidebar-axis-toggle']");
+        await expect(axisToggle).toHaveAttribute("data-axis", "repo", {
+          timeout: 10_000,
+        });
+        await cycleAxisTo(axisToggle, "repo+group");
+
+        const featureSub = page.locator(
+          "[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']",
+        );
+        const featureExpand = featureSub.locator("button[aria-expanded]");
+        await expect(featureExpand).toHaveAttribute("aria-expanded", "true");
+
+        // Collapse just the feature subgroup: its rows hide, the fix
+        // subgroup's rows stay, and the repo header stays expanded.
+        await featureExpand.click();
+        await expect(featureExpand).toHaveAttribute("aria-expanded", "false");
+        await expect(page.getByText("feat-one")).toBeHidden();
+        await expect(page.getByText("fix-one")).toBeVisible();
+
+        // The subgroup collapse survives a reload (per-repo localStorage key).
+        await page.reload();
+        await expect(axisToggle).toHaveAttribute("data-axis", "repo+group", {
+          timeout: 10_000,
+        });
+        await expect(
+          page
+            .locator(
+              "[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']",
+            )
+            .locator("button[aria-expanded]"),
+        ).toHaveAttribute("aria-expanded", "false");
+
+        // Collapsing the repo header hides every nested subgroup.
+        const repoHeader = page
+          .locator("[data-testid='sidebar-nested-repo']")
+          .first()
+          .locator("[data-testid='sidebar-group-header']")
+          .first();
+        await repoHeader.locator("button[aria-expanded]").click();
+        await expect(
+          page.locator("[data-testid='sidebar-nested-subgroup']"),
+        ).toHaveCount(0);
+      } finally {
+        await serve.stop();
+      }
+    },
+  );
 });

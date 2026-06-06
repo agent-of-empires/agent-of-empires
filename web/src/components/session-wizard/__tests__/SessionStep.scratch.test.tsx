@@ -19,7 +19,9 @@ afterEach(() => {
   cleanup();
 });
 
-function renderStep(overrides: { scratch?: boolean; useWorktree?: boolean } = {}) {
+function renderStep(
+  overrides: { scratch?: boolean; useWorktree?: boolean } = {},
+) {
   const onChange = vi.fn();
   const utils = render(
     <SessionStep
@@ -50,7 +52,9 @@ describe("SessionStep scratch rendering (#1324)", () => {
     // scratch is on. The replacement note has the dedicated
     // aria-label below.
     expect(queryByRole("switch")).toBeNull();
-    expect(getByText("Scratch sessions do not use git worktrees.")).toBeTruthy();
+    expect(
+      getByText("Scratch sessions do not use git worktrees."),
+    ).toBeTruthy();
   });
 
   it("with scratch=false, the worktree toggle is rendered", () => {

@@ -24,7 +24,10 @@ function writeEntry(id: string, queued: number, savedAt = Date.now()): void {
   }));
   localStorage.setItem(
     entryKey(id),
-    JSON.stringify({ savedAt, state: { lastSeq: 0, activity: [], queuedPrompts } }),
+    JSON.stringify({
+      savedAt,
+      state: { lastSeq: 0, activity: [], queuedPrompts },
+    }),
   );
 }
 
@@ -112,7 +115,11 @@ describe("useQueuedCountForSessions", () => {
           key: entryKey("b"),
           newValue: JSON.stringify({
             savedAt: Date.now(),
-            state: { lastSeq: 0, activity: [], queuedPrompts: [{ id: "b-0", text: "x", queuedAt: "t" }] },
+            state: {
+              lastSeq: 0,
+              activity: [],
+              queuedPrompts: [{ id: "b-0", text: "x", queuedAt: "t" }],
+            },
           }),
           storageArea: localStorage,
         }),
@@ -148,7 +155,11 @@ describe("useQueuedCountForSessions", () => {
           key: entryKey("a"),
           newValue: JSON.stringify({
             savedAt: Date.now(),
-            state: { lastSeq: 0, activity: [], queuedPrompts: [{ id: "a-0", text: "x", queuedAt: "t" }] },
+            state: {
+              lastSeq: 0,
+              activity: [],
+              queuedPrompts: [{ id: "a-0", text: "x", queuedAt: "t" }],
+            },
           }),
           storageArea: localStorage,
         }),

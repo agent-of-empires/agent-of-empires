@@ -50,23 +50,20 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     page: Page,
     opts: { deltaY: number; ctrlKey?: boolean; times?: number },
   ) {
-    await page.evaluate(
-      ({ deltaY, ctrlKey, times }) => {
-        const target = document.querySelector<HTMLElement>(".xterm");
-        if (!target) throw new Error(".xterm not mounted");
-        for (let i = 0; i < (times ?? 1); i++) {
-          target.dispatchEvent(
-            new WheelEvent("wheel", {
-              bubbles: true,
-              cancelable: true,
-              deltaY,
-              ctrlKey: ctrlKey ?? false,
-            }),
-          );
-        }
-      },
-      opts,
-    );
+    await page.evaluate(({ deltaY, ctrlKey, times }) => {
+      const target = document.querySelector<HTMLElement>(".xterm");
+      if (!target) throw new Error(".xterm not mounted");
+      for (let i = 0; i < (times ?? 1); i++) {
+        target.dispatchEvent(
+          new WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            deltaY,
+            ctrlKey: ctrlKey ?? false,
+          }),
+        );
+      }
+    }, opts);
   }
 
   // Re-fire the wheel burst on every poll tick until the expected side
@@ -221,10 +218,8 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
 
     // Wheel-up enters scrollback (pause_output). Re-firing up only deepens
     // scrollback, so the pause transition is monotonic and re-fire-safe.
-    await fireUntil(
-      page,
-      { deltaY: -120, times: 3 },
-      () => hasText('"type":"pause_output"'),
+    await fireUntil(page, { deltaY: -120, times: 3 }, () =>
+      hasText('"type":"pause_output"'),
     );
     expect(hasText('"type":"resume_output"')).toBe(false);
 
@@ -232,10 +227,8 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     // copy-mode and the client emits resume_output. Re-fire down until that
     // lands: each burst drives depth toward 0 and stops at 0, so re-firing
     // can only reach (never overshoot past) the resume transition.
-    await fireUntil(
-      page,
-      { deltaY: 120, times: 5 },
-      () => hasText('"type":"resume_output"'),
+    await fireUntil(page, { deltaY: 120, times: 5 }, () =>
+      hasText('"type":"resume_output"'),
     );
 
     // Still no button on desktop at any point.

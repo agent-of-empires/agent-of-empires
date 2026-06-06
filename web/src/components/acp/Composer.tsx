@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // VSCode/Cursor-style composer for the structured view.
 //
 // Built on assistant-ui's `<ComposerPrimitive.Root>` plus the official
@@ -18,15 +19,15 @@ import {
   type Unstable_TriggerAdapter,
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AtSign,
-  ChevronUp,
-  Paperclip,
-  Slash,
-  Square,
-  X,
-} from "lucide-react";
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { AtSign, ChevronUp, Paperclip, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { CursorModelControls } from "./CursorModelControls";
@@ -37,9 +38,9 @@ import {
 } from "./configOptionsForComposerControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
-  OPEN_SWITCH_AGENT_EVENT,
-  consumePendingSwitchAgent,
-  type OpenSwitchAgentDetail,
+  clearPendingSwitchAgent,
+  getPendingSwitchAgent,
+  subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import type {
   AcpState,
@@ -225,10 +226,7 @@ interface Props {
    *  on the just-clicked option. */
   pendingConfigOption: AcpState["pendingConfigOption"];
   /** Send `session/set_config_option` for the given pair. */
-  setConfigOption: (
-    configId: string,
-    value: string,
-  ) => void | Promise<void>;
+  setConfigOption: (configId: string, value: string) => void | Promise<void>;
   /** Latest agent-reported context-window usage. Null until the agent
    *  has emitted at least one ACP `UsageUpdate`. */
   sessionUsage: AcpState["sessionUsage"];
@@ -338,7 +336,10 @@ export function Composer({
     async (files: FileList | File[]) => {
       // Only encode up to the remaining slots: base64 work on files the
       // cap would discard anyway stalls the composer on large drops.
-      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
+      const remaining = Math.max(
+        0,
+        MAX_ATTACHMENTS - pendingAttachments.length,
+      );
       if (remaining === 0) return;
       const list = Array.from(files).slice(0, remaining);
       const accepted: PromptAttachmentInput[] = [];
@@ -362,23 +363,23 @@ export function Composer({
     [pendingAttachments.length, promptCapabilities, setPendingAttachments],
   );
 
-  // Reconcile already-staged attachments when capabilities change (e.g.
-  // after a manual agent switch): drop files whose kind the new agent no
-  // longer supports so they cannot be submitted. `attachmentsEnabled`
-  // only gates new intake, not files staged under the previous agent.
-  useEffect(() => {
-    if (!promptCapabilities) return;
-    setPendingAttachments((prev) => {
-      const next = prev.filter((att) => kindSupported(att.kind, promptCapabilities));
-      return next.length === prev.length ? prev : next;
-    });
-  }, [promptCapabilities, setPendingAttachments]);
+  const supportedPendingAttachments = useMemo(
+    () =>
+      promptCapabilities
+        ? pendingAttachments.filter((att) =>
+            kindSupported(att.kind, promptCapabilities),
+          )
+        : pendingAttachments,
+    [pendingAttachments, promptCapabilities],
+  );
 
   const removeAttachment = useCallback(
     (index: number) => {
-      setPendingAttachments((prev) => prev.filter((_, i) => i !== index));
+      const target = supportedPendingAttachments[index];
+      if (!target) return;
+      setPendingAttachments((prev) => prev.filter((att) => att !== target));
     },
-    [setPendingAttachments],
+    [setPendingAttachments, supportedPendingAttachments],
   );
 
   // When the soft keyboard is up the App root's safe-area-inset-bottom
@@ -482,35 +483,27 @@ export function Composer({
       taRef,
       composerRuntime,
       enqueuePrompt,
-      pendingAttachments,
+      supportedPendingAttachments,
       () => setPendingAttachments([]),
     );
-  }, [composerRuntime, enqueuePrompt, pendingAttachments, setPendingAttachments]);
+  }, [
+    composerRuntime,
+    enqueuePrompt,
+    setPendingAttachments,
+    supportedPendingAttachments,
+  ]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
   // trigger below. Unlike the rate-limit recovery path (which lives up in
   // StructuredView), this is available at any time so a user can hand back
   // to, say, claude after a rate-limit handoff to codex.
-  const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
-  // Open on a switch-agent request targeting this session. The dispatched
-  // event covers the already-open session; the pending latch (consumed on
-  // mount) covers the case where the user picked the menu item on another
-  // session and navigation mounted this Composer a tick later.
-  useEffect(() => {
-    if (consumePendingSwitchAgent(sessionId)) setSwitchAgentOpen(true);
-    const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
-      if (detail?.sessionId === sessionId) {
-        // Clear the latch we also set, so a later remount of this
-        // already-open session does not reopen the dialog.
-        consumePendingSwitchAgent(sessionId);
-        setSwitchAgentOpen(true);
-      }
-    };
-    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-    return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
-  }, [sessionId]);
+  const pendingSwitchAgentSessionId = useSyncExternalStore(
+    subscribePendingSwitchAgent,
+    getPendingSwitchAgent,
+    () => null,
+  );
+  const switchAgentOpen = pendingSwitchAgentSessionId === sessionId;
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -531,9 +524,21 @@ export function Composer({
   // parent re-renders that recreate the wrapping object. See #1004.
   const primerId = primerPrefill?.id ?? null;
   const primerText = primerPrefill?.text ?? null;
+  // Refs keep a snapshot of the primer values for the effect body, so the
+  // effect can access them without directly referencing reactive props
+  // (which would trigger no-event-handler). The refs are synced in a passive
+  // effect rather than during render to satisfy react-hooks/refs.
+  const primerIdRef = useRef(primerId);
+  const primerTextRef = useRef(primerText);
   useEffect(() => {
-    if (!primerId || primerText == null) return;
-    composerRuntime.setText(primerText);
+    primerIdRef.current = primerId;
+  }, [primerId]);
+  useEffect(() => {
+    primerTextRef.current = primerText;
+  }, [primerText]);
+  useEffect(() => {
+    if (!primerIdRef.current || primerTextRef.current == null) return;
+    composerRuntime.setText(primerTextRef.current);
     requestAnimationFrame(() => {
       const el = taRef.current;
       if (!el) return;
@@ -547,10 +552,6 @@ export function Composer({
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-    // primerText is intentionally a captured snapshot read via the
-    // ref above; we don't want this effect to re-fire on a text-only
-    // change (only id changes count as a new prefill action).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composerRuntime, primerId]);
 
   // Auto-grow the textarea up to ~6 visible lines.
@@ -663,7 +664,9 @@ export function Composer({
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {
-          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes("Files");
+          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes(
+            "Files",
+          );
           if (!hasFiles) return;
           e.preventDefault();
         }}
@@ -778,7 +781,9 @@ export function Composer({
                 // `composeEventHandlers` (used by ComposerPrimitive.Input)
                 // skips the downstream handler when `defaultPrevented`
                 // is set on the SyntheticEvent.
-                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) {
+                if (
+                  dictationGuard.shouldSuppressUpstream(e.currentTarget.value)
+                ) {
                   e.preventDefault();
                 }
               }}
@@ -849,9 +854,9 @@ export function Composer({
 
             {/* Staged attachments — thumbnails for images, labelled
                 chips for audio / resources. Removable before send. */}
-            {pendingAttachments.length > 0 && (
+            {supportedPendingAttachments.length > 0 && (
               <div className="flex flex-wrap gap-2 px-3 pt-1">
-                {pendingAttachments.map((att, i) => (
+                {supportedPendingAttachments.map((att, i) => (
                   <div
                     key={`${att.name ?? att.kind}-${i}`}
                     className="group/att relative flex items-center gap-2 rounded-md border border-surface-700 bg-surface-800 py-1 pl-1 pr-2 text-[11px] text-text-secondary"
@@ -986,7 +991,7 @@ export function Composer({
         open={switchAgentOpen}
         sessionId={sessionId}
         currentAgent={currentAgent}
-        onClose={() => setSwitchAgentOpen(false)}
+        onClose={() => clearPendingSwitchAgent()}
         onPrefill={(text) => {
           composerRuntime.setText(text);
           requestAnimationFrame(() => {
@@ -1129,8 +1134,7 @@ export function insertAtCaret(
   const before = ta.value.slice(0, start);
   // Trigger detection requires whitespace (or start-of-string) before
   // the trigger char; pad if we're mid-word.
-  const needsSpace =
-    before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
+  const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
   const next = before + needsSpace + text + ta.value.slice(end);
   const setter = Object.getOwnPropertyDescriptor(
     HTMLTextAreaElement.prototype,
@@ -1281,7 +1285,11 @@ function ModePicker({
   };
 
   return (
-    <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
+    <div
+      ref={ref}
+      {...tourAnchor(TOUR_ANCHORS.modePicker)}
+      className="relative"
+    >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -1429,7 +1437,9 @@ function SendButton({
   const title = connected
     ? "Send, Enter"
     : "Session not active, will send on resume";
-  const label = connected ? "Send message" : "Queue message until session resumes";
+  const label = connected
+    ? "Send message"
+    : "Queue message until session resumes";
   return (
     <button
       type="button"

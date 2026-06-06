@@ -41,6 +41,13 @@ const PAGES = [
       "Per-repo configuration and hooks for Agent of Empires sessions.",
   },
   {
+    source: "docs/guides/mcp-servers.md",
+    dest: "guides/mcp-servers.md",
+    title: "MCP Servers",
+    description:
+      "Forward configured MCP servers to structured-view agents via mcp.json.",
+  },
+  {
     source: "docs/guides/sandbox.md",
     dest: "guides/sandbox.md",
     title: "Docker Sandbox: Quick Reference",
@@ -175,6 +182,13 @@ const PAGES = [
       "Step-by-step guide for adding support for a new AI coding agent to AoE.",
   },
   {
+    source: "docs/development/adding-settings.md",
+    dest: "docs/development/adding-settings.md",
+    title: "Adding a Setting",
+    description:
+      "How to add a configuration setting with the single-source schema that drives the TUI, web dashboard, and server.",
+  },
+  {
     source: "docs/development/logging.md",
     dest: "docs/development/logging.md",
     title: "Logging",
@@ -201,6 +215,27 @@ const PAGES = [
     title: "Web Dashboard Development",
     description:
       "Build the web dashboard from source, run the frontend dev workflow (cargo xtask dev and manual Vite + VITE_PROXY), and the server architecture.",
+  },
+  {
+    source: "docs/development/internals/structured-view.md",
+    dest: "docs/development/internals/structured-view.md",
+    title: "Structured View Internals",
+    description:
+      "Contributor reference for the ACP subsystem: worker lifecycle and persistence, stuck-turn watchdogs, rate-limit handling, agent profiles, and the security model.",
+  },
+  {
+    source: "docs/development/internals/sandbox.md",
+    dest: "docs/development/internals/sandbox.md",
+    title: "Sandbox Internals",
+    description:
+      "Contributor reference for Docker sandbox internals: shared agent credential sync, the container lifecycle, Vertex AI wiring, and GH_TOKEN forwarding.",
+  },
+  {
+    source: "docs/development/internals/sessions.md",
+    dest: "docs/development/internals/sessions.md",
+    title: "Session & Worktree Internals",
+    description:
+      "Contributor reference for the session layer: Claude conversation resume, worktree creation, scratch-session cleanup, and MCP server forwarding.",
   },
   {
     source: "docs/sounds.md",
@@ -266,20 +301,6 @@ const PAGES = [
       "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
-    source: "docs/structured-view/multi-agent.md",
-    dest: "docs/structured-view/multi-agent.md",
-    title: "Structured View Multi-Agent Support",
-    description:
-      "Per-agent feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
-  },
-  {
-    source: "docs/structured-view/setup.md",
-    dest: "docs/structured-view/setup.md",
-    title: "Structured View Setup",
-    description:
-      "Confirm prerequisites with aoe acp doctor, pick structured view or terminal view per session, attach across machines, and drive it from the CLI.",
-  },
-  {
     source: "docs/structured-view/interface.md",
     dest: "docs/structured-view/interface.md",
     title: "Structured View Interface",
@@ -292,13 +313,6 @@ const PAGES = [
     title: "Structured View Modes, Approvals & Model Controls",
     description:
       "Permission modes, YOLO and bypassPermissions, approval cards and notifications, plus the model and reasoning-effort selectors.",
-  },
-  {
-    source: "docs/structured-view/persistence.md",
-    dest: "docs/structured-view/persistence.md",
-    title: "Structured View Persistence & Recovery",
-    description:
-      "How agent workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
   },
   {
     source: "docs/structured-view/troubleshooting.md",
@@ -342,18 +356,19 @@ const URL_MAP = {
   "docs/github-integration.md": "/docs/github-integration/",
   "docs/development.md": "/docs/development/",
   "docs/development/adding-agents.md": "/docs/development/adding-agents/",
+  "docs/development/adding-settings.md": "/docs/development/adding-settings/",
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
   "docs/development/releases.md": "/docs/development/releases/",
   "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
+  "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",
+  "docs/development/internals/sandbox.md": "/docs/development/internals/sandbox/",
+  "docs/development/internals/sessions.md": "/docs/development/internals/sessions/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/structured-view.md": "/docs/structured-view/",
-  "docs/structured-view/multi-agent.md": "/docs/structured-view/multi-agent/",
-  "docs/structured-view/setup.md": "/docs/structured-view/setup/",
   "docs/structured-view/interface.md": "/docs/structured-view/interface/",
   "docs/structured-view/controls.md": "/docs/structured-view/controls/",
-  "docs/structured-view/persistence.md": "/docs/structured-view/persistence/",
   "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
   "docs/api.md": "/docs/api/",
   "docs/telemetry.md": "/docs/telemetry/",
@@ -361,6 +376,7 @@ const URL_MAP = {
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
+  "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",

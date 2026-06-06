@@ -19,9 +19,11 @@ const originalFetch = globalThis.fetch;
 beforeEach(() => {
   // Default to a 404-returning fetch so any unexpected URL surfaces as
   // null from fetchJson rather than a hung test.
-  globalThis.fetch = vi.fn().mockResolvedValue(
-    new Response("not found", { status: 404 }),
-  ) as unknown as typeof globalThis.fetch;
+  globalThis.fetch = vi
+    .fn()
+    .mockResolvedValue(
+      new Response("not found", { status: 404 }),
+    ) as unknown as typeof globalThis.fetch;
 });
 
 afterEach(() => {
@@ -46,7 +48,8 @@ describe("fetchAcpAgents", () => {
     );
     const result = await fetchAcpAgents();
     expect(result).toEqual(agents);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
     expect(String(url)).toContain("/api/acp/agents");
   });
 
@@ -74,7 +77,8 @@ describe("switchAcpAgent", () => {
     );
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toEqual(response);
-    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0];
     expect(String(url)).toContain("/api/sessions/s-1/acp/switch-agent");
     const req = init as RequestInit;
     expect(req.method).toBe("POST");
@@ -83,29 +87,50 @@ describe("switchAcpAgent", () => {
 
   it("encodes the session id in the URL path", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      ok({ session_id: "weird/id", agent: "codex", before_seq: 0, switch_seq: 1, status: "ok" }),
+      ok({
+        session_id: "weird/id",
+        agent: "codex",
+        before_seq: 0,
+        switch_seq: 1,
+        status: "ok",
+      }),
     );
     await switchAcpAgent("weird/id", "codex");
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
     expect(String(url)).toContain("weird%2Fid");
   });
 
   it("includes the model field only when provided", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      ok({ session_id: "s-1", agent: "codex", before_seq: 0, switch_seq: 1, status: "ok" }),
+      ok({
+        session_id: "s-1",
+        agent: "codex",
+        before_seq: 0,
+        switch_seq: 1,
+        status: "ok",
+      }),
     );
     await switchAcpAgent("s-1", "codex", "opus-4.7");
-    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0];
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body).toEqual({ target: "codex", model: "opus-4.7" });
   });
 
   it("includes the reason field only when provided", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      ok({ session_id: "s-1", agent: "claude", before_seq: 0, switch_seq: 1, status: "ok" }),
+      ok({
+        session_id: "s-1",
+        agent: "claude",
+        before_seq: 0,
+        switch_seq: 1,
+        status: "ok",
+      }),
     );
     await switchAcpAgent("s-1", "claude", null, "manual");
-    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0];
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body).toEqual({ target: "claude", reason: "manual" });
   });

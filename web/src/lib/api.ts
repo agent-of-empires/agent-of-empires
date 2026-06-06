@@ -13,9 +13,16 @@ import type {
   CreateSessionRequest,
   SettingsFieldDescriptor,
 } from "./types";
+import {
+  clearDeviceBindingSecret,
+  getOrCreateDeviceBindingSecret,
+} from "./deviceBinding";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> {
+async function fetchJson<T>(
+  url: string,
+  init?: RequestInit,
+): Promise<T | null> {
   try {
     const res = await fetch(url, init);
     if (!res.ok) return null;
@@ -36,7 +43,9 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
-export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
+export async function updateWorkspaceOrdering(
+  order: string[],
+): Promise<boolean> {
   try {
     const res = await fetch("/api/workspace-ordering", {
       method: "PUT",
@@ -136,7 +145,9 @@ export interface SettingsResponse {
   [key: string]: unknown;
 }
 
-export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
+export function fetchSettings(
+  profile?: string,
+): Promise<SettingsResponse | null> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
@@ -318,9 +329,7 @@ export async function fetchThemes(): Promise<string[]> {
 export function fetchResolvedTheme(
   name: string,
 ): Promise<ResolvedTheme | null> {
-  return fetchJson<ResolvedTheme>(
-    `/api/themes/${encodeURIComponent(name)}`,
-  );
+  return fetchJson<ResolvedTheme>(`/api/themes/${encodeURIComponent(name)}`);
 }
 
 /** Fetch the resolved theme for the active profile's current
@@ -596,16 +605,47 @@ export function fetchContextPrimer(
 
 // --- Devices ---
 
-export interface DeviceInfo {
-  ip: string;
+/** A persisted login session, surfaced as a connected device. Backed by
+ *  the server's login-session store (#1235), so it survives a daemon
+ *  restart. `current` flags the session making the request. */
+export interface DeviceSession {
+  session_id: string;
   user_agent: string;
-  first_seen: string;
+  created_ip: string;
+  created_at: string;
   last_seen: string;
-  request_count: number;
+  current: boolean;
 }
 
-export function fetchDevices(): Promise<DeviceInfo[] | null> {
-  return fetchJson<DeviceInfo[]>("/api/devices");
+export function fetchDevices(): Promise<DeviceSession[] | null> {
+  return fetchJson<DeviceSession[]>("/api/devices");
+}
+
+/** Revoke a single device's login session. Elevation-gated: a 403
+ *  elevation_required pops the global passphrase prompt (handled by the
+ *  fetch interceptor) and this resolves false so the caller can ask the
+ *  user to retry after confirming. */
+export async function revokeDevice(sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/login/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Sign every device out (the escape hatch that replaces "restart logs
+ *  everyone out"). Ends this session too. Elevation-gated. */
+export async function signOutAllDevices(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/login/logout-all", { method: "POST" });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // --- Wizard APIs ---
@@ -631,7 +671,9 @@ export async function browseFilesystem(
   const params = new URLSearchParams({ path });
   if (limit != null) params.set("limit", String(limit));
   if (filter) params.set("filter", filter);
-  const data = await fetchJson<BrowseResponse>(`/api/filesystem/browse?${params}`);
+  const data = await fetchJson<BrowseResponse>(
+    `/api/filesystem/browse?${params}`,
+  );
   if (!data) return { entries: [], has_more: false, ok: false };
   return { ...data, ok: true };
 }
@@ -640,7 +682,9 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
 }
 
-export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
+export async function fetchProjects(
+  scope?: "global" | "profile",
+): Promise<ProjectInfo[]> {
   const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
@@ -662,7 +706,10 @@ export async function createProject(body: {
       const text = await res.text();
       try {
         const data = JSON.parse(text);
-        return { ok: false, error: data.message || `Server error (${res.status})` };
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
       } catch {
         return { ok: false, error: text || `Server error (${res.status})` };
       }
@@ -687,7 +734,10 @@ export async function deleteProject(
       const text = await res.text();
       try {
         const data = JSON.parse(text);
-        return { ok: false, error: data.message || `Server error (${res.status})` };
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
       } catch {
         return { ok: false, error: text || `Server error (${res.status})` };
       }
@@ -717,7 +767,10 @@ export async function updateProject(
       const text = await res.text();
       try {
         const data = JSON.parse(text);
-        return { ok: false, error: data.message || `Server error (${res.status})` };
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
       } catch {
         return { ok: false, error: text || `Server error (${res.status})` };
       }
@@ -848,11 +901,6 @@ export async function login(
 ): Promise<{ ok: boolean; error?: string }> {
   let deviceBindingSecret: string;
   try {
-    // Imported lazily to keep this module's load cost small; the
-    // helper itself is sync. Generates on first call.
-    const { getOrCreateDeviceBindingSecret } = await import(
-      "./deviceBinding"
-    );
     deviceBindingSecret = getOrCreateDeviceBindingSecret();
   } catch (err) {
     return {
@@ -898,9 +946,6 @@ export async function elevateLogin(
 ): Promise<{ ok: boolean; error?: string; elevated_until_secs?: number }> {
   let bindingSecret: string;
   try {
-    const { getOrCreateDeviceBindingSecret } = await import(
-      "./deviceBinding"
-    );
     bindingSecret = getOrCreateDeviceBindingSecret();
   } catch (err) {
     return {
@@ -951,7 +996,6 @@ export async function logout(): Promise<void> {
     // holds a valid binding for the next session created on this
     // browser. See #1131.
     try {
-      const { clearDeviceBindingSecret } = await import("./deviceBinding");
       clearDeviceBindingSecret();
     } catch {
       // ignore
@@ -960,9 +1004,8 @@ export async function logout(): Promise<void> {
     // same tab does not see the previous user's settings snapshot or
     // hear their cached blob.
     try {
-      const { clearApprovalSoundCache } = await import(
-        "../hooks/useApprovalSound"
-      );
+      const { clearApprovalSoundCache } =
+        await import("../hooks/useApprovalSound");
       clearApprovalSoundCache();
     } catch {
       // ignore
@@ -1046,8 +1089,7 @@ export async function setSessionNotifications(
   id: string,
   preset: "off" | "default" | "all",
 ): Promise<boolean> {
-  const value =
-    preset === "off" ? false : preset === "all" ? true : null;
+  const value = preset === "off" ? false : preset === "all" ? true : null;
   try {
     const res = await fetch(`/api/sessions/${id}/notifications`, {
       method: "PATCH",
@@ -1185,7 +1227,9 @@ export async function deleteSession(
         error: data.message || `Server error (${res.status})`,
       };
     }
-    const data = (await res.json().catch(() => ({}))) as { messages?: string[] };
+    const data = (await res.json().catch(() => ({}))) as {
+      messages?: string[];
+    };
     return { ok: true, messages: data.messages };
   } catch (e) {
     return {

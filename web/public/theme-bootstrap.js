@@ -11,7 +11,7 @@
 // `<script src="/theme-bootstrap.js"></script>`. See #1189.
 (function () {
   try {
-    var raw = localStorage.getItem('aoe-resolved-theme');
+    var raw = localStorage.getItem("aoe-resolved-theme");
     if (!raw) return;
     var theme = JSON.parse(raw);
     var root = document.documentElement;

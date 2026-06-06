@@ -29,8 +29,7 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..", "..");
 const outGif =
-  args.out ??
-  join(repoRoot, "docs", "assets", `web-${viewport}.gif`);
+  args.out ?? join(repoRoot, "docs", "assets", `web-${viewport}.gif`);
 
 const recDir = join(repoRoot, "target", "web-demo-recording");
 rmSync(recDir, { recursive: true, force: true });
@@ -173,9 +172,7 @@ function sidebarSession(page, label) {
 async function runMobile(page) {
   await sleep(1200);
   // Hamburger → sidebar → tap session.
-  await page
-    .getByRole("button", { name: "Toggle sidebar" })
-    .click();
+  await page.getByRole("button", { name: "Toggle sidebar" }).click();
   await sleep(900);
   await sidebarSession(page, "API Server").click();
   await page.waitForSelector(".xterm", { timeout: 15_000 });
@@ -191,8 +188,11 @@ async function runMobile(page) {
   await sleep(8000);
 
   // Show that scrolling works on mobile.
-  await page.locator(".xterm-viewport").first().evaluate((el) => {
-    el.scrollBy({ top: 200, behavior: "smooth" });
-  });
+  await page
+    .locator(".xterm-viewport")
+    .first()
+    .evaluate((el) => {
+      el.scrollBy({ top: 200, behavior: "smooth" });
+    });
   await sleep(1500);
 }

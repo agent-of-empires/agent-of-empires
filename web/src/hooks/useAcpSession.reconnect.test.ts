@@ -183,9 +183,7 @@ describe("useAcpSession reconnect (#1130)", () => {
       });
       if (attempt < ACP_MAX_RETRIES_EXPORT) {
         await act(async () => {
-          await vi.advanceTimersByTimeAsync(
-            acpRetryDelayMs(attempt),
-          );
+          await vi.advanceTimersByTimeAsync(acpRetryDelayMs(attempt));
         });
         await flushAsync();
       }

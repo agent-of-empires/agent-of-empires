@@ -17,8 +17,7 @@ export type ClientFormFactor =
   | "mobile_pwa";
 
 const matchesMedia = (query: string): boolean =>
-  typeof window !== "undefined" &&
-  Boolean(window.matchMedia?.(query).matches);
+  typeof window !== "undefined" && Boolean(window.matchMedia?.(query).matches);
 
 /** Installed / standalone PWA: iOS exposes `navigator.standalone`; every other
  *  platform reports `(display-mode: standalone)`. Either counts. */

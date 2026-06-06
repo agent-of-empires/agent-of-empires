@@ -11,9 +11,10 @@ import { useEffect, useState } from "react";
  *  keyboard tracking) should prefer this hook to avoid the extra
  *  visualViewport listeners. */
 export function useIsCoarsePointer(): boolean {
-  const [isCoarse, setIsCoarse] = useState(() =>
-    typeof window !== "undefined" &&
-    Boolean(window.matchMedia?.("(pointer: coarse)").matches),
+  const [isCoarse, setIsCoarse] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(pointer: coarse)").matches),
   );
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;

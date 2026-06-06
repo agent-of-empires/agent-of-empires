@@ -23,11 +23,7 @@ const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // expected shape and verify the read paths via `clearAcpCache` (the
 // only public surface that touches storage).
 
-function writeEntry(
-  sessionId: string,
-  state: AcpState,
-  savedAt: number,
-): void {
+function writeEntry(sessionId: string, state: AcpState, savedAt: number): void {
   window.localStorage.setItem(
     KEY_PREFIX + sessionId,
     JSON.stringify({ savedAt, state }),
@@ -67,7 +63,10 @@ describe("useAcpSession / persisted state", () => {
   });
 
   it("malformed entries are removed by clearAcpCache", () => {
-    window.localStorage.setItem(KEY_PREFIX + "sess-broken", "not valid json{{{");
+    window.localStorage.setItem(
+      KEY_PREFIX + "sess-broken",
+      "not valid json{{{",
+    );
     clearAcpCache("sess-broken");
     expect(window.localStorage.getItem(KEY_PREFIX + "sess-broken")).toBeNull();
   });

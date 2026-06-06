@@ -31,9 +31,7 @@ describe("ArchivedWorkerStoppedBanner", () => {
 
   it("isolates banners by sessionId", () => {
     render(<ArchivedWorkerStoppedBanner sessionId="alpha" />);
-    expect(
-      screen.queryByTestId("acp-archived-banner-alpha"),
-    ).not.toBeNull();
+    expect(screen.queryByTestId("acp-archived-banner-alpha")).not.toBeNull();
     expect(screen.queryByTestId("acp-archived-banner-beta")).toBeNull();
   });
 });

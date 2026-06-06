@@ -29,7 +29,6 @@ describe("SettingsView diff tab", () => {
         onClose={() => {}}
         tab="diff"
         onSelectTab={vi.fn()}
-        serverAbout={null}
         onServerAboutRefresh={() => {}}
       />,
     );

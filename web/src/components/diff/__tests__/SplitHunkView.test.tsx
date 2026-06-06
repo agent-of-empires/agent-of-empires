@@ -12,7 +12,12 @@ const modifyHunk: RichDiffHunk = {
   new_start: 1,
   new_lines: 1,
   lines: [
-    { type: "delete", old_line_num: 1, new_line_num: null, content: "old line\n" },
+    {
+      type: "delete",
+      old_line_num: 1,
+      new_line_num: null,
+      content: "old line\n",
+    },
     { type: "add", old_line_num: null, new_line_num: 1, content: "new line\n" },
   ],
 };
@@ -26,7 +31,12 @@ const richHunk: RichDiffHunk = {
   new_lines: 3,
   lines: [
     { type: "equal", old_line_num: 1, new_line_num: 1, content: "ctx\n" },
-    { type: "delete", old_line_num: 2, new_line_num: null, content: "removed\n" },
+    {
+      type: "delete",
+      old_line_num: 2,
+      new_line_num: null,
+      content: "removed\n",
+    },
     { type: "equal", old_line_num: 3, new_line_num: 2, content: "mid\n" },
     { type: "add", old_line_num: null, new_line_num: 3, content: "added\n" },
   ],
@@ -98,9 +108,7 @@ describe("SplitHunkView", () => {
       commentsEnabled: true,
       rangeStart: { side: "old", line: 2 },
     });
-    expect(
-      screen.getByLabelText("Add comment on old line 2"),
-    ).toBeTruthy();
+    expect(screen.getByLabelText("Add comment on old line 2")).toBeTruthy();
   });
 
   it("renders the draft form at the target row", () => {

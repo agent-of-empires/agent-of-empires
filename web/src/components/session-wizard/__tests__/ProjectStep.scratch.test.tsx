@@ -22,7 +22,11 @@ import type { SessionResponse } from "../../../lib/types";
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   cloneRepo: vi.fn(),
-  getHomePath: vi.fn().mockResolvedValue("/home/tester"),
+  // The Browse tab mounts DirectoryBrowser, which probes the filesystem on
+  // mount (getHomePath -> browseFilesystem). Stub both so the tab renders
+  // without hitting the network. ok:false makes navigate() bail cleanly.
+  getHomePath: vi.fn().mockResolvedValue(null),
+  browseFilesystem: vi.fn().mockResolvedValue({ ok: false, entries: [] }),
 }));
 
 import { fetchSessions } from "../../../lib/api";
@@ -32,7 +36,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function mockSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function mockSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: overrides.id ?? "s1",
     title: overrides.title ?? "session",
@@ -137,7 +143,9 @@ describe("ProjectStep scratch toggle (#1324)", () => {
     // Browse tab always exists; Recent only renders when fetchSessions
     // returns something. The await is required because the component
     // fetches recents on mount and the loading skeleton must resolve.
-    expect(await findByRole("button", { name: "Browse", exact: true })).toBeTruthy();
+    expect(
+      await findByRole("button", { name: "Browse", exact: true }),
+    ).toBeTruthy();
   });
 });
 

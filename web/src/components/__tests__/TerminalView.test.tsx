@@ -15,7 +15,15 @@ import type { SessionResponse } from "../../lib/types";
 // render stops at the early-return without trying to mount a real
 // terminal or open a WebSocket.
 
-const ensureSession = vi.fn();
+const ensureSession = vi.fn(async () => ({ ok: true }));
+const mockedContainerRef = { current: null } as const;
+const mockedTermRef = { current: null } as const;
+const mockedManualReconnect = vi.fn();
+const mockedSendData = vi.fn();
+const mockedActivate = vi.fn();
+const mockedExitScrollback = vi.fn();
+const mockedCtrlActiveRef = { current: false };
+const mockedClearCtrlRef = { current: null };
 vi.mock("../../lib/api", () => ({
   ensureSession: (id: string, signal?: AbortSignal) =>
     ensureSession(id, signal),
@@ -27,8 +35,8 @@ vi.mock("../../lib/api", () => ({
 // and free of jsdom canvas warnings.
 vi.mock("../../hooks/useTerminal", () => ({
   useTerminal: () => ({
-    containerRef: { current: null },
-    termRef: { current: null },
+    containerRef: mockedContainerRef,
+    termRef: mockedTermRef,
     state: {
       connected: false,
       reconnecting: false,
@@ -37,12 +45,12 @@ vi.mock("../../hooks/useTerminal", () => ({
       isPrimary: true,
       isInScrollback: false,
     },
-    manualReconnect: vi.fn(),
-    sendData: vi.fn(),
-    activate: vi.fn(),
-    exitScrollback: vi.fn(),
-    ctrlActiveRef: { current: false },
-    clearCtrlRef: { current: null },
+    manualReconnect: mockedManualReconnect,
+    sendData: mockedSendData,
+    activate: mockedActivate,
+    exitScrollback: mockedExitScrollback,
+    ctrlActiveRef: mockedCtrlActiveRef,
+    clearCtrlRef: mockedClearCtrlRef,
     maxRetries: 7,
   }),
 }));
@@ -59,7 +67,9 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 
 import { TerminalView } from "../TerminalView";
 
-function makeSession(overrides: Partial<SessionResponse> = {}): SessionResponse {
+function makeSession(
+  overrides: Partial<SessionResponse> = {},
+): SessionResponse {
   return {
     id: "sess-1",
     title: "test-session",
@@ -84,6 +94,13 @@ function makeSession(overrides: Partial<SessionResponse> = {}): SessionResponse 
 
 afterEach(() => {
   ensureSession.mockReset();
+  ensureSession.mockImplementation(async () => ({ ok: true }));
+  mockedManualReconnect.mockReset();
+  mockedSendData.mockReset();
+  mockedActivate.mockReset();
+  mockedExitScrollback.mockReset();
+  mockedCtrlActiveRef.current = false;
+  mockedClearCtrlRef.current = null;
 });
 
 describe("TerminalView early-return states", () => {

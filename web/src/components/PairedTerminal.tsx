@@ -35,8 +35,7 @@ function PairedTerminal({
   fullViewport?: boolean;
 }) {
   const [ready, setReady] = useState(false);
-  const wsPath =
-    mode === "container" ? "container-terminal/ws" : "terminal/ws";
+  const wsPath = mode === "container" ? "container-terminal/ws" : "terminal/ws";
   const {
     containerRef,
     termRef,
@@ -56,6 +55,24 @@ function PairedTerminal({
   const [bootError, setBootError] = useState(false);
   const [bootAttempt, setBootAttempt] = useState(0);
 
+  const focusSelf = useCallback(() => {
+    const ta = termRef.current?.element?.querySelector("textarea");
+    if (ta instanceof HTMLElement) {
+      ta.focus();
+      return true;
+    }
+    return false;
+  }, [termRef]);
+
+  // Track effect key changes to reset ready/bootError during render
+  const effectKey = `${sessionId}-${mode}-${bootAttempt}`;
+  const [trackedEffectKey, setTrackedEffectKey] = useState(effectKey);
+  if (effectKey !== trackedEffectKey) {
+    setTrackedEffectKey(effectKey);
+    setReady(false);
+    setBootError(false);
+  }
+
   // See TerminalView.tsx for why these syncs live in effects rather
   // than running during render.
   useEffect(() => {
@@ -67,13 +84,12 @@ function PairedTerminal({
 
   useEffect(() => {
     let cancelled = false;
-    setReady(false);
-    setBootError(false);
     void ensureTerminal(sessionId, mode === "container")
       .then((ok) => {
         if (cancelled) return;
-        if (ok) setReady(true);
-        else setBootError(true);
+        if (ok) {
+          setReady(true);
+        } else setBootError(true);
       })
       .catch(() => {
         if (!cancelled) setBootError(true);
@@ -81,7 +97,17 @@ function PairedTerminal({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, mode, bootAttempt]);
+  }, [sessionId, mode, bootAttempt, focusSelf]);
+
+  // Drain a pending paired-focus latch only after `ready` flips and the
+  // terminal renders: while !ready the splash is shown and the xterm textarea
+  // is not mounted, so consuming the latch in the ensureTerminal callback
+  // would clear it before focusSelf() could find anything to focus.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (!ready) return;
+    if (consumePendingTerminalFocus("paired")) focusSelf();
+  }, [ready, focusSelf]);
 
   // Dispatch a window resize after keyboard transitions so anything else
   // watching layout is nudged; the hook's ResizeObserver already refits
@@ -107,21 +133,13 @@ function PairedTerminal({
 
   // Returns true if focus was applied. Callers can fall back to the pending
   // latch when the textarea isn't in the DOM yet (PTY still booting).
-  const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element?.querySelector("textarea");
-    if (ta instanceof HTMLElement) {
-      ta.focus();
-      return true;
-    }
-    return false;
-  }, [termRef]);
-
   // Cmd+` shortcut focuses this terminal when "paired" is the dispatched
   // target. The component might be mounted but its PTY not yet ready (the
   // initial ensureTerminal round-trip), in which case focusSelf() can't
-  // find a textarea, so we latch the intent for the ready-effect below.
-  // While the right panel is collapsed this component is unmounted entirely;
-  // App.tsx sets the latch directly in that case.
+  // find a textarea, so we latch the intent; the ensureTerminal callback
+  // drains the latch once the PTY boots. While the right panel is
+  // collapsed this component is unmounted entirely; App.tsx sets the latch
+  // directly in that case.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
@@ -131,11 +149,6 @@ function PairedTerminal({
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
   }, [focusSelf]);
-
-  useEffect(() => {
-    if (!ready) return;
-    if (consumePendingTerminalFocus("paired")) focusSelf();
-  }, [ready, focusSelf]);
 
   if (bootError) {
     return (
@@ -170,7 +183,10 @@ function PairedTerminal({
   } as const;
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800" style={rootStyle}>
+    <div
+      className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800"
+      style={rootStyle}
+    >
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-3 py-1 shrink-0">
           <span className="text-xs text-status-waiting">
@@ -178,17 +194,19 @@ function PairedTerminal({
           </span>
         </div>
       )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Disconnected</span>
-          <button
-            onClick={manualReconnect}
-            className="text-xs text-brand-500 cursor-pointer underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      {!state.connected &&
+        !state.reconnecting &&
+        state.retryCount >= maxRetries && (
+          <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
+            <span className="text-xs text-status-error">Disconnected</span>
+            <button
+              onClick={manualReconnect}
+              className="text-xs text-brand-500 cursor-pointer underline"
+            >
+              Retry
+            </button>
+          </div>
+        )}
       <div
         data-term="paired"
         className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}

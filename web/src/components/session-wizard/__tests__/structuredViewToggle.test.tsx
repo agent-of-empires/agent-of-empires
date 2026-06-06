@@ -120,18 +120,25 @@ describe("AgentStep structured-view view card", () => {
   });
 
   it("reflects useStructuredView=false as an unchecked switch", () => {
-    const { getByRole } = renderAgentStep({ tool: "claude", useStructuredView: false });
-    expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
+    const { getByRole } = renderAgentStep({
+      tool: "claude",
+      useStructuredView: false,
+    });
+    expect(
+      getByRole("switch", { name: "Use structured view" }).getAttribute(
+        "aria-checked",
+      ),
+    ).toBe("false");
   });
 
-  it("does not render Cursor model controls in the session wizard", () => {
-    const { queryByRole } = renderAgentStep({
+  it("renders Cursor model controls in the session wizard", () => {
+    const { getByRole } = renderAgentStep({
       tool: "cursor",
       agents: [cursor],
     });
 
-    expect(queryByRole("combobox", { name: "Model" })).toBeNull();
-    expect(queryByRole("switch", { name: "Fast mode" })).toBeNull();
+    expect(getByRole("combobox", { name: "Model" })).toBeTruthy();
+    expect(getByRole("switch", { name: "Fast mode" })).toBeTruthy();
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {
@@ -141,7 +148,9 @@ describe("AgentStep structured-view view card", () => {
   });
 
   it("shows no switch for a custom agent, only the fallback notice", () => {
-    const { queryByRole, getByText } = renderAgentStep({ tool: "remote-helper" });
+    const { queryByRole, getByText } = renderAgentStep({
+      tool: "remote-helper",
+    });
     expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
     expect(
       getByText(
@@ -213,7 +222,9 @@ describe("SessionWizard structured_view payload", () => {
     const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
     // "opencode" now renders in both the Agent row and the resolved
     // Launch command row (#1911), so match either occurrence.
-    await waitFor(() => expect(getAllByText(/opencode/).length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(getAllByText(/opencode/).length).toBeGreaterThan(0),
+    );
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(
@@ -237,7 +248,9 @@ describe("SessionWizard structured_view payload", () => {
       sandbox: {},
     } as never);
     const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
-    await waitFor(() => expect(getAllByText(/cursor/).length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(getAllByText(/cursor/).length).toBeGreaterThan(0),
+    );
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(

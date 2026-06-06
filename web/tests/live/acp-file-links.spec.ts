@@ -15,9 +15,16 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import { spawnAoeServe, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
+import {
+  spawnAoeServe,
+  listSessions,
+  resolveAoeBinary,
+} from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
-import { enableStructuredViewAndWait, waitForStructuredView } from "../helpers/acp";
+import {
+  enableStructuredViewAndWait,
+  waitForStructuredView,
+} from "../helpers/acp";
 
 base(
   "structured view transcript file links open in-app and toast on miss",

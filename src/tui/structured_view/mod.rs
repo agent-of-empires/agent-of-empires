@@ -28,9 +28,10 @@ use tokio::time::Instant;
 
 use self::input::{Focus, InputContext, Intent};
 use self::state::{FileIndex, MentionSession, StructuredViewState, ToastBanner, ToastKind};
+use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
-    require_daemon, ws_connect, DaemonEndpoint, HttpClient, ManagerError, WsError, WsMessage,
-    REPLAY_PAGE_SIZE,
+    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
+    WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::protocol::ApprovalDecisionWire;
 use crate::tui::styles::Theme;
@@ -507,10 +508,35 @@ async fn handle_terminal_event(
                         ApprovalDecisionWire::Deny => "denied",
                         ApprovalDecisionWire::Cancelled => "cancelled",
                     };
+                    // Clear the card now instead of waiting on the
+                    // ApprovalResolved broadcast, which the seq dedupe can
+                    // drop and leave the card stuck. See #1821.
+                    state
+                        .transcript
+                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    // The selected/last approval may have just disappeared;
+                    // re-anchor focus like the replay/live-frame paths do.
+                    state.reconcile_selection();
                     set_toast(
                         state,
                         toast_deadline,
                         format!("approval {label}"),
+                        ToastKind::Info,
+                    );
+                }
+                // The daemon reports the nonce already gone: the approval
+                // resolved server-side (concurrent decision, watchdog
+                // cancel, or no matching option). Clear the card without an
+                // error toast. See #1821.
+                Err(HttpError::ApprovalGone) => {
+                    state
+                        .transcript
+                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "approval already resolved".into(),
                         ToastKind::Info,
                     );
                 }
@@ -523,8 +549,6 @@ async fn handle_terminal_event(
                     );
                 }
             }
-            // Server will emit ApprovalResolved over WS; the reducer
-            // updates state then.
             Ok(false)
         }
         Intent::CancelInFlight => {

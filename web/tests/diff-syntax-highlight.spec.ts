@@ -139,8 +139,9 @@ test.describe("Diff syntax highlighting", () => {
     // build kept the content span at opacity 0 forever while the
     // highlighter promise was unresolved; the fix renders raw text
     // unconditionally.
-    await page.route(/\/assets\/(typescript|tsx|jsx|javascript)-[^/]+\.js/, (r) =>
-      r.abort(),
+    await page.route(
+      /\/assets\/(typescript|tsx|jsx|javascript)-[^/]+\.js/,
+      (r) => r.abort(),
     );
     await page.goto("/");
     await openSessionAndWaitForDiffList(page);

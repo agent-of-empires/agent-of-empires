@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Markdown renderer for agent text. Thin wrapper around
 // @assistant-ui/react-markdown's MarkdownTextPrimitive; we just plug
 // in our shiki-based SyntaxHighlighter and a CodeHeader that matches
@@ -148,10 +149,7 @@ function Blockquote({
   const text = childrenText(children);
   const warn = text.trimStart().startsWith("⚠️");
   return (
-    <blockquote
-      {...rest}
-      className={warn ? "acp-callout-warn" : undefined}
-    >
+    <blockquote {...rest} className={warn ? "acp-callout-warn" : undefined}>
       {children}
     </blockquote>
   );
@@ -192,10 +190,7 @@ function TableWithScroll({
  * theme (from useShikiTheme). Falls back to a plain <pre> while the
  * language is loading or for unknown languages.
  */
-function ShikiSyntaxHighlighter({
-  language,
-  code,
-}: SyntaxHighlighterProps) {
+function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   const [html, setHtml] = useState<string | null>(null);
   const shiki = useShikiTheme();
   useEffect(() => {
@@ -211,9 +206,7 @@ function ShikiSyntaxHighlighter({
         );
         const hl = await getHighlighter();
         if (cancelled) return;
-        setHtml(
-          hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }),
-        );
+        setHtml(hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }));
       } catch {
         // Unknown lang → fall through to plain rendering.
       }

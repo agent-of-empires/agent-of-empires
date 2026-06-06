@@ -25,7 +25,10 @@ async function simulateKeyboardOpen(page: Page, keyboardPx: number) {
       get: () => newVvH,
       configurable: true,
     });
-    Object.defineProperty(vv, "offsetTop", { get: () => 0, configurable: true });
+    Object.defineProperty(vv, "offsetTop", {
+      get: () => 0,
+      configurable: true,
+    });
     vv.dispatchEvent(new Event("resize"));
   }, keyboardPx);
 }
@@ -37,7 +40,10 @@ async function setupAndOpenSession(page: Page) {
   await page.reload();
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+  await page
+    .locator(".xterm")
+    .first()
+    .waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function openPicker(page: Page) {
@@ -99,7 +105,10 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await page.goto("/");
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
-    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page
+      .locator(".xterm")
+      .first()
+      .waitFor({ state: "visible", timeout: 10_000 });
 
     await openPicker(page);
     await page.getByTestId("mobile-right-panel-pick-diff").click();
@@ -150,7 +159,10 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
-    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page
+      .locator(".xterm")
+      .first()
+      .waitFor({ state: "visible", timeout: 10_000 });
 
     // The desktop split renders the resize handle and never the picker.
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
@@ -194,9 +206,7 @@ async function setupAcpSession(page: Page) {
       },
     });
   });
-  await page.route("**/api/sessions/*/acp/**", (r) =>
-    r.fulfill({ json: {} }),
-  );
+  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.goto("/");
   await openMobileSidebar(page);
   await clickSidebarSession(page, "acp-mobile");

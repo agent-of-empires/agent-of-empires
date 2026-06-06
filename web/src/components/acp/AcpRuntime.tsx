@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Bridge between our `useStructuredView` state (which subscribes to the
 // acp WebSocket) and assistant-ui's external-store runtime. The
 // runtime adapter is the seam: assistant-ui owns the chat surface
@@ -80,10 +81,7 @@ export interface AcpContext {
   retryCountdown: number;
   maxRetries: number;
   manualReconnect: () => void;
-  resolveApproval: (
-    nonce: string,
-    decision: ApprovalDecision,
-  ) => Promise<void>;
+  resolveApproval: (nonce: string, decision: ApprovalDecision) => Promise<void>;
   sendPrompt: (
     text: string,
     attachments?: PromptAttachmentInput[],
@@ -123,7 +121,12 @@ export function AcpRuntime({
   showClearedTurns = false,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(
+    sessionId,
+    acpWorkerState,
+    archivedAt,
+    snoozedUntil,
+  );
   const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
@@ -511,7 +514,11 @@ class AssistantBuilder {
   ) {
     for (const part of this.parts) {
       if (part.type === "tool-call" && part.toolCallId === toolCallId) {
-        part.result = { content: resultText, endedAt, stopped: stopped || undefined };
+        part.result = {
+          content: resultText,
+          endedAt,
+          stopped: stopped || undefined,
+        };
         part.isError = isError || undefined;
         return;
       }

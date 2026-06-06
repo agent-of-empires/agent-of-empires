@@ -18,7 +18,11 @@ function classifyForTest(
   return { isSkill: true, name };
 }
 
-function tool(name: string, kind: string, args: Record<string, unknown>): ToolCall {
+function tool(
+  name: string,
+  kind: string,
+  args: Record<string, unknown>,
+): ToolCall {
   return {
     id: "tc-1",
     name,
@@ -36,12 +40,18 @@ describe("classifySkill (#1062)", () => {
   });
 
   it("is case-insensitive on the title", () => {
-    expect(classifyForTest(tool("skill", "other", { skill: "x" })).isSkill).toBe(true);
-    expect(classifyForTest(tool("SKILL", "other", { skill: "x" })).isSkill).toBe(true);
+    expect(
+      classifyForTest(tool("skill", "other", { skill: "x" })).isSkill,
+    ).toBe(true);
+    expect(
+      classifyForTest(tool("SKILL", "other", { skill: "x" })).isSkill,
+    ).toBe(true);
   });
 
   it("accepts the claude-skill variant", () => {
-    expect(classifyForTest(tool("claude-skill", "other", { skill: "x" })).isSkill).toBe(true);
+    expect(
+      classifyForTest(tool("claude-skill", "other", { skill: "x" })).isSkill,
+    ).toBe(true);
   });
 
   it("falls back to a generic name when skill arg is missing", () => {
@@ -51,10 +61,14 @@ describe("classifySkill (#1062)", () => {
   });
 
   it("rejects non-other kinds", () => {
-    expect(classifyForTest(tool("Skill", "execute", { skill: "x" })).isSkill).toBe(false);
+    expect(
+      classifyForTest(tool("Skill", "execute", { skill: "x" })).isSkill,
+    ).toBe(false);
   });
 
   it("rejects unrelated titles", () => {
-    expect(classifyForTest(tool("Bash", "other", { skill: "x" })).isSkill).toBe(false);
+    expect(classifyForTest(tool("Bash", "other", { skill: "x" })).isSkill).toBe(
+      false,
+    );
   });
 });

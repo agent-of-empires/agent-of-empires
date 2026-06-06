@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Transcript-level tool-card density. A purely client-side view
 // preference (no daemon config, no settings parity): "detailed" keeps
 // the existing per-card defaults; "compact" makes every tool card

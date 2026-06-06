@@ -42,7 +42,9 @@ test("review step shows the resolved structured view launch command and edits it
     // can prove the arg is shown and not duplicated on edit. Leave the
     // structured view toggle on (the default).
     await wizard.getByRole("button", { name: "opencode", exact: true }).click();
-    const acpToggle = wizard.getByRole("switch", { name: "Use structured view" });
+    const acpToggle = wizard.getByRole("switch", {
+      name: "Use structured view",
+    });
     await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: "Next" }).click();
 

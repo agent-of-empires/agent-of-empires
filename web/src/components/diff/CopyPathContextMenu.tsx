@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useClampedMenuPosition } from "../../lib/menuPosition";
 import { writeClipboard } from "../../lib/clipboard";
@@ -25,16 +25,17 @@ export function CopyPathContextMenu({ menu, onClose }: Props) {
 
   // Mirror the click position into local state so the clamp hook can nudge it
   // inside the viewport. The initial open is seeded by the lazy initializer;
-  // a layout effect re-seeds on reopen at a new spot. Both run before paint
-  // (initializer at mount, layout effect before the browser draws), so the
+  // render-time re-seeds on reopen at a new spot, both before paint so the
   // clamp hook below lands the menu on-screen without flashing at the raw
   // coordinates first.
   const [pos, setPos] = useState<{ x: number; y: number } | null>(
     menu ? { x: menu.x, y: menu.y } : null,
   );
-  useLayoutEffect(() => {
+  const [trackedMenu, setTrackedMenu] = useState(menu);
+  if (menu !== trackedMenu) {
+    setTrackedMenu(menu);
     setPos(menu ? { x: menu.x, y: menu.y } : null);
-  }, [menu]);
+  }
   useClampedMenuPosition(pos, menuRef, setPos);
 
   useEffect(() => {

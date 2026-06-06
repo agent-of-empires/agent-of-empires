@@ -11,4 +11,3 @@ export function normalizePersistentTerminalLimit(value: unknown): number {
     Math.max(MIN_PERSISTENT_TERMINALS, Math.round(value)),
   );
 }
-

@@ -15,9 +15,7 @@ export interface AcpFileRefContextValue {
   onOpenFileRef?: (ref: FileRef) => void;
 }
 
-export const AcpFileRefContext = createContext<AcpFileRefContextValue>(
-  {},
-);
+export const AcpFileRefContext = createContext<AcpFileRefContextValue>({});
 
 export function useAcpFileRef(): AcpFileRefContextValue {
   return useContext(AcpFileRefContext);

@@ -73,7 +73,10 @@ async function openSession(page: Page, title: string) {
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
   await clickSidebarSession(page, title);
-  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+  await page
+    .locator(".xterm")
+    .first()
+    .waitFor({ state: "visible", timeout: 10_000 });
 }
 
 test.describe("Terminal WebSocket reconnection", () => {
@@ -123,7 +126,9 @@ test.describe("Terminal WebSocket reconnection", () => {
     // Wait for the reconnect to fire. First retry is scheduled at 200ms
     // under the fast-start ladder; 5s upper bound still fails fast if we
     // regressed to a slow exponential delay.
-    await expect.poll(() => attempts, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
+    await expect
+      .poll(() => attempts, { timeout: 5_000 })
+      .toBeGreaterThanOrEqual(2);
 
     // Guard: both timestamps must have been set. Without this check, a 0
     // firstClosedAt would make elapsed comically large and the < 1500
@@ -198,7 +203,9 @@ test.describe("Terminal WebSocket reconnection", () => {
 
     // Attempt 5 should arrive well under the 3s backoff that would
     // otherwise gate it.
-    await expect.poll(() => attempts, { timeout: 2_000 }).toBeGreaterThanOrEqual(5);
+    await expect
+      .poll(() => attempts, { timeout: 2_000 })
+      .toBeGreaterThanOrEqual(5);
     const fifthOpenedAt = openTimes[4];
     expect(fifthOpenedAt).toBeDefined();
     expect(fifthOpenedAt! - beforeOnline).toBeLessThan(1_500);
@@ -348,7 +355,10 @@ test.describe("Terminal WebSocket reconnection", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await clickSidebarSession(page, oldTitle);
-    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page
+      .locator(".xterm")
+      .first()
+      .waitFor({ state: "visible", timeout: 10_000 });
 
     // Wait for at least one old-session attempt to land.
     await expect

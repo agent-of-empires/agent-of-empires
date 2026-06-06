@@ -117,6 +117,57 @@ pub struct DiffPreview {
     pub created_at: DateTime<Utc>,
 }
 
+/// One renderable block of a tool call's completion payload, bridged from
+/// an ACP `ToolCallContent` block. Carries the structured shape (image,
+/// audio, resource) so the cockpit can render media on completion instead
+/// of collapsing everything to text. The web card renders these richly;
+/// the native TUI shows a textual placeholder for the non-text variants.
+/// See #1818.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutputBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        mime_type: String,
+        /// Base64-encoded bytes. Absent when the block referenced a `uri`
+        /// only, or when the inline payload exceeded the size cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    Audio {
+        mime_type: String,
+        /// Base64-encoded bytes. Absent when the inline payload exceeded
+        /// the size cap (a text placeholder is emitted alongside).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+    Resource {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        /// Inline text for a text resource. Absent for a binary (blob)
+        /// resource, which carries `data` instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Base64-encoded bytes for a binary (blob) resource, so the card
+        /// can offer the payload as a download even without a fetchable uri.
+        /// Absent for a text resource, or when the blob exceeded the size
+        /// cap (the uri remains as a fallback).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingSignal {
     pub started_at: DateTime<Utc>,
@@ -479,6 +530,14 @@ pub enum Event {
         /// is empty so cards still convey state.
         #[serde(default)]
         content: String,
+        /// Structured completion payload bridged from the ACP
+        /// `ToolCallContent` blocks (images, audio, resource links/contents,
+        /// plus text). Lets the card render media that arrives only at
+        /// completion instead of collapsing it to the status word. Empty for
+        /// text-only completions (the `content` field already carries that)
+        /// and for events persisted before this field landed. See #1818.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        output: Vec<ToolOutputBlock>,
         /// Server-side wall-clock time the completion frame was minted.
         /// Carried on the event so the frontend reducer can stamp the
         /// matching `tool_complete` activity row with the REAL
@@ -1105,6 +1164,7 @@ mod tests {
             tool_call_id: "tc-1".into(),
             is_error: false,
             content: String::new(),
+            output: Vec::new(),
             completed_at: Utc::now(),
         })
         .unwrap();

@@ -32,7 +32,10 @@ function renderTokens(line: RichDiffLine, tokens?: SyntaxToken[]) {
   if (tokens && tokens.length > 0) {
     const opacity = line.type === "equal" ? 1 : 0.7;
     return tokens.map((tok, i) => (
-      <span key={i} style={tok.color ? { color: tok.color, opacity } : { opacity }}>
+      <span
+        key={i}
+        style={tok.color ? { color: tok.color, opacity } : { opacity }}
+      >
         {tok.content}
       </span>
     ));
@@ -97,7 +100,9 @@ function SplitCell({
         )}
         {lineNum ?? ""}
       </span>
-      <span className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}>
+      <span
+        className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}
+      >
         {prefix}
       </span>
       <span className="flex-1 min-w-0 font-mono text-[12px] whitespace-pre-wrap break-words">
@@ -129,7 +134,8 @@ export function SplitHunkView({
     <div>
       <div className="flex bg-surface-850 border-y border-surface-700/20 sticky top-0 z-[1]">
         <span className="flex-1 font-mono text-[11px] text-accent-600 py-0.5 px-1">
-          @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
+          @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},
+          {hunk.new_lines} @@
         </span>
       </div>
       {rows.map((row, i) => {
@@ -150,16 +156,22 @@ export function SplitHunkView({
           draftSide != null &&
           (formRowIndex === row.leftIndex || formRowIndex === row.rightIndex);
         const leftActive =
-          rangeStart?.side === "old" && rangeStart.line === row.left?.old_line_num;
+          rangeStart?.side === "old" &&
+          rangeStart.line === row.left?.old_line_num;
         const rightActive =
-          rangeStart?.side === "new" && rangeStart.line === row.right?.new_line_num;
+          rangeStart?.side === "new" &&
+          rangeStart.line === row.right?.new_line_num;
         return (
           <Fragment key={i}>
             <div className="flex">
               <SplitCell
                 line={row.left}
                 lineNum={row.left?.old_line_num ?? null}
-                tokens={row.leftIndex != null ? lineTokens?.[row.leftIndex] : undefined}
+                tokens={
+                  row.leftIndex != null
+                    ? lineTokens?.[row.leftIndex]
+                    : undefined
+                }
                 side="old"
                 hunkIndex={hunkIndex}
                 commentsEnabled={commentsEnabled}
@@ -170,7 +182,11 @@ export function SplitHunkView({
               <SplitCell
                 line={row.right}
                 lineNum={row.right?.new_line_num ?? null}
-                tokens={row.rightIndex != null ? lineTokens?.[row.rightIndex] : undefined}
+                tokens={
+                  row.rightIndex != null
+                    ? lineTokens?.[row.rightIndex]
+                    : undefined
+                }
                 side="new"
                 hunkIndex={hunkIndex}
                 commentsEnabled={commentsEnabled}
@@ -186,16 +202,19 @@ export function SplitHunkView({
                 onDelete={onCommentDelete}
               />
             ))}
-            {showForm && draftSide && draftStartLine != null && draftEndLine != null && (
-              <CommentForm
-                key={`form-${hunkIndex}-${i}`}
-                startLine={draftStartLine}
-                endLine={draftEndLine}
-                side={draftSide}
-                onSave={onDraftSave}
-                onCancel={onDraftCancel}
-              />
-            )}
+            {showForm &&
+              draftSide &&
+              draftStartLine != null &&
+              draftEndLine != null && (
+                <CommentForm
+                  key={`form-${hunkIndex}-${i}`}
+                  startLine={draftStartLine}
+                  endLine={draftEndLine}
+                  side={draftSide}
+                  onSave={onDraftSave}
+                  onCancel={onDraftCancel}
+                />
+              )}
           </Fragment>
         );
       })}

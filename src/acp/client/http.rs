@@ -46,6 +46,13 @@ pub enum HttpError {
     Transport(#[from] reqwest::Error),
     #[error("structured view session {0} not found on the daemon")]
     SessionNotFound(String),
+    // A 404 whose body names the missing nonce: the approval already
+    // resolved server-side (concurrent decision, watchdog cancel, or the
+    // agent offered no matching option). Distinct from SessionNotFound so
+    // the approval flow can clear the card instead of toasting an error.
+    // See #1821.
+    #[error("approval already resolved")]
+    ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
     // The daemon may reject for several reasons: stale token, missing
@@ -264,8 +271,12 @@ impl HttpClient {
         );
         let body = ResolveApprovalRequest { decision };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = res.text().await.unwrap_or_default();
+        Err(classify_resolve_error(status, &text, nonce, session_id))
     }
 
     /// `GET /api/sessions`. Returns the daemon's session list as
@@ -320,13 +331,44 @@ async fn check_status(
         return Ok(res);
     }
     let body = res.text().await.unwrap_or_default();
+    Err(classify_error(status, &body, session_id))
+}
+
+/// Map a non-success daemon response onto a typed error. Split out from
+/// `check_status` so the status/body dispatch is unit-testable without a
+/// live `reqwest::Response`.
+fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError {
     match status {
-        StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
+        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
         StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
-            Err(HttpError::ReadOnly)
+            HttpError::ReadOnly
         }
-        StatusCode::NOT_FOUND => Err(HttpError::SessionNotFound(session_id.to_string())),
-        _ => Err(HttpError::Server { status, body }),
+        StatusCode::NOT_FOUND => HttpError::SessionNotFound(session_id.to_string()),
+        _ => HttpError::Server {
+            status,
+            body: body.to_string(),
+        },
+    }
+}
+
+/// Classify the response of an approval-resolve POST. Scoped to that
+/// endpoint (not the shared `check_status`, which replay/prompt/cancel use
+/// too) so only this path can mint `ApprovalGone`. A 404 whose body names
+/// *this* nonce means the approval already resolved server-side; anything
+/// else folds back into the generic classifier. See #1821.
+fn classify_resolve_error(
+    status: StatusCode,
+    body: &str,
+    nonce: &str,
+    session_id: &str,
+) -> HttpError {
+    if status == StatusCode::NOT_FOUND
+        && body.contains("no pending approval")
+        && body.contains(nonce)
+    {
+        HttpError::ApprovalGone
+    } else {
+        classify_error(status, body, session_id)
     }
 }
 
@@ -364,6 +406,66 @@ mod tests {
     // which made the toast actively misleading on `--auth=passphrase`
     // and `--auth=none` daemons that never had a token. Pin the new
     // wording so the env-var hint can't regress back in.
+    #[test]
+    fn classify_resolve_error_clears_only_on_matching_nonce() {
+        // #1821: ApprovalGone is minted only by the resolve path, only for a
+        // 404 that names *this* nonce. A session-gone 404, or a 404 naming a
+        // different nonce, stays a real error.
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "no pending approval with nonce abc-123",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::ApprovalGone
+        ));
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "no pending approval with nonce other-999",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "session has no running cockpit",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+    }
+
+    #[test]
+    fn classify_error_never_mints_approval_gone() {
+        // The shared classifier (used by replay/prompt/cancel/session-list)
+        // must not produce ApprovalGone; a bare 404 is a session miss.
+        assert!(matches!(
+            classify_error(StatusCode::NOT_FOUND, "no pending approval with that nonce", "s-1"),
+            HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+    }
+
+    #[test]
+    fn classify_error_maps_auth_and_read_only() {
+        assert!(matches!(
+            classify_error(StatusCode::UNAUTHORIZED, "", "s-1"),
+            HttpError::Unauthorized
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::FORBIDDEN, "daemon is read-only", "s-1"),
+            HttpError::ReadOnly
+        ));
+        assert!(matches!(
+            classify_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", "s-1"),
+            HttpError::Server { .. }
+        ));
+    }
+
     #[test]
     fn unauthorized_display_omits_token_env_var() {
         let rendered = HttpError::Unauthorized.to_string();

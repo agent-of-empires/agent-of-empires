@@ -76,7 +76,9 @@ base("command palette switches sessions", async ({ page }, testInfo) => {
     await page.keyboard.press(`${MOD}+K`);
     const palette = page.getByRole("dialog", { name: "Command palette" });
     await expect(palette).toBeVisible({ timeout: 5_000 });
-    await palette.getByPlaceholder("Search actions, sessions, settings…").fill("palette-target");
+    await palette
+      .getByPlaceholder("Search actions, sessions, settings…")
+      .fill("palette-target");
 
     await palette.getByText("palette-target").first().click();
     await expect(page).toHaveURL(new RegExp(`/session/${target.id}`), {

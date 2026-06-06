@@ -146,12 +146,16 @@ describe("useRepoGroups grouping", () => {
         workspace_repos: multiRepos,
       }),
     ]);
-    const wScratch1 = workspace("sc1", "/home/u/.agent-of-empires/scratch/aaa", [
-      session({ id: "s-sc1", scratch: true }),
-    ]);
-    const wScratch2 = workspace("sc2", "/home/u/.agent-of-empires/scratch/bbb", [
-      session({ id: "s-sc2", scratch: true }),
-    ]);
+    const wScratch1 = workspace(
+      "sc1",
+      "/home/u/.agent-of-empires/scratch/aaa",
+      [session({ id: "s-sc1", scratch: true })],
+    );
+    const wScratch2 = workspace(
+      "sc2",
+      "/home/u/.agent-of-empires/scratch/bbb",
+      [session({ id: "s-sc2", scratch: true })],
+    );
 
     const { result } = renderHook(() =>
       useRepoGroups(
@@ -171,18 +175,12 @@ describe("useRepoGroups grouping", () => {
   });
 
   it("marks a group active when any workspace is active", () => {
-    const wIdle = workspace(
-      "a1",
-      "/repo-a",
-      [session({ id: "s1" })],
-      { status: "idle" },
-    );
-    const wActive = workspace(
-      "a2",
-      "/repo-a",
-      [session({ id: "s2" })],
-      { status: "active" },
-    );
+    const wIdle = workspace("a1", "/repo-a", [session({ id: "s1" })], {
+      status: "idle",
+    });
+    const wActive = workspace("a2", "/repo-a", [session({ id: "s2" })], {
+      status: "active",
+    });
     const { result } = renderHook(() =>
       useRepoGroups([wIdle, wActive], ["a1", "a2"]),
     );
@@ -342,9 +340,7 @@ describe("useRepoGroups sortMode = lastActivity (#1418)", () => {
 describe("useRepoGroups stateful API", () => {
   it("toggleRepoCollapsed flips collapsed and round-trips to localStorage", () => {
     const w = workspace("a1", "/repo-a", [session()]);
-    const { result, rerender } = renderHook(() =>
-      useRepoGroups([w], ["a1"]),
-    );
+    const { result, rerender } = renderHook(() => useRepoGroups([w], ["a1"]));
     expect(result.current.groups[0].collapsed).toBe(false);
 
     act(() => {
@@ -352,9 +348,7 @@ describe("useRepoGroups stateful API", () => {
     });
     rerender();
     expect(result.current.groups[0].collapsed).toBe(true);
-    expect(window.localStorage.getItem("aoe-repo-collapsed-/repo-a")).toBe(
-      "1",
-    );
+    expect(window.localStorage.getItem("aoe-repo-collapsed-/repo-a")).toBe("1");
 
     act(() => {
       result.current.toggleRepoCollapsed("/repo-a");
@@ -368,9 +362,7 @@ describe("useRepoGroups stateful API", () => {
 
   it("updateRepoAppearance applies an alias and surfaces it in displayName", () => {
     const w = workspace("a1", "/repo-a", [session()]);
-    const { result, rerender } = renderHook(() =>
-      useRepoGroups([w], ["a1"]),
-    );
+    const { result, rerender } = renderHook(() => useRepoGroups([w], ["a1"]));
     expect(result.current.groups[0].displayName).toBe("repo-a");
 
     act(() => {
@@ -436,7 +428,11 @@ describe("useRepoGroups manual group order (#1644)", () => {
     // no stored position and sink to their default bottom.
     window.localStorage.setItem(ORDER_KEY, JSON.stringify(["/repo-a"]));
     const { result } = renderHook(() =>
-      useRepoGroups([wReal, wMulti, wScratch], ["real", "multi", "sc"], "manual"),
+      useRepoGroups(
+        [wReal, wMulti, wScratch],
+        ["real", "multi", "sc"],
+        "manual",
+      ),
     );
     expect(result.current.groups.map((g) => g.id)).toEqual([
       "/repo-a",
@@ -555,11 +551,9 @@ describe("useRepoGroups sortMode = attention (#1640)", () => {
     const wReal = workspace("real", "/repo-a", [
       session({ id: "s-real", status: "Idle" }),
     ]);
-    const wScratch = workspace(
-      "sc",
-      "/home/u/.agent-of-empires/scratch/aaa",
-      [session({ id: "s-sc", status: "Waiting", urgent: true, scratch: true })],
-    );
+    const wScratch = workspace("sc", "/home/u/.agent-of-empires/scratch/aaa", [
+      session({ id: "s-sc", status: "Waiting", urgent: true, scratch: true }),
+    ]);
     const { result } = renderHook(() =>
       useRepoGroups([wScratch, wReal], ["sc", "real"], "attention"),
     );

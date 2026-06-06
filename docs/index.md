@@ -4,7 +4,7 @@
 
 A session manager for AI coding agents on Linux and macOS, built on tmux and written in Rust.
 
-AoE lets you run multiple AI agents in parallel -- each in its own tmux session, optionally on its own git branch, optionally inside a Docker container. Use the **TUI dashboard** in your terminal, or the **web dashboard** from any browser on any device.
+AoE runs multiple AI agents in parallel, each in its own tmux session, optionally on its own git branch, optionally inside a Docker container. Use the **TUI dashboard** in your terminal, or the **web dashboard** from any browser on any device.
 
 ## See it in action
 
@@ -22,11 +22,9 @@ allowfullscreen
 
 ## Why AoE?
 
-**The problem:** You're working with AI coding agents (Claude Code, OpenCode, Cursor, Codex, etc.) and want to run several in parallel across different tasks or branches. Managing multiple terminal windows, git branches, and container lifecycles by hand gets tedious fast.
+Running several AI coding agents in parallel across tasks or branches means juggling terminal windows, git branches, and container lifecycles by hand. AoE handles it for you:
 
-**AoE handles it for you:**
-
-- **Two ways to use it.** A TUI for the terminal, or a web dashboard you can open in any browser -- even on your phone. Same sessions, same data, your choice of interface.
+- **Two ways to use it.** A TUI for the terminal, or a web dashboard you can open in any browser, even on your phone. Same sessions, same data.
 - **One dashboard for all agents.** See status (running, waiting, idle, error) at a glance. Toggle to paired shell terminals with `t`.
 - **Git worktrees built in.** Create a session and AoE creates a branch + worktree automatically. Delete the session and AoE cleans up.
 - **Docker sandboxing.** Run agents in isolated containers with your project mounted and auth credentials shared across containers.

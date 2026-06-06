@@ -54,7 +54,10 @@ interface ReplayFrame {
   };
 }
 
-async function fetchFrames(baseUrl: string, sessionId: string): Promise<ReplayFrame[]> {
+async function fetchFrames(
+  baseUrl: string,
+  sessionId: string,
+): Promise<ReplayFrame[]> {
   const replay = await fetch(
     `${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
   ).then((r) => r.json());
@@ -120,8 +123,10 @@ base("permission_request flows through to the server", async ({}, testInfo) => {
     const approvalFrame = frames.find(
       (f) => f.event?.ApprovalRequested?.approval?.nonce === nonce,
     );
-    expect(approvalFrame?.event?.ApprovalRequested?.approval?.tool_call
-      ?.args_preview).toBe("");
+    expect(
+      approvalFrame?.event?.ApprovalRequested?.approval?.tool_call
+        ?.args_preview,
+    ).toBe("");
 
     // #1713 (proposal A): the permission handler must emit a
     // ToolCallStarted for this tool BEFORE the ApprovalRequested, so the

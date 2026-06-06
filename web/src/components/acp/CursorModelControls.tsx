@@ -65,13 +65,10 @@ function optionMatches(
   query: string,
   extraSearchText = "",
 ): boolean {
-  const terms = query
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean);
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return true;
-  const haystack = `${option.id} ${option.label} ${extraSearchText}`.toLowerCase();
+  const haystack =
+    `${option.id} ${option.label} ${extraSearchText}`.toLowerCase();
   return terms.every((term) => haystack.includes(term));
 }
 
@@ -103,8 +100,13 @@ function configModelSupportsFast(
   });
 }
 
-function configHasAnyFast(option: ConfigOptionDescriptor | null | undefined): boolean {
-  if (!option) return agentBaseModelOptions("cursor").some((item) => modelSupportsFast("cursor", item.id));
+function configHasAnyFast(
+  option: ConfigOptionDescriptor | null | undefined,
+): boolean {
+  if (!option)
+    return agentBaseModelOptions("cursor").some((item) =>
+      modelSupportsFast("cursor", item.id),
+    );
   return option.options.some((item) => {
     const parsed = parseCursorModelValue(item.value);
     return parsed.fast;
@@ -168,8 +170,13 @@ export function CursorModelControls({
   const visibleOptions = useMemo(
     () =>
       options
-        .filter((option) =>
-          resolveConfigModelValue(modelConfigOption, option.id, modelOptionFast) != null,
+        .filter(
+          (option) =>
+            resolveConfigModelValue(
+              modelConfigOption,
+              option.id,
+              modelOptionFast,
+            ) != null,
         )
         .filter((option) =>
           optionMatches(
@@ -218,11 +225,10 @@ export function CursorModelControls({
   const fastChecked = hasParameterizedFast
     ? effectiveFastValue === "true"
     : fastMode;
-  const current =
-    options.find((option) => option.id === baseModel) ?? {
-      id: baseModel,
-      label: baseModel,
-    };
+  const current = options.find((option) => option.id === baseModel) ?? {
+    id: baseModel,
+    label: baseModel,
+  };
   const currentNormalizedValue = normalizedModel(currentSourceModel);
 
   const commitModel = async (nextBaseModel: string, nextFast: boolean) => {

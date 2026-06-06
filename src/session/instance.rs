@@ -3265,15 +3265,26 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                self.status = if detection_tool == "codex" && hook_status == Status::Running {
+                // Codex and Claude both report Running from hooks while their
+                // pane is actually parked on a blocking prompt, so when the
+                // hook says Running we capture the pane and let the agent's
+                // reconciler downgrade it (Codex: plan/numbered prompts;
+                // Claude: tool-approval prompts, see #1913).
+                let reconciles_running = detection_tool == "codex" || detection_tool == "claude";
+                self.status = if reconciles_running && hook_status == Status::Running {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
-                            tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                            if detection_tool == "codex" {
+                                tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                            } else {
+                                tmux::reconcile_claude_hook_status(hook_status, &pane_content)
+                            }
                         }
                         Err(e) => {
                             tracing::trace!(
-                                "status '{}': codex hook fallback pane capture failed: {}",
+                                "status '{}': {} hook fallback pane capture failed: {}",
                                 self.title,
+                                detection_tool,
                                 e
                             );
                             hook_status
@@ -7278,5 +7289,128 @@ mod tests {
                 "no tmux session must exist after refusal for id={poisoned:?}"
             );
         }
+    }
+
+    struct KillTmuxOnDrop(String);
+    impl Drop for KillTmuxOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+        }
+    }
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end regression for #1913 through the real status pipeline.
+    ///
+    /// A sandboxed (or hook-equipped) Claude session reports `running` from
+    /// its hook while the pane is actually parked on a tool-approval prompt:
+    /// the `Notification` -> waiting write gets clobbered by a running-mapped
+    /// hook that re-fires during concurrent turn activity, and Claude keeps
+    /// its live spinner rendered below the prompt. Before the fix the pipeline
+    /// trusted the hook's `running` and showed green; now it captures the pane
+    /// and reconciles to Waiting.
+    #[test]
+    #[serial_test::serial]
+    fn update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let mut inst = Instance::new("aoe_test_1913_wait", "/tmp");
+        assert_eq!(inst.tool, "claude");
+
+        // Pane shows the approval prompt with the live spinner still active
+        // below it, the exact shape from the issue screenshot. The spinner
+        // line means the bare pane detector would say Running, so a green
+        // reading here can only come from reconciliation doing its job.
+        let pane = "  Bash command\n    \
+touch /tmp/aoe_test_1913/marker.txt\n    Create marker file\n  \
+Do you want to proceed?\n  \u{276f} 1. Yes\n    \
+2. Yes, and always allow access to this project\n    3. No\n  \
+Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
+\u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)\n";
+        let pane_file = std::env::temp_dir().join(format!("aoe_test_1913_{}.txt", inst.id));
+        std::fs::write(&pane_file, pane).expect("write pane fixture");
+
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        // Single-quote the path so a temp dir with spaces or shell
+        // metacharacters (e.g. macOS `$TMPDIR`) can't break the launch
+        // command; embedded single quotes are closed/escaped/reopened.
+        let quoted_pane_file =
+            format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let launch = format!("cat {quoted_pane_file}; sleep 300");
+        let created = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                &launch,
+            ])
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        // The clobbered hook state that produced the green row.
+        let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
+        std::fs::create_dir_all(&dir).expect("create hook dir");
+        std::fs::write(dir.join("status"), "running").expect("write status");
+        assert_eq!(
+            crate::hooks::read_hook_status(&inst.id),
+            Some(Status::Running),
+            "precondition: the raw hook signal is the Running that showed green"
+        );
+
+        // Wait for the pane to actually paint the cat output before the
+        // authoritative read; a fixed sleep is flaky under parallel test load.
+        let mut painted = false;
+        for _ in 0..50 {
+            let cap = std::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", &session_name])
+                .output();
+            if let Ok(out) = cap {
+                if String::from_utf8_lossy(&out.stdout).contains("Do you want to proceed?") {
+                    painted = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(painted, "approval prompt never painted into the tmux pane");
+
+        // `Session::exists()` reads a process-global 2s session cache that a
+        // concurrent test may have snapshotted before this session existed,
+        // which surfaces as a spurious Error (and the 30s error latch would
+        // then pin it). Refresh from live tmux now that the pane is painted so
+        // the single authoritative read sees a true existence result.
+        crate::tmux::refresh_session_cache();
+        inst.update_status();
+
+        std::fs::remove_file(&pane_file).ok();
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+
+        assert_eq!(
+            inst.status,
+            Status::Waiting,
+            "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
+        );
     }
 }

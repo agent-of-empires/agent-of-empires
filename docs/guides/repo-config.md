@@ -49,19 +49,19 @@ For sandboxed sessions, hooks run inside the Docker container.
 
 #### Available environment variables
 
-Lifecycle hooks (`on_create`, `on_launch`, `on_destroy`) get session metadata as environment variables:
+Lifecycle hooks (`on_create`, `on_launch`, `on_destroy`) receive session metadata as environment variables:
 
 | Variable | Value |
 | --- | --- |
 | `AOE_SESSION_ID` | Stable session identifier (e.g. `s_abc123`). |
-| `AOE_SESSION_TITLE` | The session title (also used as the worktree branch name). |
-| `AOE_PROJECT_PATH` | Absolute path to the session's working directory (worktree path when applicable). Equal to `$PWD` inside `on_create` / `on_launch`. |
-| `AOE_PROFILE` | The resolved profile name. |
-| `AOE_TOOL` | The agent tool name (e.g. `claude`, `codex`). |
-| `AOE_GROUP_PATH` | Group path for grouped sessions; empty string otherwise. |
-| `AOE_SESSION_BRANCH` | The git branch name. Only set when the session has a worktree. |
+| `AOE_SESSION_TITLE` | Session title (also the worktree branch name). |
+| `AOE_PROJECT_PATH` | Absolute path to the working directory. Equals `$PWD` inside `on_create` / `on_launch`. |
+| `AOE_PROFILE` | Resolved profile name. |
+| `AOE_TOOL` | Agent tool name (e.g. `claude`, `codex`). |
+| `AOE_GROUP_PATH` | Group path for grouped sessions; empty otherwise. |
+| `AOE_SESSION_BRANCH` | Git branch name. Set only for worktree sessions. |
 
-Example: use a sibling CLI to track session directories.
+Quote any expansion that may contain spaces (titles often do):
 
 ```toml
 [hooks]
@@ -69,11 +69,7 @@ on_create = ["port \"$AOE_SESSION_TITLE\""]
 on_destroy = ["port rm \"$AOE_SESSION_TITLE\""]
 ```
 
-Quote any expansion that may contain spaces; titles often do, and the values are passed as-is to the shell.
-
-Container hooks receive the same variables (forwarded via `docker exec -e`). Inside `on_create` and `on_launch` the hook's working directory is already `$AOE_PROJECT_PATH`, so `$PWD` works too.
-
-The same naming is used for the status-transition hooks configured in `[status_hooks]`; those add `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT` on top.
+Container hooks get the same variables (forwarded via `docker exec -e`). Status-transition hooks in `[status_hooks]` add `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
 
 ### Session
 

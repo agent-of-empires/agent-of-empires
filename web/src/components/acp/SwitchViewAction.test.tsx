@@ -6,12 +6,7 @@
 // the confirm dialog routing, and the POST endpoint shape.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { SwitchViewAction } from "./SwitchViewAction";
 
@@ -52,9 +47,7 @@ afterEach(() => {
 
 describe("SwitchViewAction trigger", () => {
   it("labels the icon as 'Switch to structured view' when current view is terminal", () => {
-    render(
-      <SwitchViewAction sessionId="s-1" structuredView={false} />,
-    );
+    render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
     const btns = document.querySelectorAll(
       "button[aria-label='Switch to structured view']",
     );
@@ -71,7 +64,11 @@ describe("SwitchViewAction trigger", () => {
 
   it("renders 'Switch to terminal' text in button variant when structuredView is true", () => {
     const { getByText } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={true} variant="button" />,
+      <SwitchViewAction
+        sessionId="s-1"
+        structuredView={true}
+        variant="button"
+      />,
     );
     expect(getByText("Switch to terminal view")).toBeTruthy();
   });
@@ -84,7 +81,9 @@ describe("SwitchViewAction trigger", () => {
         acpCapable={false}
       />,
     );
-    const btn = getByLabelText("Switch to structured view") as HTMLButtonElement;
+    const btn = getByLabelText(
+      "Switch to structured view",
+    ) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.title).toMatch(/no ACP adapter/i);
   });
@@ -94,7 +93,9 @@ describe("SwitchViewAction trigger", () => {
     const { getByLabelText } = render(
       <SwitchViewAction sessionId="s-1" structuredView={false} />,
     );
-    const btn = getByLabelText("Switch to structured view") as HTMLButtonElement;
+    const btn = getByLabelText(
+      "Switch to structured view",
+    ) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.title).toMatch(/Disconnected/i);
   });
@@ -139,9 +140,7 @@ describe("SwitchViewAction confirm dialog", () => {
     fireEvent.click(getByLabelText("Switch to structured view"));
     fireEvent.click(getByText("Switch"));
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
-    expect(fetchFn.mock.calls[0]?.[0]).toBe(
-      "/api/sessions/s-1/acp/enable",
-    );
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/sessions/s-1/acp/enable");
     expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
   });
 
@@ -153,9 +152,7 @@ describe("SwitchViewAction confirm dialog", () => {
     fireEvent.click(getByLabelText("Switch to terminal view"));
     fireEvent.click(getByText("Switch"));
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
-    expect(fetchFn.mock.calls[0]?.[0]).toBe(
-      "/api/sessions/s-1/acp/disable",
-    );
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/sessions/s-1/acp/disable");
   });
 
   it("URL-encodes the session id in the endpoint", async () => {

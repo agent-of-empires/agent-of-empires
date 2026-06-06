@@ -4,7 +4,11 @@ import type { RefObject } from "react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { toastBus } from "../lib/toastBus";
 
-const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
+const CLIPBOARD_TEXT_TYPES = [
+  "text/plain",
+  "text/uri-list",
+  "text/html",
+] as const;
 
 // Normalize clipboard payloads to plain text. Necessary because GitHub's
 // "Copy link" buttons (and many Mac copy-link UIs) write text/uri-list
@@ -138,20 +142,38 @@ export function MobileTerminalToolbar({
       // soft keyboard. onClick handlers still fire normally.
       onMouseDown={(e) => e.preventDefault()}
     >
-      <button type="button" aria-label="Arrow up" className={btnBase} {...upHandlers}>
+      <button
+        type="button"
+        aria-label="Arrow up"
+        className={btnBase}
+        {...upHandlers}
+      >
         <span className="font-mono text-sm">{"\u2191"}</span>
         {arrowHint(upAxis)}
       </button>
-      <button type="button" aria-label="Arrow down" className={btnBase} {...downHandlers}>
+      <button
+        type="button"
+        aria-label="Arrow down"
+        className={btnBase}
+        {...downHandlers}
+      >
         <span className="font-mono text-sm">{"\u2193"}</span>
         {arrowHint(downAxis)}
       </button>
-      <button type="button" aria-label="Tab" className={btnBase}
-        onClick={() => send("\t")}>
+      <button
+        type="button"
+        aria-label="Tab"
+        className={btnBase}
+        onClick={() => send("\t")}
+      >
         <span className="font-mono text-sm">Tab</span>
       </button>
-      <button type="button" aria-label="Escape" className={btnBase}
-        onClick={() => send("\x1b")}>
+      <button
+        type="button"
+        aria-label="Escape"
+        className={btnBase}
+        onClick={() => send("\x1b")}
+      >
         <span className="font-mono text-sm">Esc</span>
       </button>
       <button
@@ -163,15 +185,28 @@ export function MobileTerminalToolbar({
             ? `${btnBase.replace("text-text-secondary", "text-brand-400")} bg-brand-600/20`
             : btnBase
         }
-        onClick={() => { haptic(); onCtrlToggle(); }}
+        onClick={() => {
+          haptic();
+          onCtrlToggle();
+        }}
       >
         <span className="font-mono text-xs">Ctrl</span>
       </button>
-      <button type="button" aria-label="Ctrl+C interrupt" className={btnBase}
-        onClick={() => { send("\x03"); if (ctrlActive) onCtrlToggle(); }}>
+      <button
+        type="button"
+        aria-label="Ctrl+C interrupt"
+        className={btnBase}
+        onClick={() => {
+          send("\x03");
+          if (ctrlActive) onCtrlToggle();
+        }}
+      >
         <span className="font-mono text-xs">^C</span>
       </button>
-      <button type="button" aria-label="Paste from clipboard" className={btnBase}
+      <button
+        type="button"
+        aria-label="Paste from clipboard"
+        className={btnBase}
         onClick={async () => {
           haptic();
           const t = toastBus.handler;
@@ -282,7 +317,8 @@ export function MobileTerminalToolbar({
               "Couldn't read clipboard. Try copying again, or open this dashboard in Safari.",
             );
           }
-        }}>
+        }}
+      >
         <svg
           width="14"
           height="14"

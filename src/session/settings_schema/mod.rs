@@ -127,6 +127,11 @@ pub enum ValidationKind {
     MemoryLimit,
     /// Each list entry must be `host:container[:options]`.
     VolumeList,
+    /// Each list entry must be a sandbox env entry: bare `KEY` or `KEY=VALUE`
+    /// (key is letters, digits, underscores; must not start with a digit).
+    EnvList,
+    /// Each list entry must be a `host:container` port mapping (digits only).
+    PortMappingList,
 }
 
 /// One configurable field, emitted by the `SettingsSection` derive. Owned

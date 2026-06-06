@@ -61,18 +61,80 @@ export function Dashboard({
             <stop offset="100%" stopColor="#f59e0b" />
           </linearGradient>
         </defs>
-        <rect x="10" y="38" width="76" height="60" rx="6" fill="url(#home-win-back)" opacity="0.6" />
-        <rect x="20" y="28" width="76" height="60" rx="6" fill="url(#home-win-mid)" opacity="0.7" />
+        <rect
+          x="10"
+          y="38"
+          width="76"
+          height="60"
+          rx="6"
+          fill="url(#home-win-back)"
+          opacity="0.6"
+        />
+        <rect
+          x="20"
+          y="28"
+          width="76"
+          height="60"
+          rx="6"
+          fill="url(#home-win-mid)"
+          opacity="0.7"
+        />
         <g>
-          <rect x="32" y="18" width="82" height="66" rx="6" fill="url(#home-win-front)" />
-          <rect x="32" y="18" width="82" height="18" rx="6" fill="url(#home-titlebar)" />
-          <rect x="32" y="30" width="82" height="6" fill="url(#home-titlebar)" />
+          <rect
+            x="32"
+            y="18"
+            width="82"
+            height="66"
+            rx="6"
+            fill="url(#home-win-front)"
+          />
+          <rect
+            x="32"
+            y="18"
+            width="82"
+            height="18"
+            rx="6"
+            fill="url(#home-titlebar)"
+          />
+          <rect
+            x="32"
+            y="30"
+            width="82"
+            height="6"
+            fill="url(#home-titlebar)"
+          />
           <circle cx="46" cy="28" r="2.8" fill="#b45309" opacity="0.55" />
           <circle cx="55" cy="28" r="2.8" fill="#b45309" opacity="0.55" />
           <circle cx="64" cy="28" r="2.8" fill="#b45309" opacity="0.55" />
-          <rect x="36" y="39" width="74" height="41" rx="3" fill="#b45309" opacity="0.22" />
-          <text x="45" y="65" fontFamily="'Courier New', monospace" fontSize="20" fontWeight="bold" fill="#fef3c7" opacity="0.85">$</text>
-          <rect x="64" y="51" width="9" height="17" rx="2" fill="#fef3c7" opacity="0.75" />
+          <rect
+            x="36"
+            y="39"
+            width="74"
+            height="41"
+            rx="3"
+            fill="#b45309"
+            opacity="0.22"
+          />
+          <text
+            x="45"
+            y="65"
+            fontFamily="'Courier New', monospace"
+            fontSize="20"
+            fontWeight="bold"
+            fill="#fef3c7"
+            opacity="0.85"
+          >
+            $
+          </text>
+          <rect
+            x="64"
+            y="51"
+            width="9"
+            height="17"
+            rx="2"
+            fill="#fef3c7"
+            opacity="0.75"
+          />
         </g>
       </svg>
       <div className="mb-1 text-center">
@@ -273,7 +335,9 @@ function ActionPane({
       >
         {iconSvg[icon]}
         <div>
-          <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>
+          <p
+            className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}
+          >
             {title}
           </p>
           <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>
@@ -283,10 +347,16 @@ function ActionPane({
   }
 
   return (
-    <button onClick={onClick} data-tour={dataTour} className={`text-left ${classes}`}>
+    <button
+      onClick={onClick}
+      data-tour={dataTour}
+      className={`text-left ${classes}`}
+    >
       {iconSvg[icon]}
       <div>
-        <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>
+        <p
+          className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}
+        >
           {title}
         </p>
         <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>

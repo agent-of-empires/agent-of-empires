@@ -29,10 +29,7 @@ interface InternalDir {
   fileCount: number;
 }
 
-function getOrCreateDir(
-  root: InternalDir,
-  segments: string[],
-): InternalDir {
+function getOrCreateDir(root: InternalDir, segments: string[]): InternalDir {
   let current = root;
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]!;
@@ -77,7 +74,11 @@ function buildInternalTree(files: RichDiffFile[]): InternalDir {
   }
 
   // Propagate aggregated stats
-  function propagate(dir: InternalDir): { additions: number; deletions: number; fileCount: number } {
+  function propagate(dir: InternalDir): {
+    additions: number;
+    deletions: number;
+    fileCount: number;
+  } {
     let additions = 0;
     let deletions = 0;
     let fileCount = dir.files.length;

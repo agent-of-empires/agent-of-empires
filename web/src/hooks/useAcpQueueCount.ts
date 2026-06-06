@@ -6,10 +6,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
-import {
-  getQueuedCount,
-  subscribeAcpState,
-} from "../lib/acpStateStorage";
+import { getQueuedCount, subscribeAcpState } from "../lib/acpStateStorage";
 
 // Returns the total number of queued structured view follow-up prompts across the
 // given session ids. Re-renders the caller only when one of THESE ids'

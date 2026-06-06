@@ -61,22 +61,25 @@ export function NotificationSettings() {
         )}
       </div>
 
-      {state.kind === "unsupported" && state.reason === "ios-not-standalone" && (
-        <IOSInstallHelp />
-      )}
+      {state.kind === "unsupported" &&
+        state.reason === "ios-not-standalone" && <IOSInstallHelp />}
     </section>
   );
 }
 
-function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["state"] }) {
+function StatusRow({
+  state,
+}: {
+  state: ReturnType<typeof usePushSubscription>["state"];
+}) {
   switch (state.kind) {
     case "loading":
       return <p className="text-sm text-text-secondary">Checking...</p>;
     case "off":
       return (
         <p className="text-sm text-text-secondary">
-          Off. Enable to receive a browser notification when an agent is
-          waiting for your input.
+          Off. Enable to receive a browser notification when an agent is waiting
+          for your input.
         </p>
       );
     case "asking":
@@ -92,8 +95,8 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
     case "enabled":
       return (
         <p className="text-sm text-status-running">
-          Enabled. This device will get a lock-screen notification when an
-          agent is waiting.
+          Enabled. This device will get a lock-screen notification when an agent
+          is waiting.
         </p>
       );
     case "sending-test":
@@ -104,9 +107,7 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
         </p>
       );
     case "disabling":
-      return (
-        <p className="text-sm text-text-secondary">Turning off...</p>
-      );
+      return <p className="text-sm text-text-secondary">Turning off...</p>;
     case "denied":
       return (
         <p className="text-sm text-status-error">
@@ -117,17 +118,19 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
     case "disabled-by-server":
       return (
         <p className="text-sm text-text-secondary">
-          Push notifications are turned off by the server. Contact the
-          operator, or enable `web.notifications_enabled` in TUI settings.
+          Push notifications are turned off by the server. Contact the operator,
+          or enable `web.notifications_enabled` in TUI settings.
         </p>
       );
     case "unsupported":
       if (state.reason === "insecure-origin") {
         return (
           <p className="text-sm text-text-secondary">
-            Push notifications require HTTPS. On mobile, access this
-            dashboard through a Cloudflare tunnel by running{" "}
-            <code className="font-mono text-text-primary">aoe serve --remote</code>{" "}
+            Push notifications require HTTPS. On mobile, access this dashboard
+            through a Cloudflare tunnel by running{" "}
+            <code className="font-mono text-text-primary">
+              aoe serve --remote
+            </code>{" "}
             on your host, then open the printed URL on your phone.
           </p>
         );
@@ -135,9 +138,9 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
       if (state.reason === "ios-not-standalone") {
         return (
           <p className="text-sm text-text-secondary">
-            Push notifications on iPhone require the app to be installed
-            from Safari via Share, then Add to Home Screen. Open the
-            installed app to enable.
+            Push notifications on iPhone require the app to be installed from
+            Safari via Share, then Add to Home Screen. Open the installed app to
+            enable.
           </p>
         );
       }
@@ -165,8 +168,8 @@ function IOSInstallHelp() {
           Scroll down and tap <em>Add to Home Screen</em>.
         </li>
         <li>
-          Open the app from your Home Screen (not Safari), then come back
-          to this page.
+          Open the app from your Home Screen (not Safari), then come back to
+          this page.
         </li>
         <li>Tap Enable notifications.</li>
       </ol>

@@ -1,4 +1,9 @@
-import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
+import {
+  expect,
+  type Locator,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -166,7 +171,9 @@ export async function waitForAcpReady(
     // value, which makes a "stuck absent" indistinguishable from a
     // misrouted poll. Surface what the server actually said.
     const frames = await fetchReplayFrames(baseUrl, sessionId).catch(() => []);
-    const sessionsRes = await fetch(`${baseUrl}/api/sessions`).catch(() => null);
+    const sessionsRes = await fetch(`${baseUrl}/api/sessions`).catch(
+      () => null,
+    );
     const sessionsBody = sessionsRes
       ? await sessionsRes.json().catch(() => null)
       : null;
@@ -244,10 +251,9 @@ export async function enableStructuredViewAndWait(
   timeoutMs = 30_000,
   home?: string,
 ): Promise<void> {
-  const res = await fetch(
-    `${baseUrl}/api/sessions/${sessionId}/acp/enable`,
-    { method: "POST" },
-  );
+  const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/enable`, {
+    method: "POST",
+  });
   if (!res.ok) {
     throw new Error(
       `structured view enable failed: status=${res.status} body=${await res.text()}`,
@@ -302,7 +308,10 @@ export function settingsSelectByLabel(page: Page, labelText: string): Locator {
  * label text matches the given string. Same structure as
  * settingsSelectByLabel.
  */
-export function settingsNumberInputByLabel(page: Page, labelText: string): Locator {
+export function settingsNumberInputByLabel(
+  page: Page,
+  labelText: string,
+): Locator {
   return page
     .locator("label")
     .filter({ hasText: labelText })
@@ -312,7 +321,10 @@ export function settingsNumberInputByLabel(page: Page, labelText: string): Locat
 }
 
 /** Click a top-level SettingsView tab by its visible label. */
-export async function openSettingsTab(page: Page, label: string): Promise<void> {
+export async function openSettingsTab(
+  page: Page,
+  label: string,
+): Promise<void> {
   await page.getByRole("button", { name: label, exact: true }).click();
 }
 
@@ -387,7 +399,10 @@ export async function attachServeDiagnostics(
           ? `... (${content.length - 64_000} bytes elided)\n` +
             content.slice(-64_000)
           : content;
-      await testInfo.attach("debug.log", { body: tail, contentType: "text/plain" });
+      await testInfo.attach("debug.log", {
+        body: tail,
+        contentType: "text/plain",
+      });
     } catch (e) {
       await testInfo.attach("debug.log.read-error", {
         body: String(e),
@@ -404,7 +419,10 @@ export async function attachServeDiagnostics(
   if (existsSync(fakeLog)) {
     try {
       const content = readFileSync(fakeLog, "utf8");
-      await testInfo.attach("fake-acp.log", { body: content, contentType: "text/plain" });
+      await testInfo.attach("fake-acp.log", {
+        body: content,
+        contentType: "text/plain",
+      });
     } catch (e) {
       await testInfo.attach("fake-acp.log.read-error", {
         body: String(e),
@@ -426,9 +444,7 @@ export async function attachServeDiagnostics(
  * sidebar / topbar elements behind the overlay.
  */
 export function wizardScope(page: Page): Locator {
-  return page.locator(
-    'div.fixed.inset-0.z-50:has(h1:has-text("New session"))',
-  );
+  return page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
 }
 
 /**

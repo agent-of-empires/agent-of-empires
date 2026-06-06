@@ -128,10 +128,26 @@ async fn main() -> Result<()> {
                     SubscriberTarget::File(p, _) => Some(p.clone()),
                     SubscriberTarget::Stdout => None,
                 };
+                // Only the serve daemon multiplexes many sessions, so it is
+                // the one process that tees session-scoped tracing into each
+                // session's acp-workers/<id>.log (#1864). The acp module is
+                // serve-gated, so the tee only exists in serve builds.
+                #[cfg(feature = "serve")]
+                let session_tee = if matches!(
+                    ctx,
+                    ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
+                ) {
+                    Some(agent_of_empires::acp::session_tee::SessionTeeLayer::new())
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "serve"))]
+                let session_tee: Option<logging::TeeLayer> = None;
                 let res = logging::init_subscriber_with_options(
                     resolution.target,
                     filter,
                     log_cfg.show_spans,
+                    session_tee,
                 );
                 if let Some(w) = resolution.warning {
                     // Emit through the subscriber that just came up.

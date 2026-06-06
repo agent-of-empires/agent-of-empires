@@ -11,10 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useMemo, useRef, type ReactNode } from "react";
 
-import {
-  DragSuppressContext,
-  SessionRow,
-} from "../WorkspaceSidebar";
+import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -109,11 +106,12 @@ const fetchSpy = vi.fn<typeof fetch>();
 beforeEach(() => {
   fetchSpy.mockReset();
   vi.stubGlobal("fetch", fetchSpy);
-  fetchSpy.mockImplementation(async () =>
-    new Response(JSON.stringify({ id: "s1" }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
+  fetchSpy.mockImplementation(
+    async () =>
+      new Response(JSON.stringify({ id: "s1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
   );
 });
 
@@ -413,8 +411,8 @@ describe("SessionRow triage actions", () => {
 
   it("reverts optimistic pin override on PATCH failure", async () => {
     // Branch coverage: the wake-call-failed path through togglePin.
-    fetchSpy.mockImplementation(async () =>
-      new Response("nope", { status: 500 }),
+    fetchSpy.mockImplementation(
+      async () => new Response("nope", { status: 500 }),
     );
     const ws = workspace("w-live", [session({ id: "sess-pin-fail" })]);
     render(
@@ -433,8 +431,8 @@ describe("SessionRow triage actions", () => {
   });
 
   it("reverts optimistic archive override on PATCH failure", async () => {
-    fetchSpy.mockImplementation(async () =>
-      new Response("nope", { status: 500 }),
+    fetchSpy.mockImplementation(
+      async () => new Response("nope", { status: 500 }),
     );
     const ws = workspace("w-live", [session({ id: "sess-arch-fail" })]);
     render(
@@ -487,9 +485,7 @@ describe("SessionRow triage actions", () => {
         </Wrap>,
       );
       fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
-      fireEvent.click(
-        screen.getByTestId("sidebar-context-menu-switch-agent"),
-      );
+      fireEvent.click(screen.getByTestId("sidebar-context-menu-switch-agent"));
       expect(opened).toEqual(["sess-switch-it"]);
       expect(switched).toEqual(["sess-switch-it"]);
       // No PATCH: switching is deferred to the dialog in the composer.

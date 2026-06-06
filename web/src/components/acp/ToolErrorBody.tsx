@@ -12,10 +12,7 @@
 
 import type { ReactNode } from "react";
 
-import {
-  describeToolErrorTag,
-  parseToolError,
-} from "../../lib/toolErrorParse";
+import { describeToolErrorTag, parseToolError } from "../../lib/toolErrorParse";
 
 interface Props {
   status: "running" | "ok" | "err" | "stopped";

@@ -79,7 +79,9 @@ describe("buildSplitRows", () => {
         line("add", null, 6, "new b"),
       ]),
     );
-    expect(rows.map((r) => [r.left?.content ?? null, r.right?.content ?? null])).toEqual([
+    expect(
+      rows.map((r) => [r.left?.content ?? null, r.right?.content ?? null]),
+    ).toEqual([
       ["old a", "new a"],
       [null, "new b"],
     ]);
@@ -95,7 +97,9 @@ describe("buildSplitRows", () => {
         line("add", null, 4, "tail add"),
       ]),
     );
-    expect(rows.map((r) => [r.left?.content ?? null, r.right?.content ?? null])).toEqual([
+    expect(
+      rows.map((r) => [r.left?.content ?? null, r.right?.content ?? null]),
+    ).toEqual([
       ["ctx1", "ctx1"],
       ["del", "ins"],
       ["ctx2", "ctx2"],

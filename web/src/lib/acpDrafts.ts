@@ -5,11 +5,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
-import {
-  safeGetItem,
-  safeRemoveItem,
-  safeSetItem,
-} from "./safeStorage";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
@@ -99,9 +95,7 @@ export function clearDraft(sessionId: string): void {
 // device (the local-tab delete path calls `clearDraft` directly).
 // Fires a single wildcard notify after the batch so the sidebar's
 // "unsent draft" dot recomputes.
-export function sweepOrphanDrafts(
-  activeSessionIds: ReadonlySet<string>,
-): void {
+export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
   if (typeof window === "undefined") return;
   const toRemove: string[] = [];
   try {

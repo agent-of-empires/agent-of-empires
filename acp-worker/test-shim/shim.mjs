@@ -80,6 +80,18 @@ class ShimAgent {
     if (process.env.SHIM_DELETE_CAPABILITY === "1") {
       agentCapabilities.sessionCapabilities = { delete: {} };
     }
+    // SHIM_MCP_CAPABILITY advertises mcpCapabilities so the Rust client's
+    // http/sse capability gating can be exercised. Comma list, e.g. "http",
+    // "sse", or "http,sse". Absent => neither advertised (stdio only).
+    if (process.env.SHIM_MCP_CAPABILITY) {
+      const caps = process.env.SHIM_MCP_CAPABILITY.split(",").map((s) =>
+        s.trim(),
+      );
+      agentCapabilities.mcpCapabilities = {
+        http: caps.includes("http"),
+        sse: caps.includes("sse"),
+      };
+    }
     return {
       protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
       agentCapabilities,
@@ -124,7 +136,14 @@ class ShimAgent {
     return {};
   }
 
-  async newSession(_params) {
+  async newSession(params) {
+    // SHIM_MCP_RECORD_FILE, when set, captures the mcp_servers the client
+    // forwarded on session/new so tests assert MCP forwarding end to end.
+    const recordFile = process.env.SHIM_MCP_RECORD_FILE;
+    if (recordFile) {
+      const fs = await import("node:fs/promises");
+      await fs.writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
+    }
     const sessionId = "shim-" + Math.random().toString(36).slice(2, 10);
     this.sessions.set(sessionId, {});
     return { sessionId };

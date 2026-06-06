@@ -46,65 +46,75 @@ const SCRIPT = {
   ],
 };
 
-base("sidebar row shows a rate-limited indicator after a park", async ({ page }, testInfo) => {
-  let serveHandle: { home: string } | undefined;
-  let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
-  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-sidebar-rl-"));
-  const scriptPath = join(scriptDir, "script.json");
-  writeFileSync(scriptPath, JSON.stringify(SCRIPT));
+base(
+  "sidebar row shows a rate-limited indicator after a park",
+  async ({ page }, testInfo) => {
+    let serveHandle: { home: string } | undefined;
+    let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
+    const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-sidebar-rl-"));
+    const scriptPath = join(scriptDir, "script.json");
+    writeFileSync(scriptPath, JSON.stringify(SCRIPT));
 
-  try {
-    serve = await spawnAoeServe({
-      authMode: "none",
-      acp: true,
-      fakeAcpScript: scriptPath,
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title: "sidebar-rl-a" }),
-    });
-    serveHandle = serve;
-
-    const sessions = await listSessions(serve.baseUrl);
-    const sessionA = sessions.find((s) => s.title === "sidebar-rl-a");
-    if (!sessionA) throw new Error("seeded session 'sidebar-rl-a' missing");
-
-    await enableStructuredViewAndWait(serve.baseUrl, sessionA.id, 30_000, serve.home);
-
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`);
-    await waitForStructuredView(page);
-
-    const composer = page.getByRole("textbox", {
-      name: /Send a message|Queue a follow-up/i,
-    });
-    await composer.fill("kick off A");
-    await composer.press("Enter");
-
-    // The structured view surfaces the rate-limit park as a system notice; wait
-    // for it so we know the RateLimit event landed and was persisted
-    // before navigating away.
-    await expect(page.getByText(/Rate-limited/i)).toBeVisible({
-      timeout: 15_000,
-    });
-
-    // Navigate to the dashboard so the sidebar is the primary surface
-    // and the structured view unmounts.
-    await page.goto(serve.baseUrl);
-
-    // The row for session A carries the rate-limited indicator, read from
-    // the persisted client-only rate-limit state.
-    await expect(page.getByTitle(/Rate-limited/i)).toBeVisible({
-      timeout: 15_000,
-    });
-  } finally {
     try {
-      if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);
-    } catch {
-      // best-effort diagnostics; do not block cleanup
-    }
-    try {
-      if (serve) await serve.stop();
+      serve = await spawnAoeServe({
+        authMode: "none",
+        acp: true,
+        fakeAcpScript: scriptPath,
+        workerIndex: testInfo.workerIndex,
+        parallelIndex: testInfo.parallelIndex,
+        seedFn: seedSessionViaAoeAdd({ title: "sidebar-rl-a" }),
+      });
+      serveHandle = serve;
+
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionA = sessions.find((s) => s.title === "sidebar-rl-a");
+      if (!sessionA) throw new Error("seeded session 'sidebar-rl-a' missing");
+
+      await enableStructuredViewAndWait(
+        serve.baseUrl,
+        sessionA.id,
+        30_000,
+        serve.home,
+      );
+
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionA.id)}`,
+      );
+      await waitForStructuredView(page);
+
+      const composer = page.getByRole("textbox", {
+        name: /Send a message|Queue a follow-up/i,
+      });
+      await composer.fill("kick off A");
+      await composer.press("Enter");
+
+      // The structured view surfaces the rate-limit park as a system notice; wait
+      // for it so we know the RateLimit event landed and was persisted
+      // before navigating away.
+      await expect(page.getByText(/Rate-limited/i)).toBeVisible({
+        timeout: 15_000,
+      });
+
+      // Navigate to the dashboard so the sidebar is the primary surface
+      // and the structured view unmounts.
+      await page.goto(serve.baseUrl);
+
+      // The row for session A carries the rate-limited indicator, read from
+      // the persisted client-only rate-limit state.
+      await expect(page.getByTitle(/Rate-limited/i)).toBeVisible({
+        timeout: 15_000,
+      });
     } finally {
-      rmSync(scriptDir, { recursive: true, force: true });
+      try {
+        if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);
+      } catch {
+        // best-effort diagnostics; do not block cleanup
+      }
+      try {
+        if (serve) await serve.stop();
+      } finally {
+        rmSync(scriptDir, { recursive: true, force: true });
+      }
     }
-  }
-});
+  },
+);

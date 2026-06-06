@@ -16,6 +16,7 @@ Thanks for your interest in contributing to aoe (Agent of Empires)! This documen
 - **tmux**: Required for running the application (`brew install tmux` on macOS, `apt install tmux` on Ubuntu)
 - **Git**: For version control
 - **Node.js + npm** (optional): Only needed for the web dashboard feature (`cargo build --features serve`). Not required for TUI-only development.
+- **[kache](https://github.com/kunobi-ninja/kache)** (optional): An opt-in rustc wrapper that shares dependency builds across worktrees to cut compile time and disk. Not required to build. If you keep several worktrees in flight, see [Faster rebuilds across worktrees](docs/development.md#faster-rebuilds-across-worktrees-kache).
 
 ### Quick Start
 

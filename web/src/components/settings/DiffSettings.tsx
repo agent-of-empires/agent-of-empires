@@ -25,7 +25,9 @@ export function DiffSettings() {
               type="checkbox"
               checked={settings.diffViewLayout === "split"}
               onChange={(e) =>
-                update({ diffViewLayout: e.target.checked ? "split" : "unified" })
+                update({
+                  diffViewLayout: e.target.checked ? "split" : "unified",
+                })
               }
               className="accent-brand-600 w-4 h-4 shrink-0"
             />

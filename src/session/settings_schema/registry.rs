@@ -139,7 +139,12 @@ mod tests {
 
         assert_eq!(
             fields,
-            ["max_failures", "failure_window_secs", "lockout_secs"]
+            [
+                "persist_sessions",
+                "max_failures",
+                "failure_window_secs",
+                "lockout_secs"
+            ]
         );
         assert!(
             !descriptor("auth", "max_failures")

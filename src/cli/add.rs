@@ -811,7 +811,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     println!("  {}", cmd);
                 }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
-                repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                if instance.sandbox_info.is_some() {
+                    instance.get_container_for_instance()?;
+                    let workdir = instance.container_workdir();
+                    if let Some(ref sandbox) = instance.sandbox_info {
+                        repo_config::execute_hooks_in_container(
+                            &hooks.on_create,
+                            &sandbox.container_name,
+                            &workdir,
+                            &hook_env,
+                        )?;
+                    }
+                } else {
+                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                }
                 println!("✓ on_create hooks completed");
             }
         }

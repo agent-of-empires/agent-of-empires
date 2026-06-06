@@ -13,12 +13,9 @@ specific repo or to keep stray files around afterwards.
 
 ## When to use it
 
-* You want to ask the agent a question that does not depend on a
-  particular codebase.
-* You want a clean, empty scratch directory for the agent to write
-  files into without polluting an existing project.
-* You want to investigate something quickly and have the directory
-  go away automatically when you are done.
+* Ask the agent a question that does not depend on a particular codebase.
+* Give the agent a clean, empty directory to write files into without polluting an existing project.
+* Investigate something quickly and have the directory go away automatically when you are done.
 
 ## Three ways to start one
 
@@ -88,42 +85,22 @@ focused on the Path row. Press `Ctrl+T` again to revert.
 
 ## Storage location
 
-Scratch directories live under the app data dir, not the system temp
-directory. The exact location depends on platform:
+Scratch directories live under the app data dir, each session in its own `<instance-id>/` subdirectory:
 
 | Platform | Scratch root |
 | --- | --- |
 | macOS / Windows | `~/.agent-of-empires/scratch/` |
 | Linux | `$XDG_CONFIG_HOME/agent-of-empires/scratch/` (defaults to `~/.config/agent-of-empires/scratch/`) |
 
-Each session gets its own `<instance-id>/` subdirectory. The
-basename is the session's stable instance id so it is easy to map
-back when you peek at the folder.
-
-Storing under the app dir (rather than `$TMPDIR`) means scratch
-directories survive OS-level temp-dir cleaning (`systemd-tmpfiles` on
-Linux, macOS reboot cleanup) until you explicitly delete the session.
+Storing under the app dir (rather than `$TMPDIR`) means scratch directories survive OS-level temp-dir cleaning until you delete the session.
 
 ## What happens at delete
 
-When you delete a scratch session via `aoe rm`, the web dashboard
-delete flow, or the TUI delete dialog, the deletion path also runs
-`fs::remove_dir_all` on the session's scratch directory. The cleanup
-is guarded: it only runs when the session's `scratch` flag is true
-AND the path lives under the scratch root. A session record with a
-tampered `project_path` pointing at, say, `/etc` is left alone.
+Deleting a scratch session (`aoe rm`, web dashboard, or TUI delete dialog) also removes its scratch directory.
 
-Pass `--keep-scratch` to `aoe rm` (or check the corresponding box in
-the delete dialog) to keep the directory on disk. The session is
-detached from AoE's view but the files survive. The kept path is
-logged so you can find it later.
+Pass `--keep-scratch` to `aoe rm` (or check the box in the delete dialog) to keep the directory on disk; the session is detached from AoE's view but the files survive, and the kept path is logged.
 
-The wizard's **Recent projects** tab filters scratch sessions out
-once they exist, so a deleted scratch directory does not appear as a
-reusable recent project. Multi-repo workspace sessions are filtered out
-of the same list, since the project step cannot rebuild a workspace from
-a single path; picking one would start a plain single-repo session and
-silently drop the other repos.
+Deleted scratch directories do not appear in the wizard's **Recent projects** tab.
 
 ## Compatibility
 
@@ -143,15 +120,6 @@ silently drop the other repos.
 
 ## Cleanup and retention
 
-If `aoe serve` (or your shell session) dies before you delete a
-scratch session, the directory is left on disk. There is no automatic
-retention policy yet; you can clean up manually by deleting the
-session record (which removes the directory) or by removing entries
-under the scratch root for your platform (see the table above)
-directly. A daemon-side orphan sweep on `aoe serve` startup is
-tracked as a follow-up.
+If `aoe serve` (or your shell session) dies before you delete a scratch session, the directory is left on disk. There is no automatic retention policy yet; clean up by deleting the session record (which removes the directory) or by removing entries under the scratch root directly.
 
-If you need the session to outlive its scratch directory (rename,
-move, keep the files), use `aoe rm --keep-scratch` and copy the files
-out, or create a new session against a real path with
-`aoe add <path>`.
+To keep the files, use `aoe rm --keep-scratch` and copy them out, or create a new session against a real path with `aoe add <path>`.

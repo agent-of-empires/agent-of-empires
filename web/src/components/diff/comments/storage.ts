@@ -44,7 +44,8 @@ export function loadComments(sessionId: string): DiffCommentsStorageV1 {
     return {
       version: 1,
       comments: v.comments.filter(isWellFormed),
-      clearAfterSend: typeof v.clearAfterSend === "boolean" ? v.clearAfterSend : true,
+      clearAfterSend:
+        typeof v.clearAfterSend === "boolean" ? v.clearAfterSend : true,
       introDraft: typeof v.introDraft === "string" ? v.introDraft : "",
       outroDraft: typeof v.outroDraft === "string" ? v.outroDraft : "",
     };

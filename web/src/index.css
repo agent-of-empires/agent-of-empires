@@ -1,21 +1,21 @@
 /* Geist Sans */
 @font-face {
-  font-family: 'Geist Sans';
-  src: url('/fonts/Geist-Regular.woff2') format('woff2');
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-Regular.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Geist Sans';
-  src: url('/fonts/Geist-Medium.woff2') format('woff2');
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-Medium.woff2") format("woff2");
   font-weight: 500;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Geist Sans';
-  src: url('/fonts/Geist-SemiBold.woff2') format('woff2');
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-SemiBold.woff2") format("woff2");
   font-weight: 600;
   font-style: normal;
   font-display: swap;
@@ -23,15 +23,15 @@
 
 /* Geist Mono */
 @font-face {
-  font-family: 'Geist Mono';
-  src: url('/fonts/GeistMono-Regular.woff2') format('woff2');
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Regular.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Geist Mono';
-  src: url('/fonts/GeistMono-Medium.woff2') format('woff2');
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Medium.woff2") format("woff2");
   font-weight: 500;
   font-style: normal;
   font-display: swap;
@@ -135,8 +135,8 @@
   --term-color-15: #fbbf24;
 
   /* Typography */
-  --font-sans: 'Geist Sans', system-ui, -apple-system, sans-serif;
-  --font-mono: 'Geist Mono', ui-monospace, 'SFMono-Regular', monospace;
+  --font-sans: "Geist Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
 
   /* Layout widths */
   --width-sidebar: 280px;
@@ -176,15 +176,41 @@ body {
 .acp-markdown p {
   margin: 0.5rem 0;
 }
-.acp-markdown p:first-child { margin-top: 0; }
-.acp-markdown p:last-child { margin-bottom: 0; }
-.acp-markdown h1 { font-size: 1.25rem; font-weight: 600; margin: 1rem 0 0.5rem; }
-.acp-markdown h2 { font-size: 1.125rem; font-weight: 600; margin: 0.875rem 0 0.5rem; }
-.acp-markdown h3 { font-size: 1rem; font-weight: 600; margin: 0.75rem 0 0.375rem; }
-.acp-markdown ul, .acp-markdown ol { margin: 0.5rem 0; padding-left: 1.5rem; }
-.acp-markdown ul { list-style: disc; }
-.acp-markdown ol { list-style: decimal; }
-.acp-markdown li { margin: 0.125rem 0; }
+.acp-markdown p:first-child {
+  margin-top: 0;
+}
+.acp-markdown p:last-child {
+  margin-bottom: 0;
+}
+.acp-markdown h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 1rem 0 0.5rem;
+}
+.acp-markdown h2 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin: 0.875rem 0 0.5rem;
+}
+.acp-markdown h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0.75rem 0 0.375rem;
+}
+.acp-markdown ul,
+.acp-markdown ol {
+  margin: 0.5rem 0;
+  padding-left: 1.5rem;
+}
+.acp-markdown ul {
+  list-style: disc;
+}
+.acp-markdown ol {
+  list-style: decimal;
+}
+.acp-markdown li {
+  margin: 0.125rem 0;
+}
 .acp-markdown blockquote {
   border-left: 2px solid var(--color-surface-700);
   padding-left: 0.75rem;
@@ -200,8 +226,12 @@ body {
   padding: 0.5rem 0.75rem;
   border-radius: 0.25rem;
 }
-.acp-markdown blockquote.acp-callout-warn p { margin: 0; }
-.acp-markdown blockquote.acp-callout-warn strong { color: var(--color-text-bright); }
+.acp-markdown blockquote.acp-callout-warn p {
+  margin: 0;
+}
+.acp-markdown blockquote.acp-callout-warn strong {
+  color: var(--color-text-bright);
+}
 .acp-markdown :where(p, li) > code {
   background: var(--color-surface-800);
   padding: 0 0.25rem;
@@ -213,7 +243,9 @@ body {
   color: var(--color-brand-500);
   text-decoration: underline;
 }
-.acp-markdown a:hover { color: var(--color-brand-400); }
+.acp-markdown a:hover {
+  color: var(--color-brand-400);
+}
 /* Break long unbreakable tokens (URLs, absolute file paths, the `─` rule
    lines Playwright's list reporter emits) so they wrap inside the chat
    bubble instead of pushing it past its width cap and forcing a
@@ -302,16 +334,32 @@ body {
 
 /* Dialog/panel entrance animation */
 @keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 @keyframes slide-up {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 @keyframes slide-in-right {
-  from { opacity: 0; transform: translateX(16px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .animate-fade-in {
@@ -354,7 +402,7 @@ select:focus-visible,
    Uses a pseudo-element overlay so it paints above xterm's background. */
 @media (pointer: fine) {
   .term-panel::after {
-    content: '';
+    content: "";
     position: absolute;
     inset: 0;
     border: 1px solid rgba(217, 119, 6, 0.45);
@@ -373,4 +421,3 @@ select:focus-visible,
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
     env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
-

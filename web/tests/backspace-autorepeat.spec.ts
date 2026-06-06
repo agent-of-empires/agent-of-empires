@@ -54,7 +54,8 @@ async function fireDeleteBackward(
 // a describe-level test.use (it would force a new worker), and the project
 // already pins chromium. We only want the iPhone 13 viewport / touch / UA so
 // `(pointer: coarse)` matches.
-const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } = devices["iPhone 13"];
+const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } =
+  devices["iPhone 13"];
 
 test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
   test.use(iPhone13);

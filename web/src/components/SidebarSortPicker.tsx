@@ -40,7 +40,8 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node))
+        setOpen(false);
     };
     const onKeydown = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);

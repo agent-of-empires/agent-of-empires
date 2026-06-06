@@ -151,69 +151,69 @@ export function ThemeIntro({ onDone }: Props) {
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in p-4"
     >
       <div className="bg-surface-800 border border-surface-700/50 rounded-lg w-[460px] max-w-[92vw] lg:w-auto lg:max-w-[1024px] shadow-2xl animate-slide-up overflow-hidden">
-       <div className="lg:flex lg:items-stretch">
-        <ComposerPreview />
-        <div className="lg:flex-1 lg:min-w-[380px]">
-        <div className="px-5 py-4 border-b border-surface-700">
-          <h2
-            id="theme-intro-title"
-            className="text-sm font-semibold text-text-bright"
-          >
-            Welcome! Choose your theme
-          </h2>
-          <p className="mt-1 text-xs text-text-dim">
-            Pick a look for the dashboard and TUI. You can change it any time
-            from Settings, under Appearance.
-          </p>
-        </div>
+        <div className="lg:flex lg:items-stretch">
+          <ComposerPreview />
+          <div className="lg:flex-1 lg:min-w-[380px]">
+            <div className="px-5 py-4 border-b border-surface-700">
+              <h2
+                id="theme-intro-title"
+                className="text-sm font-semibold text-text-bright"
+              >
+                Welcome! Choose your theme
+              </h2>
+              <p className="mt-1 text-xs text-text-dim">
+                Pick a look for the dashboard and TUI. You can change it any
+                time from Settings, under Appearance.
+              </p>
+            </div>
 
-        <div className="p-5 space-y-4">
-          <div
-            role="listbox"
-            aria-label="Themes"
-            className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto"
-          >
-            {themes.map((t) => {
-              const active = t === selected;
-              return (
-                <button
-                  key={t}
-                  type="button"
-                  role="option"
-                  aria-selected={active}
-                  disabled={pending && !active}
-                  onClick={() => pick(t)}
-                  className={`text-left text-sm rounded-md border px-3 py-2 cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
-                    active
-                      ? "border-brand-500 bg-surface-700 text-text-bright"
-                      : "border-surface-700 text-text-secondary hover:border-brand-600 hover:text-text-primary"
-                  }`}
-                >
-                  {t}
-                </button>
-              );
-            })}
+            <div className="p-5 space-y-4">
+              <div
+                role="listbox"
+                aria-label="Themes"
+                className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto"
+              >
+                {themes.map((t) => {
+                  const active = t === selected;
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      role="option"
+                      aria-selected={active}
+                      disabled={pending && !active}
+                      onClick={() => pick(t)}
+                      className={`text-left text-sm rounded-md border px-3 py-2 cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
+                        active
+                          ? "border-brand-500 bg-surface-700 text-text-bright"
+                          : "border-surface-700 text-text-secondary hover:border-brand-600 hover:text-text-primary"
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  );
+                })}
+              </div>
+              {error && (
+                <p role="alert" className="text-xs text-status-error">
+                  {error}
+                </p>
+              )}
+            </div>
+
+            <div className="flex justify-end px-5 py-4 border-t border-surface-700">
+              <button
+                ref={continueRef}
+                type="button"
+                onClick={onDone}
+                className="text-sm font-medium rounded-md bg-brand-600 hover:bg-brand-500 text-surface-950 px-4 py-1.5 cursor-pointer transition-colors"
+              >
+                Continue
+              </button>
+            </div>
           </div>
-          {error && (
-            <p role="alert" className="text-xs text-status-error">
-              {error}
-            </p>
-          )}
+          <DiffPreview />
         </div>
-
-        <div className="flex justify-end px-5 py-4 border-t border-surface-700">
-          <button
-            ref={continueRef}
-            type="button"
-            onClick={onDone}
-            className="text-sm font-medium rounded-md bg-brand-600 hover:bg-brand-500 text-surface-950 px-4 py-1.5 cursor-pointer transition-colors"
-          >
-            Continue
-          </button>
-        </div>
-        </div>
-        <DiffPreview />
-       </div>
       </div>
     </div>
   );

@@ -72,10 +72,7 @@ export function TerminalSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView
-              session={session}
-              active={active}
-            />
+            <TerminalView session={session} active={active} />
           </div>
         );
       })}

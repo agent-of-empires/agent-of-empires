@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 // Detects touch-primary devices and tracks soft-keyboard state via visualViewport.
 // isMobile is used to decide whether the mobile toolbar renders at all.
@@ -30,36 +30,76 @@ import { useEffect, useRef, useState } from "react";
 // shrinking root) is what moves the terminal. Reset on orientation change.
 const OCCLUSION_COMMIT_DEBOUNCE_MS = 150;
 
-export function useMobileKeyboard() {
-  const [isMobile, setIsMobile] = useState(() =>
+interface MobileKeyboardSnapshot {
+  isMobile: boolean;
+  keyboardOpen: boolean;
+  keyboardHeight: number;
+  keyboardOcclusion: number;
+  stableViewportHeight: number;
+}
+
+function createKeyboardStore() {
+  const initialIsMobile =
     typeof window !== "undefined" &&
-    window.matchMedia?.("(pointer: coarse)").matches,
-  );
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [keyboardOcclusion, setKeyboardOcclusion] = useState(0);
-  const [stableViewportHeight, setStableViewportHeight] = useState(0);
+    window.matchMedia?.("(pointer: coarse)").matches;
+  let snapshot: MobileKeyboardSnapshot = {
+    isMobile: initialIsMobile,
+    keyboardOpen: false,
+    keyboardHeight: 0,
+    keyboardOcclusion: 0,
+    stableViewportHeight: 0,
+  };
+  const listeners = new Set<() => void>();
+  return {
+    getSnapshot: () => snapshot,
+    update: (partial: Partial<MobileKeyboardSnapshot>) => {
+      snapshot = { ...snapshot, ...partial };
+      listeners.forEach((l) => l());
+    },
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
+type KeyboardStore = ReturnType<typeof createKeyboardStore>;
+
+export function useMobileKeyboard() {
+  const [store] = useState<KeyboardStore>(() => createKeyboardStore());
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
+
   const rafRef = useRef(0);
   const stableCountRef = useRef(0);
   const lastOcclusionRef = useRef(0);
-  // Latest occlusion target already committed to React state. The debounce
-  // only schedules a commit when the target actually changes.
   const committedOcclusionRef = useRef(0);
   const commitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track the max viewport height seen (before keyboard opens) so we can
-  // detect keyboard-open even when innerHeight shrinks with the keyboard.
   const fullHeightRef = useRef(0);
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;
     const mql = window.matchMedia("(pointer: coarse)");
-    const onChange = () => setIsMobile(mql.matches);
+    const onChange = () => {
+      if (mql.matches) {
+        store.update({ isMobile: true });
+      } else {
+        // Leaving mobile mode: clear any keyboard metrics so stale padding
+        // from a prior keyboard session can't survive on a now-desktop layout.
+        store.update({
+          isMobile: false,
+          keyboardOpen: false,
+          keyboardHeight: 0,
+          keyboardOcclusion: 0,
+          stableViewportHeight: 0,
+        });
+      }
+    };
     mql.addEventListener?.("change", onChange);
     return () => mql.removeEventListener?.("change", onChange);
-  }, []);
+  }, [store]);
 
   useEffect(() => {
-    if (!isMobile) return;
+    if (!state.isMobile) return;
     const vv = window.visualViewport;
     if (!vv) return;
 
@@ -68,43 +108,32 @@ export function useMobileKeyboard() {
     let lastOpen = false;
     let lastPadding = 0;
 
-    // Read the bottom safe-area inset once. The App root applies this as
-    // padding, so the keyboard compensation should not include it.
-    const safeBottom = parseFloat(
-      getComputedStyle(document.documentElement)
-        .getPropertyValue("--safe-area-bottom"),
-    ) || 0;
+    const safeBottom =
+      parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue(
+          "--safe-area-bottom",
+        ),
+      ) || 0;
 
-    // Commit the occlusion to React state, but only after it stops changing
-    // for OCCLUSION_COMMIT_DEBOUNCE_MS. The keyboard animation ramps the
-    // occlusion over several frames; committing each frame would SIGWINCH the
-    // PTY repeatedly for one open/close. Debouncing collapses it to one.
     const scheduleOcclusionCommit = (target: number) => {
       if (target === committedOcclusionRef.current) return;
       if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
       commitTimerRef.current = setTimeout(() => {
         committedOcclusionRef.current = target;
-        setKeyboardOcclusion(target);
+        store.update({ keyboardOcclusion: target });
       }, OCCLUSION_COMMIT_DEBOUNCE_MS);
     };
 
     const measure = () => {
       const currentVvH = vv.height;
 
-      // Update the full height when viewport grows (keyboard closed,
-      // orientation change, etc.).
       if (currentVvH > fullHeightRef.current - 50) {
         fullHeightRef.current = Math.max(fullHeightRef.current, currentVvH);
       }
 
-      // Detect keyboard open: significant drop from remembered full height.
       const totalOcclusion = fullHeightRef.current - currentVvH;
       const open = totalOcclusion > 100;
 
-      // keyboardHeight: the gap between innerHeight and the visual viewport,
-      // minus the bottom safe area the App root already handles. When
-      // innerHeight shrinks with the keyboard (iOS PWA, iOS 26 Safari),
-      // innerHeight ≈ vvHeight and this is ≈ 0; RightPanel consumes it live.
       const padding = open
         ? Math.max(0, window.innerHeight - currentVvH - safeBottom)
         : 0;
@@ -113,35 +142,18 @@ export function useMobileKeyboard() {
         lastOpen = open;
         lastPadding = padding;
         stableCountRef.current = 0;
-        setKeyboardOpen(open);
-        setKeyboardHeight(padding);
+        store.update({ keyboardOpen: open, keyboardHeight: padding });
       }
 
-      // totalOcclusion is the true keyboard size on every platform (it is
-      // measured against the remembered full height, not innerHeight, so it
-      // stays correct where innerHeight shrinks with the keyboard). The main
-      // terminal pads by it while open and releases to 0 while closed.
       scheduleOcclusionCommit(open ? Math.max(0, totalOcclusion) : 0);
 
-      // Latch the max layout-viewport height. On iOS PWA the keyboard
-      // shrinks innerHeight, so without this 100dvh would also shrink and
-      // resize the terminal container. App.tsx pins the root to this value.
-      // Take the larger of innerHeight and vv.height so a mount that
-      // happens to find the keyboard already open (innerHeight reduced)
-      // can still latch to vv.height if that's somehow larger; in
-      // practice both match in the no-keyboard state and that's what we
-      // capture on first measure.
       const heightCandidate = Math.max(window.innerHeight, currentVvH);
-      setStableViewportHeight((prev) =>
-        heightCandidate > prev ? heightCandidate : prev,
-      );
+      if (heightCandidate > store.getSnapshot().stableViewportHeight) {
+        store.update({ stableViewportHeight: heightCandidate });
+      }
       return totalOcclusion;
     };
 
-    // iOS keyboard animation takes ~300ms but visualViewport events don't
-    // fire every frame during it. Poll via rAF to catch the transition,
-    // stopping early when the measurement stabilizes (same value 3 frames
-    // in a row) or after 20 frames max to avoid burning CPU while typing.
     const MAX_POLL_FRAMES = 20;
     const STABLE_THRESHOLD = 3;
     const startPolling = () => {
@@ -157,7 +169,10 @@ export function useMobileKeyboard() {
           stableCountRef.current = 0;
         }
         lastOcclusionRef.current = occlusion;
-        if (stableCountRef.current < STABLE_THRESHOLD && frameCount < MAX_POLL_FRAMES) {
+        if (
+          stableCountRef.current < STABLE_THRESHOLD &&
+          frameCount < MAX_POLL_FRAMES
+        ) {
           rafRef.current = requestAnimationFrame(poll);
         }
       };
@@ -169,8 +184,6 @@ export function useMobileKeyboard() {
       startPolling();
     };
 
-    // Also poll briefly when any focusin happens; keyboard may be about
-    // to open but visualViewport hasn't started updating yet.
     const handleFocusIn = (e: FocusEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
@@ -178,16 +191,13 @@ export function useMobileKeyboard() {
       }
     };
 
-    // Orientation changes reset the full height baseline: the keyboard
-    // physically swaps shape between portrait and landscape, so the stale
-    // baseline would mis-measure occlusion until the next full measure.
     let orientTimer: ReturnType<typeof setTimeout> | null = null;
     const handleOrientationChange = () => {
       fullHeightRef.current = 0;
-      setStableViewportHeight(0);
+      store.update({ stableViewportHeight: 0 });
       if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
       committedOcclusionRef.current = 0;
-      setKeyboardOcclusion(0);
+      store.update({ keyboardOcclusion: 0 });
       if (orientTimer) clearTimeout(orientTimer);
       orientTimer = setTimeout(() => {
         fullHeightRef.current = Math.max(window.innerHeight, vv.height);
@@ -209,13 +219,13 @@ export function useMobileKeyboard() {
       document.removeEventListener("focusin", handleFocusIn);
       window.removeEventListener("orientationchange", handleOrientationChange);
     };
-  }, [isMobile]);
+  }, [state.isMobile, store]);
 
   return {
-    isMobile,
-    keyboardOpen,
-    keyboardHeight,
-    keyboardOcclusion,
-    stableViewportHeight,
+    isMobile: state.isMobile,
+    keyboardOpen: state.keyboardOpen,
+    keyboardHeight: state.keyboardHeight,
+    keyboardOcclusion: state.keyboardOcclusion,
+    stableViewportHeight: state.stableViewportHeight,
   };
 }

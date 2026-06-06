@@ -17,8 +17,7 @@ const SHIKI_THEME_IMPORTS: Record<string, () => Promise<unknown>> = {
   "catppuccin-latte": () => import("shiki/themes/catppuccin-latte.mjs"),
   dracula: () => import("shiki/themes/dracula.mjs"),
   "rose-pine": () => import("shiki/themes/rose-pine.mjs"),
-  "material-theme-ocean": () =>
-    import("shiki/themes/material-theme-ocean.mjs"),
+  "material-theme-ocean": () => import("shiki/themes/material-theme-ocean.mjs"),
 };
 
 /** Fallback Shiki themes when the resolver names a theme this bundle
@@ -170,7 +169,9 @@ export function langImportForPath(
   const nameNoExt = basename.split(".")[0] ?? "";
   if (FILENAME_TO_LANG[nameNoExt]) return FILENAME_TO_LANG[nameNoExt];
   if (FILENAME_TO_LANG[basename]) return FILENAME_TO_LANG[basename];
-  const ext = basename.includes(".") ? basename.split(".").pop()!.toLowerCase() : "";
+  const ext = basename.includes(".")
+    ? basename.split(".").pop()!.toLowerCase()
+    : "";
   return EXT_TO_LANG[ext] ?? null;
 }
 

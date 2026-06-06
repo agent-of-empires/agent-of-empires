@@ -18,6 +18,7 @@
 mod harness;
 
 mod acp_focus_isolation_e2e;
+mod acp_session_log_tee_e2e;
 mod acp_tool_cards_e2e;
 mod cli;
 mod command_palette;

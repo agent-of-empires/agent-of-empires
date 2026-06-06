@@ -43,40 +43,43 @@ const SLOW_TURN_SCRIPT = {
   ],
 };
 
-base.skip("structured view/cancel publishes Stopped reason:cancelled mid-turn", async ({}, testInfo) => {
-  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-cancel-"));
-  const scriptPath = join(scriptDir, "script.json");
-  writeFileSync(scriptPath, JSON.stringify(SLOW_TURN_SCRIPT));
+base.skip(
+  "structured view/cancel publishes Stopped reason:cancelled mid-turn",
+  async ({}, testInfo) => {
+    const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-cancel-"));
+    const scriptPath = join(scriptDir, "script.json");
+    writeFileSync(scriptPath, JSON.stringify(SLOW_TURN_SCRIPT));
 
-  const serve = await spawnAoeServe({
-    authMode: "none",
-    acp: true,
-    fakeAcpScript: scriptPath,
-    workerIndex: testInfo.workerIndex,
-    parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "acp-cancel" }),
-  });
-
-  try {
-    const sessions = await listSessions(serve.baseUrl);
-    const sessionId = sessions[0]!.id;
-
-    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
-
-    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "long-running thought" }),
+    const serve = await spawnAoeServe({
+      authMode: "none",
+      acp: true,
+      fakeAcpScript: scriptPath,
+      workerIndex: testInfo.workerIndex,
+      parallelIndex: testInfo.parallelIndex,
+      seedFn: seedSessionViaAoeAdd({ title: "acp-cancel" }),
     });
 
-    const cancelRes = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/cancel`,
-      { method: "POST" },
-    );
-    expect(cancelRes.status).toBe(202);
+    try {
+      const sessions = await listSessions(serve.baseUrl);
+      const sessionId = sessions[0]!.id;
 
-    await waitForReplayContains(serve.baseUrl, sessionId, "cancelled");
-  } finally {
-    await serve.stop();
-  }
-});
+      await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+
+      await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "long-running thought" }),
+      });
+
+      const cancelRes = await fetch(
+        `${serve.baseUrl}/api/sessions/${sessionId}/acp/cancel`,
+        { method: "POST" },
+      );
+      expect(cancelRes.status).toBe(202);
+
+      await waitForReplayContains(serve.baseUrl, sessionId, "cancelled");
+    } finally {
+      await serve.stop();
+    }
+  },
+);

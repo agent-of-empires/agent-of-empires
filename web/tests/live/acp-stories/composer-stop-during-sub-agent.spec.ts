@@ -14,7 +14,10 @@ import {
   listSessions,
   seedSessionViaAoeAdd,
 } from "../../helpers/aoeServe";
-import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
+import {
+  waitForStructuredView,
+  enableStructuredViewAndWait,
+} from "../../helpers/acp";
 
 const SCRIPT = {
   turns: [
@@ -42,49 +45,55 @@ const SCRIPT = {
   ],
 };
 
-base("Stop button cancels a turn during a sub-agent task", async ({ page }, testInfo) => {
-  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-stop-sub-"));
-  const scriptPath = join(scriptDir, "script.json");
-  writeFileSync(scriptPath, JSON.stringify(SCRIPT));
+base(
+  "Stop button cancels a turn during a sub-agent task",
+  async ({ page }, testInfo) => {
+    const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-stop-sub-"));
+    const scriptPath = join(scriptDir, "script.json");
+    writeFileSync(scriptPath, JSON.stringify(SCRIPT));
 
-  let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
+    let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
 
-  try {
-    serve = await spawnAoeServe({
-      authMode: "none",
-      acp: true,
-      fakeAcpScript: scriptPath,
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title: "story-stop-subagent" }),
-    });
-
-    const sessions = await listSessions(serve.baseUrl);
-    const seeded = sessions.find((s) => s.title === "story-stop-subagent");
-    if (!seeded) throw new Error("seeded session 'story-stop-subagent' missing");
-    const sessionId = seeded.id;
-    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
-
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
-    await waitForStructuredView(page);
-
-    const composer = page.getByRole("textbox", { name: /Send a message/i });
-    await composer.fill("delegate this");
-    await composer.press("Enter");
-
-    const stopButton = page.getByRole("button", { name: "Stop" });
-    await expect(stopButton).toBeVisible({ timeout: 10_000 });
-    await stopButton.click();
-
-    await expect(
-      page.getByRole("textbox", { name: /Send a message/i }),
-    ).toBeVisible({ timeout: 10_000 });
-    await expect(stopButton).toBeHidden({ timeout: 10_000 });
-  } finally {
     try {
-      if (serve) await serve.stop();
+      serve = await spawnAoeServe({
+        authMode: "none",
+        acp: true,
+        fakeAcpScript: scriptPath,
+        workerIndex: testInfo.workerIndex,
+        parallelIndex: testInfo.parallelIndex,
+        seedFn: seedSessionViaAoeAdd({ title: "story-stop-subagent" }),
+      });
+
+      const sessions = await listSessions(serve.baseUrl);
+      const seeded = sessions.find((s) => s.title === "story-stop-subagent");
+      if (!seeded)
+        throw new Error("seeded session 'story-stop-subagent' missing");
+      const sessionId = seeded.id;
+      await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+
+      await page.goto(
+        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      );
+      await waitForStructuredView(page);
+
+      const composer = page.getByRole("textbox", { name: /Send a message/i });
+      await composer.fill("delegate this");
+      await composer.press("Enter");
+
+      const stopButton = page.getByRole("button", { name: "Stop" });
+      await expect(stopButton).toBeVisible({ timeout: 10_000 });
+      await stopButton.click();
+
+      await expect(
+        page.getByRole("textbox", { name: /Send a message/i }),
+      ).toBeVisible({ timeout: 10_000 });
+      await expect(stopButton).toBeHidden({ timeout: 10_000 });
     } finally {
-      rmSync(scriptDir, { recursive: true, force: true });
+      try {
+        if (serve) await serve.stop();
+      } finally {
+        rmSync(scriptDir, { recursive: true, force: true });
+      }
     }
-  }
-});
+  },
+);

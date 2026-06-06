@@ -217,7 +217,8 @@ beforeEach(() => {
   originalWebSocket = global.WebSocket;
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   originalResizeObserver = global.ResizeObserver;
-  global.ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver;
+  global.ResizeObserver =
+    FakeResizeObserver as unknown as typeof ResizeObserver;
   // localStorage starts empty so the hook reads bundled-default font
   // sizes and theme colors.
   window.localStorage.clear();
@@ -375,7 +376,8 @@ describe("useTerminal lifecycle", () => {
     // before any RO fires, and force offsetParent to null so the
     // hidden-container guard engages even though jsdom's default
     // would normally let any size through.
-    const FakeFitAddonClass = (await import("@xterm/addon-fit")).FitAddon as unknown as {
+    const FakeFitAddonClass = (await import("@xterm/addon-fit"))
+      .FitAddon as unknown as {
       prototype: { fit: () => void };
     };
     const origFit = FakeFitAddonClass.prototype.fit;
@@ -538,7 +540,9 @@ describe("useTerminal lifecycle", () => {
       act(() => {
         ws2.readyState = FakeWebSocket.OPEN;
         ws2.onopen?.(new Event("open"));
-        ws2.onmessage?.({ data: new TextEncoder().encode("hi").buffer } as MessageEvent);
+        ws2.onmessage?.({
+          data: new TextEncoder().encode("hi").buffer,
+        } as MessageEvent);
       });
       await flushAsync();
       // The first payload byte resets the counter.
@@ -1515,7 +1519,6 @@ describe("useTerminal lifecycle", () => {
       div.remove();
     }
   });
-
 });
 
 // Mobile soft-keyboard Backspace autorepeat handler (#1450). The hook
@@ -1767,7 +1770,9 @@ describe("useTerminal OSC 52 clipboard", () => {
   it("ignores an undecodable payload without throwing", async () => {
     const div = await mountHook();
     try {
-      expect(() => captured.oscHandlers[52]!("c;!!!not base64!!!")).not.toThrow();
+      expect(() =>
+        captured.oscHandlers[52]!("c;!!!not base64!!!"),
+      ).not.toThrow();
       await flushAsync();
       expect(writeText).not.toHaveBeenCalled();
     } finally {
@@ -1786,7 +1791,8 @@ describe("useTerminal OSC 52 clipboard", () => {
   // green).
   class FakeClipboardItem {
     constructor(public data: Record<string, Promise<Blob>>) {
-      for (const v of Object.values(data)) void Promise.resolve(v).catch(() => {});
+      for (const v of Object.values(data))
+        void Promise.resolve(v).catch(() => {});
     }
   }
 

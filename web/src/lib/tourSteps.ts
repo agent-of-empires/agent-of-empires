@@ -71,7 +71,9 @@ export function tourSelector(anchor: TourAnchorId): string {
  * `<div {...tourAnchor(TOUR_ANCHORS.sidebar)} />`. Using this instead of a raw
  * `data-tour="..."` string keeps the CI drift guard honest.
  */
-export function tourAnchor(anchor: TourAnchorId): { "data-tour": TourAnchorId } {
+export function tourAnchor(anchor: TourAnchorId): {
+  "data-tour": TourAnchorId;
+} {
   return { "data-tour": anchor };
 }
 

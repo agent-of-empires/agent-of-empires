@@ -616,16 +616,150 @@ describe("ToolCards failed-card folding (#1467)", () => {
       name: "Read",
       kind: "read",
       args_preview: JSON.stringify({
-        file_path: "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
+        file_path:
+          "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
       }),
     });
     const { container, getAllByRole } = render(
       <Wrap toolKey="claude">
-        <ToolCard tool={tool} result={makeError({ text: "memory read boom" })} />
+        <ToolCard
+          tool={tool}
+          result={makeError({ text: "memory read boom" })}
+        />
       </Wrap>,
     );
     expect(container.textContent).toContain("tool failed");
     fireEvent.click(getAllByRole("button")[0]);
     expect(container.textContent).not.toContain("tool failed");
+  });
+
+  // #1818: structured completion payloads (media/resources) render below
+  // the card regardless of tool kind, and are not gated behind expansion.
+  it("renders an inline image from a base64 completion payload", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              { kind: "image", mime_type: "image/png", data: "BASE64IMG" },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("data:image/png;base64,BASE64IMG");
+  });
+
+  it("renders an audio player and a resource link from a completion payload", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              { kind: "audio", mime_type: "audio/wav", data: "BASE64AUDIO" },
+              {
+                kind: "resource_link",
+                uri: "file:///report.pdf",
+                name: "report.pdf",
+              },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    const audio = container.querySelector("audio");
+    expect(audio).not.toBeNull();
+    expect(audio!.getAttribute("src")).toBe(
+      "data:audio/wav;base64,BASE64AUDIO",
+    );
+    const link = container.querySelector('a[href="file:///report.pdf"]');
+    expect(link).not.toBeNull();
+    expect(container.textContent).toContain("report.pdf");
+  });
+
+  it("degrades a data-less image block to a labelled placeholder", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [{ kind: "image", mime_type: "image/png" }],
+          })}
+        />
+      </Wrap>,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("image (image/png)");
+  });
+
+  it("refuses a javascript: resource link and shows a placeholder", () => {
+    // #1818 review: agent-controlled uris must not reach href; a
+    // javascript: scheme degrades to a non-clickable placeholder.
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              {
+                kind: "resource_link",
+                uri: "javascript:alert(1)",
+                name: "evil.html",
+              },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toContain("evil.html");
+  });
+
+  it("offers a blob resource as a download from inline data", () => {
+    // #1818 review: a blob resource keeps its bytes, so it downloads even
+    // without a fetchable uri.
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.generic}
+          result={makeCompletion({
+            output: [
+              {
+                kind: "resource",
+                uri: "file:///out.bin",
+                mime_type: "application/octet-stream",
+                data: "QkxPQg==",
+              },
+            ],
+          })}
+        />
+      </Wrap>,
+    );
+    const link = container.querySelector("a[download]");
+    expect(link).not.toBeNull();
+    expect(link!.getAttribute("href")).toBe(
+      "data:application/octet-stream;base64,QkxPQg==",
+    );
+    expect(link!.getAttribute("download")).toBe("out.bin");
+  });
+
+  it("renders a successful completion body when the card is expanded", () => {
+    // Criterion 3: the success-path body wiring (result.text) renders once
+    // the user opens the card, not just the error path.
+    const { container, getByRole } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeCompletion({ text: "hello world\n" })}
+        />
+      </Wrap>,
+    );
+    expect(container.textContent).not.toContain("hello world");
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).toContain("hello world");
   });
 });

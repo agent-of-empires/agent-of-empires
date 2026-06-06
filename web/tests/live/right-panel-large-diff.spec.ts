@@ -72,7 +72,9 @@ base(
       // Two files surface: big.txt (modified) and image.png (added).
       // The dashboard renders both a desktop and a mobile right panel
       // (one hidden via CSS); first() picks the desktop copy.
-      await expect(page.getByText("2 files", { exact: true }).first()).toBeVisible({
+      await expect(
+        page.getByText("2 files", { exact: true }).first(),
+      ).toBeVisible({
         timeout: 15_000,
       });
 

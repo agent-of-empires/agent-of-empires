@@ -341,9 +341,9 @@ describe("buildNestedSidebarGroups", () => {
     expect(feature!.workspaces[0]!.workspace.id).toBe("w1");
     expect(fix!.workspaces[0]!.workspace.id).toBe("w1");
     expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
-    expect(
-      feature!.workspaces[0]!.workspace.sessions.map((s) => s.id),
-    ).toEqual(["a"]);
+    expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(
+      ["a"],
+    );
     expect(fix!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual([
       "b",
     ]);
@@ -407,7 +407,11 @@ describe("sidebarGroupHasLiveWorkspace", () => {
   it("is false when every workspace is sunk", () => {
     const groups = build([
       workspace("w1", [
-        session({ id: "s1", group_path: "feature", archived_at: "2025-01-02T00:00:00Z" }),
+        session({
+          id: "s1",
+          group_path: "feature",
+          archived_at: "2025-01-02T00:00:00Z",
+        }),
       ]),
     ]);
     expect(sidebarGroupHasLiveWorkspace(groups[0]!)).toBe(false);

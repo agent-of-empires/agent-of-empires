@@ -49,7 +49,11 @@ function session(
   };
 }
 
-function group(name: string, path: string, status: SessionResponse["status"]): RepoGroup {
+function group(
+  name: string,
+  path: string,
+  status: SessionResponse["status"],
+): RepoGroup {
   const s = session(`${name}-session`, path, status);
   return {
     id: path,
@@ -147,7 +151,9 @@ describe("ProjectStrip", () => {
   it("renders selected project sessions and selects a specific session", () => {
     const onSelectSession = vi.fn();
     const alpha = group("Alpha", "/tmp/alpha", "Running");
-    alpha.workspaces[0]!.sessions.push(session("Alpha-second", "/tmp/alpha", "Waiting"));
+    alpha.workspaces[0]!.sessions.push(
+      session("Alpha-second", "/tmp/alpha", "Waiting"),
+    );
 
     const { getByRole } = renderProjectStrip({
       groups: [alpha],
@@ -180,7 +186,8 @@ describe("ProjectStrip", () => {
 
   it("shows the sidebar status glyph for idle projects", () => {
     const alpha = group("Alpha", "/tmp/alpha", "Idle");
-    alpha.workspaces[0]!.sessions[0]!.idle_entered_at = new Date().toISOString();
+    alpha.workspaces[0]!.sessions[0]!.idle_entered_at =
+      new Date().toISOString();
 
     const { getByLabelText } = renderProjectStrip({ groups: [alpha] });
 
@@ -191,10 +198,11 @@ describe("ProjectStrip", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-25T12:30:00Z"));
     const alpha = group("Alpha", "/tmp/alpha", "Idle");
-    alpha.workspaces[0]!.sessions[0]!.idle_entered_at =
-      "2026-05-25T12:00:00Z";
+    alpha.workspaces[0]!.sessions[0]!.idle_entered_at = "2026-05-25T12:00:00Z";
 
-    const { getByLabelText, getByText } = renderProjectStrip({ groups: [alpha] });
+    const { getByLabelText, getByText } = renderProjectStrip({
+      groups: [alpha],
+    });
 
     expect(getByLabelText("Idle for 30M")).toBeTruthy();
     expect(getByText("30M")).toBeTruthy();
@@ -233,9 +241,13 @@ describe("ProjectStrip", () => {
     alpha.workspaces[0]!.displayName = "feature/alpha";
     alpha.workspaces[0]!.sessions[0]!.title = "Build UI";
 
-    const { getByTestId, queryByText } = renderProjectStrip({ groups: [alpha] });
+    const { getByTestId, queryByText } = renderProjectStrip({
+      groups: [alpha],
+    });
 
-    expect(getByTestId("project-strip-session").textContent).toContain("Build UI");
+    expect(getByTestId("project-strip-session").textContent).toContain(
+      "Build UI",
+    );
     expect(queryByText("feature/alpha")).toBeNull();
   });
 
@@ -409,7 +421,9 @@ describe("ProjectStrip", () => {
 
     fireEvent.doubleClick(getByTestId("project-strip-tab"));
     expect(queryByTestId("project-strip-menu")).toBeTruthy();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
     fireEvent.keyDown(document, { key: "Escape" });
     expect(queryByTestId("project-strip-menu")).toBeNull();
   });

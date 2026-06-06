@@ -48,7 +48,8 @@ test("view switch round-trips between tmux and structured view", async ({}, test
 
     const sessionsAfterEnable = await listSessions(serve.baseUrl);
     expect(
-      sessionsAfterEnable.find((s) => s.id === sessionId)!.view === "structured",
+      sessionsAfterEnable.find((s) => s.id === sessionId)!.view ===
+        "structured",
     ).toBe(true);
 
     // Idempotent: a second enable returns the same shape without an
@@ -77,7 +78,8 @@ test("view switch round-trips between tmux and structured view", async ({}, test
 
     const sessionsAfterDisable = await listSessions(serve.baseUrl);
     expect(
-      sessionsAfterDisable.find((s) => s.id === sessionId)!.view === "structured",
+      sessionsAfterDisable.find((s) => s.id === sessionId)!.view ===
+        "structured",
     ).toBe(false);
 
     // Idempotent in the other direction too.

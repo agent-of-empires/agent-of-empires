@@ -37,16 +37,30 @@ export function LoginPage({ onSuccess }: Props) {
   return (
     <div className="h-dvh flex items-center justify-center bg-surface-900 p-4 safe-area-inset">
       <div className="w-full max-w-sm animate-slide-up">
-        <form onSubmit={handleSubmit} className="bg-surface-800 border border-surface-700/40 rounded-xl p-8">
+        <form
+          onSubmit={handleSubmit}
+          className="bg-surface-800 border border-surface-700/40 rounded-xl p-8"
+        >
           {/* Logo */}
           <div className="flex items-center justify-center gap-2 mb-8">
-            <img src="/icon-192.png" alt="" width="28" height="28" className="rounded-sm" />
-            <span className="font-mono text-lg text-text-primary tracking-tight">aoe</span>
+            <img
+              src="/icon-192.png"
+              alt=""
+              width="28"
+              height="28"
+              className="rounded-sm"
+            />
+            <span className="font-mono text-lg text-text-primary tracking-tight">
+              aoe
+            </span>
           </div>
 
           {/* Passphrase input */}
           <div className="mb-4">
-            <label htmlFor="passphrase" className="block text-xs text-text-muted mb-2 font-medium">
+            <label
+              htmlFor="passphrase"
+              className="block text-xs text-text-muted mb-2 font-medium"
+            >
               Passphrase
             </label>
             <div className="relative">
@@ -66,17 +80,37 @@ export function LoginPage({ onSuccess }: Props) {
                 onClick={() => setShowPassphrase((s) => !s)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center text-text-dim hover:text-text-secondary transition-colors cursor-pointer rounded"
                 tabIndex={-1}
-                aria-label={showPassphrase ? "Hide passphrase" : "Show passphrase"}
+                aria-label={
+                  showPassphrase ? "Hide passphrase" : "Show passphrase"
+                }
               >
                 {showPassphrase ? (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
                     <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
                     <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
                     <line x1="1" y1="1" x2="23" y2="23" />
                     <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
                   </svg>
                 ) : (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                     <circle cx="12" cy="12" r="3" />
                   </svg>
@@ -86,9 +120,7 @@ export function LoginPage({ onSuccess }: Props) {
           </div>
 
           {/* Error message */}
-          {error && (
-            <p className="text-status-error text-xs mb-4">{error}</p>
-          )}
+          {error && <p className="text-status-error text-xs mb-4">{error}</p>}
 
           {/* Submit button */}
           <button
@@ -98,9 +130,24 @@ export function LoginPage({ onSuccess }: Props) {
           >
             {loading ? (
               <>
-                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                <svg
+                  className="animate-spin h-4 w-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                >
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  />
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  />
                 </svg>
                 Signing in...
               </>

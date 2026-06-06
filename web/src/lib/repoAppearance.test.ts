@@ -14,7 +14,9 @@ const STORAGE_KEY = "aoe-repo-appearance-v1";
 
 describe("applyRepoAppearanceUpdate", () => {
   it("sets a trimmed alias", () => {
-    const next = applyRepoAppearanceUpdate({}, "/repo/a", { alias: "  Alpha  " });
+    const next = applyRepoAppearanceUpdate({}, "/repo/a", {
+      alias: "  Alpha  ",
+    });
     expect(next).toEqual({ "/repo/a": { alias: "Alpha" } });
   });
 

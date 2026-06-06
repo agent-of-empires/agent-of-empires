@@ -109,7 +109,12 @@ describe("ProjectsView default base branch", () => {
 
   it("edits a project's base branch via the edit modal", async () => {
     mockFetch.mockResolvedValue([
-      { name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" },
+      {
+        name: "extra",
+        path: "/repo/extra",
+        scope: "global",
+        default_base_branch: "develop",
+      },
     ]);
     mockUpdate.mockResolvedValue({ ok: true });
 
@@ -127,13 +132,20 @@ describe("ProjectsView default base branch", () => {
 
   it("clears the base branch by saving an empty value in the edit modal", async () => {
     mockFetch.mockResolvedValue([
-      { name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" },
+      {
+        name: "extra",
+        path: "/repo/extra",
+        scope: "global",
+        default_base_branch: "develop",
+      },
     ]);
     mockUpdate.mockResolvedValue({ ok: true });
 
     render(<ProjectsView onClose={() => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    fireEvent.change(screen.getByDisplayValue("develop"), { target: { value: "  " } });
+    fireEvent.change(screen.getByDisplayValue("develop"), {
+      target: { value: "  " },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() =>

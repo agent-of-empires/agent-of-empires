@@ -83,9 +83,9 @@ test.describe("Mobile scrollback exit", () => {
     await page.reload();
     await openSession(page);
 
-    await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(
-      0,
-    );
+    await expect(
+      page.getByRole("button", { name: "Back to live" }),
+    ).toHaveCount(0);
 
     await swipeUp(page, 300);
     await expect

@@ -28,7 +28,9 @@ base("Cmd+Opt+B toggles the right panel", async ({ page }, testInfo) => {
     const seeded = sessions.find((s) => s.title === "story-right-panel");
     if (!seeded) throw new Error("seeded session 'story-right-panel' missing");
     const sessionId = seeded.id;
-    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
+    await page.goto(
+      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+    );
 
     const handle = page.locator('[data-testid="content-split-resize-handle"]');
     await expect(handle).toBeVisible({ timeout: 10_000 });

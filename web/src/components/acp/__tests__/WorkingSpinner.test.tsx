@@ -107,9 +107,7 @@ describe("WorkingSpinner state precedence (#1213)", () => {
 describe("WorkingSpinner cancelling / force-stop (#1727)", () => {
   it("shows Stopping… and a Force stop button even while a tool is in flight", () => {
     renderSpinner({ stalledSecs: 2, tool: "Terminal", cancelling: true });
-    expect(
-      screen.getByRole("button", { name: /force stop/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /force stop/i })).toBeTruthy();
     expect(screen.getByText(/stopping…/i)).toBeTruthy();
     // The legacy "Force end turn" must not also render while cancelling.
     expect(

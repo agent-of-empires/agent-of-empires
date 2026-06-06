@@ -35,22 +35,18 @@ test("structured view/context-primer renders the seeded turn", async ({}, testIn
     const sessions = await listSessions(serve.baseUrl);
     const sessionId = sessions[0]!.id;
 
-    await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-      { method: "POST" },
-    );
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, {
+      method: "POST",
+    });
 
     // publish_user_prompt is called BEFORE send_prompt forwarding, so
     // UserPromptSent lands in the event store regardless of whether
     // send_prompt succeeds or 404s due to no live worker.
-    await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: PRIMER_TEXT }),
-      },
-    );
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: PRIMER_TEXT }),
+    });
     // Synthetic Stopped closes the turn boundary so the primer renders
     // it as a complete turn rather than a half-finished one.
     await fetch(
