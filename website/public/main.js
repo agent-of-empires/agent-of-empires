@@ -66,7 +66,10 @@ function toggleMobileSidebar(btn) {
 const starCountEl = document.getElementById('star-count');
 if (starCountEl) {
   fetch('https://api.github.com/repos/agent-of-empires/agent-of-empires')
-    .then(res => res.json())
+    .then(res => {
+      if (!res.ok) throw new Error('star count fetch failed: ' + res.status);
+      return res.json();
+    })
     .then(data => {
       const count = data.stargazers_count;
       if (count !== undefined) {
