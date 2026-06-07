@@ -342,6 +342,7 @@ function AcpChrome({
   }
   return (
     <div
+      data-testid="structured-view-root"
       className="flex h-full flex-col bg-surface-900 text-text-primary"
       style={rootStyle}
     >

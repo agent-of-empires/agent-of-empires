@@ -1039,9 +1039,12 @@
     },
     {
       "id": "acp.composer-ios-keyboard-reservation",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/acp/StructuredView.layout.test.ts"],
+      "specs": [
+        "tests/acp-composer-keyboard.spec.ts",
+        "src/components/acp/StructuredView.layout.test.ts"
+      ],
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
