@@ -435,17 +435,22 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool) {
         .hooks
         .on_destroy;
 
-    // Check if repo has trusted hooks that override.
-    match repo_config::check_hook_trust(project_path) {
-        Ok(repo_config::HookTrustStatus::Trusted(hooks)) if !hooks.on_destroy.is_empty() => {
-            resolved_on_destroy = hooks.on_destroy.clone();
-        }
-        Ok(repo_config::HookTrustStatus::NeedsTrust { .. }) => {
+    // Check if repo has trusted hooks that override. Only the hooks surface
+    // matters here; untrusted project MCP must not suppress trusted hooks.
+    match repo_config::check_repo_trust(project_path) {
+        Ok(trust) if trust.hooks.needs_trust() => {
             tracing::warn!(target: "session.delete",
                 "Repo hooks changed since last trust approval; skipping repo on_destroy hooks"
             );
         }
-        _ => {}
+        Ok(trust) => {
+            if let Some(hooks) = trust.hooks.trusted() {
+                if !hooks.on_destroy.is_empty() {
+                    resolved_on_destroy = hooks.on_destroy;
+                }
+            }
+        }
+        Err(_) => {}
     }
 
     if resolved_on_destroy.is_empty() {

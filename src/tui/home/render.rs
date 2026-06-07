@@ -598,7 +598,7 @@ impl HomeView {
             worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
-            hook_trust_dialog,
+            repo_trust_dialog,
             intro_dialog,
             no_agents_dialog,
             changelog_dialog,
@@ -833,7 +833,7 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
@@ -1646,10 +1646,33 @@ impl HomeView {
     /// the active view's line count; reading `preview_cache` (the Agent cache)
     /// unconditionally shows a stale or empty `[offset/max]` in Terminal or
     /// Tool live mode, where a different cache backs the visible output.
-    fn active_captured_lines(&self) -> usize {
+    /// Record the output pane's text layout for the drag-select handlers.
+    /// `total_lines` is the parsed scrollback length; `first_line` is
+    /// derived from the same `compute_scroll` the renderer feeds to
+    /// `Paragraph::scroll`, so the snapshot agrees cell-for-cell with what
+    /// was painted this frame.
+    fn set_preview_text_view(&mut self, pane: Rect, total_lines: usize) {
+        let first_line = preview::compute_scroll(
+            total_lines,
+            pane.height as usize,
+            self.preview_scroll_offset,
+        );
+        self.preview_text_view = crate::tui::home::PreviewTextView {
+            pane,
+            first_line: first_line as usize,
+            total_lines,
+        };
+    }
+
+    /// The preview cache backing whatever the pane currently shows,
+    /// resolving the sandbox container-vs-host split for Terminal view.
+    /// Shared by the scroll clamp, the scroll indicator, and the
+    /// drag-select copy so they all read the same content the renderer
+    /// painted.
+    pub(super) fn active_preview_cache(&self) -> &super::PreviewCache {
         match &self.view_mode {
-            ViewMode::Structured => self.preview_cache.captured_lines,
-            ViewMode::Tool(_) => self.tool_preview_cache.captured_lines,
+            ViewMode::Structured => &self.preview_cache,
+            ViewMode::Tool(_) => &self.tool_preview_cache,
             ViewMode::Terminal => {
                 let mode = self
                     .selected_session
@@ -1664,11 +1687,15 @@ impl HomeView {
                     })
                     .unwrap_or(TerminalMode::Host);
                 match mode {
-                    TerminalMode::Container => self.container_terminal_preview_cache.captured_lines,
-                    TerminalMode::Host => self.terminal_preview_cache.captured_lines,
+                    TerminalMode::Container => &self.container_terminal_preview_cache,
+                    TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
         }
+    }
+
+    fn active_captured_lines(&self) -> usize {
+        self.active_preview_cache().captured_lines
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1813,6 +1840,11 @@ impl HomeView {
         // exactly `pane_area.height` (see below); the seed here is only used by
         // the no-output paths (creating / no selection).
         self.preview_visible_rows = inner.height as usize;
+        // Seed the text-view snapshot inert; the output branches below
+        // refine it once they know their pane rect and parsed line count.
+        // Paths with no scrollback (creating / no selection) leave it here
+        // so a drag-select over them does nothing.
+        self.preview_text_view = crate::tui::home::PreviewTextView::default();
         frame.render_widget(block, area);
 
         // Keep the off-thread capture worker pointed at whatever pane this
@@ -1869,6 +1901,12 @@ impl HomeView {
                     let parse_start = Instant::now();
                     self.preview_cache.ensure_parsed();
                     self.preview_timings.parse = parse_start.elapsed();
+                    let total_lines = self
+                        .preview_cache
+                        .parsed_text
+                        .as_ref()
+                        .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(id) = &self.selected_session {
                         if let Some(inst) = self.get_instance(id) {
@@ -1955,6 +1993,14 @@ impl HomeView {
                             self.terminal_preview_cache.ensure_parsed();
                         }
                     }
+                    let total_lines = match terminal_mode {
+                        TerminalMode::Container => &self.container_terminal_preview_cache,
+                        TerminalMode::Host => &self.terminal_preview_cache,
+                    }
+                    .parsed_text
+                    .as_ref()
+                    .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
@@ -2026,6 +2072,12 @@ impl HomeView {
                         &tool_name,
                     );
                     self.tool_preview_cache.ensure_parsed();
+                    let total_lines = self
+                        .tool_preview_cache
+                        .parsed_text
+                        .as_ref()
+                        .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(inst) = self.get_instance(&id) {
                         let tool_session =
@@ -2054,10 +2106,11 @@ impl HomeView {
         }
 
         // Selection highlight goes last so it sits on top of whatever
-        // the active ViewMode painted into the inner area. Only live
-        // mode populates `preview_selection`, so this branch is a
-        // no-op everywhere else.
-        self.paint_preview_selection(frame, inner, theme);
+        // the active ViewMode painted into the inner area. The handlers
+        // only populate `preview_selection` while a drag is live or a
+        // finalized highlight is showing, so this branch is a no-op
+        // otherwise.
+        self.paint_preview_selection(frame, theme);
     }
 
     /// Apply the drag-select highlight to cells inside the preview
@@ -2071,24 +2124,28 @@ impl HomeView {
     /// bg/fg pair swaps. Cells outside the buffer area are skipped
     /// rather than treated as an error: a terminal resize during a
     /// drag can leave a stale extent off-screen for one frame.
-    fn paint_preview_selection(&mut self, frame: &mut Frame, inner: Rect, theme: &Theme) {
+    fn paint_preview_selection(&mut self, frame: &mut Frame, theme: &Theme) {
         let Some(sel) = self.preview_selection else {
             return;
         };
-        let segments = sel.flow_rects(inner);
-        if segments.is_empty() {
-            return;
-        }
-        // Capture cells only on the first render that follows a
-        // finalized drag; subsequent renders just keep painting the
-        // highlight. Reading from the buffer here (rather than from
-        // `App` after `terminal.draw` returns) is load-bearing:
-        // ratatui swaps front/back buffers on every frame, so
-        // `terminal.current_buffer_mut()` post-draw points at the
-        // empty next-frame buffer, not the cells we just drew.
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        // Screen rects for the visible slice of the selection. A selection
+        // that has scrolled partly (or wholly) off screen only paints the
+        // rows still in view; the copy still spans the full range.
+        let segments = sel.screen_flow_rects(view);
+        // Capture the selected text only on the first render that follows
+        // a finalized drag; subsequent renders just keep painting the
+        // highlight. Unlike the old cell-from-buffer read, the copy now
+        // comes from the parsed scrollback cache, so it includes lines
+        // that scrolled out of view.
         let capture = self.preview_copy_pending;
         if capture {
             self.preview_copy_pending = false;
+            self.preview_copy_text = self.extract_preview_selection_text();
+        }
+        if segments.is_empty() {
+            return;
         }
         let buf = frame.buffer_mut();
         let buf_area = buf.area;
@@ -2102,7 +2159,7 @@ impl HomeView {
             theme.session_selection
         };
         for segment in segments {
-            let clipped = segment.intersection(inner);
+            let clipped = segment.intersection(pane);
             if clipped.width == 0 || clipped.height == 0 {
                 continue;
             }
@@ -2119,10 +2176,6 @@ impl HomeView {
                     cell.set_fg(theme.text);
                 }
             }
-        }
-        if capture {
-            let text = self.extract_preview_selection_text(&*frame.buffer_mut());
-            self.preview_copy_text = text;
         }
     }
 
