@@ -1038,6 +1038,13 @@
       "components": []
     },
     {
+      "id": "acp.composer-ios-keyboard-reservation",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/StructuredView.layout.test.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
