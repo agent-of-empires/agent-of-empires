@@ -1,6 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
 // Mobile keyboard regression for the structured-view composer (#2011).
 //
@@ -92,6 +92,9 @@ async function setup(page: Page) {
 async function openStructuredSession(page: Page) {
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
+  // On a mobile viewport the sidebar is collapsed behind a toggle; open it
+  // before the session link is reachable.
+  await openMobileSidebar(page);
   await clickSidebarSession(page, TITLE);
   await expect(page.getByTestId("structured-view-root")).toBeVisible({
     timeout: 10000,
