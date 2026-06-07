@@ -399,7 +399,7 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "cursor",
         binary: "cursor-agent",
-        aliases: &["agent", "cursor-agent"],
+        aliases: &["cursor-agent"],
         detection: DetectionMethod::Which("cursor-agent"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
@@ -722,8 +722,9 @@ mod tests {
         assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
-        assert_eq!(resolve_tool_name("agent"), Some("cursor"));
+        assert_eq!(resolve_tool_name("agent"), None);
         assert_eq!(resolve_tool_name("cursor-agent"), Some("cursor"));
+        assert_eq!(resolve_tool_name("aoe-agent --mode acp"), None);
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 

@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
 import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { customDefaultAcpAgent } from "../../../lib/acpDefaults";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import {
   agentBaseModelOptions,
@@ -171,19 +172,6 @@ function optionMatches(
   return terms.every((term) => haystack.includes(term));
 }
 
-function customDefaultAcpAgent(settings: Record<string, unknown>): string {
-  const acp = settings.acp as Record<string, unknown> | undefined;
-  const session = settings.session as Record<string, unknown> | undefined;
-  const defaultAgent =
-    typeof acp?.default_agent === "string" ? acp.default_agent.trim() : "";
-  const agentAcpCmd = session?.agent_acp_cmd as
-    | Record<string, unknown>
-    | undefined;
-  return defaultAgent && typeof agentAcpCmd?.[defaultAgent] === "string"
-    ? defaultAgent
-    : "";
-}
-
 function AgentModelPicker({
   tool,
   value,
@@ -200,12 +188,23 @@ function AgentModelPicker({
     value: split.model,
   }));
   const [open, setOpen] = useState(false);
+  const blurTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(
+    null,
+  );
   const options = agentBaseModelOptions(tool);
   const listId = `agent-model-options-${tool}`;
   const draft = draftState.key === draftKey ? draftState.value : split.model;
   const fastSupported = modelSupportsFast(tool, draft);
   const setDraft = (nextDraft: string) =>
     setDraftState({ key: draftKey, value: nextDraft });
+  const clearBlurTimeout = useCallback(() => {
+    if (blurTimeoutRef.current !== null) {
+      window.clearTimeout(blurTimeoutRef.current);
+      blurTimeoutRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearBlurTimeout, [clearBlurTimeout]);
 
   const visibleOptions = useMemo(
     () =>
@@ -263,8 +262,17 @@ function AgentModelPicker({
           aria-expanded={open}
           aria-controls={listId}
           value={draft}
-          onFocus={() => setOpen(true)}
-          onBlur={() => window.setTimeout(() => setOpen(false), 100)}
+          onFocus={() => {
+            clearBlurTimeout();
+            setOpen(true);
+          }}
+          onBlur={() => {
+            clearBlurTimeout();
+            blurTimeoutRef.current = window.setTimeout(() => {
+              blurTimeoutRef.current = null;
+              setOpen(false);
+            }, 100);
+          }}
           onChange={(e) => {
             setDraft(e.target.value);
             commitModel(e.target.value, fastChecked);

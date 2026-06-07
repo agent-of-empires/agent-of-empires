@@ -69,7 +69,7 @@ function renderView(tab: string) {
   );
 }
 
-function findTextInputByLabel(
+function findInputByLabel(
   container: HTMLElement,
   label: string,
 ): HTMLInputElement {
@@ -80,7 +80,7 @@ function findTextInputByLabel(
       if (input instanceof HTMLInputElement) return input;
     }
   }
-  throw new Error(`text input with label ${label} not found`);
+  throw new Error(`input with label ${label} not found`);
 }
 
 describe("SettingsView schema load", () => {
@@ -111,7 +111,7 @@ describe("SettingsView schema load", () => {
     const { container } = renderView("auth");
     await screen.findByText("Max auth failures (restart req.)");
 
-    const input = findTextInputByLabel(
+    const input = findInputByLabel(
       container,
       "Max auth failures (restart req.)",
     );

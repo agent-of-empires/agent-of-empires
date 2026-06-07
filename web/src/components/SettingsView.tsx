@@ -530,27 +530,6 @@ export function SettingsView({
         );
 
       case "auth":
-        if (schemaLoading) {
-          return (
-            <div className="text-sm text-text-dim">
-              Loading settings schema...
-            </div>
-          );
-        }
-        if (schemaError) {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm text-status-error">{schemaError}</div>
-              <button
-                type="button"
-                onClick={() => void loadSchema()}
-                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
-              >
-                Retry
-              </button>
-            </div>
-          );
-        }
         return (
           <SchemaSection
             section={activeTab}

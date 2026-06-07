@@ -9,6 +9,7 @@ import {
   createSession,
 } from "../../lib/api";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
+import { customDefaultAcpAgent } from "../../lib/acpDefaults";
 import { suppressAgentEffort } from "../../lib/agentModelOptions";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
@@ -63,21 +64,6 @@ function acpDefaultsFor(
     model: typeof entry?.model === "string" ? entry.model : "",
     effort: typeof entry?.effort === "string" ? entry.effort : "",
   };
-}
-
-function customDefaultAcpAgent(
-  settings: Record<string, unknown> | null | undefined,
-): string {
-  const acp = settings?.acp as Record<string, unknown> | undefined;
-  const session = settings?.session as Record<string, unknown> | undefined;
-  const defaultAgent =
-    typeof acp?.default_agent === "string" ? acp.default_agent.trim() : "";
-  const agentAcpCmd = session?.agent_acp_cmd as
-    | Record<string, unknown>
-    | undefined;
-  return defaultAgent && typeof agentAcpCmd?.[defaultAgent] === "string"
-    ? defaultAgent
-    : "";
 }
 
 // Wizard: project path → session (title + worktree) → agent → review

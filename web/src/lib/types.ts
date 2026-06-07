@@ -405,8 +405,9 @@ export interface CreateSessionRequest {
    *  false → tmux passthrough (legacy). Server defaults to true on
    *  web-created sessions; the wizard may override. */
   view?: "structured" | "terminal";
-  /** Optional acp model selected before the ACP worker starts. */
+  /** Custom ACP backend name, used when the ACP command differs from `tool`. */
   agent_name?: string;
+  /** Optional acp model selected before the ACP worker starts. */
   agent_model?: string;
   agent_effort?: string;
   /** Optional acp reasoning effort applied after ACP config options load. */

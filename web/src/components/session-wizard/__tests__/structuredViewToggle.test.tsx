@@ -36,6 +36,7 @@ vi.mock("../../../lib/api", () => ({
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
 });
 
 const claude: AgentInfo = {
@@ -139,6 +140,23 @@ describe("AgentStep structured-view view card", () => {
 
     expect(getByRole("combobox", { name: "Model" })).toBeTruthy();
     expect(getByRole("switch", { name: "Fast mode" })).toBeTruthy();
+  });
+
+  it("clears a pending Cursor model blur timer on unmount", () => {
+    vi.useFakeTimers();
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
+    const { getByRole, unmount } = renderAgentStep({
+      tool: "cursor",
+      agents: [cursor],
+    });
+    const modelInput = getByRole("combobox", { name: "Model" });
+
+    fireEvent.focus(modelInput);
+    fireEvent.blur(modelInput);
+    unmount();
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+    clearTimeoutSpy.mockRestore();
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {

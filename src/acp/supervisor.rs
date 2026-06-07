@@ -613,19 +613,16 @@ pub(crate) fn apply_agent_model_override(
 
 pub(crate) fn normalize_cursor_model_override(model: &str) -> Option<String> {
     let trimmed = model.trim();
-    if trimmed.is_empty() || trimmed == "auto" || trimmed == "default" || trimmed == "default[]" {
-        return None;
-    }
-
     let without_metadata = trimmed
         .split_once('[')
         .map(|(base, _)| base)
-        .unwrap_or(trimmed);
+        .unwrap_or(trimmed)
+        .trim();
     let normalized = without_metadata
         .strip_suffix("-fast")
         .unwrap_or(without_metadata)
         .trim();
-    if normalized.is_empty() {
+    if normalized.is_empty() || normalized == "auto" || normalized == "default" {
         None
     } else {
         Some(normalized.to_string())
@@ -2902,7 +2899,12 @@ mod tests {
     fn cursor_model_override_normalizes_legacy_fast_variant_for_parameterized_picker() {
         let mut s = spec("cursor-agent", &["acp"]);
         let mut env = Vec::new();
-        apply_agent_model_override("cursor", "composer-2.5-fast", &mut s, &mut env);
+        apply_agent_model_override(
+            "cursor",
+            "composer-2.5-fast [recommended]",
+            &mut s,
+            &mut env,
+        );
 
         assert_eq!(s.command, "cursor-agent");
         assert_eq!(s.args, vec!["--model", "composer-2.5", "acp"]);
@@ -2913,7 +2915,7 @@ mod tests {
     fn cursor_model_override_skips_auto_values() {
         let mut s = spec("cursor-agent", &["acp"]);
         let mut env = Vec::new();
-        apply_agent_model_override("cursor", "default[]", &mut s, &mut env);
+        apply_agent_model_override("cursor", "default [recommended]", &mut s, &mut env);
 
         assert_eq!(s.command, "cursor-agent");
         assert_eq!(s.args, vec!["acp"]);
