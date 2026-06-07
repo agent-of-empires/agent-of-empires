@@ -89,7 +89,8 @@ pub struct AddArgs {
     #[arg(short = 'y', long)]
     yolo: bool,
 
-    /// Automatically trust repository hooks without prompting
+    /// Automatically trust this repository's hooks and project-local MCP
+    /// servers without prompting
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
 
