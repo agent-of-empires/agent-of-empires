@@ -375,6 +375,17 @@ fn custom_agent_acp_capable(
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
+#[cfg(feature = "serve")]
+fn structured_agent_capable(
+    registry: &crate::acp::AgentRegistry,
+    agent_acp_cmd: &std::collections::HashMap<String, String>,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    registry.get(resolved).is_some() || custom_agent_acp_capable(agent_acp_cmd, resolved)
+}
+
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -2406,22 +2417,18 @@ pub async fn create_session(
             // falls back to tmux here rather than erroring at spawn time.
             if instance.is_structured() {
                 let acp_registry = crate::acp::AgentRegistry::with_defaults();
-                let resolved = instance
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(instance.tool.as_str());
-                let capable = acp_registry.get(resolved).is_some()
-                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session
-                    .agent_acp_cmd
-                    .get(&instance.tool)
-                    .is_some_and(|cmd| {
-                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
-                    });
+                let agent_acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &instance.source_profile,
+                    std::path::Path::new(&instance.project_path),
+                )
+                .session
+                .agent_acp_cmd;
+                let capable = structured_agent_capable(
+                    &acp_registry,
+                    &agent_acp_cmd,
+                    &instance.tool,
+                    instance.agent_name.as_deref(),
+                );
                 instance.view = if capable {
                     crate::session::View::Structured
                 } else {
@@ -3750,6 +3757,19 @@ mod tests {
         assert_eq!(
             public_create_session_error(&other),
             "Failed to create session"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn structured_agent_capable_accepts_explicit_custom_acp_backend() {
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let acp_cmd =
+            std::collections::HashMap::from([("gjc".to_string(), "gjc --mode acp".to_string())]);
+
+        assert!(
+            structured_agent_capable(&registry, &acp_cmd, "opencode", Some("gjc")),
+            "a structured session should be allowed to run tool=opencode through agent_name=gjc"
         );
     }
 

@@ -57,6 +57,7 @@ export interface WizardData {
    *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
    *  remembered opt-out would silently override the per-session default. */
   useStructuredView: boolean;
+  agentName: string;
   agentModel: string;
   agentEffort: string;
   [key: string]: unknown;
@@ -91,6 +92,7 @@ export type Action =
       extraEnv: string[];
       agentModel?: string;
       agentEffort?: string;
+      agentName?: string;
       /** When true, skip the apply if the user has already edited an
        *  agent-step field. The picker-driven path always sets this false
        *  (the user has already confirmed the overwrite); the mount-time
@@ -122,6 +124,7 @@ export const initialData: WizardData = {
   commandOverride: "",
   scratch: false,
   useStructuredView: true,
+  agentName: "",
   agentModel: "",
   agentEffort: "",
 };
@@ -213,6 +216,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           sandboxEnabled: action.sandboxEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
+          agentName: action.agentName ?? "",
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           profileDirty: false,

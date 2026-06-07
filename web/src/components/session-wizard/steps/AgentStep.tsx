@@ -31,6 +31,7 @@ interface WizardData {
   extraArgs: string;
   commandOverride: string;
   useStructuredView: boolean;
+  agentName: string;
   [key: string]: unknown;
 }
 
@@ -45,6 +46,7 @@ interface Props {
     sandboxEnabled: boolean;
     tool: string;
     extraEnv: string[];
+    agentName?: string;
     agentModel?: string;
     agentEffort?: string;
     commandMaps?: CommandMaps;
@@ -167,6 +169,19 @@ function optionMatches(
   const haystack =
     `${option.id} ${option.label} ${extraSearchText}`.toLowerCase();
   return terms.every((term) => haystack.includes(term));
+}
+
+function customDefaultAcpAgent(settings: Record<string, unknown>): string {
+  const acp = settings.acp as Record<string, unknown> | undefined;
+  const session = settings.session as Record<string, unknown> | undefined;
+  const defaultAgent =
+    typeof acp?.default_agent === "string" ? acp.default_agent.trim() : "";
+  const agentAcpCmd = session?.agent_acp_cmd as
+    | Record<string, unknown>
+    | undefined;
+  return defaultAgent && typeof agentAcpCmd?.[defaultAgent] === "string"
+    ? defaultAgent
+    : "";
 }
 
 function AgentModelPicker({
@@ -387,6 +402,7 @@ export function AgentStep({
             sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
             tool: defaultTool,
             extraEnv: env,
+            agentName: customDefaultAcpAgent(settings),
             agentModel:
               typeof acpDefault?.model === "string" ? acpDefault.model : "",
             agentEffort:

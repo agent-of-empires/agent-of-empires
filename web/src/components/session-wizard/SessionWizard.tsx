@@ -65,6 +65,21 @@ function acpDefaultsFor(
   };
 }
 
+function customDefaultAcpAgent(
+  settings: Record<string, unknown> | null | undefined,
+): string {
+  const acp = settings?.acp as Record<string, unknown> | undefined;
+  const session = settings?.session as Record<string, unknown> | undefined;
+  const defaultAgent =
+    typeof acp?.default_agent === "string" ? acp.default_agent.trim() : "";
+  const agentAcpCmd = session?.agent_acp_cmd as
+    | Record<string, unknown>
+    | undefined;
+  return defaultAgent && typeof agentAcpCmd?.[defaultAgent] === "string"
+    ? defaultAgent
+    : "";
+}
+
 // Wizard: project path → session (title + worktree) → agent → review
 function computeSteps(_data: WizardData): StepDef[] {
   return [
@@ -190,6 +205,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           session,
           defaultTool || state.data.tool,
         );
+        const agentName = customDefaultAcpAgent(s as Record<string, unknown>);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
@@ -206,6 +222,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
             false,
           tool: defaultTool,
           extraEnv: env,
+          agentName,
           agentModel: acpDefaults.model,
           agentEffort: acpDefaults.effort,
           skipIfDirty: true,
@@ -228,6 +245,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       sandboxEnabled: boolean;
       tool: string;
       extraEnv: string[];
+      agentName?: string;
       agentModel?: string;
       agentEffort?: string;
       commandMaps?: CommandMaps;
@@ -304,6 +322,10 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         selectedAgentAcpCapable && d.useStructuredView
           ? "structured"
           : "terminal",
+      agent_name:
+        selectedAgentAcpCapable && d.useStructuredView && d.agentName
+          ? d.agentName
+          : undefined,
       agent_model:
         selectedAgentAcpCapable &&
         d.useStructuredView &&

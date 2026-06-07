@@ -406,6 +406,7 @@ export interface CreateSessionRequest {
    *  web-created sessions; the wizard may override. */
   view?: "structured" | "terminal";
   /** Optional acp model selected before the ACP worker starts. */
+  agent_name?: string;
   agent_model?: string;
   agent_effort?: string;
   /** Optional acp reasoning effort applied after ACP config options load. */

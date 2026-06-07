@@ -237,6 +237,36 @@ describe("SessionWizard structured_view payload", () => {
     );
   });
 
+  it("sends a custom default structured-view agent_name from profile settings", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      acp: {
+        default_agent: "gjc",
+      },
+      session: {
+        default_tool: "opencode",
+        agent_acp_cmd: {
+          gjc: "gjc --mode acp",
+        },
+      },
+      sandbox: {},
+    } as never);
+    const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
+    await waitFor(() =>
+      expect(getAllByText(/opencode/).length).toBeGreaterThan(0),
+    );
+
+    fireEvent.click(getByText(/Launch session/));
+
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "opencode",
+        view: "structured",
+        agent_name: "gjc",
+      }),
+    );
+  });
+
   it("does not send Cursor model defaults from the session wizard", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({
       session: {
