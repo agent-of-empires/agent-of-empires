@@ -1287,7 +1287,9 @@ export interface McpServersResponse {
   driftPaused: boolean;
 }
 
-export function fetchMcpServers(agent?: string): Promise<McpServersResponse | null> {
+export function fetchMcpServers(
+  agent?: string,
+): Promise<McpServersResponse | null> {
   const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
   return fetchJson<McpServersResponse>(`/api/mcp/servers${q}`);
 }
@@ -1312,23 +1314,38 @@ export async function resolveMcpConflict(
   winner: "aoe" | "native",
   fingerprint: string,
 ): Promise<McpResolveResult> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/resolve`, {
-    agent,
-    winner,
-    fingerprint,
-  });
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/resolve`,
+    {
+      agent,
+      winner,
+      fingerprint,
+    },
+  );
   if (!res) return "error";
   if (res.ok) return "applied";
   if (res.status === 409) return "stale";
   return "error";
 }
 
-export async function keepMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/keep`, { agent });
+export async function keepMcpServer(
+  name: string,
+  agent: string,
+): Promise<boolean> {
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/keep`,
+    { agent },
+  );
   return !!res && res.ok;
 }
 
-export async function dropMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/drop`, { agent });
+export async function dropMcpServer(
+  name: string,
+  agent: string,
+): Promise<boolean> {
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/drop`,
+    { agent },
+  );
   return !!res && res.ok;
 }

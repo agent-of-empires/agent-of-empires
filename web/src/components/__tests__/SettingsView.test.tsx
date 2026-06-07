@@ -25,6 +25,7 @@ describe("buildSidebar", () => {
       { kind: "divider", label: "Sessions" },
       { kind: "tab", id: "session", label: "Session" },
       { kind: "tab", id: "structured-view", label: "Structured view" },
+      { kind: "tab", id: "mcp", label: "MCP servers" },
       { kind: "divider", label: "Environment" },
       { kind: "tab", id: "sandbox", label: "Sandbox" },
       { kind: "tab", id: "worktree", label: "Worktree" },
