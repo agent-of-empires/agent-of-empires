@@ -1136,6 +1136,24 @@ impl App {
             let mut refresh_needed = false;
             let mut needs_full_refresh = false;
 
+            // Continuous edge auto-scroll for a preview drag-select. The
+            // mouse-event arm `continue`s above, so this runs on the
+            // ~33ms ticker (and other wakes): while the cursor is held at
+            // the pane edge, scroll one line and extend the selection so a
+            // single drag can grab more than a page without depending on
+            // mouse movement to fire events. No-op unless a drag is live
+            // and the pointer sits at the edge.
+            //
+            // Request a normal (diffed) redraw via `refresh_needed`, NOT
+            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // top of the loop, and clearing every ticker frame while the
+            // scroll runs strobes the screen blank-then-repaint. The diffed
+            // draw at the bottom of the loop repaints smoothly.
+            if self.home.tick_preview_autoscroll() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             // Update-check / install-status polls can flip the
             // bottom-of-screen update bar (banner or transient toast)
             // on or off, which shifts the home view's layout. If a

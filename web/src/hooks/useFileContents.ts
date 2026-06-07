@@ -1,31 +1,37 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getSessionFileDiff } from "../lib/api";
-import type { RichFileDiffResponse } from "../lib/types";
+import { getSessionFileContents } from "../lib/api";
+import type { RichFileContentsResponse } from "../lib/types";
 
-interface UseFileDiffResult {
-  diff: RichFileDiffResponse | null;
+interface UseFileContentsResult {
+  contents: RichFileContentsResponse | null;
   loading: boolean;
   error: string | null;
   refresh: () => void;
 }
 
-export function useFileDiff(
+/**
+ * Fetch raw old/new file text for the contents-based (`@pierre/diffs`)
+ * renderer. Mirrors {@link useFileDiff}'s request-dedup/stale-drop behavior
+ * but hits `?mode=contents`.
+ */
+export function useFileContents(
   sessionId: string | null,
   filePath: string | null,
-  /** Workspace repo name; pass for files belonging to a workspace
-   *  member, leave undefined for single-repo sessions. See #1047. */
+  /** Workspace repo name; undefined for single-repo sessions. See #1047. */
   repoName: string | undefined,
   /** Triggers a re-fetch when bumped (e.g. from useDiffFiles.revision). */
   externalRevision?: number,
-): UseFileDiffResult {
-  const [diff, setDiff] = useState<RichFileDiffResponse | null>(null);
+): UseFileContentsResult {
+  const [contents, setContents] = useState<RichFileContentsResponse | null>(
+    null,
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
 
-  const fetchDiff = useCallback(async () => {
+  const fetchContents = useCallback(async () => {
     if (!sessionId || !filePath) {
-      setDiff(null);
+      setContents(null);
       return;
     }
     const reqId = ++requestIdRef.current;
@@ -34,12 +40,12 @@ export function useFileDiff(
     const capturedRepoName = repoName;
     setLoading(true);
     setError(null);
-    const resp = await getSessionFileDiff(
+    const resp = await getSessionFileContents(
       capturedSessionId,
       capturedFilePath,
       capturedRepoName,
     );
-    // Drop stale responses: rapid file/session switches can cause out-of-order replies
+    // Drop stale responses from rapid file/session switches.
     if (
       reqId !== requestIdRef.current ||
       capturedSessionId !== sessionId ||
@@ -49,19 +55,19 @@ export function useFileDiff(
       return;
     }
     if (resp) {
-      setDiff(resp);
+      setContents(resp);
     } else {
-      setError("Failed to load diff");
+      setError("Failed to load file contents");
     }
     setLoading(false);
   }, [sessionId, filePath, repoName]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      void fetchDiff();
+      void fetchContents();
     }, 0);
     return () => clearTimeout(timer);
-  }, [fetchDiff, externalRevision]);
+  }, [fetchContents, externalRevision]);
 
-  return { diff, loading, error, refresh: fetchDiff };
+  return { contents, loading, error, refresh: fetchContents };
 }

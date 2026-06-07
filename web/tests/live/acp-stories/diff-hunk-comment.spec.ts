@@ -1,9 +1,9 @@
 // User story: leave a comment on a diff hunk in a structured view session.
 //
 // Structured view-enabled session with an uncommitted file: click the file
-// row → DiffFileViewer mounts → hover a line to surface the "+"
-// gutter button → click it → CommentForm appears → write body, save.
-// The persistent CommentsBanner then shows the comment count.
+// row → DiffFileViewer mounts → click a gutter line number to select the
+// line → CommentForm appears → write body, save. The persistent
+// CommentsBanner then shows the comment count.
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -77,27 +77,16 @@ base(
       await expect(fileRow).toBeVisible({ timeout: 15_000 });
       await fileRow.click();
 
-      // "+" gutter buttons live behind `opacity-0 group-hover:opacity-100`
-      // on each diff line, so the click target only paints on hover.
-      // Hover the gutter cell first to reveal the button, then click.
-      // CommentForm uses a two-click range-selection model: first click
-      // sets rangeStart, second click on the same line resolves a single-
-      // line range and mounts the draft form.
-      const addBtn = page
-        .getByRole("button", {
-          name: /Add comment on .* line/i,
-        })
-        .first();
-      await expect(addBtn).toBeAttached({ timeout: 15_000 });
-      // Hover the surrounding diff line to trigger group-hover.
-      const lineRow = addBtn.locator(
-        "xpath=ancestor::div[contains(@class,'group')][1]",
-      );
-      await lineRow.hover();
-      await expect(addBtn).toBeVisible({ timeout: 5_000 });
-      await addBtn.click(); // sets rangeStart
-      await lineRow.hover(); // re-trigger group-hover after click
-      await addBtn.click(); // resolves single-line range -> draft form mounts
+      // Select a line to comment by clicking its @pierre/diffs gutter line
+      // number. The renderer exposes `[data-line-number-content]` cells that
+      // contain only the number; a single click selects that line and opens
+      // the draft comment form. story.txt is a new file, so line 1 is on the
+      // addition side and the `^1$` filter resolves unambiguously.
+      const gutterLine1 = page
+        .locator("[data-line-number-content]")
+        .filter({ hasText: /^1$/ });
+      await expect(gutterLine1.first()).toBeVisible({ timeout: 15_000 });
+      await gutterLine1.first().click();
 
       const composer = page.getByPlaceholder(/Leave a comment/i);
       await expect(composer).toBeVisible({ timeout: 5_000 });

@@ -89,7 +89,8 @@ pub struct AddArgs {
     #[arg(short = 'y', long)]
     yolo: bool,
 
-    /// Automatically trust repository hooks without prompting
+    /// Automatically trust this repository's hooks and project-local MCP
+    /// servers without prompting
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
 
@@ -753,25 +754,57 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             // hooks so the project-less contract stays intact.
             repo_config::resolve_global_profile_hooks(profile)
         } else {
-            match repo_config::check_hook_trust(&original_project_path) {
-                Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                    let should_trust = if args.trust_hooks {
+            // Repo trust now covers two surfaces: lifecycle hooks and project
+            // MCP servers (#1985). Hooks run here at create time; project MCP is
+            // forwarded later by the daemon, but its trust is recorded through
+            // the same single approval so an untrusted repo's `.mcp.json` is
+            // never forwarded. Hooks are resolved independently of MCP so an
+            // unapproved (or absent) MCP file never suppresses trusted hooks.
+            use repo_config::TrustSurface;
+            match repo_config::check_repo_trust(&original_project_path) {
+                Ok(trust) => {
+                    let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+                        TrustSurface::Trusted(h) => Some(h.clone()),
+                        TrustSurface::NeedsTrust { config, .. } => Some(config.clone()),
+                        TrustSurface::Absent => None,
+                    };
+                    let hooks_hash_write = match &trust.hooks {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_hash_write = match &trust.mcp {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_servers = match &trust.mcp {
+                        TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => {
+                            Some(s.clone())
+                        }
+                        TrustSurface::Absent => None,
+                    };
+
+                    let approved = if !trust.needs_prompt() || args.trust_hooks {
                         true
                     } else {
-                        // Show the final merged set (repo overrides global/profile
-                        // per type) with source labels, mirroring the TUI trust
-                        // dialog, so the prompt reflects exactly what will run (#596).
-                        println!(
-                            "\nHooks for this session (repo overrides global config per type):"
-                        );
-                        let merged = repo_config::merge_hooks_for_display(profile, &hooks);
-                        for group in repo_config::hook_display_groups(&merged, &hooks, true) {
-                            println!("  {}:{}", group.name, group.source_label());
-                            for cmd in &group.commands {
-                                println!("    {}", cmd);
+                        if let Some(ref hooks) = repo_hooks {
+                            println!(
+                                "\nHooks for this session (repo overrides global config per type):"
+                            );
+                            let merged = repo_config::merge_hooks_for_display(profile, hooks);
+                            for group in repo_config::hook_display_groups(&merged, hooks, true) {
+                                println!("  {}:{}", group.name, group.source_label());
+                                for cmd in &group.commands {
+                                    println!("    {}", cmd);
+                                }
                             }
                         }
-                        print!("\nTrust and run these hooks? [y/N] ");
+                        if let Some(ref servers) = mcp_servers {
+                            println!("\nProject MCP servers from .mcp.json (values redacted):");
+                            for server in servers {
+                                println!("  {}", server.redacted_summary());
+                            }
+                        }
+                        print!("\nTrust this repo (hooks and project MCP shown above)? [y/N] ");
                         use std::io::Write;
                         std::io::stdout().flush()?;
                         let mut input = String::new();
@@ -779,23 +812,43 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         input.trim().eq_ignore_ascii_case("y")
                     };
 
-                    if should_trust {
-                        repo_config::trust_repo(&original_project_path, &hooks_hash)?;
-                        println!("✓ Repository hooks trusted");
-                        repo_config::merge_hooks_with_config(profile, hooks)
+                    if approved {
+                        if hooks_hash_write.is_some() || mcp_hash_write.is_some() {
+                            repo_config::trust_repo(
+                                &original_project_path,
+                                hooks_hash_write.as_deref(),
+                                mcp_hash_write.as_deref(),
+                            )?;
+                            if hooks_hash_write.is_some() {
+                                println!("✓ Repository hooks trusted");
+                            }
+                            if mcp_hash_write.is_some() {
+                                println!("✓ Project MCP servers trusted");
+                            }
+                        }
+                        match repo_hooks {
+                            Some(h) => repo_config::merge_hooks_with_config(profile, h),
+                            None => repo_config::resolve_global_profile_hooks(profile),
+                        }
                     } else {
-                        println!("Hooks skipped (session created without running hooks)");
-                        None
+                        println!(
+                            "Skipped (session created without trusting repo hooks or project MCP)"
+                        );
+                        // Already-trusted hooks still run; only newly-prompted
+                        // surfaces are declined.
+                        match &trust.hooks {
+                            TrustSurface::Trusted(h) => {
+                                repo_config::merge_hooks_with_config(profile, h.clone())
+                            }
+                            TrustSurface::NeedsTrust { .. } => None,
+                            TrustSurface::Absent => {
+                                repo_config::resolve_global_profile_hooks(profile)
+                            }
+                        }
                     }
                 }
-                Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                    repo_config::merge_hooks_with_config(profile, repo_hooks)
-                }
-                Ok(repo_config::HookTrustStatus::NoHooks) => {
-                    repo_config::resolve_global_profile_hooks(profile)
-                }
                 Err(e) => {
-                    tracing::warn!(target: "cli.add", "Failed to check repo hooks: {}", e);
+                    tracing::warn!(target: "cli.add", "Failed to check repo trust: {}", e);
                     repo_config::resolve_global_profile_hooks(profile)
                 }
             }

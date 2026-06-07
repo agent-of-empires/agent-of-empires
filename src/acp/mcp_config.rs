@@ -16,12 +16,13 @@
 //! }
 //! ```
 //!
-//! Only a single global file in the AoE app dir is read today. A project-local
-//! `cwd/.mcp.json` is intentionally NOT read: AoE opens cloned and potentially
-//! untrusted repositories, and stdio MCP servers launch unconditionally when a
-//! session spawns, so project scope must sit behind the repo-trust gate (the
-//! same boundary that already protects lifecycle hooks). That, plus per-profile
-//! config, are tracked as follow-ups.
+//! The global file in the AoE app dir and a per-profile `<profile_dir>/mcp.json`
+//! (issue #1986) are both read; the per-profile layer merges above global. A
+//! project-local `cwd/.mcp.json` is intentionally NOT read: AoE opens cloned and
+//! potentially untrusted repositories, and stdio MCP servers launch
+//! unconditionally when a session spawns, so project scope must sit behind the
+//! repo-trust gate (the same boundary that already protects lifecycle hooks).
+//! That project-local layer is tracked as a follow-up.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -67,8 +68,24 @@ struct RawServer {
 /// present-but-malformed file is an error the caller surfaces; it must not be
 /// silently treated as "no servers".
 pub fn load_global_mcp_servers(app_dir: &Path) -> Result<Vec<McpServer>> {
-    let path = app_dir.join("mcp.json");
-    let text = match std::fs::read_to_string(&path) {
+    read_mcp_json(&app_dir.join("mcp.json"))
+}
+
+/// Read and parse a profile's `<profile_dir>/mcp.json` (issue #1986). Same
+/// on-disk shape and same missing/malformed semantics as the global file; it is
+/// just resolved from the active session's profile directory. The per-profile
+/// layer is merged ABOVE global (so a same-named server in the profile file
+/// overrides the global one) and below project-local. Per-profile entries are
+/// AoE state only: they are never written back to any agent's native config.
+pub fn load_profile_mcp_servers(profile_dir: &Path) -> Result<Vec<McpServer>> {
+    read_mcp_json(&profile_dir.join("mcp.json"))
+}
+
+/// Read and parse an `mcp.json` at `path`. A missing file yields an empty list;
+/// a present-but-malformed file is an error the caller surfaces. Shared by the
+/// global and per-profile loaders so both layers behave identically.
+fn read_mcp_json(path: &Path) -> Result<Vec<McpServer>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
@@ -193,6 +210,33 @@ fn server_kind(server: &McpServer) -> &'static str {
         McpServer::Sse(_) => "sse",
         _ => "unknown",
     }
+}
+
+/// Convert the always-compiled project-local servers (parsed and fingerprinted
+/// by `session::project_mcp` outside the serve gate) into ACP `McpServer`
+/// values for forwarding (#1985). The supervisor calls this only after the repo
+/// is trusted for the matching fingerprint, so the converted set is exactly the
+/// reviewed set.
+pub fn project_servers_to_acp(
+    servers: Vec<crate::session::project_mcp::ProjectMcpServer>,
+) -> Vec<McpServer> {
+    use crate::session::project_mcp::ProjectMcpTransport;
+    servers
+        .into_iter()
+        .map(|server| match server.transport {
+            ProjectMcpTransport::Stdio { command, args, env } => McpServer::Stdio(
+                McpServerStdio::new(server.name, command)
+                    .args(args)
+                    .env(to_env(env)),
+            ),
+            ProjectMcpTransport::Http { url, headers } => {
+                McpServer::Http(McpServerHttp::new(server.name, url).headers(to_headers(headers)))
+            }
+            ProjectMcpTransport::Sse { url, headers } => {
+                McpServer::Sse(McpServerSse::new(server.name, url).headers(to_headers(headers)))
+            }
+        })
+        .collect()
 }
 
 /// A named source of MCP servers for precedence merging. Layers are passed
@@ -655,6 +699,105 @@ mod tests {
             servers: Vec::new(),
         };
         assert!(merge_by_precedence(vec![empty]).is_empty());
+    }
+
+    #[test]
+    fn profile_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = load_profile_mcp_servers(dir.path()).unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn profile_loads_and_parses_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{ "mcpServers": { "fs": { "command": "profile-fs" } } }"#,
+        )
+        .unwrap();
+        let servers = load_profile_mcp_servers(dir.path()).unwrap();
+        assert_eq!(names(&servers), vec!["fs"]);
+    }
+
+    #[test]
+    fn profile_malformed_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mcp.json"), "{ not json").unwrap();
+        assert!(load_profile_mcp_servers(dir.path()).is_err());
+    }
+
+    #[test]
+    fn merge_profile_overrides_global() {
+        // Ordering native < global < per-profile: on the shared "fs" name, the
+        // per-profile layer (highest of the three) wins.
+        let native = layer(
+            "agent-native",
+            r#"{ "mcpServers": { "fs": { "command": "native" } } }"#,
+        );
+        let global = layer(
+            "global",
+            r#"{ "mcpServers": { "fs": { "command": "global" } } }"#,
+        );
+        let profile = layer(
+            "per-profile",
+            r#"{ "mcpServers": { "fs": { "command": "profile" } } }"#,
+        );
+        let merged = merge_by_precedence(vec![native, global, profile]);
+        assert_eq!(names(&merged), vec!["fs"]);
+        assert_eq!(stdio_command(&merged[0]), "profile");
+    }
+
+    #[test]
+    fn project_servers_to_acp_converts_all_transports() {
+        use crate::session::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        let mut env = BTreeMap::new();
+        env.insert("TOKEN".to_string(), "secret".to_string());
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer x".to_string());
+        let project = vec![
+            ProjectMcpServer {
+                name: "a-stdio".to_string(),
+                transport: ProjectMcpTransport::Stdio {
+                    command: "cmd".to_string(),
+                    args: vec!["--arg".to_string()],
+                    env,
+                },
+            },
+            ProjectMcpServer {
+                name: "b-http".to_string(),
+                transport: ProjectMcpTransport::Http {
+                    url: "https://e/mcp".to_string(),
+                    headers,
+                },
+            },
+            ProjectMcpServer {
+                name: "c-sse".to_string(),
+                transport: ProjectMcpTransport::Sse {
+                    url: "https://e/sse".to_string(),
+                    headers: BTreeMap::new(),
+                },
+            },
+        ];
+        let acp = project_servers_to_acp(project);
+        assert_eq!(names(&acp), vec!["a-stdio", "b-http", "c-sse"]);
+        match &acp[0] {
+            McpServer::Stdio(s) => {
+                assert_eq!(s.command.to_string_lossy(), "cmd");
+                assert_eq!(s.args, vec!["--arg".to_string()]);
+                assert_eq!(s.env[0].name, "TOKEN");
+                assert_eq!(s.env[0].value, "secret");
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+        match &acp[1] {
+            McpServer::Http(h) => {
+                assert_eq!(h.url, "https://e/mcp");
+                assert_eq!(h.headers[0].name, "Authorization");
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+        assert!(matches!(&acp[2], McpServer::Sse(_)));
     }
 
     fn write(home: &Path, rel: &str, contents: &str) {

@@ -1,11 +1,12 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
+import { makePatch } from "./helpers/patch";
 
-// In-diff comments end-to-end (#928).
-// - Structured view-only feature: a non-structured view session must not show the
-//   `+` gutter button or the banner.
-// - Click `+` to comment on a single line; save; card renders.
+// In-diff comments end-to-end (#928), against the @pierre/diffs renderer.
+// - Structured-view-only feature: a session without the structured view
+//   can't select lines to comment.
+// - Select a line (click its gutter number) to comment; save; card renders.
 // - Open the send dialog, edit intro, send; comments clear; POST
 //   reaches /acp/prompt/diff-comments with the structured body
 //   (intro/outro/comments/isMultiRepo/assembledMarkdown). See #1123.
@@ -27,6 +28,9 @@ const DIFF_FILES_RESPONSE = {
   warning: null,
 };
 
+// Contents shape consumed by the @pierre/diffs renderer. The new-side line
+// numbers below line up with the comment assertions (new line 3 =
+// `function greet`, new line 4 = `return ...`).
 const DIFF_FILE_RESPONSE = {
   file: {
     path: FILE_PATH,
@@ -35,55 +39,23 @@ const DIFF_FILE_RESPONSE = {
     additions: 3,
     deletions: 1,
   },
-  hunks: [
-    {
-      old_start: 1,
-      old_lines: 3,
-      new_start: 1,
-      new_lines: 5,
-      lines: [
-        {
-          type: "equal",
-          old_line_num: 1,
-          new_line_num: 1,
-          content: 'import { useState } from "react";\n',
-        },
-        {
-          type: "delete",
-          old_line_num: 2,
-          new_line_num: null,
-          content: "const x = 42;\n",
-        },
-        {
-          type: "add",
-          old_line_num: null,
-          new_line_num: 2,
-          content: "const x: number = 42;\n",
-        },
-        {
-          type: "add",
-          old_line_num: null,
-          new_line_num: 3,
-          content: "function greet(name: string): string {\n",
-        },
-        {
-          type: "add",
-          old_line_num: null,
-          new_line_num: 4,
-          content: "  return `Hello, ${name}`;\n",
-        },
-        {
-          type: "equal",
-          old_line_num: 3,
-          new_line_num: 5,
-          content: "export default x;\n",
-        },
-      ],
-    },
-  ],
+  old_content:
+    'import { useState } from "react";\nconst x = 42;\nexport default x;\n',
+  new_content:
+    'import { useState } from "react";\n' +
+    "const x: number = 42;\n" +
+    "function greet(name: string): string {\n" +
+    "  return `Hello, ${name}`;\n" +
+    "export default x;\n",
   is_binary: false,
   truncated: false,
 };
+// Server-computed patch, generated from the same contents.
+(DIFF_FILE_RESPONSE as { patch?: string }).patch = makePatch(
+  FILE_PATH,
+  DIFF_FILE_RESPONSE.old_content,
+  DIFF_FILE_RESPONSE.new_content,
+);
 
 interface SetupOpts {
   structuredView?: boolean;
@@ -182,23 +154,28 @@ async function openSessionAndFile(page: Page) {
   });
 }
 
-async function clickPlusOn(page: Page, side: "new" | "old", lineNum: number) {
-  const btn = page.getByRole("button", {
-    name: `Add comment on ${side} line ${lineNum}`,
-  });
-  // The button is opacity-0 until hover; click with `force` so we don't
-  // depend on the hover transition firing in headless mode.
-  await btn.click({ force: true });
+/** Click the @pierre/diffs gutter line-number cell for `lineNum`. The
+ *  renderer lives in a shadow root; Playwright locators pierce it. A single
+ *  click selects that line and fires onLineSelected, which opens the draft
+ *  comment form. `[data-line-number-content]` cells contain only the number,
+ *  so an exact-text filter is unambiguous. */
+function gutterLine(page: Page, lineNum: number) {
+  return page
+    .locator("[data-line-number-content]")
+    .filter({ hasText: new RegExp(`^${lineNum}$`) });
 }
 
-/** Open a single-line comment form: click `+` twice on the same line. */
-async function startSingleLineComment(
-  page: Page,
-  side: "new" | "old",
-  lineNum: number,
-) {
-  await clickPlusOn(page, side, lineNum);
-  await clickPlusOn(page, side, lineNum);
+/** Open a single-line comment form by selecting one line. */
+async function startSingleLineComment(page: Page, lineNum: number) {
+  await gutterLine(page, lineNum).first().click();
+}
+
+/** Select a multi-line range: click the first line, shift-click the last. */
+async function selectRange(page: Page, startLine: number, endLine: number) {
+  await gutterLine(page, startLine).first().click();
+  await gutterLine(page, endLine)
+    .first()
+    .click({ modifiers: ["Shift"] });
 }
 
 test.use({ viewport: { width: 1280, height: 900 } });
@@ -209,7 +186,7 @@ test.describe("Diff comments (#928)", () => {
   }) => {
     await setup(page);
     await openSessionAndFile(page);
-    await startSingleLineComment(page, "new", 3);
+    await startSingleLineComment(page, 3);
     const textarea = page.getByPlaceholder(
       /Leave a comment \(markdown supported\)/,
     );
@@ -224,8 +201,7 @@ test.describe("Diff comments (#928)", () => {
   test("range select across two lines in the same hunk", async ({ page }) => {
     await setup(page);
     await openSessionAndFile(page);
-    await clickPlusOn(page, "new", 3);
-    await clickPlusOn(page, "new", 4);
+    await selectRange(page, 3, 4);
     const textarea = page.getByPlaceholder(
       /Leave a comment \(markdown supported\)/,
     );
@@ -242,7 +218,7 @@ test.describe("Diff comments (#928)", () => {
   }) => {
     await setup(page);
     await openSessionAndFile(page);
-    await startSingleLineComment(page, "new", 3);
+    await startSingleLineComment(page, 3);
     await page
       .getByPlaceholder(/Leave a comment \(markdown supported\)/)
       .fill("nit");
@@ -290,7 +266,7 @@ test.describe("Diff comments (#928)", () => {
       return r.fulfill({ status: 204, body: "" });
     });
     await openSessionAndFile(page);
-    await startSingleLineComment(page, "new", 3);
+    await startSingleLineComment(page, 3);
     await page
       .getByPlaceholder(/Leave a comment \(markdown supported\)/)
       .fill("**rename** this please");
@@ -332,16 +308,18 @@ test.describe("Diff comments (#928)", () => {
   test("hides feature for non-structured view sessions", async ({ page }) => {
     await setup(page, { structuredView: false });
     await openSessionAndFile(page);
-    // `+` button shouldn't render for tmux sessions.
+    // Line selection is disabled for tmux sessions, so selecting a line must
+    // not open a comment form.
+    await startSingleLineComment(page, 3);
     await expect(
-      page.getByRole("button", { name: /Add comment on .* line/ }),
+      page.getByPlaceholder(/Leave a comment \(markdown supported\)/),
     ).toHaveCount(0);
   });
 
   test("send button disabled when worker not running", async ({ page }) => {
     await setup(page, { structuredView: true, acpWorkerState: "absent" });
     await openSessionAndFile(page);
-    await startSingleLineComment(page, "new", 3);
+    await startSingleLineComment(page, 3);
     await page
       .getByPlaceholder(/Leave a comment \(markdown supported\)/)
       .fill("nit");
