@@ -21,7 +21,7 @@ import type { TimingPingMessage, TimingPongMessage } from "../lib/types";
 // so production users don't get a console full of lifecycle chatter.
 // Two opt-ins, both checked once and cached: `localStorage.aoeDebug = '1'`
 // (sticky across reloads) or `?debug=1` URL param (per-tab). Mirrors the
-// server's AOE_LOG_LEVEL/AOE_TERMINAL_TRACE pair so a full triage trace
+// server's HMP_LOG_LEVEL/HMP_TERMINAL_TRACE pair so a full triage trace
 // can be captured by setting both.
 const TERMINAL_DEBUG_ENABLED = (() => {
   if (typeof window === "undefined") return false;
@@ -130,7 +130,7 @@ export interface TerminalState {
 /**
  * Read the 16 ANSI + bg/fg/cursor slots out of CSS custom properties on
  * documentElement (set by useResolvedTheme) and return an xterm.js ITheme.
- * Called at terminal construction and again on `aoe:theme-changed` so a
+ * Called at terminal construction and again on `hmp:theme-changed` so a
  * live palette swap doesn't require a reconnect.
  */
 export function readThemeFromCss(): ITheme {
@@ -664,9 +664,9 @@ export function useTerminal(
         // login page surfaces the failure rather than booting into a
         // broken terminal.
       }
-      const protocols: string[] = ["aoe-auth"];
+      const protocols: string[] = ["hmp-auth"];
       if (token) protocols.push(token);
-      if (bindingSecret) protocols.push(`aoe-device.${bindingSecret}`);
+      if (bindingSecret) protocols.push(`hmp-device.${bindingSecret}`);
       const ws = new WebSocket(url, protocols);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -1632,9 +1632,9 @@ export function useTerminal(
       if (!term) return;
       term.options.theme = readThemeFromCss();
     };
-    window.addEventListener("aoe:theme-changed", onThemeChanged);
+    window.addEventListener("hmp:theme-changed", onThemeChanged);
     return () => {
-      window.removeEventListener("aoe:theme-changed", onThemeChanged);
+      window.removeEventListener("hmp:theme-changed", onThemeChanged);
     };
   }, []);
 

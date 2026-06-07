@@ -3,7 +3,7 @@ import { browseFilesystem, getHomePath } from "../lib/api";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import type { DirEntry } from "../lib/types";
 
-const LAST_DIR_KEY = "aoe-last-browse-dir";
+const LAST_DIR_KEY = "hmp-last-browse-dir";
 const BROWSE_PAGE_SIZE = 100;
 
 function loadLastDir(): string | null {

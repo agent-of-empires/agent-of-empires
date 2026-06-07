@@ -443,7 +443,7 @@ mod tests {
         // the dark/light split and fail this assertion in surprising
         // ways. That's intentional, the test guards every built-in
         // registered in `BUILTIN_THEMES`, not arbitrary user themes loaded
-        // from `~/.config/agent-of-empires/themes/*.toml`. If a custom-theme
+        // from `~/.config/hmp/themes/*.toml`. If a custom-theme
         // contributor needs to bypass this, they should pick `fresh_idle`
         // themselves rather than rely on the test to validate it.
         fn luminance(c: Color) -> f32 {

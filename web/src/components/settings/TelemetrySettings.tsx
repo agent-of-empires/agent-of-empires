@@ -49,7 +49,7 @@ export function TelemetrySettings() {
     <div className="space-y-4">
       <ToggleField
         label="Enable usage telemetry"
-        description="Anonymous, opt-in usage telemetry: counts of sessions, agents/models, your aoe version, and OS. Off by default. Never sends prompts, paths, names, branches, or commands. Honors DO_NOT_TRACK."
+        description="Anonymous, opt-in usage telemetry: counts of sessions, agents/models, your hmp version, and OS. Off by default. Never sends prompts, paths, names, branches, or commands. Honors DO_NOT_TRACK."
         checked={enabled && !dnt}
         onChange={(v) => {
           if (!dnt && !saving) void onToggle(v);

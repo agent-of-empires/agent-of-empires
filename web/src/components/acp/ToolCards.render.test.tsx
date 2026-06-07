@@ -467,7 +467,7 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     fireEvent.click(getByRole("button"));
     const body = getByTestId("memory-recall-synthesized");
     expect(body.textContent).toContain(
-      "User is a senior engineer working on agent-of-empires.",
+      "User is a senior engineer working on hmp.",
     );
   });
 });

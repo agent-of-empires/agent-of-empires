@@ -2,7 +2,7 @@
 //!
 //! Every event published through `ChannelSink` is appended here so the
 //! conversation transcript survives page reloads, session switches,
-//! and `aoe serve` restarts. One row per `(session_id, seq)` with a
+//! and `hmp serve` restarts. One row per `(session_id, seq)` with a
 //! per-session retention cap; older events are pruned on insert once
 //! the row count exceeds the cap.
 //!
@@ -25,7 +25,7 @@
 //! ## How it relates to agent-side memory
 //!
 //! This store only persists the *UI transcript*. The model's
-//! conversation context across `aoe serve` restarts is a separate
+//! conversation context across `hmp serve` restarts is a separate
 //! mechanism in `supervisor.rs`: when the agent advertises
 //! `agent_capabilities.load_session = true` on the ACP `initialize`
 //! response, the supervisor stores the agent-assigned `session_id` on
@@ -35,7 +35,7 @@
 //! is published; the UI renders an amber callout in the transcript so
 //! the user knows prior turns are no longer in the model's context.
 //!
-//! The bundled `aoe-agent` does not yet advertise `load_session`, so
+//! The bundled `hmp-agent` does not yet advertise `load_session`, so
 //! its UI transcript replays from this store on restart but the model
 //! itself starts fresh each spawn (tracked in #1005).
 //!
@@ -958,7 +958,7 @@ impl EventStore {
     /// True iff the session has a `UserPromptSent` whose turn never
     /// terminated (no later `Stopped` or `AgentStartupError`). Used at
     /// daemon startup to decide whether to synthesize a `Stopped` event
-    /// for a session that was mid-turn when the previous `aoe serve`
+    /// for a session that was mid-turn when the previous `hmp serve`
     /// died, and on reattach to arm the resume-idle watchdog.
     ///
     /// `Stopped` and `AgentStartupError` are serialized externally-tagged

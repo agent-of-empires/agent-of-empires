@@ -3,7 +3,7 @@
 //! Two paths fire on every copy:
 //!
 //! 1. **Platform subprocess** — `pbcopy` on macOS, `wl-copy` on Wayland,
-//!    `xclip`/`xsel` on X11. This is the load-bearing path when AoE
+//!    `xclip`/`xsel` on X11. This is the load-bearing path when HMP
 //!    runs locally: it's how every other terminal app copies, it
 //!    doesn't care whether the process owns a GUI handle, and it
 //!    survives the TUI dropping back into raw mode mid-write.
@@ -16,7 +16,7 @@
 //! subprocess binaries may not exist on a stripped-down system. Each
 //! path's outcome is logged at `tracing::info` so a future "clipboard
 //! didn't update" bug report can be diagnosed with
-//! `AGENT_OF_EMPIRES_DEBUG=1`.
+//! `HMP_DEBUG=1`.
 use std::io::Write;
 use std::process::{Command, Stdio};
 

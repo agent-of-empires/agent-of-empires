@@ -2,7 +2,7 @@
 //
 // Client-side name-validation contract for ProfileSelector. Mirrors the
 // server-side `validate_profile_name` rules (alphanumeric + `_-`, non-empty,
-// <=64 chars) without round-tripping a real `aoe serve`. Mocks the api
+// <=64 chars) without round-tripping a real `hmp serve`. Mocks the api
 // module so each assertion can pin whether the network was ever touched,
 // which is the property the validator must guarantee.
 //

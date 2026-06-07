@@ -38,11 +38,11 @@ pub fn get_container_runtime() -> ContainerRuntime {
     }
 }
 
-/// Check running state of all aoe sandbox containers in a single subprocess call.
+/// Check running state of all hmp sandbox containers in a single subprocess call.
 /// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_running_states("hmp-sandbox-");
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -68,7 +68,7 @@ impl DockerContainer {
     }
 
     pub fn generate_name(session_id: &str) -> String {
-        format!("aoe-sandbox-{}", truncate_id(session_id, 8))
+        format!("hmp-sandbox-{}", truncate_id(session_id, 8))
     }
 
     pub fn from_session_id(session_id: &str) -> Self {
@@ -135,13 +135,13 @@ impl DockerContainer {
         result
     }
 
-    /// Remove all named ignore volumes for this session (prefix = `aoe-vi-{session_id}-`).
+    /// Remove all named ignore volumes for this session (prefix = `hmp-vi-{session_id}-`).
     ///
     /// Must be called after container removal during session deletion. Named volumes are not
     /// removed by `docker rm -v`; they require explicit cleanup. Safe to call even when the
     /// container is already gone — volumes can outlive their container.
     pub fn remove_named_ignore_volumes(&self, session_id: &str) {
-        let prefix = format!("aoe-vi-{}-", session_id);
+        let prefix = format!("hmp-vi-{}-", session_id);
         if let Err(e) = self.runtime.base.remove_named_ignore_volumes(&prefix) {
             tracing::warn!(
                 target: "containers.runtime",
@@ -181,13 +181,13 @@ mod tests {
     #[test]
     fn test_container_generate_name_short_id() {
         let name = DockerContainer::generate_name("abc");
-        assert_eq!(name, "aoe-sandbox-abc");
+        assert_eq!(name, "hmp-sandbox-abc");
     }
 
     #[test]
     fn test_container_generate_name_long_id() {
         let name = DockerContainer::generate_name("abcdefghijklmnop");
-        assert_eq!(name, "aoe-sandbox-abcdefgh");
+        assert_eq!(name, "hmp-sandbox-abcdefgh");
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
         container.runtime = ContainerRuntime::docker();
 
         let cmd = container.exec_command(None, "my-agent");
-        assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
+        assert_eq!(cmd, "docker exec -it hmp-sandbox-test1234 my-agent");
     }
     #[test]
     fn test_anonymous_volumes_in_create_args() {

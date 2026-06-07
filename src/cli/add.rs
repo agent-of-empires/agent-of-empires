@@ -1,4 +1,4 @@
-//! `agent-of-empires add` command implementation
+//! `hmp add` command implementation
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -94,7 +94,7 @@ pub struct AddArgs {
     cmd_override: Option<String>,
 
     /// Render this session in the structured view (ACP-based native
-    /// rendering) instead of the default terminal view. `aoe add` defaults
+    /// rendering) instead of the default terminal view. `hmp add` defaults
     /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
     /// (or `--agent`) to opt into the structured rendering. Ignored for
     /// tools with no ACP adapter.
@@ -102,13 +102,13 @@ pub struct AddArgs {
     #[arg(long = "structured-view")]
     structured_view: bool,
 
-    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
+    /// Pick a specific ACP agent for the structured view (e.g., hmp-agent,
     /// claude-code).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
 
-    /// Override the model used by aoe-agent (e.g., claude-opus-4-7,
+    /// Override the model used by hmp-agent (e.g., claude-opus-4-7,
     /// gpt-5, gemini-2.5-pro). Forwarded to the agent at session start.
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
@@ -116,7 +116,7 @@ pub struct AddArgs {
 
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
-    /// removed when the session is deleted (unless `aoe rm` is given
+    /// removed when the session is deleted (unless `hmp rm` is given
     /// `--keep-scratch`). Mutually exclusive with worktree-related flags.
     #[arg(
         long = "scratch",
@@ -143,7 +143,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
-    // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
+    // explicitly-passed path loudly so `hmp add /some/repo --scratch` does
     // not silently drop the path arg.
     if args.scratch && args.path.is_some() {
         bail!(
@@ -174,7 +174,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     if (!args.extra_repos.is_empty() || !args.projects.is_empty()) && args.worktree_branch.is_none()
     {
-        bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
+        bail!("--repo/--project requires --worktree to specify a branch\nTip: hmp add /path --project repoB -w branch-name");
     }
 
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
@@ -192,8 +192,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Scratch sessions have no project repo, so repo-scoped config
     // overrides have nothing to anchor on. Resolving the repo-aware
     // variant against the launch directory would silently pick up
-    // `.agent-of-empires/config.toml` from whatever folder the user
-    // happened to run `aoe add --scratch` in, which breaks the
+    // `.hmp/config.toml` from whatever folder the user
+    // happened to run `hmp add --scratch` in, which breaks the
     // project-less contract. Fall back to the profile-only resolver.
     let config = if args.scratch {
         crate::session::profile_config::resolve_config_or_warn(profile)
@@ -203,7 +203,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     // Preserve the original project path for hook trust checking.
     // `path` gets reassigned to the worktree/workspace directory below,
-    // but hooks are defined in the original repo's `.agent-of-empires/config.toml`.
+    // but hooks are defined in the original repo's `.hmp/config.toml`.
     let original_project_path = path.clone();
 
     let mut worktree_info_opt = None;
@@ -320,7 +320,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
                 if worktree_path.exists() {
                     bail!(
-                        "Worktree already exists at {}\nTip: Use 'aoe add {}' to add the existing worktree",
+                        "Worktree already exists at {}\nTip: Use 'hmp add {}' to add the existing worktree",
                         worktree_path.display(),
                         worktree_path.display()
                     );
@@ -478,7 +478,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 if !crate::tmux::is_binary_on_path(&bin) {
                     bail!(
                         "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
-                         See all supported agents: aoe agents",
+                         See all supported agents: hmp agents",
                         bin
                     );
                 }
@@ -489,7 +489,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         bail!(
                             "'{}' is not installed or not on $PATH.\n\
                              Install with: {}\n\
-                             See all supported agents: aoe agents",
+                             See all supported agents: hmp agents",
                             agent_def.binary,
                             agent_def.install_hint
                         );
@@ -604,7 +604,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             bail!(
                 "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
                  `[session.agent_acp_cmd]` command.\n\
-                 Run `aoe acp doctor` to see configured agents, or omit --agent for a \
+                 Run `hmp acp doctor` to see configured agents, or omit --agent for a \
                  terminal-view session."
             );
         }
@@ -612,7 +612,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if args.structured_view && !acp_capable {
             bail!(
                 "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
-                 Run `aoe acp doctor` to see configured agents, or drop --structured-view \
+                 Run `hmp acp doctor` to see configured agents, or drop --structured-view \
                  for a terminal-view session.",
                 instance.tool
             );
@@ -628,7 +628,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // binary on PATH. A missing adapter would otherwise surface as a
         // silent 404 on the first prompt. When the user explicitly named
         // an agent (--agent) we bail; otherwise (the default path) we fall
-        // back to the terminal view with a warning so `aoe add` still
+        // back to the terminal view with a warning so `hmp add` still
         // succeeds on a machine without the adapter installed.
         if instance.is_structured() {
             let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
@@ -671,7 +671,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     bail!(
                         "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
-                         Or run: aoe acp doctor --fix\n\
+                         Or run: hmp acp doctor --fix\n\
                          Or use the terminal view: drop --agent / --structured-view.",
                         spec.command,
                         hint
@@ -679,7 +679,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
                 eprintln!(
                     "warning: ACP adapter `{}` is not installed; this session will use the \
-                     terminal view. Install it ({}) or run `aoe acp doctor --fix`, then \
+                     terminal view. Install it ({}) or run `hmp acp doctor --fix`, then \
                      switch the session to the structured view.",
                     spec.command, hint
                 );
@@ -690,10 +690,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     // Check for repository hooks.
     // Use the original project path for trust checking (not the worktree/workspace
-    // path, which won't contain `.agent-of-empires/config.toml`).
+    // path, which won't contain `.hmp/config.toml`).
     let hook_result: Result<()> = (|| {
         let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
-            // Scratch sessions never have a `.agent-of-empires/config.toml`
+            // Scratch sessions never have a `.hmp/config.toml`
             // anchored on `original_project_path` (the path is either
             // empty or the scratch dir itself). Skip the repo hook
             // trust prompt entirely and fall back to profile-level
@@ -915,20 +915,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     if is_acp {
         // Acp sessions aren't backed by tmux: their ACP worker is
-        // owned by `aoe serve`'s supervisor, which the
+        // owned by `hmp serve`'s supervisor, which the
         // status_poll_loop reconciler auto-spawns within ~2s of the
         // session appearing on disk. `--launch` and the
-        // `aoe session start` next-step would both no-op (or now
+        // `hmp session start` next-step would both no-op (or now
         // bail), so route the user to the dashboard instead.
         println!();
         println!("Next steps:");
-        println!("  aoe serve                   # Start the dashboard (worker auto-spawns)");
+        println!("  hmp serve                   # Start the dashboard (worker auto-spawns)");
         println!("  Open the printed URL and select '{}'.", final_title);
         if args.launch {
             println!();
             println!(
                 "(--launch is a no-op for structured view sessions; \
-                 lifecycle is managed by `aoe serve`.)"
+                 lifecycle is managed by `hmp serve`.)"
             );
         }
     } else if args.launch {
@@ -975,7 +975,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     );
                 }
                 eprintln!(
-                    "Warning: launch failed: {}. Retry with: aoe session start {}",
+                    "Warning: launch failed: {}. Retry with: hmp session start {}",
                     e, final_title
                 );
                 return Err(e);
@@ -984,8 +984,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     } else {
         println!();
         println!("Next steps:");
-        println!("  aoe session start {}   # Start the session", final_title);
-        println!("  aoe                         # Open TUI and press Enter to attach");
+        println!("  hmp session start {}   # Start the session", final_title);
+        println!("  hmp                         # Open TUI and press Enter to attach");
     }
 
     Ok(())
@@ -1102,7 +1102,7 @@ fn detect_tool(cmd: &str) -> Result<String> {
         })
 }
 
-/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
+/// The binary `hmp add` must verify is on PATH for a `--cmd <tool>`
 /// selection when `session.agent_command_override` (or `custom_agents`)
 /// remaps the built-in to a different command. Returns the resolved
 /// command's first word, or `None` when no override applies (the caller
@@ -1169,7 +1169,7 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
                 bail!(
                     "'{}' is not installed or not on $PATH.\n\
                      Install with: {}\n\
-                     See all supported agents: aoe agents",
+                     See all supported agents: hmp agents",
                     agent_def.binary,
                     agent_def.install_hint
                 );

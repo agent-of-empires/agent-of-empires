@@ -173,7 +173,7 @@ describe("storage", () => {
   });
 
   it("uses a deterministic, versioned key", () => {
-    expect(storageKey("abc")).toBe("aoe:diff-comments:v1:abc");
+    expect(storageKey("abc")).toBe("hmp:diff-comments:v1:abc");
   });
 
   describe("isEmptyState", () => {

@@ -1,7 +1,7 @@
 //! Status file I/O for hooks-based agent status detection.
 //!
 //! Agent hooks write `running`, `waiting`, or `idle` to a well-known
-//! file path so AoE can prefer hook status over tmux pane content. Callers may
+//! file path so HMP can prefer hook status over tmux pane content. Callers may
 //! still reconcile agent-specific hook gaps from pane text.
 
 use std::path::PathBuf;
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn test_hook_status_dir_path() {
         let dir = hook_status_dir("abc123").expect("test id must be allowlist-safe");
-        assert_eq!(dir, PathBuf::from("/tmp/aoe-hooks/abc123"));
+        assert_eq!(dir, PathBuf::from("/tmp/hmp-hooks/abc123"));
     }
 
     fn write_attention_json(instance_id: &str, body: &str) -> PathBuf {

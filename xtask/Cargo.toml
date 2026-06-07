@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-agent-of-empires = { path = "..", features = ["serve"] }
+hoxkss-my-pi = { path = "..", features = ["serve"] }
 clap = { version = "4.6", features = ["derive"] }
 clap-markdown = "0.1"
 regex = "1"

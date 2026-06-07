@@ -1,5 +1,5 @@
 //! `aoe __acp-runner`: the per-worker shim that owns the agent
-//! subprocess and outlives `aoe serve`.
+//! subprocess and outlives `hmp serve`.
 //!
 //! Invoked by `Supervisor::spawn` as a detached child via `setsid` so its
 //! process group is independent of the daemon's. The runner:
@@ -10,7 +10,7 @@
 //! 2. Spawns the configured ACP agent as a child over stdio.
 //! 3. Binds a Unix listener at `<app_dir>/acp-workers/<session_id>.sock`
 //!    and accepts connections in a loop, proxying bytes between the
-//!    currently-connected aoe daemon and the agent's stdio.
+//!    currently-connected hmp daemon and the agent's stdio.
 //! 4. Buffers agent → daemon traffic (line-oriented ndjson) in a ring
 //!    buffer while no daemon is attached, so the next reattach replays
 //!    the gap.
@@ -22,15 +22,15 @@
 //! goes back to accepting.
 //!
 //! Logging: the runner appends to
-//! `<app_dir>/acp-workers/<session_id>.log` so `aoe acp logs
+//! `<app_dir>/acp-workers/<session_id>.log` so `hmp acp logs
 //! --session <id> --follow` can tail it independently of the shared
-//! `debug.log` that all aoe processes append to.
+//! `debug.log` that all hmp processes append to.
 //!
 //! ## Why a shim and not "let the agent bind the socket"
 //!
 //! Issue #1037's Proposal A suggested patching ACP agents to listen on
 //! a unix socket directly, with the daemon connecting in. That works
-//! for cooperating agents (`aoe-agent` already honors `AOE_ACP_SOCKET`)
+//! for cooperating agents (`hmp-agent` already honors `HMP_ACP_SOCKET`)
 //! but the third-party agents we proxy (`claude-agent-acp`, etc.)
 //! only speak stdio today. This shim bridges stdio-only agents into
 //! the socket-mode lifecycle without requiring upstream changes.
@@ -64,12 +64,12 @@ use super::worker_registry::{self, RunnerRecordState, WorkerRecord};
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Resolve the watchdog poll interval. Tests shrink it via
-/// `AOE_ACP_WATCHDOG_POLL_MS` so an orphan dies in well under a second
+/// `HMP_ACP_WATCHDOG_POLL_MS` so an orphan dies in well under a second
 /// instead of tens of seconds; production always uses
 /// [`WATCHDOG_POLL_INTERVAL`]. Mirrors the
-/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` test knob.
+/// `HMP_ACP_RUNNER_SOCKET_TIMEOUT_MS` test knob.
 fn watchdog_poll_interval() -> Duration {
-    std::env::var("AOE_ACP_WATCHDOG_POLL_MS")
+    std::env::var("HMP_ACP_WATCHDOG_POLL_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
@@ -86,7 +86,7 @@ fn watchdog_poll_interval() -> Duration {
 const WATCHDOG_MISSING_THRESHOLD: u32 = 2;
 
 /// Bounded retention for a detached runner. While no daemon is attached,
-/// the runner keeps the agent alive so a fresh `aoe serve` can reattach
+/// the runner keeps the agent alive so a fresh `hmp serve` can reattach
 /// mid-turn (this is the whole point of the shim outliving the daemon).
 /// But a daemon that crashes/SIGKILLs in a persistent `$HOME` and never
 /// restarts would otherwise leave the runner + agent alive forever, with
@@ -164,7 +164,7 @@ pub struct AcpRunnerArgs {
     #[arg(long, value_delimiter = ',')]
     pub additional_dirs: Vec<PathBuf>,
     /// Comma-separated keys of provider_env passed through at spawn.
-    /// Recorded in the registry so `aoe acp ps` can show what
+    /// Recorded in the registry so `hmp acp ps` can show what
     /// auth-shape the session uses without re-reading the daemon.
     #[arg(long, value_delimiter = ',', default_value = "")]
     pub provider_env_keys: Vec<String>,
@@ -276,7 +276,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // child blocks once the stderr pipe fills (~64KB on Linux), looking
     // like a wedged handshake. The same lines also land on the daemon
     // debug.log via tracing so they appear in the unified timeline; the
-    // direct file write is what gives `aoe acp logs --session <id>`
+    // direct file write is what gives `hmp acp logs --session <id>`
     // and `GET /api/sessions/:id/acp/worker-log` something to read
     // (init_runner_logging routes tracing to debug.log, not the
     // per-session file). See #1449.
@@ -307,7 +307,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     // Wrap agent stdin in a tokio Mutex so the accept loop can hand it
     // to one connection at a time. Wrapping (not splitting) keeps stdin
-    // alive across reconnects; closing it would cause aoe-agent to
+    // alive across reconnects; closing it would cause hmp-agent to
     // `process.exit(0)`.
     let agent_stdin = Arc::new(Mutex::new(agent_stdin));
 
@@ -497,7 +497,7 @@ async fn run_watchdog(
                 return;
             }
             RunnerRecordState::Missing => {
-                // `aoe acp restart` deletes the record right before it
+                // `hmp acp restart` deletes the record right before it
                 // SIGTERMs us; the marker tells us not to race that to a
                 // hard self-destruct.
                 if restart_marker.exists() {
@@ -974,7 +974,7 @@ async fn wait_for_shutdown() {
 }
 
 fn init_runner_logging(session_id: &str) -> Result<()> {
-    // Keep the per-session log file path created so `aoe acp logs
+    // Keep the per-session log file path created so `hmp acp logs
     // --session <id>` and any external tail works. The actual tracing
     // output goes to the shared `debug.log` so daemon + every runner
     // appear in one timeline; runner spans add `session_id` for filtering.

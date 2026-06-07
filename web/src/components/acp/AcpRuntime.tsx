@@ -332,7 +332,7 @@ export function activityToThreadMessages(
     }
 
     if (row.kind === "context_reset") {
-      // `session/load` fallback after an `aoe serve` restart: model's
+      // `session/load` fallback after an `hmp serve` restart: model's
       // window is empty even though we replay the prior transcript.
       // Renders the amber-callout divider; the parallel
       // ContextPrimerBanner offers the recovery affordance.
@@ -475,10 +475,10 @@ class AssistantBuilder {
     // Forward the ACP tool title alongside the args so per-kind
     // renderers can show a descriptive label when raw_input is
     // empty (Claude's bash tool, for example, often emits an empty
-    // raw_input on the initial tool_call frame). The `_aoe_title`
+    // raw_input on the initial tool_call frame). The `_hmp_title`
     // key is namespaced so it can't collide with real tool args.
     //
-    // Also smuggle `_aoe_started_at` (the real ToolCall.started_at)
+    // Also smuggle `_hmp_started_at` (the real ToolCall.started_at)
     // through assistant-ui's tool-call part shape; its primitive
     // doesn't carry timestamps and StructuredView's fallback would
     // otherwise mint one fresh per render, breaking the duration
@@ -492,10 +492,10 @@ class AssistantBuilder {
     } catch {
       // args_preview wasn't a JSON object; keep argsObj empty.
     }
-    if (tool.name) argsObj._aoe_title = tool.name;
-    if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
+    if (tool.name) argsObj._hmp_title = tool.name;
+    if (tool.started_at) argsObj._hmp_started_at = tool.started_at;
     if (tool.parent_tool_call_id) {
-      argsObj._aoe_parent_tool_call_id = tool.parent_tool_call_id;
+      argsObj._hmp_parent_tool_call_id = tool.parent_tool_call_id;
     }
     this.parts.push({
       type: "tool-call",
@@ -547,7 +547,7 @@ function isTodoWriteArgsText(argsText: string, todosEnabled: boolean): boolean {
   if (!todosEnabled) return false;
   const parsed = parseJsonObject(argsText);
   if (parsed) {
-    const title = parsed._aoe_title;
+    const title = parsed._hmp_title;
     if (typeof title === "string" && title.startsWith("Update TODOs")) {
       return true;
     }
@@ -557,16 +557,16 @@ function isTodoWriteArgsText(argsText: string, todosEnabled: boolean): boolean {
 
 /** Synthetic toolName for a Claude sub-agent (Task) and its child tool
  *  calls collapsed into one renderable part. See #1041 layer B. */
-export const SUBAGENT_TASK_NAME = "_aoe_subagent_task";
+export const SUBAGENT_TASK_NAME = "_hmp_subagent_task";
 
-/** Read the smuggled `_aoe_parent_tool_call_id` out of a tool-call
+/** Read the smuggled `_hmp_parent_tool_call_id` out of a tool-call
  *  part's argsText. Returns the parent's tool_call_id when the part
  *  represents a sub-agent child tool call; null for top-level calls. */
 function parentIdFromArgsText(argsText: string): string | null {
   try {
     const p = JSON.parse(argsText);
     if (p && typeof p === "object" && !Array.isArray(p)) {
-      const v = (p as Record<string, unknown>)._aoe_parent_tool_call_id;
+      const v = (p as Record<string, unknown>)._hmp_parent_tool_call_id;
       if (typeof v === "string" && v !== "") return v;
     }
   } catch {
@@ -576,8 +576,8 @@ function parentIdFromArgsText(argsText: string): string | null {
 }
 
 /** Walk an assistant message's parts and collapse each parent-Task
- *  tool call plus its children (matched via `_aoe_parent_tool_call_id`)
- *  into one synthetic `_aoe_subagent_task` part. Children whose parent
+ *  tool call plus its children (matched via `_hmp_parent_tool_call_id`)
+ *  into one synthetic `_hmp_subagent_task` part. Children whose parent
  *  is not in the same message are left in place, falling through to
  *  the orphan rendering. Run before `collapseToolRuns` so a parent
  *  Task with N children doesn't get folded into the generic group
@@ -665,14 +665,14 @@ function collapseSubagents(parts: DraftPart[]): DraftPart[] {
 const TOOL_GROUP_MIN_RUN = 3;
 
 /** Synthetic toolName used for the folded group card. Namespaced with
- *  the `_aoe_` prefix so it can't collide with a real ACP tool kind. */
-export const TOOL_GROUP_NAME = "_aoe_tool_group";
+ *  the `_hmp_` prefix so it can't collide with a real ACP tool kind. */
+export const TOOL_GROUP_NAME = "_hmp_tool_group";
 
 /** Synthetic toolName for a run of consecutive TodoWrite snapshots
  *  folded into one card. Distinct from TOOL_GROUP_NAME so the renderer
  *  dispatches it to TodoGroupCard (latest list always visible, history
  *  on expand) rather than the generic actions group. See #1468. */
-export const TODO_GROUP_NAME = "_aoe_todo_group";
+export const TODO_GROUP_NAME = "_hmp_todo_group";
 
 type GroupChildPayload = {
   toolCallId: string;
@@ -732,7 +732,7 @@ function collapseToolRuns(
       // A run made up entirely of consecutive TodoWrite snapshots is
       // the spam case (#1468): fold it into one TodoGroupCard that
       // shows the latest list collapsed and the per-call history on
-      // expand. TodoWrites are detected via the `_aoe_title` echo /
+      // expand. TodoWrites are detected via the `_hmp_title` echo /
       // `todos` payload stashed in argsText.
       const isTodo = (p: DraftPart) =>
         p.type === "tool-call" && isTodoWriteArgsText(p.argsText, todosEnabled);

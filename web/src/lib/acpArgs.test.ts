@@ -126,15 +126,15 @@ describe("previewFromArgs", () => {
     );
   });
 
-  it("falls back to the ACP-forwarded _aoe_title", () => {
+  it("falls back to the ACP-forwarded _hmp_title", () => {
     expect(
-      previewFromArgs(JSON.stringify({ _aoe_title: "Run the suite" })),
+      previewFromArgs(JSON.stringify({ _hmp_title: "Run the suite" })),
     ).toBe("Run the suite");
   });
 
   it("returns null when no usable primary argument is present", () => {
     expect(previewFromArgs("{}")).toBeNull();
-    expect(previewFromArgs(JSON.stringify({ _aoe_parent: "p" }))).toBeNull();
+    expect(previewFromArgs(JSON.stringify({ _hmp_parent: "p" }))).toBeNull();
     expect(previewFromArgs("not json")).toBeNull();
   });
 });
@@ -144,9 +144,9 @@ describe("hasArgsBody", () => {
     expect(hasArgsBody(JSON.stringify({ command: "ls" }))).toBe(true);
   });
 
-  it("is false for an empty object or _aoe_-only object", () => {
+  it("is false for an empty object or _hmp_-only object", () => {
     expect(hasArgsBody("{}")).toBe(false);
-    expect(hasArgsBody(JSON.stringify({ _aoe_title: "x" }))).toBe(false);
+    expect(hasArgsBody(JSON.stringify({ _hmp_title: "x" }))).toBe(false);
   });
 
   it("is true for non-blank non-object payloads, false when blank", () => {

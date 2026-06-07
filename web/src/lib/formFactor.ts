@@ -1,6 +1,6 @@
 // Coarse client form-factor classification for the telemetry seen ping (#1883).
 //
-// The daemon snapshot's os/arch describe the host running `aoe serve`, not the
+// The daemon snapshot's os/arch describe the host running `hmp serve`, not the
 // device the user is looking at, so a phone PWA talking to a Mac daemon was
 // indistinguishable from a desktop tab. This derives one of a closed set of
 // coarse classes from the same media-query primitives the layout hooks already

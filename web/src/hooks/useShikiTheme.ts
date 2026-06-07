@@ -9,8 +9,8 @@ import { DEFAULT_SHIKI_THEME } from "../lib/highlighter";
 export interface ShikiThemeState {
   /** Bundled Shiki theme name to pass to ensureThemeLoaded. */
   theme: string;
-  /** Appearance of the active AoE theme; passed to ensureThemeLoaded
-   *  so a light AoE theme that names an unbundled Shiki theme falls
+  /** Appearance of the active HMP theme; passed to ensureThemeLoaded
+   *  so a light HMP theme that names an unbundled Shiki theme falls
    *  back to `github-light` instead of `github-dark`. */
   appearance: "dark" | "light";
 }

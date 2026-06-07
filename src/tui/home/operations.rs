@@ -285,7 +285,7 @@ impl HomeView {
         let worker_title = title;
         let worker_tool = tool;
         let spawn_result = std::thread::Builder::new()
-            .name(format!("aoe-restart-wake/{}", id))
+            .name(format!("hmp-restart-wake/{}", id))
             .stack_size(128 * 1024)
             .spawn(move || {
                 let Ok(tmux_session) = crate::tmux::Session::new(&worker_session_id, &worker_title)

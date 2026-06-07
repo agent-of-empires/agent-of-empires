@@ -389,7 +389,7 @@ export interface ServerAbout {
   acp_queue_drain_mode: "combined" | "serial";
   /** Resolved `acp.max_concurrent_resumes` from the active
    *  profile's config. Upper bound on parallel acp worker
-   *  spawns/attaches the reconciler runs on `aoe serve` cold start.
+   *  spawns/attaches the reconciler runs on `hmp serve` cold start.
    *  See #1088. */
   acp_max_concurrent_resumes: number;
   /** Resolved `acp.force_end_turn_threshold_secs` from the active
@@ -1178,7 +1178,7 @@ export async function setSessionArchive(
 /** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
  *  number of minutes between 1 and 43200 (30 days) to snooze. The server
  *  validates against the shared `validate_snooze_duration` so the bounds
- *  match the TUI dialog presets and the CLI's `aoe session snooze`. See
+ *  match the TUI dialog presets and the CLI's `hmp session snooze`. See
  *  #1581. */
 export async function setSessionSnooze(
   id: string,

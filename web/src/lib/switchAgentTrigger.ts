@@ -14,7 +14,7 @@
 // intent here; the Composer consumes it on mount. When the row is already
 // the open session the dispatched event is handled immediately.
 
-export const OPEN_SWITCH_AGENT_EVENT = "aoe:open-switch-agent";
+export const OPEN_SWITCH_AGENT_EVENT = "hmp:open-switch-agent";
 
 export interface OpenSwitchAgentDetail {
   sessionId: string;

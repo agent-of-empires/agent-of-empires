@@ -719,7 +719,7 @@ pub fn get_default_base_ref(repo_path: &Path) -> Result<String> {
 /// `repo_path` using the same resolution chain (`local branch`,
 /// `origin/<ref>` tracking branch, `revparse_single`) that
 /// `compute_changed_files` consults. Used by the CLI to validate
-/// user-provided refs (e.g. `aoe session set-base`) before persisting
+/// user-provided refs (e.g. `hmp session set-base`) before persisting
 /// a per-session diff base override. See #970.
 pub fn validate_ref(repo_path: &Path, reference: &str) -> Result<()> {
     let repo = git2::Repository::open(repo_path)?;

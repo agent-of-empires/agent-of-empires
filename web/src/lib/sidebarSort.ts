@@ -3,7 +3,7 @@ import { safeGetItem, safeSetItem } from "./safeStorage";
 
 export type SidebarSortMode = "manual" | "lastActivity" | "attention";
 
-export const SIDEBAR_SORT_MODE_KEY = "aoe-sidebar-sort-mode";
+export const SIDEBAR_SORT_MODE_KEY = "hmp-sidebar-sort-mode";
 
 const VALID_MODES: readonly SidebarSortMode[] = [
   "manual",

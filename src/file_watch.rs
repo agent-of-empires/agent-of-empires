@@ -182,7 +182,7 @@ impl FileWatchService {
     /// Construct the live service. Spawns the drain thread + tokio dispatcher.
     ///
     /// Graceful degradation: on `notify::recommended_watcher`
-    /// Err or when the env var `AOE_FILE_WATCH=off` is set, returns
+    /// Err or when the env var `HMP_FILE_WATCH=off` is set, returns
     /// `Ok(Self::noop())` rather than `Err`. The only error case surfaced by
     /// this constructor today is failure to spawn the drain thread.
     ///
@@ -191,11 +191,11 @@ impl FileWatchService {
     /// Returns [`WatchError::Init`] if spawning the dedicated drain
     /// `std::thread` fails (e.g., per-process thread limit reached).
     pub fn new() -> Result<Arc<Self>, WatchError> {
-        if std::env::var("AOE_FILE_WATCH").as_deref() == Ok("off") {
+        if std::env::var("HMP_FILE_WATCH").as_deref() == Ok("off") {
             tracing::info!(
                 target: "file_watch.service",
                 noop = true,
-                reason = "AOE_FILE_WATCH=off",
+                reason = "HMP_FILE_WATCH=off",
                 "file watch service running in noop mode"
             );
             return Ok(Self::noop());
@@ -750,15 +750,15 @@ mod tests {
         // SAFETY: `set_var`/`remove_var` are unsafe in 2024 edition for a
         // good reason (data races with other threads reading env). The
         // `#[serial(file_watch)]` annotation prevents in-process races,
-        // and no other thread reads `AOE_FILE_WATCH` concurrently here.
-        let prev = std::env::var("AOE_FILE_WATCH").ok();
+        // and no other thread reads `HMP_FILE_WATCH` concurrently here.
+        let prev = std::env::var("HMP_FILE_WATCH").ok();
         // SAFETY: see comment above.
-        unsafe { std::env::set_var("AOE_FILE_WATCH", "off") };
+        unsafe { std::env::set_var("HMP_FILE_WATCH", "off") };
         let svc = FileWatchService::new().expect("noop init");
         // Restore env before any panic-prone assertion.
         match prev {
-            Some(v) => unsafe { std::env::set_var("AOE_FILE_WATCH", v) },
-            None => unsafe { std::env::remove_var("AOE_FILE_WATCH") },
+            Some(v) => unsafe { std::env::set_var("HMP_FILE_WATCH", v) },
+            None => unsafe { std::env::remove_var("HMP_FILE_WATCH") },
         }
         let inner = svc.inner.lock().unwrap();
         assert!(inner.watcher.is_none(), "noop service must lack watcher");

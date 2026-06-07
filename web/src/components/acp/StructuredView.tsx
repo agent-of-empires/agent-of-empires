@@ -105,7 +105,7 @@ interface Props {
   tool: string | null | undefined;
   /** RFC3339 archived-at timestamp, or null. Drives the
    *  archived-specific "worker stopped" banner that replaces the
-   *  generic `aoe acp stop`-style message when the user has
+   *  generic `hmp acp stop`-style message when the user has
    *  explicitly parked the session via the sidebar archive action.
    *  See #1581. */
   archivedAt: string | null;
@@ -733,7 +733,7 @@ function AssistantToolCall(props: ToolCallProps) {
   return <ToolCard tool={tool} result={result} />;
 }
 
-/** Read the real `_aoe_started_at` ISO timestamp out of the
+/** Read the real `_hmp_started_at` ISO timestamp out of the
  *  tool-call args. Returns null when neither the parsed `args` object
  *  nor the raw `argsText` carries it; caller falls back to a minted
  *  client time. */
@@ -741,8 +741,8 @@ function pickStartedAt(
   args: Record<string, unknown> | undefined,
   argsText: string | undefined,
 ): string | null {
-  if (args && typeof args._aoe_started_at === "string") {
-    return args._aoe_started_at;
+  if (args && typeof args._hmp_started_at === "string") {
+    return args._hmp_started_at;
   }
   if (argsText) {
     try {
@@ -751,9 +751,9 @@ function pickStartedAt(
         parsed &&
         typeof parsed === "object" &&
         !Array.isArray(parsed) &&
-        typeof (parsed as Record<string, unknown>)._aoe_started_at === "string"
+        typeof (parsed as Record<string, unknown>)._hmp_started_at === "string"
       ) {
-        return (parsed as Record<string, string>)._aoe_started_at ?? null;
+        return (parsed as Record<string, string>)._hmp_started_at ?? null;
       }
     } catch {
       // ignore
@@ -878,7 +878,7 @@ interface SubagentPayload {
 }
 
 /** Reconstructs the parent Task tool plus its sub-agent children from
- *  the synthetic `_aoe_subagent_task` part AcpRuntime emits, then
+ *  the synthetic `_hmp_subagent_task` part AcpRuntime emits, then
  *  hands them to SubagentCard. See #1041 layer B. */
 function AssistantSubagentTask({ argsText }: { argsText?: string }) {
   let payload: SubagentPayload | null = null;
@@ -948,11 +948,11 @@ function prettifyToolName(
   args?: Record<string, unknown>,
 ): string {
   // Pick a human-readable label for the tool card header. Prefer the
-  // ACP title we forward via _aoe_title, then any well-known input
+  // ACP title we forward via _hmp_title, then any well-known input
   // field, then the bare kind.
   if (args) {
     for (const key of [
-      "_aoe_title",
+      "_hmp_title",
       "path",
       "file_path",
       "filePath",
@@ -1499,7 +1499,7 @@ export function WorkerRestartingBanner({
   agentOrphaned: boolean;
 }) {
   // Three reasons land here:
-  //   - `aoe acp restart` (deletes registry, daemon's reaper
+  //   - `hmp acp restart` (deletes registry, daemon's reaper
   //     publishes Stopped{reason:"restart_pending"}, reconciler spawns
   //     a fresh worker with the cached acp_session_id).
   //   - Cancel-escalation watchdog fired: claude-agent-acp ignored
@@ -1662,7 +1662,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
           </div>
           <div className="mt-1 text-xs text-amber-100/90">
             The agent was terminated via{" "}
-            <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code>{" "}
+            <code className="rounded bg-amber-900/60 px-1">hmp acp stop</code>{" "}
             or an equivalent external teardown. New prompts are disabled until
             you reconnect.
           </div>
@@ -1844,7 +1844,7 @@ export function StartupErrorBanner({
               ANTHROPIC_API_KEY
             </code>{" "}
             in the env that runs{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
+            <code className="rounded bg-rose-900/60 px-1">hmp serve</code>, or
             run{" "}
             <code className="rounded bg-rose-900/60 px-1">claude /login</code>{" "}
             in a terminal to write credentials to{" "}
@@ -1859,7 +1859,7 @@ export function StartupErrorBanner({
             </code>{" "}
             in <code className="rounded bg-rose-900/60 px-1">config.toml</code>{" "}
             and restart{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or
+            <code className="rounded bg-rose-900/60 px-1">hmp serve</code>, or
             free a slot by deleting an existing structured view session or
             switching one to the tmux view. Reinstalling the adapter won't help;
             the adapter is fine, the cap is the limit.
@@ -1884,17 +1884,17 @@ export function StartupErrorBanner({
               </li>
               <li>
                 Stop{" "}
-                <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
+                <code className="rounded bg-rose-900/60 px-1">hmp serve</code>,
                 edit{" "}
                 <code className="rounded bg-rose-900/60 px-1">
                   project_path
                 </code>{" "}
                 for this session in{" "}
                 <code className="rounded bg-rose-900/60 px-1">
-                  ~/.agent-of-empires/profiles/&lt;profile&gt;/sessions.json
+                  ~/.hmp/profiles/&lt;profile&gt;/sessions.json
                 </code>{" "}
                 to point at the new location, then start{" "}
-                <code className="rounded bg-rose-900/60 px-1">aoe serve</code>{" "}
+                <code className="rounded bg-rose-900/60 px-1">hmp serve</code>{" "}
                 again.
               </li>
             </ol>
@@ -1929,7 +1929,7 @@ export function StartupErrorBanner({
             </ul>
             Open the agent log below for the verbatim adapter error, or see{" "}
             <a
-              href="https://agent-of-empires.com/docs/structured-view#native-binary-launch-failure"
+              href="https://hmp.local/docs/structured-view#native-binary-launch-failure"
               target="_blank"
               rel="noreferrer"
               className="underline hover:text-rose-100"
@@ -1942,7 +1942,7 @@ export function StartupErrorBanner({
           <>
             Run{" "}
             <code className="rounded bg-rose-900/60 px-1">
-              aoe acp doctor --fix
+              hmp acp doctor --fix
             </code>{" "}
             from a terminal, or install the adapter manually:
             <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
@@ -1958,7 +1958,7 @@ export function StartupErrorBanner({
 
 /** Collapsible viewer for the per-session structured view runner log.
  *
- *  Surfaces the same stream `aoe acp logs --session <id>` reads,
+ *  Surfaces the same stream `hmp acp logs --session <id>` reads,
  *  so a dashboard user without host terminal access (Tailscale Funnel,
  *  remote setups) can see the verbatim adapter error when the startup
  *  banner is otherwise opaque. See #1449.

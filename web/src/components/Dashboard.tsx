@@ -204,7 +204,7 @@ export function Dashboard({
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"
-            href="https://www.agent-of-empires.com/docs"
+            href="https://www.hmp.local/docs"
             icon="book"
           />
         </div>
@@ -227,7 +227,7 @@ export function Dashboard({
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"
-            href="https://www.agent-of-empires.com/docs"
+            href="https://www.hmp.local/docs"
             icon="book"
           />
         </div>

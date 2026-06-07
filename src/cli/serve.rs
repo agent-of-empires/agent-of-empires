@@ -1,4 +1,4 @@
-//! `aoe serve` command -- start a web dashboard for remote session access
+//! `hmp serve` command -- start a web dashboard for remote session access
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
@@ -38,7 +38,7 @@ impl AuthMode {
 #[derive(Args)]
 pub struct ServeArgs {
     /// Port to listen on (default: 8080; debug builds default to 8081 so a
-    /// `cargo run` instance does not collide with an installed release `aoe`).
+    /// `cargo run` instance does not collide with an installed release `hmp`).
     #[arg(long)]
     pub port: Option<u16>,
 
@@ -122,8 +122,8 @@ pub struct ServeArgs {
     pub status: bool,
 
     /// Require a passphrase for login (second-factor auth).
-    /// Can also be set via AOE_SERVE_PASSPHRASE environment variable.
-    #[arg(long, env = "AOE_SERVE_PASSPHRASE")]
+    /// Can also be set via HMP_SERVE_PASSPHRASE environment variable.
+    #[arg(long, env = "HMP_SERVE_PASSPHRASE")]
     pub passphrase: Option<String>,
 
     /// Open the dashboard URL in the default browser once the server is ready.
@@ -140,10 +140,10 @@ pub struct ServeArgs {
     #[arg(long, hide = true)]
     pub daemon_child: bool,
 
-    /// Restart a running `aoe serve` daemon, replaying the host, port,
+    /// Restart a running `hmp serve` daemon, replaying the host, port,
     /// mode, and auth it was launched with (read from `serve.launch`).
     /// The passphrase is recalled from `serve.passphrase` or
-    /// `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a
+    /// `HMP_SERVE_PASSPHRASE` before the old daemon is stopped, so a
     /// passphrase-protected daemon is never left down.
     /// Incompatible with the flags that would change the daemon's bind
     /// config: that config comes from the persisted launch state.
@@ -206,7 +206,7 @@ fn validate_auth_combination(
     // human gate, an empty wall means no auth at all.
     if matches!(auth_mode, AuthMode::Passphrase) && !has_passphrase {
         bail!(
-            "--auth=passphrase requires --passphrase <VALUE> or AOE_SERVE_PASSPHRASE.\n\
+            "--auth=passphrase requires --passphrase <VALUE> or HMP_SERVE_PASSPHRASE.\n\
              Without a passphrase there is no gate. Use --auth=none if that is intended."
         );
     }
@@ -249,7 +249,7 @@ fn validate_auth_combination(
     Ok(())
 }
 
-/// True when `aoe serve --remote` will route through Cloudflare and therefore
+/// True when `hmp serve --remote` will route through Cloudflare and therefore
 /// needs `cloudflared` on PATH. That covers both an explicit named tunnel
 /// (`--tunnel-name`) and the quick-tunnel fallback path that runs when
 /// Tailscale isn't usable or the user passed `--no-tailscale`. Mirrors the
@@ -268,16 +268,16 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("serve.pid"))
 }
 
-/// Persisted launch state for a running `aoe serve --daemon`. Written
+/// Persisted launch state for a running `hmp serve --daemon`. Written
 /// only by `start_daemon`, so its presence is the signal that the daemon
-/// is self-managed (started by `aoe serve --daemon`) rather than run in
+/// is self-managed (started by `hmp serve --daemon`) rather than run in
 /// the foreground or under a service supervisor; that is what lets
-/// `aoe update` decide whether it may restart the daemon. `aoe serve
+/// `hmp update` decide whether it may restart the daemon. `hmp serve
 /// --restart` and the post-update restart replay it. It is removed on
 /// stop, on the daemon's own graceful exit, and in `daemon_pid`'s
 /// stale-PID sweep, so nothing relies on a stale copy. The passphrase is
 /// never stored here; it is recalled from `serve.passphrase` /
-/// `AOE_SERVE_PASSPHRASE` at restart time.
+/// `HMP_SERVE_PASSPHRASE` at restart time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
     pub schema: u32,
@@ -337,7 +337,7 @@ fn serve_launch_path() -> Result<PathBuf> {
 }
 
 /// True when a `serve.launch` file exists, i.e. a daemon started by
-/// `aoe serve --daemon` recorded its launch state. `aoe update` uses this
+/// `hmp serve --daemon` recorded its launch state. `hmp update` uses this
 /// to decide whether a running daemon is one it may restart.
 pub fn serve_launch_exists() -> bool {
     serve_launch_path().map(|p| p.exists()).unwrap_or(false)
@@ -367,7 +367,7 @@ fn read_serve_launch() -> Result<ServeLaunch> {
 
 /// Recall the daemon passphrase for a restart: the plaintext
 /// `serve.passphrase` file the server writes while running first,
-/// then the `AOE_SERVE_PASSPHRASE` env override. Returns None when
+/// then the `HMP_SERVE_PASSPHRASE` env override. Returns None when
 /// neither yields a non-empty value.
 fn recall_serve_passphrase() -> Option<String> {
     if let Ok(dir) = crate::session::get_app_dir() {
@@ -378,7 +378,7 @@ fn recall_serve_passphrase() -> Option<String> {
             }
         }
     }
-    if let Ok(p) = std::env::var("AOE_SERVE_PASSPHRASE") {
+    if let Ok(p) = std::env::var("HMP_SERVE_PASSPHRASE") {
         if !p.is_empty() {
             return Some(p);
         }
@@ -477,7 +477,7 @@ fn read_serve_mode_label() -> Option<&'static str> {
     }
 }
 
-/// Cross-platform check that `pid` belongs to an aoe / agent-of-empires
+/// Cross-platform check that `pid` belongs to an hmp / hmp
 /// process. PIDs get recycled, so `kill(pid, 0) == Ok` is not enough on
 /// its own — we also want to know it's actually *our* daemon.
 ///
@@ -491,7 +491,7 @@ fn verify_pid_is_aoe(pid: i32) -> bool {
     let proc_path = format!("/proc/{}/cmdline", pid);
     if std::path::Path::new(&proc_path).exists() {
         if let Ok(cmdline) = std::fs::read_to_string(&proc_path) {
-            return cmdline.contains("aoe") || cmdline.contains("agent-of-empires");
+            return cmdline.contains("hmp") || cmdline.contains("hmp");
         }
     }
 
@@ -503,7 +503,7 @@ fn verify_pid_is_aoe(pid: i32) -> bool {
     {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout);
-            s.contains("aoe") || s.contains("agent-of-empires")
+            s.contains("hmp") || s.contains("hmp")
         }
         // ps failed or unavailable — we can't verify, so trust the PID
         // file rather than ghosting a real daemon.
@@ -512,7 +512,7 @@ fn verify_pid_is_aoe(pid: i32) -> bool {
 }
 
 /// Returns Some(pid) if the daemon's PID file exists AND the process is
-/// still alive AND it looks like one of our aoe processes. Cleans up
+/// still alive AND it looks like one of our hmp processes. Cleans up
 /// stale PID files it finds. The TUI uses this both to jump straight to
 /// the Active state when the Remote Access dialog opens and to render
 /// the "● Remote on" status-bar indicator.
@@ -569,8 +569,8 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     }
 
     // Refuse to start a second instance (daemon or foreground) while another
-    // aoe serve is already running. Without this gate, a foreground
-    // `aoe serve` would overwrite the existing daemon's PID file in the
+    // hmp serve is already running. Without this gate, a foreground
+    // `hmp serve` would overwrite the existing daemon's PID file in the
     // non-daemon write below before its own port-bind eventually failed; the
     // post-exit cleanup would then delete the (now-foreground) PID file and
     // orphan the real daemon.
@@ -581,10 +581,10 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     if let Some(existing) = daemon_pid() {
         if existing != std::process::id() {
             bail!(
-                "aoe serve daemon already running (PID {}).\n\n  \
-                 Status:  aoe serve --status\n  \
-                 Open UI: aoe url\n  \
-                 Stop:    aoe serve --stop",
+                "hmp serve daemon already running (PID {}).\n\n  \
+                 Status:  hmp serve --status\n  \
+                 Open UI: hmp url\n  \
+                 Stop:    hmp serve --stop",
                 existing
             );
         }
@@ -621,12 +621,12 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     if args.tunnel_name.is_some() && args.tunnel_url.is_none() {
         bail!(
             "Named tunnels require --tunnel-url to specify the hostname.\n\
-             Example: aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com\n\
+             Example: hmp serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com\n\
              \n\
              Setup steps:\n\
              1. cloudflared tunnel create my-tunnel\n\
              2. Add a CNAME record: aoe.example.com -> <tunnel-id>.cfargotunnel.com\n\
-             3. aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com"
+             3. hmp serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com"
         );
     }
 
@@ -665,7 +665,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         eprintln!("  for remote access. Do NOT expose this to the");
         eprintln!("  public internet without TLS termination.");
         eprintln!();
-        eprintln!("  Or use: aoe serve --remote");
+        eprintln!("  Or use: hmp serve --remote");
         eprintln!("  for automatic HTTPS via Tailscale Funnel");
         eprintln!("  (preferred) or Cloudflare Tunnel.");
         eprintln!();
@@ -690,7 +690,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         bail!(
             "Refusing to start in remote mode without a passphrase.\n\
              --remote exposes terminal access to the internet.\n\
-             Add --passphrase <VALUE> or set AOE_SERVE_PASSPHRASE."
+             Add --passphrase <VALUE> or set HMP_SERVE_PASSPHRASE."
         );
     }
 
@@ -757,7 +757,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
 /// Path the daemon's stdout/stderr are redirected to. Resolved from the
 /// configured `[logging].file_path` so panic backtraces interleave with
 /// the structured tracing stream. Used by `start_daemon()` for the stdio
-/// redirect, by the TUI serve dialog for the tail pane, and by `aoe logs`
+/// redirect, by the TUI serve dialog for the tail pane, and by `hmp logs`
 /// for the viewer target.
 pub fn stdio_redirect_path() -> Result<PathBuf> {
     let dir = crate::session::get_app_dir()?;
@@ -809,7 +809,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     }
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
-        cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
+        cmd.env("HMP_SERVE_PASSPHRASE", passphrase);
     }
     if !profile.is_empty() {
         cmd.args(["--profile", profile]);
@@ -876,7 +876,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid, "wrote pid file");
     }
 
-    // Persist the launch state so `aoe serve --restart` and the
+    // Persist the launch state so `hmp serve --restart` and the
     // post-update restart can replay this daemon's exact config. Mirrors
     // the argv reconstruction above; the passphrase is deliberately left
     // out (recalled from serve.passphrase / the env on restart).
@@ -898,33 +898,33 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         tracing::warn!(target: "serve.lifecycle", error = %e, "failed to write serve.launch");
     }
 
-    println!("aoe serve started as daemon (PID {})", pid);
-    println!("Stop with: aoe serve --stop");
+    println!("hmp serve started as daemon (PID {})", pid);
+    println!("Stop with: hmp serve --stop");
     Ok(())
 }
 
-/// Restart the running `aoe serve` daemon from its persisted launch state
+/// Restart the running `hmp serve` daemon from its persisted launch state
 /// (`serve.launch`). Everything needed to relaunch is read into memory
 /// before the old daemon is stopped, because `stop_daemon` deletes
 /// `serve.passphrase`; a daemon that needs a passphrase is never killed
 /// without the means to bring it back. The replacement is spawned via
 /// `start_daemon`, which uses the current executable. That is correct
-/// both for a hand-run `aoe serve --restart` and for the post-update
-/// path, where `aoe update` re-execs the freshly installed binary as
-/// `aoe serve --restart` so the new code spawns the new daemon.
+/// both for a hand-run `hmp serve --restart` and for the post-update
+/// path, where `hmp update` re-execs the freshly installed binary as
+/// `hmp serve --restart` so the new code spawns the new daemon.
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
 pub async fn restart_daemon() -> Result<()> {
     let Some(pid) = daemon_pid() else {
         bail!(
-            "No running aoe serve daemon to restart.\n\
-             Start one with: aoe serve --daemon"
+            "No running hmp serve daemon to restart.\n\
+             Start one with: hmp serve --daemon"
         );
     };
 
     let launch = read_serve_launch().map_err(|e| {
         anyhow::anyhow!(
             "Cannot restart: no usable launch state ({e}).\n\
-             This daemon was not started by `aoe serve --daemon`; foreground\n\
+             This daemon was not started by `hmp serve --daemon`; foreground\n\
              or service-supervised daemons must be restarted by their manager."
         )
     })?;
@@ -944,7 +944,7 @@ pub async fn restart_daemon() -> Result<()> {
     if launch_needs_passphrase(&launch) && passphrase.is_none() {
         bail!(
             "Cannot restart: this daemon uses {} auth but no passphrase is \
-             recoverable (set AOE_SERVE_PASSPHRASE).\n\
+             recoverable (set HMP_SERVE_PASSPHRASE).\n\
              Leaving the running daemon untouched.",
             if launch.remote {
                 "remote"
@@ -968,7 +968,7 @@ pub async fn restart_daemon() -> Result<()> {
 
     let args = launch.to_serve_args(passphrase);
 
-    println!("Restarting aoe serve daemon (PID {pid})…");
+    println!("Restarting hmp serve daemon (PID {pid})…");
     stop_daemon().await?;
     start_daemon(&launch.profile, &args)
 }
@@ -992,7 +992,7 @@ async fn stop_daemon() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
-    // Verify PID belongs to an aoe process on all platforms
+    // Verify PID belongs to an hmp process on all platforms
     if !verify_pid_is_aoe(pid) {
         tokio::fs::remove_file(&path).await?;
         bail!(
@@ -1037,7 +1037,7 @@ async fn stop_daemon() -> Result<()> {
                 let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
                 let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
             }
-            println!("Stopped aoe serve daemon (PID {})", pid);
+            println!("Stopped hmp serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
             // Process doesn't exist; clean up stale PID file
@@ -1058,9 +1058,9 @@ async fn stop_daemon() -> Result<()> {
 
 /// Print the running daemon's PID, mode, URLs, and log path. Exits
 /// non-zero (via `bail!`) when no daemon is running so shell scripts
-/// can branch on it (`aoe serve --status && …`).
+/// can branch on it (`hmp serve --status && …`).
 async fn print_status() -> Result<()> {
-    // `AOE_DAEMON_URL` retargets every `aoe` invocation at a remote
+    // `HMP_DAEMON_URL` retargets every `hmp` invocation at a remote
     // daemon (see docs/acp.md). `--status` follows the same rule:
     // when the env override is set, report the remote endpoint's
     // health instead of the local PID file.
@@ -1069,7 +1069,7 @@ async fn print_status() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("http client init failed: {e}"))?;
         match client.health_check().await {
             Ok(()) => {
-                println!("Daemon: reachable (remote via AOE_DAEMON_URL)");
+                println!("Daemon: reachable (remote via HMP_DAEMON_URL)");
                 println!("URL:    {}", endpoint.base_url);
                 println!(
                     "Token:  {}",
@@ -1082,7 +1082,7 @@ async fn print_status() -> Result<()> {
                 Ok(())
             }
             Err(e) => bail!(
-                "AOE_DAEMON_URL is set but the daemon at {} is unreachable ({e}); \
+                "HMP_DAEMON_URL is set but the daemon at {} is unreachable ({e}); \
                  check the address or unset to use a local daemon",
                 endpoint.base_url
             ),
@@ -1094,7 +1094,7 @@ async fn print_status() -> Result<()> {
 
 fn print_local_status() -> Result<()> {
     let Some(pid) = daemon_pid() else {
-        bail!("Daemon: not running\nStart one with: aoe serve --daemon");
+        bail!("Daemon: not running\nStart one with: hmp serve --daemon");
     };
 
     let mode = read_serve_mode_label().unwrap_or("unknown");
@@ -1127,7 +1127,7 @@ mod tests {
 
     #[test]
     fn cloudflared_skipped_when_tailscale_available_and_default_flags() {
-        // Regression: aoe serve --remote with Tailscale up and cloudflared
+        // Regression: hmp serve --remote with Tailscale up and cloudflared
         // missing was failing because of the unconditional check. Tailscale
         // alone is enough.
         assert!(!cloudflared_required(false, false, true));

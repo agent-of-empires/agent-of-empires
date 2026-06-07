@@ -16,7 +16,7 @@ import type { TourScope } from "./tourSteps";
 // so a flat key needs no app-dir namespace. The tour-seen flag moved to the
 // backend (app_state.has_seen_web_tour) in #1832; only the theme welcome modal
 // still persists per-browser here.
-export const WELCOME_SEEN_KEY = "aoe-welcome-seen";
+export const WELCOME_SEEN_KEY = "hmp-welcome-seen";
 
 /** Auto-launch and the welcome modal are both suppressed inside automated
  *  browser sessions (a synthetic monitor, a scraper, our Playwright suites):

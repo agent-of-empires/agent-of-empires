@@ -2,7 +2,7 @@
 //!
 //! Reads a Claude hook payload from stdin, extracts the top-level
 //! `session_id` UUID via `serde_json`, and writes it atomically to
-//! `HOOK_STATUS_BASE/$AOE_INSTANCE_ID/session_id`.
+//! `HOOK_STATUS_BASE/$HMP_INSTANCE_ID/session_id`.
 //!
 //! Always exits 0: the hook runs synchronously on every Claude prompt
 //! and a non-zero exit blocks the agent. Errors surface through
@@ -20,13 +20,13 @@ const STDIN_BYTE_CAP: u64 = 1 << 20;
 pub struct ExtractSessionIdArgs {}
 
 pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
-    let Ok(instance_id) = std::env::var("AOE_INSTANCE_ID") else {
+    let Ok(instance_id) = std::env::var("HMP_INSTANCE_ID") else {
         return Ok(());
     };
     if let Err(e) = crate::session::validate_instance_id(&instance_id) {
         tracing::debug!(
             target: "hooks.session_id",
-            "rejecting unsafe AOE_INSTANCE_ID: {e}"
+            "rejecting unsafe HMP_INSTANCE_ID: {e}"
         );
         return Ok(());
     }

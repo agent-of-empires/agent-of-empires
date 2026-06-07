@@ -148,7 +148,7 @@ impl RateLimiter {
     }
 
     /// Spawn periodic cleanup task to evict expired entries. The task
-    /// exits cleanly when `shutdown` is cancelled, so `aoe serve --stop`
+    /// exits cleanly when `shutdown` is cancelled, so `hmp serve --stop`
     /// drains the loop within one tick instead of waiting for the
     /// 5 s force exit safety net.
     pub fn spawn_cleanup_task(self: &Arc<Self>, shutdown: CancellationToken) {

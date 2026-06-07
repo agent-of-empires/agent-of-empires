@@ -66,7 +66,7 @@ describe("useFocusTerminalTarget", () => {
     try {
       renderWithElement("composer", el);
       // A bare event (detail undefined) must not throw or focus.
-      window.dispatchEvent(new CustomEvent("aoe:focus-terminal"));
+      window.dispatchEvent(new CustomEvent("hmp:focus-terminal"));
       expect(document.activeElement).not.toBe(el);
     } finally {
       el.remove();

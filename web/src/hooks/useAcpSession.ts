@@ -93,7 +93,7 @@ export type Action =
 
 // LRU-capped module cache keyed by structured view session id. Mirrors the
 // per-session AcpState into `localStorage` under
-// `aoe:acp-state:v1:<id>` so a full page reload (mobile OS evicts
+// `hmp:acp-state:v1:<id>` so a full page reload (mobile OS evicts
 // the tab, user pulls down a Cloudflare re-auth, PWA cold start)
 // hydrates the reducer from the last-known state and only fetches
 // the seq-delta from the server instead of replaying the entire
@@ -117,7 +117,7 @@ function storageKey(sessionId: string): string {
   return STORAGE_KEY_PREFIX + sessionId;
 }
 
-// Walk `aoe:acp-state:v1:*` keys and remove the single oldest one
+// Walk `hmp:acp-state:v1:*` keys and remove the single oldest one
 // (by `savedAt`), preferring corrupt entries when present. Returns true
 // when an entry was removed so the caller can retry the write. The
 // whitelist filter is load-bearing: it must never touch `acp:draft:*`
@@ -1042,12 +1042,12 @@ export function useAcpSession(
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${since}`;
 
         // Subprotocols carry both factors on a WS upgrade:
-        //   - `aoe-auth` is the legacy signalling protocol the server
+        //   - `hmp-auth` is the legacy signalling protocol the server
         //     expects to see.
         //   - the bare `<token>` is the first-factor auth token
         //     (kept for backward compatibility with PWA tabs that
         //     loaded before the prefixed format landed).
-        //   - `aoe-device.<binding-secret>` is the device-binding
+        //   - `hmp-device.<binding-secret>` is the device-binding
         //     second factor introduced in #1131. The middleware
         //     enforces this when passphrase login is configured.
         let bindingSecret: string | null = null;
@@ -1057,9 +1057,9 @@ export function useAcpSession(
           // Storage / crypto unavailable; the server will reject this
           // upgrade with 401 and the login page will surface the cause.
         }
-        const protocols: string[] = ["aoe-auth"];
+        const protocols: string[] = ["hmp-auth"];
         if (token) protocols.push(token);
-        if (bindingSecret) protocols.push(`aoe-device.${bindingSecret}`);
+        if (bindingSecret) protocols.push(`hmp-device.${bindingSecret}`);
         const ws = new WebSocket(url, protocols);
         wsRef.current = ws;
 

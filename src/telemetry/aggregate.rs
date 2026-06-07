@@ -1,9 +1,9 @@
-//! Windowed aggregate of live session state for `aoe serve`.
+//! Windowed aggregate of live session state for `hmp serve`.
 //!
 //! A point-in-time `usage_snapshot` only sees sessions alive at the instant the
 //! periodic tick fires, so a session that opens and closes between two ticks is
 //! invisible in the agent/model attribution and never lifts the concurrency
-//! peak. `aoe serve` folds a sample of the live session list into a
+//! peak. `hmp serve` folds a sample of the live session list into a
 //! [`UsageAggregator`] every ~30 min and reports the window's peak concurrency
 //! and distinct-sessions-seen maps at flush time, while keeping the send cadence
 //! at one POST per send window (see `src/server/mod.rs`).

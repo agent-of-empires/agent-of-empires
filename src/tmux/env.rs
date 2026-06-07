@@ -10,8 +10,8 @@ use std::process::Command;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
-pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
+pub const HMP_INSTANCE_ID_KEY: &str = "HMP_INSTANCE_ID";
+pub const HMP_CAPTURED_SESSION_ID_KEY: &str = "HMP_CAPTURED_SESSION_ID";
 
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_parse_key_value() {
-        let output = "AOE_INSTANCE_ID=abc123";
+        let output = "HMP_INSTANCE_ID=abc123";
         let result = parse_batch_output(output, &["test_session"]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "test_session");
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_parse_unset_key() {
-        let output = "-AOE_INSTANCE_ID";
+        let output = "-HMP_INSTANCE_ID";
         let result = parse_batch_output(output, &["test_session"]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "test_session");
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_sessions() {
-        let output = "AOE_INSTANCE_ID=abc123\n-AOE_INSTANCE_ID\nAOE_INSTANCE_ID=xyz789";
+        let output = "HMP_INSTANCE_ID=abc123\n-HMP_INSTANCE_ID\nHMP_INSTANCE_ID=xyz789";
         let result = parse_batch_output(output, &["session1", "session2", "session3"]).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].1, Some("abc123".to_string()));
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_parse_whitespace_handling() {
-        let output = "  AOE_INSTANCE_ID=value123  \n  -AOE_INSTANCE_ID  ";
+        let output = "  HMP_INSTANCE_ID=value123  \n  -HMP_INSTANCE_ID  ";
         let result = parse_batch_output(output, &["session1", "session2"]).unwrap();
         assert_eq!(result[0].1, Some("value123".to_string()));
         assert_eq!(result[1].1, None);

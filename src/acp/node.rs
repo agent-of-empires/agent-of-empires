@@ -1,11 +1,11 @@
 //! Node.js runtime resolution for acp-worker subprocesses.
 //!
 //! Resolve order (matches the v4 design doc):
-//! 1. `AOE_ACP_NODE` env var.
+//! 1. `HMP_ACP_NODE` env var.
 //! 2. `acp.node_path` from settings.
 //! 3. `node` on `PATH` (must satisfy minimum version).
 //! 4. Previously-downloaded Node at
-//!    `$AOE_DATA_DIR/acp/node-v22.21.0/bin/node`.
+//!    `$HMP_DATA_DIR/acp/node-v22.21.0/bin/node`.
 //! 5. (Future) download from nodejs.org/dist on first use.
 //!
 //! For 5 we have a real `download` function, but it is opt-in: the
@@ -18,17 +18,17 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// The minimum Node major version aoe-agent supports. Matches the
-/// `engines.node` field in `acp-worker/aoe-agent/package.json`.
+/// The minimum Node major version hmp-agent supports. Matches the
+/// `engines.node` field in `acp-worker/hmp-agent/package.json`.
 pub const MIN_NODE_MAJOR: u32 = 20;
 
-/// The pinned Node version aoe downloads when no host Node is found.
+/// The pinned Node version hmp downloads when no host Node is found.
 /// Bumping this requires bumping the SHA-256 below at the same time.
 pub const PINNED_NODE_VERSION: &str = "22.21.0";
 
 #[derive(Debug, Error)]
 pub enum NodeError {
-    #[error("no Node.js >= {0} found and AOE_ACP_NODE is unset")]
+    #[error("no Node.js >= {0} found and HMP_ACP_NODE is unset")]
     NoNode(u32),
     #[error("Node at {path} is too old (version {found}; need >= {min})")]
     TooOld {
@@ -60,7 +60,7 @@ pub enum NodeSource {
 /// configured in `acp.node_path` (empty when unset). `app_dir` is
 /// where the bundled tarball would be extracted.
 pub fn resolve(settings_node_path: &str, app_dir: &Path) -> Result<ResolvedNode, NodeError> {
-    if let Ok(env_path) = std::env::var("AOE_ACP_NODE") {
+    if let Ok(env_path) = std::env::var("HMP_ACP_NODE") {
         if !env_path.is_empty() {
             let path = PathBuf::from(env_path);
             return verify_path(&path, NodeSource::Env);
@@ -226,7 +226,7 @@ pub async fn download(app_dir: &Path) -> Result<ResolvedNode, NodeError> {
     let tarball = pinned_for(platform).ok_or_else(|| {
         warn!(
             target: "acp.node",
-            "automated Node download not supported on this platform; install Node {} on PATH or set AOE_ACP_NODE",
+            "automated Node download not supported on this platform; install Node {} on PATH or set HMP_ACP_NODE",
             MIN_NODE_MAJOR
         );
         NodeError::NoNode(MIN_NODE_MAJOR)
@@ -370,10 +370,10 @@ mod tests {
             eprintln!("skipping: node not on PATH");
             return;
         };
-        std::env::set_var("AOE_ACP_NODE", &p);
+        std::env::set_var("HMP_ACP_NODE", &p);
         let temp = tempfile::tempdir().unwrap();
         let resolved = resolve("", temp.path()).expect("env var resolves");
-        std::env::remove_var("AOE_ACP_NODE");
+        std::env::remove_var("HMP_ACP_NODE");
         assert!(matches!(resolved.source, NodeSource::Env));
     }
 
@@ -383,15 +383,15 @@ mod tests {
         // No PATH-side node, no env, no settings → NoNode.
         let temp = tempfile::tempdir().unwrap();
         let saved_path = std::env::var_os("PATH");
-        let saved_env = std::env::var_os("AOE_ACP_NODE");
+        let saved_env = std::env::var_os("HMP_ACP_NODE");
         std::env::remove_var("PATH");
-        std::env::remove_var("AOE_ACP_NODE");
+        std::env::remove_var("HMP_ACP_NODE");
         let result = resolve("", temp.path());
         if let Some(p) = saved_path {
             std::env::set_var("PATH", p);
         }
         if let Some(v) = saved_env {
-            std::env::set_var("AOE_ACP_NODE", v);
+            std::env::set_var("HMP_ACP_NODE", v);
         }
         assert!(matches!(result, Err(NodeError::NoNode(_))));
     }

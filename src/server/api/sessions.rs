@@ -35,14 +35,14 @@ pub struct SessionResponse {
     pub last_error: Option<String>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
-    /// Base branch the worktree was created from when AoE managed the
+    /// Base branch the worktree was created from when HMP managed the
     /// creation. None for sessions attached to a pre-existing branch,
     /// or those that took the repo's default branch. See #948.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
     /// Per-session override for the diff base, set via the web "vs &lt;ref&gt;"
     /// picker, the TUI diff view's `b` keybind, or
-    /// `aoe session set-base`. Wins over `base_branch`, the profile
+    /// `hmp session set-base`. Wins over `base_branch`, the profile
     /// default, and auto-detection. See #970.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
@@ -58,7 +58,7 @@ pub struct SessionResponse {
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
     /// True when the agent has flagged this session as urgent via the
-    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// `attention-urgent` hook (read from `/tmp/hmp-hooks/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
     /// urgent rows above all non-urgent ones within their triage tier,
     /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
@@ -1023,7 +1023,7 @@ fn apply_session_group(inst: &mut Instance, group: String) {
 
 /// `PATCH /api/sessions/:id/group`. Moves an existing session to another
 /// group, creates a new group by assigning its path, or clears the group
-/// (empty string). Web parity with the TUI rename dialog and `aoe session
+/// (empty string). Web parity with the TUI rename dialog and `hmp session
 /// rename --group`, which already support post-create group edits.
 ///
 /// Persist-first like the other per-field PATCH sub-routes (`/pin`,
@@ -1305,7 +1305,7 @@ pub async fn update_session_notifications(
 //
 // `PATCH /api/sessions/{id}/diff-base` sets / clears the per-session
 // override for the diff base ref. The web `vs <ref>` chip popover, the
-// TUI diff view's `b` keybind, and `aoe session set-base` all funnel
+// TUI diff view's `b` keybind, and `hmp session set-base` all funnel
 // through this endpoint so the override is persisted alongside the
 // session record and survives restart. See #970.
 
@@ -1411,7 +1411,7 @@ pub struct UpdatePinBody {
 pub struct UpdateArchiveBody {
     pub archived: bool,
     /// When `archived = true`, kill the tmux pane (parity with the TUI's
-    /// `z` keybind and the CLI's `aoe session archive` default). Omitted
+    /// `z` keybind and the CLI's `hmp session archive` default). Omitted
     /// or `true` means kill; `false` keeps the pane alive while still
     /// marking the session archived. Ignored when `archived = false`.
     #[serde(default = "default_kill_pane")]
@@ -3259,7 +3259,7 @@ struct DiffRepo {
 struct DiffContext {
     repos: Vec<DiffRepo>,
     /// Per-session override for the diff base (set via
-    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
+    /// `PATCH /api/sessions/{id}/diff-base`, the `hmp session set-base`
     /// CLI, or the TUI diff view's `b` keybind). Wins over the
     /// profile-level default and the auto-detected ref. See #970.
     base_branch_override: Option<String>,
@@ -4262,7 +4262,7 @@ mod tests {
         std::env::set_var("HOME", temp_home.path());
         let _app_dir = isolated_app_dir(temp_home.path());
         let project = tempfile::tempdir().unwrap();
-        let repo_config_dir = project.path().join(".agent-of-empires");
+        let repo_config_dir = project.path().join(".hmp");
         std::fs::create_dir_all(&repo_config_dir).unwrap();
         std::fs::write(
             repo_config_dir.join("config.toml"),
@@ -4656,7 +4656,7 @@ mod tests {
 // Send + read-output endpoints
 //
 // Together these are the minimum primitive an external orchestrator needs to
-// run an aoe session as a controlled subagent: push a prompt in, read the
+// run an hmp session as a controlled subagent: push a prompt in, read the
 // pane back. Mirrors what the TUI's send-message dialog and pane preview do,
 // without requiring keyboard or websocket attach.
 // ============================================================================

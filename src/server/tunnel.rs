@@ -229,7 +229,7 @@ impl TunnelHandle {
 
         // Single-command Funnel (Tailscale 1.52+). Replaces the old
         // `tailscale serve --https=443` + `tailscale funnel 443` two-step
-        // dance. `--bg` persists across aoe restarts; `--yes` skips
+        // dance. `--bg` persists across hmp restarts; `--yes` skips
         // interactive prompts so we fail fast instead of hanging if
         // Funnel isn't pre-approved in the tailnet ACL.
         //
@@ -258,7 +258,7 @@ impl TunnelHandle {
         // Spawn drain tasks for both streams. Tailscale emits progress
         // on stderr (most useful for diagnosing hangs); logged at info!
         // so the TUI Starting screen surfaces it when tailing the
-        // configured log file, without needing AGENT_OF_EMPIRES_DEBUG=1.
+        // configured log file, without needing HMP_DEBUG=1.
         // Stdout stays at debug! because Tailscale rarely prints there
         // and the lines that do appear are noisier.
         //
@@ -323,7 +323,7 @@ impl TunnelHandle {
                 return Err(anyhow::anyhow!(
                     "Tailscale Funnel is not enabled for this tailnet.\n\n\
                      {detail}\n\n\
-                     After enabling, re-run `aoe serve --remote`. \
+                     After enabling, re-run `hmp serve --remote`. \
                      Or pass --no-tailscale to use Cloudflare instead."
                 ));
             }
@@ -333,7 +333,7 @@ impl TunnelHandle {
                         anyhow::anyhow!(
                             "tailscale funnel timed out after {}s; your node may not have \
                              HTTPS certs enabled or Funnel may not be enabled in your tailnet \
-                             ACL. Run `AGENT_OF_EMPIRES_DEBUG=1 aoe serve --remote` and \
+                             ACL. Run `HMP_DEBUG=1 hmp serve --remote` and \
                              check debug.log for the live output, or try \
                              `tailscale funnel --bg --yes {}` manually, or pass \
                              --no-tailscale to skip.",
@@ -355,7 +355,7 @@ impl TunnelHandle {
                 "tailscale funnel exited with status {:?}. Confirm Funnel is enabled \
                  in your tailnet ACL (https://login.tailscale.com/admin/acls/file) \
                  and HTTPS is enabled on the node. Run with \
-                 AGENT_OF_EMPIRES_DEBUG=1 to see the full stderr stream.",
+                 HMP_DEBUG=1 to see the full stderr stream.",
                 status.code()
             );
         }
@@ -384,7 +384,7 @@ impl TunnelHandle {
     /// Gracefully shut down the tunnel process.
     /// Cancels the health monitor first, then sends SIGTERM to cloudflared.
     /// For Tailscale funnels, leaves the funnel configuration in place on
-    /// purpose: restarting aoe shouldn't tear down the PWA's origin.
+    /// purpose: restarting hmp shouldn't tear down the PWA's origin.
     #[tracing::instrument(target = "serve.tunnel", skip_all)]
     pub async fn shutdown(self) {
         self.cancel.cancel();
@@ -435,7 +435,7 @@ impl TunnelHandle {
 
                 // Read try_wait under the lock, then drop the guard
                 // before any await. Holding the child mutex across
-                // restart_tunnel().await would block aoe serve --stop
+                // restart_tunnel().await would block hmp serve --stop
                 // (which also wants the lock to terminate the child)
                 // for the multi-second cloudflared spawn time.
                 let exit_status = {
@@ -458,7 +458,7 @@ impl TunnelHandle {
                     error!(
                         "Cloudflare tunnel exited again ({}). \
                          Remote access is unavailable. \
-                         Restart with `aoe serve --remote`.",
+                         Restart with `hmp serve --remote`.",
                         status
                     );
                     return;
@@ -623,7 +623,7 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
     //
     // Rules:
     // - Proxy to OUR local_port: idempotent, no-op.
-    // - Proxy to 127.0.0.1:<other-port> or localhost:*: stale aoe config
+    // - Proxy to 127.0.0.1:<other-port> or localhost:*: stale hmp config
     //   from a previous run (e.g. port changed across restarts).
     //   `tailscale funnel --bg --yes <new>` will cleanly replace it; no
     //   need to bail.
@@ -644,7 +644,7 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
                     continue;
                 }
                 // A different-port loopback backend looks like a prior
-                // aoe run (or another local dev server); overwriting it
+                // hmp run (or another local dev server); overwriting it
                 // is the expected behavior, not a conflict.
                 if proxy_is_loopback(proxy) {
                     debug!(
@@ -892,7 +892,7 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
 pub fn tailscale_available_sync() -> bool {
     // Unlike the async path, this runs on the TUI render hot path, so
     // we keep it cheap and quiet on the happy path. On failure, we log
-    // at debug! so `AGENT_OF_EMPIRES_DEBUG=1` surfaces exactly which
+    // at debug! so `HMP_DEBUG=1` surfaces exactly which
     // step bounced.
     let version = std::process::Command::new("tailscale")
         .arg("--version")

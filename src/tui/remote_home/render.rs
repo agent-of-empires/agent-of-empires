@@ -60,7 +60,7 @@ fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeS
     }
     if state.sessions.is_empty() {
         let para = Paragraph::new(
-            "No structured view sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nAcp sessions are created via `aoe add --structured-view` on the host\n(or the web dashboard's New Session dialog).",
+            "No structured view sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nAcp sessions are created via `hmp add --structured-view` on the host\n(or the web dashboard's New Session dialog).",
         )
         .style(Style::default().fg(theme.hint));
         frame.render_widget(para, area);

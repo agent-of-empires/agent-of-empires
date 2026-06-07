@@ -1,7 +1,7 @@
 /** Write `text` to the clipboard, returning whether it succeeded.
  *
  *  Prefers the async Clipboard API, but that is only defined in secure
- *  contexts (HTTPS or `localhost`). `aoe serve` is frequently reached
+ *  contexts (HTTPS or `localhost`). `hmp serve` is frequently reached
  *  over plain HTTP on a LAN or Tailscale IP, where `navigator.clipboard`
  *  is `undefined`, so fall back to a hidden-textarea `execCommand("copy")`
  *  (same approach the mobile terminal toolbar uses for its paste path). */

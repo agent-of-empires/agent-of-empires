@@ -56,7 +56,7 @@ export function TokenEntryPage({ onSuccess }: Props) {
       // dedup flags so the next submission attempt can be detected too.
       resetTokenExpired();
       setError(
-        "Invalid token. Copy the token from your `aoe serve` output and try again.",
+        "Invalid token. Copy the token from your `hmp serve` output and try again.",
       );
       setLoading(false);
       inputRef.current?.focus();
@@ -80,7 +80,7 @@ export function TokenEntryPage({ onSuccess }: Props) {
               className="rounded-sm"
             />
             <span className="font-mono text-lg text-text-primary tracking-tight">
-              aoe
+              hmp
             </span>
           </div>
 
@@ -88,7 +88,7 @@ export function TokenEntryPage({ onSuccess }: Props) {
           <p className="text-xs text-text-muted mb-6 text-center leading-relaxed">
             Your session token has expired or is missing. Paste the dashboard
             URL or token from{" "}
-            <code className="text-brand-500 font-mono">aoe serve</code> to
+            <code className="text-brand-500 font-mono">hmp serve</code> to
             reconnect.
           </p>
 

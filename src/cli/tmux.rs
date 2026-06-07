@@ -33,7 +33,7 @@ pub fn run_status(args: TmuxStatusArgs) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string(&json)?);
             } else {
-                let mut output = format!("aoe: {}", info.title);
+                let mut output = format!("hmp: {}", info.title);
                 if let Some(b) = &info.branch {
                     output.push_str(" | ");
                     output.push_str(b);
@@ -47,7 +47,7 @@ pub fn run_status(args: TmuxStatusArgs) -> Result<()> {
             }
         }
         None => {
-            // Not in an aoe session - output nothing (cleaner for tmux status bar)
+            // Not in an hmp session - output nothing (cleaner for tmux status bar)
             if args.format == "json" {
                 println!("null");
             }

@@ -1,4 +1,4 @@
-//! `agent-of-empires sounds` subcommands implementation
+//! `hmp sounds` subcommands implementation
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -52,9 +52,9 @@ async fn install_bundled() -> Result<()> {
                 println!("  4. Enable sounds and configure transitions");
 
                 println!("\n🎮 Want Age of Empires II sounds instead?");
-                println!("   If you own AoE II, copy the taunt .wav files from:");
-                println!("   • (AoE II dir)/resources/_common/sound/taunt/");
-                println!("   • Or: (AoE II dir)/Sound/taunt/");
+                println!("   If you own HMP II, copy the taunt .wav files from:");
+                println!("   • (HMP II dir)/resources/_common/sound/taunt/");
+                println!("   • Or: (HMP II dir)/Sound/taunt/");
                 println!("   To: {}", sounds_dir.display());
                 println!("\n   Then configure which sounds to use in Settings!");
             }
@@ -66,9 +66,7 @@ async fn install_bundled() -> Result<()> {
             eprintln!("  • Check your internet connection");
             eprintln!("  • Try again later if GitHub is unavailable");
             eprintln!("  • You can manually download sounds from:");
-            eprintln!(
-                "    https://github.com/agent-of-empires/agent-of-empires/tree/main/bundled_sounds"
-            );
+            eprintln!("    https://github.com/hoxkss/hmp/tree/main/bundled_sounds");
             Err(e)
         }
     }
@@ -93,7 +91,7 @@ fn list_sounds() -> Result<()> {
         println!("\nLocation: {}", sounds_dir.display());
     }
 
-    println!("\n💡 Test a sound: aoe sounds test <name>");
+    println!("\n💡 Test a sound: hmp sounds test <name>");
 
     Ok(())
 }

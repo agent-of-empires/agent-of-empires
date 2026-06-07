@@ -1,9 +1,9 @@
 //! Sound effects for agent state transitions
 //!
-//! Plays AoE II-style sounds when agent sessions change state.
+//! Plays HMP II-style sounds when agent sessions change state.
 //! Users place .wav/.ogg files in the sounds directory:
-//!   - Linux: ~/.config/agent-of-empires/sounds/
-//!   - macOS: ~/.agent-of-empires/sounds/
+//!   - Linux: ~/.config/hmp/sounds/
+//!   - macOS: ~/.hmp/sounds/
 //!
 //! Expected filenames (any .wav/.ogg file works):
 //!   wololo.wav, rogan.wav, allhail.wav, monk.wav,

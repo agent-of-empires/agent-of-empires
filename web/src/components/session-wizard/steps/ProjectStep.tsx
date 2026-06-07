@@ -219,7 +219,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
             Skip project folder
           </div>
           <div className="text-xs text-text-dim mt-0.5 leading-snug">
-            Run the agent in a fresh scratch directory under your AoE app data
+            Run the agent in a fresh scratch directory under your HMP app data
             folder. The folder is removed when you delete the session.
           </div>
         </div>
@@ -236,7 +236,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
             Scratch session
           </p>
           <p className="text-sm text-text-primary">
-            A fresh scratch directory under your AoE app data folder is created
+            A fresh scratch directory under your HMP app data folder is created
             when you launch this session.
           </p>
         </div>

@@ -99,14 +99,14 @@ pub struct ToolSessionConfig {
 }
 
 /// Persistent logging configuration. Drives the default tracing
-/// filter when no `AOE_LOG_LEVEL` env var is set, and is the
+/// filter when no `HMP_LOG_LEVEL` env var is set, and is the
 /// source of truth the settings UI writes to.
 ///
 /// `default_level` is the baseline applied to every known target
 /// root (see `crate::logging::DEFAULT_TARGET_ROOTS`). Entries in
 /// `targets` override per-target.
 ///
-/// Env var takes precedence: when `AOE_LOG_LEVEL` is set at startup,
+/// Env var takes precedence: when `HMP_LOG_LEVEL` is set at startup,
 /// this config is ignored for the initial filter (env wins for
 /// CI/scripted runs). Runtime changes via `/api/log-level` always
 /// honor whichever is active.
@@ -134,7 +134,7 @@ pub struct LoggingConfig {
     pub targets: std::collections::BTreeMap<String, String>,
 
     /// Where tracing lands: file (default) or stdout. TUI / daemon child /
-    /// runner coerce to file regardless. Restart aoe for changes to take
+    /// runner coerce to file regardless. Restart hmp for changes to take
     /// effect.
     #[serde(default)]
     #[setting(
@@ -147,7 +147,7 @@ pub struct LoggingConfig {
     pub output: SinkKind,
 
     /// Log file location. Relative paths resolve under the app data dir;
-    /// absolute paths are used verbatim. Restart aoe for changes.
+    /// absolute paths are used verbatim. Restart hmp for changes.
     #[serde(default = "default_file_path")]
     #[setting(
         label = "File path (restart req.)",
@@ -158,7 +158,7 @@ pub struct LoggingConfig {
     pub file_path: String,
 
     /// size rotates when the live file crosses the threshold; never disables
-    /// rotation. Restart aoe for changes.
+    /// rotation. Restart hmp for changes.
     #[serde(default)]
     #[setting(
         label = "Rotation (restart req.)",
@@ -292,7 +292,7 @@ pub struct AcpConfig {
     #[setting(label = "Replay buffer bytes", widget = "number", min = 0, advanced)]
     pub replay_bytes: u64,
     /// Override Node.js binary location. Empty resolves via
-    /// AOE_ACP_NODE then PATH then the bundled fallback.
+    /// HMP_ACP_NODE then PATH then the bundled fallback.
     #[serde(default)]
     #[setting(
         label = "Node path",
@@ -321,7 +321,7 @@ pub struct AcpConfig {
     )]
     pub queue_drain_mode: QueueDrainMode,
     /// Maximum number of acp worker resumes (spawn or attach) the
-    /// reconciler runs in parallel on `aoe serve` cold start. Bounded
+    /// reconciler runs in parallel on `hmp serve` cold start. Bounded
     /// at runtime by `min(max_concurrent_resumes, max_concurrent_workers).max(1)`
     /// so this knob can never exceed the total live worker cap. Default
     /// is 4: Node.js bootup is memory-heavy and 4 concurrent
@@ -721,7 +721,7 @@ pub struct SessionConfig {
     pub agent_command_override: HashMap<String, String>,
 
     /// Install status-detection hooks into the agent's config file (e.g.
-    /// ~/.claude/settings.json). When disabled, AoE will not modify the
+    /// ~/.claude/settings.json). When disabled, HMP will not modify the
     /// agent's settings file; status detection falls back to tmux pane
     /// content parsing, which is less reliable.
     #[serde(default = "default_true")]
@@ -732,7 +732,7 @@ pub struct SessionConfig {
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
     /// Termius/Blink where mouse-tracking escapes aren't forwarded reliably.
-    /// The AOE_MOUSE_CAPTURE env var remains an opt-out backstop and can still
+    /// The HMP_MOUSE_CAPTURE env var remains an opt-out backstop and can still
     /// force capture off when set.
     #[serde(default = "default_true")]
     #[setting(label = "Mouse Capture", widget = "toggle", category = "Interaction")]
@@ -803,7 +803,7 @@ pub struct SessionConfig {
     #[setting(label = "Strict Hotkeys", widget = "toggle")]
     pub strict_hotkeys: bool,
 
-    /// Default snooze for `aoe session snooze` (1-43200 min, picker overrides).
+    /// Default snooze for `hmp session snooze` (1-43200 min, picker overrides).
     /// During the snooze window the session is treated like archive: sinks to
     /// the bottom, renders italic+dim with a `z ` prefix, ignored by the
     /// attention sort, then rejoins the active list when the timer expires.
@@ -837,7 +837,7 @@ pub struct SessionConfig {
     )]
     pub auto_stop_idle_secs: u32,
 
-    /// Text sent to the agent after a successful `aoe session restart` /
+    /// Text sent to the agent after a successful `hmp session restart` /
     /// `e`-keybind restart, once the post-restart readiness probe says the
     /// pane is alive. Restart re-execs the agent at a blank prompt; this
     /// nudge tells the agent to pick up where it left off. Set to an
@@ -945,7 +945,7 @@ pub struct SessionConfig {
     )]
     pub click_action: ClickAction,
 
-    /// Warn before quitting aoe when you press `q` on the home screen (the
+    /// Warn before quitting hmp when you press `q` on the home screen (the
     /// dialog can also turn this off). Ctrl+C always force-quits.
     #[serde(default = "default_true")]
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
@@ -1291,7 +1291,7 @@ impl Default for WebConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "auth", category = "Web")]
 pub struct AuthConfig {
-    /// Keep dashboard login sessions across `aoe serve` restarts. When on,
+    /// Keep dashboard login sessions across `hmp serve` restarts. When on,
     /// signed-in devices stay signed in after a daemon restart instead of
     /// being re-prompted for the passphrase; sessions are stored owner-only
     /// (0600) under the app dir and dropped if the passphrase changes. Turn
@@ -1327,7 +1327,7 @@ pub enum ColorMode {
     /// Emit 256-palette escapes (\e[38;5;<idx>m) by converting every theme
     /// Rgb(r,g,b) to the nearest xterm-256 index. Use this when the transport
     /// (notably some mosh clients) mishandles 24-bit RGB; preview panes in
-    /// aoe already use 256-palette via ansi-to-tui, so palette mode renders
+    /// hmp already use 256-palette via ansi-to-tui, so palette mode renders
     /// chrome through the same escape path and survives the same transports.
     Palette,
 }
@@ -1376,7 +1376,7 @@ fn default_idle_decay_minutes() -> u64 {
 ///
 /// `Auto` quietly installs new releases in the background on next launch
 /// after detection (mid-session restart is intentionally out of scope, the
-/// new binary is picked up next time `aoe` starts). `Notify` is the
+/// new binary is picked up next time `hmp` starts). `Notify` is the
 /// default: shows the TUI banner and, when `notify_in_cli` is true, the
 /// CLI eprintln nag. `Off` suppresses every check, banner, and fetch.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1830,7 +1830,7 @@ impl Default for SandboxConfig {
 }
 
 fn default_sandbox_image() -> String {
-    "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string()
+    "ghcr.io/hmp/hmp-sandbox:latest".to_string()
 }
 
 fn default_sandbox_environment() -> Vec<String> {
@@ -1866,13 +1866,13 @@ pub enum TmuxMouseMode {
     /// Only enable mouse if user doesn't have their own tmux config
     #[default]
     Auto,
-    /// Always enable mouse for aoe sessions
+    /// Always enable mouse for hmp sessions
     Enabled,
-    /// Never enable mouse for aoe sessions (explicitly disable)
+    /// Never enable mouse for hmp sessions (explicitly disable)
     Disabled,
 }
 
-/// Controls whether aoe configures tmux to forward OSC 52 clipboard escape
+/// Controls whether hmp configures tmux to forward OSC 52 clipboard escape
 /// sequences from inner TUIs (Claude Code, OpenCode, Codex, etc.) to the
 /// outer terminal. Without this, "select to copy" inside the wrapped agent
 /// silently fails because tmux swallows the escape sequence.
@@ -1882,7 +1882,7 @@ pub enum TmuxClipboardMode {
     /// Apply clipboard pass-through only if the user has no tmux config
     #[default]
     Auto,
-    /// Always apply clipboard pass-through to aoe sessions
+    /// Always apply clipboard pass-through to hmp sessions
     Enabled,
     /// Never apply clipboard pass-through (use plain tmux defaults)
     Disabled,
@@ -2063,7 +2063,7 @@ const BOOTSTRAP_PROFILE: &str = "main";
 
 /// Create the first profile on a genuine first run and return its name.
 ///
-/// AoE always needs at least one profile (somewhere to file sessions). When
+/// HMP always needs at least one profile (somewhere to file sessions). When
 /// `profiles/` has no entries, this creates `main`. It is idempotent: calling
 /// it when `main` already exists just returns the name.
 fn ensure_bootstrap_profile() -> String {

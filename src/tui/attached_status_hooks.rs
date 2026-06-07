@@ -33,7 +33,7 @@ impl AttachedStatusHookWatcher {
         let (stop_tx, stop_rx) = mpsc::channel();
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let handle = match thread::Builder::new()
-            .name("aoe-attached-status-hooks".to_string())
+            .name("hmp-attached-status-hooks".to_string())
             .spawn(move || run_loop(sessions, stop_rx, snapshot_tx))
         {
             Ok(handle) => handle,

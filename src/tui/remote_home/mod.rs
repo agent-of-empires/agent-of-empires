@@ -1,6 +1,6 @@
 //! Remote home screen for cross-machine structured view attach.
 //!
-//! Activated when `AOE_DAEMON_URL` is set at startup (or `--daemon-url`
+//! Activated when `HMP_DAEMON_URL` is set at startup (or `--daemon-url`
 //! is passed on the CLI). Fetches the daemon's session list via
 //! `GET /api/sessions`, filters to structured view-mode sessions (the only
 //! kind that's meaningful to drive cross-machine; tmux PTYs can't be
@@ -79,7 +79,7 @@ impl RemoteHomeState {
 }
 
 /// Set up alternate-screen terminal, run the remote home loop, tear it
-/// down. Invoked from `tui::run` when `AOE_DAEMON_URL` is set.
+/// down. Invoked from `tui::run` when `HMP_DAEMON_URL` is set.
 pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -92,7 +92,7 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     use std::io::IsTerminal;
 
     if !io::stdin().is_terminal() {
-        anyhow::bail!("stdin is not a terminal; `aoe` needs an interactive TTY");
+        anyhow::bail!("stdin is not a terminal; `hmp` needs an interactive TTY");
     }
 
     enable_raw_mode()?;

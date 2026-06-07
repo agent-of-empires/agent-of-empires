@@ -573,7 +573,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
-            desc: "Update aoe (when available)",
+            desc: "Update hmp (when available)",
         }),
         palette: None,
     },

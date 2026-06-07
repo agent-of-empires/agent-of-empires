@@ -24,7 +24,7 @@ export interface ResolvedTheme {
 
 import { safeGetItem, safeSetItem } from "./safeStorage";
 
-const STORAGE_KEY = "aoe-resolved-theme";
+const STORAGE_KEY = "hmp-resolved-theme";
 
 export function readCachedResolvedTheme(): ResolvedTheme | null {
   const raw = safeGetItem(STORAGE_KEY);
@@ -61,7 +61,7 @@ export function applyResolvedTheme(theme: ResolvedTheme): void {
 // Notification key used by the theme hook to broadcast theme changes
 // across components (e.g. shiki call sites re-render against the new
 // syntax theme without needing to subscribe to a context).
-export const THEME_CHANGED_EVENT = "aoe:theme-changed";
+export const THEME_CHANGED_EVENT = "hmp:theme-changed";
 
 export function dispatchThemeChanged(theme: ResolvedTheme): void {
   window.dispatchEvent(

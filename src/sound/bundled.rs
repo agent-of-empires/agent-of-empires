@@ -3,7 +3,7 @@
 use super::discovery::get_sounds_dir;
 
 const GITHUB_SOUNDS_BASE_URL: &str =
-    "https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/bundled_sounds";
+    "https://raw.githubusercontent.com/hoxkss/hmp/main/bundled_sounds";
 
 /// List of bundled sound files available for download
 const BUNDLED_SOUND_FILES: &[&str] = &[
@@ -30,7 +30,7 @@ pub async fn install_bundled_sounds() -> anyhow::Result<()> {
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("agent-of-empires")
+        .user_agent("hmp")
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 

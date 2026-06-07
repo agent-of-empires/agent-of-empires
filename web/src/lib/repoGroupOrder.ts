@@ -6,7 +6,7 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 // A list of real repo-group ids (filesystem repo paths); synthetic
 // groups (Multi-repo, Scratch) are never stored here because they are
 // hard-pinned to the bottom regardless of manual order. See #1644.
-const STORAGE_KEY = "aoe-repo-group-order-v1";
+const STORAGE_KEY = "hmp-repo-group-order-v1";
 
 export function loadRepoGroupOrder(): string[] {
   const raw = safeGetItem(STORAGE_KEY);

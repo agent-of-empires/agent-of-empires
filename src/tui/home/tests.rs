@@ -188,7 +188,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     let live_state = || LiveSendState {
         session_id: id.clone(),
         title: "session0".to_string(),
-        tmux_name: "aoe_test_live".to_string(),
+        tmux_name: "hmp_test_live".to_string(),
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
@@ -4083,10 +4083,7 @@ fn test_project_group_name_handles_trailing_slash() {
 fn test_project_group_name_groups_scratch_under_scratch() {
     use super::project_group_name;
 
-    let mut inst = Instance::new(
-        "test",
-        "/home/user/.config/agent-of-empires/scratch/a4535853054b4096",
-    );
+    let mut inst = Instance::new("test", "/home/user/.config/hmp/scratch/a4535853054b4096");
     inst.scratch = true;
     assert_eq!(project_group_name(&inst), "scratch");
 }
@@ -4591,7 +4588,7 @@ fn paste_on_group_header_stashes_instead_of_misrouting() {
     );
 }
 
-/// Regression: a transient status toast must render even when no aoe update
+/// Regression: a transient status toast must render even when no hmp update
 /// is pending. Before the fix, the update-bar row was only laid out when
 /// `update_info.is_some()`, so toasts produced by paths like the
 /// restart-during-attach failure or `Action::SendMessage`'s "Reviving
@@ -6771,7 +6768,7 @@ mod click_to_select {
         env.view.live_send = Some(LiveSendState {
             session_id: id_a.clone(),
             title: "session1".to_string(),
-            tmux_name: format!("aoe_test_{}", id_a),
+            tmux_name: format!("hmp_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
             leader: None,
@@ -6807,7 +6804,7 @@ mod click_to_select {
         env.view.live_send = Some(LiveSendState {
             session_id: id_a.clone(),
             title: "session2".to_string(),
-            tmux_name: format!("aoe_test_{}", id_a),
+            tmux_name: format!("hmp_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
             leader: None,
@@ -7236,7 +7233,7 @@ mod preview_drag_select {
         env.view.live_send = Some(LiveSendState {
             session_id: "test-session".to_string(),
             title: "test".to_string(),
-            tmux_name: "aoe_test_drag_select".to_string(),
+            tmux_name: "hmp_test_drag_select".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
             leader: None,
@@ -7855,7 +7852,7 @@ mod preview_drag_select {
         env.view.live_send = Some(LiveSendState {
             session_id: "fake-id".to_string(),
             title: "fake".to_string(),
-            tmux_name: "aoe_test_full_pipeline".to_string(),
+            tmux_name: "hmp_test_full_pipeline".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
             leader: None,
@@ -9209,7 +9206,7 @@ mod save_field_merge {
     fn test_save_drops_peer_deleted_row_from_mirror() {
         let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/peer-rm");
 
-        // Simulate `aoe session remove victim` from another process: peer
+        // Simulate `hmp session remove victim` from another process: peer
         // deletes the row from disk while TUI still has it in memory.
         Storage::new("test")
             .unwrap()
@@ -9356,7 +9353,7 @@ mod save_field_merge {
         });
         view.save().unwrap();
 
-        // Peer clears the sid on disk (simulates `aoe session set-session-id ""`).
+        // Peer clears the sid on disk (simulates `hmp session set-session-id ""`).
         Storage::new("test")
             .unwrap()
             .update(|insts, _g| {
@@ -9669,7 +9666,7 @@ mod right_click_context_menu {
         env.view.live_send = Some(live_send::LiveSendState {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
-            tmux_name: "aoe_test_empty_click_exit_live".to_string(),
+            tmux_name: "hmp_test_empty_click_exit_live".to_string(),
             target: live_send::LiveSendTarget::Agent,
             exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
             leader: None,
@@ -9880,7 +9877,7 @@ mod apply_session_id_updates {
     }
 
     fn captured_env(name: &str) -> Option<String> {
-        crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+        crate::tmux::env::get_hidden_env(name, crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY)
     }
 
     fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
@@ -9970,7 +9967,7 @@ mod apply_session_id_updates {
         let tmux = TmuxSession::create(&inst.id, &inst.title);
         crate::tmux::env::set_hidden_env(
             tmux.name(),
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
             "stale-untouched",
         )
         .unwrap();
@@ -10025,7 +10022,7 @@ mod apply_session_id_updates {
         let tmux = TmuxSession::create(&inst.id, &inst.title);
         crate::tmux::env::set_hidden_env(
             tmux.name(),
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
             NEW_SID,
         )
         .unwrap();
@@ -10068,7 +10065,7 @@ mod apply_session_id_updates {
         let tmux = TmuxSession::create(&inst.id, &inst.title);
         crate::tmux::env::set_hidden_env(
             tmux.name(),
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
             "bad sid!",
         )
         .unwrap();

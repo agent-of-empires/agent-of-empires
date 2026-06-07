@@ -154,14 +154,14 @@ impl HooksInstallDialog {
             Style::default().bold(),
         )));
         lines.push(Line::from(
-            "  printf {status} > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status",
+            "  printf {status} > /tmp/hmp-hooks/$HMP_INSTANCE_ID/status",
         ));
 
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "Hooks are guarded by $AOE_INSTANCE_ID and are a",
+            "Hooks are guarded by $HMP_INSTANCE_ID and are a",
         ));
-        lines.push(Line::from("no-op outside of AoE sessions."));
+        lines.push(Line::from("no-op outside of HMP sessions."));
 
         if self.needs_codex_trust_note {
             lines.push(Line::from(""));
@@ -169,7 +169,7 @@ impl HooksInstallDialog {
                 "Codex may ask you to review and trust these hooks in /hooks.",
             ));
             lines.push(Line::from(
-                "Until then, AoE falls back to pane-based status detection.",
+                "Until then, HMP falls back to pane-based status detection.",
             ));
         }
 
@@ -207,7 +207,7 @@ impl HooksInstallDialog {
 
         // Header
         let header = Paragraph::new(
-            "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle).",
+            "HMP needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle).",
         )
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: true });
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_uses_aoe_instance_id_in_example() {
+    fn test_content_uses_hmp_instance_id_in_example() {
         let dialog = HooksInstallDialog::new("claude");
         let lines = dialog.build_content_lines();
         let text: String = lines
@@ -431,11 +431,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
+            text.contains("/tmp/hmp-hooks/$HMP_INSTANCE_ID/status"),
             "example command must reference the real env var: {text}"
         );
         assert!(
-            !text.contains("/tmp/aoe-hooks/$ID/"),
+            !text.contains("/tmp/hmp-hooks/$ID/"),
             "example command must not use the bogus $ID placeholder: {text}"
         );
     }

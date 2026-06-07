@@ -1594,7 +1594,7 @@ mod tests {
         // With no line count published the worker must not capture at all,
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
-        worker.set_target("aoe_test_capture_no_geometry".into());
+        worker.set_target("hmp_test_capture_no_geometry".into());
         std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
             worker.take_latest().is_none(),
@@ -1609,7 +1609,7 @@ mod tests {
         // #1501 kill switch, so the worker must drop them. Deterministic
         // without a real tmux session: a missing pane always reads empty.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
-        worker.set_target("aoe_test_capture_missing_session".into());
+        worker.set_target("hmp_test_capture_missing_session".into());
         // Fast cadence so the worker actually captures (and drops the empty
         // frame) within the wait, instead of still being in its first idle
         // sleep when we assert.
@@ -1633,7 +1633,7 @@ mod tests {
         if let Ok(mut latest) = worker.latest.lock() {
             *latest = Some("stale previous-pane content".to_string());
         }
-        worker.set_target("aoe_test_capture_new_target".into());
+        worker.set_target("hmp_test_capture_new_target".into());
         assert!(
             worker.take_latest().is_none(),
             "retarget must drop the previous pane's queued capture",
@@ -1647,7 +1647,7 @@ mod tests {
         // preview text) instead of being dropped like the agent kill switch.
         // Deterministic without a real tmux session: a missing pane reads empty.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
-        worker.set_target("aoe_test_capture_forward_empty".into());
+        worker.set_target("hmp_test_capture_forward_empty".into());
         worker.set_forward_empty(true);
         // Fast cadence so the worker captures within the wait rather than
         // still being in its first idle sleep when we assert.

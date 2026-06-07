@@ -1,8 +1,8 @@
-//! Locate a structured view daemon (`aoe serve`) the client should talk to.
+//! Locate a structured view daemon (`hmp serve`) the client should talk to.
 //!
 //! Resolution order:
 //!
-//! 1. `AOE_DAEMON_URL` env var (paired with `AOE_DAEMON_TOKEN`). Env
+//! 1. `HMP_DAEMON_URL` env var (paired with `HMP_DAEMON_TOKEN`). Env
 //!    is preferred over CLI flags so the token never leaks via `ps`.
 //! 2. Local daemon: `<app_dir>/serve.url` + a live `<app_dir>/serve.pid`.
 //!    The loopback alternate is preferred over the primary line so
@@ -29,8 +29,8 @@ pub struct DaemonEndpoint {
     /// query string.
     pub base_url: String,
     /// Bearer token. `None` when the daemon was started with
-    /// `--no-auth`, or when `AOE_DAEMON_URL` is set without
-    /// `AOE_DAEMON_TOKEN`.
+    /// `--no-auth`, or when `HMP_DAEMON_URL` is set without
+    /// `HMP_DAEMON_TOKEN`.
     pub token: Option<String>,
     pub source: Source,
 }
@@ -45,7 +45,7 @@ impl DaemonEndpoint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// `AOE_DAEMON_URL` env var.
+    /// `HMP_DAEMON_URL` env var.
     Env,
     /// Read from `<app_dir>/serve.url`.
     LocalDaemon,
@@ -54,10 +54,10 @@ pub enum Source {
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
     #[error(
-        "no local structured view daemon is running; start one with `aoe serve` or set AOE_DAEMON_URL"
+        "no local structured view daemon is running; start one with `hmp serve` or set HMP_DAEMON_URL"
     )]
     NoLocalDaemon,
-    #[error("serve.url is empty or malformed; restart `aoe serve` to refresh it")]
+    #[error("serve.url is empty or malformed; restart `hmp serve` to refresh it")]
     Malformed,
 }
 
@@ -69,15 +69,15 @@ pub fn discover() -> Result<DaemonEndpoint, DiscoveryError> {
     discover_local()
 }
 
-/// `AOE_DAEMON_URL` (+ optional `AOE_DAEMON_TOKEN`). Returns `None`
+/// `HMP_DAEMON_URL` (+ optional `HMP_DAEMON_TOKEN`). Returns `None`
 /// when the env var is unset or empty.
 pub fn discover_env() -> Option<DaemonEndpoint> {
-    let url = env::var("AOE_DAEMON_URL").ok()?;
+    let url = env::var("HMP_DAEMON_URL").ok()?;
     let url = url.trim();
     if url.is_empty() {
         return None;
     }
-    let token = env::var("AOE_DAEMON_TOKEN")
+    let token = env::var("HMP_DAEMON_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
@@ -221,8 +221,8 @@ mod tests {
     #[serial_test::serial]
     fn discover_env_returns_none_when_unset() {
         unsafe {
-            std::env::remove_var("AOE_DAEMON_URL");
-            std::env::remove_var("AOE_DAEMON_TOKEN");
+            std::env::remove_var("HMP_DAEMON_URL");
+            std::env::remove_var("HMP_DAEMON_TOKEN");
         }
         assert!(discover_env().is_none());
     }
@@ -232,20 +232,20 @@ mod tests {
     fn discover_env_parses_url_and_token() {
         unsafe {
             std::env::set_var(
-                "AOE_DAEMON_URL",
+                "HMP_DAEMON_URL",
                 "https://remote.example.com:9000/?token=zzz",
             );
-            std::env::set_var("AOE_DAEMON_TOKEN", "real-token");
+            std::env::set_var("HMP_DAEMON_TOKEN", "real-token");
         }
         let endpoint = discover_env().expect("env override should resolve");
         // ENV override strips the query string defensively even though
-        // tokens should travel via AOE_DAEMON_TOKEN, not the URL.
+        // tokens should travel via HMP_DAEMON_TOKEN, not the URL.
         assert_eq!(endpoint.base_url, "https://remote.example.com:9000");
         assert_eq!(endpoint.token.as_deref(), Some("real-token"));
         assert_eq!(endpoint.source, Source::Env);
         unsafe {
-            std::env::remove_var("AOE_DAEMON_URL");
-            std::env::remove_var("AOE_DAEMON_TOKEN");
+            std::env::remove_var("HMP_DAEMON_URL");
+            std::env::remove_var("HMP_DAEMON_TOKEN");
         }
     }
 }

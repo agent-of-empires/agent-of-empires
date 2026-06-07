@@ -2,7 +2,7 @@
  *  view, given the session's triage state. The variant matches the
  *  reason the worker was torn down so the user sees a banner that
  *  actually explains their situation (and offers the right next
- *  step) instead of the generic `aoe acp stop` message. See
+ *  step) instead of the generic `hmp acp stop` message. See
  *  #1581.
  *
  *  Returns:
@@ -13,7 +13,7 @@
  *   - `"snoozed"`  : worker was torn down by the sidebar snooze
  *                    action; the reconciler will respawn it when
  *                    the snooze expires.
- *   - `"generic"`  : everything else (`aoe acp stop`, manual
+ *   - `"generic"`  : everything else (`hmp acp stop`, manual
  *                    teardown, etc.).
  *
  *  `startupError` takes precedence over every "stopped" banner

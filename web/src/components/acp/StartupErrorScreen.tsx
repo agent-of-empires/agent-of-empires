@@ -52,7 +52,7 @@ export function StartupErrorScreen({ detail }: Props) {
           The session is paused until the adapter satisfies the required
           version. Once you have run the command above, restart{" "}
           <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">
-            aoe serve
+            hmp serve
           </code>{" "}
           (or spawn a fresh structured view session) and the check re-runs at
           the next ACP{" "}
@@ -84,7 +84,7 @@ function headingFor(detail: IncompatibleAgentDetail): string {
 function summaryFor(detail: IncompatibleAgentDetail): string {
   switch (detail.kind) {
     case "incompatible_agent_version":
-      return `aoe requires ${detail.package_name} version ${detail.required} or newer. The installed adapter is ${detail.installed}. Updating the adapter unblocks the session; aoe relies on behavior (memory_recall tool calls, native cancelled stop reason, others) that older versions do not emit.`;
+      return `aoe requires ${detail.package_name} version ${detail.required} or newer. The installed adapter is ${detail.installed}. Updating the adapter unblocks the session; hmp relies on behavior (memory_recall tool calls, native cancelled stop reason, others) that older versions do not emit.`;
     case "missing_agent_info":
       return `aoe expected ${detail.expected_package} to report a package version in its ACP initialize response. The adapter returned an empty agent_info block, which usually means a stale install or a wrapper that strips metadata. Reinstall to the pinned version.`;
     case "mismatched_agent_name":
@@ -92,7 +92,7 @@ function summaryFor(detail: IncompatibleAgentDetail): string {
     case "unparseable_agent_version":
       return `aoe expected ${detail.package_name} to report a semver-compatible version string but received ${detail.raw_version}. Required minimum is ${detail.required}. Reinstall the official build to recover.`;
     case "unsupported_protocol_version":
-      return `aoe negotiated ACP protocol ${detail.expected} but the adapter reported ${detail.received}. The session cannot proceed. This usually means an older or newer adapter generation than aoe currently supports.`;
+      return `aoe negotiated ACP protocol ${detail.expected} but the adapter reported ${detail.received}. The session cannot proceed. This usually means an older or newer adapter generation than hmp currently supports.`;
   }
 }
 

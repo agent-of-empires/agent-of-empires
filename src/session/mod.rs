@@ -73,18 +73,18 @@ use std::time::Duration;
 /// a `-dev` suffix so a `cargo run` instance shares no state with an installed
 /// release binary.
 pub const APP_DIR_NAME_XDG: &str = if cfg!(debug_assertions) {
-    "agent-of-empires-dev"
+    "hmp-dev"
 } else {
-    "agent-of-empires"
+    "hmp"
 };
 
 /// Home-dotfile app dir name (under `$HOME`). The default on macOS and the
 /// only location on Windows. Debug builds use a `-dev` suffix; see
 /// `APP_DIR_NAME_XDG`.
 pub const APP_DIR_NAME_OTHER: &str = if cfg!(debug_assertions) {
-    ".agent-of-empires-dev"
+    ".hmp-dev"
 } else {
-    ".agent-of-empires"
+    ".hmp"
 };
 
 /// Resolve the XDG-style config base directory: `$XDG_CONFIG_HOME` when set to
@@ -167,7 +167,7 @@ pub fn get_app_dir() -> Result<PathBuf> {
 /// Whether the app data dir already exists, **without** creating it (unlike
 /// [`get_app_dir`], which auto-creates). Lets side-effect-sensitive callers
 /// probe install state cheaply: the per-command telemetry recorder uses it to
-/// stay a true no-op for app-data-free commands (`aoe completion`, `aoe init`,
+/// stay a true no-op for app-data-free commands (`hmp completion`, `aoe init`,
 /// ...) on an install that is not opted in, so those commands keep working in
 /// read-only / sandboxed (e.g. Nix) environments without materializing the dir.
 pub fn app_dir_exists() -> bool {
@@ -191,7 +191,7 @@ fn get_app_dir_path() -> Result<PathBuf> {
 }
 
 /// Detect the first-launch case where a debug build is being run on a
-/// machine that has populated release-build state in `~/.agent-of-empires`
+/// machine that has populated release-build state in `~/.hmp`
 /// but no dev-build state yet. Returns the (release_dir, dev_dir) pair so
 /// callers can surface the paths in a one-time warning.
 ///
@@ -209,11 +209,11 @@ pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     }
 
     #[cfg(target_os = "linux")]
-    let release_dir = xdg_config_base().ok()?.join("agent-of-empires");
+    let release_dir = xdg_config_base().ok()?.join("hmp");
     #[cfg(target_os = "macos")]
-    let release_dir = macos_app_dir("agent-of-empires", ".agent-of-empires")?;
+    let release_dir = macos_app_dir("hmp", ".hmp")?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let release_dir = dirs::home_dir()?.join(".agent-of-empires");
+    let release_dir = dirs::home_dir()?.join(".hmp");
 
     #[cfg(target_os = "linux")]
     let dev_dir = xdg_config_base().ok()?.join(APP_DIR_NAME_XDG);
@@ -337,9 +337,9 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
 mod profile_listing_tests {
     //! Regression tests for the "three of every folder" bug (2026-04-25).
     //!
-    //! The `cs`/`cxa` account-switcher creates `~/.agent-of-empires/profiles/<name>`
+    //! The `cs`/`cxa` account-switcher creates `~/.hmp/profiles/<name>`
     //! as a symlink to `default` so multiple Claude account names share a
-    //! single AOE profile directory. Before the fix, `list_profiles()` used
+    //! single HMP profile directory. Before the fix, `list_profiles()` used
     //! `entry.path().is_dir()` which follows symlinks, so each alias was
     //! enumerated as a separate profile and the all-profiles session list
     //! rendered the same data N times.
@@ -353,7 +353,7 @@ mod profile_listing_tests {
 
     fn make_temp_profiles_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aoe-profile-listing-test-{}-{}",
+            "hmp-profile-listing-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -401,20 +401,20 @@ mod profile_listing_tests {
     }
 }
 
-/// Validate `AOE_INSTANCE_ID` is safe as a single path component and
+/// Validate `HMP_INSTANCE_ID` is safe as a single path component and
 /// for shell interpolation. Allowlist `[A-Za-z0-9_-]`, max 64 bytes.
 pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
     if id.is_empty() {
-        anyhow::bail!("AOE_INSTANCE_ID must not be empty");
+        anyhow::bail!("HMP_INSTANCE_ID must not be empty");
     }
     if id.len() > 64 {
-        anyhow::bail!("AOE_INSTANCE_ID too long ({} bytes, max 64)", id.len());
+        anyhow::bail!("HMP_INSTANCE_ID too long ({} bytes, max 64)", id.len());
     }
     if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        anyhow::bail!("AOE_INSTANCE_ID contains disallowed characters");
+        anyhow::bail!("HMP_INSTANCE_ID contains disallowed characters");
     }
     Ok(())
 }
@@ -528,7 +528,7 @@ pub fn set_default_profile(name: &str) -> Result<()> {
 /// TUI can show a single user-visible warning when either fails to parse.
 /// `tracing::warn!` calls inside the `_or_warn` helpers are silently dropped
 /// in default TUI mode (no subscriber), so this gives users a chance to see
-/// that their settings have been ignored without needing `AGENT_OF_EMPIRES_DEBUG=1`.
+/// that their settings have been ignored without needing `HMP_DEBUG=1`.
 pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     let mut messages: Vec<String> = Vec::new();
 
@@ -571,7 +571,7 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
 // refreshes its mtime on the heartbeat tick. This lets us (a) tell the push
 // consumer whether *any* TUI is watching, and (b) count how many TUIs are
 // alive so the footer can surface "another instance is watching" when two
-// `aoe` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
+// `hmp` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
 // tmux client list to read). A presence file is considered live while its
 // mtime is fresh; stale ones (crash without cleanup) are swept on read.
 
@@ -695,8 +695,8 @@ mod tests {
     #[test]
     fn test_fallback_prefers_existing_xdg_dir_even_over_legacy() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
+        let xdg = tmp.path().join(".config").join("hmp");
+        let legacy = tmp.path().join(".hmp");
         fs::create_dir_all(&xdg).unwrap();
         fs::create_dir_all(&legacy).unwrap();
 
@@ -714,8 +714,8 @@ mod tests {
     #[test]
     fn test_fallback_keeps_legacy_when_xdg_absent_even_if_env_set() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
+        let xdg = tmp.path().join(".config").join("hmp");
+        let legacy = tmp.path().join(".hmp");
         fs::create_dir_all(&legacy).unwrap();
 
         // An existing install that later sets XDG_CONFIG_HOME keeps reading its
@@ -729,8 +729,8 @@ mod tests {
     #[test]
     fn test_fallback_fresh_install_follows_env() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let xdg = tmp.path().join(".config").join("agent-of-empires");
-        let legacy = tmp.path().join(".agent-of-empires");
+        let xdg = tmp.path().join(".config").join("hmp");
+        let legacy = tmp.path().join(".hmp");
 
         // Neither dir exists yet: XDG_CONFIG_HOME set -> XDG opt-in; unset ->
         // the historical macOS home-dotfile default.
@@ -815,9 +815,9 @@ mod tests {
 
     fn release_dir_in(temp: &tempfile::TempDir) -> PathBuf {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let d = temp.path().join(".config").join("agent-of-empires");
+        let d = temp.path().join(".config").join("hmp");
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let d = temp.path().join(".agent-of-empires");
+        let d = temp.path().join(".hmp");
         d
     }
 
@@ -865,7 +865,7 @@ mod tests {
         let temp = isolate_app_dir();
         let release = release_dir_in(&temp);
         fs::create_dir_all(release.join("profiles")).unwrap();
-        // Simulate "user has already run aoe once after the namespace
+        // Simulate "user has already run hmp once after the namespace
         // change" by creating the dev dir.
         let _dev = app_dir(&temp);
         assert!(debug_namespace_drift().is_none());
@@ -873,11 +873,11 @@ mod tests {
 
     #[test]
     fn test_format_warning_mentions_both_paths_and_migration_command() {
-        let release = PathBuf::from("/home/u/.config/agent-of-empires");
-        let dev = PathBuf::from("/home/u/.config/agent-of-empires-dev");
+        let release = PathBuf::from("/home/u/.config/hmp");
+        let dev = PathBuf::from("/home/u/.config/hmp-dev");
         let msg = format_debug_namespace_warning(&release, &dev);
-        assert!(msg.contains("/home/u/.config/agent-of-empires"));
-        assert!(msg.contains("/home/u/.config/agent-of-empires-dev"));
+        assert!(msg.contains("/home/u/.config/hmp"));
+        assert!(msg.contains("/home/u/.config/hmp-dev"));
         assert!(msg.contains("cp -r"));
         assert!(msg.contains("not repeat"));
     }
@@ -930,7 +930,7 @@ mod tests {
     #[serial_test::serial]
     fn test_delete_profile_refuses_last_remaining() {
         // The invariant is a count, not a name: deleting the only profile is
-        // refused so AoE always has somewhere to file sessions.
+        // refused so HMP always has somewhere to file sessions.
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("solo")).unwrap();

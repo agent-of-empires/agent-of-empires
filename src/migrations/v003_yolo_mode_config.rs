@@ -108,7 +108,7 @@ mod tests {
 [sandbox]
 enabled_by_default = false
 yolo_mode_default = true
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+default_image = "ghcr.io/njbrake/hmp-sandbox:latest"
 
 [session]
 default_tool = "claude"

@@ -26,11 +26,11 @@ export interface NotMcp {
 }
 
 /** Pull the canonical name out of a tool call: prefer the wire `name`
- *  field, but fall back to `_aoe_title` from args (the structured view runtime
+ *  field, but fall back to `_hmp_title` from args (the structured view runtime
  *  forwards the ACP title there when it's distinct from the kind). */
 function nameOf(tool: ToolCall): string {
   if (tool.name) return tool.name;
-  const t = pickStr(parseJsonObject(tool.args_preview), "_aoe_title");
+  const t = pickStr(parseJsonObject(tool.args_preview), "_hmp_title");
   return t ?? "";
 }
 

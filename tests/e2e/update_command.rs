@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn aoe_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_aoe")
+    env!("CARGO_BIN_EXE_hmp")
 }
 
 /// Test that `aoe update --dry-run` invokes `brew list aoe` during installation detection.

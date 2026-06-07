@@ -37,25 +37,24 @@ use super::worktree::WorktreeCommands;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
-#[command(name = "aoe")]
-#[command(about = "Terminal session manager for AI coding agents")]
+#[command(name = "hmp")]
+#[command(about = "Hoxkss My Pi OMP workspace")]
 #[command(version = VERSION)]
 #[command(
-    long_about = "Agent of Empires (aoe) is a terminal session manager that uses tmux to help \
-    you manage and monitor AI coding agents like Claude Code and OpenCode.\n\n\
+    long_about = "Hoxkss My Pi (hmp) is an OMP-focused structured workspace with a web dashboard, tmux sessions, and ACP structured view.\n\n\
     Run without arguments to launch the TUI dashboard."
 )]
 pub struct Cli {
     /// Profile to use (separate workspace with its own sessions)
-    #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
+    #[arg(short = 'p', long, global = true, env = "HMP_PROFILE")]
     pub profile: Option<String>,
 
     /// Attach to a remote agent daemon instead of using the local
-    /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the
-    /// no-subcommand `aoe` invocation (the TUI dashboard); ignored
+    /// session list. Equivalent to setting `HMP_DAEMON_URL`; pair with
+    /// `HMP_DAEMON_TOKEN` for the bearer token. Only meaningful at the
+    /// no-subcommand `hmp` invocation (the TUI dashboard); ignored
     /// otherwise.
-    #[arg(long, global = true, env = "AOE_DAEMON_URL")]
+    #[arg(long, global = true, env = "HMP_DAEMON_URL")]
     pub daemon_url: Option<String>,
 
     #[command(subcommand)]
@@ -70,14 +69,14 @@ pub enum Commands {
     /// List supported agents and their install status
     Agents,
 
-    /// Initialize .agent-of-empires/config.toml in a repository
+    /// Initialize .hmp/config.toml in a repository
     Init(InitArgs),
 
     /// List all sessions
     #[command(alias = "ls")]
     List(ListArgs),
 
-    /// View the configured AoE log file with a pretty viewer
+    /// View the configured HMP log file with a pretty viewer
     Logs(LogsArgs),
 
     /// Get or set the running daemon's log filter at runtime.
@@ -155,7 +154,7 @@ pub enum Commands {
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
 
-    /// Print the current dashboard URL of a running `aoe serve` daemon
+    /// Print the current dashboard URL of a running `hmp serve` daemon
     #[cfg(feature = "serve")]
     Url(UrlArgs),
 
@@ -166,9 +165,9 @@ pub enum Commands {
         command: AcpCommands,
     },
 
-    /// Internal: per-acp-worker shim spawned by `aoe serve`. Owns the
+    /// Internal: per-acp-worker shim spawned by `hmp serve`. Owns the
     /// agent subprocess and outlives the daemon so workers survive
-    /// `aoe serve --stop`. Hidden from help.
+    /// `hmp serve --stop`. Hidden from help.
     #[cfg(feature = "serve")]
     #[command(name = "__acp-runner", hide = true)]
     AcpRunner(Box<crate::acp::runner::AcpRunnerArgs>),
@@ -179,10 +178,10 @@ pub enum Commands {
     #[command(name = "__extract-session-id", hide = true)]
     ExtractSessionId(ExtractSessionIdArgs),
 
-    /// Uninstall Agent of Empires
+    /// Uninstall Hoxkss My Pi
     Uninstall(UninstallArgs),
 
-    /// Update aoe to the latest release
+    /// Update hmp to the latest release
     Update(UpdateArgs),
 
     /// Generate shell completions
@@ -289,14 +288,14 @@ mod tests {
     #[test]
     fn command_name_is_allowlisted_and_identifier_safe() {
         let cases: &[(&[&str], &str)] = &[
-            (&["aoe", "add", "demo"], "add"),
-            (&["aoe", "agents"], "agents"),
-            (&["aoe", "ls"], "list"), // alias collapses to canonical
-            (&["aoe", "rm", "demo"], "remove"),
-            (&["aoe", "session", "current"], "session"),
-            (&["aoe", "telemetry", "status"], "telemetry"),
-            (&["aoe", "update"], "update"),
-            (&["aoe", "completion", "bash"], "completion"),
+            (&["hmp", "add", "demo"], "add"),
+            (&["hmp", "agents"], "agents"),
+            (&["hmp", "ls"], "list"), // alias collapses to canonical
+            (&["hmp", "rm", "demo"], "remove"),
+            (&["hmp", "session", "current"], "session"),
+            (&["hmp", "telemetry", "status"], "telemetry"),
+            (&["hmp", "update"], "update"),
+            (&["hmp", "completion", "bash"], "completion"),
         ];
         for (argv, expected) in cases {
             let cli = Cli::try_parse_from(*argv).expect("parse");
@@ -317,7 +316,7 @@ mod tests {
     /// Hidden, machine-spawned commands are never counted.
     #[test]
     fn hidden_commands_are_not_named() {
-        let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
+        let cli = Cli::try_parse_from(["hmp", "__extract-session-id"]).expect("parse");
         assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
     }
 

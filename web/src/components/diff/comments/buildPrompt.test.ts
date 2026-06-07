@@ -7,7 +7,7 @@ import {
 } from "./buildPrompt";
 import type { DiffComment } from "./types";
 
-/** Reproduce the legacy `<!-- aoe:diff-comments:v1 <base64> -->`
+/** Reproduce the legacy `<!-- hmp:diff-comments:v1 <base64> -->`
  *  encoder (removed from the send path in #1123) so the decode-fallback
  *  tests can still exercise `parseDiffCommentsSentinel` against the
  *  shape older persisted prompts carry. */
@@ -21,7 +21,7 @@ function legacySentinel(payload: {
   const bytes = new TextEncoder().encode(json);
   let bin = "";
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
-  return `<!-- aoe:diff-comments:v1 ${btoa(bin)} -->\nbody\n`;
+  return `<!-- hmp:diff-comments:v1 ${btoa(bin)} -->\nbody\n`;
 }
 
 function mk(partial: Partial<DiffComment>): DiffComment {
@@ -179,7 +179,7 @@ describe("buildDiffCommentsPrompt", () => {
     const built = buildDiffCommentsPrompt([mk({})], "", "", {
       isMultiRepo: false,
     });
-    expect(built.assembledMarkdown).not.toContain("aoe:diff-comments");
+    expect(built.assembledMarkdown).not.toContain("hmp:diff-comments");
     expect(built.assembledMarkdown).not.toContain("<!--");
     expect(built.assembledMarkdown).toContain("## Diff comments");
   });
@@ -234,7 +234,7 @@ describe("parseDiffCommentsSentinel (legacy decode fallback)", () => {
   });
 
   it("returns null for a malformed payload", () => {
-    const broken = "<!-- aoe:diff-comments:v1 not-base64!@# -->\nbody\n";
+    const broken = "<!-- hmp:diff-comments:v1 not-base64!@# -->\nbody\n";
     expect(parseDiffCommentsSentinel(broken)).toBeNull();
   });
 

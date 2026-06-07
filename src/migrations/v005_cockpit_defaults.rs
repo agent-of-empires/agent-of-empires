@@ -46,7 +46,7 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     let mut cockpit = toml::Table::new();
     cockpit.insert("enabled".into(), false.into());
     cockpit.insert("default_for_claude".into(), true.into());
-    cockpit.insert("default_agent".into(), "aoe-agent".into());
+    cockpit.insert("default_agent".into(), "hmp-agent".into());
     cockpit.insert("max_concurrent_workers".into(), (5_i64).into());
     cockpit.insert("replay_events".into(), (500_i64).into());
     cockpit.insert("replay_bytes".into(), (5_242_880_i64).into());

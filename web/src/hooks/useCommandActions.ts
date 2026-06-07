@@ -115,7 +115,7 @@ export function useCommandActions({
 
     actions.push({
       id: "action:about",
-      title: "About Agent of Empires",
+      title: "About Hoxkss My Pi",
       group: "Actions",
       keywords: ["info", "version", "links", "github", "website"],
       perform: onOpenAbout,

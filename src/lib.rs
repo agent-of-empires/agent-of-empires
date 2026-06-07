@@ -1,4 +1,4 @@
-//! Agent of Empires library - Core functionality for the terminal session manager
+//! Hoxkss My Pi library - Core functionality for the terminal session manager
 
 #[cfg(feature = "serve")]
 pub mod acp;

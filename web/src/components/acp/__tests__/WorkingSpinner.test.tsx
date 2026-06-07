@@ -31,7 +31,7 @@ function renderSpinner(opts: {
   /** In-flight tool name, or null for "model is silent". */
   tool: string | null;
   thinking?: boolean;
-  /** True once the user clicked Stop and aoe armed escalation (#1727). */
+  /** True once the user clicked Stop and hmp armed escalation (#1727). */
   cancelling?: boolean;
   /** ISO deadline for the escalation countdown, or null. */
   cancelEscalatesAt?: string | null;

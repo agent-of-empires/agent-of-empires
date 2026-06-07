@@ -1,4 +1,4 @@
-//! `agent-of-empires worktree` command implementation
+//! `hmp worktree` command implementation
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
@@ -91,7 +91,7 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
         println!("  Worktree Path: {}", session.project_path);
         println!("  Main Repo:     {}", wt_info.main_repo_path);
         println!(
-            "  Managed by aoe: {}",
+            "  Managed by hmp: {}",
             if wt_info.managed_by_aoe { "Yes" } else { "No" }
         );
         println!(

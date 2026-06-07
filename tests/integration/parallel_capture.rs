@@ -52,13 +52,13 @@ fn build_exclusion_set_for_test(current_instance_id: &str) -> HashSet<String> {
             continue;
         }
 
-        let owner = env::get_hidden_env(session_name, env::AOE_INSTANCE_ID_KEY);
+        let owner = env::get_hidden_env(session_name, env::HMP_INSTANCE_ID_KEY);
 
         if owner.as_deref() == Some(current_instance_id) {
             continue;
         }
 
-        if let Some(captured) = env::get_hidden_env(session_name, env::AOE_CAPTURED_SESSION_ID_KEY)
+        if let Some(captured) = env::get_hidden_env(session_name, env::HMP_CAPTURED_SESSION_ID_KEY)
         {
             excluded.insert(captured);
         }
@@ -96,7 +96,7 @@ fn create_test_sessions(session_names: &[String], instance_ids: &[String]) {
             .expect("Failed to create tmux session");
         assert!(status.success(), "Failed to create tmux session: {}", name);
 
-        env::set_hidden_env(name, env::AOE_INSTANCE_ID_KEY, instance_id)
+        env::set_hidden_env(name, env::HMP_INSTANCE_ID_KEY, instance_id)
             .unwrap_or_else(|e| panic!("Failed to set AOE_INSTANCE_ID for {}: {}", name, e));
     }
 }
@@ -143,7 +143,7 @@ fn test_parallel_launch_unique_session_ids() {
                     if let Some(ref session_id) = captured {
                         let _ = env::set_hidden_env(
                             session_name,
-                            env::AOE_CAPTURED_SESSION_ID_KEY,
+                            env::HMP_CAPTURED_SESSION_ID_KEY,
                             session_id,
                         );
                     }
@@ -211,7 +211,7 @@ fn test_sequential_capture_strict_uniqueness() {
 
         env::set_hidden_env(
             &session_names[i],
-            env::AOE_CAPTURED_SESSION_ID_KEY,
+            env::HMP_CAPTURED_SESSION_ID_KEY,
             &session_id,
         )
         .unwrap_or_else(|e| panic!("Failed to persist captured session for {}: {}", i + 1, e));

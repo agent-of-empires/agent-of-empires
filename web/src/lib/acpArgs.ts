@@ -45,7 +45,7 @@ export function pickFirst(
 /** Derive a one-line preview from a tool call's `args_preview`, mirroring
  *  the per-card primary-arg extraction in ToolCards.tsx: command for
  *  execute, path for read/edit/delete, query/pattern for search, url for
- *  fetch, then the ACP-forwarded `_aoe_title`. Returns null when the
+ *  fetch, then the ACP-forwarded `_hmp_title`. Returns null when the
  *  payload carries no usable primary argument (e.g. an adapter that ships
  *  an empty `{}` for bash); callers fall back to the tool name. */
 export function previewFromArgs(argsPreview: string): string | null {
@@ -55,19 +55,19 @@ export function previewFromArgs(argsPreview: string): string | null {
     pickStr(args, "path", "file_path", "filePath", "filename"),
     pickStr(args, "query", "pattern"),
     pickStr(args, "url"),
-    pickStr(args, "_aoe_title"),
+    pickStr(args, "_hmp_title"),
   );
 }
 
 /** Whether an `args_preview` has body content worth expanding: a
  *  non-object payload counts when non-blank; an object counts when it
- *  has at least one non-`_aoe_` key. Mirrors ArgsView's render gate so
+ *  has at least one non-`_hmp_` key. Mirrors ArgsView's render gate so
  *  the approval card only shows an expand affordance when there is
  *  something behind it. */
 export function hasArgsBody(argsPreview: string): boolean {
   const parsed = parseJsonObject(argsPreview);
   if (!parsed) return argsPreview.trim().length > 0;
-  return Object.keys(parsed).some((k) => !k.startsWith("_aoe_"));
+  return Object.keys(parsed).some((k) => !k.startsWith("_hmp_"));
 }
 
 export interface TodoPayloadItem {

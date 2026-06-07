@@ -3,7 +3,7 @@ import { fetchUpdateStatus } from "../lib/api";
 import type { UpdateStatus } from "../lib/api";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
-const DISMISS_KEY = "aoe-update-dismissed-version";
+const DISMISS_KEY = "hmp-update-dismissed-version";
 
 // Minimum poll period regardless of what the server reports. Guards
 // against a misconfigured `web_poll_interval_minutes = 0` hammering

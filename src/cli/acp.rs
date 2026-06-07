@@ -1,9 +1,9 @@
 //! ACP structured-view CLI subcommands.
 //!
-//! `aoe acp doctor` runs preflight checks (Node runtime, agent
-//! binaries, claude auth). `aoe acp agents` lists configured
+//! `hmp acp doctor` runs preflight checks (Node runtime, agent
+//! binaries, claude auth). `hmp acp agents` lists configured
 //! agents. Logs/restart are deferred until the worker
-//! supervisor is wired into `aoe serve`.
+//! supervisor is wired into `hmp serve`.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -21,12 +21,12 @@ pub enum AcpCommands {
         #[arg(long)]
         json: bool,
         /// Attempt safe remediations: install missing claude-code-acp
-        /// adapter, verify aoe-agent presence, etc. (Reserved for future
+        /// adapter, verify hmp-agent presence, etc. (Reserved for future
         /// release; the flag exists so scripts can opt in early.)
         #[arg(long)]
         fix: bool,
     },
-    /// List configured agents (claude-code, aoe-agent, etc.).
+    /// List configured agents (claude-code, hmp-agent, etc.).
     Agents,
     /// List running agent workers (detached or attached).
     Ps {
@@ -36,7 +36,7 @@ pub enum AcpCommands {
     },
     /// Gracefully stop an agent worker (SIGTERM the runner, agent
     /// receives stdin EOF). Sessions can be reattached on the next
-    /// `aoe serve` only if they are still alive afterward; `stop`
+    /// `hmp serve` only if they are still alive afterward; `stop`
     /// destroys the worker.
     Stop {
         /// Session id to stop. Mutually exclusive with `--all`.
@@ -124,14 +124,14 @@ pub enum AcpCommands {
         since: u64,
     },
     /// Open the TUI structured view directly for a known session id.
-    /// Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach
+    /// Combine with `HMP_DAEMON_URL` (+ `HMP_DAEMON_TOKEN`) to attach
     /// across machines without going through the home session list.
     Attach {
         /// Acp session id.
         session: String,
     },
     /// Switch an agent session to a different ACP agent, keeping the
-    /// transcript. The new agent starts fresh; use `aoe acp agents`
+    /// transcript. The new agent starts fresh; use `hmp acp agents`
     /// to list valid targets. Handy for returning to claude after a
     /// rate-limit handoff to codex.
     SwitchAgent {
@@ -301,7 +301,7 @@ async fn doctor(json: bool, fix: bool) -> Result<()> {
     println!("======================");
     println!();
     println!("The structured view is the ACP-based structured rendering. It is the default");
-    println!("in the web dashboard; `aoe add` and the TUI default to the terminal view.");
+    println!("in the web dashboard; `hmp add` and the TUI default to the terminal view.");
     println!("Pass --structured-view or --agent to opt a CLI session in (or flip a session");
     println!("from the session view).");
     println!();
@@ -397,12 +397,12 @@ fn find_in_path(binary: &str) -> Option<String> {
 }
 
 pub(crate) fn command_present(command: &str) -> bool {
-    // Placeholders like `${aoe_data_dir}/acp-worker/...` resolve at
+    // Placeholders like `${hmp_data_dir}/acp-worker/...` resolve at
     // runtime against the app data dir, so the literal string contains
     // both `${` and `/`. Check the placeholder branch FIRST — otherwise
     // the `/`-branch tries to stat a literal path containing `${...}`
     // and reports "missing" for every placeholder-based agent
-    // (notably `aoe-agent`, our bundled multi-provider fallback).
+    // (notably `hmp-agent`, our bundled multi-provider fallback).
     if command.contains("${") {
         true
     } else if command.contains('/') || command.contains('\\') {
@@ -488,7 +488,7 @@ fn ps(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Render the BUILD cell for `aoe acp ps`. An empty `build_version`
+/// Render the BUILD cell for `hmp acp ps`. An empty `build_version`
 /// (a legacy record written before the field existed) shows `<legacy>`;
 /// any worker whose build differs from the running daemon's is tagged
 /// `(stale)` so a not-yet-respawned worker is visible rather than silent.
@@ -514,7 +514,7 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
         let id = match session {
             Some(s) => s,
             None => {
-                anyhow::bail!("aoe acp stop requires <session> or --all");
+                anyhow::bail!("hmp acp stop requires <session> or --all");
             }
         };
         worker_registry::load(&id)?
@@ -590,7 +590,7 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
             if records.len() == 1 {
                 records[0].session_id.clone()
             } else if records.is_empty() {
-                println!("No agent workers running. Use `aoe acp ps` to inspect.");
+                println!("No agent workers running. Use `hmp acp ps` to inspect.");
                 return Ok(());
             } else {
                 println!("Multiple agent workers running; pass --session <id>:");
@@ -642,11 +642,11 @@ fn restart(session: &str) -> Result<()> {
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
-    // SIGTERM the runner; the next 2s reconciler tick on `aoe serve`
+    // SIGTERM the runner; the next 2s reconciler tick on `hmp serve`
     // notices the session has no live worker and spawns a fresh one
     // (which calls session/load with the cached acp_session_id).
     // Write the restart-pending marker BEFORE deleting the registry so
-    // the daemon's reaper can distinguish a restart from `aoe acp
+    // the daemon's reaper can distinguish a restart from `hmp acp
     // stop|kill` and emit `Stopped { reason: "restart_pending" }`
     // instead of `user_stopped` — the UI then renders a transient
     // "Restarting…" banner instead of the persistent "Stopped +
@@ -659,7 +659,7 @@ fn restart(session: &str) -> Result<()> {
     // leader liveness would skip the killpg and leak descendants.
     worker_registry::terminate_runner_group(record.pid);
     println!(
-        "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
+        "Stopped runner for {} (PID {}). `hmp serve` will respawn on its next reconciler tick.",
         session, record.pid
     );
     Ok(())
@@ -677,10 +677,10 @@ fn truncate(s: &str, n: usize) -> String {
 
 // ── Daemon-backed agent verbs ─────────────────────────────────────
 //
-// These talk to a running `aoe serve` daemon via the agent HTTP / WS
+// These talk to a running `hmp serve` daemon via the agent HTTP / WS
 // client. Mutating verbs (`prompt`, `approve`, `cancel`) auto-spawn a
 // loopback daemon when none is running so a user who only ever uses
-// the CLI doesn't have to remember to start `aoe serve` first. Read
+// the CLI doesn't have to remember to start `hmp serve` first. Read
 // verbs (`history`, `status`, `tail`) auto-spawn too because the
 // daemon is the only path to the disk-backed event store; there's no
 // useful read against "no daemon".
@@ -796,12 +796,12 @@ async fn cancel(session: &str) -> Result<()> {
     Ok(())
 }
 
-/// Honest confirmation for `aoe acp cancel`. The daemon only arms
+/// Honest confirmation for `hmp acp cancel`. The daemon only arms
 /// the auto-restart escalation when a prompt is in flight; for an idle
 /// session the cancel is a no-op notification, and the CLI cannot tell
 /// which from the 202 it gets back. Spell both out so the operator does
 /// not read a bare "cancel sent" as "nothing happened" and reach for
-/// `aoe acp restart` before the escalation has a chance to fire. See
+/// `hmp acp restart` before the escalation has a chance to fire. See
 /// #1858.
 fn cancel_confirmation_message(escalation_grace_secs: u64) -> String {
     format!(
@@ -835,7 +835,7 @@ async fn tail(session: &str, since: u64) -> Result<()> {
                 println!("{line}");
             }
             Ok(WsMessage::Lagged) => {
-                eprintln!("warning: ring buffer lagged; some events lost. Refetch with `aoe acp history <session>`.");
+                eprintln!("warning: ring buffer lagged; some events lost. Refetch with `hmp acp history <session>`.");
             }
             Err(e) => {
                 eprintln!("ws error: {e}");
@@ -916,7 +916,7 @@ mod tests {
         assert_eq!(parse_node_major("not a version"), None);
     }
 
-    /// Story 3: `aoe acp ps` surfaces the worker build version, tags
+    /// Story 3: `hmp acp ps` surfaces the worker build version, tags
     /// a build-stale worker, and renders an empty (legacy) version as
     /// `<legacy>`. See #1754.
     #[test]
@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(render_build_cell("", true), "<legacy> (stale)");
     }
 
-    /// #1858: `aoe acp cancel` must explain the conditional
+    /// #1858: `hmp acp cancel` must explain the conditional
     /// auto-restart escalation and the idle no-op, not print a bare
     /// "cancel sent" that reads as "nothing happened".
     #[test]

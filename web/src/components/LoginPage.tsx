@@ -51,7 +51,7 @@ export function LoginPage({ onSuccess }: Props) {
               className="rounded-sm"
             />
             <span className="font-mono text-lg text-text-primary tracking-tight">
-              aoe
+              hmp
             </span>
           </div>
 

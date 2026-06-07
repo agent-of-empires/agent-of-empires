@@ -9,7 +9,7 @@
 //     `onResolve` with the matching ApprovalDecision,
 //   - destructive branch: only Hold-to-allow + Deny; instant click
 //     does NOT resolve until LONG_PRESS_MS elapses,
-//   - args_preview rendering: parsed JSON → <dl> with `_aoe_*` keys
+//   - args_preview rendering: parsed JSON → <dl> with `_hmp_*` keys
 //     hidden; non-object → raw <pre>,
 //   - offline + rolled-back states disable the action surface.
 
@@ -134,7 +134,7 @@ describe("ApprovalCard (benign)", () => {
     expect(screen.queryByText("cwd")).toBeNull();
   });
 
-  it("hides bookkeeping keys whose name starts with _aoe_ when expanded", () => {
+  it("hides bookkeeping keys whose name starts with _hmp_ when expanded", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(
       <ApprovalCard
@@ -145,7 +145,7 @@ describe("ApprovalCard (benign)", () => {
             kind: "execute",
             args_preview: JSON.stringify({
               command: "ls",
-              _aoe_parent_tool_call_id: "parent-123",
+              _hmp_parent_tool_call_id: "parent-123",
             }),
             started_at: "2026-05-21T00:00:00Z",
           },
@@ -154,7 +154,7 @@ describe("ApprovalCard (benign)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /Approval needed/i }));
-    expect(screen.queryByText("_aoe_parent_tool_call_id")).toBeNull();
+    expect(screen.queryByText("_hmp_parent_tool_call_id")).toBeNull();
     expect(screen.queryByText("parent-123")).toBeNull();
     expect(screen.getByText("command")).toBeTruthy();
   });
@@ -188,7 +188,7 @@ describe("ApprovalCard (benign)", () => {
             id: "t-1",
             name: "Bash",
             kind: "execute",
-            args_preview: JSON.stringify({ _aoe_title: "noop" }),
+            args_preview: JSON.stringify({ _hmp_title: "noop" }),
             started_at: "2026-05-21T00:00:00Z",
           },
         })}

@@ -57,10 +57,10 @@ pub enum HttpError {
     ReadOnly,
     // The daemon may reject for several reasons: stale token, missing
     // passphrase session, device binding mismatch. Pointing at
-    // `AOE_DAEMON_TOKEN` was misleading on `--auth=passphrase` and
+    // `HMP_DAEMON_TOKEN` was misleading on `--auth=passphrase` and
     // `--auth=none` daemons that never had a token in the first
     // place. See #1525.
-    #[error("daemon rejected the request (401); restart `aoe serve` or check `--auth` mode")]
+    #[error("daemon rejected the request (401); restart `hmp serve` or check `--auth` mode")]
     Unauthorized,
     #[error("daemon returned HTTP {status}: {body}")]
     Server { status: StatusCode, body: String },
@@ -70,7 +70,7 @@ impl HttpClient {
     pub fn new(endpoint: DaemonEndpoint) -> Result<Self, HttpError> {
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
-            .user_agent(concat!("aoe-acp-client/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("hmp-acp-client/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { http, endpoint })
     }
@@ -292,8 +292,8 @@ impl HttpClient {
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when
-    /// `AOE_DAEMON_URL` is set, we fail loud before falling into raw
-    /// reqwest transport errors) and `aoe serve --status` (renders
+    /// `HMP_DAEMON_URL` is set, we fail loud before falling into raw
+    /// reqwest transport errors) and `hmp serve --status` (renders
     /// remote daemon info instead of "Daemon: not running").
     ///
     /// Hits `GET /api/sessions`, the cheapest authenticated endpoint
@@ -402,7 +402,7 @@ mod tests {
 
     // Regression test for #1525. The startup toast on a 401 from the
     // structured view endpoints folds in `HttpError::Unauthorized`'s Display.
-    // Previously that Display string hard-coded `AOE_DAEMON_TOKEN`,
+    // Previously that Display string hard-coded `HMP_DAEMON_TOKEN`,
     // which made the toast actively misleading on `--auth=passphrase`
     // and `--auth=none` daemons that never had a token. Pin the new
     // wording so the env-var hint can't regress back in.
@@ -470,7 +470,7 @@ mod tests {
     fn unauthorized_display_omits_token_env_var() {
         let rendered = HttpError::Unauthorized.to_string();
         assert!(
-            !rendered.contains("AOE_DAEMON_TOKEN"),
+            !rendered.contains("HMP_DAEMON_TOKEN"),
             "Unauthorized message must not pin diagnosis to a token env var that does not exist in passphrase or no-auth mode: {rendered}"
         );
         assert!(

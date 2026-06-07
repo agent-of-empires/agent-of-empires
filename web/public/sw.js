@@ -43,13 +43,13 @@ self.addEventListener("push", (event) => {
     try {
       payload = event.data.json();
     } catch {
-      payload = { title: "Agent of Empires", body: event.data.text() };
+      payload = { title: "Hoxkss My Pi", body: event.data.text() };
     }
   }
-  const title = payload.title || "Agent of Empires";
+  const title = payload.title || "Hoxkss My Pi";
   const options = {
     body: payload.body || "",
-    tag: payload.tag || "aoe",
+    tag: payload.tag || "hmp",
     renotify: true,
     data: { url: payload.url || "/" },
     icon: "/icon-192.png",
@@ -70,7 +70,7 @@ self.addEventListener("push", (event) => {
         // toast, skip the OS notification. If the client has no handler,
         // the message is silently dropped which is fine.
         try {
-          focused.postMessage({ type: "aoe-push", payload });
+          focused.postMessage({ type: "hmp-push", payload });
         } catch {
           /* ignore */
         }

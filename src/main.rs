@@ -1,4 +1,4 @@
-//! Agent of Empires - Terminal session manager for AI coding agents
+//! Hoxkss My Pi - Terminal session manager for AI coding agents
 
 use agent_of_empires::cli::{self, Cli, Commands};
 use agent_of_empires::logging::{self, LogConfig, ProcessContext, SubscriberTarget};
@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 
-/// Did the user invoke `aoe serve`? Feature-gated because `Commands::Serve`
+/// Did the user invoke `hmp serve`? Feature-gated because `Commands::Serve`
 /// only exists when the `serve` feature is on; in TUI-only builds we
 /// always return false so the tracing-init branch below compiles.
 #[cfg(feature = "serve")]
@@ -21,13 +21,13 @@ fn is_serve_command(_cli: &Cli) -> bool {
     false
 }
 
-/// Did the parent `aoe serve --daemon` spawn this process as the detached
+/// Did the parent `hmp serve --daemon` spawn this process as the detached
 /// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
 /// Drives sink resolution: child's stdout/stderr are redirected to the
 /// configured log file, so tracing must also write there (a Stdout sink
 /// would land bytes in the same file via the OS redirect, but mixing two
 /// writers on the same fd hurts ordering, and the configured-sink path
-/// is what the TUI dialog and `aoe logs` tail).
+/// is what the TUI dialog and `hmp logs` tail).
 #[cfg(feature = "serve")]
 fn is_serve_daemon_child(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
 
     // If the user passed --daemon-url, mirror the value into the env
     // var so the acp::client::discovery layer (used by both the
-    // remote TUI home and the `aoe acp *` verbs) picks it up
+    // remote TUI home and the `hmp acp *` verbs) picks it up
     // through the same code path the env-only path uses. This avoids a
     // second "is the flag set?" check in every callsite.
     if let Some(url) = &cli.daemon_url {
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         // the `#[tokio::main]` wrapper that called us, and clap's
         // parsing was synchronous).
         unsafe {
-            std::env::set_var("AOE_DAEMON_URL", url);
+            std::env::set_var("HMP_DAEMON_URL", url);
         }
     }
 
@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
     // Lazy holder for the loaded config. Populated by the logging-init block
     // when it needs the `[logging]` section, and reused by the session-id
     // poller seed below the early-return command dispatch. Staying lazy here
-    // means commands that don't need app data (`aoe completion`,
-    // `aoe init`, `aoe agents`, `aoe uninstall`, `aoe update`, …) never
+    // means commands that don't need app data (`hmp completion`,
+    // `aoe init`, `aoe agents`, `aoe uninstall`, `hmp update`, …) never
     // call `get_app_dir()` as a side effect. `config_load_attempted` lets
     // the seed block skip a redundant load (and a redundant error warning)
     // when the logging block already tried.
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     let mut debug_log_warning: Option<String> = None;
     // Subscriber installation. One resolver picks the sink based on
     // `ProcessContext` + `[logging]` config (see `logging::resolve_sink`).
-    // Filter precedence: env (AOE_LOG_LEVEL / AGENT_OF_EMPIRES_DEBUG /
+    // Filter precedence: env (HMP_LOG_LEVEL / HMP_DEBUG /
     // overlay vars) > `[logging]` config > info baseline. See
     // `docs/development/logging.md` for the sink and filter matrix.
     let env_cfg = LogConfig::from_env();
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
     };
 
     // One-shot CLI without an env override gets no subscriber: short-lived,
-    // not worth the overhead. Opt in via `AOE_LOG_LEVEL=...`.
+    // not worth the overhead. Opt in via `HMP_LOG_LEVEL=...`.
     let should_init = matches!(
         ctx,
         ProcessContext::Tui | ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
@@ -208,12 +208,12 @@ async fn main() -> Result<()> {
     }
 
     // Record which CLI subcommand ran for opt-in telemetry, before dispatch so
-    // early-returning commands (e.g. `aoe update`, `aoe telemetry`) are counted
+    // early-returning commands (e.g. `hmp update`, `aoe telemetry`) are counted
     // too. A true no-op unless the install is opted in: `track_cli_command`
     // gates on a non-creating app-dir check first, so app-data-free commands
-    // (`aoe completion`, `aoe init`, ...) never materialize the app dir and keep
+    // (`hmp completion`, `aoe init`, ...) never materialize the app dir and keep
     // working in read-only / sandboxed (Nix) environments. Skipped for the
-    // detached `--daemon-child` re-exec so `aoe serve --daemon` counts the
+    // detached `--daemon-child` re-exec so `hmp serve --daemon` counts the
     // user's invocation once, not the machinery fork. The once-per-day flush is
     // bounded so a dead endpoint can never hang the command.
     if !is_daemon_child {
@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
     // These work in read-only/sandboxed environments (e.g. Nix builds).
     match cli.command {
         Some(Commands::Completion { shell }) => {
-            generate(shell, &mut Cli::command(), "aoe", &mut std::io::stdout());
+            generate(shell, &mut Cli::command(), "hmp", &mut std::io::stdout());
             return Ok(());
         }
         Some(Commands::Init(args)) => return cli::init::run(args).await,

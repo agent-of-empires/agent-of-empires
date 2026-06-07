@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Guards the dev-server proxy contract that `cargo xtask dev` relies on: when
-// VITE_PROXY points at a running `aoe serve`, the Vite dev server must forward
+// VITE_PROXY points at a running `hmp serve`, the Vite dev server must forward
 // REST (/api) and every WebSocket relay (/sessions/{id}/...ws) there, with the
 // WS target switched to the ws:// scheme. See vite.config.ts.
 

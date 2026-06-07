@@ -293,7 +293,7 @@ pub fn remove(
 ///
 /// This is a read-modify-write over the scope's registry file. There is no
 /// optimistic-concurrency guard; for a single-user local tool last-writer-wins
-/// across racing `aoe` processes is acceptable.
+/// across racing `hmp` processes is acceptable.
 pub fn update_base_branch(
     profile: &str,
     scope: ProjectScope,

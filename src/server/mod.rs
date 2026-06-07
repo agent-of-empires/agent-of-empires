@@ -154,7 +154,7 @@ impl TokenManager {
 
     /// Spawn a background rotation task. Production paths only call this
     /// from the `--remote` branch; debug builds also call it when the
-    /// `AOE_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
+    /// `HMP_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
     /// specs can observe the grace window without waiting hours.
     pub fn spawn_rotation_task(self: &Arc<Self>) {
         let manager = Arc::clone(self);
@@ -179,12 +179,12 @@ impl TokenManager {
     }
 }
 
-/// Read `AOE_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
+/// Read `HMP_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
 /// release so production cannot be forced into a short rotation cycle
 /// by a stray env var.
 #[cfg(debug_assertions)]
 fn test_token_lifetime_override() -> Option<Duration> {
-    std::env::var("AOE_TEST_TOKEN_LIFETIME_SECS")
+    std::env::var("HMP_TEST_TOKEN_LIFETIME_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -196,10 +196,10 @@ fn test_token_lifetime_override() -> Option<Duration> {
     None
 }
 
-/// Read `AOE_TEST_TOKEN_GRACE_SECS`. Debug builds only.
+/// Read `HMP_TEST_TOKEN_GRACE_SECS`. Debug builds only.
 #[cfg(debug_assertions)]
 fn test_token_grace_override() -> Option<Duration> {
-    std::env::var("AOE_TEST_TOKEN_GRACE_SECS")
+    std::env::var("HMP_TEST_TOKEN_GRACE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -682,13 +682,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Tailscale Funnel setup failed: {e}\n\n\
-                         aoe detected a logged-in Tailscale on this host and did not \
+                         hmp detected a logged-in Tailscale on this host and did not \
                          fall back to Cloudflare, because doing so silently would \
                          give you a rotating URL that breaks installed PWAs (the \
                          reason Tailscale is the preferred transport).\n\n\
                          Ways to move forward:\n  \
-                         - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
-                         - Re-run with `aoe serve --remote --no-tailscale` to use \
+                         - Fix the Tailscale issue above and re-run `hmp serve --remote`.\n  \
+                         - Re-run with `hmp serve --remote --no-tailscale` to use \
                          Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
                          - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
                          to use a named Cloudflare tunnel."
@@ -725,7 +725,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     "\nNote: this Cloudflare quick tunnel URL changes on every restart.\n\
                      Installed PWAs (home-screen apps) break when the URL changes.\n\
                      For a stable installable dashboard, install Tailscale and run\n\
-                     `tailscale up` on this host before `aoe serve --remote`, or use\n\
+                     `tailscale up` on this host before `hmp serve --remote`, or use\n\
                      a named Cloudflare tunnel via --tunnel-name/--tunnel-url.\n"
                 );
             }
@@ -872,7 +872,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // reconciler in `status_poll_loop`. The poll interval's first tick
     // fires immediately, so on cold startup this is equivalent to the
     // old in-place loop here, while also covering sessions added via
-    // `aoe add --acp` while serve is already running.
+    // `hmp add --acp` while serve is already running.
 
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
@@ -1064,14 +1064,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         });
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
         // Debug-build test path: live Playwright specs set
-        // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
+        // HMP_TEST_TOKEN_LIFETIME_SECS (and optionally HMP_TEST_TOKEN_GRACE_SECS)
         // so they can observe the rotation grace window without waiting hours.
         // Skips the remote-only serve.url rewrite and push retain steps because
         // neither exists in the local test setup.
         token_manager.spawn_rotation_task();
     }
 
-    // Graceful shutdown: SIGINT (Ctrl-C), SIGTERM (`aoe serve --stop`),
+    // Graceful shutdown: SIGINT (Ctrl-C), SIGTERM (`hmp serve --stop`),
     // and SIGHUP (parent session died). Without these, the default handler
     // kills the process immediately, skipping PID/URL file cleanup.
     //
@@ -1082,7 +1082,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     //      on the open WebSockets the browser hasn't disconnected.
     //   2. Spawns a 5s deadline as the safety net: if any handler
     //      somehow ignores the cancel, the process force-exits so
-    //      `Ctrl-C` and `aoe serve --stop` never hang. See #1198.
+    //      `Ctrl-C` and `hmp serve --stop` never hang. See #1198.
     //
     // Note: this future is awaited by `with_graceful_shutdown`, which
     // signals axum to stop accepting new connections once the future
@@ -1144,9 +1144,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Detach (but do NOT kill) every acp ACP worker. The per-session
     // `aoe __acp-runner` shims outlive this daemon: a fresh
-    // `aoe serve` reattaches via the reconciler on startup, so in-flight
-    // turns survive `aoe serve --stop`. To actually terminate workers,
-    // use `aoe acp stop [--all]`.
+    // `hmp serve` reattaches via the reconciler on startup, so in-flight
+    // turns survive `hmp serve --stop`. To actually terminate workers,
+    // use `hmp acp stop [--all]`.
     acp_supervisor.detach_all().await;
 
     // Clean up tunnel (cancels health monitor, then sends SIGTERM to cloudflared)
@@ -1571,7 +1571,7 @@ impl IpKind {
 
 /// Classify a v4 address into Tailscale (CGNAT 100.64.0.0/10, which is
 /// what Tailscale hands out), regular LAN (RFC1918), or loopback.
-/// Public non-RFC1918 / non-CGNAT addresses are rare on an `aoe serve`
+/// Public non-RFC1918 / non-CGNAT addresses are rare on an `hmp serve`
 /// host (would mean serving directly on the open internet) and fall
 /// through to `Lan` so we still surface them.
 pub fn classify_ip(ip: std::net::Ipv4Addr) -> IpKind {
@@ -2483,7 +2483,7 @@ async fn daemon_startup_recovery_cascade(
             // `structured view` OR brought the tmux pane back. Without the
             // tmux re-check, recovery would `kill_clean` a freshly-started
             // pane the user just attached to. The lock + this re-check
-            // serialise against any other AoE writer.
+            // serialise against any other HMP writer.
             //
             // Use the fallible `batch_pane_metadata()` here so a transient
             // tmux probe failure does NOT collapse to "pane dead" and
@@ -2754,7 +2754,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
         // status-change pushes in `push.rs`, approvals do NOT honour
         // the TUI/web active-session suppression; the service worker
         // still routes focused clients to an in-app toast via the
-        // existing `aoe-push` postMessage path. See #1038.
+        // existing `hmp-push` postMessage path. See #1038.
         if let crate::acp::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();

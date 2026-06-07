@@ -1,11 +1,11 @@
 //! Startup auto-recovery for AI agent sessions.
 //!
-//! After a system reboot, tmux loses all its sessions. AoE sessions whose
+//! After a system reboot, tmux loses all its sessions. HMP sessions whose
 //! agent supports `--resume <sid>` (claude, opencode, codex, gemini, vibe,
 //! pi, hermes, kiro, qwen) can be transparently recreated by replaying the
 //! resume cascade in `start_with_resume_fallback`. This module centralises
 //! the candidate selection and the cross-process exclusion needed to make
-//! that safe when both the TUI (`aoe`) and the daemon (`aoe serve`) are
+//! that safe when both the TUI (`hmp`) and the daemon (`hmp serve`) are
 //! running.
 //!
 //! The recovery cascade itself lives in `instance::start_with_resume_fallback`;
@@ -34,7 +34,7 @@
 //! Recovery installs a [`HookTimeoutScope`] before entering the cascade.
 //! `repo_config::run_hooks_captured` reads the scope and bounds each
 //! `on_launch` command by [`RECOVERY_HOOK_TIMEOUT`] (30 s, debug-overridable
-//! via `AOE_RECOVERY_HOOK_TIMEOUT_MS`); on expiry the child tree is killed
+//! via `HMP_RECOVERY_HOOK_TIMEOUT_MS`); on expiry the child tree is killed
 //! through [`crate::process::kill_process_tree`] (SIGTERM, 100 ms grace,
 //! then SIGKILL). An `N`-command list releases the lock within
 //! `N * (RECOVERY_HOOK_TIMEOUT + kill_grace)` per worker, with up to
@@ -263,17 +263,17 @@ pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
 /// hooks (#1265).
 pub const RECOVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Lower bound on `AOE_RECOVERY_HOOK_TIMEOUT_MS` so a misconfigured test
+/// Lower bound on `HMP_RECOVERY_HOOK_TIMEOUT_MS` so a misconfigured test
 /// cannot race fork+exec and trip the timeout before the child spawns.
 #[cfg(debug_assertions)]
 const RECOVERY_HOOK_TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 
 /// Resolve the recovery hook timeout. Release builds always return
-/// [`RECOVERY_HOOK_TIMEOUT`]; debug builds honor `AOE_RECOVERY_HOOK_TIMEOUT_MS`
+/// [`RECOVERY_HOOK_TIMEOUT`]; debug builds honor `HMP_RECOVERY_HOOK_TIMEOUT_MS`
 /// for tests, clamped to [`RECOVERY_HOOK_TIMEOUT_FLOOR`].
 pub fn recovery_hook_timeout() -> Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_RECOVERY_HOOK_TIMEOUT_MS") {
+    if let Ok(raw) = std::env::var("HMP_RECOVERY_HOOK_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             return Duration::from_millis(ms).max(RECOVERY_HOOK_TIMEOUT_FLOOR);
         }

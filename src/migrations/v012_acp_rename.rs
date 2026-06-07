@@ -308,7 +308,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[other]\nk = \"v\"\n\n[cockpit]\nenabled = true\ndefault_for_claude = false\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n",
+            "[other]\nk = \"v\"\n\n[cockpit]\nenabled = true\ndefault_for_claude = false\ndefault_agent = \"hmp-agent\"\nmax_concurrent_workers = 5\n",
         )
         .unwrap();
 
@@ -319,7 +319,7 @@ mod tests {
         let acp = doc["acp"].as_table().unwrap();
         assert!(!acp.contains_key("enabled"));
         assert!(!acp.contains_key("default_for_claude"));
-        assert_eq!(acp["default_agent"].as_str(), Some("aoe-agent"));
+        assert_eq!(acp["default_agent"].as_str(), Some("hmp-agent"));
         assert_eq!(acp["max_concurrent_workers"].as_integer(), Some(5));
         assert!(doc.contains_key("other"));
 

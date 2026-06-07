@@ -1,6 +1,6 @@
 //! Migration v002: Seed shared sandbox directories from existing named Docker volumes.
 //!
-//! Previously, agent auth was stored in named Docker volumes (e.g. `aoe-claude-auth`).
+//! Previously, agent auth was stored in named Docker volumes (e.g. `hmp-claude-auth`).
 //! Now sandbox dirs are the only mechanism. This migration copies data from any
 //! existing named volumes into the corresponding sandbox directories so users don't
 //! lose their auth state.
@@ -10,7 +10,7 @@
 //! sync_agent_config has already populated the sandbox dir with non-credential files.
 //!
 //! Old volumes are intentionally preserved after migration. Users can remove them
-//! manually with `docker volume rm aoe-claude-auth aoe-opencode-auth ...`.
+//! manually with `docker volume rm hmp-claude-auth hmp-opencode-auth ...`.
 
 use anyhow::Result;
 use std::path::Path;
@@ -26,23 +26,23 @@ struct VolumeMigration {
 
 const VOLUME_MIGRATIONS: &[VolumeMigration] = &[
     VolumeMigration {
-        volume_name: "aoe-claude-auth",
+        volume_name: "hmp-claude-auth",
         sandbox_rel: ".claude/sandbox",
     },
     VolumeMigration {
-        volume_name: "aoe-opencode-auth",
+        volume_name: "hmp-opencode-auth",
         sandbox_rel: ".local/share/opencode/sandbox",
     },
     VolumeMigration {
-        volume_name: "aoe-codex-auth",
+        volume_name: "hmp-codex-auth",
         sandbox_rel: ".codex/sandbox",
     },
     VolumeMigration {
-        volume_name: "aoe-gemini-auth",
+        volume_name: "hmp-gemini-auth",
         sandbox_rel: ".gemini/sandbox",
     },
     VolumeMigration {
-        volume_name: "aoe-vibe-auth",
+        volume_name: "hmp-vibe-auth",
         sandbox_rel: ".vibe/sandbox",
     },
 ];
@@ -66,11 +66,11 @@ fn volume_exists(name: &str) -> bool {
 }
 
 /// Find a container image available locally to use for volume extraction.
-/// Tries the AOE sandbox image first, then small well-known images, then
+/// Tries the HMP sandbox image first, then small well-known images, then
 /// falls back to whatever is locally available.
 fn find_local_image() -> Option<String> {
     let candidates = [
-        "ghcr.io/njbrake/aoe-sandbox:latest",
+        "ghcr.io/njbrake/hmp-sandbox:latest",
         "alpine",
         "busybox",
         "ubuntu",
@@ -105,7 +105,7 @@ fn find_local_image() -> Option<String> {
 /// available image. Returns the temp dir path on success. Caller is responsible
 /// for cleaning up the temp dir.
 fn extract_volume_to_temp(volume_name: &str, image: &str) -> Result<std::path::PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("aoe-migration-{}", volume_name));
+    let tmp = std::env::temp_dir().join(format!("hmp-migration-{}", volume_name));
     if tmp.exists() {
         std::fs::remove_dir_all(&tmp)?;
     }

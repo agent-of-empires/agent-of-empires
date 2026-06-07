@@ -2,9 +2,9 @@
 // the passphrase login cookie. Generated once on first load via
 // `crypto.getRandomValues`, persisted in localStorage, and presented on
 // every authenticated REST request (via `X-Aoe-Device-Binding`) and
-// every WebSocket upgrade (via the `aoe-device.<secret>` subprotocol).
+// every WebSocket upgrade (via the `hmp-device.<secret>` subprotocol).
 //
-// A stolen `aoe_session` cookie alone is therefore not enough to
+// A stolen `hmp_session` cookie alone is therefore not enough to
 // authenticate as the user: the attacker also needs the binding
 // secret. Mobile IP rotation no longer logs the user out because IP
 // is no longer part of the session identity on the server side. See
@@ -24,7 +24,7 @@
 // pass (WebCrypto non-extractable keys + per-request signatures) can
 // replace the storage and accessor without touching the call sites.
 
-const STORAGE_KEY = "aoe_device_binding_secret_v1";
+const STORAGE_KEY = "hmp_device_binding_secret_v1";
 
 /** Bytes of entropy in the secret. Matches the server-side constant in
  *  `src/server/login.rs::BINDING_SECRET_BYTES`. */

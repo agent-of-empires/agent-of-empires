@@ -1,4 +1,4 @@
-//! `agent-of-empires profile` subcommands implementation
+//! `hmp profile` subcommands implementation
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
@@ -88,7 +88,7 @@ async fn list_profiles() -> Result<()> {
 async fn create_profile(name: &str) -> Result<()> {
     session::create_profile(name)?;
     println!("✓ Created profile: {}", name);
-    println!("  Use with: aoe -p {}", name);
+    println!("  Use with: hmp -p {}", name);
     Ok(())
 }
 

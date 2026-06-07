@@ -107,8 +107,8 @@ import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
 
-const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
-const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
+const SIDEBAR_WIDTH_KEY = "hmp-sidebar-width";
+const SUNK_EXPANDED_KEY = "hmp-sidebar-sunk-expanded";
 const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 480;
@@ -643,7 +643,7 @@ export const SessionRow = memo(function SessionRow({
   // Workspace renders as favorited when any of its sessions are
   // favorited. Mirrors the TUI's within-tier pin: the star promotes the
   // row visually so the user can find their starred work fast. Toggled
-  // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
+  // via TUI `f`/`F` or `hmp session favorite|unfavorite`.
   const isFavorited = workspace.sessions.some((s) => s.favorited);
   // Web-only triage signals. `pinned` floats the workspace to the top
   // of every sort mode; `archived` and `snoozedUntil` mark the row as
@@ -869,7 +869,7 @@ export const SessionRow = memo(function SessionRow({
   };
 
   // Editing the workdir name moves the worktree directory, so it is only
-  // offered for an aoe-managed worktree session that is not running. See
+  // offered for an hmp-managed worktree session that is not running. See
   // #1723.
   const canEditWorkdir =
     !!firstSession?.has_managed_worktree && !runningSession && !!sessionId;

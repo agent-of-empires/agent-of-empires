@@ -1,4 +1,4 @@
-//! `agent-of-empires uninstall` command implementation
+//! `hmp uninstall` command implementation
 
 use anyhow::Result;
 use clap::Args;
@@ -34,7 +34,7 @@ struct FoundItem {
 #[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(args: UninstallArgs) -> Result<()> {
     println!("╔════════════════════════════════════════╗");
-    println!("║     Agent of Empires Uninstaller       ║");
+    println!("║     Hoxkss My Pi Uninstaller       ║");
     println!("╚════════════════════════════════════════╝");
     println!();
 
@@ -50,20 +50,20 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     // alongside the XDG path, so either layout is cleaned up.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let data_dirs = {
-        let mut dirs = vec![home_dir.join(".agent-of-empires")];
+        let mut dirs = vec![home_dir.join(".hmp")];
         if let Ok(base) = crate::session::xdg_config_base() {
-            dirs.push(base.join("agent-of-empires"));
+            dirs.push(base.join("hmp"));
         }
         dirs
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let data_dirs = vec![home_dir.join(".agent-of-empires")];
+    let data_dirs = vec![home_dir.join(".hmp")];
 
     let mut found_items: Vec<FoundItem> = Vec::new();
 
-    // Check for Homebrew installation (formula is named "aoe")
+    // Check for Homebrew installation (formula is named "hmp")
     let homebrew_installed = Command::new("brew")
-        .args(["list", "aoe"])
+        .args(["list", "hmp"])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
@@ -76,14 +76,14 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         println!("Found: Homebrew installation");
     }
 
-    // Check common binary locations for both "aoe" and "agent-of-empires"
+    // Check common binary locations for both "hmp" and "hmp"
     let mut binary_locations = vec![
         home_dir.join(".local/bin/aoe"),
         PathBuf::from("/usr/local/bin/aoe"),
         home_dir.join("bin/aoe"),
-        home_dir.join(".local/bin/agent-of-empires"),
-        PathBuf::from("/usr/local/bin/agent-of-empires"),
-        home_dir.join("bin/agent-of-empires"),
+        home_dir.join(".local/bin/hmp"),
+        PathBuf::from("/usr/local/bin/hmp"),
+        home_dir.join("bin/hmp"),
     ];
 
     // Also check the currently running binary's location
@@ -140,7 +140,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     // Check for tmux config
     let tmux_conf = home_dir.join(".tmux.conf");
     if let Ok(content) = fs::read_to_string(&tmux_conf) {
-        if content.contains("# agent-of-empires configuration") {
+        if content.contains("# hmp configuration") {
             found_items.push(FoundItem {
                 item_type: "tmux".to_string(),
                 path: tmux_conf.clone(),
@@ -152,7 +152,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!();
 
     if found_items.is_empty() {
-        println!("Agent of Empires does not appear to be installed.");
+        println!("Hoxkss My Pi does not appear to be installed.");
         return Ok(());
     }
 
@@ -208,7 +208,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!("Uninstalling...");
     println!();
 
-    // Remove AoE hooks from agent settings files (e.g. ~/.claude/settings.json)
+    // Remove HMP hooks from agent settings files (e.g. ~/.claude/settings.json)
     crate::hooks::uninstall_all_hooks();
 
     // Perform uninstall
@@ -216,7 +216,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         match item.item_type.as_str() {
             "homebrew" => {
                 println!("Removing Homebrew package...");
-                let _ = Command::new("brew").args(["uninstall", "aoe"]).status();
+                let _ = Command::new("brew").args(["uninstall", "hmp"]).status();
                 println!("✓ Homebrew package removed");
             }
             "binary" => {
@@ -240,12 +240,12 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
                 println!("Removing tmux configuration...");
                 if let Ok(content) = fs::read_to_string(&item.path) {
                     // Backup
-                    let backup_path = format!("{}.bak.aoe-uninstall", item.path.display());
+                    let backup_path = format!("{}.bak.hmp-uninstall", item.path.display());
                     let _ = fs::write(&backup_path, &content);
 
-                    // Remove agent-of-empires config block
-                    let start_marker = "# agent-of-empires configuration";
-                    let end_marker = "# End agent-of-empires configuration";
+                    // Remove hmp config block
+                    let start_marker = "# hmp configuration";
+                    let end_marker = "# End hmp configuration";
 
                     if let (Some(start), Some(end)) =
                         (content.find(start_marker), content.find(end_marker))
@@ -287,8 +287,8 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     }
 
     println!();
-    println!("Thank you for using Agent of Empires!");
-    println!("Feedback: https://github.com/agent-of-empires/agent-of-empires/issues");
+    println!("Thank you for using Hoxkss My Pi!");
+    println!("Feedback: https://github.com/hoxkss/hmp/issues");
 
     Ok(())
 }

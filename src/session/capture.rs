@@ -221,7 +221,7 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// Polling closure for Claude Code session tracking on the host filesystem.
 ///
 /// Per tick, in order:
-/// 1. Read `/tmp/aoe-hooks/<instance_id>/session_id` (written by Claude's
+/// 1. Read `/tmp/hmp-hooks/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
 /// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
@@ -239,7 +239,7 @@ pub(crate) fn claude_poll_fn(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         // Sidecar reads are scoped per-instance: the file lives under
-        // `/tmp/aoe-hooks/<instance_id>/` so a sibling instance's hook
+        // `/tmp/hmp-hooks/<instance_id>/` so a sibling instance's hook
         // writes cannot reach this path, which is why the read skips
         // `compose_exclusion`. `extra_excludes` is still honored so a
         // sidecar value matching one of this instance's cleared sids does
@@ -365,7 +365,7 @@ fn select_claude_session_in_container(
 /// Polling closure for sandboxed (Docker) Claude Code session tracking.
 ///
 /// Mirrors [`claude_poll_fn`] but does not read the host hook sidecar (the
-/// in-container hook would write to the container's `/tmp/aoe-hooks/`,
+/// in-container hook would write to the container's `/tmp/hmp-hooks/`,
 /// which the host poller cannot see without bind-mounting). Sandboxed
 /// `/clear` adoption therefore takes ≤ 1 poll tick.
 pub(crate) fn claude_poll_fn_sandboxed(
@@ -743,9 +743,9 @@ pub(crate) fn compose_exclusion(
     set
 }
 
-/// Build the set of session IDs already claimed by other live AoE instances.
+/// Build the set of session IDs already claimed by other live HMP instances.
 ///
-/// Reads every other AoE-prefixed tmux session's hidden env to find which
+/// Reads every other HMP-prefixed tmux session's hidden env to find which
 /// session IDs are currently bound to which instance, and returns the set
 /// of captured IDs that belong to instances OTHER than `current_instance_id`.
 /// Used by post-launch poll closures to avoid re-importing another
@@ -765,7 +765,7 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let aoe_sessions: Vec<&str> = stdout
+    let hmp_sessions: Vec<&str> = stdout
         .lines()
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
@@ -774,13 +774,13 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
         })
         .collect();
 
-    if aoe_sessions.is_empty() {
+    if hmp_sessions.is_empty() {
         return HashSet::new();
     }
 
     let instance_ids = crate::tmux::env::get_hidden_env_batch(
-        &aoe_sessions,
-        crate::tmux::env::AOE_INSTANCE_ID_KEY,
+        &hmp_sessions,
+        crate::tmux::env::HMP_INSTANCE_ID_KEY,
     );
 
     let other_sessions: Vec<&str> = instance_ids
@@ -795,7 +795,7 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
 
     let captured_ids = crate::tmux::env::get_hidden_env_batch(
         &other_sessions,
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+        crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
     );
 
     captured_ids.into_iter().filter_map(|(_, id)| id).collect()
@@ -2393,7 +2393,7 @@ mod tests {
     #[test]
     fn test_capture_claude_session_in_container_returns_error_for_missing_container() {
         let result = capture_claude_session_id_in_container(
-            "aoe-test-nonexistent-container-xyz",
+            "hmp-test-nonexistent-container-xyz",
             "/workspace/test",
             &HashSet::new(),
             None,
@@ -2525,18 +2525,18 @@ mod tests {
 
     /// Real e2e: run the same shell script we ship to `docker exec` against a
     /// Pi session dir on disk, and feed the stdout into the parser to confirm
-    /// it picks up the live UUID. Set `AOE_PI_E2E_DIR=/path/to/.pi/agent` and
-    /// `AOE_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
+    /// it picks up the live UUID. Set `HMP_PI_E2E_DIR=/path/to/.pi/agent` and
+    /// `HMP_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
     /// Validates the production `PI_CONTAINER_LIST_SCRIPT` against real Pi
     /// output without needing Docker.
     #[test]
     #[serial]
     fn test_select_pi_session_in_container_against_real_script_output() {
-        let agent_dir = match std::env::var("AOE_PI_E2E_DIR") {
+        let agent_dir = match std::env::var("HMP_PI_E2E_DIR") {
             Ok(v) => v,
             Err(_) => return,
         };
-        let project_path = match std::env::var("AOE_PI_E2E_PROJECT") {
+        let project_path = match std::env::var("HMP_PI_E2E_PROJECT") {
             Ok(v) => v,
             Err(_) => return,
         };
@@ -2564,16 +2564,16 @@ mod tests {
 
     /// Real e2e: when run against a session dir produced by an actual `pi`
     /// binary, capture must return an ID that `pi --session <id>` accepts.
-    /// Set `AOE_PI_E2E_DIR=/path/to/.pi/agent` and
-    /// `AOE_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
+    /// Set `HMP_PI_E2E_DIR=/path/to/.pi/agent` and
+    /// `HMP_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
     #[test]
     #[serial]
     fn test_capture_pi_session_id_against_real_pi_binary() {
-        let agent_dir = match std::env::var("AOE_PI_E2E_DIR") {
+        let agent_dir = match std::env::var("HMP_PI_E2E_DIR") {
             Ok(v) => v,
             Err(_) => return,
         };
-        let project_path = match std::env::var("AOE_PI_E2E_PROJECT") {
+        let project_path = match std::env::var("HMP_PI_E2E_PROJECT") {
             Ok(v) => v,
             Err(_) => return,
         };
@@ -3206,7 +3206,7 @@ mod tests {
         let result = build_exclusion_set("nonexistent-instance-id-12345");
         // The exclusion set should never contain our own instance ID
         // (it collects OTHER instances' captured session IDs).
-        // On a machine with active AoE tmux sessions, the set may be
+        // On a machine with active HMP tmux sessions, the set may be
         // non-empty, so we verify our own ID isn't self-excluded.
         assert!(!result.contains("nonexistent-instance-id-12345"));
     }
@@ -4181,7 +4181,7 @@ mod tests {
     #[serial]
     fn test_claude_poll_fn_reads_hook_sidecar_first() {
         let instance_id = "test_sidecar_first_path";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
+        let hook_dir = std::path::PathBuf::from("/tmp/hmp-hooks").join(instance_id);
         std::fs::create_dir_all(&hook_dir).unwrap();
         let sidecar_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         std::fs::write(hook_dir.join("session_id"), sidecar_uuid).unwrap();
@@ -4214,7 +4214,7 @@ mod tests {
     #[serial]
     fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
         let instance_id = "test_sidecar_stale_falls_through";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
+        let hook_dir = std::path::PathBuf::from("/tmp/hmp-hooks").join(instance_id);
         std::fs::create_dir_all(&hook_dir).unwrap();
         let stale_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sidecar_path = hook_dir.join("session_id");

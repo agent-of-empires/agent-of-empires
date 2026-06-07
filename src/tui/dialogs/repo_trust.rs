@@ -1,6 +1,6 @@
 //! Trust confirmation dialog for repository hooks and project-local MCP servers.
 //!
-//! A repo's `.agent-of-empires/config.toml` hooks and its `.mcp.json` MCP
+//! A repo's `.hmp/config.toml` hooks and its `.mcp.json` MCP
 //! servers both run code on the user's behalf (a stdio MCP server launches its
 //! `command` when a session spawns), so both sit behind one approval (#1985).
 //! The dialog displays whichever surfaces are present, redacting MCP env and

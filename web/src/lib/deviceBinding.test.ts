@@ -12,7 +12,7 @@ import {
   getOrCreateDeviceBindingSecret,
 } from "./deviceBinding";
 
-const STORAGE_KEY = "aoe_device_binding_secret_v1";
+const STORAGE_KEY = "hmp_device_binding_secret_v1";
 
 beforeEach(() => {
   window.localStorage.clear();

@@ -19,7 +19,7 @@
 //!    Linux's documented OFD scoping.) Every `Storage::update` opens its
 //!    own fd via `OpenOptions::open`, so two `Storage` handles in the
 //!    same process get distinct OFDs and `flock` between them conflicts
-//!    just as it does between processes. If AoE is ever ported to a
+//!    just as it does between processes. If HMP is ever ported to a
 //!    platform whose underlying lock primitive is process-scoped (e.g.
 //!    POSIX `fcntl(F_SETLK)` advisory locks, or certain Windows backends
 //!    that key on the `HANDLE` rather than the open file description),
@@ -34,7 +34,7 @@
 //!    Polled `fs2::FileExt::try_lock_exclusive` with a 50ms backoff so
 //!    that a wait longer than 1s fires a single `tracing::warn`; the
 //!    kernel releases the lock on process exit, including SIGKILL, so a
-//!    crashed peer cannot wedge other aoe processes. Mirrors the pattern
+//!    crashed peer cannot wedge other hmp processes. Mirrors the pattern
 //!    already used by `recovery.rs` and `logging.rs`.
 //!
 //! All mutation goes through `update` (load -> mutate -> save under both
@@ -86,7 +86,7 @@ const STORAGE_LOCK_FILENAME: &str = ".storage.lock";
 const WORKSPACE_LOCK_FILENAME: &str = ".workspace-ordering.lock";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
-/// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
+/// longer than this. Surfaces a wedged peer in `hmp logs` instead of a
 /// silent stall. The acquire itself blocks indefinitely; the warning is
 /// observability only, not a timeout.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
@@ -159,7 +159,7 @@ impl Drop for StorageFlock {
 /// Polling instead of `lock_exclusive` is deliberate: `fs2` exposes no hook
 /// to instrument a blocking acquire, and we need a single `tracing::warn`
 /// after `FLOCK_WAIT_WARN_AFTER` so a wedged peer is observable in
-/// `aoe logs`. The 50ms cadence is below human perception and far above any
+/// `hmp logs`. The 50ms cadence is below human perception and far above any
 /// realistic mutator's hold time.
 ///
 /// On Unix the lock file is chmodded to `0o600` so it never widens beyond
@@ -211,7 +211,7 @@ fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
                                 target: "session.store",
                                 ?waited,
                                 path = %path.display(),
-                                "storage flock contended for >1s; another aoe process held it"
+                                "storage flock contended for >1s; another hmp process held it"
                             );
                         }
                     }
@@ -222,7 +222,7 @@ fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
                         tracing::warn!(
                             target: "session.store",
                             path = %path.display(),
-                            "storage flock contended for >1s; another aoe process is mid-write"
+                            "storage flock contended for >1s; another hmp process is mid-write"
                         );
                         warned = true;
                     }

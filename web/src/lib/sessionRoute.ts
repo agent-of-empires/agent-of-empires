@@ -1,7 +1,7 @@
 // Custom event dispatched when an in-app toast (for a focused PWA
 // client) is tapped. App listens and navigates to the session.
 
-export const OPEN_SESSION_EVENT = "aoe-open-session";
+export const OPEN_SESSION_EVENT = "hmp-open-session";
 
 export function requestOpenSession(sessionId: string): void {
   if (typeof window === "undefined") return;

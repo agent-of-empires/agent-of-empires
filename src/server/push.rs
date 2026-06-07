@@ -79,7 +79,7 @@ pub struct VapidKeypair {
 impl VapidKeypair {
     /// Load from disk, or generate and persist a new keypair. Uses an
     /// exclusive file lock on `<path>.lock` to prevent two concurrent
-    /// `aoe serve` invocations from racing and producing two keypairs.
+    /// `hmp serve` invocations from racing and producing two keypairs.
     pub fn load_or_generate(path: &Path) -> anyhow::Result<Self> {
         use fs2::FileExt;
         use std::fs::OpenOptions;
@@ -345,7 +345,7 @@ pub struct PushState {
 /// URL but does not require deliverability; major push services do not
 /// validate this for reachability in practice. We use the project's
 /// public URL so providers that do care have somewhere real to reach.
-pub const VAPID_SUBJECT: &str = "https://github.com/agent-of-empires/agent-of-empires";
+pub const VAPID_SUBJECT: &str = "https://github.com/hoxkss/hmp";
 
 impl PushState {
     pub fn init(app_dir: &Path) -> anyhow::Result<Self> {
@@ -540,7 +540,7 @@ async fn fire_due_pushes(
     };
     let push = push.clone();
 
-    // Suppress pushes when the user is actively using aoe (TUI or web
+    // Suppress pushes when the user is actively using hmp (TUI or web
     // dashboard). They can already see session state changes in real
     // time, so OS-level push notifications are noise. Checked BEFORE
     // the dwell collection loop so that dwell timers are preserved:
@@ -1060,11 +1060,11 @@ pub async fn test(
         return Err(StatusCode::CONFLICT.into_response());
     };
     let payload = super::push_send::PushPayload {
-        title: "Agent of Empires".to_string(),
+        title: "Hoxkss My Pi".to_string(),
         body: "Test notification. If you see this on your lock screen, push is working."
             .to_string(),
         url,
-        tag: "aoe-test".to_string(),
+        tag: "hmp-test".to_string(),
         session_id: String::new(),
     };
 

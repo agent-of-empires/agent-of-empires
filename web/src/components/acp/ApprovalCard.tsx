@@ -292,7 +292,7 @@ function ArgsView({ raw }: { raw: string }) {
   }
 
   const entries = Object.entries(parsed).filter(
-    ([k]) => !k.startsWith("_aoe_"),
+    ([k]) => !k.startsWith("_hmp_"),
   );
   if (entries.length === 0) return null;
 

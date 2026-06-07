@@ -91,7 +91,7 @@ pub fn detect_install_method() -> Result<InstallMethod> {
     let home = dirs::home_dir().context("locating home directory")?;
     let home = home.canonicalize().unwrap_or(home);
     let prefix = classify_path_prefix(&exe, &home);
-    let brew_path = probe_brew_aoe_path();
+    let brew_path = probe_brew_hmp_path();
     Ok(classify_with_brew(prefix, brew_path.as_deref(), &exe))
 }
 
@@ -109,16 +109,16 @@ const BREW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 /// Bounded by `BREW_PROBE_TIMEOUT`: if brew doesn't return in time we
 /// kill the child and treat it as "not a brew install" rather than
 /// blocking the TUI's startup-update path.
-fn probe_brew_aoe_path() -> Option<PathBuf> {
-    probe_brew_aoe_path_with_timeout(BREW_PROBE_TIMEOUT)
+fn probe_brew_hmp_path() -> Option<PathBuf> {
+    probe_brew_hmp_path_with_timeout(BREW_PROBE_TIMEOUT)
 }
 
-fn probe_brew_aoe_path_with_timeout(timeout: std::time::Duration) -> Option<PathBuf> {
+fn probe_brew_hmp_path_with_timeout(timeout: std::time::Duration) -> Option<PathBuf> {
     use std::process::Stdio;
     use std::time::Instant;
 
     let mut child = Command::new("brew")
-        .args(["list", "aoe"])
+        .args(["list", "hmp"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -184,13 +184,12 @@ pub fn current_platform_string() -> Result<&'static str> {
     platform_string_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-const DEFAULT_RELEASE_BASE: &str =
-    "https://github.com/agent-of-empires/agent-of-empires/releases/download";
+const DEFAULT_RELEASE_BASE: &str = "https://github.com/hoxkss/hmp/releases/download";
 
 fn release_tarball_url(version: &str, platform: &str) -> String {
     let base =
-        std::env::var("AOE_UPDATE_BASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_BASE.to_string());
-    format!("{base}/v{version}/aoe-{platform}.tar.gz")
+        std::env::var("HMP_UPDATE_BASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_BASE.to_string());
+    format!("{base}/v{version}/hmp-{platform}.tar.gz")
 }
 
 /// Download a release tarball to `dest`. Streams bytes; reports
@@ -204,7 +203,7 @@ async fn download_tarball(
     use tokio::io::AsyncWriteExt;
 
     let client = reqwest::Client::builder()
-        .user_agent("agent-of-empires")
+        .user_agent("hmp")
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
     let response = client.get(url).send().await?;
@@ -233,7 +232,7 @@ async fn download_tarball(
 /// Extract a `.tar.gz` into `dest_dir`. Shells out to `tar xzf`, which is
 /// universally available on macOS/Linux and matches what `scripts/install.sh`
 /// does. Returns the path to the extracted binary
-/// (`dest_dir/aoe-{platform}`).
+/// (`dest_dir/hmp-{platform}`).
 fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<PathBuf> {
     let status = Command::new("tar")
         .arg("xzf")
@@ -245,7 +244,7 @@ fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<Pa
     if !status.success() {
         anyhow::bail!("tar extraction failed (exit {})", status);
     }
-    let extracted = dest_dir.join(format!("aoe-{platform}"));
+    let extracted = dest_dir.join(format!("hmp-{platform}"));
     if !extracted.exists() {
         anyhow::bail!("extracted tarball did not contain {}", extracted.display());
     }
@@ -335,7 +334,7 @@ pub fn parent_is_writable(binary_path: &Path) -> bool {
         return false;
     };
     tempfile::Builder::new()
-        .prefix(".aoe-update-probe-")
+        .prefix(".hmp-update-probe-")
         .tempfile_in(parent)
         .is_ok()
 }
@@ -356,7 +355,7 @@ pub async fn update_via_tarball(
     // Same-filesystem temp dir so the rename in atomic_replace works.
     let workdir = TempDir::new_in(parent).context("creating temp dir for update")?;
 
-    let tarball_path = workdir.path().join(format!("aoe-{platform}.tar.gz"));
+    let tarball_path = workdir.path().join(format!("hmp-{platform}.tar.gz"));
     let url = release_tarball_url(version, platform);
     download_tarball(&url, &tarball_path, on_progress).await?;
 
@@ -366,7 +365,7 @@ pub async fn update_via_tarball(
     Ok(())
 }
 
-/// How long we wait for `brew info aoe --json=v2` before giving up on
+/// How long we wait for `brew info hmp --json=v2` before giving up on
 /// learning what version Homebrew has. Same rationale as
 /// `BREW_PROBE_TIMEOUT`: don't let a hung `brew` block the update flow.
 const BREW_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -382,7 +381,7 @@ struct BrewVersions {
 }
 
 /// Return the `versions.stable` Homebrew currently advertises for the
-/// `aoe` formula, or `None` if brew isn't installed, the formula isn't
+/// `hmp` formula, or `None` if brew isn't installed, the formula isn't
 /// known, the probe times out, or the JSON can't be parsed.
 fn brew_available_version() -> Option<String> {
     brew_available_version_with_timeout(BREW_INFO_TIMEOUT)
@@ -393,7 +392,7 @@ fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<S
     use std::time::Instant;
 
     let mut child = Command::new("brew")
-        .args(["info", "aoe", "--json=v2"])
+        .args(["info", "hmp", "--json=v2"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -503,7 +502,7 @@ fn update_via_brew(target_version: &str) -> Result<()> {
     }
 
     let status = Command::new("brew")
-        .args(["upgrade", "aoe"])
+        .args(["upgrade", "hmp"])
         .status()
         .context("running `brew upgrade aoe`")?;
     if !status.success() {
@@ -514,7 +513,7 @@ fn update_via_brew(target_version: &str) -> Result<()> {
 
 fn nix_refusal_message() -> String {
     "aoe was installed via Nix. Update by running:\n\
-     \n    nix run github:agent-of-empires/agent-of-empires\n\
+     \n    nix run github:hoxkss/hmp\n\
      \n(or rebuild your flake input)."
         .to_string()
 }
@@ -525,7 +524,7 @@ fn print_nix_refusal() {
 
 fn cargo_refusal_message() -> String {
     "aoe was installed via cargo. Update by running:\n\
-     \n    cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe\n\
+     \n    cargo install --git https://github.com/hoxkss/hmp aoe\n\
      \n(or `git pull && cargo install --path .` from a local clone)."
         .to_string()
 }
@@ -536,9 +535,9 @@ fn print_cargo_refusal() {
 
 fn unknown_refusal_message(binary_path: &Path) -> String {
     format!(
-        "Couldn't determine how aoe was installed at {}.\n\
+        "Couldn't determine how hmp was installed at {}.\n\
          Reinstall with:\n\
-         \n    curl -fsSL https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh | bash\n",
+         \n    curl -fsSL https://raw.githubusercontent.com/hoxkss/hmp/main/scripts/install.sh | bash\n",
         binary_path.display()
     )
 }
@@ -614,7 +613,7 @@ mod tests {
 
     #[test]
     fn classifies_nix_store() {
-        let p = PathBuf::from("/nix/store/abc123-aoe-0.4.5/bin/aoe");
+        let p = PathBuf::from("/nix/store/abc123-hmp-0.4.5/bin/aoe");
         assert_eq!(classify_path_prefix(&p, &home()), InstallMethod::Nix);
     }
 
@@ -657,7 +656,7 @@ mod tests {
 
     #[test]
     fn classifies_random_path_as_unknown() {
-        let p = PathBuf::from("/opt/aoe-custom/bin/aoe");
+        let p = PathBuf::from("/opt/hmp-custom/bin/aoe");
         assert_eq!(
             classify_path_prefix(&p, &home()),
             InstallMethod::Unknown { binary_path: p }
@@ -695,7 +694,7 @@ mod tests {
     }
 
     /// Real-filesystem regression test: build a symlinked HOME on disk,
-    /// place an aoe binary at $HOME/.local/bin/aoe through the symlink,
+    /// place an hmp binary at $HOME/.local/bin/aoe through the symlink,
     /// and verify detect_install_method (which does its own canonicalize)
     /// still classifies it as Tarball, not Unknown.
     ///
@@ -708,7 +707,7 @@ mod tests {
         let real_dir = TempDir::new().unwrap();
         let bin_dir = real_dir.path().join(".local").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("aoe");
+        let exe = bin_dir.join("hmp");
         std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -822,14 +821,14 @@ mod tests {
         let url = release_tarball_url("0.5.0", "linux-amd64");
         assert_eq!(
             url,
-            "https://github.com/agent-of-empires/agent-of-empires/releases/download/v0.5.0/aoe-linux-amd64.tar.gz"
+            "https://github.com/hoxkss/hmp/releases/download/v0.5.0/hmp-linux-amd64.tar.gz"
         );
     }
 
     #[test]
     #[serial]
     fn release_tarball_url_respects_env_override() {
-        let key = "AOE_UPDATE_BASE_URL";
+        let key = "HMP_UPDATE_BASE_URL";
         let prev = std::env::var(key).ok();
         // SAFETY: single-threaded test context; serial_test ensures no concurrent mutation.
         unsafe {
@@ -838,7 +837,7 @@ mod tests {
         let url = release_tarball_url("0.5.0", "linux-amd64");
         assert_eq!(
             url,
-            "http://127.0.0.1:9999/releases/v0.5.0/aoe-linux-amd64.tar.gz"
+            "http://127.0.0.1:9999/releases/v0.5.0/hmp-linux-amd64.tar.gz"
         );
         unsafe {
             match prev {
@@ -884,7 +883,7 @@ mod tests {
 
     #[test]
     fn nix_refusal_message_contains_nix_run() {
-        assert!(nix_refusal_message().contains("nix run github:agent-of-empires/agent-of-empires"));
+        assert!(nix_refusal_message().contains("nix run github:hoxkss/hmp"));
     }
 
     #[test]
@@ -1028,7 +1027,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
 
-        /// Brew shim that handles `info aoe --json=v2` (emits the supplied
+        /// Brew shim that handles `info hmp --json=v2` (emits the supplied
         /// stable version as a v1-style top-level array) and records every
         /// invocation. `fail_on` lets a test simulate a brew subcommand
         /// failing (matched on the first arg).
@@ -1085,7 +1084,7 @@ mod tests {
             let lines: Vec<_> = invocations.lines().collect();
             assert_eq!(lines.len(), 3, "expected 3 brew calls; got {invocations:?}");
             assert_eq!(lines[0], "update");
-            assert_eq!(lines[1], "info aoe --json=v2");
+            assert_eq!(lines[1], "info hmp --json=v2");
             assert_eq!(lines[2], "upgrade aoe");
         }
 
@@ -1153,7 +1152,7 @@ mod tests {
             let lines: Vec<_> = invocations.lines().collect();
             assert_eq!(
                 lines,
-                vec!["update", "info aoe --json=v2"],
+                vec!["update", "info hmp --json=v2"],
                 "upgrade should not run when brew is behind"
             );
         }
@@ -1227,7 +1226,7 @@ mod tests {
             }
 
             let started = Instant::now();
-            let result = probe_brew_aoe_path_with_timeout(Duration::from_millis(300));
+            let result = probe_brew_hmp_path_with_timeout(Duration::from_millis(300));
             let elapsed = started.elapsed();
 
             unsafe {

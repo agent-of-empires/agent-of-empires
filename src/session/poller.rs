@@ -218,7 +218,7 @@ impl SessionPoller {
         };
 
         let session_name = self.session_name.clone();
-        let thread_label = format!("aoe-poller/{}", instance_id);
+        let thread_label = format!("hmp-poller/{}", instance_id);
         let result_tx = self.result_tx.clone();
 
         let handle = std::thread::Builder::new()

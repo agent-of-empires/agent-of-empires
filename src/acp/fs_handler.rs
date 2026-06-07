@@ -1,7 +1,7 @@
 //! Handlers for ACP `fs/*` requests delegated by agents.
 //!
 //! ACP defines `fs/read_text_file` and `fs/write_text_file` as agent → client
-//! requests. The agent asks aoe to read or write; aoe enforces sandboxing
+//! requests. The agent asks hmp to read or write; hmp enforces sandboxing
 //! and worktree isolation before doing the fs op.
 //!
 //! Important security invariants enforced here:
@@ -15,7 +15,7 @@
 //!
 //! Sandbox interaction: when the session runs inside a Docker container,
 //! the agent process lives inside the container; this handler runs in
-//! aoe-host. The unix socket transport (see design v4) is what makes the
+//! hmp-host. The unix socket transport (see design v4) is what makes the
 //! request cross the container boundary; once it arrives here, the path is
 //! interpreted in the container's mounted-volume layout.
 
@@ -293,7 +293,7 @@ mod tests {
     fn rejects_symlink_leaf_pointing_outside_root() {
         let temp = tempfile::tempdir().unwrap();
         let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
-        let outside = std::env::temp_dir().join("aoe-fs-handler-symlink-target");
+        let outside = std::env::temp_dir().join("hmp-fs-handler-symlink-target");
         let _ = std::fs::remove_file(&outside);
         std::fs::write(&outside, "secret").unwrap();
         let symlink_in_root = temp.path().join("escape");

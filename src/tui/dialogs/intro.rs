@@ -1,7 +1,7 @@
 //! First-run walkthrough dialog.
 //!
 //! Replaces the older one-page welcome with a multi-step intro that explains
-//! what AoE is, how to start a first session, lets the user pick a theme with
+//! what HMP is, how to start a first session, lets the user pick a theme with
 //! live preview, and points at the help shortcut. Navigable by keyboard and
 //! mouse. Driven by `config.app_state.has_seen_welcome` like the previous
 //! welcome dialog, so existing first-run gating in `App::new()` carries over.
@@ -451,7 +451,7 @@ impl IntroDialog {
 
         let total = Page::all().len();
         let title = format!(
-            " Welcome to Agent of Empires  ({}/{}) ",
+            " Welcome to Hoxkss My Pi  ({}/{}) ",
             self.page_idx + 1,
             total
         );
@@ -485,7 +485,7 @@ impl IntroDialog {
     fn render_welcome(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let lines = vec![
             Line::from(Span::styled(
-                "Agent of Empires (aoe) runs many AI coding agents side by side.",
+                "Hoxkss My Pi (aoe) runs many AI coding agents side by side.",
                 Style::default().fg(theme.text),
             )),
             Line::from(""),
@@ -505,14 +505,14 @@ impl IntroDialog {
             Line::from(vec![
                 Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.agent-of-empires.com/docs/quick-start",
+                    "https://www.hmp.local/docs/quick-start",
                     Style::default().fg(theme.accent),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("  Tutorials: ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.youtube.com/@agent-of-empires",
+                    "https://www.youtube.com/@hmp",
                     Style::default().fg(theme.accent),
                 ),
             ]),
@@ -562,16 +562,16 @@ impl IntroDialog {
 
         let intro = Paragraph::new(vec![
             Line::from(Span::styled(
-                "Help improve aoe with anonymous usage telemetry?",
+                "Help improve hmp with anonymous usage telemetry?",
                 Style::default().fg(theme.title).bold(),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "It shows us how aoe is actually used, so we can prioritize the",
+                "It shows us how hmp is actually used, so we can prioritize the",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
-                "features that matter most. Off by default; when on, aoe sends",
+                "features that matter most. Off by default; when on, hmp sends",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
@@ -759,7 +759,7 @@ impl IntroDialog {
                 NewSessionAttachMode::LiveSend,
                 "Live mode  (recommended; works for most workflows)",
                 vec![
-                    "      aoe stays open with the agent's terminal shown next to".to_string(),
+                    "      hmp stays open with the agent's terminal shown next to".to_string(),
                     "      the session list. Type to send keys to the highlighted".to_string(),
                     "      agent. Ctrl+Q stops typing. Tab attaches into tmux.".to_string(),
                 ],
@@ -921,14 +921,14 @@ impl IntroDialog {
             Line::from(vec![
                 Span::styled("  Docs:      ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.agent-of-empires.com/docs",
+                    "https://www.hmp.local/docs",
                     Style::default().fg(theme.accent),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("  Tutorials: ", Style::default().fg(theme.dimmed)),
                 Span::styled(
-                    "https://www.youtube.com/@agent-of-empires",
+                    "https://www.youtube.com/@hmp",
                     Style::default().fg(theme.accent),
                 ),
             ]),

@@ -1,4 +1,4 @@
-//! `agent-of-empires remove` command implementation
+//! `hmp remove` command implementation
 
 use anyhow::Result;
 use clap::Args;

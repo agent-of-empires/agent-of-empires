@@ -1,7 +1,7 @@
 //! Token-based authentication middleware for the web dashboard.
 //!
 //! Accepts the auth token via:
-//! - Cookie: `aoe_token=<token>`
+//! - Cookie: `hmp_token=<token>`
 //! - Query parameter: `?token=<token>` (sets the cookie for future requests)
 //! - WebSocket protocol header: `Sec-WebSocket-Protocol: <token>`
 //! - Authorization header: `Authorization: Bearer <token>` (used by the PWA,
@@ -63,7 +63,7 @@ pub(crate) fn resolve_client_ip(
 
 /// Whether `client_ip` should be treated as a same-host caller that
 /// already passes the filesystem-permission trust boundary. The local
-/// TUI reads its bearer token from `~/.agent-of-empires/serve.url`
+/// TUI reads its bearer token from `~/.hmp/serve.url`
 /// (file mode 0600), so a loopback request that carries a valid token
 /// has, by construction, the same fs-level access as the daemon owner.
 /// Layering a passphrase factor on top adds friction without
@@ -79,7 +79,7 @@ fn is_local_trusted(client_ip: IpAddr) -> bool {
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
 fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     let mut cookie = format!(
-        "aoe_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        "hmp_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         token, max_age_secs
     );
     if secure {
@@ -88,17 +88,17 @@ fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     cookie
 }
 
-/// Write the `aoe_token` Set-Cookie and the companion `x-aoe-token`
+/// Write the `hmp_token` Set-Cookie and the companion `x-hmp-token`
 /// header into a response's header map.
 ///
 /// Uses `.append` for `Set-Cookie` because the handler that just ran
-/// may already have set its own (`login_handler` sets `aoe_session`
+/// may already have set its own (`login_handler` sets `hmp_session`
 /// on successful login; `logout_handler` clears it). `.insert` would
 /// replace those values and the browser would only see our
-/// `aoe_token` cookie, silently dropping the session state the
+/// `hmp_token` cookie, silently dropping the session state the
 /// handler intended to set. The two cookie names don't collide, so
 /// the browser processes both Set-Cookie values. `.insert` is fine
-/// for `x-aoe-token` because no handler writes that header.
+/// for `x-hmp-token` because no handler writes that header.
 fn write_token_headers(
     headers: &mut axum::http::HeaderMap,
     token: &str,
@@ -111,7 +111,7 @@ fn write_token_headers(
         cookie.parse().expect("cookie format must be valid"),
     );
     if let Ok(value) = token.parse() {
-        headers.insert("x-aoe-token", value);
+        headers.insert("x-hmp-token", value);
     }
 }
 
@@ -145,7 +145,7 @@ fn extract_tokens(request: &Request) -> Vec<(&str, TokenSource)> {
         if let Ok(cookie_str) = cookie_header.to_str() {
             for cookie in cookie_str.split(';') {
                 let cookie = cookie.trim();
-                if let Some(value) = cookie.strip_prefix("aoe_token=") {
+                if let Some(value) = cookie.strip_prefix("hmp_token=") {
                     tokens.push((value, TokenSource::Cookie));
                 }
             }
@@ -223,14 +223,14 @@ fn is_login_session_exempt(path: &str) -> bool {
         || path.starts_with("/fonts/")
 }
 
-/// Whether to append a sliding-window refresh of the `aoe_session`
+/// Whether to append a sliding-window refresh of the `hmp_session`
 /// cookie on the response for a session-authenticated request.
 /// Login-exempt paths skip the refresh because their own handlers
-/// own the `aoe_session` cookie's lifecycle on that response: the
+/// own the `hmp_session` cookie's lifecycle on that response: the
 /// `POST /api/logout` handler sets `Max-Age=0` to clear it, and the
 /// `POST /api/login` handler mints a fresh session id and sets a
 /// new cookie. An unconditional refresh would emit a second
-/// `Set-Cookie: aoe_session=<id>; Max-Age=2592000` after the
+/// `Set-Cookie: hmp_session=<id>; Max-Age=2592000` after the
 /// handler's, and browsers process Set-Cookie headers in order
 /// (later wins), so logout would leave a stale 30-day cookie
 /// pointing at a server session that no longer exists, and login
@@ -240,7 +240,7 @@ fn should_refresh_session_cookie(path: &str) -> bool {
 }
 
 /// Decision for the post-token branch of `auth_middleware`: a request
-/// validated its bearer token but did not present an `aoe_session`
+/// validated its bearer token but did not present an `hmp_session`
 /// cookie + device binding. When passphrase login is on, that would
 /// normally redirect/401 with `login_required` so the SPA can pop the
 /// passphrase prompt. The bypass case lets the request through to the
@@ -292,7 +292,7 @@ enum PassphraseWallEntryAction {
     /// even without a session.
     BypassExempt,
     /// Caller is on loopback. fs-perm boundary on
-    /// `~/.agent-of-empires/serve.*` already protects same-host
+    /// `~/.hmp/serve.*` already protects same-host
     /// access, so layering the passphrase factor on top adds friction
     /// without strengthening the trust boundary. Mirrors the token-
     /// auth path's `is_local_trusted` carve-out from #1168 so the
@@ -429,7 +429,7 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
 
 /// Strip the leading `<prefix>.` from a subprotocol value when present,
 /// returning the suffix. Used to read prefixed values like
-/// `aoe-token.<token>` and `aoe-device.<base64url-secret>` from a
+/// `hmp-token.<token>` and `hmp-device.<base64url-secret>` from a
 /// `Sec-WebSocket-Protocol` header without confusing them with
 /// historically-bare token entries.
 fn strip_ws_prefix<'a>(proto: &'a str, prefix: &str) -> Option<&'a str> {
@@ -441,10 +441,10 @@ fn strip_ws_prefix<'a>(proto: &'a str, prefix: &str) -> Option<&'a str> {
 /// the decoded 32 raw bytes when present and well-formed; `None`
 /// otherwise. For REST the secret rides the `X-Aoe-Device-Binding`
 /// header; for WebSocket upgrades it rides as
-/// `Sec-WebSocket-Protocol: aoe-device.<base64url>` (never a query
+/// `Sec-WebSocket-Protocol: hmp-device.<base64url>` (never a query
 /// param, which would leak into proxy logs). See #1131.
 pub(crate) fn extract_device_binding(request: &Request) -> Option<Vec<u8>> {
-    if let Some(value) = request.headers().get("x-aoe-device-binding") {
+    if let Some(value) = request.headers().get("x-hmp-device-binding") {
         if let Ok(s) = value.to_str() {
             if let Some(bytes) = super::login::decode_binding_secret(s) {
                 return Some(bytes);
@@ -452,7 +452,7 @@ pub(crate) fn extract_device_binding(request: &Request) -> Option<Vec<u8>> {
         }
     }
     for proto in extract_ws_protocols(request) {
-        if let Some(secret) = strip_ws_prefix(&proto, "aoe-device") {
+        if let Some(secret) = strip_ws_prefix(&proto, "hmp-device") {
             if let Some(bytes) = super::login::decode_binding_secret(secret) {
                 return Some(bytes);
             }
@@ -478,7 +478,7 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 
 /// Request extension carrying the login session id used to authenticate
 /// the current request. Inserted by `auth_middleware` whenever a valid
-/// `aoe_session` cookie + device binding pair landed (both the
+/// `hmp_session` cookie + device binding pair landed (both the
 /// session+binding steady-state path and the `--auth=passphrase` wall).
 /// Absent under `--auth=none` and on bootstrap token-only paths where
 /// no session cookie exists yet. Handlers that need a body-shape
@@ -499,7 +499,7 @@ pub struct AuthenticatedSession(pub String);
 /// mirrors the token-auth path's #1168 carve-out so the local TUI can
 /// attach to a same-host `--auth=passphrase` daemon without going
 /// through a passphrase exchange. The fs-perm boundary on
-/// `~/.agent-of-empires/serve.*` already protects same-host access,
+/// `~/.hmp/serve.*` already protects same-host access,
 /// and remote callers proxied through a tunnel come in with the real
 /// remote IP via `resolve_client_ip`, so they still hit the wall as
 /// expected. See #1525.
@@ -736,10 +736,10 @@ pub async fn auth_middleware(
     // WebSocket sub-protocol fallback. A client may send multiple
     // protocols (e.g., "graphql-ws, <token>"), so check each.
     // Accept either bare-token (older PWA tabs) or the prefixed
-    // `aoe-token.<token>` form. See #1131.
+    // `hmp-token.<token>` form. See #1131.
     if matched_source.is_none() {
         for proto in extract_ws_protocols(&request) {
-            let candidate = strip_ws_prefix(&proto, "aoe-token").unwrap_or(&proto);
+            let candidate = strip_ws_prefix(&proto, "hmp-token").unwrap_or(&proto);
             let (valid, upgrade) = state.token_manager.validate(candidate).await;
             if valid {
                 matched_source = Some(TokenSource::WebSocketProtocol);
@@ -864,7 +864,7 @@ pub async fn auth_middleware(
 /// owner identity (from the current token hash for push attribution),
 /// records the device, enforces step-up elevation for sensitive
 /// routes, and refreshes the session cookie's sliding window. NO
-/// `aoe_token` cookie or `x-aoe-token` header is attached: bound
+/// `hmp_token` cookie or `x-hmp-token` header is attached: bound
 /// devices don't need the rotating token propagated to them.
 async fn handle_session_authenticated(
     state: &Arc<AppState>,
@@ -1097,7 +1097,7 @@ mod tests {
 
         // login enabled + non-bootstrap path + loopback: the #1168
         // carve-out. Local TUI authenticated by token from
-        // ~/.agent-of-empires/serve.url skips the passphrase factor.
+        // ~/.hmp/serve.url skips the passphrase factor.
         assert_eq!(
             post_token_auth_action(true, false, loopback),
             PostTokenAuthAction::Bypass
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn build_cookie_without_secure() {
         let cookie = build_cookie("mytoken", false, 14400);
-        assert!(cookie.contains("aoe_token=mytoken"));
+        assert!(cookie.contains("hmp_token=mytoken"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=14400"));
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn extract_tokens_cookie_wins_over_bearer() {
         let req = build_request_with_headers(vec![
-            ("cookie", "aoe_token=cookie_tok"),
+            ("cookie", "hmp_token=cookie_tok"),
             ("authorization", "Bearer bearer_tok"),
         ]);
         let tokens = extract_tokens(&req);
@@ -1243,13 +1243,13 @@ mod tests {
 
     #[test]
     fn strip_ws_prefix_works() {
-        assert_eq!(strip_ws_prefix("aoe-token.abc", "aoe-token"), Some("abc"));
-        assert_eq!(strip_ws_prefix("aoe-device.xyz", "aoe-device"), Some("xyz"));
+        assert_eq!(strip_ws_prefix("hmp-token.abc", "hmp-token"), Some("abc"));
+        assert_eq!(strip_ws_prefix("hmp-device.xyz", "hmp-device"), Some("xyz"));
         // No leading dot -> not a prefixed value, just a coincidentally
         // matching string. Don't strip.
-        assert_eq!(strip_ws_prefix("aoe-tokenabc", "aoe-token"), None);
+        assert_eq!(strip_ws_prefix("hmp-tokenabc", "hmp-token"), None);
         // Unrelated subprotocol.
-        assert_eq!(strip_ws_prefix("graphql-ws", "aoe-token"), None);
+        assert_eq!(strip_ws_prefix("graphql-ws", "hmp-token"), None);
     }
 
     #[test]
@@ -1259,7 +1259,7 @@ mod tests {
         let raw = [0xAB; 32];
         let encoded = URL_SAFE_NO_PAD.encode(raw);
         let req = build_request_with_headers(vec![(
-            "x-aoe-device-binding",
+            "x-hmp-device-binding",
             Box::leak(encoded.into_boxed_str()),
         )]);
         let bytes = extract_device_binding(&req).expect("decodes");
@@ -1272,7 +1272,7 @@ mod tests {
         use base64::Engine;
         let raw = [0xCD; 32];
         let encoded = URL_SAFE_NO_PAD.encode(raw);
-        let proto = format!("aoe-token.tok123, aoe-device.{}", encoded);
+        let proto = format!("hmp-token.tok123, hmp-device.{}", encoded);
         let req = build_request_with_headers(vec![(
             "sec-websocket-protocol",
             Box::leak(proto.into_boxed_str()),
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn extract_device_binding_rejects_malformed() {
         let req = build_request_with_headers(vec![(
-            "x-aoe-device-binding",
+            "x-hmp-device-binding",
             "not-base64-and-wrong-length",
         )]);
         assert!(extract_device_binding(&req).is_none());
@@ -1298,13 +1298,13 @@ mod tests {
 
     // Regression test for the token-cookie clobber bug:
     // `write_token_headers` must `.append` the `Set-Cookie` for
-    // `aoe_token`, never `.insert`. A handler that already set
-    // `aoe_session` on its response (login_handler on success,
+    // `hmp_token`, never `.insert`. A handler that already set
+    // `hmp_session` on its response (login_handler on success,
     // logout_handler on clear) must keep its cookie when the
-    // middleware later adds the `aoe_token` cookie. A `.insert`
+    // middleware later adds the `hmp_token` cookie. A `.insert`
     // would replace the handler's `Set-Cookie` (HeaderMap::insert
     // semantics: remove all prior values, set the new one), so
-    // browsers would receive only `aoe_token=...` and the
+    // browsers would receive only `hmp_token=...` and the
     // session-cookie write would be silently dropped. This test
     // pins the two-cookies-in-the-response invariant.
     #[test]
@@ -1313,15 +1313,15 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         // Simulate a handler that already set its own Set-Cookie
-        // (e.g., `login_handler` setting `aoe_session=...`).
+        // (e.g., `login_handler` setting `hmp_session=...`).
         headers.insert(
             header::SET_COOKIE,
             HeaderValue::from_static(
-                "aoe_session=abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
+                "hmp_session=abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
             ),
         );
 
-        // Middleware writes the `aoe_token` cookie + companion
+        // Middleware writes the `hmp_token` cookie + companion
         // header on top.
         write_token_headers(&mut headers, "tok123", false, 14400);
 
@@ -1337,15 +1337,15 @@ mod tests {
             "both Set-Cookie values must survive, got {cookies:?}"
         );
         assert!(
-            cookies.iter().any(|c| c.contains("aoe_session=abc")),
-            "handler's aoe_session cookie was clobbered: {cookies:?}"
+            cookies.iter().any(|c| c.contains("hmp_session=abc")),
+            "handler's hmp_session cookie was clobbered: {cookies:?}"
         );
         assert!(
-            cookies.iter().any(|c| c.contains("aoe_token=tok123")),
-            "middleware's aoe_token cookie missing: {cookies:?}"
+            cookies.iter().any(|c| c.contains("hmp_token=tok123")),
+            "middleware's hmp_token cookie missing: {cookies:?}"
         );
         assert_eq!(
-            headers.get("x-aoe-token").and_then(|v| v.to_str().ok()),
+            headers.get("x-hmp-token").and_then(|v| v.to_str().ok()),
             Some("tok123")
         );
     }
@@ -1353,7 +1353,7 @@ mod tests {
     // Regression test for the logout-clobber bug: when a request
     // hits a login-exempt path (notably `POST /api/logout` and
     // `POST /api/login`), `handle_session_authenticated` must NOT
-    // append a sliding-window `Set-Cookie: aoe_session=<id>` after
+    // append a sliding-window `Set-Cookie: hmp_session=<id>` after
     // the handler runs. The handler is the one that owns the cookie
     // on those responses (logout clears with `Max-Age=0`; login
     // mints a fresh id), and an unconditional refresh would emit a

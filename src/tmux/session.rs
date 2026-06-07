@@ -491,7 +491,7 @@ impl Session {
     fn send_via_paste_buffer(target: &str, text: &str) -> Result<()> {
         static SEND_COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
+        let buf_name = format!("hmp-send-{}-{}", std::process::id(), seq);
 
         let mut child = Command::new("tmux")
             .args(["load-buffer", "-b", &buf_name, "-"])
@@ -605,7 +605,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_remain");
+        let guard = TmuxTestSession::new("hmp_test_remain");
         let session_name = guard.name().to_string();
         // Chain set-option -p with new-session to avoid race condition
         let output = Command::new("tmux")
@@ -661,7 +661,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_alive");
+        let guard = TmuxTestSession::new("hmp_test_alive");
         let session_name = guard.name().to_string();
 
         // Create a session with a long-running command
@@ -712,7 +712,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_multiwin");
+        let guard = TmuxTestSession::new("hmp_test_multiwin");
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command in window 0
@@ -785,7 +785,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_capture_multiwin");
+        let guard = TmuxTestSession::new("hmp_test_capture_multiwin");
         let session_name = guard.name().to_string();
 
         // Create session running sleep in the first window
@@ -854,7 +854,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
+        let guard = TmuxTestSession::new("hmp_test_shell_multiwin");
         let session_name = guard.name().to_string();
 
         // Create session running sleep (not a shell) in the first window
@@ -913,7 +913,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_splitpane");
+        let guard = TmuxTestSession::new("hmp_test_splitpane");
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command (the "agent")
@@ -979,10 +979,10 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_splitpbi");
+        let guard = TmuxTestSession::new("hmp_test_splitpbi");
         let session_name = guard.name().to_string();
 
-        // Create session with pane-base-index 0 pinned (as aoe does)
+        // Create session with pane-base-index 0 pinned (as hmp does)
         let output = Command::new("tmux")
             .args([
                 "new-session",
@@ -1013,7 +1013,7 @@ mod tests {
         assert!(output.status.success());
 
         // Simulate a user with pane-base-index 1 globally by setting it on the
-        // window -- but aoe has already pinned pane-base-index 0 on the session,
+        // window -- but hmp has already pinned pane-base-index 0 on the session,
         // so pane 0 should still be valid.
         // Note: we set it on the session to verify our pinning takes precedence.
         // Actually, set pane-base-index 1 globally to simulate user config, then
@@ -1108,7 +1108,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_shell");
+        let guard = TmuxTestSession::new("hmp_test_shell");
         let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
@@ -1143,7 +1143,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_noshell");
+        let guard = TmuxTestSession::new("hmp_test_noshell");
         let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
@@ -1182,12 +1182,12 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_respawn");
+        let guard = TmuxTestSession::new("hmp_test_respawn");
         let session_name = guard.name().to_string();
 
         // Start a session with a command that exits immediately and
         // remain-on-exit set, so we end up with a dead pane. Pin
-        // pane-base-index 0 to match what aoe does in production;
+        // pane-base-index 0 to match what hmp does in production;
         // without this, users with `pane-base-index 1` in their
         // tmux.conf cause the `^.0` target to miss.
         let output = Command::new("tmux")
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_respawn_dead_pane_no_session() {
-        let session = Session::from_name("aoe_test_nonexistent_session_xyz");
+        let session = Session::from_name("hmp_test_nonexistent_session_xyz");
         let result = session
             .respawn_dead_pane("/tmp", Some("zsh"))
             .expect("respawn_dead_pane should not error on missing session");

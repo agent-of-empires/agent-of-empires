@@ -1,4 +1,4 @@
-//! `aoe url` command -- print the live dashboard URL of a running `aoe serve` daemon.
+//! `aoe url` command -- print the live dashboard URL of a running `hmp serve` daemon.
 
 use anyhow::{bail, Result};
 use clap::Args;
@@ -25,8 +25,8 @@ pub struct UrlArgs {
 pub fn run(args: UrlArgs) -> Result<()> {
     if daemon_pid().is_none() {
         bail!(
-            "No aoe serve daemon is running.\n\
-             Start one with: aoe serve --daemon"
+            "No hmp serve daemon is running.\n\
+             Start one with: hmp serve --daemon"
         );
     }
 

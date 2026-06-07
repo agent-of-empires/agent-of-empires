@@ -130,7 +130,7 @@ mod tests {
         // claiming `scratch: true` with `project_path: /etc` cannot trip the
         // deletion path.
         assert!(!is_scratch_path(Path::new("/etc")));
-        assert!(!is_scratch_path(Path::new("/tmp/aoe-scratch-foo")));
+        assert!(!is_scratch_path(Path::new("/tmp/hmp-scratch-foo")));
     }
 
     #[test]

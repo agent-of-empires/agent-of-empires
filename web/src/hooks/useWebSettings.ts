@@ -6,7 +6,7 @@ import {
 } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
-const STORAGE_KEY = "aoe-web-settings";
+const STORAGE_KEY = "hmp-web-settings";
 
 export interface WebSettings {
   mobileFontSize: number;
@@ -93,7 +93,7 @@ export function useWebSettings() {
     const next = { ...current, ...patch };
     if (!safeSetItem(STORAGE_KEY, JSON.stringify(next))) {
       console.warn(
-        "aoe-web-settings: failed to persist (storage full or disabled)",
+        "hmp-web-settings: failed to persist (storage full or disabled)",
       );
     }
     cachedRaw = null;

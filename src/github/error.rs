@@ -153,7 +153,7 @@ mod tests {
         let err = rt.block_on(async {
             crate::github::GitHubClient::unauthenticated(crate::github::GitHubClientConfig {
                 api_base: "http://127.0.0.1:1".to_string(),
-                user_agent: "agent-of-empires-test".to_string(),
+                user_agent: "hmp-test".to_string(),
                 timeout: std::time::Duration::from_millis(200),
             })
             .unwrap()

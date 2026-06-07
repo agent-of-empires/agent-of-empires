@@ -1,4 +1,4 @@
-//! Repository-level configuration (`.agent-of-empires/config.toml`)
+//! Repository-level configuration (`.hmp/config.toml`)
 //!
 //! Allows repos to define hooks and override session/sandbox/worktree settings.
 //! Settings that are personal/global (theme, updates, tmux) are intentionally
@@ -24,7 +24,7 @@ use super::config::Config;
 use super::profile_config::ProfileConfig;
 use super::project_mcp::ProjectMcpServer;
 
-/// Config sections a repo `.agent-of-empires/config.toml` may override.
+/// Config sections a repo `.hmp/config.toml` may override.
 /// Personal/global sections (theme, status_hooks, acp, web, logging, host
 /// environment) are intentionally excluded, matching the historical typed
 /// `RepoConfig` that simply had no field for them.
@@ -32,7 +32,7 @@ const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
     "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
 ];
 
-/// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
+/// Repository-level configuration loaded from `.hmp/config.toml`.
 ///
 /// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
 /// tables keyed by config-section name. Only [`REPO_OVERRIDABLE_SECTIONS`] are
@@ -113,12 +113,12 @@ impl HooksConfig {
 }
 
 /// Path to the repo config file relative to the project root.
-const REPO_CONFIG_PATH: &str = ".agent-of-empires/config.toml";
+const REPO_CONFIG_PATH: &str = ".hmp/config.toml";
 
 /// Legacy path (pre-1.1) for backwards compatibility.
 const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 
-/// Load repo config from `<project_path>/.agent-of-empires/config.toml`.
+/// Load repo config from `<project_path>/.hmp/config.toml`.
 /// Falls back to the legacy `.aoe/config.toml` path with a deprecation warning.
 /// Returns `None` if neither file exists.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
@@ -136,7 +136,7 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
 
     if is_legacy {
         tracing::warn!(target: "session.store",
-            "Found repo config at legacy path .aoe/config.toml -- please rename to .agent-of-empires/config.toml"
+            "Found repo config at legacy path .aoe/config.toml -- please rename to .hmp/config.toml"
         );
     }
 
@@ -159,12 +159,12 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     Ok(Some(config))
 }
 
-/// Save repo config to `<project_path>/.agent-of-empires/config.toml`.
-/// Creates the `.agent-of-empires/` directory if it does not exist.
+/// Save repo config to `<project_path>/.hmp/config.toml`.
+/// Creates the `.hmp/` directory if it does not exist.
 /// If a legacy `.aoe/config.toml` exists, it is removed after a successful save
 /// to prevent stale config from silently reactivating.
 pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> {
-    let config_dir = project_path.join(".agent-of-empires");
+    let config_dir = project_path.join(".hmp");
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
@@ -181,7 +181,7 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
         if let Err(e) = fs::remove_file(&legacy_config) {
             tracing::warn!(target: "session.store", "Failed to remove legacy {}: {}", legacy_config.display(), e);
         } else {
-            tracing::info!(target: "session.store", "Removed legacy .aoe/config.toml after migrating to .agent-of-empires/");
+            tracing::info!(target: "session.store", "Removed legacy .aoe/config.toml after migrating to .hmp/");
         }
         // Also remove the .aoe/ directory if it's now empty
         let legacy_dir = project_path.join(".aoe");
@@ -234,7 +234,7 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
     }
 }
 
-/// For worktrees, `.agent-of-empires/config.toml` lives in the main repo, not
+/// For worktrees, `.hmp/config.toml` lives in the main repo, not
 /// the worktree dir. Resolve the main repo path so repo config follows the
 /// session regardless of which checkout it was created from.
 ///
@@ -509,7 +509,7 @@ impl RepoTrust {
 }
 
 /// Check combined repo trust for a project path: hook commands from
-/// `.agent-of-empires/config.toml` and MCP servers from `.mcp.json`, both read
+/// `.hmp/config.toml` and MCP servers from `.mcp.json`, both read
 /// from the main repo (resolved from a worktree path) and checked against the
 /// stored per-surface hashes.
 pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
@@ -719,7 +719,7 @@ const PROMPT_SUPPRESS_ENV: &[(&str, &str)] = &[
 /// container hooks use `bash` since the user shell may not be installed.
 ///
 /// `extra_env` carries session metadata (see [`lifecycle_env_vars`]) that
-/// scripts can read via `$AOE_SESSION_ID`, `$AOE_PROJECT_PATH`, etc. For
+/// scripts can read via `$HMP_SESSION_ID`, `$HMP_PROJECT_PATH`, etc. For
 /// container hooks these are re-emitted as `docker exec -e KEY=VALUE` since
 /// host env vars don't propagate into `docker exec` by default.
 fn build_hook_command(
@@ -805,20 +805,20 @@ fn build_hook_command(
 /// Env vars exposed to lifecycle hooks (`on_create`, `on_launch`, `on_destroy`).
 ///
 /// Mirrors the naming in [`crate::status_hooks::StatusHookContext::env_vars`]
-/// so a single vocabulary covers both hook surfaces. `AOE_SESSION_BRANCH` is
+/// so a single vocabulary covers both hook surfaces. `HMP_SESSION_BRANCH` is
 /// only present when the session has a worktree; other fields may be empty
-/// strings (e.g., `AOE_GROUP_PATH` for ungrouped sessions).
+/// strings (e.g., `HMP_GROUP_PATH` for ungrouped sessions).
 pub(crate) fn lifecycle_env_vars(instance: &super::Instance) -> Vec<(&'static str, String)> {
     let mut env = vec![
-        ("AOE_SESSION_ID", instance.id.clone()),
-        ("AOE_SESSION_TITLE", instance.title.clone()),
-        ("AOE_PROJECT_PATH", instance.project_path.clone()),
-        ("AOE_PROFILE", instance.effective_profile()),
-        ("AOE_TOOL", instance.tool.clone()),
-        ("AOE_GROUP_PATH", instance.group_path.clone()),
+        ("HMP_SESSION_ID", instance.id.clone()),
+        ("HMP_SESSION_TITLE", instance.title.clone()),
+        ("HMP_PROJECT_PATH", instance.project_path.clone()),
+        ("HMP_PROFILE", instance.effective_profile()),
+        ("HMP_TOOL", instance.tool.clone()),
+        ("HMP_GROUP_PATH", instance.group_path.clone()),
     ];
     if let Some(wt) = instance.worktree_info.as_ref() {
-        env.push(("AOE_SESSION_BRANCH", wt.branch.clone()));
+        env.push(("HMP_SESSION_BRANCH", wt.branch.clone()));
     }
     env
 }
@@ -914,7 +914,7 @@ fn run_hook_with_timeout(
 
     let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
     std::thread::Builder::new()
-        .name(format!("aoe-hook-drain-{}", pid))
+        .name(format!("hmp-hook-drain-{}", pid))
         .spawn(move || {
             let _ = tx.send(child.wait_with_output());
         })
@@ -1170,9 +1170,9 @@ pub fn execute_hooks_in_container_streamed(
 }
 
 /// Template content for `aoe init`.
-pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
-# This file configures aoe behavior for this repository.
-# See: https://github.com/agent-of-empires/agent-of-empires
+pub const INIT_TEMPLATE: &str = r#"# Hoxkss My Pi - Repository Configuration
+# This file configures hmp behavior for this repository.
+# See: https://github.com/hoxkss/hmp
 
 # [hooks]
 # Commands run once when a session is first created
@@ -1187,7 +1187,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 
 # [sandbox]
 # enabled_by_default = true
-# default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10"
+# default_image = "ghcr.io/hmp/hmp-dev-sandbox:0.10"
 # List fields below replace (not append to) global settings when set:
 # environment = ["NODE_ENV", "DATABASE_URL"]
 # volume_ignores = ["node_modules", ".next"]
@@ -1424,7 +1424,7 @@ mod tests {
         .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert!(merged.sandbox.enabled_by_default);
-        // `aoe add --sandbox` reads `config.sandbox.default_image` as its
+        // `hmp add --sandbox` reads `config.sandbox.default_image` as its
         // fallback image, so the repo override must land here (see #1651).
         assert_eq!(
             merged.sandbox.default_image,
@@ -1748,7 +1748,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     }
 
     /// The CLI/captured path leaves the terminal attached so users running
-    /// `aoe add` from a real shell can still answer interactive prompts. We
+    /// `hmp add` from a real shell can still answer interactive prompts. We
     /// only verify the env vars are NOT forced here (stdin may or may not be
     /// a TTY depending on how tests are launched).
     #[test]
@@ -1858,7 +1858,7 @@ trusted_at = "2026-01-31T00:00:00Z"
 
     /// `lifecycle_env_vars` is the contract advertised to hook authors in
     /// docs/guides/repo-config.md. Keys (and conditional inclusion of
-    /// `AOE_SESSION_BRANCH`) must stay stable; pin the shape here so changes
+    /// `HMP_SESSION_BRANCH`) must stay stable; pin the shape here so changes
     /// have to update both the helper and the docs in lockstep.
     #[test]
     fn lifecycle_env_vars_shape() {
@@ -1874,25 +1874,25 @@ trusted_at = "2026-01-31T00:00:00Z"
             lifecycle_env_vars(&instance).into_iter().collect();
 
         assert_eq!(
-            env.get("AOE_SESSION_ID").map(String::as_str),
+            env.get("HMP_SESSION_ID").map(String::as_str),
             Some(instance.id.as_str())
         );
         assert_eq!(
-            env.get("AOE_SESSION_TITLE").map(String::as_str),
+            env.get("HMP_SESSION_TITLE").map(String::as_str),
             Some("My Session")
         );
         assert_eq!(
-            env.get("AOE_PROJECT_PATH").map(String::as_str),
+            env.get("HMP_PROJECT_PATH").map(String::as_str),
             Some("/tmp/proj")
         );
-        assert_eq!(env.get("AOE_TOOL").map(String::as_str), Some("claude"));
+        assert_eq!(env.get("HMP_TOOL").map(String::as_str), Some("claude"));
         assert_eq!(
-            env.get("AOE_GROUP_PATH").map(String::as_str),
+            env.get("HMP_GROUP_PATH").map(String::as_str),
             Some("backend/api")
         );
-        assert!(env.contains_key("AOE_PROFILE"));
+        assert!(env.contains_key("HMP_PROFILE"));
         assert!(
-            !env.contains_key("AOE_SESSION_BRANCH"),
+            !env.contains_key("HMP_SESSION_BRANCH"),
             "branch should be omitted when no worktree is attached"
         );
 
@@ -1907,7 +1907,7 @@ trusted_at = "2026-01-31T00:00:00Z"
             lifecycle_env_vars(&instance).into_iter().collect();
         assert_eq!(
             env_with_branch
-                .get("AOE_SESSION_BRANCH")
+                .get("HMP_SESSION_BRANCH")
                 .map(String::as_str),
             Some("feature/auth")
         );
@@ -1929,10 +1929,10 @@ trusted_at = "2026-01-31T00:00:00Z"
         let env = lifecycle_env_vars(&instance);
 
         let probe = r#"
-            echo "ID=${AOE_SESSION_ID}" > env.txt
-            echo "TITLE=${AOE_SESSION_TITLE}" >> env.txt
-            echo "PATH=${AOE_PROJECT_PATH}" >> env.txt
-            echo "TOOL=${AOE_TOOL}" >> env.txt
+            echo "ID=${HMP_SESSION_ID}" > env.txt
+            echo "TITLE=${HMP_SESSION_TITLE}" >> env.txt
+            echo "PATH=${HMP_PROJECT_PATH}" >> env.txt
+            echo "TOOL=${HMP_TOOL}" >> env.txt
         "#;
 
         execute_hooks(&[probe.to_string()], tmp.path(), &env).unwrap();
@@ -1977,8 +1977,8 @@ trusted_at = "2026-01-31T00:00:00Z"
             workdir: "/work",
         };
         let env = vec![
-            ("AOE_SESSION_ID", "s_abc".to_string()),
-            ("AOE_SESSION_TITLE", "My Title".to_string()),
+            ("HMP_SESSION_ID", "s_abc".to_string()),
+            ("HMP_SESSION_TITLE", "My Title".to_string()),
         ];
         let cmd = build_hook_command("true", &target, HookSpawnOpts::default(), &env);
         let args: Vec<String> = cmd
@@ -1993,13 +1993,13 @@ trusted_at = "2026-01-31T00:00:00Z"
                 .any(|w| w[0] == "-e" && w[1] == format!("{}={}", k, v))
         };
         assert!(
-            has_pair("AOE_SESSION_ID", "s_abc"),
-            "expected (-e, AOE_SESSION_ID=s_abc) pair in argv, got: {:?}",
+            has_pair("HMP_SESSION_ID", "s_abc"),
+            "expected (-e, HMP_SESSION_ID=s_abc) pair in argv, got: {:?}",
             args
         );
         assert!(
-            has_pair("AOE_SESSION_TITLE", "My Title"),
-            "expected (-e, AOE_SESSION_TITLE=My Title) pair as single argv element, got: {:?}",
+            has_pair("HMP_SESSION_TITLE", "My Title"),
+            "expected (-e, HMP_SESSION_TITLE=My Title) pair as single argv element, got: {:?}",
             args
         );
     }

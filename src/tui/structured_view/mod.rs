@@ -6,7 +6,7 @@
 //!
 //! Directory name is `structured_view` (not `structured view`) to avoid colliding
 //! with `src/acp/` per the recipe in
-//! https://github.com/agent-of-empires/agent-of-empires/issues/1018#issuecomment-4444040929.
+//! https://github.com/hoxkss/hmp/issues/1018#issuecomment-4444040929.
 
 pub mod input;
 pub mod mention;
@@ -45,9 +45,9 @@ const TOAST_TTL: Duration = Duration::from_secs(4);
 
 /// Set up an alternate-screen terminal, run the structured view against
 /// the given session, and tear it back down on exit. Used by the
-/// `aoe acp attach <id>` CLI verb to jump straight into the
+/// `hmp acp attach <id>` CLI verb to jump straight into the
 /// structured view without going through the home screen. Pair with
-/// `AOE_DAEMON_URL` for remote-attach against another machine's
+/// `HMP_DAEMON_URL` for remote-attach against another machine's
 /// structured view daemon.
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use crossterm::event::{
@@ -62,7 +62,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use std::io::IsTerminal;
 
     if !io::stdin().is_terminal() {
-        anyhow::bail!("stdin is not a terminal; `aoe acp attach` requires an interactive TTY");
+        anyhow::bail!("stdin is not a terminal; `hmp acp attach` requires an interactive TTY");
     }
 
     enable_raw_mode()?;
@@ -111,7 +111,7 @@ pub async fn run(
             render_error_screen(
                 terminal,
                 theme,
-                "AOE_DAEMON_URL is set but the daemon at that URL is unreachable.\n\nCheck the URL, or unset the env var to use a local daemon.",
+                "HMP_DAEMON_URL is set but the daemon at that URL is unreachable.\n\nCheck the URL, or unset the env var to use a local daemon.",
             )?;
             wait_for_dismiss(event_stream).await?;
             return Ok(());
@@ -120,7 +120,7 @@ pub async fn run(
             render_error_screen(
                 terminal,
                 theme,
-                "AOE_DAEMON_URL is set but the daemon rejected the bearer token.\n\nCheck AOE_DAEMON_TOKEN.",
+                "HMP_DAEMON_URL is set but the daemon rejected the bearer token.\n\nCheck HMP_DAEMON_TOKEN.",
             )?;
             wait_for_dismiss(event_stream).await?;
             return Ok(());
@@ -144,7 +144,7 @@ pub async fn run(
 
 /// Same as [`run`] but the caller has already located the daemon
 /// endpoint (e.g. the remote-home picker that ran a session discovery
-/// step against a fixed `AOE_DAEMON_URL`). Skips `require_daemon` so
+/// step against a fixed `HMP_DAEMON_URL`). Skips `require_daemon` so
 /// the view doesn't re-run discovery / health-check when the caller
 /// has already done it.
 pub async fn run_for_endpoint(

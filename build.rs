@@ -6,7 +6,7 @@ fn main() {
     build_frontend();
 }
 
-/// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
+/// Emit `HMP_BUILD_VERSION`, the build identity stamped on each structured view
 /// worker record so the daemon can tell whether a surviving worker is
 /// running the current binary or an older one (see issue #1754).
 ///
@@ -16,7 +16,7 @@ fn main() {
 /// commit identity so dev rebuilds across commits are distinguishable.
 ///
 /// Source order (first hit wins):
-///   1. `AOE_BUILD_VERSION` env override (release packaging, reproducible
+///   1. `HMP_BUILD_VERSION` env override (release packaging, reproducible
 ///      builds, downstream packagers).
 ///   2. `GITHUB_SHA` (CI builds where `.git` may be a shallow checkout).
 ///   3. Local `git rev-parse` + a coarse dirty flag.
@@ -33,12 +33,12 @@ fn emit_build_version() {
     // `.git/HEAD` moves on checkout/commit; `.git/index` moves on stage.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-env-changed=AOE_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=HMP_BUILD_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
     let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
-    let build_version = if let Ok(explicit) = std::env::var("AOE_BUILD_VERSION") {
+    let build_version = if let Ok(explicit) = std::env::var("HMP_BUILD_VERSION") {
         explicit
     } else if let Ok(sha) = std::env::var("GITHUB_SHA") {
         let short: String = sha.chars().take(12).collect();
@@ -53,7 +53,7 @@ fn emit_build_version() {
         pkg_version
     };
 
-    println!("cargo:rustc-env=AOE_BUILD_VERSION={build_version}");
+    println!("cargo:rustc-env=HMP_BUILD_VERSION={build_version}");
 }
 
 /// Short (12-char) HEAD commit hash, or `None` when git is unavailable or
@@ -100,7 +100,7 @@ fn check_stale_build_cache() {
     let target_dir = std::env::var("OUT_DIR")
         .ok()
         .and_then(|out| {
-            // OUT_DIR is something like target/debug/build/agent-of-empires-xxx/out
+            // OUT_DIR is something like target/debug/build/hmp-xxx/out
             // Walk up to find the target/ root.
             let mut p = Path::new(&out).to_path_buf();
             while p.pop() {
@@ -154,22 +154,22 @@ fn build_frontend() {
     println!("cargo:rerun-if-changed=web/vite.config.ts");
     println!("cargo:rerun-if-changed=web/tsconfig.json");
 
-    // AOE_WEB_DIST allows Nix (and other reproducible build systems) to supply
+    // HMP_WEB_DIST allows Nix (and other reproducible build systems) to supply
     // a pre-built frontend directory, bypassing the npm build entirely. When
     // set, the directory is copied to web/dist/ and npm is not invoked.
     //
     // Registered unconditionally so Cargo re-runs build.rs when the var is
     // added or removed, not only when it is already set.
-    println!("cargo:rerun-if-env-changed=AOE_WEB_DIST");
+    println!("cargo:rerun-if-env-changed=HMP_WEB_DIST");
 
-    // AOE_COVERAGE=1 instructs Vite to instrument the web bundle with
+    // HMP_COVERAGE=1 instructs Vite to instrument the web bundle with
     // istanbul (see web/vite.config.ts) so Playwright tests against the
     // embedded frontend can collect coverage. The env var is read by the
     // npm child process below; we only need to tell Cargo to invalidate the
     // build script's cache when it toggles.
-    println!("cargo:rerun-if-env-changed=AOE_COVERAGE");
-    if let Ok(dist_src) = std::env::var("AOE_WEB_DIST") {
-        eprintln!("Using pre-built web frontend from AOE_WEB_DIST={dist_src}");
+    println!("cargo:rerun-if-env-changed=HMP_COVERAGE");
+    if let Ok(dist_src) = std::env::var("HMP_WEB_DIST") {
+        eprintln!("Using pre-built web frontend from HMP_WEB_DIST={dist_src}");
         let src = Path::new(&dist_src);
         let dst = Path::new("web/dist");
         if dst.exists() {

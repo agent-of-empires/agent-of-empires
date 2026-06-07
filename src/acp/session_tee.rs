@@ -1,5 +1,5 @@
 //! Per-session tracing tee: mirrors session-scoped events into each
-//! session's `acp-workers/<id>.log` so `aoe acp logs --session <id>`
+//! session's `acp-workers/<id>.log` so `hmp acp logs --session <id>`
 //! surfaces the daemon's watchdog/cancel breadcrumbs, not just the
 //! startup marker plus agent stderr. Additive: events still flow to the
 //! shared `debug.log`. See issue #1864.

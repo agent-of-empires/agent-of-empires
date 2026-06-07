@@ -10,7 +10,7 @@ import {
   type RepoAppearance,
 } from "./repoAppearance";
 
-const STORAGE_KEY = "aoe-repo-appearance-v1";
+const STORAGE_KEY = "hmp-repo-appearance-v1";
 
 describe("applyRepoAppearanceUpdate", () => {
   it("sets a trimmed alias", () => {

@@ -27,9 +27,9 @@ import {
 /** localStorage key persisting the last tool the user picked in the
  *  wizard. Per-browser, scoped by tool registry key. Validated against
  *  ACP_CAPABLE_TOOLS on read so an outdated value (or one written by a
- *  different aoe install with extra agents registered) doesn't crash
+ *  different hmp install with extra agents registered) doesn't crash
  *  the wizard. See #1133 thread 7 / #1135. */
-const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
+const LAST_USED_TOOL_KEY = "hmp-acp-last-tool";
 
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);

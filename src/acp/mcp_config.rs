@@ -1,7 +1,7 @@
 //! Global MCP server config (`<app_dir>/mcp.json`) parsing and conversion
 //! to ACP `McpServer` values forwarded at session creation.
 //!
-//! AoE forwards the user's MCP servers to structured-view ACP agents through
+//! HMP forwards the user's MCP servers to structured-view ACP agents through
 //! `session/new` and `session/load`; without this the agent reaches no MCP
 //! servers at all. The on-disk format mirrors the ecosystem-standard
 //! `.mcp.json` so users can reuse the definitions they already maintain for
@@ -16,9 +16,9 @@
 //! }
 //! ```
 //!
-//! The global file in the AoE app dir and a per-profile `<profile_dir>/mcp.json`
+//! The global file in the HMP app dir and a per-profile `<profile_dir>/mcp.json`
 //! (issue #1986) are both read; the per-profile layer merges above global. A
-//! project-local `cwd/.mcp.json` is intentionally NOT read: AoE opens cloned and
+//! project-local `cwd/.mcp.json` is intentionally NOT read: HMP opens cloned and
 //! potentially untrusted repositories, and stdio MCP servers launch
 //! unconditionally when a session spawns, so project scope must sit behind the
 //! repo-trust gate (the same boundary that already protects lifecycle hooks).
@@ -76,7 +76,7 @@ pub fn load_global_mcp_servers(app_dir: &Path) -> Result<Vec<McpServer>> {
 /// just resolved from the active session's profile directory. The per-profile
 /// layer is merged ABOVE global (so a same-named server in the profile file
 /// overrides the global one) and below project-local. Per-profile entries are
-/// AoE state only: they are never written back to any agent's native config.
+/// HMP state only: they are never written back to any agent's native config.
 pub fn load_profile_mcp_servers(profile_dir: &Path) -> Result<Vec<McpServer>> {
     read_mcp_json(&profile_dir.join("mcp.json"))
 }
@@ -276,7 +276,7 @@ pub fn merge_by_precedence(layers: Vec<McpLayer>) -> Vec<McpServer> {
 
 /// Where an agent keeps its own MCP server config, and in what shape. This is
 /// the per-agent seam: adding an agent is one match arm in `native_config_for`
-/// plus, if its format differs, one converter. AoE only ever reads these files;
+/// plus, if its format differs, one converter. HMP only ever reads these files;
 /// it never writes them.
 enum NativeMcpConfig {
     /// Standard `{ "mcpServers": { ... } }` JSON with the ecosystem `type`/`url`
@@ -292,7 +292,7 @@ enum NativeMcpConfig {
 }
 
 /// Map an agent registry key to its native MCP config descriptor, or `None` for
-/// an agent AoE has no native reader for (those contribute no native servers).
+/// an agent HMP has no native reader for (those contribute no native servers).
 fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     match agent_key {
         "claude" | "claude-code" => Some(NativeMcpConfig::StandardJson(".claude.json")),
@@ -307,7 +307,7 @@ fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
 /// edits are picked up on the next session. Returns an empty list for an agent
 /// with no known native reader and for a missing file. A present-but-unparseable
 /// file is an error the caller downgrades to a warning, so a broken native file
-/// (which AoE does not own) never blocks a spawn. Individual malformed server
+/// (which HMP does not own) never blocks a spawn. Individual malformed server
 /// entries are skipped with a warning rather than failing the whole file.
 pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<McpServer>> {
     let Some(config) = native_config_for(agent_key) else {

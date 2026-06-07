@@ -2,15 +2,15 @@
 members = [".", "xtask", "aoe-settings-derive"]
 
 [package]
-name = "agent-of-empires"
+name = "hoxkss-my-pi"
 version = "1.10.1"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Agent of Empires Contributors"]
-description = "Terminal session manager for AI coding agents"
+authors = ["Hoxkss"]
+description = "OMP-focused structured workspace for Hoxkss My Pi"
 license = "MIT"
-repository = "https://github.com/agent-of-empires/agent-of-empires"
-keywords = ["tmux", "tui", "ai", "claude", "terminal"]
+repository = "https://github.com/hoxkss/agent-of-empires"
+keywords = ["tmux", "tui", "ai", "omp", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
@@ -126,7 +126,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Web server (optional, behind "serve" feature)
 axum = { version = "0.8", features = ["ws"], optional = true }
-# Cross-platform browser launcher for `aoe serve --open`.
+# Cross-platform browser launcher for `hmp serve --open`.
 webbrowser = { version = "1", optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
@@ -219,7 +219,7 @@ axum = { version = "0.8", features = ["ws"] }
 # integration tests so they can reach `crate::tmux::test_support`. This is
 # the standard Cargo pattern for opt-in test-only re-exports; the lib build
 # (and release binaries) never see the feature.
-agent-of-empires = { path = ".", features = ["test-support"] }
+hoxkss-my-pi = { path = ".", features = ["test-support"] }
 
 [profile.release]
 lto = true
@@ -236,6 +236,11 @@ codegen-units = 16
 # `-dev` namespace.
 debug-assertions = false
 
+
+[lib]
+name = "agent_of_empires"
+path = "src/lib.rs"
+
 [[bin]]
-name = "aoe"
+name = "hmp"
 path = "src/main.rs"

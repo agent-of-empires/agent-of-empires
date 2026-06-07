@@ -680,18 +680,18 @@ mod tests {
     #[test]
     fn test_try_sandbox_dir_cleanup_respects_allow_container_removal_false() {
         use crate::session::{Instance, SandboxInfo};
-        let mut instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
+        let mut instance = Instance::new("Test", "/tmp/hmp-cleanup-test-nonexistent");
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),
-            container_name: "aoe-sandbox-doesnotexist".to_string(),
+            container_name: "hmp-sandbox-doesnotexist".to_string(),
             extra_env: None,
             custom_instruction: None,
         });
 
-        let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
-        let main_repo = std::path::PathBuf::from("/tmp/aoe-cleanup-test-main-nonexistent");
+        let worktree = std::path::PathBuf::from("/tmp/hmp-cleanup-test-nonexistent");
+        let main_repo = std::path::PathBuf::from("/tmp/hmp-cleanup-test-main-nonexistent");
 
         // With allow_container_removal=false, must return false without
         // touching anything.
@@ -757,7 +757,7 @@ mod tests {
             enabled: true,
             container_id: None,
             image: "alpine".to_string(),
-            container_name: "aoe-cruft-doesnotexist".to_string(),
+            container_name: "hmp-cruft-doesnotexist".to_string(),
             extra_env: None,
             custom_instruction: None,
         });
@@ -839,10 +839,10 @@ mod tests {
     #[test]
     fn test_try_sandbox_dir_cleanup_returns_false_for_non_sandboxed() {
         use crate::session::Instance;
-        let instance = Instance::new("Test", "/tmp/aoe-cleanup-test-nonexistent");
+        let instance = Instance::new("Test", "/tmp/hmp-cleanup-test-nonexistent");
         // No sandbox_info set.
-        let worktree = std::path::PathBuf::from("/tmp/aoe-cleanup-test-nonexistent");
-        let main_repo = std::path::PathBuf::from("/tmp/aoe-cleanup-test-main-nonexistent");
+        let worktree = std::path::PathBuf::from("/tmp/hmp-cleanup-test-nonexistent");
+        let main_repo = std::path::PathBuf::from("/tmp/hmp-cleanup-test-main-nonexistent");
 
         // Even with allow_container_removal=true, a non-sandboxed
         // instance must early-return.

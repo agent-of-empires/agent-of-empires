@@ -6,7 +6,7 @@ import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 
-const VSPLIT_STORAGE_KEY = "aoe-right-vsplit";
+const VSPLIT_STORAGE_KEY = "hmp-right-vsplit";
 const DEFAULT_TOP_RATIO = 0.5;
 const MIN_TOP_PX = 80;
 const MIN_BOTTOM_PX = 120;

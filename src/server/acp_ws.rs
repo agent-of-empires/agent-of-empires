@@ -84,7 +84,7 @@ pub async fn acp_ws(
         "agent ws route entered, beginning upgrade"
     );
     let session_for_handler = id.clone();
-    ws.protocols(["aoe-auth"])
+    ws.protocols(["hmp-auth"])
         .on_upgrade(move |socket| async move {
             debug!(target: "acp.ws", session = %session_for_handler, "agent ws upgrade complete");
             handle(socket, session_for_handler, state, since).await
@@ -229,7 +229,7 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
 /// Read every stored event for `session_id` with `seq > since` out of
 /// the disk-backed event store and forward it to the socket as a
 /// `AcpBroadcastFrame`. Returns the number of frames sent. The
-/// event store survives `aoe serve` restart, so this drain works even
+/// event store survives `hmp serve` restart, so this drain works even
 /// after the daemon has restarted. The live broadcast channel is
 /// already subscribed by the caller before this runs, so any events
 /// published between the snapshot and the live-loop entry are still

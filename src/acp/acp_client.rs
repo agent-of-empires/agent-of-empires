@@ -1,6 +1,6 @@
 //! ACP client wrapper.
 //!
-//! aoe is the *client* in ACP terms; the agent (claude-code, aoe-agent,
+//! hmp is the *client* in ACP terms; the agent (claude-code, hmp-agent,
 //! gemini, etc.) is the *server*. The client sends `initialize`,
 //! `session/new`, `session/prompt` and handles incoming `session/update`
 //! notifications and `session/request_permission` requests.
@@ -225,7 +225,7 @@ pub enum DeleteSessionOutcome {
     Deleted,
     /// Adapter returned JSON-RPC `-32601 method_not_found`. Expected on
     /// adapters that don't advertise `sessionCapabilities.delete`
-    /// (`aoe-agent`, `codex`, `opencode`, older `claude-agent-acp`).
+    /// (`hmp-agent`, `codex`, `opencode`, older `claude-agent-acp`).
     UnsupportedMethod,
     /// The bounded wait elapsed before the adapter responded.
     TimedOut,
@@ -333,14 +333,14 @@ enum ClientCmd {
 /// `session/load` (if the agent advertises support AND we have a stored
 /// id) or `session/new`.
 ///
-/// `Resume` is used by `AcpClient::attach` on `aoe serve` restart, when
+/// `Resume` is used by `AcpClient::attach` on `hmp serve` restart, when
 /// the per-session `aoe __acp-runner` shim kept the agent process
 /// alive across the daemon's death. The agent is already initialized
 /// and the session is already in its in-memory map; re-sending
 /// `session/new` would split context onto a new session id (which the
 /// in-flight turn does not address), and re-sending `session/load`
 /// against an agent that advertises `loadSession: false` (e.g. the
-/// bundled `aoe-agent`) would fall through to `session/new` with the
+/// bundled `hmp-agent`) would fall through to `session/new` with the
 /// same split-context bug. In `Resume` mode the daemon still sends
 /// `initialize` (idempotent for capabilities, cheap, lets us learn the
 /// agent's caps) but skips both `session/new` and `session/load` and
@@ -902,7 +902,7 @@ fn detect_off_protocol_work_completed(
 static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Read the resume-idle grace. In debug builds, honors
-/// `AOE_RESUME_IDLE_GRACE_MS` so integration tests can short-circuit
+/// `HMP_RESUME_IDLE_GRACE_MS` so integration tests can short-circuit
 /// the default 10s without making real failures racy. Values below
 /// 100ms are clamped up so a typo can't effectively disable the
 /// watchdog. Release builds always use `RESUME_IDLE_GRACE_DEFAULT`
@@ -910,7 +910,7 @@ static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// events to real users.
 fn resume_idle_grace() -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_RESUME_IDLE_GRACE_MS") {
+    if let Ok(raw) = std::env::var("HMP_RESUME_IDLE_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             return std::time::Duration::from_millis(ms.max(100));
         }
@@ -932,17 +932,17 @@ fn resolved_acp_config(profile: Option<&str>) -> Option<crate::session::config::
 /// Deadline for the runner unix socket to appear after spawning the
 /// `aoe __acp-runner` shim. 10s is enough in production, but a
 /// debug-build cold-start under heavy CI load (v8 coverage + multiple
-/// parallel `aoe serve` binaries + a runner subprocess that re-execs
+/// parallel `hmp serve` binaries + a runner subprocess that re-execs
 /// the same debug binary) can blow past it deterministically. Honors
-/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` in debug builds so the
+/// `HMP_ACP_RUNNER_SOCKET_TIMEOUT_MS` in debug builds so the
 /// Playwright harness can lift it; release builds keep the original
 /// 10s ceiling.
 fn runner_socket_deadline() -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
+    if let Ok(raw) = std::env::var("HMP_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             // Clamp to a floor of 100ms so a typo like
-            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
+            // `HMP_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
             // wait_for_socket fail immediately and surface as a
             // mysterious "runner socket did not appear" without ever
             // polling.
@@ -953,7 +953,7 @@ fn runner_socket_deadline() -> std::time::Duration {
 }
 
 /// Read the silent-orphan watchdog grace for the given source profile.
-/// In debug builds, honors `AOE_SILENT_ORPHAN_GRACE_MS` so the
+/// In debug builds, honors `HMP_SILENT_ORPHAN_GRACE_MS` so the
 /// integration test can drive a sub-second cadence without making
 /// real failures racy. Otherwise reads
 /// `acp.silent_orphan_grace_secs` from the profile-resolved
@@ -967,7 +967,7 @@ fn runner_socket_deadline() -> std::time::Duration {
 /// must set `0` to disable instead.
 fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_GRACE_MS") {
+    if let Ok(raw) = std::env::var("HMP_SILENT_ORPHAN_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             if ms == 0 {
                 return std::time::Duration::ZERO;
@@ -996,7 +996,7 @@ fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
 /// `UsageUpdate` arrives. Non-zero values smaller than 5s clamp up.
 fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_FAST_GRACE_MS") {
+    if let Ok(raw) = std::env::var("HMP_SILENT_ORPHAN_FAST_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             if ms == 0 {
                 return std::time::Duration::ZERO;
@@ -1018,12 +1018,12 @@ fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
 }
 
 /// Read the silent-orphan polling cadence. Constant in production;
-/// tunable in debug builds via `AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS`
+/// tunable in debug builds via `HMP_SILENT_ORPHAN_CHECK_INTERVAL_MS`
 /// so the disabled-path integration test can verify the watchdog
 /// stays silent without waiting a full polling tick.
 fn silent_orphan_check_interval() -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS") {
+    if let Ok(raw) = std::env::var("HMP_SILENT_ORPHAN_CHECK_INTERVAL_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             return std::time::Duration::from_millis(ms.max(10));
         }
@@ -1226,11 +1226,11 @@ impl AcpClient {
         //  - Socket (runner-mediated): for every structured view session in
         //    production. Spawn `aoe __acp-runner` detached via
         //    `setsid`; the runner binds the unix socket, spawns the
-        //    agent over stdio, and survives `aoe serve --stop`. The
+        //    agent over stdio, and survives `hmp serve --stop`. The
         //    daemon then dials the socket and runs the ACP handshake.
         //  - Stdio (in-proc): the legacy direct-spawn path. Retained for
         //    tests where we don't want to depend on `current_exe()` being
-        //    a real `aoe` binary, and as a safety valve.
+        //    a real `hmp` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
         };
@@ -1401,7 +1401,7 @@ impl AcpClient {
 
     /// Connect to a per-session runner over its unix socket. Used by the
     /// post-spawn "wait for runner to bind, then dial" path AND by the
-    /// `Self::attach` reattach path on `aoe serve` startup. The runner
+    /// `Self::attach` reattach path on `hmp serve` startup. The runner
     /// owns the agent subprocess so this constructor returns an
     /// `AcpClient` with `_child = None`; dropping the client does not
     /// terminate the worker.
@@ -1493,12 +1493,12 @@ impl AcpClient {
     }
 
     /// Reattach to an already-running structured view worker over its unix
-    /// socket. Used by `aoe serve` startup when a registry entry has a
+    /// socket. Used by `hmp serve` startup when a registry entry has a
     /// live PID and an existing socket file; we connect, send only the
     /// (idempotent) ACP `initialize` request, and reuse the existing
     /// `stored_acp_session_id` directly. We deliberately do NOT issue
     /// `session/new` or `session/load`: the agent process is still
-    /// running (the runner kept it alive across `aoe serve --stop`) and
+    /// running (the runner kept it alive across `hmp serve --stop`) and
     /// the session is already loaded in its memory, so re-sending those
     /// requests would either split context onto a new session id (when
     /// the agent doesn't advertise `loadSession`) or double-load against
@@ -1783,7 +1783,7 @@ fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     if key.is_empty() {
         return Some("empty key");
     }
-    if key == "AOE_TOKEN" {
+    if key == "HMP_TOKEN" {
         return Some("aoe auth token, must not reach the agent");
     }
     // Infrastructure / locale keys that `always_forward` already wires
@@ -1915,7 +1915,7 @@ fn push_subdirs(out: &mut Vec<std::path::PathBuf>, root: &std::path::Path, leaf:
 /// runner owns the agent subprocess and outlives the daemon. We retain
 /// no `Child` handle here; once the runner is up, the daemon talks to
 /// it over the unix socket and the OS keeps the runner alive across
-/// `aoe serve` restarts.
+/// `hmp serve` restarts.
 fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
@@ -2043,7 +2043,7 @@ fn spawn_runner_detached(
     // Env: apply the same allowlist + provider_env filtering that the
     // legacy in-proc path does, then hand the cleaned env to the runner.
     // The runner inherits this env when it spawns the agent (no second
-    // filter pass needed). AOE_TOKEN is stripped here so it never reaches
+    // filter pass needed). HMP_TOKEN is stripped here so it never reaches
     // either process.
     cmd.env_clear();
     apply_env_filter(&mut cmd, config);
@@ -2069,7 +2069,7 @@ fn spawn_runner_detached(
     }
 
     // Detach: child becomes its own session leader so a SIGTERM/SIGHUP
-    // to the aoe daemon's group doesn't cascade. The runner installs its
+    // to the hmp daemon's group doesn't cascade. The runner installs its
     // own signal handlers.
     #[cfg(unix)]
     {
@@ -2202,7 +2202,7 @@ fn build_sandbox_docker_argv(
         }
     }
 
-    // Model override (AOE_AGENT_MODEL): the supervisor folds the
+    // Model override (HMP_AGENT_MODEL): the supervisor folds the
     // requested model into provider_env above, so it's already covered.
 
     docker_args.push(sandbox.container_name.clone());
@@ -2227,7 +2227,7 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
         "HOME",
         // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
         // src/session/mod.rs). Without forwarding, the runner falls
-        // back to `$HOME/.config/agent-of-empires[-dev]`, which
+        // back to `$HOME/.config/hmp[-dev]`, which
         // diverges from the daemon when the operator (or live test
         // harness) has set XDG_CONFIG_HOME to a non-default value.
         // The runner then writes its WorkerRecord to a path the
@@ -2253,7 +2253,7 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     }
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
+            if name == "HMP_TOKEN" {
                 continue;
             }
             if let Ok(value) = std::env::var(name) {
@@ -2302,7 +2302,7 @@ async fn wait_for_socket(
 
 fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpError> {
     // Resolve bare command names against PATH + known node-manager dirs.
-    // `aoe serve` captures PATH at daemon-launch time and freezes it for
+    // `hmp serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
     // adapter installed but unreachable. See #1048.
     let resolved = resolve_agent_command(&config.spec.command);
@@ -2319,7 +2319,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stderr(Stdio::piped());
 
     // Env: clear, then forward an explicit allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent.
+    // creds. HMP_TOKEN must NEVER reach the agent.
     cmd.env_clear();
     let always_forward = [
         "PATH",
@@ -2363,8 +2363,8 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     }
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
-                warn!(target: "acp", "ignoring AOE_TOKEN in agent env allowlist");
+            if name == "HMP_TOKEN" {
+                warn!(target: "acp", "ignoring HMP_TOKEN in agent env allowlist");
                 continue;
             }
             if let Ok(value) = std::env::var(name) {
@@ -2392,7 +2392,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // path via env so the agent's bootstrap can `connect()` to it
     // instead of falling back to stdio.
     if let Some(socket_path) = &config.socket_path {
-        cmd.env("AOE_ACP_SOCKET", socket_path);
+        cmd.env("HMP_ACP_SOCKET", socket_path);
     }
 
     info!(
@@ -2428,7 +2428,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             AcpError::Spawn(format!(
                 "{} (binary `{}` not found on the daemon's PATH or in any \
                  known node-manager bin dir; install it where the daemon \
-                 can see it, or restart `aoe serve` from a shell where \
+                 can see it, or restart `hmp serve` from a shell where \
                  `which {}` resolves)",
                 e, config.spec.command, config.spec.command
             ))
@@ -2844,7 +2844,7 @@ fn map_update_to_events(
             let args_preview = preview_optional_args(tc.raw_input.as_ref());
             let parent_tool_call_id = profile.parent_tool_use_id_from_meta(&tc.meta);
             if let Some(parent) = parent_tool_call_id.as_deref() {
-                // Breadcrumb so AOE_ACP_TRACE=1 sessions can verify the
+                // Breadcrumb so HMP_ACP_TRACE=1 sessions can verify the
                 // subagent linkage round-trip (parent Task id → child
                 // tool_call id) end-to-end. See #1041 layer C.
                 debug!(
@@ -3173,13 +3173,13 @@ fn map_update_to_events(
     }
 }
 
-/// Reserved id for the synthetic model selector AoE injects when an
+/// Reserved id for the synthetic model selector HMP injects when an
 /// agent advertises its model via the ACP `unstable_session_model`
 /// capability (`SessionModelState`) instead of a generic
 /// `config_option` with `category: Model`. The set path recognizes
 /// this id and routes to `session/set_model` rather than
 /// `session/set_config_option`. See #1820.
-const ACP_SESSION_MODEL_CONFIG_ID: &str = "__aoe_acp_session_model__";
+const ACP_SESSION_MODEL_CONFIG_ID: &str = "__hmp_acp_session_model__";
 
 /// Per-connection cache of the two ACP channels that can carry a model
 /// selector: the generic `config_option` list and the unstable
@@ -4027,7 +4027,7 @@ async fn run_connection_task<W, R>(
 
     let result = Client
         .builder()
-        .name("aoe-acp")
+        .name("hmp-acp")
         .on_receive_notification(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();
@@ -4224,7 +4224,7 @@ async fn run_connection_task<W, R>(
                 .terminal(true);
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
-            // (aoe-agent, claude-agent-acp); the response only carries
+            // (hmp-agent, claude-agent-acp); the response only carries
             // capability metadata; so re-sending it on attach is safe.
             let init = connection
                 .send_request(
@@ -4330,7 +4330,7 @@ async fn run_connection_task<W, R>(
                     // INVARIANT: Resume mode MUST NOT send `session/new`
                     // or `session/load`. This is the load-bearing trick
                     // that makes mid-turn continuity work across
-                    // `aoe serve --stop` + `aoe serve`. Do not "fix" it
+                    // `hmp serve --stop` + `hmp serve`. Do not "fix" it
                     // by adding either call here.
                     //
                     // Why: the runner kept the agent process alive
@@ -4785,7 +4785,7 @@ async fn run_connection_task<W, R>(
                         // arm is unconditionally polled.
                         #[cfg(debug_assertions)]
                         let simulate_orphan = {
-                            let on = std::env::var("AOE_ACP_SIMULATE_ORPHAN_NEXT_PROMPT")
+                            let on = std::env::var("HMP_ACP_SIMULATE_ORPHAN_NEXT_PROMPT")
                                 .ok()
                                 .as_deref()
                                 == Some("1");
@@ -4793,9 +4793,9 @@ async fn run_connection_task<W, R>(
                                 warn!(
                                     target: "acp.protocol",
                                     session = %session_label,
-                                    "AOE_ACP_SIMULATE_ORPHAN_NEXT_PROMPT set; suppressing prompt_fut completion to trigger silent-orphan watchdog"
+                                    "HMP_ACP_SIMULATE_ORPHAN_NEXT_PROMPT set; suppressing prompt_fut completion to trigger silent-orphan watchdog"
                                 );
-                                std::env::remove_var("AOE_ACP_SIMULATE_ORPHAN_NEXT_PROMPT");
+                                std::env::remove_var("HMP_ACP_SIMULATE_ORPHAN_NEXT_PROMPT");
                             }
                             on
                         };
@@ -6483,7 +6483,7 @@ mod tests {
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-abc12345".into(),
+            container_name: "hmp-sandbox-abc12345".into(),
             extra_env: Some(vec!["MY_LITERAL=hello".into()]),
             custom_instruction: None,
         };
@@ -6518,7 +6518,7 @@ mod tests {
         let cn_idx = argv
             .docker_args
             .iter()
-            .position(|a| a == "aoe-sandbox-abc12345")
+            .position(|a| a == "hmp-sandbox-abc12345")
             .expect("container name in argv");
         let cmd_idx = cn_idx + 1;
         assert_eq!(argv.docker_args[cmd_idx], "claude-agent-acp");
@@ -6549,7 +6549,7 @@ mod tests {
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-abc12345".into(),
+            container_name: "hmp-sandbox-abc12345".into(),
             extra_env: None,
             custom_instruction: None,
         };
@@ -6619,7 +6619,7 @@ mod tests {
             enabled: true,
             container_id: None,
             image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-cfgdir".into(),
+            container_name: "hmp-sandbox-cfgdir".into(),
             extra_env: None,
             custom_instruction: None,
         };
@@ -6672,7 +6672,7 @@ mod tests {
         let config = SpawnConfig {
             agent_key: "claude".into(),
             spec: AgentSpec {
-                command: "/nonexistent/agent/binary/aoe-test".into(),
+                command: "/nonexistent/agent/binary/hmp-test".into(),
                 args: vec![],
                 description: "test".into(),
                 env_allowlist: None,
@@ -6698,7 +6698,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_returns_project_path_missing_when_cwd_does_not_exist() {
         let missing =
-            std::env::temp_dir().join(format!("aoe-test-missing-cwd-{}", std::process::id()));
+            std::env::temp_dir().join(format!("hmp-test-missing-cwd-{}", std::process::id()));
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
@@ -6734,7 +6734,7 @@ mod tests {
     #[test]
     fn classify_spawn_error_routes_missing_cwd_to_project_path_missing() {
         let missing =
-            std::env::temp_dir().join(format!("aoe-test-classify-{}", std::process::id()));
+            std::env::temp_dir().join(format!("hmp-test-classify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
         match AcpError::classify_spawn_error(io_err, &missing, "/bin/true") {
@@ -6896,7 +6896,7 @@ mod tests {
 
     #[test]
     fn resolve_agent_command_returns_none_for_placeholder() {
-        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent").is_none());
+        assert!(resolve_agent_command("${hmp_data_dir}/acp-worker/dist/hmp-agent").is_none());
     }
 
     #[test]
@@ -6907,7 +6907,7 @@ mod tests {
         // PATH; any concurrent test that reads PATH (e.g. resolves a
         // real binary) would race.
         let dir = tempfile::TempDir::new().unwrap();
-        let bin = dir.path().join("aoe-test-resolver-fake");
+        let bin = dir.path().join("hmp-test-resolver-fake");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -6928,7 +6928,7 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        let resolved = resolve_agent_command("hmp-test-resolver-fake");
         if let Some(prev) = prev {
             unsafe {
                 std::env::set_var("PATH", prev);
@@ -8066,7 +8066,7 @@ mod tests {
 
     #[test]
     fn map_config_option_preserves_unknown_category_name() {
-        // Forward-compat path for #1563: a category name aoe doesn't
+        // Forward-compat path for #1563: a category name hmp doesn't
         // recognize arrives via the upstream untagged `Other(String)`
         // arm. It must pass through as `Other(<name>)` and the option
         // must not be dropped from the descriptor list. (The wildcard
@@ -8291,7 +8291,7 @@ mod tests {
 
     #[test]
     fn provider_env_denyreason_blocks_infra_and_linker_keys() {
-        assert!(provider_env_denyreason("AOE_TOKEN").is_some());
+        assert!(provider_env_denyreason("HMP_TOKEN").is_some());
         assert!(provider_env_denyreason("PATH").is_some());
         assert!(provider_env_denyreason("HOME").is_some());
         assert!(provider_env_denyreason("LD_PRELOAD").is_some());
@@ -8306,7 +8306,7 @@ mod tests {
         assert!(provider_env_denyreason("ANTHROPIC_API_KEY").is_none());
         assert!(provider_env_denyreason("CLAUDE_CODE_OAUTH_TOKEN").is_none());
         assert!(provider_env_denyreason("OPENAI_API_KEY").is_none());
-        assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
+        assert!(provider_env_denyreason("HMP_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
     }

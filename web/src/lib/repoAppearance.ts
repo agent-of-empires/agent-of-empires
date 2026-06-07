@@ -1,6 +1,6 @@
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 
-const STORAGE_KEY = "aoe-repo-appearance-v1";
+const STORAGE_KEY = "hmp-repo-appearance-v1";
 
 export type RepoColor = "amber" | "teal" | "sky" | "violet" | "rose" | "slate";
 

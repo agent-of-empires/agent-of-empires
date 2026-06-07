@@ -31,7 +31,7 @@ pub struct AgentInfo {
     pub acp_capable: bool,
     /// The ACP command a built-in agent launches in acp, e.g.
     /// `claude-agent-acp` for claude or `opencode` for opencode. This is
-    /// the registry command (post `${aoe_data_dir}` substitution), which
+    /// the registry command (post `${hmp_data_dir}` substitution), which
     /// can differ from `binary`; the wizard previews it so the user sees
     /// the real launch command before starting. Omitted for custom
     /// agents, whose command values are never serialized here (see the
@@ -46,7 +46,7 @@ pub struct AgentInfo {
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
-/// its registry spec, substituting `${aoe_data_dir}` so the preview
+/// its registry spec, substituting `${hmp_data_dir}` so the preview
 /// matches what `supervisor::spawn_inner` actually runs. Returns
 /// `(None, [])` for agents without a registry entry.
 fn acp_command_fields(
@@ -54,8 +54,8 @@ fn acp_command_fields(
     data_dir: Option<&std::path::Path>,
 ) -> (Option<String>, Vec<String>) {
     let substitute = |value: &str| match data_dir {
-        Some(dir) if value.contains("${aoe_data_dir}") => {
-            value.replace("${aoe_data_dir}", &dir.to_string_lossy())
+        Some(dir) if value.contains("${hmp_data_dir}") => {
+            value.replace("${hmp_data_dir}", &dir.to_string_lossy())
         }
         _ => value.to_string(),
     };
@@ -657,7 +657,7 @@ pub struct ServerAbout {
     pub acp_queue_drain_mode: String,
     /// Resolved value of `acp.max_concurrent_resumes` from the
     /// active profile's config. Upper bound on parallel acp worker
-    /// spawns/attaches the reconciler runs on `aoe serve` cold start.
+    /// spawns/attaches the reconciler runs on `hmp serve` cold start.
     /// Surfaced so the settings UI shows the current value. See #1088.
     pub acp_max_concurrent_resumes: u32,
     /// Resolved value of `acp.force_end_turn_threshold_secs` from
@@ -1375,14 +1375,14 @@ mod tests {
     #[test]
     fn acp_command_fields_substitute_data_dir() {
         let registry = crate::acp::AgentRegistry::with_defaults();
-        let dir = std::path::Path::new("/tmp/aoe-data");
-        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
-        let cmd = cmd.expect("aoe-agent has a registry command");
+        let dir = std::path::Path::new("/tmp/hmp-data");
+        let (cmd, _) = acp_command_fields(registry.get("hmp-agent"), Some(dir));
+        let cmd = cmd.expect("hmp-agent has a registry command");
         assert!(
-            !cmd.contains("${aoe_data_dir}"),
+            !cmd.contains("${hmp_data_dir}"),
             "placeholder must be substituted"
         );
-        assert!(cmd.starts_with("/tmp/aoe-data/"));
+        assert!(cmd.starts_with("/tmp/hmp-data/"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("gemini").key).toBe("gemini");
     expect(resolveAgentProfile("vibe").key).toBe("vibe");
     expect(resolveAgentProfile("pi").key).toBe("pi");
-    expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
+    expect(resolveAgentProfile("hmp-agent").key).toBe("hmp-agent");
   });
 
   it("falls back to DEFAULT for unknown / nullish keys", () => {

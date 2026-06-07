@@ -1,7 +1,7 @@
 //! Migration v001: Move to XDG Base Directory on Linux
 //!
-//! Previously: ~/.agent-of-empires/
-//! After:     $XDG_CONFIG_HOME/agent-of-empires/ (defaults to ~/.config/agent-of-empires/)
+//! Previously: ~/.hmp/
+//! After:     $XDG_CONFIG_HOME/hmp/ (defaults to ~/.config/hmp/)
 //!
 //! This migration moves all data from the legacy location to the XDG-compliant location.
 //! On non-Linux platforms, this is a no-op.
@@ -21,11 +21,11 @@ pub fn run() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-        let legacy_dir = home.join(".agent-of-empires");
+        let legacy_dir = home.join(".hmp");
 
         let config_dir =
             dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?;
-        let xdg_dir = config_dir.join("agent-of-empires");
+        let xdg_dir = config_dir.join("hmp");
 
         if !legacy_dir.exists() {
             debug!("No legacy directory found, skipping XDG migration");

@@ -2,7 +2,7 @@
 //!
 //! Rules:
 //!
-//! 1. If `AOE_DAEMON_URL` is set, point at it and health-check the
+//! 1. If `HMP_DAEMON_URL` is set, point at it and health-check the
 //!    endpoint. Never silently fall back to a local daemon: the whole
 //!    point of the env override is to attach to a *specific* daemon.
 //! 2. If a live local daemon exists (`serve.pid` + reachable
@@ -11,12 +11,12 @@
 //!    actionable hint. Auto-spawn is intentionally not provided:
 //!    starting a loopback daemon by side-effect hides the choice
 //!    between localhost, Tailscale, and Cloudflare from the user and
-//!    leaves an `aoe serve` process behind that they did not ask for.
+//!    leaves an `hmp serve` process behind that they did not ask for.
 //!    The caller is expected to render the hint and bail.
 //!
 //! Build-namespace discipline (debug vs release) is enforced by
 //! `crate::session::get_app_dir`: discovery reads `serve.pid` /
-//! `serve.url` from the same app dir an `aoe serve` of the same build
+//! `serve.url` from the same app dir an `hmp serve` of the same build
 //! would have written, so a debug client never picks up a release
 //! daemon (or vice versa).
 
@@ -28,11 +28,11 @@ use super::http::HttpError;
 #[derive(Debug, Error)]
 pub enum ManagerError {
     #[error(
-        "AOE_DAEMON_URL is set but the daemon at that URL is unreachable; check the address or unset to use a local daemon"
+        "HMP_DAEMON_URL is set but the daemon at that URL is unreachable; check the address or unset to use a local daemon"
     )]
     EnvOverrideUnreachable,
     #[error(
-        "AOE_DAEMON_URL is set but the daemon rejected the bearer token; check AOE_DAEMON_TOKEN"
+        "HMP_DAEMON_URL is set but the daemon rejected the bearer token; check HMP_DAEMON_TOKEN"
     )]
     EnvOverrideUnauthorized,
     /// No daemon was reachable and no env override was set. Carries
@@ -40,7 +40,7 @@ pub enum ManagerError {
     /// `serve.pid` at all" from "stale PID" if they care; most
     /// callers just render the user-facing hint.
     #[error(
-        "no structured view daemon is running.\n\nStart one with one of:\n  aoe serve --daemon                 (localhost only, recommended for solo dev)\n  aoe serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  aoe serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\nOr attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
+        "no structured view daemon is running.\n\nStart one with one of:\n  hmp serve --daemon                 (localhost only, recommended for solo dev)\n  hmp serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  hmp serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\nOr attach to an existing remote daemon with:\n  HMP_DAEMON_URL=<url> HMP_DAEMON_TOKEN=<token> hmp …"
     )]
     NoDaemonRunning(#[from] DiscoveryError),
 }

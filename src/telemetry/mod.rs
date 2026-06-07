@@ -7,7 +7,7 @@
 //!   suppresses both sending and install-id generation regardless of config.
 //! - **Endpoint.** Opted-in sends go to the collection gateway at
 //!   [`DEFAULT_ENDPOINT`] (which validates and re-sanitizes as a backstop);
-//!   `AOE_TELEMETRY_ENDPOINT` overrides it, e.g. to point at a local sink. A
+//!   `HMP_TELEMETRY_ENDPOINT` overrides it, e.g. to point at a local sink. A
 //!   compiled-in [`TELEMETRY_KEY`] is sent as `X-Telemetry-Key` so the gateway
 //!   can shed drive-by noise (it is visible in source, so not real auth).
 //! - **Fire-and-forget.** Sends run detached with a hard timeout (plus a short
@@ -50,11 +50,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// costing a CLI run the full send budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Default collection gateway. Overridable via `AOE_TELEMETRY_ENDPOINT` (handy
+/// Default collection gateway. Overridable via `HMP_TELEMETRY_ENDPOINT` (handy
 /// for pointing at a local sink to inspect what is sent). The gateway
 /// validates the envelope and re-sanitizes every field as a defense-in-depth
 /// backstop. Nothing reaches it unless the user has opted in.
-const DEFAULT_ENDPOINT: &str = "https://telemetry.agent-of-empires.com/v1/ingest";
+const DEFAULT_ENDPOINT: &str = "https://telemetry.hmp.local/v1/ingest";
 
 /// Static key sent as `X-Telemetry-Key`. NOT authentication: it is visible in
 /// this source, so it only lets the gateway drop unkeyed drive-by traffic. The
@@ -62,11 +62,11 @@ const DEFAULT_ENDPOINT: &str = "https://telemetry.agent-of-empires.com/v1/ingest
 const TELEMETRY_KEY: &str = "7bc5a4e45ce861662b9690a7105da988";
 
 /// CLI `cli_usage` is the only *high-frequency* event source in normal use (one
-/// per `aoe` invocation, and users script `aoe` in loops), so its flush is
+/// per `hmp` invocation, and users script `hmp` in loops), so its flush is
 /// throttled locally to at most once per install per day. Per-command counts
 /// accumulate on disk between flushes, so a single daily POST still answers
 /// "which commands did this install run" without a POST per command. TUI and
-/// `aoe serve` `process_start` stay per-launch and are deliberately not capped:
+/// `hmp serve` `process_start` stay per-launch and are deliberately not capped:
 /// one emit per launch is the signal we want, and suppressing it would hide
 /// legitimate restarts. A pathological crash-loop could still flood from those
 /// surfaces; that is accepted as a telemetry-only risk, absorbed by the
@@ -75,7 +75,7 @@ const CLI_USAGE_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Retry backoff after a *failed* CLI `cli_usage` send. While the daily slot
 /// stays open (a failed send never claims it), this bounds re-attempts to once
-/// per hour so a down endpoint can't make every `aoe` invocation re-send.
+/// per hour so a down endpoint can't make every `hmp` invocation re-send.
 const CLI_USAGE_RETRY_GAP: Duration = Duration::from_secs(60 * 60);
 
 /// Base cadence for periodic `usage_snapshot` sends (TUI and serve). The real
@@ -114,12 +114,12 @@ pub fn do_not_track() -> bool {
     }
 }
 
-/// The send endpoint. `AOE_TELEMETRY_ENDPOINT` overrides when set to a
+/// The send endpoint. `HMP_TELEMETRY_ENDPOINT` overrides when set to a
 /// non-empty value; otherwise the compiled-in [`DEFAULT_ENDPOINT`] is used.
 /// Always returns a target, so the opt-in gate (not a missing endpoint) is
 /// what decides whether anything is sent.
 pub fn endpoint() -> String {
-    match std::env::var("AOE_TELEMETRY_ENDPOINT") {
+    match std::env::var("HMP_TELEMETRY_ENDPOINT") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => DEFAULT_ENDPOINT.to_string(),
     }
@@ -215,7 +215,7 @@ pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
         install_id,
         sent_at: now_rfc3339(),
         surface,
-        aoe_version: env!("CARGO_PKG_VERSION").to_string(),
+        hmp_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         data_schema_version: crate::migrations::current_schema_version(),
@@ -442,7 +442,7 @@ fn assemble_usage_snapshot(
         install_id,
         sent_at: now_rfc3339(),
         surface,
-        aoe_version: env!("CARGO_PKG_VERSION").to_string(),
+        hmp_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         // Version-health is install-level I/O (reads the update cache + schema
@@ -502,7 +502,7 @@ fn assemble_usage_snapshot(
 async fn post<T: serde::Serialize>(event: &T) -> bool {
     let endpoint = endpoint();
     let client = match reqwest::Client::builder()
-        .user_agent(concat!("agent-of-empires/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("hmp/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(SEND_TIMEOUT)
         .build()
@@ -571,7 +571,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
         install_id,
         sent_at: now_rfc3339(),
         surface: Surface::Cli,
-        aoe_version: env!("CARGO_PKG_VERSION").to_string(),
+        hmp_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         window_start,
@@ -583,7 +583,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
 /// event if a send is due. Called once per `aoe <subcommand>` run.
 ///
 /// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
-/// is a non-creating check, so app-data-free commands (`aoe completion`,
+/// is a non-creating check, so app-data-free commands (`hmp completion`,
 /// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
 /// keep working in read-only / sandboxed environments. The daily slot is claimed
 /// only after a *confirmed* send, so a failed send leaves the counts and the slot
@@ -729,7 +729,7 @@ mod tests {
 
     // `#[serial]` (the default global group) serializes these env-mutating
     // tests against every other telemetry test that reads `DO_NOT_TRACK` /
-    // `AOE_TELEMETRY_ENDPOINT`, including the consent-dialog tests in another
+    // `HMP_TELEMETRY_ENDPOINT`, including the consent-dialog tests in another
     // module, so none of them race on the shared process env.
     #[test]
     #[serial]
@@ -750,14 +750,14 @@ mod tests {
     #[serial]
     fn endpoint_falls_back_to_default_and_env_overrides() {
         // Unset or blank => the compiled-in default gateway.
-        unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
+        unsafe { std::env::remove_var("HMP_TELEMETRY_ENDPOINT") };
         assert_eq!(endpoint(), DEFAULT_ENDPOINT);
-        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", "   ") };
+        unsafe { std::env::set_var("HMP_TELEMETRY_ENDPOINT", "   ") };
         assert_eq!(endpoint(), DEFAULT_ENDPOINT);
         // A non-empty value overrides (trimmed).
-        unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", " https://x/y ") };
+        unsafe { std::env::set_var("HMP_TELEMETRY_ENDPOINT", " https://x/y ") };
         assert_eq!(endpoint(), "https://x/y");
-        unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
+        unsafe { std::env::remove_var("HMP_TELEMETRY_ENDPOINT") };
     }
 
     fn sample_snapshot() -> UsageSnapshot {
@@ -768,7 +768,7 @@ mod tests {
             install_id: "00000000-0000-0000-0000-000000000000".to_string(),
             sent_at: "2026-06-02T19:00:45Z".to_string(),
             surface: Surface::Tui,
-            aoe_version: "0.0.0".to_string(),
+            hmp_version: "0.0.0".to_string(),
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             data_schema_version: 11,

@@ -8,11 +8,11 @@ import {
 import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
-// Distinct from both the repo prefix (`aoe-repo-collapsed-`) and the flat
-// group prefix (`aoe-group-collapsed-`): a subgroup only exists inside one
+// Distinct from both the repo prefix (`hmp-repo-collapsed-`) and the flat
+// group prefix (`hmp-group-collapsed-`): a subgroup only exists inside one
 // repo, so its collapse state is keyed on the repo plus the group path and
 // never shared with the flat group axis. See #1720.
-const COLLAPSED_KEY_PREFIX = "aoe-nested-group-collapsed-";
+const COLLAPSED_KEY_PREFIX = "hmp-nested-group-collapsed-";
 
 // Encode both halves so a `::` inside a repo path or group path cannot make
 // two different (repo, group) pairs collapse the same key. Keying on the

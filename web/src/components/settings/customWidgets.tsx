@@ -32,7 +32,7 @@ async function didSave(result: Promise<boolean> | unknown): Promise<boolean> {
 }
 
 /** Theme picker. Options come from the live theme list (builtins plus custom
- *  `~/.agent-of-empires/themes/*.toml`); a successful save repaints the
+ *  `~/.hmp/themes/*.toml`); a successful save repaints the
  *  dashboard chrome. The repaint only fires after the PATCH lands so a failed
  *  save (elevation missing, read-only, network) does not paint a theme that
  *  is not on disk (#1510). */

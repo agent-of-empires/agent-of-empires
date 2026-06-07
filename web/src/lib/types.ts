@@ -19,7 +19,7 @@ export interface SessionResponse {
   last_error: string | null;
   branch: string | null;
   main_repo_path: string | null;
-  /** Base branch the worktree was created from when AoE managed the
+  /** Base branch the worktree was created from when HMP managed the
    *  creation. null for sessions attached to a pre-existing branch or
    *  those that took the repo's default branch. See #948. */
   base_branch?: string | null;
@@ -29,7 +29,7 @@ export interface SessionResponse {
    *  diff header. See #970. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
-  /** True when the session was created in scratch mode (`aoe add
+  /** True when the session was created in scratch mode (`hmp add
    *  --scratch` or the wizard toggle). The `project_path` points
    *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
    *  and the deletion path removes it (unless the user opts in to
@@ -39,7 +39,7 @@ export interface SessionResponse {
   /** True when the session is marked as a user favorite. Mirrors
    *  `Instance::is_favorited()` server-side. The sidebar pins favorited
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
-   *  or `aoe session favorite|unfavorite`. */
+   *  or `hmp session favorite|unfavorite`. */
   favorited: boolean;
   /** True when the agent has flagged this session as urgent via the
    *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
@@ -311,7 +311,7 @@ export interface AgentInfo {
    *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
-   *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
+   *  `claude-agent-acp`, `opencode`), post `${hmp_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,
    *  whose command values are never serialized by the backend. */
   acp_command?: string;

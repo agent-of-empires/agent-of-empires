@@ -88,7 +88,7 @@ pub struct App {
     update_status_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     /// Latest version the user dismissed via Ctrl+x. Persisted to
     /// `app_state.dismissed_update_version` so the snooze survives
-    /// `aoe` restarts (per #1140). The banner stays hidden while the
+    /// `hmp` restarts (per #1140). The banner stays hidden while the
     /// fetched latest_version equals this value, and returns
     /// automatically when a newer release ships.
     dismissed_update_version: Option<String>,
@@ -104,7 +104,7 @@ pub struct App {
     /// startup `EnableMouseCapture` in `tui::run`.
     mouse_captured: bool,
     /// Whether the resolved config permits xterm mouse tracking (the
-    /// `session.mouse_capture` field plus the `AOE_MOUSE_CAPTURE` backstop).
+    /// `session.mouse_capture` field plus the `HMP_MOUSE_CAPTURE` backstop).
     /// This is permission, not live state: `mouse_captured` tracks whether
     /// tracking is actually engaged right now. Refreshed from disk on the
     /// periodic reload so toggling Settings > Interaction > Mouse Capture takes
@@ -323,7 +323,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Mouse capture is on by default; the Mouse Capture setting (or the
-        // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
+        // HMP_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
         // use the terminal app's native scrollback for touch-scroll (Mosh
         // doesn't reliably forward mouse-tracking escapes to mobile clients).
         // Folding `mouse_capture_allowed` into `desired` (rather than an early
@@ -417,7 +417,7 @@ impl App {
         // Defer mouse-capture restore to sync_mouse_capture so we don't
         // briefly enable it only to disable again when the user returned
         // to the serve view. sync_mouse_capture itself respects the Mouse
-        // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
+        // Capture setting and the HMP_MOUSE_CAPTURE opt-out.
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
@@ -457,7 +457,7 @@ impl App {
         // at the sidebar's right border, which makes the modal visually
         // blend into the layout. 96 shifts the coincidence point off the
         // common laptop-fullscreen width and gives long path lines (e.g.
-        // `~/.config/agent-of-empires-dev`) more breathing room.
+        // `~/.config/hmp-dev`) more breathing room.
         const WIDTH: u16 = 96;
         let inner_width = WIDTH.saturating_sub(4) as usize;
         let visual_lines: usize = message
@@ -1394,7 +1394,7 @@ impl App {
     /// `usage_seen` map is reported zeroed (a stable full key set), the
     /// per-client form-factor maps stay empty (and so omitted), the create-trend
     /// counter is left at 0, and the structured-interaction counts are empty (the
-    /// `aoe serve` daemon is the surface that tracks all of those).
+    /// `hmp serve` daemon is the surface that tracks all of those).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
@@ -1519,7 +1519,7 @@ impl App {
             tracing::info!(
                 target: "update.dedup",
                 version = %info.latest_version,
-                "skipping: already installed this version this session, restart aoe to use it"
+                "skipping: already installed this version this session, restart hmp to use it"
             );
             self.update_info = None;
             return false;
@@ -1553,7 +1553,7 @@ impl App {
     /// new release is detected. Tarball + writable parent is the only safe
     /// auto path: Homebrew expects the user to run `brew upgrade`, and a
     /// sudo-required tarball install can't prompt without a TTY. In every
-    /// other case we silently no-op so the user can still run `aoe update`
+    /// other case we silently no-op so the user can still run `hmp update`
     /// manually.
     fn maybe_kick_off_auto_install(&mut self, version: String) {
         use crate::update::install::{detect_install_method, perform_update, InstallMethod};
@@ -1624,7 +1624,7 @@ impl App {
                 // the periodic re-check (#1471) stops surfacing this release.
                 self.last_installed_version_in_session = self.pending_install_version.take();
                 self.update_status = Some(UpdateStatus::persistent(
-                    "update complete. Restart aoe to use the new version.".into(),
+                    "update complete. Restart hmp to use the new version.".into(),
                 ));
                 true
             }
@@ -1683,7 +1683,7 @@ impl App {
                     // re-check (#1471) stops re-surfacing this release.
                     self.last_installed_version_in_session = Some(version.clone());
                     self.update_status = Some(UpdateStatus::persistent(
-                        "update complete. Restart aoe to use the new version.".into(),
+                        "update complete. Restart hmp to use the new version.".into(),
                     ));
                 }
                 Err(e) => {
@@ -1796,7 +1796,7 @@ fn poll_update_receiver(
 #[derive(Debug, PartialEq, Eq)]
 enum QuitIntent {
     /// Don't quit. Ctrl+Q lands here: it's reserved for exiting live-send
-    /// mode and must never close aoe from the home view (#1569).
+    /// mode and must never close hmp from the home view (#1569).
     Ignore,
     /// A session is mid-creation; confirm before cancelling it.
     ConfirmDuringCreation,
@@ -1929,7 +1929,7 @@ impl App {
 
     /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
     /// (#1690). Runs on a 60s gate from the main loop. Each candidate is
-    /// claimed under the per-profile storage lock (so a co-running `aoe serve`
+    /// claimed under the per-profile storage lock (so a co-running `hmp serve`
     /// cannot double-stop it), marked `Stopped` in memory, then handed to the
     /// background `StopPoller`; the result is reconciled by `apply_stop_results`
     /// like a manual stop. Returns true if any session was reaped.
@@ -2166,7 +2166,7 @@ impl App {
         // handler in `home::input` already short-circuits with a
         // transient toast pointing the user at the web dashboard;
         // this function still gets called from `apply_creation_results`
-        // after `aoe add --launch`, so guard here too. Falling through
+        // after `hmp add --launch`, so guard here too. Falling through
         // would attempt a tmux attach against a non-existent pane.
         if instance.is_structured() {
             let _ = terminal;
@@ -2301,7 +2301,7 @@ impl App {
         self.home
             .apply_status_updates_without_hooks(attached_status_updates);
         self.home.stamp_last_accessed(session_id);
-        // Persist so the attach-return bump survives aoe restart. Same
+        // Persist so the attach-return bump survives hmp restart. Same
         // reasoning as the send-message path in home/input.rs: without a
         // save() here the aging signal collapses back to startup timestamps
         // on next launch.
@@ -2576,7 +2576,7 @@ mod tests {
     #[test]
     fn ctrl_q_never_quits() {
         // The whole point of #1569: Ctrl+Q is a live-mode-exit habit and
-        // must not close aoe from the home view, regardless of the other
+        // must not close hmp from the home view, regardless of the other
         // flags.
         for creation_pending in [false, true] {
             for confirm in [false, true] {

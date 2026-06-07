@@ -310,7 +310,7 @@ export function MobileTerminalToolbar({
           // All paths failed. Tell the user what to try next.
           if (!window.isSecureContext) {
             t?.error(
-              "Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.",
+              "Paste needs HTTPS. Run `hmp serve --remote` for a Tailscale or Cloudflare HTTPS URL.",
             );
           } else {
             t?.error(

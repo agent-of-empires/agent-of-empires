@@ -23,7 +23,7 @@ pub use utils::tmux_prefix_display;
 pub mod test_support {
     pub use super::env::{
         get_hidden_env, get_hidden_env_batch, remove_hidden_env, set_hidden_env,
-        set_hidden_env_batch, AOE_CAPTURED_SESSION_ID_KEY, AOE_INSTANCE_ID_KEY,
+        set_hidden_env_batch, HMP_CAPTURED_SESSION_ID_KEY, HMP_INSTANCE_ID_KEY,
     };
 }
 
@@ -32,28 +32,28 @@ use std::process::Command;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-// Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
-// release `aoe` can coexist on the same tmux server without seeing each
+// Debug builds use `hmp_dev_*` prefixes so `cargo run` and an installed
+// release `hmp` can coexist on the same tmux server without seeing each
 // other's sessions.
 pub const SESSION_PREFIX: &str = if cfg!(debug_assertions) {
-    "aoe_dev_"
+    "hmp_dev_"
 } else {
-    "aoe_"
+    "hmp_"
 };
 pub const TERMINAL_PREFIX: &str = if cfg!(debug_assertions) {
-    "aoe_dev_term_"
+    "hmp_dev_term_"
 } else {
-    "aoe_term_"
+    "hmp_term_"
 };
 pub const CONTAINER_TERMINAL_PREFIX: &str = if cfg!(debug_assertions) {
-    "aoe_dev_cterm_"
+    "hmp_dev_cterm_"
 } else {
-    "aoe_cterm_"
+    "hmp_cterm_"
 };
 pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
-    "aoe_dev_tool_"
+    "hmp_dev_tool_"
 } else {
-    "aoe_tool_"
+    "hmp_tool_"
 };
 
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
@@ -130,7 +130,7 @@ pub fn refresh_session_cache() {
     }
 }
 
-/// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
+/// Batch-fetch pane metadata for all hmp sessions in a single tmux subprocess call.
 /// Returns a map from session name to metadata for the first window's first pane.
 ///
 /// Returns `Err` when the underlying `tmux list-panes` call fails to spawn or
@@ -185,7 +185,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     result
 }
 
-/// Names of aoe tmux sessions that currently have at least one attached
+/// Names of hmp tmux sessions that currently have at least one attached
 /// client, from a single `tmux list-sessions` call.
 ///
 /// Used by the idle auto-stop reapers (#1690) to spare a session the user is
@@ -232,7 +232,7 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
 }
 
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
-/// Filters to aoe sessions, pane index 0, and takes only the first window per session.
+/// Filters to hmp sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
@@ -247,7 +247,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             continue;
         }
 
-        // Only take pane 0 (the agent pane). aoe pins pane-base-index to 0.
+        // Only take pane 0 (the agent pane). hmp pins pane-base-index to 0.
         if parts[1] != "0" {
             continue;
         }
@@ -327,7 +327,7 @@ pub fn is_tmux_available() -> bool {
 /// True when `binary` resolves on the user's PATH. An absolute or relative
 /// path is checked for existence; a bare name is looked up with `which`,
 /// falling back to a login shell so version-manager PATHs (NVM, etc.) are
-/// loaded. Shared by `is_agent_available` and the `aoe add` override
+/// loaded. Shared by `is_agent_available` and the `hmp add` override
 /// availability check so both honor the same detection. See #1910.
 pub(crate) fn is_binary_on_path(binary: &str) -> bool {
     if binary.contains('/') || binary.contains('\\') {
@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     // Session names embed `SESSION_PREFIX`, which differs between release
-    // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
+    // (`hmp_`) and debug (`hmp_dev_`) builds. Use the constant so the same
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
 
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pane_metadata_filters_non_aoe_sessions() {
+    fn test_parse_pane_metadata_filters_non_hmp_sessions() {
         let output =
             format!("user_session|0|0|bash\n{P}proj_abc12345|0|0|claude\nmy_tmux|0|0|vim\n");
         let map = parse_pane_metadata(&output);
@@ -547,7 +547,7 @@ mod tests {
 
         // Ensure the tmux server is already running so the test session's
         // command string doesn't end up in the server process's argv.
-        let dummy_guard = TmuxTestSession::new("aoe_test_compound_dummy");
+        let dummy_guard = TmuxTestSession::new("hmp_test_compound_dummy");
         let dummy = dummy_guard.name().to_string();
         let _ = Command::new("tmux")
             .args([
@@ -564,9 +564,9 @@ mod tests {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let session_guard = TmuxTestSession::new("aoe_test_compound");
+        let session_guard = TmuxTestSession::new("hmp_test_compound");
         let session_name = session_guard.name().to_string();
-        let marker = format!("AOE_COMPOUND_TEST_{}", std::process::id());
+        let marker = format!("HMP_COMPOUND_TEST_{}", std::process::id());
         let secret_value = "s3cret_val!@#";
 
         // Simulate the compound command approach: export + exec as the session command
@@ -652,7 +652,7 @@ mod tests {
     /// Note: the tmux server must already be running before this test.
     /// If the test session is the FIRST tmux process, the `tmux new-session`
     /// process becomes the server and its argv (which contains the command
-    /// string with the secret) persists. In real aoe usage the server is
+    /// string with the secret) persists. In real hmp usage the server is
     /// always already running. We start a dummy session first to ensure this.
     #[test]
     #[serial_test::serial]
@@ -664,7 +664,7 @@ mod tests {
 
         // Ensure the tmux server is already running so our test session's
         // command string doesn't end up in the server process's argv.
-        let dummy_guard = TmuxTestSession::new("aoe_test_ps_dummy");
+        let dummy_guard = TmuxTestSession::new("hmp_test_ps_dummy");
         let dummy = dummy_guard.name().to_string();
         let _ = Command::new("tmux")
             .args([
@@ -681,14 +681,14 @@ mod tests {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let session_guard = TmuxTestSession::new("aoe_test_ps");
+        let session_guard = TmuxTestSession::new("hmp_test_ps");
         let session_name = session_guard.name().to_string();
         let secret_value = format!("UNIQUE_SECRET_{}_xyzzy", std::process::id());
 
         // Simulate: export SECRET='val'; exec sleep 30
         // After exec, the shell process (whose argv contained the export) is
         // replaced by sleep, whose argv is just "sleep 30" (no secret).
-        let compound_cmd = format!("export AOE_PS_TEST='{}'; exec sleep 30", secret_value);
+        let compound_cmd = format!("export HMP_PS_TEST='{}'; exec sleep 30", secret_value);
 
         let output = Command::new("tmux")
             .args([

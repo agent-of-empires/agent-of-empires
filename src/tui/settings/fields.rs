@@ -1,7 +1,7 @@
 //! Settings field definitions, built from the single-source schema.
 //!
 //! Every configurable field is declared once on its `Config` sub-struct via
-//! `#[derive(SettingsSection)]` (see `aoe-settings-derive`). This module turns
+//! `#[derive(SettingsSection)]` (see `hmp-settings-derive`). This module turns
 //! the resulting [`FieldDescriptor`] list into renderable [`SettingField`]
 //! rows and applies edits back, instead of hand-wiring a `build_*_fields` /
 //! `apply_field_*` pair per field. Reads and writes go through the serialized

@@ -1,9 +1,9 @@
 //! Migration v007: rename leftover `serve.log` to `serve.log.legacy`.
 //!
-//! The serve.log file was retired when foreground and daemon `aoe serve`
+//! The serve.log file was retired when foreground and daemon `hmp serve`
 //! consolidated onto the configured `[logging].file_path` (debug.log by
 //! default). Existing users have a serve.log file from before the upgrade;
-//! we rename it to `.legacy` so the bytes aren't lost but `aoe logs` and
+//! we rename it to `.legacy` so the bytes aren't lost but `hmp logs` and
 //! the TUI dialog no longer try to read it. Idempotent: skips when there
 //! is no serve.log to move.
 

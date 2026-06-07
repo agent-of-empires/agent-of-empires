@@ -9,14 +9,14 @@ interface BuildOpts {
 
 const DEFAULT_OUTRO = "Please address these comments.";
 
-const SENTINEL_PREFIX = "<!-- aoe:diff-comments:v1 ";
+const SENTINEL_PREFIX = "<!-- hmp:diff-comments:v1 ";
 const SENTINEL_SUFFIX = " -->";
 
 /** Structured fields the structured view transcript needs to render the rich
  *  `DiffCommentsUserCard`. Produced two ways: freshly by
  *  `buildDiffCommentsPrompt` (the typed-event send path), and by
  *  `parseDiffCommentsSentinel` when decoding legacy prompts that still
- *  carry the old `<!-- aoe:diff-comments:v1 ... -->` sentinel. */
+ *  carry the old `<!-- hmp:diff-comments:v1 ... -->` sentinel. */
 export interface DiffCommentsCardPayload {
   intro: string;
   outro: string;

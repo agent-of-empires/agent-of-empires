@@ -1,9 +1,9 @@
 //! Acp daemon client.
 //!
-//! HTTP + WebSocket client for talking to an `aoe serve` daemon. Used
+//! HTTP + WebSocket client for talking to an `hmp serve` daemon. Used
 //! by:
 //!
-//! - The `aoe acp *` CLI verbs (history, status, prompt, approve,
+//! - The `hmp acp *` CLI verbs (history, status, prompt, approve,
 //!   cancel, tail, attach).
 //! - The TUI structured view (`src/tui/structured_view/`).
 //!
@@ -13,7 +13,7 @@
 //!
 //! Discovery resolution order:
 //!
-//! 1. `AOE_DAEMON_URL` (+ optional `AOE_DAEMON_TOKEN`).
+//! 1. `HMP_DAEMON_URL` (+ optional `HMP_DAEMON_TOKEN`).
 //! 2. Local `<app_dir>/serve.url` paired with a live `serve.pid`.
 //!
 //! [`daemon_manager::require_daemon`] returns

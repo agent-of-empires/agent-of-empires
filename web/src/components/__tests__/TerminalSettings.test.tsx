@@ -2,14 +2,14 @@
 //
 // Contract test for the TerminalSettings panel. Unlike the panels under
 // settings/, this one persists through useWebSettings + localStorage
-// (key `aoe-web-settings`) rather than PATCH /api/settings. The contract
+// (key `hmp-web-settings`) rather than PATCH /api/settings. The contract
 // here is the JSON shape written to that key. Part of #1217.
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { TerminalSettings } from "../TerminalSettings";
 
-const KEY = "aoe-web-settings";
+const KEY = "hmp-web-settings";
 
 function readStored(): Record<string, unknown> {
   const raw = window.localStorage.getItem(KEY);
@@ -36,7 +36,7 @@ describe("TerminalSettings localStorage contract", () => {
     ).toBeTruthy();
   });
 
-  it("mobile font slider writes mobileFontSize into aoe-web-settings", () => {
+  it("mobile font slider writes mobileFontSize into hmp-web-settings", () => {
     const { container } = render(<TerminalSettings />);
     const slider = container.querySelectorAll(
       "input[type=range]",

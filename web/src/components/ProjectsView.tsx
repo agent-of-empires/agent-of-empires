@@ -362,7 +362,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
             <p className="text-xs text-text-dim">
               Add one above, or use{" "}
               <code className="text-text-secondary">
-                aoe project add &lt;path&gt;
+                hmp project add &lt;path&gt;
               </code>{" "}
               from the CLI.
             </p>

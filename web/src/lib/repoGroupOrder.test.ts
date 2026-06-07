@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { loadRepoGroupOrder, persistRepoGroupOrder } from "./repoGroupOrder";
 
-const ORDER_KEY = "aoe-repo-group-order-v1";
+const ORDER_KEY = "hmp-repo-group-order-v1";
 
 beforeEach(() => {
   window.localStorage.clear();

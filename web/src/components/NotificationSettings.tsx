@@ -129,7 +129,7 @@ function StatusRow({
             Push notifications require HTTPS. On mobile, access this dashboard
             through a Cloudflare tunnel by running{" "}
             <code className="font-mono text-text-primary">
-              aoe serve --remote
+              hmp serve --remote
             </code>{" "}
             on your host, then open the printed URL on your phone.
           </p>

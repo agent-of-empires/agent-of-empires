@@ -3,7 +3,7 @@
 //! Each running structured view worker has a JSON file at
 //! `<app_dir>/acp-workers/<session_id>.json` describing how to dial it
 //! and who owns the process. The directory is the source of truth across
-//! `aoe serve` restarts: when serve starts, it scans the directory, dials
+//! `hmp serve` restarts: when serve starts, it scans the directory, dials
 //! every live worker, and only spawns a fresh worker for sessions that
 //! have no registry entry (or a dead one).
 //!
@@ -40,7 +40,7 @@ pub struct WorkerRecord {
     /// `"1.9.5+g7f31a9c42e01"`. Distinct from `runner_version`, which is
     /// the on-disk SCHEMA version. The daemon compares this against its
     /// own `BUILD_VERSION` to detect a worker left running on an older
-    /// binary after `aoe update` and respawn it (see #1754). Defaulted on
+    /// binary after `hmp update` and respawn it (see #1754). Defaulted on
     /// load for legacy records that pre-date this field; the empty string
     /// compares unequal to any current build, forcing a one-time respawn.
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct WorkerRecord {
     pub socket_path: PathBuf,
     /// Binary command name that the runner was invoked with
     /// (e.g. `"claude-agent-acp"`, `"codex-acp"`). Surfaced in
-    /// `aoe acp ps`, logs, and the doctor's install-hint lookup.
+    /// `hmp acp ps`, logs, and the doctor's install-hint lookup.
     /// NOT the registry key; use `agent_key` to resolve a profile.
     pub agent_name: String,
     /// Registry key for the agent (e.g. `"claude"`, `"codex"`,
@@ -194,16 +194,16 @@ pub fn socket_path_for(session_id: &str) -> Result<PathBuf> {
 }
 
 /// `<workers_dir>/<session_id>.log` is the runner-side stderr drain
-/// consumed by `aoe acp logs --session <id>`.
+/// consumed by `hmp acp logs --session <id>`.
 pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
     validate_session_id(session_id)?;
     Ok(workers_dir()?.join(format!("{session_id}.log")))
 }
 
 /// Sentinel file `<workers_dir>/<session_id>.restart`. Written by
-/// `aoe acp restart` BEFORE the registry delete + SIGTERM so the
+/// `hmp acp restart` BEFORE the registry delete + SIGTERM so the
 /// daemon's reaper can distinguish a restart-driven teardown from
-/// `aoe acp stop|kill` and:
+/// `hmp acp stop|kill` and:
 ///   - emit `Stopped { reason: "restart_pending" }` instead of
 ///     `user_stopped` so the UI shows a "Restarting…" banner without
 ///     the "Reconnect" button (the daemon will respawn shortly);
@@ -215,7 +215,7 @@ pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
 }
 
 /// Best-effort write of an empty restart-pending marker. Called by the
-/// CLI's `aoe acp restart` before deleting the registry entry. The
+/// CLI's `hmp acp restart` before deleting the registry entry. The
 /// file's existence is the signal; its contents are irrelevant.
 pub fn mark_restart_pending(session_id: &str) {
     let Ok(path) = restart_marker_path(session_id) else {
@@ -386,7 +386,7 @@ pub fn mark_detached(session_id: &str) {
 
 /// Update only `stored_acp_session_id` in place. Called by the
 /// supervisor when the drain task observes an `AcpSessionAssigned`
-/// event, so a fresh `aoe serve` knows to call `session/load` instead
+/// event, so a fresh `hmp serve` knows to call `session/load` instead
 /// of `session/new` on reattach.
 pub fn update_stored_acp_session_id(session_id: &str, acp_id: Option<&str>) {
     if let Ok(Some(mut rec)) = load(session_id) {
@@ -607,7 +607,7 @@ mod tests {
     /// A fresh record is stamped with this binary's build identity and
     /// reports as current; the empty-string legacy default reports stale.
     /// This is the gate the reconciler uses to respawn workers left on an
-    /// old binary after `aoe update`. See #1754.
+    /// old binary after `hmp update`. See #1754.
     #[test]
     #[serial]
     fn build_version_stamped_and_current() {
@@ -616,8 +616,8 @@ mod tests {
                 "sess-bv".into(),
                 1,
                 PathBuf::from("/tmp/sess-bv.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],
@@ -759,8 +759,8 @@ mod tests {
                 "sess-sp".into(),
                 1,
                 PathBuf::from("/tmp/sess-sp.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],
@@ -785,8 +785,8 @@ mod tests {
                 "live".into(),
                 1,
                 PathBuf::from("/tmp/sock-live"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],
@@ -812,8 +812,8 @@ mod tests {
                 "sess".into(),
                 1,
                 sock.clone(),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],
@@ -862,8 +862,8 @@ mod tests {
                 "x".into(),
                 1,
                 PathBuf::from("/tmp/x.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],
@@ -890,8 +890,8 @@ mod tests {
                 "term-dead".into(),
                 2_000_000_000,
                 PathBuf::from("/tmp/term-dead.sock"),
-                "aoe-agent".into(),
-                "aoe-agent".into(),
+                "hmp-agent".into(),
+                "hmp-agent".into(),
                 PathBuf::from("/repo"),
                 None,
                 vec![],

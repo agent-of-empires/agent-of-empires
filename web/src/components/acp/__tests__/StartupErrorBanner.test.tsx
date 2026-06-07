@@ -43,7 +43,7 @@ describe("StartupErrorBanner native-binary branch", () => {
     expect(container.textContent).toContain("Architecture mismatch");
     expect(container.textContent).toContain("dynamic loader");
     expect(container.textContent).toContain("bind-mounted into a container");
-    expect(container.textContent).not.toContain("aoe acp doctor --fix");
+    expect(container.textContent).not.toContain("hmp acp doctor --fix");
   });
 
   it("links the native-binary docs anchor", () => {
@@ -70,7 +70,7 @@ describe("StartupErrorBanner fallback branch (unchanged)", () => {
     const { container } = render(
       <StartupErrorBanner sessionId="s-1" message="some unknown failure" />,
     );
-    expect(container.textContent).toContain("aoe acp doctor --fix");
+    expect(container.textContent).toContain("hmp acp doctor --fix");
   });
 });
 

@@ -1137,7 +1137,7 @@ mod tests {
         // create a wrapping TempDir and then a known-named subdir inside it
         // by leveraging tempfile::Builder.
         let parent = tempfile::Builder::new()
-            .prefix("aoe-test-")
+            .prefix("hmp-test-")
             .tempdir()
             .unwrap();
         let dir = parent.path().join(name);
@@ -1333,7 +1333,7 @@ mod tests {
     /// test can assert a worktree forked from it instead of `main`.
     fn init_repo_with_branch(name: &str, branch: &str) -> (tempfile::TempDir, git2::Oid) {
         let parent = tempfile::Builder::new()
-            .prefix("aoe-test-")
+            .prefix("hmp-test-")
             .tempdir()
             .unwrap();
         let dir = parent.path().join(name);

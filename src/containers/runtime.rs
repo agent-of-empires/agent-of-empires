@@ -375,7 +375,7 @@ mod tests {
         // The CLI surfaces this string to the user via tmux; it must not
         // wrap the command in `sh -c` the way Apple Container does.
         let rt = ContainerRuntime::podman();
-        let cmd = rt.exec_command("aoe-sandbox-test1234", None, "claude");
-        assert_eq!(cmd, "podman exec -it aoe-sandbox-test1234 claude");
+        let cmd = rt.exec_command("hmp-sandbox-test1234", None, "claude");
+        assert_eq!(cmd, "podman exec -it hmp-sandbox-test1234 claude");
     }
 }

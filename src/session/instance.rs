@@ -274,7 +274,7 @@ fn status_hook_env_prefix(
         || tool == "kiro";
 
     if has_hooks {
-        format!("AOE_INSTANCE_ID={} ", instance_id)
+        format!("HMP_INSTANCE_ID={} ", instance_id)
     } else {
         String::new()
     }
@@ -438,7 +438,7 @@ pub struct Instance {
 
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
-    /// deletion path removes on `aoe rm` (unless the user opts in to keeping
+    /// deletion path removes on `hmp rm` (unless the user opts in to keeping
     /// the directory). Mutually exclusive with worktree/workspace.
     /// See `src/session/scratch.rs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -507,19 +507,19 @@ pub struct Instance {
     pub base_branch_override: Option<String>,
 
     /// How this session is rendered: `Structured` (ACP native rendering) or
-    /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
+    /// `Terminal` (raw tmux pane). When `Structured`, hmp spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
     /// bypassed for this session.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
-    /// Optional structured view agent name (e.g., "claude-code", "aoe-agent",
+    /// Optional structured view agent name (e.g., "claude-code", "hmp-agent",
     /// "gemini"). When None, the structured view picks the default for the
     /// session's tool.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
-    /// Optional model id forwarded to aoe-agent (e.g., "claude-opus-4-7",
+    /// Optional model id forwarded to hmp-agent (e.g., "claude-opus-4-7",
     /// "gpt-5", "llama3.3:ollama").
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -528,7 +528,7 @@ pub struct Instance {
     /// the agent advertises `agent_capabilities.load_session = true`
     /// (claude-agent-acp does), the next spawn calls `session/load`
     /// with this id so the agent reloads its on-disk transcript and
-    /// the model retains context across `aoe serve` restarts. Cleared
+    /// the model retains context across `hmp serve` restarts. Cleared
     /// on acp_disable, session delete, or `session/load` failure.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -746,7 +746,7 @@ pub(crate) fn persist_session_to_storage(
 fn publish_session_to_tmux_env(tmux_session_name: &str, session_id: &str) {
     if let Err(e) = crate::tmux::env::set_hidden_env(
         tmux_session_name,
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+        crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
         session_id,
     ) {
         tracing::warn!(target: "session.store", "Failed to write captured session ID to tmux env: {}", e);
@@ -1108,7 +1108,7 @@ impl Instance {
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
-    /// on-demand from `/tmp/aoe-hooks/{id}/attention.json` so it picks up
+    /// on-demand from `/tmp/hmp-hooks/{id}/attention.json` so it picks up
     /// changes the running agent makes (via the `attention-urgent` script)
     /// without an Instance state mutation. Suppressed for archived/snoozed
     /// rows so a sunk session can't claw its way back to the top.
@@ -1650,7 +1650,7 @@ impl Instance {
         // structured view short-circuit so a tampered id surfaces as `Err` for
         // structured view sessions too.
         crate::session::validate_instance_id(&self.id)
-            .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
+            .context("refusing to launch: HMP_INSTANCE_ID failed validation")?;
 
         // Acp-mode sessions are not backed by tmux. The structured view
         // worker supervisor spawns the ACP agent process directly;
@@ -1794,7 +1794,7 @@ impl Instance {
                 sandbox,
                 std::path::Path::new(&self.project_path),
             );
-            let docker_args = format!("{} -e AOE_INSTANCE_ID={}", env_info.docker_args, self.id);
+            let docker_args = format!("{} -e HMP_INSTANCE_ID={}", env_info.docker_args, self.id);
             let env_part = format!("{} ", docker_args);
             let wrapped =
                 wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
@@ -1927,7 +1927,7 @@ impl Instance {
     ///
     /// Runs on_launch hooks on the host, then constructs the command from either
     /// the agent's default binary or a user-supplied custom command, applying
-    /// yolo mode, session flags, and the AOE_INSTANCE_ID env prefix.
+    /// yolo mode, session flags, and the HMP_INSTANCE_ID env prefix.
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
@@ -2016,7 +2016,7 @@ impl Instance {
     ) {
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
-        // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
+        // Skip outcomes leave HMP_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
         let publish_sid = matches!(outcome, SidPersistOutcome::Published);
         let captured_sid: Option<String> = if publish_sid {
@@ -2027,13 +2027,13 @@ impl Instance {
 
         let mut entries: Vec<(&str, &str, &str)> = vec![(
             session_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+            crate::tmux::env::HMP_INSTANCE_ID_KEY,
             &self.id,
         )];
         if let Some(ref sid) = captured_sid {
             entries.push((
                 session_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
                 sid.as_str(),
             ));
         }
@@ -2046,7 +2046,7 @@ impl Instance {
         if publish_sid && self.agent_session_id.is_none() {
             if let Err(e) = crate::tmux::env::remove_hidden_env(
                 session_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
             ) {
                 tracing::warn!(target: "session.store",
                     instance = %self.id,
@@ -2746,7 +2746,7 @@ impl Instance {
     ) -> Result<StartOutcome> {
         // Clear `Status::Error` on entry so a successful relaunch from any
         // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
-        // `aoe session restart [id|--all]`, structured view-mode short-circuit)
+        // `hmp session restart [id|--all]`, structured view-mode short-circuit)
         // does not leave a stale error chip up. REST `ensure_session`
         // re-asserts `status=Starting`, `last_error=None` pre-call as
         // defense in depth.
@@ -2780,7 +2780,7 @@ impl Instance {
         // that was never passed). The debug_assert surfaces the protocol
         // violation in dev/test if a future caller forgets to tear down;
         // the tracing::warn! mirrors it in release so the race is visible
-        // in `aoe logs` for diagnosis. The branch on `attempting_resume`
+        // in `hmp logs` for diagnosis. The branch on `attempting_resume`
         // separates the dangerous case (sid was passed but no probe ran,
         // pane could be left frozen) from the benign one (no resume was
         // attempted, the race is just kill_clean cache staleness).
@@ -3660,7 +3660,7 @@ mod tests {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
             status_hook_env_prefix("abc123", "codex", agent),
-            "AOE_INSTANCE_ID=abc123 "
+            "HMP_INSTANCE_ID=abc123 "
         );
     }
 
@@ -3681,7 +3681,7 @@ mod tests {
         let config_path = tmp.path().join(".codex").join("config.toml");
         let config = std::fs::read_to_string(config_path).unwrap();
         assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
+        assert!(config.contains("hmp-hooks"));
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
@@ -3711,7 +3711,7 @@ mod tests {
         let config_path = codex_home.join("config.toml");
         let config = std::fs::read_to_string(config_path).unwrap();
         assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
+        assert!(config.contains("hmp-hooks"));
         assert!(!tmp.path().join(".codex").join("config.toml").exists());
     }
 
@@ -3769,7 +3769,7 @@ mod tests {
         let config_path = tmp.path().join(".codex").join("config.toml");
         let config = std::fs::read_to_string(config_path).unwrap();
         assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
+        assert!(config.contains("hmp-hooks"));
     }
 
     #[test]
@@ -5184,15 +5184,15 @@ mod tests {
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
             status_hook_env_prefix("abc123", "hermes", crate::agents::get_agent("hermes")),
-            "AOE_INSTANCE_ID=abc123 "
+            "HMP_INSTANCE_ID=abc123 "
         );
         assert_eq!(
             status_hook_env_prefix("abc123", "settl", crate::agents::get_agent("settl")),
-            "AOE_INSTANCE_ID=abc123 "
+            "HMP_INSTANCE_ID=abc123 "
         );
         assert_eq!(
             status_hook_env_prefix("abc123", "claude", crate::agents::get_agent("claude")),
-            "AOE_INSTANCE_ID=abc123 "
+            "HMP_INSTANCE_ID=abc123 "
         );
         assert_eq!(
             status_hook_env_prefix("abc123", "opencode", crate::agents::get_agent("opencode")),
@@ -5200,7 +5200,7 @@ mod tests {
         );
         assert_eq!(
             status_hook_env_prefix("abc123", "kiro", crate::agents::get_agent("kiro")),
-            "AOE_INSTANCE_ID=abc123 "
+            "HMP_INSTANCE_ID=abc123 "
         );
     }
 
@@ -7022,7 +7022,7 @@ mod tests {
         }
 
         fn captured_env(name: &str) -> Option<String> {
-            crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+            crate::tmux::env::get_hidden_env(name, crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY)
         }
 
         fn make_inst(profile: &str, title: &str) -> Instance {
@@ -7093,7 +7093,7 @@ mod tests {
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
                 Some(VALID_SID),
-                "non-claude tools must also publish AOE_CAPTURED_SESSION_ID at finalize"
+                "non-claude tools must also publish HMP_CAPTURED_SESSION_ID at finalize"
             );
         }
 
@@ -7137,7 +7137,7 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
             crate::tmux::env::set_hidden_env(
                 tmux.name(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
                 "stale-leftover",
             )
             .unwrap();
@@ -7165,7 +7165,7 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
             crate::tmux::env::set_hidden_env(
                 tmux.name(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
                 "stale-untouched",
             )
             .unwrap();
@@ -7201,7 +7201,7 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
             crate::tmux::env::set_hidden_env(
                 tmux.name(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY,
                 "stale-untouched",
             )
             .unwrap();
@@ -7257,7 +7257,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains("AOE_INSTANCE_ID"),
+                err.to_string().contains("HMP_INSTANCE_ID"),
                 "error must surface validator failure for id={poisoned:?}, got: {err}"
             );
             assert!(
@@ -7301,7 +7301,7 @@ mod tests {
             return;
         }
 
-        let mut inst = Instance::new("aoe_test_1913_wait", "/tmp");
+        let mut inst = Instance::new("hmp_test_1913_wait", "/tmp");
         assert_eq!(inst.tool, "claude");
 
         // Pane shows the approval prompt with the live spinner still active
@@ -7309,12 +7309,12 @@ mod tests {
         // line means the bare pane detector would say Running, so a green
         // reading here can only come from reconciliation doing its job.
         let pane = "  Bash command\n    \
-touch /tmp/aoe_test_1913/marker.txt\n    Create marker file\n  \
+touch /tmp/hmp_test_1913/marker.txt\n    Create marker file\n  \
 Do you want to proceed?\n  \u{276f} 1. Yes\n    \
 2. Yes, and always allow access to this project\n    3. No\n  \
 Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 \u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)\n";
-        let pane_file = std::env::temp_dir().join(format!("aoe_test_1913_{}.txt", inst.id));
+        let pane_file = std::env::temp_dir().join(format!("hmp_test_1913_{}.txt", inst.id));
         std::fs::write(&pane_file, pane).expect("write pane fixture");
 
         let session_name = tmux::Session::generate_name(&inst.id, &inst.title);

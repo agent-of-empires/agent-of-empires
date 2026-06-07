@@ -3,7 +3,7 @@
 //! `ResolvedTheme` is the payload the web dashboard consumes from
 //! `GET /api/themes/:name` and `GET /api/theme/current`. It is derived
 //! from the canonical [`Theme`] (loaded from a builtin TOML or a custom
-//! TOML in `~/.agent-of-empires/themes/*.toml`) by:
+//! TOML in `~/.hmp/themes/*.toml`) by:
 //!
 //! - emitting the named TUI color fields as CSS variables the web's
 //!   Tailwind tokens consume (`--color-surface-900`, `--color-text-primary`,

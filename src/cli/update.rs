@@ -1,4 +1,4 @@
-//! `aoe update` command - self-update by detected install method.
+//! `hmp update` command - self-update by detected install method.
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -107,7 +107,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     if let InstallMethod::Tarball { binary_path } = &method {
         eprintln!();
         println!(
-            "✓ Updated to v{}. Restart `aoe` to use the new version.",
+            "✓ Updated to v{}. Restart `hmp` to use the new version.",
             info.latest_version
         );
         #[cfg(feature = "serve")]
@@ -146,7 +146,7 @@ enum RestartDecision {
 
 /// Decide whether to restart the daemon after an update. A daemon is only
 /// restartable when it is both running AND left a `serve.launch` behind
-/// (i.e. it was started by `aoe serve --daemon`, not run in the
+/// (i.e. it was started by `hmp serve --daemon`, not run in the
 /// foreground or under a service supervisor). Pure so the matrix is unit
 /// testable.
 #[cfg(feature = "serve")]
@@ -170,8 +170,8 @@ fn restart_decision(
 }
 
 /// After an in-place tarball update, offer to restart a self-managed
-/// `aoe serve` daemon so it runs the new binary. The restart re-execs the
-/// freshly installed binary as `aoe serve --restart` so the new code, not
+/// `hmp serve` daemon so it runs the new binary. The restart re-execs the
+/// freshly installed binary as `hmp serve --restart` so the new code, not
 /// this old in-memory image (whose `current_exe()` may now point at the
 /// replaced/unlinked inode), spawns the replacement daemon.
 #[cfg(feature = "serve")]
@@ -184,7 +184,7 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
             // Nothing running means no hint is needed. Otherwise point at
             // the right manual step: a self-managed daemon we just cannot
             // drive right now (non-interactive, no -y) restarts with
-            // `aoe serve --restart`, but a foreground or supervised daemon
+            // `hmp serve --restart`, but a foreground or supervised daemon
             // (no launch state) must be bounced by its own manager, for
             // which --restart would correctly refuse.
             if running && launch_present {
@@ -194,7 +194,7 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
             }
         }
         RestartDecision::Prompt => {
-            print!("Restart the running aoe serve daemon now? [Y/n] ");
+            print!("Restart the running hmp serve daemon now? [Y/n] ");
             io::stdout().flush()?;
             let mut answer = String::new();
             io::stdin().read_line(&mut answer)?;
@@ -210,18 +210,18 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
     Ok(())
 }
 
-/// Hint for a running daemon that aoe did not start itself (foreground,
-/// or under systemd/launchd): `aoe serve --restart` would refuse it, so
+/// Hint for a running daemon that hmp did not start itself (foreground,
+/// or under systemd/launchd): `hmp serve --restart` would refuse it, so
 /// point the user at the supervisor that owns the process instead.
 #[cfg(feature = "serve")]
 fn external_restart_hint() -> &'static str {
-    "  An `aoe serve` daemon is running but was not started by\n  \
-     `aoe serve --daemon`; restart it through whatever launched it (your\n  \
+    "  An `hmp serve` daemon is running but was not started by\n  \
+     `hmp serve --daemon`; restart it through whatever launched it (your\n  \
      service manager, or the terminal it runs in) so it picks up the new\n  \
      binary."
 }
 
-/// Spawn the freshly installed binary as `aoe serve --restart`. Best
+/// Spawn the freshly installed binary as `hmp serve --restart`. Best
 /// effort: on any failure we fall back to the manual hint rather than
 /// failing the whole update, which already succeeded.
 #[cfg(feature = "serve")]
@@ -237,14 +237,14 @@ fn restart_via_new_binary(binary_path: &Path) {
             println!("{}", daemon_restart_hint());
         }
         Err(e) => {
-            eprintln!("Failed to launch `aoe serve --restart`: {e}");
+            eprintln!("Failed to launch `hmp serve --restart`: {e}");
             println!("{}", daemon_restart_hint());
         }
     }
 }
 
 /// Reminder printed after a successful in-place update: a running
-/// `aoe serve` daemon keeps executing the old code it already loaded
+/// `hmp serve` daemon keeps executing the old code it already loaded
 /// until it is restarted, and its structured view workers survive that restart by
 /// design (see #1037). The new binary therefore does not take effect
 /// anywhere until the daemon restarts; once it does, a worker left on the
@@ -252,21 +252,21 @@ fn restart_via_new_binary(binary_path: &Path) {
 /// build automatically (see #1754). Surfacing this avoids the silent
 /// mixed-version trap where a freshly-shipped fix appears not to work.
 fn daemon_restart_hint() -> &'static str {
-    "  If `aoe serve` is running, restart it (`aoe serve --restart`) so the daemon\n  \
+    "  If `hmp serve` is running, restart it (`hmp serve --restart`) so the daemon\n  \
      picks up the new binary. Acp workers from the old build finish their\n  \
      current turn, then respawn on the new build."
 }
 
 /// Reminder printed after a successful in-place update. A static completion
 /// file does not refresh itself, so it goes stale once the new binary adds or
-/// renames commands. We deliberately do not rewrite the file: aoe does not
+/// renames commands. We deliberately do not rewrite the file: hmp does not
 /// track which paths the user installed completions to, and overwriting files
 /// it does not own (dotfile-managed symlinks, system paths) is unsafe. The
 /// eval-on-startup setup avoids the problem entirely.
 fn completion_refresh_hint() -> &'static str {
     "  If you use static shell completions, regenerate them so they pick up new\n  \
-     commands, e.g. `aoe completion zsh > ~/.zfunc/_aoe`. Eval-on-startup setups\n  \
-     stay in sync automatically: https://www.agent-of-empires.com/guides/shell-completions/"
+     commands, e.g. `hmp completion zsh > ~/.zfunc/_aoe`. Eval-on-startup setups\n  \
+     stay in sync automatically: https://www.hmp.local/guides/shell-completions/"
 }
 
 #[cfg(test)]
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn hint_points_at_regen_and_eval_alternative() {
         let hint = completion_refresh_hint();
-        assert!(hint.contains("aoe completion"));
+        assert!(hint.contains("hmp completion"));
         assert!(hint.contains("guides/shell-completions"));
         // Mentions the always-fresh alternative so users can avoid manual refresh.
         assert!(hint.to_lowercase().contains("eval"));
@@ -286,7 +286,7 @@ mod tests {
     fn daemon_hint_mentions_restart_and_respawn() {
         let hint = daemon_restart_hint();
         // Points the user at the restart that actually applies the binary.
-        assert!(hint.contains("aoe serve --restart"));
+        assert!(hint.contains("hmp serve --restart"));
         // Sets the expectation that workers converge to the new build.
         assert!(hint.to_lowercase().contains("respawn"));
     }

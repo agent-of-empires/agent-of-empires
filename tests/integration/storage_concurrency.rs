@@ -261,7 +261,7 @@ fn test_update_propagates_disk_write_failure() -> Result<()> {
 // cannot lose each other's updates when racing on the same profile.
 
 fn aoe_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_aoe")
+    env!("CARGO_BIN_EXE_hmp")
 }
 
 fn spawn_favorite(aoe: &str, home: &std::path::Path, id: &str) -> std::process::Child {

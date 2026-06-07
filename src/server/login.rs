@@ -68,7 +68,7 @@ const BINDING_SECRET_BYTES: usize = 32;
 
 /// Filename for the persisted login-session store under the app dir.
 /// Owner-only (0600); survives daemon restart so signed-in devices are
-/// not re-prompted for the passphrase on every `aoe serve` bounce. See
+/// not re-prompted for the passphrase on every `hmp serve` bounce. See
 /// #1235.
 const SESSIONS_FILE: &str = "login_sessions.toml";
 
@@ -588,7 +588,7 @@ impl LoginManager {
     }
 
     /// Spawn periodic cleanup (piggybacks on the rate limiter's interval).
-    /// Exits cleanly on shutdown so `aoe serve --stop` drains within one
+    /// Exits cleanly on shutdown so `hmp serve --stop` drains within one
     /// tick instead of waiting for the 5 s force exit safety net.
     pub fn spawn_cleanup_task(self: &Arc<Self>, shutdown: CancellationToken) {
         let manager = Arc::clone(self);
@@ -1246,7 +1246,7 @@ pub async fn logout_handler(
 /// Build a `Set-Cookie` header that clears the login session cookie.
 fn clear_login_cookie(secure: bool) -> String {
     format!(
-        "aoe_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        "hmp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         if secure { "; Secure" } else { "" }
     )
 }
@@ -1363,13 +1363,13 @@ pub async fn login_status_handler(
     }))
 }
 
-/// Extract the `aoe_session` cookie value from a request.
+/// Extract the `hmp_session` cookie value from a request.
 pub fn extract_login_session(request: &axum::extract::Request) -> Option<String> {
     let cookie_header = request.headers().get(header::COOKIE)?;
     let cookie_str = cookie_header.to_str().ok()?;
     for cookie in cookie_str.split(';') {
         let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("aoe_session=") {
+        if let Some(value) = cookie.strip_prefix("hmp_session=") {
             if !value.is_empty() {
                 return Some(value.to_string());
             }
@@ -1396,7 +1396,7 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
         return;
     }
     let truncated_ua = user_agent.chars().take(80).collect::<String>();
-    let title = "New aoe dashboard login".to_string();
+    let title = "New hmp dashboard login".to_string();
     let body = format!("New device signed in. UA: {truncated_ua}");
     let client = match super::push_send::build_client() {
         Ok(c) => c,
@@ -1413,7 +1413,7 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
             title: title.clone(),
             body: body.clone(),
             url,
-            tag: "aoe-new-login".to_string(),
+            tag: "hmp-new-login".to_string(),
             session_id: String::new(),
         };
         let body_bytes = match serde_json::to_vec(&payload) {
@@ -1452,7 +1452,7 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
 /// Build a Set-Cookie header for the login session.
 pub fn build_login_cookie(session_id: &str, secure: bool) -> String {
     let mut cookie = format!(
-        "aoe_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
+        "hmp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
         session_id
     );
     if secure {
@@ -1716,7 +1716,7 @@ mod tests {
     #[test]
     fn build_cookie_without_secure() {
         let cookie = build_login_cookie("abc123", false);
-        assert!(cookie.contains("aoe_session=abc123"));
+        assert!(cookie.contains("hmp_session=abc123"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=2592000"));
@@ -1732,7 +1732,7 @@ mod tests {
     #[test]
     fn extract_session_from_cookie_header() {
         let request = axum::http::Request::builder()
-            .header(header::COOKIE, "aoe_token=foo; aoe_session=bar123")
+            .header(header::COOKIE, "hmp_token=foo; hmp_session=bar123")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1742,7 +1742,7 @@ mod tests {
     #[test]
     fn extract_session_missing_cookie() {
         let request = axum::http::Request::builder()
-            .header(header::COOKIE, "aoe_token=foo")
+            .header(header::COOKIE, "hmp_token=foo")
             .body(axum::body::Body::empty())
             .unwrap();
 

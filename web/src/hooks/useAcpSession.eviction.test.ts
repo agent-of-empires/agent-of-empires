@@ -7,7 +7,7 @@
 //   acp-state entries currently in storage. Drafts hold authoritative
 //   client-side data; silent destruction would be data loss.
 // - Eviction whitelist-filters by STORAGE_KEY_PREFIX
-//   (`aoe:acp-state:v1:`), not blacklist-filters.
+//   (`hmp:acp-state:v1:`), not blacklist-filters.
 // - Corrupt entries (parse failure or missing savedAt) are evicted before
 //   well-formed ones.
 // - Retry depth is exactly 1: on a second failure, persistState gives up
@@ -99,8 +99,8 @@ describe("structured view cache eviction (#1345)", () => {
 
   it("never evicts unrelated keys (e.g. theme cache, settings)", () => {
     const now = Date.now();
-    window.localStorage.setItem("aoe-resolved-theme", "themedata");
-    window.localStorage.setItem("aoe-web-settings", "{}");
+    window.localStorage.setItem("hmp-resolved-theme", "themedata");
+    window.localStorage.setItem("hmp-web-settings", "{}");
     window.localStorage.setItem(
       `${STORAGE_KEY_PREFIX}sess-old`,
       JSON.stringify({ savedAt: now - 86_400_000, state: emptyAcpState() }),
@@ -108,8 +108,8 @@ describe("structured view cache eviction (#1345)", () => {
 
     evictOldestPersistedAcpState(`${STORAGE_KEY_PREFIX}sess-current`);
 
-    expect(window.localStorage.getItem("aoe-resolved-theme")).toBe("themedata");
-    expect(window.localStorage.getItem("aoe-web-settings")).toBe("{}");
+    expect(window.localStorage.getItem("hmp-resolved-theme")).toBe("themedata");
+    expect(window.localStorage.getItem("hmp-web-settings")).toBe("{}");
     expect(
       window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`),
     ).toBeNull();
@@ -181,7 +181,7 @@ describe("structured view cache eviction (#1345)", () => {
   it("returns false silently when no acp-state candidate exists", () => {
     // Only drafts and unrelated keys; nothing to evict.
     window.localStorage.setItem(`${DRAFT_KEY_PREFIX}sess-a`, "draft");
-    window.localStorage.setItem("aoe-resolved-theme", "{}");
+    window.localStorage.setItem("hmp-resolved-theme", "{}");
 
     const removed = evictOldestPersistedAcpState(
       `${STORAGE_KEY_PREFIX}sess-current`,

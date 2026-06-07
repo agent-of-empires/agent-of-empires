@@ -149,26 +149,24 @@ mod tests {
     #[test]
     fn test_parse_owner_ssh_shorthand() {
         assert_eq!(
-            parse_owner_from_remote_url("git@github.com:agent-of-empires/agent-of-empires.git"),
-            Some("agent-of-empires".to_string()),
+            parse_owner_from_remote_url("git@github.com:hoxkss/hmp.git"),
+            Some("hmp".to_string()),
         );
     }
 
     #[test]
     fn test_parse_owner_https() {
         assert_eq!(
-            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires.git"),
-            Some("agent-of-empires".to_string()),
+            parse_owner_from_remote_url("https://github.com/hoxkss/hmp.git"),
+            Some("hmp".to_string()),
         );
     }
 
     #[test]
     fn test_parse_owner_ssh_url() {
         assert_eq!(
-            parse_owner_from_remote_url(
-                "ssh://git@github.com/agent-of-empires/agent-of-empires.git"
-            ),
-            Some("agent-of-empires".to_string()),
+            parse_owner_from_remote_url("ssh://git@github.com/hoxkss/hmp.git"),
+            Some("hmp".to_string()),
         );
     }
 
@@ -183,8 +181,8 @@ mod tests {
     #[test]
     fn test_parse_owner_no_dotgit_suffix() {
         assert_eq!(
-            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires"),
-            Some("agent-of-empires".to_string()),
+            parse_owner_from_remote_url("https://github.com/hoxkss/hmp"),
+            Some("hmp".to_string()),
         );
     }
 

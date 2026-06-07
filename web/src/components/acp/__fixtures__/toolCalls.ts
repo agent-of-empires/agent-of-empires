@@ -194,7 +194,7 @@ export const fixtures = {
     memory_recall: {
       mode: "synthesize",
       synthesized_text:
-        "User is a senior engineer working on agent-of-empires.",
+        "User is a senior engineer working on hmp.",
     },
   }),
 };

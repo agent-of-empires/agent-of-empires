@@ -524,13 +524,13 @@ export interface AcpState {
    *  `CurrentModeChanged`. See #1233. */
   modeSwitchFailed: { modeId: string; reason: string; at: string } | null;
   /** Set true when the daemon publishes `Stopped { reason: "user_stopped" }`,
-   *  meaning `aoe acp stop|kill` (or an equivalent external
+   *  meaning `hmp acp stop|kill` (or an equivalent external
    *  teardown) terminated the runner. The composer disables itself and
    *  shows a reconnect banner; cleared on the next UserPromptSent or
    *  AcpSessionAssigned (a fresh worker is online). */
   workerStopped: boolean;
   /** Set true when the daemon publishes `Stopped { reason: "restart_pending" }`,
-   *  meaning `aoe acp restart` ran and the reconciler will respawn
+   *  meaning `hmp acp restart` ran and the reconciler will respawn
    *  the worker on its next 2s tick with the cached `acp_session_id`
    *  (transcript continuity). The composer disables itself and a
    *  transient "Restarting…" banner appears without a reconnect button;
@@ -1494,8 +1494,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // online; the structured incompatibility banner heals so the
     // session can resume.
     next.incompatibleAgent = null;
-    // A fresh agent (via POST /acp/spawn after `aoe acp stop`
-    // or via the reconciler's auto-respawn after `aoe acp restart`)
+    // A fresh agent (via POST /acp/spawn after `hmp acp stop`
+    // or via the reconciler's auto-respawn after `hmp acp restart`)
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
@@ -1560,7 +1560,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("CancelRequested" in event) {
-    // aoe sent session/cancel and armed the escalation watchdog; the
+    // hmp sent session/cancel and armed the escalation watchdog; the
     // turn is still active. Surface "Stopping..." and the escalation
     // deadline so the user gets feedback instead of a silent spinner,
     // and can reveal the Force-stop affordance. See #1727.

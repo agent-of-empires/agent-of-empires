@@ -2,7 +2,7 @@
 //!
 //! Calls the daemon's `/api/log-level` endpoint over HTTP using the
 //! token embedded in `serve.url`. Does not require the daemon to be
-//! daemonised — a foreground `aoe serve` is reachable if its
+//! daemonised — a foreground `hmp serve` is reachable if its
 //! `serve.url` file is current.
 
 use anyhow::{bail, Context, Result};
@@ -32,7 +32,7 @@ pub struct LogLevelArgs {
 pub async fn run(args: LogLevelArgs) -> Result<()> {
     let urls = read_serve_urls();
     let Some(primary) = urls.first() else {
-        bail!("No aoe serve daemon is running, or serve.url is empty/missing.");
+        bail!("No hmp serve daemon is running, or serve.url is empty/missing.");
     };
 
     let base = primary

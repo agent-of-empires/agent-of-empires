@@ -684,8 +684,8 @@ impl GitWorktree {
         // `walk_worktree_stats` walks the entire checked-out tree, which is
         // unwanted overhead on the hot path when no one is listening. Only
         // pay the cost when the matching tracing target is actually emitting
-        // at INFO (i.e. AOE_LOG_LEVEL=info|debug|trace or the legacy
-        // AGENT_OF_EMPIRES_DEBUG=1).
+        // at INFO (i.e. HMP_LOG_LEVEL=info|debug|trace or the legacy
+        // HMP_DEBUG=1).
         if tracing::enabled!(tracing::Level::INFO) {
             let WorktreeWalkStats {
                 file_count,

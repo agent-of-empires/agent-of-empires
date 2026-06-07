@@ -29,7 +29,7 @@ fn session_offset(created_at: &DateTime<Utc>) -> usize {
 
 /// Build the list-pane title.
 ///
-/// `prefix` is the leading label ("aoe", "Terminals", "Tool: <name>").
+/// `prefix` is the leading label ("hmp", "Terminals", "Tool: <name>").
 /// `profile` is `Some(name)` only when a real filter is active; when `None`,
 /// the `[<profile>]` segment is omitted so the default all-profiles state
 /// stays uncluttered.
@@ -654,7 +654,7 @@ impl HomeView {
         let profile = self.active_profile_display();
         let title = match &self.view_mode {
             ViewMode::Structured => {
-                compose_list_title("aoe", profile, self.group_by, self.sort_order)
+                compose_list_title("hmp", profile, self.group_by, self.sort_order)
             }
             ViewMode::Terminal => {
                 compose_list_title("Terminals", profile, self.group_by, self.sort_order)
@@ -701,7 +701,7 @@ impl HomeView {
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
                 Line::from(""),
                 Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
-                Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
+                Line::from("or 'hmp add .'").style(Style::default().fg(theme.hint)),
             ];
             let para = Paragraph::new(empty_text).alignment(Alignment::Center);
             frame.render_widget(para, inner);
@@ -2436,7 +2436,7 @@ impl HomeView {
 
         let mut groups: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
 
-        // Serve indicator: shown only when the `aoe serve` daemon is live.
+        // Serve indicator: shown only when the `hmp serve` daemon is live.
         // The TUI does not own the daemon, so we probe the PID file each
         // render. Mode comes from a PID-keyed cache so we don't read the
         // serve.mode file from disk on every frame.
@@ -2458,7 +2458,7 @@ impl HomeView {
             }
         }
 
-        // Other-TUI indicator: shown only when more than one `aoe` TUI is
+        // Other-TUI indicator: shown only when more than one `hmp` TUI is
         // alive. Two TUIs watching the same agent sessions clash over pane
         // sizes (tmux reflows to the smallest attached client), so surface the
         // count as a heads-up. The value is recomputed on a throttle in the
@@ -2669,50 +2669,50 @@ mod tests {
     fn compose_list_title_omits_profile_and_suffix_at_defaults() {
         // Default group/sort and no profile filter: title is just the prefix,
         // no `[all]` tag, no parenthesized suffix.
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Newest);
-        assert_eq!(title, " aoe ");
+        let title = compose_list_title("hmp", None, GroupByMode::Manual, SortOrder::Newest);
+        assert_eq!(title, " hmp ");
     }
 
     #[test]
     fn compose_list_title_includes_profile_when_filter_active() {
         let title = compose_list_title(
-            "aoe",
+            "hmp",
             Some("my-profile"),
             GroupByMode::Manual,
             SortOrder::Newest,
         );
-        assert_eq!(title, " aoe [my-profile] ");
+        assert_eq!(title, " hmp [my-profile] ");
     }
 
     #[test]
     fn compose_list_title_shows_by_project_only() {
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
-        assert_eq!(title, " aoe · project ");
+        let title = compose_list_title("hmp", None, GroupByMode::Project, SortOrder::Newest);
+        assert_eq!(title, " hmp · project ");
     }
 
     #[test]
     fn compose_list_title_shows_sort_only_when_non_default() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::LastActivity);
-        assert_eq!(title, " aoe · Recent ");
+        let title = compose_list_title("hmp", None, GroupByMode::Manual, SortOrder::LastActivity);
+        assert_eq!(title, " hmp · Recent ");
     }
 
     #[test]
     fn compose_list_title_merges_group_and_sort_suffixes() {
         let title = compose_list_title(
-            "aoe",
+            "hmp",
             Some("alpha"),
             GroupByMode::Project,
             SortOrder::LastActivity,
         );
-        assert_eq!(title, " aoe [alpha] · project · Recent ");
+        assert_eq!(title, " hmp [alpha] · project · Recent ");
     }
 
     #[test]
     fn compose_list_title_default_sort_drops_suffix_segment() {
         // Newest is the default; it must not appear in the title even when
         // group mode contributes its own suffix piece.
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
-        assert_eq!(title, " aoe · project ");
+        let title = compose_list_title("hmp", None, GroupByMode::Project, SortOrder::Newest);
+        assert_eq!(title, " hmp · project ");
     }
 
     #[test]
@@ -2738,43 +2738,43 @@ mod tests {
     fn compose_list_title_default_sort_with_project_and_profile() {
         // Matrix cell: default sort + project group + active profile.
         let title = compose_list_title(
-            "aoe",
+            "hmp",
             Some("alpha"),
             GroupByMode::Project,
             SortOrder::Newest,
         );
-        assert_eq!(title, " aoe [alpha] · project ");
+        assert_eq!(title, " hmp [alpha] · project ");
     }
 
     #[test]
     fn compose_list_title_non_default_sort_with_profile_only() {
         // Matrix cell: non-default sort + manual group + active profile.
         let title = compose_list_title(
-            "aoe",
+            "hmp",
             Some("alpha"),
             GroupByMode::Manual,
             SortOrder::LastActivity,
         );
-        assert_eq!(title, " aoe [alpha] · Recent ");
+        assert_eq!(title, " hmp [alpha] · Recent ");
     }
 
     #[test]
     fn compose_list_title_non_default_sort_with_project_no_profile() {
         // Matrix cell: non-default sort + project group + no profile.
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::LastActivity);
-        assert_eq!(title, " aoe · project · Recent ");
+        let title = compose_list_title("hmp", None, GroupByMode::Project, SortOrder::LastActivity);
+        assert_eq!(title, " hmp · project · Recent ");
     }
 
     #[test]
     fn compose_list_title_renders_oldest_sort_label() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Oldest);
-        assert_eq!(title, " aoe · Oldest ");
+        let title = compose_list_title("hmp", None, GroupByMode::Manual, SortOrder::Oldest);
+        assert_eq!(title, " hmp · Oldest ");
     }
 
     #[test]
     fn compose_list_title_renders_za_sort_label() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::ZA);
-        assert_eq!(title, " aoe · Z-A ");
+        let title = compose_list_title("hmp", None, GroupByMode::Manual, SortOrder::ZA);
+        assert_eq!(title, " hmp · Z-A ");
     }
 
     #[test]

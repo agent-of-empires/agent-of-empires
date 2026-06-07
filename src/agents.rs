@@ -36,7 +36,7 @@ pub enum ResumeStrategy {
     Unsupported,
 }
 
-/// A single hook event that AoE registers in an agent's settings file.
+/// A single hook event that HMP registers in an agent's settings file.
 pub struct HookEvent {
     pub name: &'static str,
     pub matcher: Option<&'static str>,

@@ -1,5 +1,5 @@
 // Storage layer for per-session structured view state. The structured view reducer state
-// is mirrored into localStorage under `aoe:acp-state:v1:<id>` by
+// is mirrored into localStorage under `hmp:acp-state:v1:<id>` by
 // useStructuredView's persistState so a reload rehydrates without replaying the
 // whole transcript (see useStructuredView.ts and #1132). This module owns the
 // key shape and TTL so both the writer (useStructuredView) and read-only
@@ -17,7 +17,7 @@
 
 import type { AcpState, RateLimitInfo } from "./acpTypes";
 
-export const STORAGE_KEY_PREFIX = "aoe:acp-state:v1:";
+export const STORAGE_KEY_PREFIX = "hmp:acp-state:v1:";
 export const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface PersistedEntry {

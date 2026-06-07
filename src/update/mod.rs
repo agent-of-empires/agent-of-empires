@@ -10,15 +10,15 @@ use tracing::warn;
 
 use crate::session::{get_app_dir, get_update_settings};
 
-const GITHUB_OWNER: &str = "agent-of-empires";
-const GITHUB_REPO: &str = "agent-of-empires";
+const GITHUB_OWNER: &str = "hmp";
+const GITHUB_REPO: &str = "hmp";
 
-/// Resolve the GitHub API base URL, honoring `AOE_UPDATE_API_BASE` for
-/// hermetic tests. The override mirrors `AOE_UPDATE_BASE_URL` (which
+/// Resolve the GitHub API base URL, honoring `HMP_UPDATE_API_BASE` for
+/// hermetic tests. The override mirrors `HMP_UPDATE_BASE_URL` (which
 /// covers tarball downloads); tests that need to exercise the CLI
 /// without rate-limiting GitHub set both.
 fn github_api_base() -> String {
-    std::env::var("AOE_UPDATE_API_BASE")
+    std::env::var("HMP_UPDATE_API_BASE")
         .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
 }
 
@@ -31,10 +31,7 @@ pub fn release_page_url(version: &str) -> String {
     } else {
         format!("v{}", version)
     };
-    format!(
-        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/{}",
-        tag
-    )
+    format!("https://github.com/hoxkss/hmp/releases/tag/{}", tag)
 }
 
 #[derive(Debug, Clone)]
@@ -362,7 +359,7 @@ pub async fn print_update_notice() {
     if let Ok(info) = check_for_update(version, false).await {
         if info.available {
             eprintln!(
-                "\n💡 Update available: v{} → v{} (run: aoe update)",
+                "\n💡 Update available: v{} → v{} (run: hmp update)",
                 info.current_version, info.latest_version
             );
         }

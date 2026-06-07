@@ -6,7 +6,7 @@
 //! dropped (every fire and forget `tokio::spawn(...)` in this crate),
 //! the panic message is lost. `spawn_supervised` wraps the future in
 //! `catch_unwind` so a panic surfaces through `tracing::error!` with
-//! a static task name attached, which makes `aoe logs` answer
+//! a static task name attached, which makes `hmp logs` answer
 //! "why did the cleanup task stop running" instead of dropping the
 //! signal on the floor.
 

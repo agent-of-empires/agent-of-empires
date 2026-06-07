@@ -1,4 +1,4 @@
-//! `aoe logs` - view the configured AoE log file with a pretty viewer.
+//! `hmp logs` - view the configured HMP log file with a pretty viewer.
 //!
 //! Resolves the path from `[logging].file_path`, picks the best available
 //! viewer (lnav > bat > less > plain stdout), and prints a one-line tip when
@@ -82,15 +82,15 @@ pub async fn run(args: LogsArgs) -> Result<()> {
 
     if !target_path.exists() {
         eprintln!("{} does not exist (yet).", target_path.display());
-        eprintln!("Tip: start `aoe` (TUI) or `aoe serve`, or run with AOE_LOG_LEVEL=debug.");
+        eprintln!("Tip: start `hmp` (TUI) or `hmp serve`, or run with HMP_LOG_LEVEL=debug.");
         return Ok(());
     }
 
     let viewer = detect_viewer(args.no_pager);
-    if !args.no_pager && viewer != Viewer::Lnav && std::env::var_os("AOE_NO_LNAV_TIP").is_none() {
+    if !args.no_pager && viewer != Viewer::Lnav && std::env::var_os("HMP_NO_LNAV_TIP").is_none() {
         eprintln!(
             "Tip: install `lnav` for color, level filters, and search (https://lnav.org). \
-             Set AOE_NO_LNAV_TIP=1 to silence. Falling back to {}.",
+             Set HMP_NO_LNAV_TIP=1 to silence. Falling back to {}.",
             viewer_name(viewer)
         );
     }

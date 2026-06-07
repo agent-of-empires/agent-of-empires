@@ -1,4 +1,4 @@
-//! `agent-of-empires status` command implementation
+//! `hmp status` command implementation
 
 use anyhow::Result;
 use clap::Args;

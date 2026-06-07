@@ -31,7 +31,7 @@ interface Props {
    *  actually offered. */
 }
 
-const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
+const SCROLL_HINT_SEEN_KEY = "hmp-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
 export function TerminalView({ session, active = true }: Props) {

@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn missing_file_returns_false() {
-        let path = std::path::Path::new("/nonexistent/aoe-test/settings.json");
+        let path = std::path::Path::new("/nonexistent/hmp-test/settings.json");
         assert!(!read_tui_fullscreen_at(path));
     }
 

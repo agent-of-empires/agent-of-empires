@@ -130,12 +130,12 @@ impl TelemetryConsentDialog {
 
         let body = Paragraph::new(vec![
             Line::from(Span::styled(
-                "Help improve aoe with anonymous usage telemetry?",
+                "Help improve hmp with anonymous usage telemetry?",
                 Style::default().fg(theme.title).bold(),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "It shows us how aoe is actually used, so we can prioritize the",
+                "It shows us how hmp is actually used, so we can prioritize the",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
@@ -144,11 +144,11 @@ impl TelemetryConsentDialog {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "When on, aoe sends anonymous counts only: sessions, agents and",
+                "When on, hmp sends anonymous counts only: sessions, agents and",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
-                "models, your aoe version, and OS. Never prompts, paths, names,",
+                "models, your hmp version, and OS. Never prompts, paths, names,",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(

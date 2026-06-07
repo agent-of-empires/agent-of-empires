@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
-const SPLIT_STORAGE_KEY = "aoe-split-ratio";
+const SPLIT_STORAGE_KEY = "hmp-split-ratio";
 const DEFAULT_DIFF_WIDTH = 380;
 const MIN_TERMINAL_WIDTH = 400;
 const MIN_DIFF_WIDTH = 280;

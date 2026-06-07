@@ -1,9 +1,9 @@
-//! Migration v011: Relocate sandbox image from ghcr.io/njbrake to ghcr.io/agent-of-empires
+//! Migration v011: Relocate sandbox image from ghcr.io/njbrake to ghcr.io/hmp
 //!
-//! When the repo moved from `njbrake/agent-of-empires` to `agent-of-empires/agent-of-empires`
-//! the published container images moved with it: `ghcr.io/njbrake/aoe-sandbox` and
-//! `ghcr.io/njbrake/aoe-dev-sandbox` are republished as `ghcr.io/agent-of-empires/aoe-sandbox`
-//! and `ghcr.io/agent-of-empires/aoe-dev-sandbox`. GHCR keeps the old paths alive as redirects
+//! When the repo moved from `njbrake/hmp` to `hoxkss/hmp`
+//! the published container images moved with it: `ghcr.io/njbrake/hmp-sandbox` and
+//! `ghcr.io/njbrake/hmp-dev-sandbox` are republished as `ghcr.io/hmp/hmp-sandbox`
+//! and `ghcr.io/hmp/hmp-dev-sandbox`. GHCR keeps the old paths alive as redirects
 //! for now, but they should not be the canonical reference in stored config.
 //!
 //! This migration rewrites `[sandbox] default_image` in the global config and every profile
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tracing::{debug, info};
 
 const OLD_NAMESPACE: &str = "ghcr.io/njbrake/";
-const NEW_NAMESPACE: &str = "ghcr.io/agent-of-empires/";
+const NEW_NAMESPACE: &str = "ghcr.io/hmp/";
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -86,13 +86,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rewrites_aoe_sandbox() {
+    fn test_rewrites_hmp_sandbox() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         fs::write(
             &config_path,
             r#"[sandbox]
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+default_image = "ghcr.io/njbrake/hmp-sandbox:latest"
 "#,
         )
         .unwrap();
@@ -102,18 +102,18 @@ default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
         let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
         assert_eq!(
             result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-sandbox:latest")
+            Some("ghcr.io/hmp/hmp-sandbox:latest")
         );
     }
 
     #[test]
-    fn test_rewrites_aoe_dev_sandbox() {
+    fn test_rewrites_hmp_dev_sandbox() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         fs::write(
             &config_path,
             r#"[sandbox]
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:0.10"
+default_image = "ghcr.io/njbrake/hmp-dev-sandbox:0.10"
 "#,
         )
         .unwrap();
@@ -123,7 +123,7 @@ default_image = "ghcr.io/njbrake/aoe-dev-sandbox:0.10"
         let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
         assert_eq!(
             result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10")
+            Some("ghcr.io/hmp/hmp-dev-sandbox:0.10")
         );
     }
 
@@ -132,7 +132,7 @@ default_image = "ghcr.io/njbrake/aoe-dev-sandbox:0.10"
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         let original = r#"[sandbox]
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
+default_image = "ghcr.io/hmp/hmp-sandbox:latest"
 "#;
         fs::write(&config_path, original).unwrap();
 
@@ -141,7 +141,7 @@ default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
         let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
         assert_eq!(
             result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-sandbox:latest")
+            Some("ghcr.io/hmp/hmp-sandbox:latest")
         );
     }
 

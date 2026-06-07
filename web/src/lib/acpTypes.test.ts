@@ -550,7 +550,7 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
     // text is the assembled markdown (agent-visible body / fallback),
     // never a base64 sentinel.
     expect(row.text).toContain("## Diff comments");
-    expect(row.text).not.toContain("aoe:diff-comments");
+    expect(row.text).not.toContain("hmp:diff-comments");
     expect(row.diffComments).toEqual({
       intro: "Take a look:",
       outro: "Please address these comments.",
@@ -984,7 +984,7 @@ describe("applyEvent / Stopped restart_pending", () => {
   });
 
   it("user_stopped → restart_pending transitions cleanly", () => {
-    // Edge case: user runs `aoe acp stop`, then realises they meant
+    // Edge case: user runs `hmp acp stop`, then realises they meant
     // `restart`. The two reasons must not pile up — restart_pending
     // wins because it's the most recent signal from the daemon.
     let state = applyEvent(emptyAcpState(), {

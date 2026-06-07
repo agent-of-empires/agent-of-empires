@@ -30,8 +30,8 @@ function storageWorks(name: "localStorage" | "sessionStorage"): boolean {
       | Storage
       | undefined;
     if (!s || typeof s.setItem !== "function") return false;
-    s.setItem("__aoe_probe__", "1");
-    s.removeItem("__aoe_probe__");
+    s.setItem("__hmp_probe__", "1");
+    s.removeItem("__hmp_probe__");
     return true;
   } catch {
     return false;

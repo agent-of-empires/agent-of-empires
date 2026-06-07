@@ -14,7 +14,7 @@ use super::Instance;
 /// mode. Code that walks `flat_items` and dispatches on `Item::Group.path`
 /// must skip this path before invoking GroupTree-mutating ops (rename,
 /// delete, archive, etc.) since no matching group exists.
-pub const ARCHIVED_SECTION_PATH: &str = "__aoe_archived_section__";
+pub const ARCHIVED_SECTION_PATH: &str = "__hmp_archived_section__";
 pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 
 #[inline]
@@ -476,7 +476,7 @@ fn last_activity_group_key(
 }
 
 /// Priority tier for the Attention sort. Lower = higher priority = closer to
-/// the top of the list. See `docs/plans/2026-04-21-aoe-attention-sort.md` for
+/// the top of the list. See `docs/plans/2026-04-21-hmp-attention-sort.md` for
 /// the full rationale on tier choices.
 ///
 /// Archived sessions short-circuit to tier 99 so they always sink to the

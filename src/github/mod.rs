@@ -19,4 +19,4 @@ pub use error::{GitHubAuthError, GitHubError, Result};
 /// Default GitHub REST API base.
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 /// User-Agent sent on every GitHub request (GitHub requires one).
-pub const DEFAULT_USER_AGENT: &str = "agent-of-empires";
+pub const DEFAULT_USER_AGENT: &str = "hmp";

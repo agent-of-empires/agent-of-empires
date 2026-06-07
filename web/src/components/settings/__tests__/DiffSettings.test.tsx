@@ -2,14 +2,14 @@
 //
 // Contract test for the DiffSettings panel. Like TerminalSettings (and unlike
 // the server-backed panels under settings/), this persists through
-// useWebSettings + localStorage (key `aoe-web-settings`), not PATCH
+// useWebSettings + localStorage (key `hmp-web-settings`), not PATCH
 // /api/settings. The contract is the JSON shape written to that key.
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { DiffSettings } from "../DiffSettings";
 
-const KEY = "aoe-web-settings";
+const KEY = "hmp-web-settings";
 
 function readStored(): Record<string, unknown> {
   const raw = window.localStorage.getItem(KEY);

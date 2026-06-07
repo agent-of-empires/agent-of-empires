@@ -454,7 +454,7 @@ const AGENT_GUTTER_CONT: &str = "     ";
 /// ratatui `Line`s ourselves (see [`MarkdownBuilder`]). This strips the
 /// raw `#`/`**`/backtick/fence markers and styles content with modifiers
 /// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
-/// carrying hardcoded colors. Each line is prefixed with the `aoe` gutter
+/// carrying hardcoded colors. Each line is prefixed with the `hmp` gutter
 /// on the first row and an aligned indent on continuation rows. Empty or
 /// marker-only input falls back to the bare `aoe  …` placeholder the
 /// streaming UI showed before.
@@ -1157,7 +1157,7 @@ mod tests {
             line_text(&lines[0])
         );
         // Every continuation line aligns under the text with spaces, no
-        // repeated `aoe` literal.
+        // repeated `hmp` literal.
         for line in &lines[1..] {
             let text = line_text(line);
             assert!(
@@ -1165,7 +1165,7 @@ mod tests {
                 "continuation line not indented: {text:?}"
             );
             assert!(
-                !text.trim_start().starts_with("aoe"),
+                !text.trim_start().starts_with("hmp"),
                 "gutter literal repeated on continuation: {text:?}"
             );
         }

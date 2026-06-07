@@ -1,7 +1,7 @@
 //! Onboarding dialog shown when no AI agents are installed.
 //!
 //! Displays install instructions for popular agents and offers a re-check
-//! button that re-runs detection without restarting AoE.
+//! button that re-runs detection without restarting HMP.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -15,7 +15,7 @@ use crate::tui::styles::Theme;
 pub enum NoAgentsAction {
     /// User chose to re-check for installed agents.
     Recheck,
-    /// User chose to quit AoE.
+    /// User chose to quit HMP.
     Quit,
 }
 
@@ -90,7 +90,7 @@ impl NoAgentsDialog {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent))
-            .title(" Welcome to Agent of Empires ")
+            .title(" Welcome to Hoxkss My Pi ")
             .title_style(Style::default().fg(theme.accent).bold());
 
         let inner = block.inner(dialog_area);
@@ -113,7 +113,7 @@ impl NoAgentsDialog {
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
-                "AI coding agent. AoE manages and orchestrates them.",
+                "AI coding agent. HMP manages and orchestrates them.",
                 Style::default().fg(theme.text),
             )),
             Line::from(""),

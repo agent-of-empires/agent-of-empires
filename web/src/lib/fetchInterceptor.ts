@@ -5,18 +5,18 @@ import { clearToken, getToken, saveToken } from "./token";
 
 /** Dispatched on `window` when the auth token is rejected or missing. App.tsx
  *  listens for this to show the token entry page instead of just a toast. */
-export const TOKEN_EXPIRED_EVENT = "aoe:token-expired";
+export const TOKEN_EXPIRED_EVENT = "hmp:token-expired";
 
 /** Dispatched on `window` when the token is valid but the passphrase login
  *  session is missing or expired. App.tsx listens to show the LoginPage
  *  instead of the TokenEntryPage, so a valid token isn't wrongly cleared. */
-export const LOGIN_REQUIRED_EVENT = "aoe:login-required";
+export const LOGIN_REQUIRED_EVENT = "hmp:login-required";
 
 /** Dispatched on `window` when an authenticated request hits a sensitive
  *  route whose login session is not currently elevated (the server
  *  returns `403 elevation_required`). Structured view/terminal hooks listen for
  *  this to pop an inline passphrase prompt. See #1131. */
-export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
+export const ELEVATION_REQUIRED_EVENT = "hmp:elevation-required";
 
 /** Classify a 401 body as `login_required` or `unauthorized`. Clones the
  *  response so downstream readers (fetchJson, etc.) can still parse the
@@ -111,7 +111,7 @@ export function installFetchErrorToasts(): void {
     try {
       const res = await original(input, patchedInit);
       if (sameOrigin) {
-        const rotated = res.headers.get("x-aoe-token");
+        const rotated = res.headers.get("x-hmp-token");
         if (rotated) saveToken(rotated);
       }
       if (res.status === 401 && isApi) {
@@ -164,7 +164,7 @@ export function installFetchErrorToasts(): void {
 
 // 401 with no `login_required` body: this is the true
 // unauthenticated state. A bound device authenticates purely via
-// its `aoe_session` cookie + device binding; the server does not
+// its `hmp_session` cookie + device binding; the server does not
 // consult the token on regular requests. This branch fires only
 // when the session is gone (server restart, 30-day idle, explicit
 // logout, or a fresh browser profile). Clear any cached token

@@ -62,14 +62,14 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-/// Per-message byte tracing is hidden behind `AOE_TERMINAL_TRACE=1` so the
-/// default `AOE_LOG_LEVEL=debug` run captures lifecycle without drowning
+/// Per-message byte tracing is hidden behind `HMP_TERMINAL_TRACE=1` so the
+/// default `HMP_LOG_LEVEL=debug` run captures lifecycle without drowning
 /// the log in PTY-byte chatter (a busy claude session emits thousands of
 /// frames/min). Read once at connect time so the gate is a single atomic
 /// load per message instead of an env lookup.
 fn terminal_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("AOE_TERMINAL_TRACE").is_ok())
+    *ENABLED.get_or_init(|| std::env::var("HMP_TERMINAL_TRACE").is_ok())
 }
 
 use super::AppState;
@@ -98,7 +98,7 @@ pub async fn paired_terminal_ws(
     // Auto-respawn a dead pane before upgrading. The browser's WS reconnect
     // path goes straight to this route without re-running ensure_terminal,
     // so without this check a pane that died while the page stayed open
-    // (most commonly across an `aoe serve` restart) would attach to a
+    // (most commonly across an `hmp serve` restart) would attach to a
     // tombstone that swallows every keystroke. Match the kill+recreate
     // dance in `ensure_terminal` and the TUI attach path.
     let tmux_name = match respawn_paired_if_dead(&state, &id, &inst).await {
@@ -118,12 +118,12 @@ pub async fn paired_terminal_ws(
         }
     };
 
-    // Accept the "aoe-auth" subprotocol so the browser's handshake
-    // completes. The client offers `["aoe-auth", <token>]`; the auth
+    // Accept the "hmp-auth" subprotocol so the browser's handshake
+    // completes. The client offers `["hmp-auth", <token>]`; the auth
     // middleware validates the token from the same header, and the
-    // server echoes back "aoe-auth" to satisfy the WS spec. The token
+    // server echoes back "hmp-auth" to satisfy the WS spec. The token
     // itself is not echoed, only the marker.
-    ws.protocols(["aoe-auth"])
+    ws.protocols(["hmp-auth"])
         .on_upgrade(move |socket| {
             handle_terminal_ws(
                 socket,
@@ -160,7 +160,7 @@ async fn respawn_paired_if_dead(
     //      under `remain-on-exit on`). `kill_terminal_if_dead` clears
     //      the tombstone, then we respawn.
     //   2. The whole tmux session is gone (`tmux kill-session`, daemon
-    //      reaped on aoe restart, etc). `kill_terminal_if_dead`
+    //      reaped on hmp restart, etc). `kill_terminal_if_dead`
     //      returns false here because there's nothing to kill, but the
     //      next `tmux attach-session` will fail with "can't find
     //      session" and the WS will close with code 4001. Recreate
@@ -240,12 +240,12 @@ pub async fn container_terminal_ws(
         }
     };
 
-    // Accept the "aoe-auth" subprotocol so the browser's handshake
-    // completes. The client offers `["aoe-auth", <token>]`; the auth
+    // Accept the "hmp-auth" subprotocol so the browser's handshake
+    // completes. The client offers `["hmp-auth", <token>]`; the auth
     // middleware validates the token from the same header, and the
-    // server echoes back "aoe-auth" to satisfy the WS spec. The token
+    // server echoes back "hmp-auth" to satisfy the WS spec. The token
     // itself is not echoed, only the marker.
-    ws.protocols(["aoe-auth"])
+    ws.protocols(["hmp-auth"])
         .on_upgrade(move |socket| {
             handle_terminal_ws(
                 socket,
@@ -330,13 +330,13 @@ pub async fn terminal_ws(
     let shutdown = state.shutdown.clone();
 
     match session_info {
-        // Accept the "aoe-auth" subprotocol so the browser's handshake
-        // completes. The client offers `["aoe-auth", <token>]`; the auth
+        // Accept the "hmp-auth" subprotocol so the browser's handshake
+        // completes. The client offers `["hmp-auth", <token>]`; the auth
         // middleware validates the token from the same header, and the
-        // server echoes back "aoe-auth" to satisfy the WS spec. The token
+        // server echoes back "hmp-auth" to satisfy the WS spec. The token
         // itself is not echoed, only the marker.
         Some(tmux_name) => ws
-            .protocols(["aoe-auth"])
+            .protocols(["hmp-auth"])
             .on_upgrade(move |socket| {
                 handle_terminal_ws(
                     socket,
@@ -378,7 +378,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Only the primary client's resize messages are applied to its PTY. This
 /// prevents multiple browser viewports (phone, desktop, tablet) from
 /// fighting over the tmux window size. The primary is whichever client
-/// most recently sent keyboard input, since aoe is single-user: if
+/// most recently sent keyboard input, since hmp is single-user: if
 /// you're typing on your phone you want phone-sized output.
 ///
 /// When no client is primary (all have disconnected, or nobody has typed
@@ -422,7 +422,7 @@ async fn handle_terminal_ws(
     // browser dialed in fractions of a second after the session was
     // created and the attach raced the tmux daemon's pane bookkeeping.
     // The `terminal_ws` (agent main) route lacks an analog of
-    // `respawn_paired_if_dead`, so without this poll a fresh `aoe serve`
+    // `respawn_paired_if_dead`, so without this poll a fresh `hmp serve`
     // would let the first attach exit with PTY EOF, the send task would
     // close 4001 (pty_dead), and the client would burn its retry budget
     // on a session that was about to become healthy. See #1455.
@@ -475,7 +475,7 @@ async fn handle_terminal_ws(
     let mut cmd = CommandBuilder::new("tmux");
     cmd.args(["attach-session", "-t", &tmux_name]);
     cmd.env("TERM", "xterm-256color");
-    // Allow nesting: unset TMUX so the attach works when aoe serve runs inside tmux
+    // Allow nesting: unset TMUX so the attach works when hmp serve runs inside tmux
     cmd.env_remove("TMUX");
 
     let mut child = match pair.slave.spawn_command(cmd) {

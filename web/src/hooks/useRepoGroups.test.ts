@@ -148,12 +148,12 @@ describe("useRepoGroups grouping", () => {
     ]);
     const wScratch1 = workspace(
       "sc1",
-      "/home/u/.agent-of-empires/scratch/aaa",
+      "/home/u/.hmp/scratch/aaa",
       [session({ id: "s-sc1", scratch: true })],
     );
     const wScratch2 = workspace(
       "sc2",
-      "/home/u/.agent-of-empires/scratch/bbb",
+      "/home/u/.hmp/scratch/bbb",
       [session({ id: "s-sc2", scratch: true })],
     );
 
@@ -291,7 +291,7 @@ describe("useRepoGroups sortMode = lastActivity (#1418)", () => {
         workspace_repos: multiRepos,
       }),
     ]);
-    const wScratch = workspace("sc", "/home/u/.agent-of-empires/scratch/aaa", [
+    const wScratch = workspace("sc", "/home/u/.hmp/scratch/aaa", [
       session({
         id: "s-sc",
         created_at: "2025-01-01T00:00:00Z",
@@ -348,7 +348,7 @@ describe("useRepoGroups stateful API", () => {
     });
     rerender();
     expect(result.current.groups[0].collapsed).toBe(true);
-    expect(window.localStorage.getItem("aoe-repo-collapsed-/repo-a")).toBe("1");
+    expect(window.localStorage.getItem("hmp-repo-collapsed-/repo-a")).toBe("1");
 
     act(() => {
       result.current.toggleRepoCollapsed("/repo-a");
@@ -356,7 +356,7 @@ describe("useRepoGroups stateful API", () => {
     rerender();
     expect(result.current.groups[0].collapsed).toBe(false);
     expect(
-      window.localStorage.getItem("aoe-repo-collapsed-/repo-a"),
+      window.localStorage.getItem("hmp-repo-collapsed-/repo-a"),
     ).toBeNull();
   });
 
@@ -376,7 +376,7 @@ describe("useRepoGroups stateful API", () => {
 });
 
 describe("useRepoGroups manual group order (#1644)", () => {
-  const ORDER_KEY = "aoe-repo-group-order-v1";
+  const ORDER_KEY = "hmp-repo-group-order-v1";
 
   it("orders groups by the persisted group order ahead of the min-rank fallback", () => {
     const wA = workspace("a1", "/repo-a", [session({ id: "s-a" })]);
@@ -421,7 +421,7 @@ describe("useRepoGroups manual group order (#1644)", () => {
     const wMulti = workspace("multi", "/repo-a", [
       session({ id: "s-multi", workspace_repos: multiRepos }),
     ]);
-    const wScratch = workspace("sc", "/home/u/.agent-of-empires/scratch/aaa", [
+    const wScratch = workspace("sc", "/home/u/.hmp/scratch/aaa", [
       session({ id: "s-sc", scratch: true }),
     ]);
     // Stored order only ranks the real group; the synthetic groups have
@@ -443,7 +443,7 @@ describe("useRepoGroups manual group order (#1644)", () => {
 
   it("lets a synthetic group hold an explicit dragged position above a real group", () => {
     const wReal = workspace("real", "/repo-a", [session({ id: "s-real" })]);
-    const wScratch = workspace("sc", "/home/u/.agent-of-empires/scratch/aaa", [
+    const wScratch = workspace("sc", "/home/u/.hmp/scratch/aaa", [
       session({ id: "s-sc", scratch: true }),
     ]);
     // User dragged scratch above the real group; the stored order ranks
@@ -551,7 +551,7 @@ describe("useRepoGroups sortMode = attention (#1640)", () => {
     const wReal = workspace("real", "/repo-a", [
       session({ id: "s-real", status: "Idle" }),
     ]);
-    const wScratch = workspace("sc", "/home/u/.agent-of-empires/scratch/aaa", [
+    const wScratch = workspace("sc", "/home/u/.hmp/scratch/aaa", [
       session({ id: "s-sc", status: "Waiting", urgent: true, scratch: true }),
     ]);
     const { result } = renderHook(() =>

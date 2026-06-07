@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 
 fn aoe_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_aoe")
+    env!("CARGO_BIN_EXE_hmp")
 }
 
 /// Start an axum server that returns canned JSON for the two GitHub

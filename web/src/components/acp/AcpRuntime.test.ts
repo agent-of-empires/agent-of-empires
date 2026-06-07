@@ -285,7 +285,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(groups).toHaveLength(0);
   });
 
-  it("smuggles parent_tool_call_id through args_preview as _aoe_parent_tool_call_id (#1041)", () => {
+  it("smuggles parent_tool_call_id through args_preview as _hmp_parent_tool_call_id (#1041)", () => {
     const childTool: ToolCall = {
       id: "ch-1",
       name: "Read",
@@ -310,17 +310,17 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     }>;
     const child = parts.find((p) => p.type === "tool-call")!;
     const parsed = JSON.parse(child.argsText!);
-    expect(parsed._aoe_parent_tool_call_id).toBe("task-parent-1");
+    expect(parsed._hmp_parent_tool_call_id).toBe("task-parent-1");
   });
 
-  it("collapses a parent Task + its children into a _aoe_subagent_task part (#1041)", () => {
+  it("collapses a parent Task + its children into a _hmp_subagent_task part (#1041)", () => {
     const parent: ToolCall = {
       id: "task-1",
       name: "Investigate auth bug",
       kind: "think",
       args_preview: JSON.stringify({
         description: "Investigate auth bug",
-        _aoe_title: "Investigate auth bug",
+        _hmp_title: "Investigate auth bug",
       }),
       started_at: "2026-05-12T00:00:00Z",
     };
@@ -568,7 +568,7 @@ describe("activityToThreadMessages; stopped status threading (#1646)", () => {
       id: "task-1",
       name: "Task",
       kind: "think",
-      args_preview: JSON.stringify({ _aoe_title: "Task" }),
+      args_preview: JSON.stringify({ _hmp_title: "Task" }),
       started_at: "2026-05-12T00:00:00Z",
     };
     const parentRow: ActivityRow = {

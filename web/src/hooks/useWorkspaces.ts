@@ -22,7 +22,7 @@ export function useWorkspaces(sessions: SessionResponse[]): Workspace[] {
     // Sessions with a non-null `branch` represent a worktree and collapse
     // into a single workspace row (one row per worktree). Sessions with a
     // null `branch` (no `--worktree`) each get their own workspace; without
-    // this split, multiple `aoe add <same-path>` sessions vanished behind
+    // this split, multiple `hmp add <same-path>` sessions vanished behind
     // `workspace.sessions[0]`. See #956.
     for (const session of sessions) {
       const repoPath = normalizePath(

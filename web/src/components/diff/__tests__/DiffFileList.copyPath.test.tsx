@@ -79,7 +79,7 @@ describe("DiffFileList copy relative path", () => {
   it("copies from a flat-list row too", () => {
     const writeText = stubClipboard();
     window.localStorage.setItem(
-      "aoe-web-settings",
+      "hmp-web-settings",
       JSON.stringify({ diffViewMode: "flat" }),
     );
     render(

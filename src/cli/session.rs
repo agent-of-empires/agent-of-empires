@@ -1,4 +1,4 @@
-//! `agent-of-empires session` subcommands implementation
+//! `hmp session` subcommands implementation
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
@@ -116,7 +116,7 @@ pub struct RestartArgs {
     pub identifier: Option<String>,
 
     /// Restart every session in the active profile. Useful after
-    /// `aoe update`, after editing `sandbox.environment`, after a
+    /// `hmp update`, after editing `sandbox.environment`, after a
     /// Docker hiccup, or after changing a hook. Mutually exclusive
     /// with `identifier`.
     #[arg(long, conflicts_with = "identifier")]
@@ -428,7 +428,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 /// Acp-mode sessions are not backed by tmux; their ACP worker is owned
-/// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
+/// by `hmp serve`'s supervisor (auto-spawned by the reconciler within ~2s
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
@@ -440,10 +440,10 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     if inst.is_structured() {
         bail!(
-            "structured view sessions are managed by `aoe serve`; \
-             cannot `aoe session {verb}` from the CLI.\n\
+            "structured view sessions are managed by `hmp serve`; \
+             cannot `hmp session {verb}` from the CLI.\n\
              The ACP worker is auto-spawned within ~2s of an structured-view session \
-             while serve is running, or on next `aoe serve` startup.\n\
+             while serve is running, or on next `hmp serve` startup.\n\
              To control an structured-view session, use the web dashboard or the REST API."
         );
     }
@@ -666,7 +666,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
 /// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
 /// would race the deletion/boot path. Acp-mode sessions are skipped
-/// because their lifecycle is owned by `aoe serve`'s supervisor, not
+/// because their lifecycle is owned by `hmp serve`'s supervisor, not
 /// tmux: a CLI-side restart would no-op silently and (with the explicit
 /// bail in `restart_session`) flood `--all` with per-session errors.
 /// Everything else is fair game; agents have their own resume-or-restart
@@ -818,7 +818,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     if !tmux_session.exists() {
         bail!(
-            "Session is not running. Start it first with: aoe session start {}",
+            "Session is not running. Start it first with: hmp session start {}",
             args.identifier
         );
     }
@@ -847,7 +847,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
                     tmux_name == session_name
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                    anyhow::anyhow!("Current tmux session is not an Hoxkss My Pi session")
                 })?
                 .clone()
         } else {
@@ -909,7 +909,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                     tmux_name == session_name
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                    anyhow::anyhow!("Current tmux session is not an Hoxkss My Pi session")
                 })?
         } else {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
@@ -998,7 +998,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                     tmux_name == session_name
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                    anyhow::anyhow!("Current tmux session is not an Hoxkss My Pi session")
                 })?
         } else {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
@@ -1080,7 +1080,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
                     tmux_name == session_name
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
+                    anyhow::anyhow!("Current tmux session is not an Hoxkss My Pi session")
                 })?
         } else {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
@@ -1184,7 +1184,7 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
         }
     }
 
-    bail!("Current tmux session is not an Agent of Empires session")
+    bail!("Current tmux session is not an Hoxkss My Pi session")
 }
 
 async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
@@ -1304,7 +1304,7 @@ mod restart_args_tests {
 
     #[test]
     fn restart_with_identifier_still_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "claude-3"])
+        let cli = Cli::try_parse_from(["hmp", "restart", "claude-3"])
             .expect("identifier-only must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
@@ -1318,7 +1318,7 @@ mod restart_args_tests {
 
     #[test]
     fn restart_all_alone_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all"]).expect("--all alone must parse");
+        let cli = Cli::try_parse_from(["hmp", "restart", "--all"]).expect("--all alone must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
                 assert!(args.all);
@@ -1331,7 +1331,7 @@ mod restart_args_tests {
 
     #[test]
     fn restart_all_with_parallel_parses() {
-        let cli = Cli::try_parse_from(["aoe", "restart", "--all", "--parallel", "5"])
+        let cli = Cli::try_parse_from(["hmp", "restart", "--all", "--parallel", "5"])
             .expect("--all --parallel must parse");
         match cli.cmd {
             SessionCommands::Restart(args) => {
@@ -1344,7 +1344,7 @@ mod restart_args_tests {
 
     #[test]
     fn restart_identifier_and_all_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "restart", "claude-3", "--all"]);
+        let result = Cli::try_parse_from(["hmp", "restart", "claude-3", "--all"]);
         assert!(
             result.is_err(),
             "passing both identifier and --all should error"
@@ -1353,7 +1353,7 @@ mod restart_args_tests {
 
     #[test]
     fn set_base_with_branch_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "upstream/main"])
+        let cli = Cli::try_parse_from(["hmp", "set-base", "claude-3", "upstream/main"])
             .expect("set-base with branch must parse");
         match cli.cmd {
             SessionCommands::SetBase(args) => {
@@ -1367,7 +1367,7 @@ mod restart_args_tests {
 
     #[test]
     fn set_base_with_clear_parses() {
-        let cli = Cli::try_parse_from(["aoe", "set-base", "claude-3", "--clear"])
+        let cli = Cli::try_parse_from(["hmp", "set-base", "claude-3", "--clear"])
             .expect("set-base --clear must parse");
         match cli.cmd {
             SessionCommands::SetBase(args) => {
@@ -1381,7 +1381,7 @@ mod restart_args_tests {
 
     #[test]
     fn set_base_branch_and_clear_conflicts() {
-        let result = Cli::try_parse_from(["aoe", "set-base", "claude-3", "main", "--clear"]);
+        let result = Cli::try_parse_from(["hmp", "set-base", "claude-3", "main", "--clear"]);
         assert!(
             result.is_err(),
             "passing both branch and --clear should error"

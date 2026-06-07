@@ -14,13 +14,13 @@ interface LinkRow {
 const LINKS: LinkRow[] = [
   {
     label: "Website",
-    href: "https://agent-of-empires.com",
-    display: "agent-of-empires.com",
+    href: "https://hmp.local",
+    display: "hmp.local",
   },
   {
     label: "GitHub",
-    href: "https://github.com/agent-of-empires/agent-of-empires",
-    display: "github.com/agent-of-empires/agent-of-empires",
+    href: "https://github.com/hoxkss/hmp",
+    display: "github.com/hoxkss/hmp",
   },
   {
     label: "Twitter",
@@ -50,7 +50,7 @@ function buildFeedbackUrl(version: string | null): string {
     body,
     labels: "web,feedback",
   });
-  return `https://github.com/agent-of-empires/agent-of-empires/issues/new?${params.toString()}`;
+  return `https://github.com/hoxkss/hmp/issues/new?${params.toString()}`;
 }
 
 export function AboutModal({ onClose }: Props) {
@@ -87,7 +87,7 @@ export function AboutModal({ onClose }: Props) {
               id="about-modal-title"
               className="text-sm font-semibold text-text-bright truncate"
             >
-              Agent of Empires
+              Hoxkss My Pi
             </h2>
             {version && (
               <span
@@ -110,8 +110,8 @@ export function AboutModal({ onClose }: Props) {
 
         <div className="p-5 space-y-4">
           <p className="text-sm text-text-secondary">
-            Terminal session manager for parallel AI coding agents. Open source,
-            cross-platform, sandboxed.
+            OMP-focused structured workspace with a web dashboard, tmux sessions,
+            and mobile access.
           </p>
 
           <div className="space-y-2">

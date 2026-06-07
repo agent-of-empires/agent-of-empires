@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState, type AcpState } from "../lib/acpTypes";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
 
-const KEY_PREFIX = "aoe:acp-state:v1:";
+const KEY_PREFIX = "hmp:acp-state:v1:";
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Reach into the module's internal helpers via a side-channel: cacheSet

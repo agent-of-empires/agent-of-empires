@@ -22,7 +22,7 @@ import {
   type SidebarSortMode,
 } from "../lib/sidebarSort";
 
-const COLLAPSED_KEY_PREFIX = "aoe-repo-collapsed-";
+const COLLAPSED_KEY_PREFIX = "hmp-repo-collapsed-";
 export const MULTI_REPO_GROUP_ID = "__multi_repo__";
 export const SCRATCH_GROUP_ID = "__scratch__";
 

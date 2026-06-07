@@ -2325,7 +2325,7 @@ impl HomeView {
         {
             self.info_dialog = Some(InfoDialog::new(
                 "Serve unavailable",
-                "This `aoe` binary was built without the `serve` feature, \
+                "This `hmp` binary was built without the `serve` feature, \
                  so the web dashboard, local network serving, and \
                  Cloudflare Tunnel integration are not included.\n\n\
                  To serve to your phone (LAN / Tailscale / tunnel):\n\
@@ -2373,13 +2373,13 @@ impl HomeView {
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {
-                            "Nix install: run `nix run github:agent-of-empires/agent-of-empires` to update".to_string()
+                            "Nix install: run `nix run github:hoxkss/hmp` to update".to_string()
                         }
                         InstallMethod::Cargo => {
-                            "Cargo install: run `cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe`".to_string()
+                            "Cargo install: run `cargo install --git https://github.com/hoxkss/hmp aoe`".to_string()
                         }
                         InstallMethod::Unknown { .. } => {
-                            "Unknown install method: run `aoe update` in a terminal for instructions".to_string()
+                            "Unknown install method: run `hmp update` in a terminal for instructions".to_string()
                         }
                         _ => unreachable!(),
                     };
@@ -2426,7 +2426,7 @@ impl HomeView {
         // add it here, still routed through the shared action dispatch.
         entries.push(PaletteCommand {
             id: bindings::palette_id(ActionId::Quit),
-            title: "Quit Agent of Empires".to_string(),
+            title: "Quit Hoxkss My Pi".to_string(),
             group: PaletteGroup::Settings,
             keywords: vec!["exit", "close"],
             hotkey: bindings::label(ActionId::Quit, self.strict_hotkeys),
@@ -3273,7 +3273,7 @@ impl HomeView {
     }
 
     /// Open the edit-workdir-name dialog for the selected session. Only
-    /// valid for an aoe-managed worktree session that is not running; other
+    /// valid for an hmp-managed worktree session that is not running; other
     /// cases surface an info dialog explaining why.
     pub(super) fn open_worktree_name_for_selected(&mut self) {
         let Some(id) = self.selected_session.clone() else {
@@ -3298,8 +3298,8 @@ impl HomeView {
         };
         if !wt.managed_by_aoe {
             self.info_dialog = Some(InfoDialog::new(
-                "Worktree Not Managed by AoE",
-                "This worktree was attached rather than created by AoE, so its workdir name cannot be edited.",
+                "Worktree Not Managed by HMP",
+                "This worktree was attached rather than created by HMP, so its workdir name cannot be edited.",
             ));
             return;
         }
@@ -3963,7 +3963,7 @@ impl HomeView {
 
     /// Returns `Some(reason)` if the live-send target has drifted out
     /// from under us between entry and now. Three drift modes:
-    /// - Instance row deleted (peer / web structured view / another aoe killed
+    /// - Instance row deleted (peer / web structured view / another hmp killed
     ///   it).
     /// - Title renamed (which regenerates the tmux session name; the
     ///   worker is now targeting a stale name).

@@ -893,7 +893,7 @@ describe("useTerminal lifecycle", () => {
     }
   });
 
-  it("re-reads --term-* CSS vars when aoe:theme-changed fires", async () => {
+  it("re-reads --term-* CSS vars when hmp:theme-changed fires", async () => {
     const div = document.createElement("div");
     document.body.appendChild(div);
     document.documentElement.style.setProperty("--term-bg", "#abc123");
@@ -911,7 +911,7 @@ describe("useTerminal lifecycle", () => {
       // Swap the CSS var, then fire the bus event.
       document.documentElement.style.setProperty("--term-bg", "#deadbe");
       act(() => {
-        window.dispatchEvent(new Event("aoe:theme-changed"));
+        window.dispatchEvent(new Event("hmp:theme-changed"));
       });
       await flushAsync();
       // The terminal's options.theme should now have the swapped bg.
@@ -1101,7 +1101,7 @@ describe("useTerminal lifecycle", () => {
     // re-reads settings via useWebSettings which is store-backed.
     try {
       localStorage.setItem(
-        "aoe-web-settings",
+        "hmp-web-settings",
         JSON.stringify({ mobileFontSize: 14, desktopFontSize: 22 }),
       );
       renderHook(() => {
@@ -1117,7 +1117,7 @@ describe("useTerminal lifecycle", () => {
       // The constructor read 22 from localStorage.
       expect(captured.options.fontSize).toBe(22);
     } finally {
-      localStorage.removeItem("aoe-web-settings");
+      localStorage.removeItem("hmp-web-settings");
       div.remove();
     }
   });

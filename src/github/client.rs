@@ -206,7 +206,7 @@ mod tests {
     fn config() -> GitHubClientConfig {
         GitHubClientConfig {
             api_base: "https://api.github.com".to_string(),
-            user_agent: "agent-of-empires-test".to_string(),
+            user_agent: "hmp-test".to_string(),
             timeout: Duration::from_secs(5),
         }
     }

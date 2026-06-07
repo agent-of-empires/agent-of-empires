@@ -1,7 +1,7 @@
 //! Single source of truth for the settings surface (#1692).
 //!
 //! Each configurable field is declared once on its `Config` sub-struct via
-//! `#[derive(SettingsSection)]` + `#[setting(...)]` (see the `aoe-settings-derive`
+//! `#[derive(SettingsSection)]` + `#[setting(...)]` (see the `hmp-settings-derive`
 //! crate). The derive emits a flat list of [`FieldDescriptor`]s. Every surface
 //! consumes that list instead of hand-wiring itself:
 //!

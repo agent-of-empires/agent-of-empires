@@ -1,6 +1,6 @@
 // The only module that imports react-joyride. Lazy-loaded by TourProvider the
 // first time a tour actually runs, so returning users (who have the
-// `aoe-tour-seen` flag set) never download the engine. Everything react-joyride
+// `hmp-tour-seen` flag set) never download the engine. Everything react-joyride
 // specific (the component, its event/action constants, theming) lives here;
 // TourProvider stays engine-agnostic and deals only in TourStep data. Swapping
 // the engine later means rewriting this file alone.

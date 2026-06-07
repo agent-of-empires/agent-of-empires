@@ -143,7 +143,7 @@ async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
 
     if entries.is_empty() {
         println!("No projects registered.");
-        println!("Add one with: aoe project add <path>");
+        println!("Add one with: hmp project add <path>");
         return Ok(());
     }
 

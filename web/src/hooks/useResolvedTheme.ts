@@ -11,7 +11,7 @@ import {
  *  theme. The hook listens for it and refetches /api/theme/current
  *  (or, if the event carries a `detail.name`, /api/themes/:name) so
  *  the dashboard repaints without a settings round-trip. */
-export const THEME_PICKER_CHANGED_EVENT = "aoe:theme-picker-changed";
+export const THEME_PICKER_CHANGED_EVENT = "hmp:theme-picker-changed";
 
 export interface ThemePickerChangedDetail {
   /** New theme name selected by the user. Optional: when omitted the

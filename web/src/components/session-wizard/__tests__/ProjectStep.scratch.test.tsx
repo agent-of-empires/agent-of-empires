@@ -10,7 +10,7 @@
 // Live Playwright (`wizard-scratch-*.spec.ts`) exercises the
 // end-to-end create flow; this file isolates the pure-render bits so
 // the bundle of branches under `data.scratch` does not depend on a
-// real `aoe serve`.
+// real `hmp serve`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, fireEvent } from "@testing-library/react";
@@ -134,7 +134,7 @@ describe("ProjectStep scratch toggle (#1324)", () => {
     expect(queryByRole("button", { name: "Clone URL" })).toBeNull();
     // The confirmation card replaces the picker.
     expect(
-      queryByText(/A fresh scratch directory under your AoE app data folder/),
+      queryByText(/A fresh scratch directory under your HMP app data folder/),
     ).toBeTruthy();
   });
 
@@ -173,7 +173,7 @@ describe("ProjectStep recents filter (#1324)", () => {
         }),
         mockSession({
           id: "s-scratch",
-          project_path: "/home/u/.agent-of-empires/scratch/aaa",
+          project_path: "/home/u/.hmp/scratch/aaa",
           scratch: true,
           last_accessed_at: "2025-09-03T00:00:00Z",
         }),

@@ -15,7 +15,7 @@ const SAFE_ENV_KEYS: &[&str] = &[
     "NO_COLOR",
     "GIT_CONFIG_GLOBAL",
     "CLAUDE_CONFIG_DIR",
-    "AOE_INSTANCE_ID",
+    "HMP_INSTANCE_ID",
 ];
 
 /// Redact secret values from a command string for safe logging.
@@ -450,7 +450,7 @@ pub(crate) fn collect_environment(
 
     // Git's safe-directory check fails when the container user (root) does not
     // match the file owner (host UID 1000, shown as "ubuntu" inside the
-    // aoe-dev-sandbox image). Bind-mounted repos trigger:
+    // hmp-dev-sandbox image). Bind-mounted repos trigger:
     //   fatal: detected dubious ownership in repository at '...'
     // We inject safe.directory=* via Git's env-var config API (Git 2.31+),
     // which overrides the check without modifying any files.
@@ -802,17 +802,17 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_host_environment_prefix_dollar_var_reads_host_env() {
-        std::env::set_var("AOE_TEST_HOST_ENV_PREFIX", "from-host");
-        let prefix = host_environment_prefix(&["FORWARDED=$AOE_TEST_HOST_ENV_PREFIX".to_string()]);
-        std::env::remove_var("AOE_TEST_HOST_ENV_PREFIX");
+        std::env::set_var("HMP_TEST_HOST_ENV_PREFIX", "from-host");
+        let prefix = host_environment_prefix(&["FORWARDED=$HMP_TEST_HOST_ENV_PREFIX".to_string()]);
+        std::env::remove_var("HMP_TEST_HOST_ENV_PREFIX");
         assert_eq!(prefix, "FORWARDED='from-host' ");
     }
 
     #[test]
     fn test_host_environment_prefix_dollar_var_missing_is_skipped() {
-        std::env::remove_var("AOE_TEST_DEFINITELY_NOT_SET");
+        std::env::remove_var("HMP_TEST_DEFINITELY_NOT_SET");
         let prefix = host_environment_prefix(&[
-            "MISSING=$AOE_TEST_DEFINITELY_NOT_SET".to_string(),
+            "MISSING=$HMP_TEST_DEFINITELY_NOT_SET".to_string(),
             "PRESENT=ok".to_string(),
         ]);
         assert_eq!(prefix, "PRESENT='ok' ");
@@ -820,10 +820,10 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_host_environment_prefix_bare_key_passthrough() {
-        std::env::set_var("AOE_TEST_BARE_PASSTHROUGH", "v");
-        let prefix = host_environment_prefix(&["AOE_TEST_BARE_PASSTHROUGH".to_string()]);
-        std::env::remove_var("AOE_TEST_BARE_PASSTHROUGH");
-        assert_eq!(prefix, "AOE_TEST_BARE_PASSTHROUGH='v' ");
+        std::env::set_var("HMP_TEST_BARE_PASSTHROUGH", "v");
+        let prefix = host_environment_prefix(&["HMP_TEST_BARE_PASSTHROUGH".to_string()]);
+        std::env::remove_var("HMP_TEST_BARE_PASSTHROUGH");
+        assert_eq!(prefix, "HMP_TEST_BARE_PASSTHROUGH='v' ");
     }
 
     #[test]
@@ -835,11 +835,11 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_resolve_host_environment_value_uses_last_resolved_entry() {
-        std::env::remove_var("AOE_TEST_MISSING_HOST_ENV_VALUE");
+        std::env::remove_var("HMP_TEST_MISSING_HOST_ENV_VALUE");
         let entries = vec![
             "CODEX_HOME=/first".to_string(),
             "OTHER=value".to_string(),
-            "CODEX_HOME=$AOE_TEST_MISSING_HOST_ENV_VALUE".to_string(),
+            "CODEX_HOME=$HMP_TEST_MISSING_HOST_ENV_VALUE".to_string(),
             "CODEX_HOME=/second".to_string(),
         ];
 
@@ -851,15 +851,15 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_resolve_host_environment_value_matches_host_env_grammar() {
-        std::env::set_var("AOE_TEST_CODEX_HOME_REF", "/from-host");
-        let entries = vec!["CODEX_HOME=$AOE_TEST_CODEX_HOME_REF".to_string()];
+        std::env::set_var("HMP_TEST_CODEX_HOME_REF", "/from-host");
+        let entries = vec!["CODEX_HOME=$HMP_TEST_CODEX_HOME_REF".to_string()];
 
         assert_eq!(
             resolve_host_environment_value(&entries, "CODEX_HOME"),
             Some("/from-host".to_string())
         );
 
-        std::env::remove_var("AOE_TEST_CODEX_HOME_REF");
+        std::env::remove_var("HMP_TEST_CODEX_HOME_REF");
     }
 
     /// Helper to find an entry by key and check its value
@@ -869,9 +869,9 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_collect_environment_passthrough() {
-        std::env::set_var("AOE_TEST_ENV_PT", "test_value");
+        std::env::set_var("HMP_TEST_ENV_PT", "test_value");
         let config = SandboxConfig {
-            environment: vec!["AOE_TEST_ENV_PT".to_string()],
+            environment: vec!["HMP_TEST_ENV_PT".to_string()],
             ..Default::default()
         };
         let info = SandboxInfo {
@@ -884,10 +884,10 @@ environment = ["GH_TOKEN=write_token"]
         };
 
         let result = collect_environment(&config, &info);
-        let entry = find_entry(&result, "AOE_TEST_ENV_PT").expect("AOE_TEST_ENV_PT not found");
+        let entry = find_entry(&result, "HMP_TEST_ENV_PT").expect("HMP_TEST_ENV_PT not found");
         assert_eq!(entry.value(), "test_value");
         assert!(matches!(entry, EnvEntry::Inherit { .. }));
-        std::env::remove_var("AOE_TEST_ENV_PT");
+        std::env::remove_var("HMP_TEST_ENV_PT");
     }
 
     #[test]
@@ -977,25 +977,25 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_collect_environment_extra_env() {
-        std::env::set_var("AOE_TEST_EXTRA", "extra_val");
+        std::env::set_var("HMP_TEST_EXTRA", "extra_val");
         let config = SandboxConfig::default();
         let info = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            extra_env: Some(vec!["AOE_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
+            extra_env: Some(vec!["HMP_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
             custom_instruction: None,
         };
 
         let result = collect_environment(&config, &info);
-        let extra = find_entry(&result, "AOE_TEST_EXTRA").expect("AOE_TEST_EXTRA not found");
+        let extra = find_entry(&result, "HMP_TEST_EXTRA").expect("HMP_TEST_EXTRA not found");
         assert_eq!(extra.value(), "extra_val");
         assert!(matches!(extra, EnvEntry::Inherit { .. }));
         let foo = find_entry(&result, "FOO").expect("FOO not found");
         assert_eq!(foo.value(), "bar");
         assert!(matches!(foo, EnvEntry::Literal { .. }));
-        std::env::remove_var("AOE_TEST_EXTRA");
+        std::env::remove_var("HMP_TEST_EXTRA");
     }
 
     #[test]
@@ -1041,9 +1041,9 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_collect_environment_dollar_ref() {
-        std::env::set_var("AOE_TEST_HOST_REF", "host_val");
+        std::env::set_var("HMP_TEST_HOST_REF", "host_val");
         let config = SandboxConfig {
-            environment: vec!["INJECTED=$AOE_TEST_HOST_REF".to_string()],
+            environment: vec!["INJECTED=$HMP_TEST_HOST_REF".to_string()],
             ..Default::default()
         };
         let info = SandboxInfo {
@@ -1059,7 +1059,7 @@ environment = ["GH_TOKEN=write_token"]
         let entry = find_entry(&result, "INJECTED").expect("INJECTED not found");
         assert_eq!(entry.value(), "host_val");
         assert!(matches!(entry, EnvEntry::Inherit { .. }));
-        std::env::remove_var("AOE_TEST_HOST_REF");
+        std::env::remove_var("HMP_TEST_HOST_REF");
     }
 
     #[test]
@@ -1085,32 +1085,32 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_validate_env_entry_bare_key_present() {
-        std::env::set_var("AOE_TEST_VALIDATE_BARE", "exists");
-        assert_eq!(validate_env_entry("AOE_TEST_VALIDATE_BARE"), None);
-        std::env::remove_var("AOE_TEST_VALIDATE_BARE");
+        std::env::set_var("HMP_TEST_VALIDATE_BARE", "exists");
+        assert_eq!(validate_env_entry("HMP_TEST_VALIDATE_BARE"), None);
+        std::env::remove_var("HMP_TEST_VALIDATE_BARE");
     }
 
     #[test]
     fn test_validate_env_entry_bare_key_missing() {
-        std::env::remove_var("AOE_TEST_VALIDATE_MISSING_BARE");
-        let result = validate_env_entry("AOE_TEST_VALIDATE_MISSING_BARE");
+        std::env::remove_var("HMP_TEST_VALIDATE_MISSING_BARE");
+        let result = validate_env_entry("HMP_TEST_VALIDATE_MISSING_BARE");
         assert!(result.is_some());
-        assert!(result.unwrap().contains("AOE_TEST_VALIDATE_MISSING_BARE"));
+        assert!(result.unwrap().contains("HMP_TEST_VALIDATE_MISSING_BARE"));
     }
 
     #[test]
     fn test_validate_env_entry_key_dollar_var_present() {
-        std::env::set_var("AOE_TEST_VALIDATE_REF", "value");
-        assert_eq!(validate_env_entry("MY_KEY=$AOE_TEST_VALIDATE_REF"), None);
-        std::env::remove_var("AOE_TEST_VALIDATE_REF");
+        std::env::set_var("HMP_TEST_VALIDATE_REF", "value");
+        assert_eq!(validate_env_entry("MY_KEY=$HMP_TEST_VALIDATE_REF"), None);
+        std::env::remove_var("HMP_TEST_VALIDATE_REF");
     }
 
     #[test]
     fn test_validate_env_entry_key_dollar_var_missing() {
-        std::env::remove_var("AOE_TEST_VALIDATE_MISSING_REF");
-        let result = validate_env_entry("MY_KEY=$AOE_TEST_VALIDATE_MISSING_REF");
+        std::env::remove_var("HMP_TEST_VALIDATE_MISSING_REF");
+        let result = validate_env_entry("MY_KEY=$HMP_TEST_VALIDATE_MISSING_REF");
         assert!(result.is_some());
-        assert!(result.unwrap().contains("AOE_TEST_VALIDATE_MISSING_REF"));
+        assert!(result.unwrap().contains("HMP_TEST_VALIDATE_MISSING_REF"));
     }
 
     #[test]
@@ -1126,14 +1126,14 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     fn test_validate_env_entries_returns_one_warning_per_missing_var() {
         // Use unique names to avoid collisions with other tests' env state.
-        std::env::remove_var("AOE_TEST_BATCH_MISSING_A");
-        std::env::remove_var("AOE_TEST_BATCH_MISSING_B");
-        std::env::set_var("AOE_TEST_BATCH_PRESENT", "ok");
+        std::env::remove_var("HMP_TEST_BATCH_MISSING_A");
+        std::env::remove_var("HMP_TEST_BATCH_MISSING_B");
+        std::env::set_var("HMP_TEST_BATCH_PRESENT", "ok");
 
         let entries = vec![
-            "GH_TOKEN=$AOE_TEST_BATCH_MISSING_A".to_string(),
-            "OK=$AOE_TEST_BATCH_PRESENT".to_string(),
-            "ALSO_BROKEN=$AOE_TEST_BATCH_MISSING_B".to_string(),
+            "GH_TOKEN=$HMP_TEST_BATCH_MISSING_A".to_string(),
+            "OK=$HMP_TEST_BATCH_PRESENT".to_string(),
+            "ALSO_BROKEN=$HMP_TEST_BATCH_MISSING_B".to_string(),
             "LITERAL=fine".to_string(),
         ];
         let warnings = validate_env_entries(&entries);
@@ -1145,12 +1145,12 @@ environment = ["GH_TOKEN=write_token"]
         );
         assert!(warnings
             .iter()
-            .any(|w| w.contains("AOE_TEST_BATCH_MISSING_A")));
+            .any(|w| w.contains("HMP_TEST_BATCH_MISSING_A")));
         assert!(warnings
             .iter()
-            .any(|w| w.contains("AOE_TEST_BATCH_MISSING_B")));
+            .any(|w| w.contains("HMP_TEST_BATCH_MISSING_B")));
 
-        std::env::remove_var("AOE_TEST_BATCH_PRESENT");
+        std::env::remove_var("HMP_TEST_BATCH_PRESENT");
     }
 
     #[test]
@@ -1197,20 +1197,20 @@ environment = ["GH_TOKEN=write_token"]
     fn test_build_docker_env_args_inherit_uses_key_only_in_args() {
         // Inherited (secret) env vars must NOT have values in docker_args.
         // Values are in exports for injection via tmux send-keys.
-        std::env::set_var("AOE_TEST_TOKEN", "secret123");
+        std::env::set_var("HMP_TEST_TOKEN", "secret123");
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            extra_env: Some(vec!["AOE_TEST_TOKEN=$AOE_TEST_TOKEN".to_string()]),
+            extra_env: Some(vec!["HMP_TEST_TOKEN=$HMP_TEST_TOKEN".to_string()]),
             custom_instruction: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // docker_args should have the key but NOT the secret value
         assert!(
-            result.docker_args.contains("-e AOE_TEST_TOKEN"),
-            "Expected -e AOE_TEST_TOKEN in docker_args: {}",
+            result.docker_args.contains("-e HMP_TEST_TOKEN"),
+            "Expected -e HMP_TEST_TOKEN in docker_args: {}",
             result.docker_args
         );
         assert!(
@@ -1223,22 +1223,22 @@ environment = ["GH_TOKEN=write_token"]
             result
                 .exports
                 .iter()
-                .any(|e| e.contains("AOE_TEST_TOKEN") && e.contains("secret123")),
+                .any(|e| e.contains("HMP_TEST_TOKEN") && e.contains("secret123")),
             "Expected export with secret value in exports: {:?}",
             result.exports
         );
-        std::env::remove_var("AOE_TEST_TOKEN");
+        std::env::remove_var("HMP_TEST_TOKEN");
     }
 
     #[test]
     fn test_build_docker_env_args_inherit_with_different_key() {
-        std::env::set_var("AOE_TEST_SOURCE", "secret456");
+        std::env::set_var("HMP_TEST_SOURCE", "secret456");
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            extra_env: Some(vec!["MY_MAPPED=$AOE_TEST_SOURCE".to_string()]),
+            extra_env: Some(vec!["MY_MAPPED=$HMP_TEST_SOURCE".to_string()]),
             custom_instruction: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -1260,26 +1260,26 @@ environment = ["GH_TOKEN=write_token"]
             "Expected export with value in exports: {:?}",
             result.exports
         );
-        std::env::remove_var("AOE_TEST_SOURCE");
+        std::env::remove_var("HMP_TEST_SOURCE");
     }
 
     #[test]
     fn test_build_docker_env_args_bare_key_uses_export() {
         // Bare keys (pass-through from host) are Inherit entries,
         // so they must use exports, not inline values.
-        std::env::set_var("AOE_TEST_BARE", "barevalue");
+        std::env::set_var("HMP_TEST_BARE", "barevalue");
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            extra_env: Some(vec!["AOE_TEST_BARE".to_string()]),
+            extra_env: Some(vec!["HMP_TEST_BARE".to_string()]),
             custom_instruction: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
-            result.docker_args.contains("-e AOE_TEST_BARE"),
-            "Expected -e AOE_TEST_BARE in docker_args: {}",
+            result.docker_args.contains("-e HMP_TEST_BARE"),
+            "Expected -e HMP_TEST_BARE in docker_args: {}",
             result.docker_args
         );
         assert!(
@@ -1291,11 +1291,11 @@ environment = ["GH_TOKEN=write_token"]
             result
                 .exports
                 .iter()
-                .any(|e| e.contains("AOE_TEST_BARE") && e.contains("barevalue")),
+                .any(|e| e.contains("HMP_TEST_BARE") && e.contains("barevalue")),
             "Expected export with value: {:?}",
             result.exports
         );
-        std::env::remove_var("AOE_TEST_BARE");
+        std::env::remove_var("HMP_TEST_BARE");
     }
 
     #[test]
@@ -1331,30 +1331,30 @@ environment = ["GH_TOKEN=write_token"]
 
     #[test]
     fn test_build_docker_env_args_mixed_inherit_and_literal() {
-        std::env::set_var("AOE_TEST_SECRET", "mysecret");
+        std::env::set_var("HMP_TEST_SECRET", "mysecret");
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
             extra_env: Some(vec![
-                "AOE_TEST_SECRET=$AOE_TEST_SECRET".to_string(),
+                "HMP_TEST_SECRET=$HMP_TEST_SECRET".to_string(),
                 "MY_LITERAL=public_val".to_string(),
             ]),
             custom_instruction: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // Secret: key only in docker_args, value in exports
-        assert!(result.docker_args.contains("-e AOE_TEST_SECRET"));
+        assert!(result.docker_args.contains("-e HMP_TEST_SECRET"));
         assert!(!result.docker_args.contains("mysecret"));
         assert!(result
             .exports
             .iter()
-            .any(|e| e.contains("AOE_TEST_SECRET") && e.contains("mysecret")));
+            .any(|e| e.contains("HMP_TEST_SECRET") && e.contains("mysecret")));
         // Literal: key=value in docker_args, no export
         assert!(result.docker_args.contains("MY_LITERAL='public_val'"));
         assert!(!result.exports.iter().any(|e| e.contains("MY_LITERAL")));
-        std::env::remove_var("AOE_TEST_SECRET");
+        std::env::remove_var("HMP_TEST_SECRET");
     }
 
     #[test]

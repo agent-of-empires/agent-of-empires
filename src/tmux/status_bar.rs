@@ -1,4 +1,4 @@
-//! tmux status bar configuration for aoe sessions
+//! tmux status bar configuration for hmp sessions
 
 use anyhow::Result;
 use ratatui::style::Color;
@@ -19,9 +19,9 @@ fn color_to_tmux(color: Color) -> String {
     }
 }
 
-/// Apply aoe-styled status bar configuration to a tmux session.
+/// Apply hmp-styled status bar configuration to a tmux session.
 ///
-/// Sets tmux user options (@aoe_title, @aoe_branch, @aoe_sandbox) and configures
+/// Sets tmux user options (@hmp_title, @hmp_branch, @hmp_sandbox) and configures
 /// the status-right to display session information using theme colors.
 pub fn apply_status_bar(
     session_name: &str,
@@ -31,16 +31,16 @@ pub fn apply_status_bar(
     theme: &Theme,
 ) -> Result<()> {
     // Set the session title as a tmux user option
-    set_session_option(session_name, "@aoe_title", title)?;
+    set_session_option(session_name, "@hmp_title", title)?;
 
     // Set branch if provided (for worktree sessions)
     if let Some(branch_name) = branch {
-        set_session_option(session_name, "@aoe_branch", branch_name)?;
+        set_session_option(session_name, "@hmp_branch", branch_name)?;
     }
 
     // Set sandbox info if running in docker container
     if let Some(sandbox_info) = sandbox {
-        set_session_option(session_name, "@aoe_sandbox", &sandbox_info.container_name)?;
+        set_session_option(session_name, "@hmp_sandbox", &sandbox_info.container_name)?;
     }
 
     let accent = color_to_tmux(theme.accent);
@@ -50,12 +50,12 @@ pub fn apply_status_bar(
     let sandbox_color = color_to_tmux(theme.sandbox);
     let hint = color_to_tmux(theme.dimmed);
 
-    // Format: "aoe: Title | branch | [container] | 14:30"
+    // Format: "hmp: Title | branch | [container] | 14:30"
     let status_format = format!(
         " #[fg={accent},bold]aoe#[fg={fg},nobold]: \
-         #{{@aoe_title}}\
-         #{{?#{{@aoe_branch}}, #[fg={branch_color}]| #{{@aoe_branch}}#[fg={fg}],}}\
-         #{{?#{{@aoe_sandbox}}, #[fg={sandbox_color}]\u{2b21} #{{@aoe_sandbox}}#[fg={fg}],}}\
+         #{{@hmp_title}}\
+         #{{?#{{@hmp_branch}}, #[fg={branch_color}]| #{{@hmp_branch}}#[fg={fg}],}}\
+         #{{?#{{@hmp_sandbox}}, #[fg={sandbox_color}]\u{2b21} #{{@hmp_sandbox}}#[fg={fg}],}}\
           | %H:%M ",
     );
 
@@ -145,15 +145,15 @@ pub struct SessionInfo {
 pub fn get_session_info_for_current() -> Option<SessionInfo> {
     let session_name = crate::tmux::get_current_session_name()?;
 
-    // Check if this is an aoe session
+    // Check if this is an hmp session
     if !session_name.starts_with(crate::tmux::SESSION_PREFIX) {
         return None;
     }
 
-    // Try to get the aoe title from tmux user option
-    let title = get_session_option(&session_name, "@aoe_title").unwrap_or_else(|| {
+    // Try to get the hmp title from tmux user option
+    let title = get_session_option(&session_name, "@hmp_title").unwrap_or_else(|| {
         // Fallback: extract title from session name
-        // Session names are: aoe_<title>_<id>
+        // Session names are: hmp_<title>_<id>
         let name_without_prefix = session_name
             .strip_prefix(crate::tmux::SESSION_PREFIX)
             .unwrap_or(&session_name);
@@ -164,8 +164,8 @@ pub fn get_session_info_for_current() -> Option<SessionInfo> {
         }
     });
 
-    let branch = get_session_option(&session_name, "@aoe_branch");
-    let sandbox = get_session_option(&session_name, "@aoe_sandbox");
+    let branch = get_session_option(&session_name, "@hmp_branch");
+    let sandbox = get_session_option(&session_name, "@hmp_sandbox");
 
     Some(SessionInfo {
         title,
@@ -175,11 +175,11 @@ pub fn get_session_info_for_current() -> Option<SessionInfo> {
 }
 
 /// Get formatted status string for the current tmux session.
-/// Returns a plain text string like "aoe: Title | branch | [container]"
+/// Returns a plain text string like "hmp: Title | branch | [container]"
 pub fn get_status_for_current_session() -> Option<String> {
     let info = get_session_info_for_current()?;
 
-    let mut result = format!("aoe: {}", info.title);
+    let mut result = format!("hmp: {}", info.title);
 
     if let Some(b) = &info.branch {
         result.push_str(" | ");

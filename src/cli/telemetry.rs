@@ -48,11 +48,11 @@ fn run_status() -> Result<()> {
         println!("Telemetry: disabled (default)");
     }
 
-    let overridden = std::env::var("AOE_TELEMETRY_ENDPOINT")
+    let overridden = std::env::var("HMP_TELEMETRY_ENDPOINT")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     if overridden {
-        println!("  endpoint: {endpoint}  (overridden via AOE_TELEMETRY_ENDPOINT)");
+        println!("  endpoint: {endpoint}  (overridden via HMP_TELEMETRY_ENDPOINT)");
     } else {
         println!("  endpoint: {endpoint}  (default)");
     }

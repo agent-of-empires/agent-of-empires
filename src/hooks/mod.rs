@@ -1,6 +1,6 @@
 //! Agent hook management for status detection.
 //!
-//! AoE installs hooks into an agent's settings file that write session
+//! HMP installs hooks into an agent's settings file that write session
 //! status (`running`/`waiting`/`idle`) to a sidecar file. This provides a
 //! hook-first status source; agent-specific code may still reconcile known
 //! hook gaps from tmux pane content.
@@ -20,18 +20,18 @@ pub use status_file::{
     read_hook_urgent,
 };
 
-/// Base directory for all AoE hook status files.
-pub(crate) const HOOK_STATUS_BASE: &str = "/tmp/aoe-hooks";
+/// Base directory for all HMP hook status files.
+pub(crate) const HOOK_STATUS_BASE: &str = "/tmp/hmp-hooks";
 
-/// Marker substring used to identify AoE-managed hooks in settings.json.
+/// Marker substring used to identify HMP-managed hooks in settings.json.
 /// Any hook command containing this string is considered ours.
-const AOE_HOOK_MARKER: &str = "aoe-hooks";
+const HMP_HOOK_MARKER: &str = "hmp-hooks";
 
 /// Where an agent's settings file lives. Determines which shell command
 /// `hook_command_session_id` emits.
 ///
 /// `Host`: emits a call to the `aoe __extract-session-id` Rust subcommand.
-/// `Sandbox`: emits a POSIX shell pipeline because `aoe` is not installed
+/// `Sandbox`: emits a POSIX shell pipeline because `hmp` is not installed
 /// inside the sandbox image. The pipeline keeps a known schema-ordering
 /// quirk: a textually-earlier nested `session_id` wins over the top-level
 /// one, accepted because Claude does not emit such payloads.
@@ -91,7 +91,7 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
 /// Build the shell command for a hook that writes a status value.
 ///
 /// The command must never exit non-zero, otherwise the agent treats the hook
-/// as a blocking failure and refuses to run further tool calls. `/tmp/aoe-hooks/<id>`
+/// as a blocking failure and refuses to run further tool calls. `/tmp/hmp-hooks/<id>`
 /// can disappear mid-session (OS /tmp cleanup, transient FS hiccup, external
 /// tooling), so both mkdir and printf must tolerate a missing parent dir. We
 /// swallow stderr and force a final `exit 0`: at worst the status file is one
@@ -105,10 +105,10 @@ fn hook_command_with_base(status: &str, base: &str) -> String {
     // string. `exit 0` on rejection: a non-zero hook exit blocks the
     // agent's tool calls.
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
-         mkdir -p \"{base}/$AOE_INSTANCE_ID\" 2>/dev/null; \
-         printf {status} > \"{base}/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
+        "sh -c '[ -n \"$HMP_INSTANCE_ID\" ] || exit 0; \
+         case \"$HMP_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+         mkdir -p \"{base}/$HMP_INSTANCE_ID\" 2>/dev/null; \
+         printf {status} > \"{base}/$HMP_INSTANCE_ID/status\" 2>/dev/null; \
          exit 0'"
     )
 }
@@ -117,14 +117,14 @@ fn hook_command_with_base(status: &str, base: &str) -> String {
 /// agent's stdin JSON payload and writes it to a sidecar file.
 ///
 /// Both variants must exit 0 even on failure: a non-zero hook blocks the
-/// agent's tool calls. The trailing `# AOE_HOOK_MARKER` on the host
-/// variant is load-bearing: `is_aoe_hook_command` recognises AoE hooks by
+/// agent's tool calls. The trailing `# HMP_HOOK_MARKER` on the host
+/// variant is load-bearing: `is_hmp_hook_command` recognises HMP hooks by
 /// substring; the sandbox variant gets the marker via its baked-in
 /// `HOOK_STATUS_BASE` path.
 ///
 /// Host-variant silent-failure modes (acceptable, equivalent to a regex
-/// miss in the sandbox variant): `aoe` not on PATH at hook-exec time, or
-/// a stale `aoe` on PATH that predates `__extract-session-id`. Both yield
+/// miss in the sandbox variant): `hmp` not on PATH at hook-exec time, or
+/// a stale `hmp` on PATH that predates `__extract-session-id`. Both yield
 /// no sidecar without surfacing an error; session resume falls back to
 /// the filesystem scan.
 fn hook_command_session_id(target: HookInstallTarget) -> String {
@@ -136,28 +136,28 @@ fn hook_command_session_id(target: HookInstallTarget) -> String {
 
 fn hook_command_session_id_host() -> String {
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         command -v aoe >/dev/null 2>&1 || exit 0; \
-         aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+        "sh -c '[ -n \"$HMP_INSTANCE_ID\" ] || exit 0; \
+         command -v hmp >/dev/null 2>&1 || exit 0; \
+         hmp __extract-session-id 2>/dev/null; exit 0 # {HMP_HOOK_MARKER}'"
     )
 }
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
-         D=\"{base}/$AOE_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
+        "sh -c '[ -n \"$HMP_INSTANCE_ID\" ] || exit 0; \
+         case \"$HMP_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
+         D=\"{base}/$HMP_INSTANCE_ID\"; mkdir -p \"$D\" 2>/dev/null; \
          SID=$(tr -d \"\\n\" | grep -oE \"[{{,][[:space:]]*\\\"session_id\\\"[[:space:]]*:[[:space:]]*\\\"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\\\"\" | head -1 | grep -oE \"[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}\"); \
          [ -n \"$SID\" ] && printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0'"
     )
 }
 
-fn is_aoe_hook_command(cmd: &str) -> bool {
-    cmd.contains(AOE_HOOK_MARKER)
+fn is_hmp_hook_command(cmd: &str) -> bool {
+    cmd.contains(HMP_HOOK_MARKER)
 }
 
-/// Build the AoE hooks JSON structure from agent-defined events.
+/// Build the HMP hooks JSON structure from agent-defined events.
 ///
 /// For each event, emit one entry per active behaviour:
 /// - `event.session_id_capture` → session-id-extractor command (placed
@@ -168,7 +168,7 @@ fn is_aoe_hook_command(cmd: &str) -> bool {
 ///
 /// An event with both produces two `hooks` array entries under the same
 /// matcher block. An event with neither is skipped.
-fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
+fn build_hmp_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
     let mut hooks_obj = serde_json::Map::new();
     for event in events {
         let mut commands: Vec<String> = Vec::new();
@@ -205,25 +205,25 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
     Value::Object(hooks_obj)
 }
 
-/// Remove any existing AoE hooks from an event's matcher array.
-fn remove_aoe_entries(matchers: &mut Vec<Value>) {
+/// Remove any existing HMP hooks from an event's matcher array.
+fn remove_hmp_entries(matchers: &mut Vec<Value>) {
     matchers.retain(|matcher| {
         let Some(hooks_arr) = matcher.get("hooks").and_then(|h| h.as_array()) else {
             return true;
         };
-        // Keep the matcher group only if it has at least one non-AoE hook
+        // Keep the matcher group only if it has at least one non-HMP hook
         !hooks_arr.iter().all(|hook| {
             hook.get("command")
                 .and_then(|c| c.as_str())
-                .is_some_and(is_aoe_hook_command)
+                .is_some_and(is_hmp_hook_command)
         })
     });
 }
 
-/// Install AoE status hooks into an agent's `settings.json` file.
+/// Install HMP status hooks into an agent's `settings.json` file.
 ///
-/// Merges AoE hook entries into the existing hooks configuration, preserving
-/// any user-defined hooks. Existing AoE hooks are replaced (idempotent).
+/// Merges HMP hook entries into the existing hooks configuration, preserving
+/// any user-defined hooks. Existing HMP hooks are replaced (idempotent).
 ///
 /// If the file doesn't exist, it will be created with just the hooks.
 pub fn install_hooks(
@@ -241,7 +241,7 @@ pub fn install_hooks(
         serde_json::json!({})
     };
 
-    let aoe_hooks = build_aoe_hooks(events, target);
+    let hmp_hooks = build_hmp_hooks(events, target);
 
     if !settings.get("hooks").is_some_and(|h| h.is_object()) {
         settings
@@ -255,20 +255,20 @@ pub fn install_hooks(
         .and_then(|h| h.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
 
-    let aoe_hooks_obj = aoe_hooks
+    let hmp_hooks_obj = hmp_hooks
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Internal error: built hooks is not a JSON object"))?;
-    for (event_name, aoe_matchers) in aoe_hooks_obj {
+    for (event_name, hmp_matchers) in hmp_hooks_obj {
         if let Some(existing) = settings_hooks.get_mut(event_name) {
             if let Some(arr) = existing.as_array_mut() {
-                // Remove old AoE entries, then append new ones
-                remove_aoe_entries(arr);
-                if let Some(new_arr) = aoe_matchers.as_array() {
+                // Remove old HMP entries, then append new ones
+                remove_hmp_entries(arr);
+                if let Some(new_arr) = hmp_matchers.as_array() {
                     arr.extend(new_arr.iter().cloned());
                 }
             }
         } else {
-            settings_hooks.insert(event_name.clone(), aoe_matchers.clone());
+            settings_hooks.insert(event_name.clone(), hmp_matchers.clone());
         }
     }
 
@@ -278,7 +278,7 @@ pub fn install_hooks(
     let formatted = serde_json::to_string_pretty(&settings)?;
     std::fs::write(settings_path, formatted)?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", settings_path.display());
+    tracing::info!(target: "hooks.install", "Installed HMP hooks in {}", settings_path.display());
     Ok(())
 }
 
@@ -293,9 +293,9 @@ const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "PostCompact",
 ];
 
-/// Install AoE status hooks into Codex's `config.toml`.
+/// Install HMP status hooks into Codex's `config.toml`.
 ///
-/// Codex also stores hook trust state in this file. Keep every AoE mutation
+/// Codex also stores hook trust state in this file. Keep every HMP mutation
 /// behind the lock and atomic replace below so repeated launches cannot leave
 /// duplicated hook blocks or torn TOML.
 pub fn install_codex_hooks(config_path: &Path, events: &[crate::agents::HookEvent]) -> Result<()> {
@@ -334,13 +334,13 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
                 hooks.insert("state", state);
             }
         }
-        remove_codex_aoe_hooks(&mut config)?;
+        remove_codex_hmp_hooks(&mut config)?;
         merge_codex_hooks(&mut config, events)?;
         write_codex_config(config_path, &config)?;
         Ok(())
     })?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
+    tracing::info!(target: "hooks.install", "Installed HMP hooks in {}", config_path.display());
     Ok(())
 }
 
@@ -529,7 +529,7 @@ fn codex_matcher_group(event: &crate::agents::HookEvent, status: &str) -> toml_e
     group
 }
 
-fn remove_codex_aoe_hooks(config: &mut toml_edit::DocumentMut) -> Result<bool> {
+fn remove_codex_hmp_hooks(config: &mut toml_edit::DocumentMut) -> Result<bool> {
     let Some(hooks_item) = config.as_table_mut().get_mut("hooks") else {
         return Ok(false);
     };
@@ -586,7 +586,7 @@ fn codex_matcher_group_is_all_aoe(group: &toml_edit::Table) -> bool {
         return !handlers.is_empty()
             && handlers
                 .iter()
-                .all(|handler| codex_toml_table_command(handler).is_some_and(is_aoe_hook_command));
+                .all(|handler| codex_toml_table_command(handler).is_some_and(is_hmp_hook_command));
     }
 
     if let Some(handlers) = hooks_item.as_array() {
@@ -614,7 +614,7 @@ fn codex_inline_hook_handler_is_aoe(handler: &toml_edit::Value) -> bool {
     handler
         .as_inline_table()
         .and_then(|handler| codex_toml_table_command(handler))
-        .is_some_and(is_aoe_hook_command)
+        .is_some_and(is_hmp_hook_command)
 }
 
 fn codex_toml_table_command(table: &dyn toml_edit::TableLike) -> Option<&str> {
@@ -635,7 +635,7 @@ fn codex_hooks_feature_is_disabled(config: &toml_edit::DocumentMut, config_path:
 
     if disabled {
         tracing::warn!(target: "hooks.install",
-            "Codex hooks are explicitly disabled in {}; skipping AoE status hooks",
+            "Codex hooks are explicitly disabled in {}; skipping HMP status hooks",
             config_path.display()
         );
     }
@@ -643,7 +643,7 @@ fn codex_hooks_feature_is_disabled(config: &toml_edit::DocumentMut, config_path:
     disabled
 }
 
-/// Remove AoE status hooks from Codex's `config.toml`.
+/// Remove HMP status hooks from Codex's `config.toml`.
 pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
     if !config_path.exists() {
         return Ok(false);
@@ -651,7 +651,7 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
 
     let modified = with_codex_config_lock(config_path, || {
         let mut config = read_codex_config(config_path)?;
-        if !remove_codex_aoe_hooks(&mut config)? {
+        if !remove_codex_hmp_hooks(&mut config)? {
             return Ok(false);
         }
 
@@ -659,18 +659,18 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
         Ok(true)
     })?;
     if modified {
-        tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+        tracing::info!(target: "hooks.uninstall", "Removed HMP hooks from {}", config_path.display());
     }
     Ok(modified)
 }
 
-/// Remove all AoE hooks from an agent's `settings.json` file.
+/// Remove all HMP hooks from an agent's `settings.json` file.
 ///
-/// Strips AoE hook entries while preserving user-defined hooks. If an event
+/// Strips HMP hook entries while preserving user-defined hooks. If an event
 /// ends up with no matchers after removal, the event key is removed entirely.
 /// If the hooks object becomes empty, the `hooks` key is removed from settings.
 ///
-/// Returns `Ok(true)` if the file was modified, `Ok(false)` if no AoE hooks were found.
+/// Returns `Ok(true)` if the file was modified, `Ok(false)` if no HMP hooks were found.
 pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
@@ -695,7 +695,7 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
             .and_then(|v| v.as_array_mut())
         {
             let before = matchers.len();
-            remove_aoe_entries(matchers);
+            remove_hmp_entries(matchers);
             if matchers.len() != before {
                 modified = true;
             }
@@ -724,22 +724,22 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     let formatted = serde_json::to_string_pretty(&settings)?;
     std::fs::write(settings_path, formatted)?;
 
-    tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", settings_path.display());
+    tracing::info!(target: "hooks.uninstall", "Removed HMP hooks from {}", settings_path.display());
     Ok(true)
 }
 
-/// settl hook events and the AoE status they map to.
+/// settl hook events and the HMP status they map to.
 const SETTL_HOOKS: &[(&str, &str)] = &[
     ("TurnStarted", "running"),
     ("WaitingForHuman", "waiting"),
     ("GameWon", "idle"),
 ];
 
-/// Install AoE status hooks into settl's `~/.settl/config.toml`.
+/// Install HMP status hooks into settl's `~/.settl/config.toml`.
 ///
 /// settl uses TOML config with `[[hooks]]` array entries instead of JSON
 /// settings files. This function reads the existing config, removes any
-/// previous AoE-managed hooks (identified by the marker), and adds hooks
+/// previous HMP-managed hooks (identified by the marker), and adds hooks
 /// for the three status transitions: TurnStarted->running,
 /// WaitingForHuman->waiting, GameWon->idle.
 pub fn install_settl_hooks() -> Result<()> {
@@ -769,12 +769,12 @@ pub fn install_settl_hooks() -> Result<()> {
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("hooks key is not a TOML array"))?;
 
-    // Remove existing AoE hooks
+    // Remove existing HMP hooks
     hooks_arr.retain(|hook| {
         !hook
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(is_aoe_hook_command)
+            .is_some_and(is_hmp_hook_command)
     });
 
     // Add one hook per status transition
@@ -792,11 +792,11 @@ pub fn install_settl_hooks() -> Result<()> {
     let formatted = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, formatted)?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
+    tracing::info!(target: "hooks.install", "Installed HMP hooks in {}", config_path.display());
     Ok(())
 }
 
-/// Remove AoE hooks from settl's `~/.settl/config.toml`.
+/// Remove HMP hooks from settl's `~/.settl/config.toml`.
 pub fn uninstall_settl_hooks() -> Result<bool> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
     let config_path = home.join(".settl").join("config.toml");
@@ -820,7 +820,7 @@ pub fn uninstall_settl_hooks() -> Result<bool> {
         !hook
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(is_aoe_hook_command)
+            .is_some_and(is_hmp_hook_command)
     });
 
     if hooks_arr.len() == before {
@@ -829,11 +829,11 @@ pub fn uninstall_settl_hooks() -> Result<bool> {
 
     let formatted = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, formatted)?;
-    tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+    tracing::info!(target: "hooks.uninstall", "Removed HMP hooks from {}", config_path.display());
     Ok(true)
 }
 
-/// Hermes hook events and the AoE status they map to. Hermes uses an
+/// Hermes hook events and the HMP status they map to. Hermes uses an
 /// event-keyed YAML schema (`hooks: { event_name: [ {command, ...} ] }`),
 /// not the flat array settl uses.
 const HERMES_HOOKS: &[(&str, &str)] = &[
@@ -845,10 +845,10 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
     ("on_session_end", "idle"),
 ];
 
-/// Install AoE status hooks into Hermes's `config.yaml`.
+/// Install HMP status hooks into Hermes's `config.yaml`.
 ///
-/// Reads the existing YAML, removes any prior AoE-managed hook entries
-/// (identified by the `aoe-hooks` marker in the command string), and inserts
+/// Reads the existing YAML, removes any prior HMP-managed hook entries
+/// (identified by the `hmp-hooks` marker in the command string), and inserts
 /// our status-writing hooks under the configured events. Also pre-populates
 /// `<config_dir>/shell-hooks-allowlist.json` so Hermes registers the hooks
 /// without prompting for first-use consent.
@@ -893,7 +893,7 @@ pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
                 .as_mapping()
                 .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
                 .and_then(|c| c.as_str())
-                .is_some_and(is_aoe_hook_command)
+                .is_some_and(is_hmp_hook_command)
         });
 
         let mut entry = serde_yaml::Mapping::new();
@@ -920,11 +920,11 @@ pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
     }
     std::fs::write(&allowlist_path, allowlist_formatted)?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
+    tracing::info!(target: "hooks.install", "Installed HMP hooks in {}", config_path.display());
     Ok(())
 }
 
-/// Remove AoE hooks from Hermes's `config.yaml`.
+/// Remove HMP hooks from Hermes's `config.yaml`.
 pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
     if !config_path.exists() {
         return Ok(false);
@@ -962,7 +962,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
                     .as_mapping()
                     .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
                     .and_then(|c| c.as_str())
-                    .is_some_and(is_aoe_hook_command)
+                    .is_some_and(is_hmp_hook_command)
             });
             if arr.len() != before {
                 modified = true;
@@ -988,7 +988,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
 
     let formatted = serde_yaml::to_string(&config)?;
     std::fs::write(config_path, formatted)?;
-    tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+    tracing::info!(target: "hooks.uninstall", "Removed HMP hooks from {}", config_path.display());
     Ok(true)
 }
 
@@ -1042,15 +1042,15 @@ const KIRO_HOOKS: &[(&str, &str)] = &[
     ("stop", "idle"),
 ];
 
-/// Default agent config path for Kiro CLI: `~/.kiro/agents/aoe-hooks.json`.
+/// Default agent config path for Kiro CLI: `~/.kiro/agents/hmp-hooks.json`.
 /// We use a dedicated agent config file rather than modifying the user's
-/// default agent, so AoE hooks are isolated and easy to remove.
-pub const KIRO_HOOKS_AGENT_FILE: &str = ".kiro/agents/aoe-hooks.json";
+/// default agent, so HMP hooks are isolated and easy to remove.
+pub const KIRO_HOOKS_AGENT_FILE: &str = ".kiro/agents/hmp-hooks.json";
 
-/// Install AoE status hooks into a Kiro CLI agent config file.
+/// Install HMP status hooks into a Kiro CLI agent config file.
 ///
 /// Writes a minimal agent config with hooks that write status to the
-/// AoE sidecar file. This function is pure file IO and is safe to call
+/// HMP sidecar file. This function is pure file IO and is safe to call
 /// from any context (host install, sandbox provisioning, tests). To make
 /// the agent the active default on the host, call
 /// [`set_kiro_default_agent_if_builtin`] after this returns.
@@ -1065,7 +1065,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
     // Kiro requires a name field for valid agent configs
     config
         .entry("name".to_string())
-        .or_insert_with(|| Value::String("aoe-hooks".to_string()));
+        .or_insert_with(|| Value::String("hmp-hooks".to_string()));
     // Wildcard tools so preToolUse hooks fire for all tool invocations
     config
         .entry("tools".to_string())
@@ -1086,7 +1086,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
                 !hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(is_aoe_hook_command)
+                    .is_some_and(is_hmp_hook_command)
             });
             arr.push(serde_json::json!({ "command": hook_command(status) }));
         }
@@ -1100,11 +1100,11 @@ pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
     let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
     std::fs::write(agent_config_path, formatted)?;
 
-    tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", agent_config_path.display());
+    tracing::info!(target: "hooks.install", "Installed HMP hooks in {}", agent_config_path.display());
     Ok(())
 }
 
-/// Make `aoe-hooks` the active default Kiro agent if the user is still on
+/// Make `hmp-hooks` the active default Kiro agent if the user is still on
 /// Kiro's built-in default. Skipped when a user has chosen a custom default
 /// so we never silently override their preference. Best-effort: any failure
 /// (kiro-cli missing, unexpected output, command error) is logged and ignored.
@@ -1129,11 +1129,11 @@ pub fn set_kiro_default_agent_if_builtin() {
 
     if is_builtin_default {
         let set_result = std::process::Command::new("kiro-cli")
-            .args(["agent", "set-default", "aoe-hooks"])
+            .args(["agent", "set-default", "hmp-hooks"])
             .output();
         match set_result {
             Ok(o) if o.status.success() => {
-                tracing::info!(target: "hooks.install", "Set aoe-hooks as default Kiro agent for status detection");
+                tracing::info!(target: "hooks.install", "Set hmp-hooks as default Kiro agent for status detection");
             }
             Ok(o) => {
                 tracing::debug!(target: "hooks.install",
@@ -1148,12 +1148,12 @@ pub fn set_kiro_default_agent_if_builtin() {
     } else {
         tracing::info!(target: "hooks.install",
             "Kiro has a custom default agent; skipping set-default. \
-             Run `kiro-cli agent set-default aoe-hooks` to enable status detection."
+             Run `kiro-cli agent set-default hmp-hooks` to enable status detection."
         );
     }
 }
 
-/// Remove AoE hooks from a Kiro CLI agent config file.
+/// Remove HMP hooks from a Kiro CLI agent config file.
 /// Returns true if hooks were removed, false if nothing to do.
 pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
     if !agent_config_path.exists() {
@@ -1180,7 +1180,7 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
                 !hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(is_aoe_hook_command)
+                    .is_some_and(is_hmp_hook_command)
             });
             if arr.len() != before {
                 modified = true;
@@ -1206,16 +1206,16 @@ pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
         std::fs::write(agent_config_path, formatted)?;
     }
 
-    tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", agent_config_path.display());
+    tracing::info!(target: "hooks.uninstall", "Removed HMP hooks from {}", agent_config_path.display());
     Ok(true)
 }
 
-/// Remove all AoE hooks from all known agent settings files and clean up
+/// Remove all HMP hooks from all known agent settings files and clean up
 /// the hook status base directory. Called during `aoe uninstall`.
 pub fn uninstall_all_hooks() {
     // Remove settl TOML hooks
     match uninstall_settl_hooks() {
-        Ok(true) => println!("Removed AoE hooks from ~/.settl/config.toml"),
+        Ok(true) => println!("Removed HMP hooks from ~/.settl/config.toml"),
         Ok(false) => {}
         Err(e) => tracing::warn!(target: "hooks.uninstall", "Failed to remove settl hooks: {}", e),
     }
@@ -1225,7 +1225,7 @@ pub fn uninstall_all_hooks() {
         // Remove Hermes YAML hooks
         let hermes_config = home.join(".hermes").join("config.yaml");
         match uninstall_hermes_hooks(&hermes_config) {
-            Ok(true) => println!("Removed AoE hooks from {}", hermes_config.display()),
+            Ok(true) => println!("Removed HMP hooks from {}", hermes_config.display()),
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(target: "hooks.uninstall", "Failed to remove hermes hooks: {}", e)
@@ -1235,7 +1235,7 @@ pub fn uninstall_all_hooks() {
         // Remove Kiro CLI agent config hooks
         let kiro_config = home.join(KIRO_HOOKS_AGENT_FILE);
         match uninstall_kiro_hooks(&kiro_config) {
-            Ok(true) => println!("Removed AoE hooks from {}", kiro_config.display()),
+            Ok(true) => println!("Removed HMP hooks from {}", kiro_config.display()),
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(target: "hooks.uninstall", "Failed to remove kiro hooks: {}", e)
@@ -1266,7 +1266,7 @@ pub fn uninstall_all_hooks() {
                     uninstall_hooks(&settings_path)
                 };
                 match result {
-                    Ok(true) => println!("Removed AoE hooks from {}", settings_path.display()),
+                    Ok(true) => println!("Removed HMP hooks from {}", settings_path.display()),
                     Ok(false) => {}
                     Err(e) => tracing::warn!(target: "hooks.uninstall",
                         "Failed to remove hooks from {}: {}",
@@ -1418,17 +1418,17 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
 
-        // Should have both user hook and AoE hook
+        // Should have both user hook and HMP hook
         assert_eq!(pre_tool.len(), 2);
 
         // User hook preserved
         let user_hook = &pre_tool[0];
         assert_eq!(user_hook["matcher"], "Bash");
 
-        // AoE hook added
-        let aoe_hook = &pre_tool[1];
-        let cmd = aoe_hook["hooks"][0]["command"].as_str().unwrap();
-        assert!(is_aoe_hook_command(cmd));
+        // HMP hook added
+        let hmp_hook = &pre_tool[1];
+        let cmd = hmp_hook["hooks"][0]["command"].as_str().unwrap();
+        assert!(is_hmp_hook_command(cmd));
     }
 
     #[test]
@@ -1443,7 +1443,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
 
-        // Should have exactly one AoE entry, not duplicates
+        // Should have exactly one HMP entry, not duplicates
         assert_eq!(pre_tool.len(), 1);
     }
 
@@ -1580,7 +1580,7 @@ mod tests {
         assert!(config.contains("web_search = true"));
         assert!(config.contains("hooks = false"));
         assert!(!config.contains("hooks = true"));
-        assert!(!config.contains("aoe-hooks"));
+        assert!(!config.contains("hmp-hooks"));
     }
 
     #[test]
@@ -1616,7 +1616,7 @@ hooks = { PreToolUse = [{ matcher = "Bash", hooks = [{ type = "command", command
     }
 
     #[test]
-    fn test_install_codex_hooks_preserves_hooks_state_on_existing_aoe_hooks() {
+    fn test_install_codex_hooks_preserves_hooks_state_on_existing_hmp_hooks() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).unwrap();
@@ -1691,7 +1691,7 @@ trusted_hash = "new"
     }
 
     #[test]
-    fn test_install_codex_hooks_collapses_duplicated_aoe_blocks() {
+    fn test_install_codex_hooks_collapses_duplicated_hmp_blocks() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).unwrap();
@@ -1739,7 +1739,7 @@ command = {:?}
 enabled = true
 trusted_hash = "sha256:keep"
 
-[projects."/tmp/aoe-project"]
+[projects."/tmp/hmp-project"]
 trust_level = "trusted"
 "#,
             hook_command("idle"),
@@ -1763,7 +1763,7 @@ trust_level = "trusted"
             Some("sha256:keep")
         );
         assert_eq!(
-            config["projects"]["/tmp/aoe-project"]["trust_level"].as_str(),
+            config["projects"]["/tmp/hmp-project"]["trust_level"].as_str(),
             Some("trusted")
         );
         assert_eq!(config_text.matches("sh -c").count(), codex_events().len());
@@ -1779,7 +1779,7 @@ trust_level = "trusted"
             &config_path,
             r#"model = "gpt-5.3-codex"
 
-[projects."/tmp/aoe-project"]
+[projects."/tmp/hmp-project"]
 trust_level = "trusted"
 "#,
         )
@@ -1811,7 +1811,7 @@ trust_level = "trusted"
             assert_eq!(config["hooks"][event.name].as_array().unwrap().len(), 1);
         }
         assert_eq!(
-            config["projects"]["/tmp/aoe-project"]["trust_level"].as_str(),
+            config["projects"]["/tmp/hmp-project"]["trust_level"].as_str(),
             Some("trusted")
         );
         assert_eq!(config_text.matches("sh -c").count(), codex_events().len());
@@ -1837,7 +1837,7 @@ features = { web_search = true, hooks = false }
         assert!(config.contains("model = \"gpt-5.3-codex\""));
         assert!(config.contains("web_search = true"));
         assert!(config.contains("hooks = false"));
-        assert!(!config.contains("aoe-hooks"));
+        assert!(!config.contains("hmp-hooks"));
     }
 
     #[test]
@@ -1857,7 +1857,7 @@ features = { web_search = true, codex_hooks = false }
         install_codex_hooks(&config_path, codex_events()).unwrap();
 
         let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(!config.contains("aoe-hooks"));
+        assert!(!config.contains("hmp-hooks"));
     }
 
     #[test]
@@ -1887,33 +1887,33 @@ command = "echo user-hook"
         let config = std::fs::read_to_string(config_path).unwrap();
         assert!(config.contains("echo user-hook"));
         assert!(config.contains("trusted_hash = \"keep\""));
-        assert!(!config.contains("aoe-hooks"));
+        assert!(!config.contains("hmp-hooks"));
     }
 
     #[test]
     fn test_hook_command_format() {
         let cmd = hook_command("running");
-        assert!(cmd.contains(AOE_HOOK_MARKER));
+        assert!(cmd.contains(HMP_HOOK_MARKER));
         assert!(cmd.contains("printf running"));
     }
 
     #[test]
     fn test_hook_command_contains_instance_id_guard() {
         let cmd = hook_command("idle");
-        assert!(cmd.contains("AOE_INSTANCE_ID"));
+        assert!(cmd.contains("HMP_INSTANCE_ID"));
         assert!(cmd.contains("printf idle"));
     }
 
     #[test]
     fn test_hook_command_tolerates_unwritable_base_dir() {
-        // Regression for #1390: if /tmp/aoe-hooks/<id> disappears mid-session
+        // Regression for #1390: if /tmp/hmp-hooks/<id> disappears mid-session
         // (OS /tmp cleanup, transient FS hiccup, external tooling), the hook
         // must still exit 0 so the agent doesn't treat it as blocking and
         // freeze further tool calls.
         use std::process::Command;
 
         let tmp = TempDir::new().unwrap();
-        let base = tmp.path().join("aoe-hooks-blocked");
+        let base = tmp.path().join("hmp-hooks-blocked");
         // Pre-create base as a regular file so mkdir -p can never succeed.
         std::fs::write(&base, "i am a file, not a dir").unwrap();
 
@@ -1921,7 +1921,7 @@ command = "echo user-hook"
 
         let output = Command::new("sh")
             .args(["-c", &cmd])
-            .env("AOE_INSTANCE_ID", "regression_1390")
+            .env("HMP_INSTANCE_ID", "regression_1390")
             .output()
             .expect("spawn sh");
 
@@ -1937,13 +1937,13 @@ command = "echo user-hook"
         use std::process::Command;
 
         let tmp = TempDir::new().unwrap();
-        let base = tmp.path().join("aoe-hooks");
+        let base = tmp.path().join("hmp-hooks");
 
         let cmd = hook_command_with_base("waiting", base.to_str().unwrap());
 
         let output = Command::new("sh")
             .args(["-c", &cmd])
-            .env("AOE_INSTANCE_ID", "happy_path")
+            .env("HMP_INSTANCE_ID", "happy_path")
             .output()
             .expect("spawn sh");
 
@@ -1954,7 +1954,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_notification_hook_has_matcher() {
-        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(claude_events(), HookInstallTarget::Sandbox);
         let notification = hooks["Notification"].as_array().unwrap();
         assert_eq!(notification.len(), 1);
         let matcher = notification[0]["matcher"].as_str().unwrap();
@@ -1965,7 +1965,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_stop_hook_writes_idle() {
-        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(claude_events(), HookInstallTarget::Sandbox);
         let stop = hooks["Stop"].as_array().unwrap();
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(
@@ -1977,7 +1977,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_elicitation_result_hook_writes_running() {
-        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(claude_events(), HookInstallTarget::Sandbox);
         let er = hooks["ElicitationResult"].as_array().unwrap();
         assert_eq!(er.len(), 1);
         let cmd = er[0]["hooks"][0]["command"].as_str().unwrap();
@@ -1990,7 +1990,7 @@ command = "echo user-hook"
 
     #[test]
     fn test_hooks_are_synchronous() {
-        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(claude_events(), HookInstallTarget::Sandbox);
         for (_, matchers) in hooks.as_object().unwrap() {
             for matcher in matchers.as_array().unwrap() {
                 for hook in matcher["hooks"].as_array().unwrap() {
@@ -2005,7 +2005,7 @@ command = "echo user-hook"
     }
 
     #[test]
-    fn test_uninstall_hooks_removes_aoe_entries() {
+    fn test_uninstall_hooks_removes_hmp_entries() {
         let tmp = TempDir::new().unwrap();
         let settings_path = tmp.path().join("settings.json");
 
@@ -2070,7 +2070,7 @@ command = "echo user-hook"
     }
 
     #[test]
-    fn test_uninstall_hooks_no_aoe_hooks() {
+    fn test_uninstall_hooks_no_hmp_hooks() {
         let tmp = TempDir::new().unwrap();
         let settings_path = tmp.path().join("settings.json");
 
@@ -2095,18 +2095,18 @@ command = "echo user-hook"
     }
 
     #[test]
-    fn test_remove_aoe_entries_keeps_user_hooks() {
+    fn test_remove_hmp_entries_keeps_user_hooks() {
         let mut matchers = vec![
             serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{"type": "command", "command": "echo user"}]
             }),
             serde_json::json!({
-                "hooks": [{"type": "command", "command": "sh -c 'aoe-hooks stuff'"}]
+                "hooks": [{"type": "command", "command": "sh -c 'hmp-hooks stuff'"}]
             }),
         ];
 
-        remove_aoe_entries(&mut matchers);
+        remove_hmp_entries(&mut matchers);
         assert_eq!(matchers.len(), 1);
         assert_eq!(matchers[0]["matcher"], "Bash");
     }
@@ -2121,7 +2121,7 @@ command = "echo user-hook"
                 "PreToolUse": [{
                     "hooks": [{
                         "type": "command",
-                        "command": "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; mkdir -p /tmp/aoe-hooks/$AOE_INSTANCE_ID && printf running > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status'"
+                        "command": "sh -c '[ -n \"$HMP_INSTANCE_ID\" ] || exit 0; mkdir -p /tmp/hmp-hooks/$HMP_INSTANCE_ID && printf running > /tmp/hmp-hooks/$HMP_INSTANCE_ID/status'"
                     }]
                 }]
             }
@@ -2172,7 +2172,7 @@ command = "echo user-hook"
         assert_eq!(hooks[2]["event"].as_str().unwrap(), "GameWon");
 
         for hook in hooks {
-            assert!(hook["command"].as_str().unwrap().contains("aoe-hooks"));
+            assert!(hook["command"].as_str().unwrap().contains("hmp-hooks"));
         }
     }
 
@@ -2219,14 +2219,14 @@ command = "echo user-hook"
         let content = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
         let config: toml::Value = toml::from_str(&content).unwrap();
         let hooks = config["hooks"].as_array().unwrap();
-        // 1 user hook + 3 AoE hooks = 4
+        // 1 user hook + 3 HMP hooks = 4
         assert_eq!(hooks.len(), 4);
         assert_eq!(hooks[0]["command"].as_str().unwrap(), "echo user-hook");
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_uninstall_settl_hooks_removes_aoe_entries() {
+    fn test_uninstall_settl_hooks_removes_hmp_entries() {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         install_settl_hooks().unwrap();
@@ -2282,7 +2282,7 @@ command = "echo user-hook"
                 expected_status,
                 cmd
             );
-            assert!(cmd.contains("aoe-hooks"), "Hook should contain marker");
+            assert!(cmd.contains("hmp-hooks"), "Hook should contain marker");
         }
     }
 
@@ -2315,7 +2315,7 @@ command = "echo user-hook"
                 .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
                 .and_then(|c| c.as_str())
                 .unwrap();
-            assert!(is_aoe_hook_command(cmd));
+            assert!(is_hmp_hook_command(cmd));
         }
 
         // Allowlist should be pre-populated alongside the config
@@ -2358,10 +2358,10 @@ hooks_auto_accept: false
         );
 
         let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
-        // 1 user hook + 1 AoE hook = 2
+        // 1 user hook + 1 HMP hook = 2
         assert_eq!(pre_tool.len(), 2);
         assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
-        assert!(is_aoe_hook_command(
+        assert!(is_hmp_hook_command(
             pre_tool[1]["command"].as_str().unwrap()
         ));
     }
@@ -2443,7 +2443,7 @@ hooks_auto_accept: false
         let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
         assert_eq!(pre_tool.len(), 1);
         assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
-        // Other AoE-only events should be gone entirely
+        // Other HMP-only events should be gone entirely
         assert!(config["hooks"].get("post_llm_call").is_none());
     }
 
@@ -2466,7 +2466,7 @@ hooks_auto_accept: false
                 expected_status,
                 cmd
             );
-            assert!(cmd.contains("aoe-hooks"), "Hook should contain marker");
+            assert!(cmd.contains("hmp-hooks"), "Hook should contain marker");
         }
     }
 
@@ -2491,7 +2491,7 @@ hooks_auto_accept: false
             .path()
             .join(".kiro")
             .join("agents")
-            .join("aoe-hooks.json");
+            .join("hmp-hooks.json");
 
         install_kiro_hooks(&config_path).unwrap();
 
@@ -2507,14 +2507,14 @@ hooks_auto_accept: false
                 .unwrap();
             assert_eq!(entries.len(), 1, "event {} should have one entry", event);
             let cmd = entries[0]["command"].as_str().unwrap();
-            assert!(is_aoe_hook_command(cmd));
+            assert!(is_hmp_hook_command(cmd));
         }
     }
 
     #[test]
     fn test_install_kiro_hooks_preserves_user_hooks() {
         let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("aoe-hooks.json");
+        let config_path = tmp.path().join("hmp-hooks.json");
         std::fs::write(
             &config_path,
             r#"{"hooks": {"preToolUse": [{"command": "echo user-hook", "matcher": "shell"}]}}"#,
@@ -2526,10 +2526,10 @@ hooks_auto_accept: false
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
         let pre_tool = config["hooks"]["preToolUse"].as_array().unwrap();
-        // 1 user hook + 1 AoE hook = 2
+        // 1 user hook + 1 HMP hook = 2
         assert_eq!(pre_tool.len(), 2);
         assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
-        assert!(is_aoe_hook_command(
+        assert!(is_hmp_hook_command(
             pre_tool[1]["command"].as_str().unwrap()
         ));
     }
@@ -2537,7 +2537,7 @@ hooks_auto_accept: false
     #[test]
     fn test_install_kiro_hooks_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("aoe-hooks.json");
+        let config_path = tmp.path().join("hmp-hooks.json");
 
         install_kiro_hooks(&config_path).unwrap();
         install_kiro_hooks(&config_path).unwrap();
@@ -2549,16 +2549,16 @@ hooks_auto_accept: false
             assert_eq!(
                 entries.len(),
                 1,
-                "event {} should still have exactly one AoE entry after double install",
+                "event {} should still have exactly one HMP entry after double install",
                 event
             );
         }
     }
 
     #[test]
-    fn test_uninstall_kiro_hooks_removes_aoe_entries() {
+    fn test_uninstall_kiro_hooks_removes_hmp_entries() {
         let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("aoe-hooks.json");
+        let config_path = tmp.path().join("hmp-hooks.json");
 
         install_kiro_hooks(&config_path).unwrap();
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
@@ -2572,7 +2572,7 @@ hooks_auto_accept: false
     #[test]
     fn test_uninstall_kiro_hooks_preserves_user_hooks() {
         let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("aoe-hooks.json");
+        let config_path = tmp.path().join("hmp-hooks.json");
         std::fs::write(
             &config_path,
             r#"{"hooks": {"preToolUse": [{"command": "echo user-hook"}]}}"#,
@@ -2602,7 +2602,7 @@ hooks_auto_accept: false
         let cmd = hook_command_session_id_sandbox(base.to_str().unwrap());
         let mut child = std::process::Command::new("sh")
             .args(["-c", &cmd])
-            .env("AOE_INSTANCE_ID", instance_id)
+            .env("HMP_INSTANCE_ID", instance_id)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2702,7 +2702,7 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_hook_command_session_id_host_invokes_aoe_subcommand() {
+    fn test_hook_command_session_id_host_invokes_hmp_subcommand() {
         let cmd = hook_command_session_id(HookInstallTarget::Host);
         assert!(
             cmd.contains("aoe __extract-session-id"),
@@ -2710,11 +2710,11 @@ hooks_auto_accept: false
         );
         assert!(
             cmd.contains("command -v aoe"),
-            "host hook should guard on `aoe` being on PATH, got: {cmd}"
+            "host hook should guard on `hmp` being on PATH, got: {cmd}"
         );
         assert!(
-            cmd.contains(AOE_HOOK_MARKER),
-            "host hook must carry the AoE marker so uninstall can find it, got: {cmd}"
+            cmd.contains(HMP_HOOK_MARKER),
+            "host hook must carry the HMP marker so uninstall can find it, got: {cmd}"
         );
         assert!(
             !cmd.contains("grep -oE"),
@@ -2727,22 +2727,22 @@ hooks_auto_accept: false
         let cmd = hook_command_session_id(HookInstallTarget::Sandbox);
         assert!(
             cmd.contains("grep -oE"),
-            "sandbox hook must keep the POSIX pipeline since `aoe` is not in the image, got: {cmd}"
+            "sandbox hook must keep the POSIX pipeline since `hmp` is not in the image, got: {cmd}"
         );
         assert!(
             !cmd.contains("aoe __extract-session-id"),
             "sandbox hook must not invoke the Rust subcommand, got: {cmd}"
         );
         assert!(
-            cmd.contains(AOE_HOOK_MARKER),
-            "sandbox hook must carry the AoE marker, got: {cmd}"
+            cmd.contains(HMP_HOOK_MARKER),
+            "sandbox hook must carry the HMP marker, got: {cmd}"
         );
     }
 
     #[test]
-    fn test_build_aoe_hooks_emits_session_id_capture_for_session_start() {
+    fn test_build_hmp_hooks_emits_session_id_capture_for_session_start() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(events, HookInstallTarget::Sandbox);
         let session_start = hooks
             .get("SessionStart")
             .expect("SessionStart matcher block")
@@ -2753,13 +2753,13 @@ hooks_auto_accept: false
         assert_eq!(entries.len(), 1, "SessionStart should emit 1 hook command");
         let cmd = entries[0]["command"].as_str().unwrap();
         assert!(cmd.contains("session_id"));
-        assert!(cmd.contains(AOE_HOOK_MARKER));
+        assert!(cmd.contains(HMP_HOOK_MARKER));
     }
 
     #[test]
-    fn test_build_aoe_hooks_emits_both_for_user_prompt_submit() {
+    fn test_build_hmp_hooks_emits_both_for_user_prompt_submit() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(events, HookInstallTarget::Sandbox);
         let user_prompt = hooks
             .get("UserPromptSubmit")
             .expect("UserPromptSubmit matcher block")
@@ -2780,9 +2780,9 @@ hooks_auto_accept: false
     }
 
     #[test]
-    fn test_build_aoe_hooks_status_only_events_unchanged() {
+    fn test_build_hmp_hooks_status_only_events_unchanged() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_hmp_hooks(events, HookInstallTarget::Sandbox);
         for event_name in &["PreToolUse", "Stop", "Notification", "ElicitationResult"] {
             let block = hooks
                 .get(*event_name)
@@ -2800,20 +2800,20 @@ hooks_auto_accept: false
 
     #[test]
     fn hook_command_with_base_quotes_and_guards() {
-        let cmd = hook_command_with_base("running", "/tmp/aoe-hooks");
+        let cmd = hook_command_with_base("running", "/tmp/hmp-hooks");
         assert!(
-            cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
+            cmd.contains("case \"$HMP_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
             "missing shell guard: {cmd}"
         );
-        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
-        assert!(cmd.contains("\"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\""));
+        assert!(cmd.contains("\"/tmp/hmp-hooks/$HMP_INSTANCE_ID\""));
+        assert!(cmd.contains("\"/tmp/hmp-hooks/$HMP_INSTANCE_ID/status\""));
     }
 
     #[test]
     fn hook_command_session_id_sandbox_quotes_and_guards() {
-        let cmd = hook_command_session_id_sandbox("/tmp/aoe-hooks");
-        assert!(cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*"));
-        assert!(cmd.contains("D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\""));
+        let cmd = hook_command_session_id_sandbox("/tmp/hmp-hooks");
+        assert!(cmd.contains("case \"$HMP_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*"));
+        assert!(cmd.contains("D=\"/tmp/hmp-hooks/$HMP_INSTANCE_ID\""));
     }
 
     #[test]
@@ -2834,7 +2834,7 @@ hooks_auto_accept: false
             let status = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
-                .env("AOE_INSTANCE_ID", poisoned)
+                .env("HMP_INSTANCE_ID", poisoned)
                 .status()
                 .unwrap();
             assert!(status.success(), "hook MUST exit 0 (id={poisoned:?})");

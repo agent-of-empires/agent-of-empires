@@ -64,7 +64,7 @@ mod tests {
         }
         let captured_name;
         {
-            let guard = TmuxTestSession::new("aoe_test_guard_self");
+            let guard = TmuxTestSession::new("hmp_test_guard_self");
             captured_name = guard.name().to_string();
             let output = Command::new("tmux")
                 .args([
@@ -103,8 +103,8 @@ mod tests {
     // serialize it against unrelated tmux-spawning tests.
     #[test]
     fn unique_names_within_process() {
-        let a = TmuxTestSession::new("aoe_test_unique");
-        let b = TmuxTestSession::new("aoe_test_unique");
+        let a = TmuxTestSession::new("hmp_test_unique");
+        let b = TmuxTestSession::new("hmp_test_unique");
         assert_ne!(a.name(), b.name());
     }
 }

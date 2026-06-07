@@ -51,7 +51,7 @@ const supportsPush = (): boolean =>
  *  allowed over http for dev, but any LAN IP or hostname must be
  *  served over https. This is especially relevant on mobile where
  *  users hit the dashboard at `http://<laptop-ip>:<port>` and are
- *  surprised push doesn't work. Tunnel mode (aoe serve --remote)
+ *  surprised push doesn't work. Tunnel mode (hmp serve --remote)
  *  provides https out of the box via Cloudflare. */
 const isSecureOrigin = (): boolean => {
   if (typeof window === "undefined") return false;

@@ -251,7 +251,7 @@ impl TerminalSession {
 }
 
 /// Container terminal session for sandboxed sessions.
-/// Uses a separate prefix (aoe_cterm_) to allow both container and host terminals to coexist.
+/// Uses a separate prefix (hmp_cterm_) to allow both container and host terminals to coexist.
 pub struct ContainerTerminalSession {
     inner: PairedTerminal,
 }
@@ -451,7 +451,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_terminal_dead");
+        let guard = TmuxTestSession::new("hmp_test_terminal_dead");
         let session_name = guard.name().to_string();
         let session = TerminalSession {
             inner: PairedTerminal {
@@ -499,7 +499,7 @@ mod tests {
             return;
         }
 
-        let guard = TmuxTestSession::new("aoe_test_terminal_alive");
+        let guard = TmuxTestSession::new("hmp_test_terminal_alive");
         let session_name = guard.name().to_string();
         let session = TerminalSession {
             inner: PairedTerminal {

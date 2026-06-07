@@ -3,7 +3,7 @@
 //! Single source of truth for env-var resolution, default-filter
 //! construction, and the reloadable subscriber handle. Both the main
 //! daemon and structured view runner subprocesses use this module so they
-//! agree on what `AOE_LOG_LEVEL=debug` means.
+//! agree on what `HMP_LOG_LEVEL=debug` means.
 //!
 //! The process-global `FilterController` is exposed via free
 //! functions (`set_filter`, `set_level`, `current_filter`). Tracing's
@@ -46,7 +46,7 @@ pub struct SinkResolution {
 
 /// Resolve the configured log file path. Relative `file_path` values join
 /// onto `app_dir`; absolute paths are used verbatim. Used by every site
-/// that names the log file (main, runner, aoe logs, TUI serve dialog).
+/// that names the log file (main, runner, hmp logs, TUI serve dialog).
 pub fn resolve_log_path(cfg: &LoggingConfig, app_dir: &Path) -> PathBuf {
     let p = Path::new(&cfg.file_path);
     if p.is_absolute() {
@@ -279,7 +279,7 @@ pub fn load_persisted_filter() -> Option<String> {
 }
 
 /// Info-baseline filter directive. Used as the universal fallback when
-/// neither env nor config produce one — both `aoe serve` and the TUI
+/// neither env nor config produce one — both `hmp serve` and the TUI
 /// must come up with *some* filter so the subscriber can be installed.
 pub fn serve_default_filter() -> String {
     LogConfig::serve_default()
@@ -330,11 +330,11 @@ pub struct LogConfig {
 
 impl LogConfig {
     pub fn from_env() -> Self {
-        let level = std::env::var("AOE_LOG_LEVEL")
+        let level = std::env::var("HMP_LOG_LEVEL")
             .ok()
             .and_then(|v| LogLevel::parse(&v))
             .or_else(|| {
-                if std::env::var("AGENT_OF_EMPIRES_DEBUG").is_ok() {
+                if std::env::var("HMP_DEBUG").is_ok() {
                     Some(LogLevel::Debug)
                 } else {
                     None
@@ -342,12 +342,12 @@ impl LogConfig {
             });
         Self {
             level,
-            acp_trace: std::env::var("AOE_ACP_TRACE").is_ok(),
-            terminal_trace: std::env::var("AOE_TERMINAL_TRACE").is_ok(),
+            acp_trace: std::env::var("HMP_ACP_TRACE").is_ok(),
+            terminal_trace: std::env::var("HMP_TERMINAL_TRACE").is_ok(),
         }
     }
 
-    /// Default for foreground `aoe serve` (info level, no overlays).
+    /// Default for foreground `hmp serve` (info level, no overlays).
     pub fn serve_default() -> Self {
         Self {
             level: Some(LogLevel::Info),
@@ -660,7 +660,7 @@ fn write_raw_startup_marker(writer: &mut dyn Write) {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let line = format!(
-        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={} exe={}\n",
+        "{} INFO log.runtime [HMP_START_MARKER] version={} pid={} exe={}\n",
         chrono::Utc::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
@@ -1134,10 +1134,10 @@ mod tests {
     #[test]
     fn from_env_no_vars() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
-        std::env::remove_var("AOE_ACP_TRACE");
-        std::env::remove_var("AOE_TERMINAL_TRACE");
+        std::env::remove_var("HMP_LOG_LEVEL");
+        std::env::remove_var("HMP_DEBUG");
+        std::env::remove_var("HMP_ACP_TRACE");
+        std::env::remove_var("HMP_TERMINAL_TRACE");
         let cfg = LogConfig::from_env();
         assert_eq!(cfg.level, None);
         assert!(!cfg.acp_trace);
@@ -1145,22 +1145,22 @@ mod tests {
     }
 
     #[test]
-    fn from_env_aoe_log_level() {
+    fn from_env_hmp_log_level() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("AOE_LOG_LEVEL", "trace");
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
+        std::env::set_var("HMP_LOG_LEVEL", "trace");
+        std::env::remove_var("HMP_DEBUG");
         let cfg = LogConfig::from_env();
-        std::env::remove_var("AOE_LOG_LEVEL");
+        std::env::remove_var("HMP_LOG_LEVEL");
         assert_eq!(cfg.level, Some(LogLevel::Trace));
     }
 
     #[test]
     fn from_env_legacy_debug_flag() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("AOE_LOG_LEVEL");
-        std::env::set_var("AGENT_OF_EMPIRES_DEBUG", "1");
+        std::env::remove_var("HMP_LOG_LEVEL");
+        std::env::set_var("HMP_DEBUG", "1");
         let cfg = LogConfig::from_env();
-        std::env::remove_var("AGENT_OF_EMPIRES_DEBUG");
+        std::env::remove_var("HMP_DEBUG");
         assert_eq!(cfg.level, Some(LogLevel::Debug));
     }
 
@@ -1244,7 +1244,7 @@ mod tests {
     #[test]
     fn resolve_log_path_relative_joins_app_dir() {
         let cfg = make_cfg(RotationKind::Size, 50, 5);
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let dir = std::path::PathBuf::from("/tmp/hmp-test");
         assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
     }
 
@@ -1252,7 +1252,7 @@ mod tests {
     fn resolve_log_path_absolute_used_verbatim() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);
         cfg.file_path = "/var/log/aoe.log".into();
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let dir = std::path::PathBuf::from("/tmp/hmp-test");
         assert_eq!(
             resolve_log_path(&cfg, &dir),
             std::path::PathBuf::from("/var/log/aoe.log")
@@ -1263,7 +1263,7 @@ mod tests {
     fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);
         cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let dir = std::path::PathBuf::from("/tmp/hmp-test");
         let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
         assert!(matches!(r.target, SubscriberTarget::File(_, _)));
         assert!(r.warning.is_some(), "coercion should surface a warning");
@@ -1273,7 +1273,7 @@ mod tests {
     fn resolve_sink_serve_foreground_honors_stdout() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);
         cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let dir = std::path::PathBuf::from("/tmp/hmp-test");
         let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
         assert!(matches!(r.target, SubscriberTarget::Stdout));
         assert!(r.warning.is_none());

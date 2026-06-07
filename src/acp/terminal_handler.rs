@@ -1,9 +1,9 @@
 //! Handlers for ACP `terminal/*` requests.
 //!
 //! ACP terminal methods let agents create a terminal session, read its
-//! output, wait for exit, kill it, or release it. aoe runs the command in
+//! output, wait for exit, kill it, or release it. hmp runs the command in
 //! the session's worktree (or sandbox container if applicable). This is
-//! the place where the existing aoe sandbox/worktree security applies to
+//! the place where the existing hmp sandbox/worktree security applies to
 //! the agent's command execution.
 //!
 //! For the MVP we keep the surface narrow: spawn a one-shot command,
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn sandbox_exec_args_emit_e_flags_for_each_entry() {
         let sandbox = TerminalSandbox {
-            container_name: "aoe-sandbox-test".into(),
+            container_name: "hmp-sandbox-test".into(),
             env_entries: vec![
                 EnvEntry::Inherit {
                     key: "GH_TOKEN".into(),
@@ -312,7 +312,7 @@ mod tests {
         // Both -e flags must appear before the container name.
         let container_idx = argv
             .iter()
-            .position(|a| a == "aoe-sandbox-test")
+            .position(|a| a == "hmp-sandbox-test")
             .expect("container name in argv");
         let e_positions: Vec<usize> = argv
             .iter()
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn sandbox_exec_args_no_env_entries() {
         let sandbox = TerminalSandbox {
-            container_name: "aoe-sandbox-test".into(),
+            container_name: "hmp-sandbox-test".into(),
             env_entries: vec![],
         };
         let (argv, inherit) = build_sandbox_exec_args(
@@ -361,7 +361,7 @@ mod tests {
                 "exec".to_string(),
                 "-w".to_string(),
                 "/workspace".to_string(),
-                "aoe-sandbox-test".to_string(),
+                "hmp-sandbox-test".to_string(),
                 "echo".to_string(),
                 "hi".to_string(),
             ]

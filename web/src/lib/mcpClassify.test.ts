@@ -42,8 +42,8 @@ describe("classifyMcp", () => {
     }
   });
 
-  it("falls back to _aoe_title when tool.name is empty", () => {
-    const t = tool("", { _aoe_title: "mcp__sentry__find_issues" });
+  it("falls back to _hmp_title when tool.name is empty", () => {
+    const t = tool("", { _hmp_title: "mcp__sentry__find_issues" });
     const r = classifyMcp(t);
     expect(r.isMcp).toBe(true);
     if (r.isMcp) expect(r.server).toBe("sentry");

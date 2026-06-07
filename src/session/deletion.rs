@@ -326,11 +326,11 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     if request.instance.scratch {
         let path = PathBuf::from(&request.instance.project_path);
         // keep_scratch + tampered project_path used to surface
-        // "Scratch directory kept at: /etc" which implied AoE was
+        // "Scratch directory kept at: /etc" which implied HMP was
         // intentionally leaving a path it never owned. Gate the
         // keep-scratch message on the same `is_scratch_path` guard
         // the remove branch uses so the message only fires for
-        // paths AoE actually controls.
+        // paths HMP actually controls.
         let guard_ok = path.exists() && super::scratch::is_scratch_path(&path);
         if request.keep_scratch && guard_ok {
             tracing::info!(
@@ -687,12 +687,12 @@ mod tests {
             // container. The container ops will no-op (container does
             // not exist), but the *order* of stage events is still
             // emitted, and that's what we're testing.
-            let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
+            let mut instance = Instance::new("Test", "/tmp/hmp-deletion-test-nonexistent");
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),
-                container_name: "aoe-sandbox-doesnotexist".to_string(),
+                container_name: "hmp-sandbox-doesnotexist".to_string(),
                 extra_env: None,
                 custom_instruction: None,
             });
@@ -772,7 +772,7 @@ mod tests {
                 .unwrap();
 
             // create the worktree on a new branch via real `git` so the
-            // admin files match what aoe creates in production
+            // admin files match what hmp creates in production
             let status = std::process::Command::new("git")
                 .args([
                     "worktree",
@@ -996,7 +996,7 @@ mod tests {
                 enabled: true,
                 container_id: None,
                 image: "alpine".to_string(),
-                container_name: "aoe-dirty-test-doesnotexist".to_string(),
+                container_name: "hmp-dirty-test-doesnotexist".to_string(),
                 extra_env: None,
                 custom_instruction: None,
             });
@@ -1127,7 +1127,7 @@ mod tests {
         /// tmux still gets killed before worktree work.
         #[test]
         fn unsandboxed_kills_tmux_before_worktree() {
-            let instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
+            let instance = Instance::new("Test", "/tmp/hmp-deletion-test-nonexistent");
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
                 instance,

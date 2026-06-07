@@ -253,7 +253,7 @@ hotkey = "Alt+t"
     // point `TMUX` at it so the subprocess routes its tmux commands
     // there instead of the system default.
     let tmux_env = format!("{},0,0", harness_sock.display());
-    let aoe_binary = env!("CARGO_BIN_EXE_aoe");
+    let aoe_binary = env!("CARGO_BIN_EXE_hmp");
     let remove = Command::new(aoe_binary)
         .args(["remove", &session_id, "--force"])
         .env("HOME", h.home_path())

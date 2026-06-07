@@ -90,18 +90,18 @@ interface Props {
  *  user-visible input JSON dumps. */
 function isAcpBookkeepingKey(key: string): boolean {
   return (
-    key === "_aoe_title" ||
-    key === "_aoe_started_at" ||
-    key === "_aoe_parent_tool_call_id"
+    key === "_hmp_title" ||
+    key === "_hmp_started_at" ||
+    key === "_hmp_parent_tool_call_id"
   );
 }
 
-/** Read the smuggled `_aoe_parent_tool_call_id` from a tool's
+/** Read the smuggled `_hmp_parent_tool_call_id` from a tool's
  *  args_preview. Present when the tool is a Claude sub-agent (Task)
  *  child; falsy on top-level tools. See #1041. */
 function hasSubagentParent(tool: ToolCall): boolean {
   const args = parseJsonObject(tool.args_preview);
-  return Boolean(pickStr(args, "_aoe_parent_tool_call_id"));
+  return Boolean(pickStr(args, "_hmp_parent_tool_call_id"));
 }
 
 interface ToolCardProps extends Props {
@@ -844,9 +844,9 @@ function ExecuteToolCard({ tool, result }: Props) {
   const args = parseJsonObject(tool.args_preview);
   const argCommand = pickStr(args, "command", "cmd", "args");
   // Fallback chain: real command → ACP-provided title (forwarded via
-  // _aoe_title in AcpRuntime) → tool's own kind/name. Never show
+  // _hmp_title in AcpRuntime) → tool's own kind/name. Never show
   // the literal `{}` from an empty raw_input.
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   const command = pickFirst(argCommand, title, tool.name) ?? "(no command)";
   const description = pickStr(args, "description");
   const output = result?.text ?? "";
@@ -906,7 +906,7 @@ function ReadToolCard({ tool, result }: Props) {
   const status = statusFor(result);
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
   const range = formatRange(args);
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
@@ -964,7 +964,7 @@ function EditToolCard({ tool, result }: Props) {
   const status = statusFor(result);
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   // Codex (and any ACP agent) attaches structured per-file diffs via
   // ToolCallContent::Diff; prefer those for path + body and fall back to
   // the legacy old_string/new_string args shape otherwise. See #1721.
@@ -1065,7 +1065,7 @@ function DeleteToolCard({ tool, result }: Props) {
   const status = statusFor(result);
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
   const [open, setOpen] = useToolCardExpansion(status);
   return (
@@ -1103,7 +1103,7 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
   const args = parseJsonObject(tool.args_preview);
   const argQuery = pickStr(args, "query", "pattern", "q", "search");
   const argCommand = pickStr(args, "command");
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   const query =
     pickFirst(argQuery, title, argCommand, tool.name) ?? "(no query)";
   const path = pickStr(args, "path", "directory", "scope");
@@ -1176,7 +1176,7 @@ function FetchToolCard({ tool, result }: Props) {
   const status = statusFor(result);
   const args = parseJsonObject(tool.args_preview);
   const argUrl = pickStr(args, "url", "uri", "endpoint");
-  const title = pickStr(args, "_aoe_title");
+  const title = pickStr(args, "_hmp_title");
   const url = pickFirst(argUrl, title, tool.name) ?? "(no url)";
   const output = result?.text ?? "";
   const [open, setOpen] = useToolCardExpansion(status);
@@ -1501,7 +1501,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
   );
   const output = result?.text ?? "";
 
-  // Pretty-printed input minus the bookkeeping _aoe_title field so the
+  // Pretty-printed input minus the bookkeeping _hmp_title field so the
   // user sees the actual skill arguments, not the adapter's title echo.
   const inputJson = useMemo<string>(() => {
     if (!args) return tool.args_preview;
@@ -1657,7 +1657,7 @@ export function SubagentCard({ tool, result, children }: SubagentProps) {
     [tool.args_preview],
   );
   const description =
-    pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task";
+    pickStr(args, "description", "_hmp_title") ?? tool.name ?? "Subagent task";
 
   const runningChildren = children.filter((c) => !c.result).length;
   const parentDone = result !== undefined;
@@ -1792,7 +1792,7 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
 
   // Pull a short single-field arg preview for the header so the user
   // can see what the call was about without expanding. Skip the
-  // _aoe_title bookkeeping field; cap length so headers stay readable.
+  // _hmp_title bookkeeping field; cap length so headers stay readable.
   const argPreview = useMemo<string | null>(() => {
     if (!args) return null;
     for (const [k, v] of Object.entries(args)) {
@@ -1805,7 +1805,7 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
     return null;
   }, [args]);
 
-  // Pretty-printed input, excluding the bookkeeping _aoe_title field
+  // Pretty-printed input, excluding the bookkeeping _hmp_title field
   // so the user sees the actual MCP arguments, not the adapter's
   // forwarded title.
   const inputJson = useMemo<string>(() => {
@@ -2073,10 +2073,10 @@ function classifySchedule(
 ): { kind: "wakeup" | "cron_create" | "cron_list" | "cron_delete" | null } {
   if (tool.kind !== "other") return { kind: null };
   const args = parseJsonObject(tool.args_preview);
-  // ACP titles come through the `_aoe_title` smuggle; the tool's own
+  // ACP titles come through the `_hmp_title` smuggle; the tool's own
   // `name` is usually the same value but matching both keeps us robust
   // to upstream relabels (e.g. claude-agent-acp future kind handling).
-  const title = (pickStr(args, "_aoe_title") ?? tool.name ?? "").trim();
+  const title = (pickStr(args, "_hmp_title") ?? tool.name ?? "").trim();
   const allowed = profile.specialTitles.scheduleNames;
   if (!allowed.includes(title)) return { kind: null };
   switch (title) {

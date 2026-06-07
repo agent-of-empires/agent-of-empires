@@ -1,5 +1,5 @@
 // Fun status messages for the structured view working indicator. Themed around
-// Agent of Empires' civilization-building flavor (see
+// Hoxkss My Pi' civilization-building flavor (see
 // src/session/civilizations.rs and the random-title generator). The
 // spinner glyph rattles through braille frames at terminal speed; the
 // verb cycles every few seconds so long turns stay alive.

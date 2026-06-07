@@ -1,6 +1,6 @@
 //! Acp worker supervisor.
 //!
-//! Owns a per-aoe-process map of session_id -> AcpClient handles. Spawns
+//! Owns a per-hmp-process map of session_id -> AcpClient handles. Spawns
 //! the ACP agent subprocess on demand, bridges its events into the
 //! per-AppState `acp_events_tx` broadcast channel, and fires push
 //! notifications for ApprovalRequested events.
@@ -49,7 +49,7 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// fire the experimental `session/delete` RPC against the live worker.
 /// Logs the outcome at a level matched to its severity, tagging with
 /// the adapter kind so operators can tell `claude-agent-acp` apart
-/// from `aoe-agent` / `codex` / `opencode` / future adapters in
+/// from `hmp-agent` / `codex` / `opencode` / future adapters in
 /// debug.log without bouncing through the registry. All outcomes are
 /// non-fatal and the caller proceeds to shutdown + SIGTERM. See
 /// `AcpClient::delete_session` and #1404.
@@ -336,7 +336,7 @@ pub struct Supervisor<S: BroadcastSink> {
     /// the second fails with "Claude Code native binary not found".
     /// Tracking which agents have already been warmed up in this
     /// process lifetime lets every subsequent spawn proceed in
-    /// parallel without the gate. Reset on every `aoe serve` restart
+    /// parallel without the gate. Reset on every `hmp serve` restart
     /// (warm-cache restarts pay one serial spawn). See #1088.
     warmed_up_agents: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-agent warm-up locks. The first `spawn` for an agent name
@@ -354,7 +354,7 @@ pub struct Supervisor<S: BroadcastSink> {
     /// scheduler tick instead of waiting up to 50 ms.
     worker_notify: Arc<tokio::sync::Notify>,
     /// Sessions whose adopted worker is running an older binary than the
-    /// daemon (detected at reconcile after `aoe update`) and carried an
+    /// daemon (detected at reconcile after `hmp update`) and carried an
     /// in-flight turn, so the reconciler attached to drain it rather than
     /// hard-killing the turn. The reconciler's per-tick drain check
     /// respawns these on the current binary once the turn finishes. See
@@ -402,7 +402,7 @@ impl Drop for ResumeReservation {
 
 /// Instance-level command override carried from the stored session
 /// (`Instance.command`, populated by `session.agent_command_override`
-/// or `--cmd-override` in `aoe add`). The tmux view already
+/// or `--cmd-override` in `hmp add`). The tmux view already
 /// honors `Instance.command`; this lets the structured view do the
 /// same so a session launches the same binary regardless of view.
 /// `logical_tool` is the instance's tool (e.g. `opencode`), kept
@@ -1032,7 +1032,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Publish a synthetic `Stopped` event for a session whose turn was
-    /// in flight when the previous `aoe serve` died. Called at startup
+    /// in flight when the previous `hmp serve` died. Called at startup
     /// from the reconciler when the on-disk event store shows an
     /// orphaned `UserPromptSent` (no terminating `Stopped` or
     /// `AgentStartupError` after it) AND there is no live runner to
@@ -1377,24 +1377,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(ref ovr) = agent_command_override {
             apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
         }
-        // Apply ${aoe_data_dir} placeholder substitution against the
+        // Apply ${hmp_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
-        if spec.command.contains("${aoe_data_dir}") {
+        if spec.command.contains("${hmp_data_dir}") {
             if let Ok(data_dir) = crate::session::get_app_dir() {
                 spec.command = spec
                     .command
-                    .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
+                    .replace("${hmp_data_dir}", &data_dir.to_string_lossy());
             }
         }
 
         let mut env = provider_env;
         if let Some(model) = model {
-            env.push(("AOE_AGENT_MODEL".into(), model));
+            env.push(("HMP_AGENT_MODEL".into(), model));
         }
 
         // Every structured view worker runs through `aoe __acp-runner` so it
-        // survives `aoe serve --stop`. The runner binds the socket path
+        // survives `hmp serve --stop`. The runner binds the socket path
         // computed here and the daemon dials it.
         let socket_path = super::worker_registry::socket_path_for(&session_id).map_err(|e| {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
@@ -1632,7 +1632,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     }
                                 }
                                 // Mirror into the on-disk registry so a fresh
-                                // `aoe serve` after a daemon restart issues
+                                // `hmp serve` after a daemon restart issues
                                 // `session/load` instead of `session/new`.
                                 super::worker_registry::update_stored_acp_session_id(
                                     &session_id,
@@ -1840,12 +1840,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 info!(
                                     target: "acp.supervisor",
                                     session = %session_id,
-                                    "worker registry deleted by user (`aoe acp stop|kill`); \
+                                    "worker registry deleted by user (`hmp acp stop|kill`); \
                                      dropping WorkerHandle without respawn"
                                 );
                                 // Emit a Stopped so the UI clears any
                                 // "thinking" indicator the user might have
-                                // been staring at when they ran `aoe acp
+                                // been staring at when they ran `hmp acp
                                 // stop`. The reconciler will spawn a fresh
                                 // worker on its next tick if the session is
                                 // still structured_view.
@@ -2293,10 +2293,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Shutdown every worker. Called when the user explicitly terminates
-    /// all structured view workers (e.g. `aoe acp stop --all`); sends ACP
+    /// all structured view workers (e.g. `hmp acp stop --all`); sends ACP
     /// shutdown to each connected client, aborts the drain task, AND
     /// signals every per-session `aoe __acp-runner` so the agent
-    /// subprocess dies. For the everyday `aoe serve --stop` flow, use
+    /// subprocess dies. For the everyday `hmp serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
     pub async fn shutdown_all(&self) {
         let registry_pids: Vec<(String, u32)> = super::worker_registry::list()
@@ -2328,8 +2328,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Drop the daemon-side handle to every worker without killing the
-    /// runner or its agent. Used on `aoe serve` graceful shutdown so the
-    /// agents keep running and the next `aoe serve` reattaches.
+    /// runner or its agent. Used on `hmp serve` graceful shutdown so the
+    /// agents keep running and the next `hmp serve` reattaches.
     ///
     /// Concretely: closes the unix-socket connection (via `client
     /// .shutdown()` which sends `ClientCmd::Shutdown` to the connection
@@ -2344,7 +2344,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 target: "acp.supervisor",
                 count = drained.len(),
                 "detaching structured view workers; they continue running. \
-                 Use `aoe acp stop` to terminate."
+                 Use `hmp acp stop` to terminate."
             );
             drained
         };
@@ -2357,7 +2357,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Reattach to an already-running worker by dialing its existing
-    /// runner socket. Used by `reconcile_acp_workers` on `aoe serve`
+    /// runner socket. Used by `reconcile_acp_workers` on `hmp serve`
     /// startup before falling back to a fresh spawn.
     ///
     /// `in_flight_turn` should be true when the on-disk event store
@@ -2574,7 +2574,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Reap workers whose on-disk registry entry has disappeared while
     /// the in-memory `WorkerHandle` is still installed. This is the
-    /// out-of-band stop signal: `aoe acp stop|kill|restart` (a
+    /// out-of-band stop signal: `hmp acp stop|kill|restart` (a
     /// separate process from the daemon) deletes the registry entry,
     /// then SIGTERMs the runner. The daemon's protocol-layer connection
     /// task blocks on `cmd_rx.recv()` while idle, so socket EOF does
@@ -2682,7 +2682,7 @@ enum RestartDecision {
     /// The on-disk worker registry entry for this session was deleted
     /// while the in-memory WorkerHandle still exists. Signals that the
     /// user (or a peer process) explicitly stopped this worker via
-    /// `aoe acp stop|kill`. The drain task removes the WorkerHandle
+    /// `hmp acp stop|kill`. The drain task removes the WorkerHandle
     /// and emits a soft `Stopped` event instead of burning the restart
     /// budget with respawns of an agent the user just terminated.
     UserStopped,
@@ -2703,7 +2703,7 @@ async fn restart_decision(
     };
     // Registry-deletion signal: if the on-disk record for this session
     // was removed but we still hold a WorkerHandle, the user terminated
-    // the runner externally (`aoe acp stop|kill`). Don't respawn;
+    // the runner externally (`hmp acp stop|kill`). Don't respawn;
     // the reconciler will handle a fresh spawn on its next tick if the
     // session is still `structured_view = true`. Returning `UserStopped`
     // both skips the respawn budget bookkeeping and lets the drain task
@@ -2811,7 +2811,7 @@ pub struct ChannelSink {
     /// and the supervisor's startup `hydrate_seqs` all read from here.
     /// Each publish has a monotonic seq from `Supervisor::next_seqs`
     /// which is hydrated from this store at startup, so seqs survive
-    /// `aoe serve` restart without coordination.
+    /// `hmp serve` restart without coordination.
     pub event_store: Arc<crate::acp::event_store::EventStore>,
 }
 
@@ -2980,15 +2980,15 @@ mod tests {
 
     #[test]
     fn command_override_skips_when_agent_differs_from_logical_tool() {
-        let mut s = spec("aoe-agent", &[]);
+        let mut s = spec("hmp-agent", &[]);
         apply_agent_command_override(
-            "aoe-agent",
+            "hmp-agent",
             true,
             &ovr("opencode", "opencode-plannotator"),
             &mut s,
         )
         .unwrap();
-        assert_eq!(s.command, "aoe-agent");
+        assert_eq!(s.command, "hmp-agent");
     }
 
     /// In-memory sink that captures published frames.
@@ -3340,7 +3340,7 @@ mod tests {
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
-    /// Regression: `aoe acp stop|kill` deletes the registry entry,
+    /// Regression: `hmp acp stop|kill` deletes the registry entry,
     /// then SIGTERMs the runner. The daemon's drain task sees socket EOF
     /// and consults `restart_decision`. With the registry entry gone but
     /// the in-memory `WorkerHandle` still installed, `restart_decision`
@@ -3412,7 +3412,7 @@ mod tests {
     }
 
     /// `reap_user_stopped` is the polling fallback that catches the
-    /// `aoe acp stop|kill` case the drain task cannot detect on its
+    /// `hmp acp stop|kill` case the drain task cannot detect on its
     /// own (idle connection task blocks on `cmd_rx.recv()`, so socket
     /// EOF never propagates back). When a runner-managed worker's
     /// registry entry vanishes, the reaper must:
@@ -3498,7 +3498,7 @@ mod tests {
         }
     }
 
-    /// `reap_user_stopped` distinguishes `aoe acp restart` from `stop`
+    /// `reap_user_stopped` distinguishes `hmp acp restart` from `stop`
     /// via the `.restart` sentinel: the CLI's restart path writes the
     /// marker BEFORE deleting the registry, and the reaper consumes it
     /// to (a) publish `restart_pending` instead of `user_stopped`, and
@@ -3550,7 +3550,7 @@ mod tests {
                 },
             );
         }
-        // Simulate `aoe acp restart`: registry already deleted (no
+        // Simulate `hmp acp restart`: registry already deleted (no
         // file at record_path); marker file written before delete.
         crate::acp::worker_registry::mark_restart_pending("s-restart");
 
@@ -4475,7 +4475,7 @@ mod tests {
     /// in-memory ones. Issue #1037 called this out explicitly: a fresh
     /// daemon spawn must not race the reconciler and over-spawn while
     /// it's still attaching to live runners. Without this, two
-    /// consecutive `aoe serve` invocations could push the worker count
+    /// consecutive `hmp serve` invocations could push the worker count
     /// past `max_concurrent_workers`.
     #[tokio::test]
     #[serial_test::serial]
@@ -4618,7 +4618,7 @@ mod tests {
     /// Restart simulation: publish through one Supervisor, drop it,
     /// reopen the EventStore at the same path, hydrate a fresh
     /// Supervisor's seqs from disk, and verify the next publish gets
-    /// stored_max + 1 (not 1). This is exactly what `aoe serve`
+    /// stored_max + 1 (not 1). This is exactly what `hmp serve`
     /// startup does after an unclean shutdown.
     #[tokio::test]
     async fn supervisor_resumes_seq_counter_from_disk_after_restart() {

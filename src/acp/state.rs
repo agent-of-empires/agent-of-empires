@@ -303,7 +303,7 @@ pub struct ConfigOptionSwitchFailure {
     pub reason: String,
 }
 
-/// Structured detail about why aoe refused to enter the session after
+/// Structured detail about why hmp refused to enter the session after
 /// the ACP `initialize` handshake completed. Distinct from the runtime
 /// `Stopped` taxonomy: a startup error means the session never reached
 /// the Running state. The structured view UI short-circuits its normal render
@@ -695,7 +695,7 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
     },
-    /// A cancel was requested for the in-flight turn: aoe sent the ACP
+    /// A cancel was requested for the in-flight turn: hmp sent the ACP
     /// `session/cancel` notification and armed the escalation watchdog.
     /// The turn is NOT over yet (no `Stopped`); this lets the UI show a
     /// "Stopping..." state and reveal a force-stop affordance instead of
@@ -767,7 +767,7 @@ pub enum Event {
     /// `intro`/`outro` are the effective values the user approved in the
     /// dialog (trimmed intro, defaulted outro), so replay matches what
     /// the agent received. Replaces the legacy
-    /// `<!-- aoe:diff-comments:v1 ... -->` sentinel carried inside an
+    /// `<!-- hmp:diff-comments:v1 ... -->` sentinel carried inside an
     /// ordinary `UserPromptSent`; older persisted sentinel events keep
     /// rendering via the frontend decode fallback.
     #[serde(rename_all = "camelCase")]
@@ -795,7 +795,7 @@ pub enum Event {
     /// Agent-assigned ACP session id from a successful `session/new`.
     /// Server-side listener catches this and persists the id on
     /// `Instance.acp_session_id` so the next spawn can call
-    /// `session/load` and the model retains context across `aoe serve`
+    /// `session/load` and the model retains context across `hmp serve`
     /// restarts. Not emitted on `session/load` success (id unchanged).
     AcpSessionAssigned {
         acp_session_id: String,
@@ -1084,7 +1084,7 @@ mod tests {
     fn fresh_state() -> AcpState {
         AcpState::new(
             AcpSessionId("s-1".into()),
-            AgentName("aoe-agent".into()),
+            AgentName("hmp-agent".into()),
             Some("claude-opus-4-7".into()),
         )
     }

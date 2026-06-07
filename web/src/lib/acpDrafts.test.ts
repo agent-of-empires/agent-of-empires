@@ -260,10 +260,10 @@ describe("sweepOrphanDrafts", () => {
   });
 
   it("leaves non-draft keys untouched", () => {
-    localStorage.setItem("aoe:other", "untouched");
+    localStorage.setItem("hmp:other", "untouched");
     localStorage.setItem("acp:draft:s-orphan", "gone");
     sweepOrphanDrafts(new Set());
-    expect(localStorage.getItem("aoe:other")).toBe("untouched");
+    expect(localStorage.getItem("hmp:other")).toBe("untouched");
     expect(localStorage.getItem("acp:draft:s-orphan")).toBeNull();
   });
 

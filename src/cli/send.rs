@@ -1,4 +1,4 @@
-//! `agent-of-empires send` subcommand implementation
+//! `hmp send` subcommand implementation
 
 use anyhow::{bail, Result};
 use clap::Args;
@@ -78,7 +78,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let tmux_session = crate::tmux::Session::new(&session_id, &session_title)?;
     if !tmux_session.exists() {
         bail!(
-            "Session is not running. Start it first with: aoe session start {}",
+            "Session is not running. Start it first with: hmp session start {}",
             args.identifier
         );
     }

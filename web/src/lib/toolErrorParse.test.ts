@@ -90,11 +90,11 @@ describe("parseToolError", () => {
     // Regression for the reported case: a `Read` of a missing file
     // returns this exact shape from claude-agent-acp.
     const raw =
-      "<tool_use_error>File does not exist. Note: your current working directory is /Users/seluj78/aoe/dev-agent-of-empires-worktrees/test31.</tool_use_error>";
+      "<tool_use_error>File does not exist. Note: your current working directory is /Users/seluj78/aoe/dev-hmp-worktrees/test31.</tool_use_error>";
     const parsed = parseToolError(raw);
     expect(parsed.tag).toBe("tool_use_error");
     expect(parsed.body).toBe(
-      "File does not exist. Note: your current working directory is /Users/seluj78/aoe/dev-agent-of-empires-worktrees/test31.",
+      "File does not exist. Note: your current working directory is /Users/seluj78/aoe/dev-hmp-worktrees/test31.",
     );
   });
 });

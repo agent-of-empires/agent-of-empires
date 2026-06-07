@@ -2,12 +2,12 @@
 //!
 //! Architecture summary (see design doc v4 for the full picture):
 //!
-//! - aoe is an ACP **client**.
+//! - hmp is an ACP **client**.
 //! - Backends are ACP **agents** spawned as subprocesses.
 //! - Day-one backends: `claude-code` (Anthropic's official ACP adapter) and
-//!   `aoe-agent` (our Node binary, Vercel AI SDK 6).
+//!   `hmp-agent` (our Node binary, Vercel AI SDK 6).
 //! - File-system access (`fs/*`) and terminal execution (`terminal/*`) are
-//!   delegated from the agent to aoe via ACP. aoe owns the disk; the agent
+//!   delegated from the agent to hmp via ACP. hmp owns the disk; the agent
 //!   only orchestrates the model.
 //! - State lives behind a single-writer actor; all mutations flow through
 //!   `state::apply_event`.

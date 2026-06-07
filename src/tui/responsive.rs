@@ -1,6 +1,6 @@
 //! Viewport breakpoints and layout helpers for narrow terminals.
 //!
-//! aoe runs over Mosh on phones and tablets where the viewport can be
+//! hmp runs over Mosh on phones and tablets where the viewport can be
 //! anywhere from ~26 cols (iPhone-portrait Mosh, soft keyboard up) to
 //! ~250 cols (full-screen desktop). All width/height-driven layout
 //! decisions live here so the device-class assumptions are visible in

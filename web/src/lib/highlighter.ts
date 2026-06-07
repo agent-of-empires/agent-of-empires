@@ -5,7 +5,7 @@ import { createOnigurumaEngine } from "shiki/engine/oniguruma";
 let instance: HighlighterCore | null = null;
 let loading: Promise<HighlighterCore> | null = null;
 
-/** Shiki theme module imports for every theme an AoE-resolved theme
+/** Shiki theme module imports for every theme an HMP-resolved theme
  *  can name. Unknown values fall back to `DEFAULT_SHIKI_THEME`. Lazy
  *  imports so users on Empire don't pay for the Dracula/Tokyo Night
  *  modules they never see. */
@@ -22,7 +22,7 @@ const SHIKI_THEME_IMPORTS: Record<string, () => Promise<unknown>> = {
 
 /** Fallback Shiki themes when the resolver names a theme this bundle
  *  doesn't carry (user-defined themes with arbitrary shiki_theme
- *  entries). Picked by appearance so a light AoE theme falling back
+ *  entries). Picked by appearance so a light HMP theme falling back
  *  doesn't end up rendering code on a light surface with a dark
  *  syntax theme. */
 export const DEFAULT_SHIKI_THEME = "github-dark";
@@ -60,7 +60,7 @@ export async function getHighlighter(): Promise<HighlighterCore> {
  *  highlighter. Returns the name the caller should pass to
  *  `codeToHtml` / `codeToTokens`: the requested name if it loaded
  *  cleanly, otherwise an appearance-appropriate fallback
- *  (`github-dark` / `github-light`) so a light AoE theme isn't
+ *  (`github-dark` / `github-light`) so a light HMP theme isn't
  *  rendered with a dark syntax palette. Idempotent. */
 export async function ensureThemeLoaded(
   name: string,

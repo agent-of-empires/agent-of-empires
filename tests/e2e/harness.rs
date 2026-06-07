@@ -267,7 +267,7 @@ last_seen_version = "{}"
         std::fs::create_dir_all(config_dir.join("profiles").join("default"))
             .expect("create default profile dir");
 
-        let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_aoe"));
+        let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_hmp"));
 
         let recording = recording_enabled() && asciinema_available();
         if recording_enabled() && !asciinema_available() {

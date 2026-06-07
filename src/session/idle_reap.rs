@@ -122,7 +122,7 @@ pub fn should_auto_stop_session(
 }
 
 /// Atomically claim an idle session for auto-stop, under the per-profile
-/// storage file lock so concurrent reapers (a standalone TUI and an `aoe serve`
+/// storage file lock so concurrent reapers (a standalone TUI and an `hmp serve`
 /// daemon against the same on-disk state) cannot double-stop it.
 ///
 /// Re-reads the session from disk inside the lock and re-checks eligibility

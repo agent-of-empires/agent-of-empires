@@ -1,8 +1,8 @@
-//! Serve dialog: drives the `aoe serve --daemon` lifecycle (either Local
+//! Serve dialog: drives the `hmp serve --daemon` lifecycle (either Local
 //! network mode on 0.0.0.0, or Cloudflare Tunnel mode) and shows a QR +
 //! URL + (passphrase for Tunnel) + log tail so a phone can connect. The
 //! TUI is a controller here, not a host: it spawns the daemon, reads
-//! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `aoe serve --stop`
+//! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `hmp serve --stop`
 //! to tear down. The daemon survives across TUI quits, just like tmux
 //! sessions or the CLI-invoked daemon path.
 //!
@@ -93,7 +93,7 @@ pub use crate::cli::serve::{read_serve_urls, ServeUrl};
 /// the Remote Access dialog after closing it can re-display the same
 /// passphrase instead of the "set at startup" placeholder. Cleared when
 /// the daemon is stopped from this process. A daemon spawned by a
-/// separate `aoe serve` invocation (outside this TUI) leaves this None,
+/// separate `hmp serve` invocation (outside this TUI) leaves this None,
 /// so we correctly fall back to the placeholder for those.
 static LAST_SPAWNED_PASSPHRASE: Mutex<Option<String>> = Mutex::new(None);
 
@@ -229,7 +229,7 @@ pub enum ServeViewState {
         /// Transient message (e.g. "opened admin console").
         flash: Option<(String, Instant)>,
     },
-    /// We issued `aoe serve --daemon`; now polling `serve.url`.
+    /// We issued `hmp serve --daemon`; now polling `serve.url`.
     /// `passphrase` is Some only for Tunnel spawns from this TUI.
     /// `log_tail` is a rolling window of the configured log file (since the
     /// captured offset taken before spawn) so the user sees real progress
@@ -719,7 +719,7 @@ impl ServeView {
                         }
                         Err(e) => {
                             self.state = ServeViewState::Error(format!(
-                                "Stop failed: {}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.",
+                                "Stop failed: {}. Daemon may still be running; retry or use `hmp serve --stop` from a shell.",
                                 e
                             ));
                             ServeAction::Continue
@@ -958,10 +958,10 @@ impl ServeView {
                     };
                     let prefix = match mode {
                         ServeMode::Tunnel => {
-                            "`aoe serve --remote --daemon` exited before the tunnel came up."
+                            "`hmp serve --remote --daemon` exited before the tunnel came up."
                         }
                         ServeMode::Local => {
-                            "`aoe serve --daemon` exited before the server started."
+                            "`hmp serve --daemon` exited before the server started."
                         }
                     };
                     self.state = ServeViewState::Error(format!("{}{}{}", prefix, hint, detail));
@@ -981,7 +981,7 @@ impl ServeView {
                         Ok(()) => "Stuck daemon stopped.".to_string(),
                         Err(e) => format!(
                             "Daemon may still be running \
-                             (tried to stop: {}). Stop manually with `aoe serve --stop`.",
+                             (tried to stop: {}). Stop manually with `hmp serve --stop`.",
                             e
                         ),
                     };
@@ -997,7 +997,7 @@ impl ServeView {
                          {}\n\n\
                          Most likely cause: Tailscale Funnel needs HTTPS certs \
                          or ACL approval, OR cloudflared is rate-limited / \
-                         offline. Re-run with AGENT_OF_EMPIRES_DEBUG=1 and \
+                         offline. Re-run with HMP_DEBUG=1 and \
                          check debug.log for details.{}",
                         TUNNEL_STARTUP_TIMEOUT_SECS, stop_note, tail_detail
                     ));
@@ -1089,7 +1089,7 @@ impl ServeView {
     }
 }
 
-/// Spawn the aoe serve daemon in the requested mode. Tunnel requires a
+/// Spawn the hmp serve daemon in the requested mode. Tunnel requires a
 /// passphrase (it's public-internet exposure) and a transport choice;
 /// Local ignores both.
 fn spawn_daemon(
@@ -1111,7 +1111,7 @@ fn spawn_daemon(
     }
 
     let exe =
-        std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))?;
+        std::env::current_exe().map_err(|e| format!("Could not resolve hmp binary path: {}", e))?;
 
     // Delete stale serve.url / serve.mode / serve.passphrase from a
     // previous hard-killed daemon before launching. Without this,
@@ -1128,7 +1128,7 @@ fn spawn_daemon(
     // bookmark the URL and not have to re-paste it after every restart.
     // Only generate a fresh random port on the very first launch (or if
     // the persisted file is missing). This avoids colliding with a user's
-    // own `aoe serve` on the default 8080.
+    // own `hmp serve` on the default 8080.
     let port: u16 = load_or_generate_port();
 
     let mut cmd = Command::new(&exe);
@@ -1145,7 +1145,7 @@ fn spawn_daemon(
                 cmd.arg("--no-tailscale");
             }
             if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
+                cmd.env("HMP_SERVE_PASSPHRASE", pp);
             }
         }
         ServeMode::Local => {
@@ -1165,7 +1165,7 @@ fn spawn_daemon(
 
     let status = cmd
         .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
+        .map_err(|e| format!("Failed to launch `hmp serve --daemon`: {}", e))?;
 
     if !status.success() {
         // If the daemon failed because the port was in use, clear the
@@ -1187,7 +1187,7 @@ fn spawn_daemon(
             ServeMode::Local => format!("Most likely port {} is in use.", port),
         };
         return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
+            "`hmp serve --daemon` exited with {:?}. {}",
             status.code(),
             hint
         ));
@@ -1228,12 +1228,12 @@ fn stop_daemon() -> Result<(), String> {
     use std::process::Command;
 
     let exe =
-        std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))?;
+        std::env::current_exe().map_err(|e| format!("Could not resolve hmp binary path: {}", e))?;
 
     let output = Command::new(&exe)
         .args(["serve", "--stop"])
         .output()
-        .map_err(|e| format!("Failed to invoke `aoe serve --stop`: {}", e))?;
+        .map_err(|e| format!("Failed to invoke `hmp serve --stop`: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1268,7 +1268,7 @@ fn read_serve_mode() -> Option<ServeMode> {
 
 /// Read the last mode the user picked (across TUI restarts). Used to
 /// default the ModePicker highlight on subsequent opens. Stored in a
-/// separate file from `serve.mode` so it survives `aoe serve --stop`.
+/// separate file from `serve.mode` so it survives `hmp serve --stop`.
 fn read_last_mode() -> Option<ServeMode> {
     let dir = crate::session::get_app_dir().ok()?;
     let raw = std::fs::read_to_string(dir.join("serve.last_mode")).ok()?;
@@ -1323,13 +1323,13 @@ fn initial_log_tail() -> Vec<String> {
     };
     let all: Vec<&str> = contents.lines().collect();
     // debug.log carries TUI + runner + daemon lines now that serve.log is
-    // gone. Anchor the initial tail at the last [AOE_START_MARKER] (written
+    // gone. Anchor the initial tail at the last [HMP_START_MARKER] (written
     // by `init_subscriber` for every process) so we show the current
     // daemon's run rather than mixed history. Falls back to the trailing
     // window when no marker is found.
     let anchor = all
         .iter()
-        .rposition(|line| line.contains("[AOE_START_MARKER]"))
+        .rposition(|line| line.contains("[HMP_START_MARKER]"))
         .unwrap_or_else(|| all.len().saturating_sub(LOG_TAIL_LINES));
     let from = anchor.min(all.len());
     let window = &all[from..];
@@ -2135,7 +2135,7 @@ fn render_active(
         let (pp_label, pp_style) = match passphrase {
             Some(pp) => (pp.to_string(), Style::default().fg(theme.accent).bold()),
             None => (
-                "(set when the daemon started; check the shell that ran `aoe serve`)".to_string(),
+                "(set when the daemon started; check the shell that ran `hmp serve`)".to_string(),
                 Style::default().fg(theme.dimmed),
             ),
         };

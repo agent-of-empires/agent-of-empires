@@ -1,4 +1,4 @@
-//! Wire-format types shared between the structured view daemon (`aoe serve`)
+//! Wire-format types shared between the structured view daemon (`hmp serve`)
 //! and its HTTP / WebSocket clients (web frontend, CLI structured view verbs,
 //! and the TUI structured view).
 //!
@@ -259,7 +259,7 @@ pub struct SwitchAgentRequest {
     /// Why the switch happened, recorded verbatim in the `AgentSwitched`
     /// event and surfaced in the transcript divider. The rate-limit
     /// recovery flow sends `"rate_limited"`; an explicit user-initiated
-    /// switch (composer control, `aoe acp switch-agent`) sends
+    /// switch (composer control, `hmp acp switch-agent`) sends
     /// `"manual"`. Defaults to `"manual"` when omitted.
     #[serde(default)]
     pub reason: Option<String>,

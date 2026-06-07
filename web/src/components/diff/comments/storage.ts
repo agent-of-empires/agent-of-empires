@@ -5,7 +5,7 @@ import {
 } from "../../../lib/safeStorage";
 import type { DiffComment, DiffCommentsStorageV1 } from "./types";
 
-const KEY_PREFIX = "aoe:diff-comments:v1:";
+const KEY_PREFIX = "hmp:diff-comments:v1:";
 
 export function storageKey(sessionId: string): string {
   return `${KEY_PREFIX}${sessionId}`;
@@ -86,7 +86,7 @@ export function clearStoredComments(sessionId: string): void {
   safeRemoveItem(storageKey(sessionId));
 }
 
-// Remove every `aoe:diff-comments:v1:<id>` key whose session id is not in
+// Remove every `hmp:diff-comments:v1:<id>` key whose session id is not in
 // the given active set. Run once on app mount to catch keys left behind by
 // session deletions in another tab or on another device, and to retroactively
 // clear empty keys written before the empty-removal fix landed. Mirrors

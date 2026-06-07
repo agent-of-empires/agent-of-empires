@@ -203,10 +203,10 @@ fn validate_attachments(
 #[derive(Debug, Deserialize)]
 pub struct SpawnAcpRequest {
     /// Optional override; falls back to the acp_default_agent
-    /// setting / aoe-agent.
+    /// setting / hmp-agent.
     pub agent: Option<String>,
-    /// Optional model override; forwarded to aoe-agent as
-    /// AOE_AGENT_MODEL env var.
+    /// Optional model override; forwarded to hmp-agent as
+    /// HMP_AGENT_MODEL env var.
     pub model: Option<String>,
     /// Optional additional dirs the agent may read/write through
     /// fs/*. The session's worktree is always allowed.
@@ -231,7 +231,7 @@ pub struct SpawnAcpResponse {
     pub status: &'static str,
 }
 
-/// 403 helper for `aoe serve --read-only`. Matches the response shape used
+/// 403 helper for `hmp serve --read-only`. Matches the response shape used
 /// by `sessions.rs` write endpoints so the read-only contract is uniform
 /// across the API surface.
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
@@ -415,7 +415,7 @@ pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
 /// Two callers drive this: the rate-limit recovery flow (#1282), which
 /// hands a Claude-rate-limited session off to `codex` (or another
 /// installed backend), and explicit user-initiated switches from the
-/// composer control or `aoe acp switch-agent`. Both keep the
+/// composer control or `hmp acp switch-agent`. Both keep the
 /// transcript; only the recorded `reason` differs.
 ///
 /// Sequence:
@@ -1042,7 +1042,7 @@ pub struct WorkerLogResponse {
 }
 
 /// Tail of the per-session structured view runner log file. Surfaces the same
-/// stream `aoe acp logs --session <id>` reads, so a dashboard user
+/// stream `hmp acp logs --session <id>` reads, so a dashboard user
 /// (Funnel / no host terminal) can see the verbatim adapter error when
 /// the structured view startup banner is otherwise opaque. Read-only; allowed
 /// in `--read-only` mode.
@@ -1746,7 +1746,7 @@ pub async fn acp_replay(
     axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
 ) -> impl IntoResponse {
     // Reads from the disk-backed event store so reload, session-switch,
-    // and `aoe serve` restart all reconstruct the full conversation
+    // and `hmp serve` restart all reconstruct the full conversation
     // (subject to the per-session retention cap). The in-memory replay
     // buffer is still consulted on WS connect for the hot path; this
     // endpoint backstops that when the in-memory ring is cold (server

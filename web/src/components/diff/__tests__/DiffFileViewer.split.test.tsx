@@ -125,7 +125,7 @@ describe("DiffFileViewer split layout", () => {
       screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
     ).toBe("split");
     expect(
-      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}")
+      JSON.parse(window.localStorage.getItem("hmp-web-settings") ?? "{}")
         .diffViewLayout,
     ).toBe("split");
   });

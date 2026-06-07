@@ -9,7 +9,7 @@
 //! forwarded can never diverge.
 //!
 //! The on-disk shape is the ecosystem-standard `.mcp.json` (`mcpServers` map),
-//! the same shape AoE already reads for the global and per-profile layers.
+//! the same shape HMP already reads for the global and per-profile layers.
 //! Unlike those, a project-local file is repo-provided and therefore only
 //! forwarded once the repo is trusted: a stdio server launches its `command`
 //! the moment a session spawns, so an untrusted repo's `.mcp.json` is a

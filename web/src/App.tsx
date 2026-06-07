@@ -109,10 +109,10 @@ import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 
-const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
+const RIGHT_PANEL_COLLAPSED_KEY = "hmp-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
-const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
+const LEGACY_TOUR_SEEN_KEY = "hmp-tour-seen";
 
 export default function App() {
   // Apply the user-selected theme as CSS custom properties on the root

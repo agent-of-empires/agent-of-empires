@@ -966,7 +966,7 @@ fn test_profile_override_beats_global_default_tool() {
 // --- confirm_create_dir tests ---
 
 fn nonexistent_dialog() -> NewSessionDialog {
-    NewSessionDialog::new_with_tools(vec!["claude"], "/__aoe_nonexistent__/project".to_string())
+    NewSessionDialog::new_with_tools(vec!["claude"], "/__hmp_nonexistent__/project".to_string())
 }
 
 #[test]
@@ -1074,7 +1074,7 @@ fn test_confirm_enter_no_cancels() {
 fn test_confirm_create_failure_shows_error() {
     let mut dialog = NewSessionDialog::new_with_tools(
         vec!["claude"],
-        "/proc/aoe_test_cannot_create".to_string(),
+        "/proc/hmp_test_cannot_create".to_string(),
     );
     dialog.confirm_create_dir = Some(true);
     let result = dialog.handle_key(key(KeyCode::Char('y')));
@@ -1159,7 +1159,7 @@ fn test_profile_switch_reloads_sandbox_env_without_session_override() {
     let app_dir = crate::session::get_app_dir().expect("app dir");
     let profiles_dir = app_dir.join("profiles");
     fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
-    fs::create_dir_all(profiles_dir.join("aoe")).expect("aoe profile");
+    fs::create_dir_all(profiles_dir.join("hmp")).expect("aoe profile");
     fs::write(
         app_dir.join("config.toml"),
         r#"
@@ -1172,7 +1172,7 @@ environment = ["THING=$OLD_THING"]
     )
     .expect("global config");
     fs::write(
-        profiles_dir.join("aoe").join("config.toml"),
+        profiles_dir.join("hmp").join("config.toml"),
         r#"
 [sandbox]
 environment = ["THING=$NEW_THING"]
@@ -1181,7 +1181,7 @@ environment = ["THING=$NEW_THING"]
     .expect("profile config");
 
     let mut dialog = single_tool_dialog();
-    dialog.available_profiles = vec!["default".to_string(), "aoe".to_string()];
+    dialog.available_profiles = vec!["default".to_string(), "hmp".to_string()];
     dialog.profile_descriptions = vec![None, None];
     dialog.profile_index = 0;
     dialog.docker_available = true;
@@ -1191,14 +1191,14 @@ environment = ["THING=$NEW_THING"]
     dialog.focused_field = 0;
     dialog.handle_key(key(KeyCode::Right));
 
-    assert_eq!(dialog.selected_profile(), "aoe");
+    assert_eq!(dialog.selected_profile(), "hmp");
     assert!(dialog.sandbox_enabled);
     assert_eq!(dialog.extra_env, vec!["THING=$NEW_THING".to_string()]);
     assert!(!dialog.extra_env_overridden);
 
     match dialog.build_submit_result() {
         DialogResult::Submit(data) => {
-            assert_eq!(data.profile, "aoe");
+            assert_eq!(data.profile, "hmp");
             assert!(
                 data.extra_env.is_empty(),
                 "inherited sandbox env must not become a session override"
@@ -1245,9 +1245,9 @@ environment = ["THING=$OLD_THING"]
     .expect("global config");
 
     let repo = tempfile::tempdir().expect("repo dir");
-    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::create_dir_all(repo.path().join(".hmp")).expect("repo config dir");
     fs::write(
-        repo.path().join(".agent-of-empires/config.toml"),
+        repo.path().join(".hmp/config.toml"),
         r#"
 [sandbox]
 environment = ["THING=$REPO_THING"]
@@ -1310,9 +1310,9 @@ environment = ["THING=$OLD_THING"]
     .expect("global config");
 
     let repo = tempfile::tempdir().expect("repo dir");
-    fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+    fs::create_dir_all(repo.path().join(".hmp")).expect("repo config dir");
     fs::write(
-        repo.path().join(".agent-of-empires/config.toml"),
+        repo.path().join(".hmp/config.toml"),
         r#"
 [sandbox]
 environment = ["THING=$REPO_THING"]

@@ -155,7 +155,7 @@ impl RuntimeBase {
     }
 
     pub fn default_sandbox_image(&self) -> &'static str {
-        "ghcr.io/agent-of-empires/aoe-sandbox:latest"
+        "ghcr.io/hmp/hmp-sandbox:latest"
     }
 
     pub fn effective_default_image(&self) -> String {
@@ -194,7 +194,7 @@ impl RuntimeBase {
             }
             if config.selinux_relabel && self.supports_selinux_relabel {
                 // `:z` (shared) relabels the host path to a container-accessible
-                // SELinux type. Shared rather than `:Z` because aoe mounts the
+                // SELinux type. Shared rather than `:Z` because hmp mounts the
                 // credential dir into multiple sandbox containers.
                 opts.push("z");
             }
@@ -686,7 +686,7 @@ mod tests {
             volumes: vec![],
             anonymous_volumes: vec![],
             named_ignore_volumes: vec![NamedVolumeMount {
-                volume_name: "aoe-vi-sess1-workspace-node_modules-abc123def456".to_string(),
+                volume_name: "hmp-vi-sess1-workspace-node_modules-abc123def456".to_string(),
                 container_path: "/workspace/node_modules".to_string(),
             }],
             environment: vec![],
@@ -708,7 +708,7 @@ mod tests {
 
         assert!(
             volume_args.contains(
-                &"aoe-vi-sess1-workspace-node_modules-abc123def456:/workspace/node_modules"
+                &"hmp-vi-sess1-workspace-node_modules-abc123def456:/workspace/node_modules"
             ),
             "Named volume must render as name:/path, got: {:?}",
             volume_args
@@ -724,7 +724,7 @@ mod tests {
             volumes: vec![],
             anonymous_volumes: vec![],
             named_ignore_volumes: vec![NamedVolumeMount {
-                volume_name: "aoe-vi-sess1-workspace-node_modules-abc123".to_string(),
+                volume_name: "hmp-vi-sess1-workspace-node_modules-abc123".to_string(),
                 container_path: "/workspace/node_modules".to_string(),
             }],
             environment: vec![],
@@ -751,7 +751,7 @@ mod tests {
             volume_args
         );
         assert!(
-            !volume_args.iter().any(|a| a.contains("aoe-vi-")),
+            !volume_args.iter().any(|a| a.contains("hmp-vi-")),
             "Apple Container must not use the volume name in -v args"
         );
     }

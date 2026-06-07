@@ -59,11 +59,11 @@ mod tests {
 
     #[test]
     fn override_leaf_keeps_siblings() {
-        let mut base = json!({"acp": {"enabled": false, "default_agent": "aoe-agent"}});
+        let mut base = json!({"acp": {"enabled": false, "default_agent": "hmp-agent"}});
         merge_json(&mut base, &json!({"acp": {"enabled": true}}));
         assert_eq!(
             base,
-            json!({"acp": {"enabled": true, "default_agent": "aoe-agent"}})
+            json!({"acp": {"enabled": true, "default_agent": "hmp-agent"}})
         );
     }
 

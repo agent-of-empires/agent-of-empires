@@ -26,7 +26,7 @@ describe("pickWorkerStoppedVariant", () => {
 
   it("returns 'archived' when the session is archived", () => {
     // Regression: an archived structured view session must not show the
-    // generic `aoe acp stop` reconnect banner. Reconnecting from
+    // generic `hmp acp stop` reconnect banner. Reconnecting from
     // the structured view would race the reconciler, which skips
     // archived sessions, and the user would see the spawn flicker
     // and then disappear. See #1581.
@@ -70,7 +70,7 @@ describe("pickWorkerStoppedVariant", () => {
     ).toBe("archived");
   });
 
-  it("returns 'generic' for the `aoe acp stop` / external-teardown case", () => {
+  it("returns 'generic' for the `hmp acp stop` / external-teardown case", () => {
     expect(
       pickWorkerStoppedVariant({
         workerStopped: true,

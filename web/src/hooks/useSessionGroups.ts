@@ -5,10 +5,10 @@ import { buildSessionGroups, type SidebarGroup } from "../lib/sidebarGroups";
 import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
-// Distinct from the repo axis prefix (`aoe-repo-collapsed-`) so collapse
+// Distinct from the repo axis prefix (`hmp-repo-collapsed-`) so collapse
 // state is per-axis: collapsing a user group never changes a repo group's
 // state and vice versa. See #1234.
-const COLLAPSED_KEY_PREFIX = "aoe-group-collapsed-";
+const COLLAPSED_KEY_PREFIX = "hmp-group-collapsed-";
 
 function loadCollapsed(id: string): boolean {
   return safeGetItem(`${COLLAPSED_KEY_PREFIX}${id}`) === "1";

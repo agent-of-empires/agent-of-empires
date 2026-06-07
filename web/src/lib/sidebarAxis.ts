@@ -7,7 +7,7 @@ import { safeGetItem, safeSetItem } from "./safeStorage";
  *  Per-browser, like the sort mode. See #1234, #1720. */
 export type SidebarAxis = "repo" | "group" | "repo+group";
 
-export const SIDEBAR_AXIS_KEY = "aoe-sidebar-axis";
+export const SIDEBAR_AXIS_KEY = "hmp-sidebar-axis";
 
 export function loadSidebarAxis(): SidebarAxis {
   const value = safeGetItem(SIDEBAR_AXIS_KEY);

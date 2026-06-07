@@ -136,15 +136,15 @@ impl StatusHookContext {
 
     pub fn env_vars(&self) -> [(&'static str, String); 9] {
         [
-            ("AOE_SESSION_ID", self.session_id.clone()),
-            ("AOE_SESSION_TITLE", self.session_title.clone()),
-            ("AOE_PROJECT_PATH", self.project_path.clone()),
-            ("AOE_PROFILE", self.profile.clone()),
-            ("AOE_TOOL", self.tool.clone()),
-            ("AOE_GROUP_PATH", self.group_path.clone()),
-            ("AOE_OLD_STATUS", self.old_status.as_str().to_string()),
-            ("AOE_NEW_STATUS", self.new_status.as_str().to_string()),
-            ("AOE_STATUS_CHANGED_AT", self.changed_at.to_rfc3339()),
+            ("HMP_SESSION_ID", self.session_id.clone()),
+            ("HMP_SESSION_TITLE", self.session_title.clone()),
+            ("HMP_PROJECT_PATH", self.project_path.clone()),
+            ("HMP_PROFILE", self.profile.clone()),
+            ("HMP_TOOL", self.tool.clone()),
+            ("HMP_GROUP_PATH", self.group_path.clone()),
+            ("HMP_OLD_STATUS", self.old_status.as_str().to_string()),
+            ("HMP_NEW_STATUS", self.new_status.as_str().to_string()),
+            ("HMP_STATUS_CHANGED_AT", self.changed_at.to_rfc3339()),
         ]
     }
 }
@@ -462,14 +462,14 @@ mod tests {
             r#"
             enabled = true
             on_waiting = "notify-send waiting"
-            on_change = "~/bin/aoe-hook"
+            on_change = "~/bin/hmp-hook"
             "#,
         )
         .unwrap();
         assert!(config.enabled);
         assert_eq!(config.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert_eq!(config.on_waiting.as_deref(), Some("notify-send waiting"));
-        assert_eq!(config.on_change.as_deref(), Some("~/bin/aoe-hook"));
+        assert_eq!(config.on_change.as_deref(), Some("~/bin/hmp-hook"));
     }
 
     #[test]
@@ -610,16 +610,16 @@ mod tests {
             changed_at,
         );
         let env = context.env_vars();
-        assert!(env.contains(&("AOE_SESSION_ID", "abc123".to_string())));
-        assert!(env.contains(&("AOE_SESSION_TITLE", "Build API".to_string())));
-        assert!(env.contains(&("AOE_PROJECT_PATH", "/tmp/project".to_string())));
-        assert!(env.contains(&("AOE_PROFILE", "work".to_string())));
-        assert!(env.contains(&("AOE_TOOL", "codex".to_string())));
-        assert!(env.contains(&("AOE_GROUP_PATH", "Backend".to_string())));
-        assert!(env.contains(&("AOE_OLD_STATUS", "running".to_string())));
-        assert!(env.contains(&("AOE_NEW_STATUS", "waiting".to_string())));
+        assert!(env.contains(&("HMP_SESSION_ID", "abc123".to_string())));
+        assert!(env.contains(&("HMP_SESSION_TITLE", "Build API".to_string())));
+        assert!(env.contains(&("HMP_PROJECT_PATH", "/tmp/project".to_string())));
+        assert!(env.contains(&("HMP_PROFILE", "work".to_string())));
+        assert!(env.contains(&("HMP_TOOL", "codex".to_string())));
+        assert!(env.contains(&("HMP_GROUP_PATH", "Backend".to_string())));
+        assert!(env.contains(&("HMP_OLD_STATUS", "running".to_string())));
+        assert!(env.contains(&("HMP_NEW_STATUS", "waiting".to_string())));
         assert!(env.contains(&(
-            "AOE_STATUS_CHANGED_AT",
+            "HMP_STATUS_CHANGED_AT",
             "2026-05-20T10:11:12+00:00".to_string()
         )));
     }

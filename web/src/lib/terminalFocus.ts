@@ -1,4 +1,4 @@
-export const FOCUS_TERMINAL_EVENT = "aoe:focus-terminal";
+export const FOCUS_TERMINAL_EVENT = "hmp:focus-terminal";
 
 export type TerminalFocusTarget = "agent" | "paired" | "composer";
 

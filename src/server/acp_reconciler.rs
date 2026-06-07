@@ -4,7 +4,7 @@
 //!
 //! Responsibilities:
 //!
-//! 1. Honor the `aoe acp stop|kill|restart` side-channel.
+//! 1. Honor the `hmp acp stop|kill|restart` side-channel.
 //! 2. Sweep orphan registry entries whose session is gone.
 //! 3. For every structured view-mode session without a live worker, run a
 //!    resume task: reattach to an existing runner if one is alive,
@@ -141,7 +141,7 @@ pub async fn reconcile_acp_workers(
     // on the current binary.
     respawn_drained_stale_workers(state).await;
 
-    // Detect `aoe acp stop|kill|restart` (a separate process that
+    // Detect `hmp acp stop|kill|restart` (a separate process that
     // deletes the registry entry + SIGTERMs the runner) and surface it
     // as a typed Stopped event. The daemon's protocol-layer connection
     // task blocks on `cmd_rx.recv()` while idle, so socket EOF doesn't
@@ -154,7 +154,7 @@ pub async fn reconcile_acp_workers(
     let restart_pending = state.acp_supervisor.reap_user_stopped().await;
     for id in &restart_pending {
         attempted.remove(id);
-        // `aoe acp restart` is an explicit user retry: wipe the respawn
+        // `hmp acp restart` is an explicit user retry: wipe the respawn
         // budget so a session that was crash-loop-parked gets a clean slate.
         parked.remove(id);
         respawn_history.remove(id);
@@ -645,7 +645,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 /// in-flight turn has finished. Idle is detected with the same
 /// `has_in_flight_turn` event-store probe the resume pass uses.
 ///
-/// For each drained session this mirrors `aoe acp restart`: write the
+/// For each drained session this mirrors `hmp acp restart`: write the
 /// restart marker so the reaper publishes `restart_pending` (the UI shows
 /// "Restarting…" rather than a stop), then SIGTERM the stale runner group
 /// and delete its registry entry. The caller runs the reaper immediately
@@ -925,7 +925,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             crate::acp::worker_registry::delete(&id).ok();
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
-            // older binary (e.g. after `aoe update`) and has no in-flight
+            // older binary (e.g. after `hmp update`) and has no in-flight
             // turn. Replace it now: SIGTERM the stale runner group (which
             // also deletes the registry entry) and fall through to a
             // fresh spawn on the current binary. See #1754.
@@ -1287,7 +1287,7 @@ pub(crate) async fn trigger_resume_background(
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     // Sweep registry entries whose session no longer exists (deleted
     // while serve was down) and SIGTERM the orphan runner so the user
-    // doesn't see a phantom in `aoe acp ps`. Only runs against
+    // doesn't see a phantom in `hmp acp ps`. Only runs against
     // entries that aren't currently in our `workers` map.
     let Ok(records) = crate::acp::worker_registry::list() else {
         return;

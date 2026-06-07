@@ -161,7 +161,7 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
 /// resilient to future tmux scope-inference changes; matches the convention
 /// used by `append_remain_on_exit_args` for `remain-on-exit`.
 ///
-/// `-q` (silently ignore errors) keeps aoe compatible with tmux < 3.3, where
+/// `-q` (silently ignore errors) keeps hmp compatible with tmux < 3.3, where
 /// `allow-passthrough` does not exist. On those versions the set-option call
 /// quietly no-ops instead of failing the whole `new-session` invocation.
 pub fn append_clipboard_passthrough_args(args: &mut Vec<String>, target: &str) {
@@ -237,7 +237,7 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
 /// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
 /// Reads `tmux show-option -gv prefix` once on first call and caches the
 /// result; falls back to "Ctrl+b" if tmux is unavailable or the option can't
-/// be parsed. The prefix can't change while AOE is running, so caching avoids
+/// be parsed. The prefix can't change while HMP is running, so caching avoids
 /// per-render-frame subprocess calls from the welcome dialog.
 pub fn tmux_prefix_display() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn test_append_clipboard_passthrough_args() {
         let mut args: Vec<String> = vec!["new-session".into()];
-        append_clipboard_passthrough_args(&mut args, "aoe_test");
+        append_clipboard_passthrough_args(&mut args, "hmp_test");
         assert_eq!(
             args,
             vec![
@@ -510,7 +510,7 @@ mod tests {
                 "-q",
                 "-w",
                 "-t",
-                "aoe_test",
+                "hmp_test",
                 "allow-passthrough",
                 "on",
             ]
@@ -530,7 +530,7 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_kill_if_present_missing";
+        let name = "hmp_test_kill_if_present_missing";
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", name])
             .output();
@@ -542,7 +542,7 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_kill_if_present_alive";
+        let name = "hmp_test_kill_if_present_alive";
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", name])
             .output();

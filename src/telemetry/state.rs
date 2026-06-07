@@ -54,7 +54,7 @@ struct TelemetryState {
     last_cli_usage_flush: Option<DateTime<Utc>>,
     /// Last time a CLI `cli_usage` send was *attempted* (success or failure).
     /// Bounds retries: while the daily slot is open after a failed send, this stops
-    /// every `aoe` invocation from re-attempting against a down endpoint.
+    /// every `hmp` invocation from re-attempting against a down endpoint.
     #[serde(
         default,
         alias = "last_cli_process_start_attempt",
@@ -93,7 +93,7 @@ fn save_state(state: &TelemetryState) -> Result<()> {
     let content = serde_json::to_string_pretty(state)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
     // The id is mildly sensitive (it's the distinct-install key); keep the
-    // file owner-only, matching the `aoe serve` runtime files.
+    // file owner-only, matching the `hmp serve` runtime files.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -177,7 +177,7 @@ fn open_state_lock_file() -> Result<std::fs::File> {
 }
 
 /// Run a `telemetry.json` read-modify-write under both the process-local mutex
-/// and the cross-process flock, so concurrent updaters (TUI, CLI, `aoe serve`)
+/// and the cross-process flock, so concurrent updaters (TUI, CLI, `hmp serve`)
 /// can never lose each other's writes (the lost-update race in #1877). `f`
 /// receives the loaded state and returns `(value, dirty)`; the state is
 /// persisted only when `dirty` is true, so a pure check never recreates the
@@ -292,7 +292,7 @@ pub fn cli_usage_window() -> (BTreeMap<String, u32>, Option<DateTime<Utc>>) {
 /// older than `success_gap` (or never) AND the last *attempt* is older than
 /// `retry_gap` (or never). `success_gap` is the real once-per-day throttle that
 /// bounds the only unbounded telemetry source; `retry_gap` bounds how often a
-/// failed send is retried so a down endpoint can't turn every `aoe` invocation
+/// failed send is retried so a down endpoint can't turn every `hmp` invocation
 /// into a fresh attempt. Caller is responsible for the opt-in gate. Read-only:
 /// the stamps are written by [`record_cli_usage_flush`] after the send.
 pub fn cli_usage_due(success_gap: Duration, retry_gap: Duration) -> bool {

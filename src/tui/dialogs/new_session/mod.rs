@@ -216,7 +216,7 @@ pub struct NewSessionDialog {
     /// None = inactive, Some(true) = Yes selected, Some(false) = No selected.
     pub(super) confirm_create_dir: Option<bool>,
     /// Scratch-session marker. When true, submission skips the path
-    /// canonicalize/exists checks; the server (or `aoe add` CLI path)
+    /// canonicalize/exists checks; the server (or `hmp add` CLI path)
     /// provisions a fresh scratch directory. Toggled with Ctrl+T from
     /// anywhere in the form. Mutually exclusive with worktree mode.
     pub(super) scratch: bool,
@@ -1319,7 +1319,7 @@ impl NewSessionDialog {
             KeyCode::Enter => {
                 self.error_message = None;
                 // Scratch sessions skip the path-existence check: the
-                // server (or `aoe add` CLI) provisions the scratch dir on
+                // server (or `hmp add` CLI) provisions the scratch dir on
                 // submit.
                 if !self.scratch {
                     let path_str = self.path.value().trim().to_string();
@@ -1983,7 +1983,7 @@ impl NewSessionDialog {
         DialogResult::Submit(NewSessionData {
             profile: self.selected_profile().to_string(),
             title: final_title,
-            // Scratch sessions send an empty path; the server / `aoe add`
+            // Scratch sessions send an empty path; the server / `hmp add`
             // CLI provisions a fresh scratch directory keyed on the instance id.
             path: if self.scratch {
                 String::new()

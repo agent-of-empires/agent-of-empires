@@ -12,7 +12,7 @@
 // and the PWA flow otherwise doesn't work at all on iOS. If we ever add a
 // rich plugin system or user-generated content to the dashboard, revisit.
 
-const STORAGE_KEY = "aoe_auth_token";
+const STORAGE_KEY = "hmp_auth_token";
 
 function captureFromUrl(): void {
   if (typeof window === "undefined") return;

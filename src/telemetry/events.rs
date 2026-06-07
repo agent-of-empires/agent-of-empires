@@ -41,7 +41,7 @@ pub enum Surface {
     Cli,
     /// The interactive terminal UI.
     Tui,
-    /// The `aoe serve` daemon (web dashboard / acp host).
+    /// The `hmp serve` daemon (web dashboard / acp host).
     Serve,
 }
 
@@ -55,7 +55,7 @@ impl Surface {
     }
 }
 
-/// Emitted once on boot by the long-running surfaces (TUI, `aoe serve`).
+/// Emitted once on boot by the long-running surfaces (TUI, `hmp serve`).
 /// Captures launches that a periodic snapshot would miss. Carries no session
 /// details. Short-lived `aoe <subcommand>` invocations no longer emit this;
 /// they report through [`CliUsage`] instead, which carries the same
@@ -74,7 +74,7 @@ pub struct ProcessStart {
     /// RFC 3339 UTC timestamp.
     pub sent_at: String,
     pub surface: Surface,
-    pub aoe_version: String,
+    pub hmp_version: String,
     pub os: String,
     pub arch: String,
 
@@ -92,7 +92,7 @@ pub struct ProcessStart {
 /// non-empty `command_counts` carries the same "this install ran the CLI today"
 /// signal, plus which subcommands actually ran and how often.
 ///
-/// Counts accumulate on disk across invocations (each `aoe` run is a separate
+/// Counts accumulate on disk across invocations (each `hmp` run is a separate
 /// short-lived process, so there is no in-memory aggregation) and flush as one
 /// POST per day. `command_counts` keys are the closed clap subcommand set
 /// produced by [`crate::cli::command_name`]; they carry no args, flags, or
@@ -106,12 +106,12 @@ pub struct CliUsage {
     pub install_id: String,
     pub sent_at: String,
     pub surface: Surface,
-    pub aoe_version: String,
+    pub hmp_version: String,
     pub os: String,
     pub arch: String,
 
     /// RFC 3339 UTC timestamp of the first command counted in this window. The
-    /// window length varies (a user may run `aoe` once, then again days later),
+    /// window length varies (a user may run `hmp` once, then again days later),
     /// so this lets the aggregator compute honest per-day rates rather than
     /// assuming a fixed 24h window.
     pub window_start: String,
@@ -120,7 +120,7 @@ pub struct CliUsage {
     pub command_counts: BTreeMap<String, u32>,
 }
 
-/// Emitted by long-running surfaces (TUI, `aoe serve`) on start, then every
+/// Emitted by long-running surfaces (TUI, `hmp serve`) on start, then every
 /// ~4 hours, and best-effort on graceful shutdown. Carries current
 /// aggregate state, never a per-action stream. Every string-valued bucket
 /// has already passed through [`super::sanitize`].
@@ -137,7 +137,7 @@ pub struct UsageSnapshot {
     pub install_id: String,
     pub sent_at: String,
     pub surface: Surface,
-    pub aoe_version: String,
+    pub hmp_version: String,
     pub os: String,
     pub arch: String,
 
@@ -158,7 +158,7 @@ pub struct UsageSnapshot {
     pub session_yolo: u32,
 
     /// Peak concurrent `session_total` observed across the window since the
-    /// last snapshot. `aoe serve` folds a sample every ~30 min into a local
+    /// last snapshot. `hmp serve` folds a sample every ~30 min into a local
     /// aggregate and reports the max here, so a short-lived burst of sessions
     /// that opens and closes between two 4h sends is still captured. The TUI
     /// does not aggregate, so it reports the point-in-time `session_total`.
@@ -197,7 +197,7 @@ pub struct UsageSnapshot {
     /// Allowlisted agent bucket -> distinct sessions *seen* across the window
     /// since the last snapshot (not concurrent at the tick), so short-lived
     /// sessions caught by a ~30-min sample still contribute their agent mix.
-    /// The sum can exceed `session_total`. Populated by `aoe serve`; empty on
+    /// The sum can exceed `session_total`. Populated by `hmp serve`; empty on
     /// the TUI, which does not aggregate.
     pub distinct_sessions_by_agent: BTreeMap<String, u32>,
     /// Coarse model family bucket -> distinct sessions seen across the window.

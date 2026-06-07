@@ -95,7 +95,7 @@ describe("CopyPathContextMenu", () => {
   });
 
   it("falls back to execCommand and toasts when the clipboard API is unavailable", async () => {
-    // Insecure context (plain-HTTP `aoe serve`): navigator.clipboard is absent.
+    // Insecure context (plain-HTTP `hmp serve`): navigator.clipboard is absent.
     setSecureContext(false);
     Object.defineProperty(navigator, "clipboard", {
       value: undefined,

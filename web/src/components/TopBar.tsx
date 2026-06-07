@@ -19,7 +19,7 @@ interface Props {
   isOffline: boolean;
   /** When true, render a "DEV" badge (in the `status-waiting` amber)
    *  in the right-hand status zone so debug builds (port 8081 /
-   *  `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct
+   *  `hmp_dev_` tmux / `~/.hmp-dev/`) are visually distinct
    *  from release builds at a glance, including in PWA installs where
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
@@ -93,7 +93,7 @@ export function TopBar({
             height="18"
             className="rounded-sm"
           />
-          <span className="font-mono text-xs leading-none">aoe</span>
+          <span className="font-mono text-xs leading-none">hmp</span>
         </button>
       </div>
 

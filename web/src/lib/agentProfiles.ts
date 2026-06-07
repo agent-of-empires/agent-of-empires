@@ -201,9 +201,9 @@ const PI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [] },
 };
 
-const AOE_AGENT: AgentProfile = {
+const HMP_AGENT: AgentProfile = {
   ...CLAUDE,
-  key: "aoe-agent",
+  key: "hmp-agent",
 };
 
 /** Permissive fallback for unknown agent keys: kind-only dispatch with
@@ -233,7 +233,7 @@ const PROFILES: Record<string, AgentProfile> = {
   gemini: GEMINI,
   vibe: VIBE,
   pi: PI,
-  "aoe-agent": AOE_AGENT,
+  "hmp-agent": HMP_AGENT,
 };
 
 /** Resolve a profile by the session's `tool` key. Unknown keys (and

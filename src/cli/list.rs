@@ -1,4 +1,4 @@
-//! `agent-of-empires list` command implementation
+//! `hmp list` command implementation
 
 use anyhow::Result;
 use clap::Args;

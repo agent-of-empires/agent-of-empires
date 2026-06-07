@@ -419,12 +419,12 @@ pub struct HomeView {
     pending_deletions: HashMap<String, HashSet<String>>,
     /// Per-profile tombstones for group paths removed since last `save`.
     /// Mirrors `pending_deletions` for groups so concurrent peer-added
-    /// groups (e.g. `aoe add --group X`) survive the next save.
+    /// groups (e.g. `hmp add --group X`) survive the next save.
     pending_group_deletions: HashMap<String, HashSet<String>>,
     /// Per-profile ids added via `add_instance` since last save. In
     /// `save()`, only ids present here are pushed when the disk row is
     /// missing; TUI rows absent from disk AND absent from this set are
-    /// treated as peer-deleted (CLI/`aoe serve`) and dropped from the
+    /// treated as peer-deleted (CLI/`hmp serve`) and dropped from the
     /// in-memory mirror. Drained on Ok save.
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
@@ -712,7 +712,7 @@ pub struct HomeView {
     // confirmation first (guards against accidental exits, #1569).
     pub(super) confirm_before_quit: bool,
 
-    // Number of live `aoe` TUI processes (including this one), refreshed on a
+    // Number of live `hmp` TUI processes (including this one), refreshed on a
     // throttle from the app loop. The footer surfaces it when >1 so the user
     // knows another instance is attached (the two clash over agent pane sizes
     // since tmux reflows to the smallest attached client).
@@ -1082,7 +1082,7 @@ impl HomeView {
         }
 
         // Batch-sync instance IDs and captured session IDs to tmux hidden env
-        // so that build_exclusion_set() on other AoE instances can see them.
+        // so that build_exclusion_set() on other HMP instances can see them.
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
@@ -1094,19 +1094,19 @@ impl HomeView {
 
                 set_batch.push((
                     tmux_name.clone(),
-                    crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                    crate::tmux::env::HMP_INSTANCE_ID_KEY.to_string(),
                     inst.id.clone(),
                 ));
                 if let Some(ref sid) = inst.agent_session_id {
                     set_batch.push((
                         tmux_name,
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY.to_string(),
                         sid.clone(),
                     ));
                 } else {
                     unset_batch.push((
                         tmux_name,
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY.to_string(),
                     ));
                 }
             }
@@ -1627,12 +1627,12 @@ impl HomeView {
             match &inst.agent_session_id {
                 Some(sid) => set_batch.push((
                     tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY.to_string(),
                     sid.clone(),
                 )),
                 None => unset_batch.push((
                     tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    crate::tmux::env::HMP_CAPTURED_SESSION_ID_KEY.to_string(),
                 )),
             }
         }
@@ -2268,7 +2268,7 @@ impl HomeView {
     pub fn show_quit_confirm(&mut self) {
         self.confirm_dialog = Some(
             ConfirmDialog::new(
-                "Quit Agent of Empires",
+                "Quit Hoxkss My Pi",
                 "Quit?\nYour sessions persist in the background.",
                 "quit",
             )
@@ -3338,7 +3338,7 @@ impl HomeView {
                         disk_instances.push(tui_inst.clone());
                     } else {
                         // Disk had no row with this id and we did not add it
-                        // this session: a peer (CLI / aoe serve) removed it.
+                        // this session: a peer (CLI / hmp serve) removed it.
                         peer_deleted.push(tui_inst.id.clone());
                     }
                 }
@@ -3373,7 +3373,7 @@ impl HomeView {
     }
 
     /// Drop in-memory mirror rows that no longer exist on disk (peer-deleted
-    /// via CLI / aoe serve). Rebuilds derived UI state so callers don't
+    /// via CLI / hmp serve). Rebuilds derived UI state so callers don't
     /// render or target removed rows.
     fn drop_peer_deleted_rows(&mut self, ids: &[String]) {
         if ids.is_empty() {
