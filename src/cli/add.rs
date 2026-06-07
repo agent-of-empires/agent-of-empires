@@ -5,10 +5,9 @@ use clap::Args;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::containers::{self, ContainerRuntimeInterface};
 use crate::session::builder;
 use crate::session::repo_config;
-use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
+use crate::session::{civilizations, GroupTree, Instance, Storage};
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -76,14 +75,6 @@ pub struct AddArgs {
     /// that you don't need inside the agent session.
     #[arg(long = "no-submodules")]
     no_submodules: bool,
-
-    /// Run session in a container sandbox
-    #[arg(short = 's', long)]
-    sandbox: bool,
-
-    /// Custom container image for sandbox (implies --sandbox)
-    #[arg(long = "sandbox-image")]
-    sandbox_image: Option<String>,
 
     /// Enable YOLO mode (skip permission prompts)
     #[arg(short = 'y', long)]
@@ -514,9 +505,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             instance.command = cmd.clone();
         }
     } else {
-        // Use default_tool from resolved config, then first available tool, then "claude".
-        // Check custom_agents first (exact match) before resolve_tool_name (substring match),
-        // so names like "lenovo-claude" resolve as the custom agent, not built-in "claude".
+        // Use default_tool from resolved config, then first available tool, then OMP.
+        // Check custom_agents first (exact match) before resolve_tool_name.
         let available_tools = crate::tmux::AvailableTools::detect();
         let tools_list = available_tools.available_list();
         instance.tool = config
@@ -531,7 +521,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
             })
             .or_else(|| tools_list.first().map(|s| s.as_str()))
-            .unwrap_or("claude")
+            .unwrap_or("omp")
             .to_string();
     }
 
@@ -601,12 +591,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             &instance.tool,
             instance.agent_name.as_deref(),
         );
-        // Capability is judged against the explicit `--agent` (or, with none,
-        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
-        // otherwise every tool would look ACP-capable via the bundled default
-        // and `--structured-view` could never be rejected for a non-ACP tool
-        // (it would silently substitute aoe-agent). Mirrors the server create
-        // path in `src/server/api/sessions.rs`.
+        // Capability is judged against the explicit `--agent` or tool itself.
         let capability_key = instance
             .agent_name
             .as_deref()
@@ -687,7 +672,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
                          Or run: aoe acp doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
                          Or use the terminal view: drop --agent / --structured-view.",
                         spec.command,
                         hint
@@ -701,44 +685,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
                 instance.view = crate::session::View::Terminal;
             }
-        }
-    }
-
-    // Handle sandbox setup
-    let use_sandbox = args.sandbox || args.sandbox_image.is_some();
-
-    let runtime = containers::get_container_runtime();
-    if use_sandbox || config.sandbox.enabled_by_default {
-        if !runtime.is_available() {
-            if use_sandbox {
-                bail!(
-                    "Container runtime is not installed or not accessible.\n\
-                     Install a supported runtime to use sandbox mode.\n\
-                     Tip: Use 'aoe add' without --sandbox to run directly on host"
-                );
-            }
-        } else {
-            // Surface env-resolution warnings before container creation so
-            // typos and missing host vars don't silently produce empty
-            // values inside the sandbox. Same source the TUI path uses.
-            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
-                eprintln!("⚠ {}", w);
-            }
-
-            let container_name = containers::DockerContainer::generate_name(&instance.id);
-            let image = resolve_sandbox_image(
-                args.sandbox_image.as_deref(),
-                &config.sandbox.default_image,
-                runtime.default_sandbox_image(),
-            );
-            instance.sandbox_info = Some(SandboxInfo {
-                enabled: true,
-                container_id: None,
-                image,
-                container_name,
-                extra_env: None,
-                custom_instruction: config.sandbox.custom_instruction.clone(),
-            });
         }
     }
 
@@ -864,20 +810,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     println!("  {}", cmd);
                 }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
-                if instance.sandbox_info.is_some() {
-                    instance.get_container_for_instance()?;
-                    let workdir = instance.container_workdir();
-                    if let Some(ref sandbox) = instance.sandbox_info {
-                        repo_config::execute_hooks_in_container(
-                            &hooks.on_create,
-                            &sandbox.container_name,
-                            &workdir,
-                            &hook_env,
-                        )?;
-                    }
-                } else {
-                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
-                }
+                repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 println!("✓ on_create hooks completed");
             }
         }
@@ -961,9 +894,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if let Some(parent) = &args.parent {
         println!("  Parent:  {}", parent);
-    }
-    if instance.sandbox_info.is_some() {
-        println!("  Sandbox: enabled");
     }
     if instance.scratch {
         println!("  Scratch:  yes");
@@ -1136,8 +1066,7 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_acp_cmd` → legacy
-/// (`claude` → `claude`, else `aoe-agent`).
+/// registry entry → custom agent with `agent_acp_cmd` → OMP.
 #[cfg(feature = "serve")]
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
@@ -1156,11 +1085,7 @@ fn pick_acp_agent_name(
     if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
     }
-    if tool == "claude" {
-        "claude".into()
-    } else {
-        "aoe-agent".into()
-    }
+    "omp".into()
 }
 
 fn detect_tool(cmd: &str) -> Result<String> {
@@ -1274,35 +1199,10 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     )
 }
 
-/// Resolve the sandbox image for a new session.
-///
-/// Precedence: the explicit `--sandbox-image` flag, then the merged
-/// `[sandbox] default_image` from `config` (which `resolve_config_with_repo_or_warn`
-/// already layers repo over profile/global, see #1651), then the runtime's
-/// hardcoded default. The merged value already carries the global config, so
-/// there is no need to reload it from disk for the empty-fallback case.
-fn resolve_sandbox_image(
-    flag: Option<&str>,
-    merged_default: &str,
-    hardcoded_default: &str,
-) -> String {
-    if let Some(flag) = flag {
-        return flag.trim().to_string();
-    }
-    let merged = merged_default.trim();
-    if merged.is_empty() {
-        hardcoded_default.to_string()
-    } else {
-        merged.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, resolve_sandbox_image};
+    use super::override_launch_binary;
     use crate::session::config::SessionConfig;
-
-    const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 
     #[test]
     fn override_launch_binary_uses_command_override() {
@@ -1350,29 +1250,5 @@ mod tests {
     fn override_launch_binary_none_without_override() {
         let session = SessionConfig::default();
         assert_eq!(override_launch_binary("opencode", &session), None);
-    }
-
-    #[test]
-    fn flag_overrides_everything() {
-        let image = resolve_sandbox_image(Some(" custom:flag "), "repo:merged", HARDCODED);
-        assert_eq!(image, "custom:flag");
-    }
-
-    #[test]
-    fn merged_default_used_when_no_flag() {
-        let image = resolve_sandbox_image(None, "ghcr.io/example/custom:latest", HARDCODED);
-        assert_eq!(image, "ghcr.io/example/custom:latest");
-    }
-
-    #[test]
-    fn whitespace_merged_falls_back_to_hardcoded() {
-        let image = resolve_sandbox_image(None, "   ", HARDCODED);
-        assert_eq!(image, HARDCODED);
-    }
-
-    #[test]
-    fn empty_merged_falls_back_to_hardcoded() {
-        let image = resolve_sandbox_image(None, "", HARDCODED);
-        assert_eq!(image, HARDCODED);
     }
 }

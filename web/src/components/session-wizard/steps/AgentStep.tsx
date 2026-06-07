@@ -85,13 +85,10 @@ function ViewNotice({
 function ViewPickerCard({
   checked,
   onChange,
-  sandboxEnabled,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
-  sandboxEnabled: boolean;
 }) {
-  const sandboxedStructuredView = checked && sandboxEnabled;
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2.5">
       <div className="flex items-center justify-between gap-3">
@@ -102,11 +99,9 @@ function ViewPickerCard({
             </span>
           </div>
           <p className="mt-1 text-xs text-text-dim leading-snug">
-            {sandboxedStructuredView
-              ? "Structured view + container: the agent runs inside the sandbox container, so its file and terminal access stay inside the container's mounts. Turn off to run this session in the terminal view instead."
-              : checked
-                ? "Renders the agent's plan, tool calls, and diffs in the structured view. Turn off to run this session in the terminal view instead."
-                : "This session will run in the terminal view (raw tmux). Turn on to use the structured view; you can also switch views from the session later."}
+            {checked
+              ? "Renders OMP plans, tool calls, and diffs in the structured view. Turn off to run this session in the terminal view instead."
+              : "This session will run in the terminal view (raw tmux). Turn on to use the structured view."}
           </p>
         </div>
         <Toggle
@@ -156,17 +151,13 @@ export function AgentStep({
   onChange,
   agents,
   profiles,
-  dockerAvailable,
   onApplyProfileDefaults,
   commandMaps = EMPTY_COMMAND_MAPS,
 }: Props) {
-  const selectableAgents = agents.filter(
-    (agent) => agent.kind === "custom" || agent.installed,
-  );
-  const selectedAgent = agents.find((a) => a.name === data.tool);
-  const selectedCustomAgent = selectedAgent?.kind === "custom";
-  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
-  const isHostOnly = selectedAgent?.host_only ?? false;
+  const selectableAgents = agents.filter((agent) => agent.name === "omp");
+  const selectedAgent = agents.find((a) => a.name === "omp");
+  const selectedCustomAgent = false;
+  const acpCapable = isAcpCapable("omp", selectedAgent?.acp_capable);
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
 
@@ -208,18 +199,7 @@ export function AgentStep({
           const session = settings.session as
             | Record<string, unknown>
             | undefined;
-          const sandbox = settings.sandbox as
-            | Record<string, unknown>
-            | undefined;
-          // Pre-populate sandbox env from the profile so the user can see and edit
-          // it before submission; without this, an empty extra_env is sent and the
-          // backend falls back to the wrong (globally-default) profile's env vars.
-          const env = Array.isArray(sandbox?.environment)
-            ? (sandbox.environment as unknown[]).filter(
-                (v): v is string => typeof v === "string",
-              )
-            : [];
-          const defaultTool = (session?.default_tool as string) || data.tool;
+          const defaultTool = "omp";
           const acpDefaults = session?.acp_defaults as
             | Record<string, unknown>
             | undefined;
@@ -228,9 +208,9 @@ export function AgentStep({
             | undefined;
           onApplyProfileDefaults({
             yoloMode: (session?.yolo_mode_default as boolean) ?? false,
-            sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
+            sandboxEnabled: false,
             tool: defaultTool,
-            extraEnv: env,
+            extraEnv: [],
             agentModel:
               typeof acpDefault?.model === "string" ? acpDefault.model : "",
             agentEffort:
@@ -242,16 +222,16 @@ export function AgentStep({
         // If we can't load profile settings, just set the profile name
       }
     },
-    [data.profileDirty, data.tool, onChange, onApplyProfileDefaults],
+    [data.profileDirty, onChange, onApplyProfileDefaults],
   );
 
   return (
     <div>
       <h2 className="text-lg font-semibold text-text-primary mb-1">
-        Which AI agent?
+        OMP session
       </h2>
       <p className="text-sm text-text-muted mb-5">
-        Pick the coding assistant and configure your session.
+        Sessions run through OMP. Structured view stays enabled by default.
       </p>
 
       {/* No agents installed */}
@@ -261,11 +241,11 @@ export function AgentStep({
             No agents installed
           </p>
           <p className="text-sm text-text-muted mb-3">
-            Install at least one AI coding agent to create a session.
+            Install OMP to create a session.
           </p>
           <div className="space-y-1.5">
             {agents
-              .filter((a) => ["claude", "codex", "gemini"].includes(a.name))
+              .filter((a) => a.name === "omp")
               .map((agent) => (
                 <div key={agent.name} className="flex items-baseline gap-2">
                   <span className="text-sm font-medium text-text-primary w-20">
@@ -280,32 +260,26 @@ export function AgentStep({
         </div>
       )}
 
-      {/* Agent picker */}
-      <div className="grid grid-cols-2 gap-2 mb-5">
-        {selectableAgents.map((agent) => (
-          <button
-            type="button"
-            key={agent.name}
-            onClick={() => onChange("tool", agent.name)}
-            className={`min-h-[44px] text-left p-3 rounded-lg border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-              data.tool === agent.name
-                ? "border-brand-600 bg-surface-900"
-                : "border-surface-700 bg-surface-950 hover:border-surface-600"
-            }`}
-          >
-            <div className="flex flex-wrap items-center gap-2">
+      {selectableAgents.length > 1 && (
+        <div className="grid grid-cols-2 gap-2 mb-5">
+          {selectableAgents.map((agent) => (
+            <button
+              type="button"
+              key={agent.name}
+              onClick={() => onChange("tool", "omp")}
+              className={`min-h-[44px] text-left p-3 rounded-lg border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
+                data.tool === agent.name
+                  ? "border-brand-600 bg-surface-900"
+                  : "border-surface-700 bg-surface-950 hover:border-surface-600"
+              }`}
+            >
               <span className="text-sm font-semibold text-text-primary">
                 {agent.name}
               </span>
-              {agent.kind === "custom" && (
-                <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
-                  Custom
-                </span>
-              )}
-            </div>
-          </button>
-        ))}
-      </div>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* View picker. ACP-capable tools get a per-session structured-view toggle
           (default on, see #1580) so they can opt down to a terminal-view
@@ -315,7 +289,6 @@ export function AgentStep({
         <ViewPickerCard
           checked={data.useStructuredView}
           onChange={(v) => onChange("useStructuredView", v)}
-          sandboxEnabled={data.sandboxEnabled}
         />
       ) : (
         <ViewNotice tool={data.tool} customAgent={selectedCustomAgent} />
@@ -331,8 +304,8 @@ export function AgentStep({
             Workflow preset
           </label>
           <p className="text-xs text-text-dim mb-2">
-            Profiles preload tool, sandbox, auto-approve, and env defaults for
-            common workflows.
+            Profiles preload auto-approve and ACP defaults for common
+            workflows.
           </p>
           <div
             role="radiogroup"
@@ -398,30 +371,7 @@ export function AgentStep({
 
       {/* Core toggles */}
       <div className="space-y-2 mb-4">
-        <label
-          className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
-          onClick={() =>
-            !(isHostOnly || !dockerAvailable) &&
-            onChange("sandboxEnabled", !data.sandboxEnabled)
-          }
-        >
-          <div className="flex-1">
-            <div className="text-sm font-medium text-text-primary">
-              Run in a safe container
-            </div>
-            <div className="text-xs text-text-dim mt-0.5 leading-snug">
-              {!dockerAvailable
-                ? "Docker is not running. Install or start Docker to use containers."
-                : "Isolate the agent so it can't affect your system"}
-            </div>
-          </div>
-          <Toggle
-            checked={data.sandboxEnabled}
-            onChange={(v) => onChange("sandboxEnabled", v)}
-            disabled={isHostOnly || !dockerAvailable}
-          />
-        </label>
-
+        <input type="hidden" aria-hidden="true" />
         <label
           className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer"
           onClick={() => onChange("yoloMode", !data.yoloMode)}
@@ -441,14 +391,6 @@ export function AgentStep({
         </label>
       </div>
 
-      {isHostOnly && (
-        <p className="text-xs text-status-warning mt-3 mb-3">
-          {selectedAgent?.name} can only run on the host. Container is disabled
-          {data.useWorktree
-            ? "; go back and turn off “Create a worktree” too."
-            : "."}
-        </p>
-      )}
 
       {/* Advanced settings (collapsible) */}
       <button
@@ -477,60 +419,6 @@ export function AgentStep({
 
       {showAdvanced && (
         <div className="mt-2 space-y-4 border-t border-surface-700/30 pt-4">
-          {/* Container config (if sandbox enabled) */}
-          {data.sandboxEnabled && (
-            <>
-              <div>
-                <label className="block text-sm text-text-dim mb-1.5">
-                  Container image
-                </label>
-                <input
-                  type="text"
-                  value={data.sandboxImage}
-                  onChange={(e) => onChange("sandboxImage", e.target.value)}
-                  placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
-                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-sm text-text-dim mb-1.5">
-                  Environment variables
-                </label>
-                {data.extraEnv.map((env, i) => (
-                  <div key={i} className="flex gap-2 mb-1">
-                    <input
-                      type="text"
-                      value={env}
-                      onChange={(e) => {
-                        const updated = [...data.extraEnv];
-                        updated[i] = e.target.value;
-                        onChange("extraEnv", updated);
-                      }}
-                      placeholder="KEY=value"
-                      className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-                    />
-                    <button
-                      onClick={() =>
-                        onChange(
-                          "extraEnv",
-                          data.extraEnv.filter((_, j) => j !== i),
-                        )
-                      }
-                      className="px-2 text-text-dim hover:text-status-error cursor-pointer"
-                    >
-                      &times;
-                    </button>
-                  </div>
-                ))}
-                <button
-                  onClick={() => onChange("extraEnv", [...data.extraEnv, ""])}
-                  className="text-xs text-text-dim hover:text-text-secondary cursor-pointer"
-                >
-                  + Add variable
-                </button>
-              </div>
-            </>
-          )}
 
           {/* Custom instruction */}
           <div>

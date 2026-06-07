@@ -804,12 +804,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Pick the agent name to spawn for an instance. Precedence:
     ///   1. explicit `agent_name` override on the instance
     ///   2. registry entry keyed on the instance's tool name
-    ///      (so `tool="opencode"` → registry `"opencode"` →
-    ///      `opencode acp`, etc.)
     ///   3. custom agent declaring an ACP command via
     ///      `agent_acp_cmd` in the session's profile config
-    ///   4. legacy fallback: `claude` for the claude tool, otherwise
-    ///      `aoe-agent` (our bundled multi-provider agent)
+    ///   4. OMP fallback
     ///
     /// `profile` is the session's source profile (`""` resolves the
     /// user's default) and `project_path` is its working directory;
@@ -843,12 +840,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return tool.to_string();
         }
-        // Step 4: legacy fallbacks.
-        if tool == "claude" {
-            "claude".into()
-        } else {
-            "aoe-agent".into()
-        }
+        // Step 4: OMP-only fallback.
+        "omp".into()
     }
 
     /// True iff `tool` is a custom agent that declares an
@@ -1166,9 +1159,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `Runner` handle's `SpawnConfig` directly when available;
     /// otherwise loads the on-disk record so an `Attached` worker (or
     /// a session whose handle has been dropped) still resolves its
-    /// profile correctly. Returns `"claude"` as a last-resort default
-    /// for sessions whose record predates the `agent_key` field
-    /// (empty after the serde default).
+    /// profile correctly. Returns `"omp"` as the last-resort default.
     async fn agent_key_for_session(&self, session_id: &str) -> String {
         if let Some(handle) = self.workers.lock().await.get(session_id) {
             if let WorkerKind::Runner { spawn_config } = &handle.kind {
@@ -1180,7 +1171,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return record.agent_key;
             }
         }
-        "claude".to_string()
+        "omp".to_string()
     }
 
     /// Drop per-session bookkeeping (replay seq counter). Called when

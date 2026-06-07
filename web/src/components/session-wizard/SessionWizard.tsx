@@ -3,7 +3,6 @@ import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
-  fetchDockerStatus,
   fetchProfiles,
   fetchSettings,
   createSession,
@@ -37,7 +36,7 @@ function loadLastUsedTool(): string {
   if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
     return stored;
   }
-  return "claude";
+  return "omp";
 }
 
 function saveLastUsedTool(tool: string): void {
@@ -104,9 +103,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     ? {
         ...baseInitial,
         path: prefill.scratch ? "" : prefill.path || "",
-        tool: prefill.tool || baseInitial.tool,
+        tool: "omp",
         yoloMode: prefill.yoloMode ?? false,
-        sandboxEnabled: prefill.sandboxEnabled ?? false,
+        sandboxEnabled: false,
         profile: prefill.profile || "",
         group: prefill.group || "",
         scratch: prefill.scratch ?? false,
@@ -152,9 +151,6 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    fetchDockerStatus().then((d) =>
-      dispatch({ type: "SET_DOCKER", available: d.available }),
-    );
 
     // Seed the wizard with the resolved (global + active profile) defaults so
     // single-profile users get yolo_mode_default and friends without ever
@@ -173,18 +169,8 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       fetchSettings(effectiveProfile || undefined).then((s) => {
         if (!s) return;
         setCommandMaps(commandMapsFromSettings(s));
-        const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
-        const img = (sandbox?.default_image as string) || "";
-        if (img)
-          dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
-        const env = Array.isArray(sandbox?.environment)
-          ? (sandbox?.environment as unknown[]).filter(
-              (v): v is string => typeof v === "string",
-            )
-          : [];
-        const defaultTool =
-          prefill?.tool || (session?.default_tool as string) || "";
+        const defaultTool = "omp";
         const acpDefaults = acpDefaultsFor(
           session,
           defaultTool || state.data.tool,
@@ -199,12 +185,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
             prefill?.yoloMode ??
             (session?.yolo_mode_default as boolean) ??
             false,
-          sandboxEnabled:
-            prefill?.sandboxEnabled ??
-            (sandbox?.enabled_by_default as boolean) ??
-            false,
+          sandboxEnabled: false,
           tool: defaultTool,
-          extraEnv: env,
+          extraEnv: [],
           agentModel: acpDefaults.model,
           agentEffort: acpDefaults.effort,
           skipIfDirty: true,
@@ -264,7 +247,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // `scratch + worktree_branch` mutex.
     const body: CreateSessionRequest = {
       path: d.scratch ? "" : d.path,
-      tool: d.tool,
+      tool: "omp",
       title: d.title || undefined,
       group: d.group || undefined,
       yolo_mode: d.yoloMode,
@@ -277,12 +260,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim()
           ? d.baseBranch.trim()
           : undefined,
-      sandbox: d.sandboxEnabled,
-      sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
-      extra_env:
-        d.sandboxEnabled && d.extraEnv.length > 0
-          ? d.extraEnv.filter(Boolean)
-          : undefined,
+      sandbox: false,
       extra_repo_paths:
         !d.scratch && d.extraRepoPaths.length > 0
           ? d.extraRepoPaths
@@ -316,7 +294,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     const result = await createSession(body);
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
-      saveLastUsedTool(d.tool);
+      saveLastUsedTool("omp");
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);

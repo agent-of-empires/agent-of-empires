@@ -267,8 +267,7 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
-    /// Acp agent used when --agent is not specified (e.g. aoe-agent,
-    /// claude-code, gemini).
+    /// Acp agent used when --agent is not specified.
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
@@ -520,7 +519,7 @@ impl Default for AcpConfig {
 }
 
 fn default_agent() -> String {
-    "aoe-agent".to_string()
+    "omp".to_string()
 }
 fn default_max_workers() -> u32 {
     5

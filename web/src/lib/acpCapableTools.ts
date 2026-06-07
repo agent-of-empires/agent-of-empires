@@ -1,20 +1,5 @@
-// Tools known to have a published ACP server. Anything not in this
-// set falls back to tmux automatically; when the structured view master
-// switch is on, the wizard creates structured view sessions only for tools
-// listed here.
-//
-// SOURCE OF TRUTH: src/acp/agent_registry.rs. If you add a new
-// ACP adapter to that registry, also add it here; otherwise the web
-// wizard will silently fall back to tmux for it. (Long-term we should
-// expose this list via /api/about and drop the JS-side copy.)
-export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set([
-  "claude",
-  "opencode",
-  "gemini",
-  "codex",
-  "vibe",
-  "pi",
-]);
+// OMP is the only bundled ACP-capable tool in this fork.
+export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set(["omp"]);
 
 /** Authoritative acp-capability check. The server now reports
  *  `acp_capable` per agent (built-ins and custom agents with an

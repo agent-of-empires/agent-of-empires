@@ -108,7 +108,7 @@ export const initialData: WizardData = {
   attachExisting: false,
   baseBranch: "",
   group: "",
-  tool: "claude",
+  tool: "omp",
   profile: "",
   yoloMode: false,
   sandboxEnabled: false,
