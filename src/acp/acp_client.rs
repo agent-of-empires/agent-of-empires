@@ -2711,8 +2711,16 @@ fn classify_watchdog_notification_signals(
     if suppressing_history_replay {
         return (None, None);
     }
+    let lifecycle = match classify_lifecycle_signal(update) {
+        Some(LifecycleSignal::TerminalUsage)
+            if !matches!(profile.key, "claude" | "claude-code") =>
+        {
+            None
+        }
+        other => other,
+    };
     (
-        classify_lifecycle_signal(update),
+        lifecycle,
         wakeup_lifecycle_signal_from_update(update, profile),
     )
 }
@@ -7295,6 +7303,27 @@ mod tests {
         assert!(
             lifecycle.is_some() && wakeup.is_none(),
             "tool lifecycle updates must disarm the resume-idle watchdog"
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_notification_signals_keeps_cursor_usage_ambient() {
+        use agent_client_protocol::schema::{Cost, UsageUpdate};
+        let update =
+            SessionUpdate::UsageUpdate(UsageUpdate::new(1200, 2000).cost(Cost::new(0.01, "USD")));
+
+        let (claude_lifecycle, _) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CLAUDE, false);
+        assert!(
+            matches!(claude_lifecycle, Some(LifecycleSignal::TerminalUsage)),
+            "claude-agent-acp cost usage remains the silent-orphan fast-grace marker"
+        );
+
+        let (cursor_lifecycle, cursor_wakeup) =
+            classify_watchdog_notification_signals(&update, &agent_profiles::CURSOR, false);
+        assert!(
+            cursor_lifecycle.is_none() && cursor_wakeup.is_none(),
+            "cursor usage updates must not trip the silent-orphan fast-grace path"
         );
     }
 
