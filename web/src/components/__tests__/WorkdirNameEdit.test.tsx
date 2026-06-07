@@ -185,7 +185,10 @@ describe("sidebar Edit workdir name", () => {
     fetchSpy.mockImplementation(
       async () =>
         new Response(
-          JSON.stringify({ error: "session_running", message: "Stop the session before renaming it." }),
+          JSON.stringify({
+            error: "session_running",
+            message: "Stop the session before renaming it.",
+          }),
           { status: 409, headers: { "content-type": "application/json" } },
         ),
     );
