@@ -26,14 +26,14 @@ const WORKTREE_SCHEMA = [
   },
 ];
 
-const DISCORD_SCHEMA = [
+const AUTH_SCHEMA = [
   {
-    section: "discord",
-    field: "webhook_url",
-    category: "Discord Beta",
-    label: "Webhook URL",
-    description: "Discord webhook URL for status notifications.",
-    widget: { kind: "optional_text" },
+    section: "auth",
+    field: "max_failures",
+    category: "Auth",
+    label: "Max auth failures (restart req.)",
+    description: "Failed token-auth attempts allowed per client IP before lockout.",
+    widget: { kind: "number", min: 0 },
     web_write: { policy: "writable" },
     profile_overridable: false,
     validation: { rule: "none" },
@@ -76,7 +76,7 @@ function findTextInputByLabel(
   const labels = container.querySelectorAll("label");
   for (const node of labels) {
     if (node.textContent === label) {
-      const input = node.parentElement?.querySelector("input[type='text']");
+      const input = node.parentElement?.querySelector("input");
       if (input instanceof HTMLInputElement) return input;
     }
   }
@@ -102,30 +102,33 @@ describe("SettingsView schema load", () => {
 
   it("saves non-profile-overridable schema fields through the global settings path", async () => {
     vi.mocked(api.getSettingsSchema).mockResolvedValueOnce(
-      DISCORD_SCHEMA as never,
+      AUTH_SCHEMA as never,
     );
     vi.mocked(api.fetchSettings).mockResolvedValueOnce({
-      discord: { webhook_url: null },
+      auth: { max_failures: 5 },
     } as never);
 
-    const { container } = renderView("discord");
-    await screen.findByText("Webhook URL");
+    const { container } = renderView("auth");
+    await screen.findByText("Max auth failures (restart req.)");
 
-    const input = findTextInputByLabel(container, "Webhook URL");
+    const input = findTextInputByLabel(
+      container,
+      "Max auth failures (restart req.)",
+    );
     fireEvent.focus(input);
     fireEvent.change(input, {
-      target: { value: "https://discord.com/api/webhooks/123/abc" },
+      target: { value: "10" },
     });
     fireEvent.blur(input);
 
     await waitFor(() =>
       expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
-        discord: { webhook_url: "https://discord.com/api/webhooks/123/abc" },
+        auth: { max_failures: 10 },
       }),
     );
     expect(vi.mocked(api.updateProfileSettings)).not.toHaveBeenCalledWith(
       "main",
-      expect.objectContaining({ discord: expect.anything() }),
+      expect.objectContaining({ auth: expect.anything() }),
     );
   });
 

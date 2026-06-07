@@ -9,7 +9,6 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
-pub mod discord;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -971,7 +970,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
-    discord::spawn_consumer(state.clone(), config.discord.clone());
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());

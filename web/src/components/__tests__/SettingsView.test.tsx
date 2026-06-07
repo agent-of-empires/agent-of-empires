@@ -32,8 +32,6 @@ describe("buildSidebar", () => {
       { kind: "divider", label: "Notifications" },
       { kind: "tab", id: "sound", label: "Sound" },
       { kind: "tab", id: "notifications", label: "Notifications" },
-      { kind: "divider", label: "Integrations Beta" },
-      { kind: "tab", id: "discord", label: "Discord" },
       { kind: "divider", label: "Web Dashboard" },
       { kind: "tab", id: "auth", label: "Auth" },
       { kind: "tab", id: "terminal", label: "Terminal" },

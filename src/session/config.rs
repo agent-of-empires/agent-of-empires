@@ -57,9 +57,6 @@ pub struct Config {
     pub auth: AuthConfig,
 
     #[serde(default)]
-    pub discord: DiscordConfig,
-
-    #[serde(default)]
     pub acp: AcpConfig,
 
     #[serde(default)]
@@ -1366,84 +1363,6 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
-        }
-    }
-}
-
-/// Discord webhook notifications. This is intentionally one-way: AoE posts
-/// session status notifications to Discord and never accepts commands from it.
-#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
-#[setting_section(name = "discord", category = "Discord Beta")]
-pub struct DiscordConfig {
-    /// Enable Discord webhook notifications.
-    #[serde(default)]
-    #[setting(
-        label = "Discord webhook notifications",
-        widget = "toggle",
-        global_only
-    )]
-    pub enabled: bool,
-
-    /// Discord webhook URL. Stored in config.toml for this beta.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(
-        label = "Webhook URL",
-        widget = "optional_text",
-        mono,
-        global_only,
-        desc = "Discord channel webhook URL. AoE uses this only for one-way notifications."
-    )]
-    pub webhook_url: Option<String>,
-
-    /// Optional username override for webhook messages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "Webhook username", widget = "optional_text", global_only)]
-    pub username: Option<String>,
-
-    /// Optional mention prefix, e.g. `<@123>` or `<@&456>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(
-        label = "Mention",
-        widget = "optional_text",
-        global_only,
-        desc = "Optional mention text prepended to notifications, such as a user or role mention.",
-        advanced
-    )]
-    pub mention: Option<String>,
-
-    /// Send a notification when an agent waits for input.
-    #[serde(default = "default_true")]
-    #[setting(label = "Notify on waiting", widget = "toggle", global_only)]
-    pub notify_on_waiting: bool,
-
-    /// Send a notification when an agent finishes and becomes idle.
-    #[serde(default = "default_true")]
-    #[setting(label = "Notify on finished", widget = "toggle", global_only)]
-    pub notify_on_idle: bool,
-
-    /// Send a notification when a session enters Error.
-    #[serde(default = "default_true")]
-    #[setting(label = "Notify on error", widget = "toggle", global_only)]
-    pub notify_on_error: bool,
-
-    /// Send a notification when a session stops. Off by default because
-    /// manual stops are usually intentional.
-    #[serde(default)]
-    #[setting(label = "Notify on stopped", widget = "toggle", global_only, advanced)]
-    pub notify_on_stopped: bool,
-}
-
-impl Default for DiscordConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            webhook_url: None,
-            username: None,
-            mention: None,
-            notify_on_waiting: true,
-            notify_on_idle: true,
-            notify_on_error: true,
-            notify_on_stopped: false,
         }
     }
 }

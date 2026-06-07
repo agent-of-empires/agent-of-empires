@@ -4,7 +4,7 @@
 
 use super::FieldDescriptor;
 use crate::session::config::{
-    AcpConfig, AuthConfig, DiffConfig, DiscordConfig, LoggingConfig, SandboxConfig, SessionConfig,
+    AcpConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig,
     TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
 };
 use crate::sound::SoundConfig;
@@ -24,7 +24,6 @@ pub fn schema() -> Vec<FieldDescriptor> {
     out.extend(StatusHookConfig::settings_descriptors());
     out.extend(WebConfig::settings_descriptors());
     out.extend(AuthConfig::settings_descriptors());
-    out.extend(DiscordConfig::settings_descriptors());
     out.extend(AcpConfig::settings_descriptors());
     out.extend(DiffConfig::settings_descriptors());
     out.extend(LoggingConfig::settings_descriptors());
@@ -100,33 +99,6 @@ mod tests {
             }
             other => panic!("expected select, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn discord_section_exposes_beta_settings() {
-        let fields: Vec<_> = schema()
-            .into_iter()
-            .filter(|d| d.section == "discord")
-            .map(|d| d.field)
-            .collect();
-        assert_eq!(
-            fields,
-            [
-                "enabled",
-                "webhook_url",
-                "username",
-                "mention",
-                "notify_on_waiting",
-                "notify_on_idle",
-                "notify_on_error",
-                "notify_on_stopped"
-            ]
-        );
-        assert!(
-            !descriptor("discord", "enabled")
-                .expect("discord.enabled descriptor")
-                .profile_overridable
-        );
     }
 
     #[test]

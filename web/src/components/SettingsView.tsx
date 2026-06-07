@@ -31,7 +31,6 @@ type TabId =
   | "updates"
   | "telemetry"
   | "notifications"
-  | "discord"
   | "auth"
   | "terminal"
   | "security"
@@ -67,8 +66,6 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "divider", label: "Notifications" },
     { kind: "tab", id: "sound", label: "Sound" },
     { kind: "tab", id: "notifications", label: "Notifications" },
-    { kind: "divider", label: "Integrations Beta" },
-    { kind: "tab", id: "discord", label: "Discord" },
     { kind: "divider", label: "Web Dashboard" },
     { kind: "tab", id: "auth", label: "Auth" },
     { kind: "tab", id: "terminal", label: "Terminal" },
@@ -105,7 +102,6 @@ const ALL_TAB_IDS = new Set<TabId>([
   "updates",
   "telemetry",
   "notifications",
-  "discord",
   "auth",
   "terminal",
   "security",
@@ -134,7 +130,6 @@ const SCHEMA_BACKED_TABS = new Set<TabId>([
   "logging",
   "notifications",
   "structured-view",
-  "discord",
   "auth",
 ]);
 
@@ -534,7 +529,6 @@ export function SettingsView({
           </div>
         );
 
-      case "discord":
       case "auth":
         if (schemaLoading) {
           return (
@@ -563,11 +557,7 @@ export function SettingsView({
             schema={schema}
             values={(settings?.[activeTab] ?? {}) as Record<string, unknown>}
             onSaveField={saveSubField}
-            advancedSubtitle={
-              activeTab === "discord"
-                ? "Webhook-only Discord notifications for session status changes."
-                : "Authentication lockout settings. Restart the AoE server for changes to take effect."
-            }
+            advancedSubtitle="Authentication lockout settings. Restart the AoE server for changes to take effect."
           />
         );
 
