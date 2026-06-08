@@ -22,6 +22,39 @@ pub struct Session {
     name: String,
 }
 
+/// The active pane's cursor, queried alongside a `capture-pane` so the
+/// live-send preview can paint a real cursor (`capture-pane` returns cell
+/// text only; tmux's own client draws the cursor from these pane fields).
+/// `pane_height` rides along so the renderer can map `y` (counted from the
+/// top of the visible screen) onto the bottom-anchored preview output rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneCursor {
+    pub x: u16,
+    pub y: u16,
+    /// `#{cursor_flag}`: 0 when the application hid the cursor (DECTCEM),
+    /// e.g. an agent that parks it while "working". Don't paint when false.
+    pub visible: bool,
+    pub pane_height: u16,
+}
+
+impl PaneCursor {
+    /// Parse the single space-separated line emitted by the
+    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}` format.
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        let x = fields.next()?.parse().ok()?;
+        let y = fields.next()?.parse().ok()?;
+        let flag: u8 = fields.next()?.parse().ok()?;
+        let pane_height = fields.next()?.parse().ok()?;
+        Some(Self {
+            x,
+            y,
+            visible: flag != 0,
+            pane_height,
+        })
+    }
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -311,6 +344,53 @@ impl Session {
         }
     }
 
+    /// Capture the pane like [`capture_pane`](Self::capture_pane), but in the
+    /// same `tmux` fork also query the cursor position + visibility, so the
+    /// live-send preview can paint a real cursor without paying a second fork
+    /// per capture cycle. The cursor line is emitted first (a single
+    /// `display-message` line) and the capture content follows; we split it
+    /// back off. Returns `None` for the cursor if the pane is gone or the
+    /// header didn't parse, in which case the caller simply paints no cursor.
+    pub fn capture_pane_with_cursor(&self, lines: usize) -> Result<(String, Option<PaneCursor>)> {
+        if !self.exists() {
+            return Ok((String::new(), None));
+        }
+
+        let target = format!("{}:^.0", self.name);
+        let start = format!("-{}", lines);
+        let output = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "-F",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+                ";",
+                "capture-pane",
+                "-t",
+                &target,
+                "-p",
+                "-e",
+                "-S",
+                &start,
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Ok((String::new(), None));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        // The cursor line is the first line; everything after the first
+        // newline is the verbatim `capture-pane` output (same bytes the
+        // plain `capture_pane` path returns).
+        let mut parts = raw.splitn(2, '\n');
+        let cursor_line = parts.next().unwrap_or("");
+        let content = parts.next().unwrap_or("").to_string();
+        Ok((content, PaneCursor::parse(cursor_line)))
+    }
+
     pub fn get_pane_pid(&self) -> Option<u32> {
         process::get_pane_pid(&self.name)
     }
@@ -576,6 +656,78 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn pane_cursor_parses_format_line() {
+        let c = PaneCursor::parse("3 2 1 24").expect("parses");
+        assert_eq!(
+            c,
+            PaneCursor {
+                x: 3,
+                y: 2,
+                visible: true,
+                pane_height: 24,
+            }
+        );
+        // cursor_flag 0 => hidden.
+        assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
+        // Garbage / short input yields None rather than a bogus cursor.
+        assert!(PaneCursor::parse("").is_none());
+        assert!(PaneCursor::parse("1 2 3").is_none());
+        assert!(PaneCursor::parse("a b c d").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_pane_with_cursor_returns_content_and_cursor() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_cursor");
+        let name = guard.name().to_string();
+        // `printf` (no trailing newline, no shell prompt, no input echo) parks
+        // the cursor deterministically just past the written text: "hello" is
+        // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
+        // alive across the capture.
+        let status = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
+                "sh -c 'printf hello; sleep 5'",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let session = Session::from_name(&name);
+        let (content, cursor) = session
+            .capture_pane_with_cursor(5)
+            .expect("capture with cursor");
+
+        // The capture content is the same text the plain path would return:
+        // the cursor line must have been split off, not leak into the body.
+        assert!(
+            content.contains("hello"),
+            "capture content should hold the written text, got: {content:?}"
+        );
+        let cursor = cursor.expect("a live session reports a cursor");
+        assert!(cursor.visible, "default cursor is visible");
+        assert_eq!(cursor.pane_height, 10, "pane was created 10 rows tall");
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (5, 0),
+            "cursor parks just past 'hello'"
+        );
     }
 
     #[test]

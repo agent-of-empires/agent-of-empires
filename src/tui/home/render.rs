@@ -91,6 +91,38 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Map a tmux pane cursor onto the preview's output rect for live-send.
+///
+/// `output` is the rect the captured pane text paints into; `visible_rows` is
+/// its height in rows; `cursor` carries the pane's `(x, y)` (counted from the
+/// top of the visible screen) plus `pane_height`. Assumes the preview is at
+/// the live tail, where the bottom captured line pins to the bottom of
+/// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
+/// + cursor.y`. When the pane is sized to the output area (the live-send
+/// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
+/// only bites for the frame or two after a resize. A hidden cursor, or one
+/// that maps outside `output` (e.g. a pane taller than the output area clips
+/// its top rows), yields `None` so nothing is painted.
+fn map_live_preview_cursor(
+    output: Rect,
+    visible_rows: usize,
+    cursor: crate::tmux::PaneCursor,
+) -> Option<Position> {
+    if !cursor.visible {
+        return None;
+    }
+    let row = output.y as i32 + (visible_rows as i32 - cursor.pane_height as i32) + cursor.y as i32;
+    let col = output.x as i32 + cursor.x as i32;
+    if row < output.y as i32
+        || row >= output.y as i32 + output.height as i32
+        || col < output.x as i32
+        || col >= output.x as i32 + output.width as i32
+    {
+        return None;
+    }
+    Some(Position::new(col as u16, row as u16))
+}
+
 /// Number of pane lines to capture for the preview, accounting for the user's
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
 /// fresh capture on every wheel tick.
@@ -2105,12 +2137,37 @@ impl HomeView {
             }
         }
 
+        // In live-send mode, place a real terminal cursor over the preview at
+        // the agent pane's cursor cell. `capture-pane` carries only text, so
+        // without this the "feels-attached" preview shows no cursor even
+        // though a direct tmux attach would (#cursor-in-live-preview).
+        if let Some(pos) = self.live_preview_cursor_pos() {
+            frame.set_cursor_position(pos);
+        }
+
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
         // only populate `preview_selection` while a drag is live or a
         // finalized highlight is showing, so this branch is a no-op
         // otherwise.
         self.paint_preview_selection(frame, theme);
+    }
+
+    /// Where to paint the live-send cursor this frame, or `None` to paint no
+    /// cursor. Maps the agent pane's `(cursor_x, cursor_y)` (counted from the
+    /// top of the visible screen) onto the preview's output rect.
+    ///
+    /// Only fires while live-send is active and the preview is at the live
+    /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
+    /// live cursor would land on the wrong row. The capture worker only
+    /// publishes a cursor when the displayed pane IS the live-send target, so
+    /// a `Some` here already means "this pane is the one being driven."
+    fn live_preview_cursor_pos(&self) -> Option<Position> {
+        if self.live_send.is_none() || self.preview_scroll_offset != 0 {
+            return None;
+        }
+        let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
     }
 
     /// Apply the drag-select highlight to cells inside the preview
@@ -2637,6 +2694,55 @@ mod tests {
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
+
+    fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x,
+            y,
+            visible,
+            pane_height,
+        }
+    }
+
+    #[test]
+    fn live_cursor_maps_directly_when_pane_matches_output() {
+        // Pane sized to the output area (the steady-state live-send case): the
+        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y).
+        let output = Rect::new(40, 5, 80, 24);
+        let pos = map_live_preview_cursor(output, 24, pane_cursor(3, 2, true, 24));
+        assert_eq!(pos, Some(Position::new(43, 7)));
+    }
+
+    #[test]
+    fn live_cursor_anchored_to_bottom_when_pane_taller_than_output() {
+        // Pane is 24 rows but only 10 are visible (top clipped). The bottom 10
+        // pin to the output, so a cursor on the last screen row (y=23) lands on
+        // the output's last row; a cursor in the clipped top maps out and drops.
+        let output = Rect::new(0, 0, 80, 10);
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 23, true, 24)),
+            Some(Position::new(0, 9)),
+        );
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 5, true, 24)),
+            None,
+        );
+    }
+
+    #[test]
+    fn live_cursor_hidden_or_out_of_bounds_paints_nothing() {
+        let output = Rect::new(0, 0, 80, 24);
+        // DECTCEM-hidden cursor: nothing to paint.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(3, 2, false, 24)),
+            None,
+        );
+        // Column past the output width is dropped rather than clamped.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(80, 2, true, 24)),
+            None,
+        );
+    }
 
     #[test]
     fn truncate_to_width_passthrough_when_fits() {
