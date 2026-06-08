@@ -4830,6 +4830,45 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
 }
 
+/// Approach 2: archiving in the default (non-Attention) sort keeps the cursor
+/// AND selection on the just-archived session instead of swapping to a
+/// neighbor, and reveals the Archived section so the row stays visible. This is
+/// what lets the preview render the calm "Archived" placeholder for the same
+/// row the user is looking at, rather than flashing a dead-pane warning and
+/// then snapping selection to the session below.
+#[test]
+#[serial]
+fn archive_keeps_selection_and_reveals_section() {
+    let mut env = create_test_env_with_sessions(2);
+    // Start with the Archived section collapsed (the default / reported repro).
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_archived(),
+        "the session must be archived"
+    );
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(id.as_str()),
+        "selection must stay on the archived session, not swap to a neighbor"
+    );
+    assert!(
+        !env.view.archived_section_collapsed,
+        "archiving must reveal the Archived section so the row stays visible"
+    );
+    match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id: cur, .. }) => {
+            assert_eq!(cur, &id, "cursor must land on the archived row")
+        }
+        _ => panic!("cursor should be on the archived session row"),
+    }
+}
+
 /// `restart_selected_session` must drop the press silently when nothing is
 /// selected. No restart_with_size call, no save, no cooldown insertion.
 #[test]
@@ -6422,6 +6461,59 @@ mod click_to_select {
         assert_eq!(
             env.view.cursor, 2,
             "SelectOnly must still move the cursor to the clicked row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn single_click_on_archived_row_selects_without_reviving() {
+        // A parked (archived) session has had its pane killed. Single-clicking
+        // it is a "let me look" gesture and must NOT resurrect it: no
+        // EnterLiveSend (which would respawn the pane) and the session stays
+        // archived (no auto-unarchive). This holds even under the default
+        // `click_action = LiveSend`. Bringing it back stays explicit: `z`,
+        // double-click, or Enter.
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Keep archived rows visible so the archived row is clickable.
+        env.view.archived_section_collapsed = false;
+
+        // Archive the row at cursor 0.
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let archived_id = env.view.selected_session.clone().unwrap();
+        env.view.toggle_archive_at_cursor().unwrap();
+        assert!(
+            env.view.get_instance(&archived_id).unwrap().is_archived(),
+            "precondition: the session must be archived"
+        );
+
+        // Locate the archived row in the flat list and click it.
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id, .. } if id == &archived_id))
+            .expect("archived session must render under the expanded Archived section");
+        let row = env.view.list_inner_area.y + idx as u16;
+        let action = env.view.handle_click(5, row);
+
+        assert_eq!(
+            action, None,
+            "single click on an archived row must not request live-send"
+        );
+        assert!(
+            env.view.live_send.is_none(),
+            "single click on an archived row must not enter live-send mode"
+        );
+        assert!(
+            env.view.get_instance(&archived_id).unwrap().is_archived(),
+            "single click on an archived row must not unarchive it"
+        );
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(archived_id.as_str()),
+            "single click should still select the archived row"
         );
     }
 
@@ -9567,6 +9659,8 @@ mod right_click_context_menu {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1);
+        // Session menu is Rename / Archive / Delete; Delete is two Downs away.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(env.view.context_menu.is_none());
@@ -9586,6 +9680,74 @@ mod right_click_context_menu {
         assert!(env.view.context_menu.is_none());
         assert!(env.view.rename_dialog.is_none());
         assert!(env.view.unified_delete_dialog.is_none());
+    }
+
+    /// Right-click a session, pick the Archive item (Rename -> Archive is one
+    /// Down), and the row gets archived through the same `z` codepath. No
+    /// follow-up dialog: archiving is immediate.
+    #[test]
+    #[serial]
+    fn right_click_archive_action_archives_session() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        let id = env.view.selected_session.clone().unwrap();
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_archived(),
+            "precondition: session starts unarchived"
+        );
+
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert!(env.view.context_menu.is_none(), "menu closes after archive");
+        assert!(
+            env.view.get_instance(&id).unwrap().is_archived(),
+            "context-menu Archive must archive the session"
+        );
+    }
+
+    /// An archived row's context menu offers Unarchive, and picking it restores
+    /// the session.
+    #[test]
+    #[serial]
+    fn right_click_unarchive_action_restores_session() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        // Reveal the section and archive the first row so it stays visible.
+        env.view.archived_section_collapsed = false;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = env.view.selected_session.clone().unwrap();
+        env.view.toggle_archive_at_cursor().unwrap();
+        assert!(env.view.get_instance(&id).unwrap().is_archived());
+
+        // Right-click the archived row: its menu must read "Unarchive".
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id: i, .. } if i == &id))
+            .expect("archived row must be visible");
+        let row = env.view.list_inner_area.y + idx as u16;
+        assert!(env.view.handle_right_click(5, row));
+        let labels: Vec<&str> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(_, l)| *l)
+            .collect();
+        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_archived(),
+            "context-menu Unarchive must restore the session"
+        );
     }
 
     #[test]

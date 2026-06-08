@@ -3083,7 +3083,13 @@ impl HomeView {
             self.context_menu = Some(if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                ContextMenuDialog::for_session(anchor)
+                let is_archived = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => {
+                        self.get_instance(id).is_some_and(|inst| inst.is_archived())
+                    }
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session(anchor, is_archived)
             });
             return true;
         }
@@ -3145,6 +3151,13 @@ impl HomeView {
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
+            ContextMenuAction::ToggleArchive => {
+                // The right-click already moved the cursor onto the row, so the
+                // toggle acts on the same session the menu was opened for.
+                if let Err(e) = self.toggle_archive_at_cursor() {
+                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -3500,7 +3513,20 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Single-click behavior is user-configurable via
+                // An archived row is parked: its pane was killed on archive.
+                // A single click is a "let me look at this" gesture, so it
+                // must NOT enter live-send, because `start_live_send` would
+                // respawn the pane (ensure_pane_ready) and the live-send path
+                // would auto-unarchive it (touch_last_accessed), silently
+                // resurrecting a session the user deliberately parked. Stop at
+                // the cursor update so the row just gets selected. Bringing it
+                // back stays explicit: `z` to unarchive, or a deliberate
+                // double-click / Enter to open it.
+                let archived = self
+                    .get_instance(&id)
+                    .map(|inst| inst.is_archived())
+                    .unwrap_or(false);
+                // Single-click behavior is otherwise user-configurable via
                 // `SessionConfig::click_action`. `LiveSend` (default,
                 // historical behavior) enters live-send for the clicked
                 // row, or switches the live target when already in live
@@ -3511,10 +3537,12 @@ impl HomeView {
                 // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
                 // is fine.
-                if matches!(
-                    self.click_action(&id),
-                    Some(crate::session::ClickAction::SelectOnly)
-                ) {
+                if archived
+                    || matches!(
+                        self.click_action(&id),
+                        Some(crate::session::ClickAction::SelectOnly)
+                    )
+                {
                     None
                 } else {
                     self.start_live_send()

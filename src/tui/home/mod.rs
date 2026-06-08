@@ -2586,6 +2586,23 @@ impl HomeView {
         self.preview_pane_synced = None;
     }
 
+    /// Expand the synthetic Archived section if it is collapsed, persisting
+    /// the change. Used when archiving a session in the non-Attention sort so
+    /// the freshly archived row is visible and can stay selected under the
+    /// cursor. No-op (and no save) when the section is already open.
+    pub(super) fn reveal_archived_section(&mut self) {
+        if !self.archived_section_collapsed {
+            return;
+        }
+        self.archived_section_collapsed = false;
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.archived_section_collapsed = Some(false);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+            }
+        }
+    }
+
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {

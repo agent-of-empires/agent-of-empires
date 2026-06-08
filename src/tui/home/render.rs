@@ -1847,12 +1847,33 @@ impl HomeView {
         self.preview_text_view = crate::tui::home::PreviewTextView::default();
         frame.render_widget(block, area);
 
+        // An archived session's pane was killed on archive, so there's nothing
+        // live to capture. Short-circuit every view mode to a calm "Archived"
+        // placeholder instead of forking captures that come back empty and
+        // surface as "No output available".
+        let selected_archived = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_archived());
+
         // Keep the off-thread capture worker pointed at whatever pane this
         // view shows (and tuned to live-send vs. idle cadence) before any
         // refresh reads from it. Done once here, not per-branch, so the
-        // creating / no-selection paths also retarget or tear it down.
-        let desired = self.displayed_pane_tmux_name();
+        // creating / no-selection / archived paths also retarget or tear it
+        // down (archived feeds `None` so the worker stops capturing).
+        let desired = if selected_archived {
+            None
+        } else {
+            self.displayed_pane_tmux_name()
+        };
         self.sync_preview_capture_worker(desired);
+
+        if selected_archived {
+            self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
 
         match self.view_mode {
             ViewMode::Structured => {
@@ -2282,6 +2303,45 @@ impl HomeView {
                 .style(Style::default().fg(theme.dimmed));
             frame.render_widget(hint, inner);
         }
+    }
+
+    /// Calm placeholder shown in the preview pane when the selected session is
+    /// archived. Archiving kills the pane, so the normal capture path would
+    /// render an empty body ("No output available"); this explains the state
+    /// instead and points at `z` to restore.
+    fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| inst.title.clone())
+            .unwrap_or_default();
+        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let parked = if title.is_empty() {
+            "This session is parked. Its agent was stopped.".to_string()
+        } else {
+            format!("\"{}\" is parked. Its agent was stopped.", title)
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Archived",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(parked, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(key, Style::default().fg(theme.hint).bold()),
+                Span::styled(
+                    " to restore it, or pick another session.",
+                    Style::default().fg(theme.dimmed),
+                ),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
