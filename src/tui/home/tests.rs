@@ -4867,6 +4867,45 @@ fn archive_keeps_selection_and_reveals_section() {
         }
         _ => panic!("cursor should be on the archived session row"),
     }
+    // Archiving does not queue a revive.
+    assert!(env.view.pending_revive_session.is_none());
+}
+
+/// Restoring with `z` unarchives the row AND queues a revive so the app loop
+/// respawns the killed pane (the session comes back Running, not Stopped). The
+/// spawn itself is deferred to the loop, so the toggle stays side-effect-free.
+#[test]
+#[serial]
+fn unarchive_queues_a_revive() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    // Archive, then restore.
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert!(
+        env.view.pending_revive_session.is_none(),
+        "archiving must not queue a revive"
+    );
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_archived(),
+        "second toggle unarchives"
+    );
+    assert_eq!(
+        env.view.pending_revive_session.as_deref(),
+        Some(id.as_str()),
+        "restoring must queue the row for revival by the app loop"
+    );
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(id.as_str()),
+        "restored row stays selected"
+    );
 }
 
 /// `restart_selected_session` must drop the press silently when nothing is
@@ -9747,6 +9786,11 @@ mod right_click_context_menu {
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
             "context-menu Unarchive must restore the session"
+        );
+        assert_eq!(
+            env.view.pending_revive_session.as_deref(),
+            Some(id.as_str()),
+            "context-menu Unarchive must queue the revive like the keyboard path"
         );
     }
 

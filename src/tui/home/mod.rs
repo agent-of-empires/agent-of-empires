@@ -584,6 +584,11 @@ pub struct HomeView {
     /// an Action. Stashed here and drained by `app.rs` after the click
     /// is consumed so both paths produce the same downstream effect.
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
+    /// Session id queued for revival after an unarchive (`z` on an archived
+    /// row). Set by `toggle_archive_at_cursor`, drained by the app loop, which
+    /// runs the slow `ensure_pane_ready` respawn behind a "Reviving..." toast.
+    /// Deferring keeps the spawn out of the directly-unit-tested toggle.
+    pub(super) pending_revive_session: Option<String>,
     // Search
     pub(super) search_active: bool,
     pub(super) search_query: Input,
@@ -981,6 +986,7 @@ impl HomeView {
             pending_stop_session: None,
             pending_force_remove_session: None,
             pending_dialog_click_action: None,
+            pending_revive_session: None,
             search_active: false,
             search_query: Input::default(),
             search_matches: Vec::new(),

@@ -1000,6 +1000,15 @@ impl HomeView {
             // tier, so without this the cursor stays at the old index and
             // ends up on whatever row slid into that slot.
             self.select_session_by_id(&id);
+            // Restore means "bring it back to life", not just un-park it.
+            // Archiving killed the whole tmux session, so an unarchived row
+            // would otherwise sit Stopped with a dead-pane preview. Defer the
+            // respawn to the app loop (pending_revive_session) rather than
+            // calling ensure_pane_ready inline: the revive can block for
+            // seconds (Docker pull, agent splash, resume) and the loop shows a
+            // "Reviving..." toast while it runs. Deferring also keeps this
+            // method free of spawn side effects so unit tests stay clean.
+            self.pending_revive_session = Some(id);
             return Ok(());
         }
 
@@ -1031,6 +1040,25 @@ impl HomeView {
             self.flat_items = self.build_flat_items();
             self.select_session_by_id(&id);
         }
+        Ok(())
+    }
+
+    /// Respawn a just-unarchived session's pane so a restored row comes back
+    /// Running instead of Stopped. Archiving killed the whole tmux session, so
+    /// this routes through the same dead/gone-pane cascade attach and live-send
+    /// use (`ensure_pane_ready` -> `start_with_resume_fallback`), reloading the
+    /// agent's prior context where the engine supports resume. Run from the app
+    /// loop (see `pending_revive_session`) because it can block for seconds.
+    /// On failure the row stays unarchived so the user can retry with `e`.
+    pub(crate) fn revive_session(&mut self, id: &str) -> anyhow::Result<()> {
+        self.try_mutate_instance_writeback_on_err(id, |inst| {
+            inst.ensure_pane_ready().map(|_| ()).map_err(Into::into)
+        })?;
+        // User gesture: bump last_accessed so the restored row sorts as freshly
+        // touched, then rebuild + re-seat so the cursor follows it to its tier.
+        self.stamp_last_accessed(id);
+        self.flat_items = self.build_flat_items();
+        self.select_session_by_id(id);
         Ok(())
     }
 }
