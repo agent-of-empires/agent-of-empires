@@ -1301,20 +1301,7 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            // Recovery-edge cleanup: when every reload source returns to
-            // healthy and a stale Reload Failed dialog is still rendered,
-            // clear it so the user regains keyboard control. Without this,
-            // InfoDialog absorbs every key except Esc/Enter/Space (including
-            // q / Ctrl-C) for as long as the dialog is up, even after the
-            // underlying failure has recovered.
-            if !self.home.reload_failure_state.has_any_failure()
-                && self
-                    .home
-                    .info_dialog
-                    .as_ref()
-                    .is_some_and(|d| d.title() == "Reload Failed")
-            {
-                self.home.info_dialog = None;
+            if self.home.try_clear_recovered_reload_dialog() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }

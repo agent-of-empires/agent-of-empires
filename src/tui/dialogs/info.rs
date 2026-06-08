@@ -92,6 +92,8 @@ impl InfoDialog {
         self
     }
 
+    /// The dialog title; the tick loop reads this to decide which
+    /// auto-dismiss path applies on recovery edges.
     pub fn title(&self) -> &str {
         &self.title
     }

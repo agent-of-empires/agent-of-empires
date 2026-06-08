@@ -961,10 +961,12 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
 /// once per failure burst, not once per tick. The dialog body aggregates
 /// every currently-failing source (storage and config) into a single
 /// message.
-/// Distinguishes create vs delete in `rewire_after_profile_mutation`
-/// so call sites cannot drift in a parallel-string convention; the two
-/// methods produce the structured-log label and the user-facing
-/// past-tense word.
+/// Distinguishes create vs delete in `rewire_after_profile_mutation`.
+/// The two methods produce the structured-log label
+/// (`op_label`, used in tracing) and the user-facing past-tense word
+/// (`past_tense`, used in dialog text) so call sites cannot drift in
+/// a parallel-string convention.
+#[derive(Debug)]
 pub(super) enum ProfileMutation {
     Create,
     Delete,
@@ -1826,13 +1828,12 @@ impl HomeView {
     /// rewires because the app dir is never deleted mid-session, so the
     /// kernel watch on it stays valid.
     ///
-    /// Per-profile entries use the same systematic teardown +
-    /// re-subscribe shape as `rewire_disk_subscriptions`: every existing
-    /// per-profile entry is dropped first, then a fresh subscription is
-    /// installed for each profile in `current`. This handles the
-    /// "profile dir deleted and recreated under the same name" case
-    /// where the kernel watch is invalidated by the unlink even though
-    /// the profile name has not changed.
+    /// Per-profile entries are fully torn down then re-subscribed on
+    /// each rewire: every existing per-profile entry is dropped first,
+    /// then a fresh subscription is installed for each profile in
+    /// `current`. This handles the "profile dir deleted and recreated
+    /// under the same name" case where the kernel watch is invalidated
+    /// by the unlink even though the profile name has not changed.
     ///
     /// Drop order on remove is canonical: drop the `SubscriptionHandle`
     /// FIRST, then abort the forwarder, so the source channel closes
@@ -1886,12 +1887,12 @@ impl HomeView {
             .collect();
         let target: std::collections::HashSet<&String> = current.iter().collect();
 
-        // Per-profile inode invalidation mirrors the disk-watch path:
-        // peer-driven `aoe profile delete X && aoe profile new X` keeps
-        // the same name but produces a new inode, and notify NonRecursive
-        // watches do not auto-reattach. Compare each prior entry's stored
-        // canonical_dir against the current canonical resolution; mismatch
-        // forces a rewire even when the name set is unchanged.
+        // Per-profile inode invalidation: peer-driven `aoe profile delete X
+        // && aoe profile new X` keeps the same name but produces a new
+        // inode, and notify NonRecursive watches do not auto-reattach.
+        // Compare each prior entry's stored canonical_dir against the
+        // current canonical resolution; mismatch forces a rewire even
+        // when the name set is unchanged.
         let inode_invalidated: Vec<String> = prior_profiles
             .iter()
             .filter(|name| {
@@ -2023,7 +2024,12 @@ impl HomeView {
             };
             match self.file_watch.subscribe_channel(spec, 4) {
                 Ok((mut rx, handle)) => {
-                    let dirty = std::sync::Arc::clone(&self.config_dirty);
+                    use tracing::Instrument;
+                    let dirty = self.config_dirty.clone();
+                    let span = tracing::debug_span!(
+                        "tui.config_watch.profile.forwarder",
+                        profile = %name
+                    );
                     let join = crate::task_util::spawn_supervised(
                         "tui.config_watch.profile.forwarder",
                         crate::task_util::PanicPolicy::Log,
@@ -2031,7 +2037,8 @@ impl HomeView {
                             while rx.recv().await.is_some() {
                                 dirty.store(true, std::sync::atomic::Ordering::Release);
                             }
-                        },
+                        }
+                        .instrument(span),
                     );
                     self.config_watch_handles.insert(
                         ConfigWatchKey::profile(name),
@@ -2056,7 +2063,7 @@ impl HomeView {
             }
         }
         if !to_add.is_empty() || !to_remove.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 target: "tui.file_watch",
                 added = ?to_add,
                 removed = ?to_remove,
@@ -2104,8 +2111,7 @@ impl HomeView {
                     profile = %profile_name,
                     op = %op_label,
                     error = %e,
-                    "list_profiles failed during rewire after {}; watcher state will repair on next reload",
-                    op_label
+                    "list_profiles failed during rewire after profile mutation; watcher state will repair on next reload"
                 );
                 if self.info_dialog.is_none() {
                     self.info_dialog = Some(InfoDialog::new(
@@ -2117,6 +2123,26 @@ impl HomeView {
                     ));
                 }
             }
+        }
+    }
+
+    /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog
+    /// when every reload source returns to healthy. Returns `true`
+    /// when the dialog was cleared so the caller can request a redraw.
+    /// The `Watcher Warning` dialog raised by
+    /// `rewire_after_profile_mutation` is intentionally outside
+    /// `reload_failure_state` and is left for the user to dismiss.
+    pub(super) fn try_clear_recovered_reload_dialog(&mut self) -> bool {
+        if !self.reload_failure_state.has_any_failure()
+            && self
+                .info_dialog
+                .as_ref()
+                .is_some_and(|d| d.title() == "Reload Failed")
+        {
+            self.info_dialog = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -3662,7 +3688,17 @@ impl HomeView {
         // global subscription is install-once and per-profile entries
         // converge to the on-disk profile set; redundant invocations are
         // no-ops.
-        let config_targets = crate::session::list_profiles().unwrap_or_default();
+        let config_targets = match crate::session::list_profiles() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                tracing::warn!(
+                    target: "tui.file_watch",
+                    error = %e,
+                    "list_profiles failed during switch_profile; reusing loaded storages for config rewire"
+                );
+                self.storages.keys().cloned().collect()
+            }
+        };
         self.rewire_config_subscriptions(&config_targets)?;
         // Clear selection before reload so stale session/group refs don't linger
         self.selected_session = None;

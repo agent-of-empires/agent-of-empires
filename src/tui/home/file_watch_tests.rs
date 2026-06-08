@@ -366,6 +366,60 @@ async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
     );
 }
 
+/// The Watcher Warning dialog raised by `rewire_after_profile_mutation`
+/// is intentionally outside `reload_failure_state`, so `has_any_failure()`
+/// stays false. The recovery-edge cleanup keys off both the failure
+/// state and the dialog title, and must not match `Watcher Warning`;
+/// the dialog stays visible until the user dismisses it.
+#[tokio::test]
+#[serial]
+async fn rewire_after_profile_mutation_watcher_warning_survives_recovery_edge() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("watcher-warning-edge").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("watcher-warning-edge".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+    view.rewire_after_profile_mutation("watcher-warning-edge", super::ProfileMutation::Create);
+
+    let dialog = view.info_dialog.as_ref().expect("watcher warning raised");
+    assert_eq!(
+        dialog.title(),
+        "Watcher Warning",
+        "rewire failure must raise the Watcher Warning dialog"
+    );
+    assert!(
+        !view.reload_failure_state.has_any_failure(),
+        "rewire_after_profile_mutation does not record into reload_failure_state; \
+         the recovery-edge cleanup keys off has_any_failure() to protect tracked \
+         failures, and the Watcher Warning relies on its title to stay visible"
+    );
+
+    let cleared = view.try_clear_recovered_reload_dialog();
+    assert!(
+        !cleared,
+        "try_clear_recovered_reload_dialog must not match Watcher Warning"
+    );
+    let dialog = view
+        .info_dialog
+        .as_ref()
+        .expect("watcher warning must persist past the recovery-edge check");
+    assert_eq!(
+        dialog.title(),
+        "Watcher Warning",
+        "the dialog promises the next reload will repair watcher state and \
+         stays visible for the user to read and dismiss"
+    );
+}
+
 /// Locks the no-op fast-path invariant: when `rewire_disk_subscriptions`
 /// is called with an unchanged profile set and no inode invalidation, the
 /// fast-path returns without running the install loop, and a previously
