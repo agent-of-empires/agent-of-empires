@@ -10,6 +10,16 @@
       "components": ["web/src/components/McpServers.tsx"]
     },
     {
+      "id": "settings.mcp-servers.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/McpServers.test.tsx",
+        "src/lib/api.mcp.test.ts"
+      ],
+      "components": ["web/src/components/McpServers.tsx"]
+    },
+    {
       "id": "dashboard.golden-path",
       "kind": "live-playwright",
       "risk": "high",
