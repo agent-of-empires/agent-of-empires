@@ -994,6 +994,11 @@ impl HomeView {
         };
         if is_archived {
             self.apply_user_action(&id, |inst| inst.unarchive())?;
+            // Archiving killed the tmux session, so the status poller stamped a
+            // "tmux session is gone" error on the row. Clear it now so the
+            // restored row shows "Reviving..." / live output instead of
+            // flashing that stale corpse error before the new pane comes up.
+            self.set_instance_error(&id, None);
             self.flat_items = self.build_flat_items();
             // Re-seat the cursor on the just-unarchived session. After the
             // flat_items rebuild the row jumps from tier 99 to its real

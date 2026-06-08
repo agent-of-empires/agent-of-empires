@@ -4891,6 +4891,13 @@ fn unarchive_queues_a_revive() {
         "archiving must not queue a revive"
     );
 
+    // Simulate the poller stamping the killed session with the corpse error,
+    // which is what previously flashed in the preview on the first restore.
+    env.view.set_instance_error(
+        &id,
+        Some("tmux session is gone. The agent process may have exited or been killed.".to_string()),
+    );
+
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
@@ -4905,6 +4912,11 @@ fn unarchive_queues_a_revive() {
         env.view.selected_session.as_deref(),
         Some(id.as_str()),
         "restored row stays selected"
+    );
+    assert!(
+        env.view.get_instance(&id).unwrap().last_error.is_none(),
+        "restoring must clear the stale 'tmux session is gone' error so the \
+         preview doesn't flash it before the new pane comes up"
     );
 }
 
