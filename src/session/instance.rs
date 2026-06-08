@@ -3539,11 +3539,18 @@ fn resolve_detected_status(
     match detected {
         Status::Idle if has_command_override => {
             // Custom commands run agents through wrapper scripts that appear
-            // as shell processes to tmux. Only declare Error when the pane is
-            // actually dead; don't use shell-stale since the shell IS the
-            // expected wrapper process.
+            // as shell processes to tmux, so we can't trust the pane's current
+            // command here; decide from pane *content* instead. A pane that is
+            // still rendering the agent TUI is genuinely parked at its prompt,
+            // so a detected Idle is real and we keep it (otherwise on_idle /
+            // on_waiting status hooks never fire for wrapped agents, e.g. an
+            // opencode session launched via agent_command_override, see #2022).
+            // Only declare Error when the pane is actually dead; a live pane
+            // without recognizable agent content stays Unknown.
             if is_dead {
                 Status::Error
+            } else if pane_has_agent_content(pane_content, tool) {
+                Status::Idle
             } else {
                 Status::Unknown
             }
@@ -5407,6 +5414,19 @@ mod tests {
         assert_eq!(
             resolve_detected_status(Status::Idle, false, true, true, "$ ", "opencode"),
             Status::Unknown
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_command_override_agent_content_stays_idle() {
+        // A wrapped agent (agent_command_override) whose pane still renders the
+        // agent TUI must keep its detected Idle so on_idle / on_waiting status
+        // hooks fire; previously the override masked every Idle to Unknown and
+        // those hooks never ran (#2022).
+        let content = "ctrl+p commands \u{2022} OpenCode 1.16.2";
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, false, true, content, "opencode"),
+            Status::Idle
         );
     }
 
