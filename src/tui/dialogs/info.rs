@@ -8,11 +8,22 @@ use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
+/// Which end of an overflowing message stays visible. Most dialogs read
+/// top-down, so `Top` is the default; error output (hook failures, panics)
+/// puts the payload last and overrides to `Tail`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollMode {
+    #[default]
+    Top,
+    Tail,
+}
+
 pub struct InfoDialog {
     title: String,
     message: String,
     width: u16,
     height: u16,
+    scroll_mode: ScrollMode,
     dialog_area: Rect,
     /// Rect of the `[OK]` button, captured during `render`. A click
     /// anywhere dismisses, but the button is the call to action, so it
@@ -29,6 +40,7 @@ impl InfoDialog {
             message: message.to_string(),
             width: 50,
             height: 9,
+            scroll_mode: ScrollMode::Top,
             dialog_area: Rect::default(),
             ok_button_area: Rect::default(),
             hover: HoverState::default(),
@@ -67,7 +79,17 @@ impl InfoDialog {
             rows.insert(0, format!("… {} earlier lines hidden", hidden));
         }
         let height = ((rows.len() as u16).saturating_add(7)).clamp(9, MAX_HEIGHT);
-        Self::new(title, &rows.join("\n")).with_size(WIDTH, height)
+        Self::new(title, &rows.join("\n"))
+            .with_size(WIDTH, height)
+            .with_scroll_mode(ScrollMode::Tail)
+    }
+
+    /// Choose which end of an overflowing message stays visible. Defaults to
+    /// [`ScrollMode::Top`]; error dialogs override to [`ScrollMode::Tail`] so
+    /// the trailing payload (panic message, hook output) isn't scrolled off.
+    pub fn with_scroll_mode(mut self, mode: ScrollMode) -> Self {
+        self.scroll_mode = mode;
+        self
     }
 
     /// A left-click anywhere inside the info dialog dismisses it,
@@ -132,11 +154,16 @@ impl InfoDialog {
 
         // Message. Wrap to the *rendered* width (centered_rect may have
         // clamped below the requested size on small terminals) so the row
-        // count is exact, then scroll so the message's tail stays visible
-        // when it doesn't fit: for error output the last lines are the
-        // payload (the panic message, the npm error summary).
+        // count is exact. In `Tail` mode scroll so the message's tail stays
+        // visible when it doesn't fit (error output puts the payload last:
+        // the panic message, the npm error summary); `Top` mode keeps the
+        // head anchored and clips the bottom, the default for read-top-down
+        // dialogs.
         let rows = wrap_to_width(&self.message, chunks[0].width as usize);
-        let scroll = (rows.len() as u16).saturating_sub(chunks[0].height);
+        let scroll = match self.scroll_mode {
+            ScrollMode::Top => 0,
+            ScrollMode::Tail => (rows.len() as u16).saturating_sub(chunks[0].height),
+        };
         let message = Paragraph::new(rows.join("\n"))
             .style(Style::default().fg(theme.text))
             .scroll((scroll, 0));
@@ -330,6 +357,32 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("line 28"), "tail must be visible");
         assert!(!rendered.contains("line 1 "), "head should scroll away");
+    }
+
+    /// Default (`Top`) dialogs keep the head anchored when content overflows,
+    /// so the first lines of a top-down message (e.g. a warning list) stay
+    /// visible and the bottom clips instead. Guards against the error-dialog
+    /// tail-scroll leaking onto every `InfoDialog::new` caller.
+    #[test]
+    fn default_dialog_anchors_head_on_overflow() {
+        use ratatui::backend::TestBackend;
+
+        let message: String = (1..=30)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut dialog = InfoDialog::new("T", &message);
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                dialog.render(frame, area, &Theme::default());
+            })
+            .unwrap();
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("line 1 "), "head must stay visible");
+        assert!(!rendered.contains("line 30"), "tail should clip away");
     }
 
     #[test]
