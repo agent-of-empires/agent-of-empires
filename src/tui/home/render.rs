@@ -1870,7 +1870,13 @@ impl HomeView {
         // that as a calm "Stopped" placeholder rather than the red crash error;
         // a real crash leaves a specific message and still renders red. Covers
         // the just-unarchived row, which sits Stopped until restarted.
+        //
+        // Only in Structured view: the gone-error is about the agent pane, but
+        // Tool / Terminal views show a different, independently-live pane (a tool
+        // session can be running while the agent has exited), so the placeholder
+        // must not hide that pane's output there.
         let selected_stopped = !selected_archived
+            && matches!(self.view_mode, ViewMode::Structured)
             && self
                 .selected_session
                 .as_ref()
