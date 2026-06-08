@@ -185,9 +185,10 @@ export async function updateSettings(
  * must not trip the passphrase/elevation wall the general settings surface
  * carries. Returns false on read-only servers (403) or network failure.
  */
-export async function updateTheme(
-  patch: { name?: string; color_mode?: string },
-): Promise<boolean> {
+export async function updateTheme(patch: {
+  name?: string;
+  color_mode?: string;
+}): Promise<boolean> {
   try {
     const res = await fetch("/api/theme", {
       method: "PATCH",
