@@ -2316,7 +2316,7 @@ impl HomeView {
     /// Calm placeholder shown in the preview pane when the selected session is
     /// archived. Archiving kills the pane, so the normal capture path would
     /// render an empty body ("No output available"); this explains the state
-    /// instead and points at `z` to restore.
+    /// instead and points at `z` to bring the row back to the active list.
     fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = self
             .selected_session
@@ -2343,7 +2343,7 @@ impl HomeView {
                 Span::styled("Press ", Style::default().fg(theme.dimmed)),
                 Span::styled(key, Style::default().fg(theme.hint).bold()),
                 Span::styled(
-                    " to restore it, or pick another session.",
+                    " to unarchive it, then e to restart.",
                     Style::default().fg(theme.dimmed),
                 ),
             ]),

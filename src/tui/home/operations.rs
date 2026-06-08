@@ -994,35 +994,14 @@ impl HomeView {
         };
         if is_archived {
             self.apply_user_action(&id, |inst| inst.unarchive())?;
-            // Archiving killed the tmux session, so the status poller stamped a
-            // "tmux session is gone" error on the row. Clear it now so the
-            // restored row shows "Reviving..." / live output instead of
-            // flashing that stale corpse error before the new pane comes up.
-            self.set_instance_error(&id, None);
             self.flat_items = self.build_flat_items();
             // Re-seat the cursor on the just-unarchived session. After the
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
-            // ends up on whatever row slid into that slot.
+            // ends up on whatever row slid into that slot. The session stays
+            // Stopped (archive killed its pane); the user restarts it with `e`
+            // when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
-            // Restore means "bring it back to life", not just un-park it.
-            // Archiving killed the whole tmux session, so an unarchived row
-            // would otherwise sit Stopped with a dead-pane preview. Defer the
-            // respawn to the app loop (pending_revive_session) rather than
-            // calling ensure_pane_ready inline: the revive can block for
-            // seconds (Docker pull, agent splash, resume) and the loop shows a
-            // "Reviving..." toast while it runs. Deferring also keeps this
-            // method free of spawn side effects so unit tests stay clean.
-            //
-            // Structured (ACP) sessions have no tmux pane to respawn, so
-            // ensure_pane_ready would error; skip the revive and just leave
-            // them unarchived. Their worker lifecycle is managed elsewhere.
-            let is_structured = self
-                .get_instance(&id)
-                .is_some_and(|inst| inst.is_structured());
-            if !is_structured {
-                self.pending_revive_session = Some(id);
-            }
             return Ok(());
         }
 

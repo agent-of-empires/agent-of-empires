@@ -1041,12 +1041,6 @@ impl App {
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
                             }
-                            // A context-menu "Unarchive" click queues a revive
-                            // the same way the keyboard path does; drain it here
-                            // so the mouse path also respawns the restored row.
-                            if let Some(id) = self.home.pending_revive_session.take() {
-                                self.home.request_session_revive(&id);
-                            }
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
@@ -1196,11 +1190,6 @@ impl App {
             }
 
             if self.home.apply_stop_results() {
-                refresh_needed = true;
-                needs_full_refresh = true;
-            }
-
-            if self.home.apply_revive_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1902,13 +1891,6 @@ impl App {
 
         if let Some(action) = self.home.handle_key(key, self.update_info.as_ref()) {
             self.execute_action(action, terminal)?;
-        }
-
-        // Drain a revive queued by `z` on an archived row (keyboard or context
-        // menu). The respawn runs on a background worker so the event loop
-        // stays responsive while the agent comes back.
-        if let Some(id) = self.home.pending_revive_session.take() {
-            self.home.request_session_revive(&id);
         }
 
         #[cfg(feature = "serve")]

@@ -4867,36 +4867,22 @@ fn archive_keeps_selection_and_reveals_section() {
         }
         _ => panic!("cursor should be on the archived session row"),
     }
-    // Archiving does not queue a revive.
-    assert!(env.view.pending_revive_session.is_none());
 }
 
-/// Restoring with `z` unarchives the row AND queues a revive so the app loop
-/// respawns the killed pane (the session comes back Running, not Stopped). The
-/// spawn itself is deferred to the loop, so the toggle stays side-effect-free.
+/// Restoring with `z` unarchives the row and keeps it selected, following it
+/// back to its real tier. Unarchive does not restart the agent: the row stays
+/// Stopped (archive killed its pane) and the user restarts with `e`.
 #[test]
 #[serial]
-fn unarchive_queues_a_revive() {
+fn unarchive_keeps_selection() {
     let mut env = create_test_env_with_sessions(2);
     env.view.archived_section_collapsed = false;
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
 
-    // Archive, then restore.
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.get_instance(&id).unwrap().is_archived());
-    assert!(
-        env.view.pending_revive_session.is_none(),
-        "archiving must not queue a revive"
-    );
-
-    // Simulate the poller stamping the killed session with the corpse error,
-    // which is what previously flashed in the preview on the first restore.
-    env.view.set_instance_error(
-        &id,
-        Some("tmux session is gone. The agent process may have exited or been killed.".to_string()),
-    );
 
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(
@@ -4904,20 +4890,16 @@ fn unarchive_queues_a_revive() {
         "second toggle unarchives"
     );
     assert_eq!(
-        env.view.pending_revive_session.as_deref(),
-        Some(id.as_str()),
-        "restoring must queue the row for revival by the app loop"
-    );
-    assert_eq!(
         env.view.selected_session.as_deref(),
         Some(id.as_str()),
-        "restored row stays selected"
+        "unarchived row stays selected"
     );
-    assert!(
-        env.view.get_instance(&id).unwrap().last_error.is_none(),
-        "restoring must clear the stale 'tmux session is gone' error so the \
-         preview doesn't flash it before the new pane comes up"
-    );
+    match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id: cur, .. }) => {
+            assert_eq!(cur, &id, "cursor follows the unarchived row")
+        }
+        _ => panic!("cursor should be on the unarchived session row"),
+    }
 }
 
 /// `restart_selected_session` must drop the press silently when nothing is
@@ -9797,12 +9779,7 @@ mod right_click_context_menu {
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
-            "context-menu Unarchive must restore the session"
-        );
-        assert_eq!(
-            env.view.pending_revive_session.as_deref(),
-            Some(id.as_str()),
-            "context-menu Unarchive must queue the revive like the keyboard path"
+            "context-menu Unarchive must unarchive the session"
         );
     }
 

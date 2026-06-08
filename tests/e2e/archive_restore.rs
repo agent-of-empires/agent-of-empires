@@ -38,16 +38,15 @@ fn install_persistent_claude(h: &mut TuiTestHarness) {
     }
 }
 
-/// Drive a full archive -> restore cycle through the real TUI.
+/// Drive a full archive -> unarchive cycle through the real TUI.
 ///
 /// Verifies the user-visible contract end to end: archiving keeps the row
 /// selected (its calm "Archived" placeholder is what the preview shows, even
 /// with another session present to swap to) and reveals the Archived section;
-/// restoring does NOT flash the "tmux session is gone" corpse error and brings
-/// the row back to the live list.
+/// unarchiving brings the row back to the active list and keeps it selected.
 #[test]
 #[serial]
-fn test_archive_then_restore_cycle() {
+fn test_archive_then_unarchive_cycle() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("archive_restore");
@@ -75,38 +74,31 @@ fn test_archive_then_restore_cycle() {
     let after_archive = h.capture_screen();
 
     // The calm placeholder proves the archived session is still the selected
-    // preview target (it did not swap to Neighbor).
-    assert!(
-        after_archive.contains("Press z to restore"),
-        "archived preview should show the calm placeholder for the still-selected row\n{after_archive}"
-    );
+    // preview target (it did not swap to Neighbor) and the Archived section
+    // was revealed.
     assert!(
         after_archive.contains("is parked"),
-        "archived preview should explain the parked state\n{after_archive}"
+        "archived preview should explain the parked state for the still-selected row\n{after_archive}"
     );
     assert!(
-        !after_archive.contains("tmux session is gone"),
-        "archived preview must not show the corpse error\n{after_archive}"
+        after_archive.contains("to unarchive"),
+        "archived preview should point at z to unarchive\n{after_archive}"
+    );
+    assert!(
+        after_archive.contains("Archived ("),
+        "the Archived section should be revealed\n{after_archive}"
     );
 
-    // Restore it.
+    // Unarchive it; the row returns to the active list, still selected.
     h.send_keys("z");
-    std::thread::sleep(Duration::from_millis(400));
-    let after_restore = h.capture_screen();
+    h.wait_for_absent("is parked", Duration::from_secs(5));
+    let after_unarchive = h.capture_screen();
     assert!(
-        !after_restore.contains("tmux session is gone"),
-        "restore must not flash the 'tmux session is gone' error\n{after_restore}"
+        after_unarchive.contains("Archivo"),
+        "unarchived row should be back in the active list\n{after_unarchive}"
     );
     assert!(
-        after_restore.contains("Archivo"),
-        "restored row should be back in the live list\n{after_restore}"
-    );
-
-    // Let the background revive settle; the corpse error must not reappear.
-    std::thread::sleep(Duration::from_millis(2500));
-    let settled = h.capture_screen();
-    assert!(
-        !settled.contains("tmux session is gone"),
-        "restored session must not settle on the corpse error\n{settled}"
+        !after_unarchive.contains("Archived ("),
+        "the Archived section should be gone once empty\n{after_unarchive}"
     );
 }
