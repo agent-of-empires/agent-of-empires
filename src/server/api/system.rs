@@ -339,7 +339,11 @@ pub async fn update_theme(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load_or_warn();
+        // `Config::load()` (not `load_or_warn`) so a corrupt config.toml is not
+        // silently replaced with defaults, wiping every other setting, just to
+        // change a theme. Mirrors `mark_web_tour_seen`. A parse error surfaces
+        // as a 400 below.
+        let mut config = crate::session::Config::load()?;
         if let Some(name) = patch.name {
             config.theme.name = name;
         }
