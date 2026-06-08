@@ -992,12 +992,17 @@ pub(super) struct ReloadFailureState {
     storage_error: Option<String>,
     config_failed: bool,
     config_error: Option<String>,
-    /// Latched description of the most recent watcher-init failure
-    /// (typically `subscribe_channel` returning Err on disk or config
-    /// rewire). Surfaced in the reload-failure dialog body so the user
-    /// sees that live propagation is degraded for this profile. Cleared
-    /// on the next successful rewire pass for that profile.
-    watcher_init_error: Option<String>,
+    /// Latched description of the most recent disk-watcher init failure
+    /// (typically `subscribe_channel` returning Err on disk rewire).
+    /// Surfaced in the reload-failure dialog body. Cleared on the next
+    /// successful disk rewire pass for the affected profile.
+    disk_watcher_init_error: Option<String>,
+    /// Latched description of the most recent config-watcher init failure
+    /// (typically `subscribe_channel` returning Err on config rewire).
+    /// Independent from `disk_watcher_init_error`: a config init failure
+    /// is not overwritten by a disk rewire and persists until the next
+    /// successful config rewire pass for the affected key.
+    config_watcher_init_error: Option<String>,
     dialog_acknowledged: bool,
 }
 
@@ -1054,17 +1059,34 @@ impl ReloadFailureState {
         }
     }
 
-    pub(super) fn record_watcher_init_failure(&mut self, detail: &str) {
-        let was_clear = self.watcher_init_error.is_none();
-        self.watcher_init_error = Some(detail.to_string());
+    pub(super) fn record_disk_watcher_init_failure(&mut self, detail: &str) {
+        let was_clear = self.disk_watcher_init_error.is_none();
+        self.disk_watcher_init_error = Some(detail.to_string());
         if was_clear {
             self.dialog_acknowledged = false;
         }
     }
 
-    pub(super) fn clear_watcher_init_failure(&mut self) {
-        if self.watcher_init_error.is_some() {
-            self.watcher_init_error = None;
+    pub(super) fn clear_disk_watcher_init_failure(&mut self) {
+        if self.disk_watcher_init_error.is_some() {
+            self.disk_watcher_init_error = None;
+            if !self.has_any_failure() {
+                self.dialog_acknowledged = false;
+            }
+        }
+    }
+
+    pub(super) fn record_config_watcher_init_failure(&mut self, detail: &str) {
+        let was_clear = self.config_watcher_init_error.is_none();
+        self.config_watcher_init_error = Some(detail.to_string());
+        if was_clear {
+            self.dialog_acknowledged = false;
+        }
+    }
+
+    pub(super) fn clear_config_watcher_init_failure(&mut self) {
+        if self.config_watcher_init_error.is_some() {
+            self.config_watcher_init_error = None;
             if !self.has_any_failure() {
                 self.dialog_acknowledged = false;
             }
@@ -1072,7 +1094,10 @@ impl ReloadFailureState {
     }
 
     pub(super) fn has_any_failure(&self) -> bool {
-        self.storage_failed || self.config_failed || self.watcher_init_error.is_some()
+        self.storage_failed
+            || self.config_failed
+            || self.disk_watcher_init_error.is_some()
+            || self.config_watcher_init_error.is_some()
     }
 
     pub(super) fn has_unacknowledged_failure(&self) -> bool {
@@ -1087,8 +1112,11 @@ impl ReloadFailureState {
         if let Some(e) = &self.config_error {
             lines.push(format!("- Config: {e}"));
         }
-        if let Some(e) = &self.watcher_init_error {
-            lines.push(format!("- Watcher init: {e}"));
+        if let Some(e) = &self.disk_watcher_init_error {
+            lines.push(format!("- Disk watcher init: {e}"));
+        }
+        if let Some(e) = &self.config_watcher_init_error {
+            lines.push(format!("- Config watcher init: {e}"));
         }
         lines.push(String::new());
         lines.push("Previous in-memory state preserved; will retry on next tick.".to_string());
@@ -1697,10 +1725,10 @@ impl HomeView {
             return Ok(());
         }
 
-        // Clear the latch ahead of the install loop. `record_watcher_init_failure`
+        // Clear the latch ahead of the install loop. `record_disk_watcher_init_failure`
         // re-latches it on any `subscribe_channel` Err below, so the latch
         // reflects the outcome of this rewire pass.
-        self.reload_failure_state.clear_watcher_init_failure();
+        self.reload_failure_state.clear_disk_watcher_init_failure();
 
         let to_remove: Vec<String> = prior
             .iter()
@@ -1779,7 +1807,7 @@ impl HomeView {
                         "subscribe_channel failed; falling back to 5s heartbeat for this profile"
                     );
                     self.reload_failure_state
-                        .record_watcher_init_failure(&format!("{}: {}", name, e));
+                        .record_disk_watcher_init_failure(&format!("{}: {}", name, e));
                 }
             }
         }
@@ -1828,10 +1856,85 @@ impl HomeView {
             return Ok(());
         }
 
-        if !self
+        // Drop the existing global entry when its stored canonical_dir
+        // does not match the live canonicalized app dir, mirroring the
+        // disk-watch inode-aware rewire. The install-once branch below
+        // picks up the new inode.
+        let global_invalidated = match self.config_watch_handles.get(&ConfigWatchKey::Global) {
+            Some(entry) => crate::session::get_app_dir()
+                .ok()
+                .and_then(|p| std::fs::canonicalize(&p).ok())
+                .is_none_or(|canonical| canonical != entry.canonical_dir),
+            None => false,
+        };
+        if global_invalidated {
+            if let Some(entry) = self.config_watch_handles.remove(&ConfigWatchKey::Global) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+        let global_needs_install = !self
             .config_watch_handles
-            .contains_key(&ConfigWatchKey::Global)
-        {
+            .contains_key(&ConfigWatchKey::Global);
+
+        let prior_profiles: std::collections::HashSet<String> = self
+            .config_watch_handles
+            .keys()
+            .filter_map(|key| match key {
+                ConfigWatchKey::Global => None,
+                ConfigWatchKey::Profile(name) => Some(name.clone()),
+            })
+            .collect();
+        let target: std::collections::HashSet<&String> = current.iter().collect();
+
+        // Per-profile inode invalidation mirrors the disk-watch path:
+        // peer-driven `aoe profile delete X && aoe profile new X` keeps
+        // the same name but produces a new inode, and notify NonRecursive
+        // watches do not auto-reattach. Compare each prior entry's stored
+        // canonical_dir against the current canonical resolution; mismatch
+        // forces a rewire even when the name set is unchanged.
+        let inode_invalidated: Vec<String> = prior_profiles
+            .iter()
+            .filter(|name| {
+                let entry = match self
+                    .config_watch_handles
+                    .get(&ConfigWatchKey::profile(name))
+                {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let current_canonical = crate::session::get_profile_dir(name)
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => canonical != entry.canonical_dir,
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        let to_remove: Vec<String> = prior_profiles
+            .iter()
+            .filter(|n| !target.contains(*n) || inode_invalidated.iter().any(|i| i == *n))
+            .cloned()
+            .collect();
+        let to_add: Vec<String> = current
+            .iter()
+            .filter(|n| !prior_profiles.contains(*n) || inode_invalidated.iter().any(|i| i == *n))
+            .cloned()
+            .collect();
+
+        if !global_needs_install && to_remove.is_empty() && to_add.is_empty() {
+            return Ok(());
+        }
+
+        // Clear the latch ahead of the install loop. `record_config_watcher_init_failure`
+        // re-latches it on any `subscribe_channel` Err below, so the latch
+        // reflects the outcome of this rewire pass.
+        self.reload_failure_state
+            .clear_config_watcher_init_failure();
+
+        if global_needs_install {
             match crate::session::get_app_dir() {
                 Ok(app_dir) => {
                     let canonical_dir =
@@ -1875,7 +1978,7 @@ impl HomeView {
                                  falling back to settings-close + profile-switch reload"
                             );
                             self.reload_failure_state
-                                .record_watcher_init_failure(&format!("global config: {}", e));
+                                .record_config_watcher_init_failure(&format!("global config: {e}"));
                         }
                     }
                 }
@@ -1888,27 +1991,6 @@ impl HomeView {
                 }
             }
         }
-
-        let prior_profiles: std::collections::HashSet<String> = self
-            .config_watch_handles
-            .keys()
-            .filter_map(|key| match key {
-                ConfigWatchKey::Global => None,
-                ConfigWatchKey::Profile(name) => Some(name.clone()),
-            })
-            .collect();
-        let target: std::collections::HashSet<&String> = current.iter().collect();
-
-        let to_remove: Vec<String> = prior_profiles
-            .iter()
-            .filter(|n| !target.contains(*n))
-            .cloned()
-            .collect();
-        let to_add: Vec<String> = current
-            .iter()
-            .filter(|n| !prior_profiles.contains(*n))
-            .cloned()
-            .collect();
 
         for name in &to_remove {
             if let Some(entry) = self
@@ -1969,7 +2051,7 @@ impl HomeView {
                          falling back to settings-close + profile-switch reload for this profile"
                     );
                     self.reload_failure_state
-                        .record_watcher_init_failure(&format!("profile {} config: {}", name, e));
+                        .record_config_watcher_init_failure(&format!("profile {name} config: {e}"));
                 }
             }
         }

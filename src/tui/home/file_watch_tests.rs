@@ -369,11 +369,11 @@ async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
 /// Locks the no-op fast-path invariant: when `rewire_disk_subscriptions`
 /// is called with an unchanged profile set and no inode invalidation, the
 /// fast-path returns without running the install loop, and a previously
-/// latched `watcher_init_error` must be preserved (the install loop is
-/// the only path that re-latches via `record_watcher_init_failure`).
+/// latched `disk_watcher_init_error` must be preserved (the install loop
+/// is the only path that re-latches via `record_disk_watcher_init_failure`).
 #[tokio::test]
 #[serial]
-async fn rewire_no_op_preserves_latched_watcher_init_failure() {
+async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
     let temp = TempDir::new().expect("tempdir");
     isolate_home(temp.path());
 
@@ -395,7 +395,7 @@ async fn rewire_no_op_preserves_latched_watcher_init_failure() {
     );
 
     view.reload_failure_state
-        .record_watcher_init_failure("seed: simulated prior failure");
+        .record_disk_watcher_init_failure("seed: simulated prior failure");
     assert!(
         view.reload_failure_state.has_any_failure(),
         "precondition: latch is set"
@@ -406,7 +406,43 @@ async fn rewire_no_op_preserves_latched_watcher_init_failure() {
 
     assert!(
         view.reload_failure_state.has_any_failure(),
-        "no-op rewire (unchanged set, no inode change) must preserve the watcher_init_error latch"
+        "no-op rewire (unchanged set, no inode change) must preserve the disk_watcher_init_error latch"
+    );
+}
+
+/// Locks the per-source independence invariant: a config init failure
+/// recorded in `config_watcher_init_error` must survive a concurrent disk
+/// rewire that clears `disk_watcher_init_error` (and vice-versa). The two
+/// fields are independent slots; clearing one never touches the other.
+#[tokio::test]
+#[serial]
+async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("hv-iso").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("hv-iso".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.reload_failure_state
+        .record_config_watcher_init_failure("seed: config init failed");
+    assert!(
+        view.reload_failure_state.has_any_failure(),
+        "precondition: config latch is set"
+    );
+
+    view.rewire_disk_subscriptions(&["hv-iso".to_string()])
+        .expect("disk rewire install");
+
+    assert!(
+        view.reload_failure_state.has_any_failure(),
+        "disk rewire install must not clear the independent config_watcher_init_error latch"
     );
 }
 
@@ -458,11 +494,12 @@ fn reload_failure_state_new_failure_during_acked_burst_re_arms_dialog() {
 }
 
 #[test]
-fn reload_failure_state_dialog_body_aggregates_all_three_sources() {
+fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
     let mut state = super::ReloadFailureState::default();
     state.record_storage(&Err::<(), _>(anyhow::anyhow!("storage err")));
     state.record_config(&Err::<(), _>(anyhow::anyhow!("config err")));
-    state.record_watcher_init_failure("subscribe denied");
+    state.record_disk_watcher_init_failure("disk subscribe denied");
+    state.record_config_watcher_init_failure("config subscribe denied");
 
     let body = state.build_dialog_body();
     assert!(
@@ -474,28 +511,41 @@ fn reload_failure_state_dialog_body_aggregates_all_three_sources() {
         "missing config line: {body}"
     );
     assert!(
-        body.contains("- Watcher init: subscribe denied"),
-        "missing watcher-init line: {body}"
+        body.contains("- Disk watcher init: disk subscribe denied"),
+        "missing disk watcher-init line: {body}"
+    );
+    assert!(
+        body.contains("- Config watcher init: config subscribe denied"),
+        "missing config watcher-init line: {body}"
     );
 }
 
 #[test]
-fn reload_failure_state_watcher_init_failure_lifecycle() {
+fn reload_failure_state_watcher_init_failure_lifecycle_is_per_source() {
     let mut state = super::ReloadFailureState::default();
-    state.record_watcher_init_failure("first install failed");
+
+    state.record_disk_watcher_init_failure("first disk install failed");
     assert!(
         state.has_unacknowledged_failure(),
-        "watcher_init_error contributes to has_any_failure"
+        "disk_watcher_init_error contributes to has_any_failure"
     );
 
+    state.record_config_watcher_init_failure("first config install failed");
     state.acknowledge_dialog();
-    state.clear_watcher_init_failure();
+
+    state.clear_disk_watcher_init_failure();
+    assert!(
+        state.has_any_failure(),
+        "clearing only the disk slot leaves the config slot latched"
+    );
+
+    state.clear_config_watcher_init_failure();
     assert!(
         !state.has_any_failure(),
-        "clear_watcher_init_failure removes the latch"
+        "clearing the last failing source removes all latches"
     );
     assert!(
         !state.has_unacknowledged_failure(),
-        "clearing the only failing source resets the ack latch"
+        "clearing the last failing source resets the ack latch"
     );
 }
