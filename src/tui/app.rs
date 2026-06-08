@@ -1045,7 +1045,7 @@ impl App {
                             // the same way the keyboard path does; drain it here
                             // so the mouse path also respawns the restored row.
                             if let Some(id) = self.home.pending_revive_session.take() {
-                                self.execute_action(Action::ReviveSession(id), terminal)?;
+                                self.home.request_session_revive(&id);
                             }
                             continue;
                         }
@@ -1196,6 +1196,11 @@ impl App {
             }
 
             if self.home.apply_stop_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_revive_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1900,10 +1905,10 @@ impl App {
         }
 
         // Drain a revive queued by `z` on an archived row (keyboard or context
-        // menu). Deferred out of `toggle_archive_at_cursor` so the slow respawn
-        // runs here behind a toast instead of blocking inside handle_key.
+        // menu). The respawn runs on a background worker so the event loop
+        // stays responsive while the agent comes back.
         if let Some(id) = self.home.pending_revive_session.take() {
-            self.execute_action(Action::ReviveSession(id), terminal)?;
+            self.home.request_session_revive(&id);
         }
 
         #[cfg(feature = "serve")]
@@ -2117,22 +2122,6 @@ impl App {
                 if outcome.is_ok() {
                     self.draw(terminal)?;
                     self.home.finalize_live_send_resize();
-                }
-            }
-            Action::ReviveSession(id) => {
-                // Mirror SendMessage's revive feedback: flip to Starting and
-                // toast "Reviving..." before the potentially-slow respawn
-                // (Docker pull, agent splash, resume). The status poller
-                // corrects the row to its real state after we return.
-                self.home
-                    .set_instance_status(&id, crate::session::Status::Starting);
-                self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
-                self.draw(terminal)?;
-                if let Err(e) = self.home.revive_session(&id) {
-                    self.update_status =
-                        Some(UpdateStatus::transient(format!("Restore failed: {e}")));
-                } else {
-                    self.update_status = None;
                 }
             }
             Action::AttachToolSession(id, tool_name) => {
@@ -2587,12 +2576,6 @@ pub enum Action {
     /// bypasses the setting because pressing Enter on a session row is
     /// the user's explicit ask for a tmux attach.
     AttachAfterCreate(String),
-    /// Revive a just-unarchived session: respawn its pane so a restored row
-    /// comes back Running instead of Stopped. Deferred to `execute_action`
-    /// (via `HomeView::pending_revive_session`) for the same reason as
-    /// `SendMessage`: `ensure_pane_ready` can block for seconds, so the loop
-    /// renders a "Reviving..." toast first.
-    ReviveSession(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),

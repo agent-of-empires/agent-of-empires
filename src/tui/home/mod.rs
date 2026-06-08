@@ -40,6 +40,7 @@ use super::dialogs::{
     WorktreeNameDialog,
 };
 use super::diff::DiffView;
+use super::revive_poller::RevivePoller;
 use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
@@ -608,6 +609,10 @@ pub struct HomeView {
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
 
+    // Performance: background session revive on unarchive (the restart cascade
+    // probes the agent for ~2s, which would otherwise freeze the event loop).
+    pub(super) revive_poller: RevivePoller,
+
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
     /// Set to true if user cancelled while creation was pending
@@ -996,6 +1001,7 @@ impl HomeView {
             pending_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            revive_poller: RevivePoller::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -1498,6 +1504,65 @@ impl HomeView {
             return true;
         }
         false
+    }
+
+    /// Respawn a just-unarchived session's agent on a background worker so the
+    /// event loop stays responsive (the restart cascade probes the agent for
+    /// ~2s). Flips the row to Starting and clears the stale "tmux session is
+    /// gone" error optimistically, marks it in-flight so the status poller
+    /// doesn't fight the worker, and ships a clone to `revive_poller`. The
+    /// post-cascade instance lands via `apply_revive_results`. No-op for a
+    /// missing id (deleted between unarchive and drain).
+    pub(crate) fn request_session_revive(&mut self, id: &str) {
+        let Some(inst) = self.get_instance(id).cloned() else {
+            return;
+        };
+        self.set_instance_error(id, None);
+        self.set_instance_status(id, crate::session::Status::Starting);
+        self.recovery_in_flight.insert(id.to_string());
+        self.revive_poller.request(inst);
+    }
+
+    /// Drain finished background revives and fold each post-cascade instance
+    /// back into the list. Mirrors `apply_recovery_updates`: drop the in-flight
+    /// marker first so the next status poll sees the row through the normal
+    /// pipeline, then rebuild and re-seat the cursor by id (the revive bumps
+    /// `last_start_time`, which can reorder under LastActivity sort). Returns
+    /// true if any row changed.
+    pub fn apply_revive_results(&mut self) -> bool {
+        let mut touched = false;
+        while let Some(result) = self.revive_poller.try_recv_result() {
+            self.recovery_in_flight.remove(&result.session_id);
+            if let Err(e) = &result.outcome {
+                tracing::warn!(
+                    target: "tui.revive_poller",
+                    id = %result.session_id,
+                    error = %e,
+                    "revive cascade failed",
+                );
+            }
+            if let Some(slot) = self
+                .instances
+                .iter_mut()
+                .find(|i| i.id == result.session_id)
+            {
+                *slot = *result.instance;
+                touched = true;
+            }
+        }
+        if touched {
+            self.instance_map = self
+                .instances
+                .iter()
+                .map(|i| (i.id.clone(), i.clone()))
+                .collect();
+            self.flat_items = self.build_flat_items();
+            self.reseat_cursor_after_rebuild();
+            if let Err(e) = self.save() {
+                tracing::error!(target: "tui.home", "Failed to save after revive: {}", e);
+            }
+        }
+        touched
     }
 
     /// Apply any pending session ID updates from background pollers.

@@ -1056,29 +1056,4 @@ impl HomeView {
         }
         Ok(())
     }
-
-    /// Respawn a just-unarchived session's pane so a restored row comes back
-    /// Running instead of Stopped. Archiving killed the whole tmux session, so
-    /// this routes through the same dead/gone-pane cascade attach and live-send
-    /// use (`ensure_pane_ready` -> `start_with_resume_fallback`), reloading the
-    /// agent's prior context where the engine supports resume. Run from the app
-    /// loop (see `pending_revive_session`) because it can block for seconds.
-    /// On failure the row stays unarchived so the user can retry with `e`.
-    pub(crate) fn revive_session(&mut self, id: &str) -> anyhow::Result<()> {
-        // Respawn detached: restore only needs the session Running again, so we
-        // must NOT block the event loop on the readiness probe (up to 3s). The
-        // status poller flips the row to Running and the preview captures the
-        // booting agent on the next tick. (A sandboxed cold-start can still
-        // take a moment inside the spawn itself; the "Reviving..." toast the
-        // caller shows covers that.)
-        self.try_mutate_instance_writeback_on_err(id, |inst| {
-            inst.respawn_pane_detached().map(|_| ()).map_err(Into::into)
-        })?;
-        // User gesture: bump last_accessed so the restored row sorts as freshly
-        // touched, then rebuild + re-seat so the cursor follows it to its tier.
-        self.stamp_last_accessed(id);
-        self.flat_items = self.build_flat_items();
-        self.select_session_by_id(id);
-        Ok(())
-    }
 }
