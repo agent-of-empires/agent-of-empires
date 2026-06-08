@@ -759,6 +759,24 @@ impl HomeView {
         }
     }
 
+    /// Discard unsaved Settings changes: force-close the view, clear the
+    /// confirm state, and revert any live theme preview back to the saved
+    /// config theme. Shared by the keyboard (Esc/q -> confirm) and mouse
+    /// (click [Yes]) discard paths so the two can't drift. The mouse path
+    /// previously skipped the theme revert, so discarding via a click left a
+    /// previewed theme applied until the next restart.
+    pub(super) fn discard_settings_changes(&mut self) -> Action {
+        if let Some(ref mut settings) = self.settings_view {
+            settings.force_close();
+        }
+        self.settings_view = None;
+        self.confirm_dialog = None;
+        self.settings_close_confirm = false;
+        // Theme is a global preference, not profile-merged: revert any live
+        // preview to the saved global theme so boot and Settings agree.
+        Action::SetTheme(crate::session::config::resolve_theme_name())
+    }
+
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
@@ -855,18 +873,19 @@ impl HomeView {
                         let dont_ask_again = dialog.dont_ask_again();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
-                            // Discard branch: force-close settings (the
-                            // keyboard path runs the same sequence).
-                            if let Some(ref mut settings) = self.settings_view {
-                                settings.force_close();
+                            // Discard branch: run the exact same sequence as the
+                            // keyboard path, including the theme revert. Omitting
+                            // it here stranded a live theme preview until the next
+                            // restart when the user discarded via a mouse click.
+                            self.pending_dialog_click_action =
+                                Some(self.discard_settings_changes());
+                        } else {
+                            if action == "quit" && dont_ask_again {
+                                self.disable_confirm_before_quit();
                             }
-                            self.settings_view = None;
-                            self.settings_close_confirm = false;
+                            self.pending_dialog_click_action =
+                                self.dispatch_confirm_submit(&action);
                         }
-                        if action == "quit" && dont_ask_again {
-                            self.disable_confirm_before_quit();
-                        }
-                        self.pending_dialog_click_action = self.dispatch_confirm_submit(&action);
                     }
                 }
             }
@@ -1192,19 +1211,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(_) => {
                         // User chose to discard changes
-                        if let Some(ref mut settings) = self.settings_view {
-                            settings.force_close();
-                        }
-                        self.settings_view = None;
-                        self.confirm_dialog = None;
-                        self.settings_close_confirm = false;
-                        let config = resolve_config_or_warn(&self.config_profile());
-                        let theme_name = if config.theme.name.is_empty() {
-                            "default".to_string()
-                        } else {
-                            config.theme.name
-                        };
-                        return Some(Action::SetTheme(theme_name));
+                        return Some(self.discard_settings_changes());
                     }
                 }
             }
@@ -1220,14 +1227,11 @@ impl HomeView {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
                     self.refresh_from_config();
-                    // Reload theme from saved config
-                    let config = resolve_config_or_warn(&self.config_profile());
-                    let theme_name = if config.theme.name.is_empty() {
-                        "default".to_string()
-                    } else {
-                        config.theme.name
-                    };
-                    return Some(Action::SetTheme(theme_name));
+                    // Reload the theme from the global config (theme is a global
+                    // preference, not profile-merged) so the repaint matches boot.
+                    return Some(Action::SetTheme(
+                        crate::session::config::resolve_theme_name(),
+                    ));
                 }
                 SettingsAction::UnsavedChangesWarning => {
                     // Show confirmation dialog
@@ -2338,7 +2342,7 @@ impl HomeView {
         }
     }
 
-    fn open_settings(&mut self) {
+    pub(super) fn open_settings(&mut self) {
         let project_path = self
             .selected_session
             .as_ref()

@@ -643,6 +643,12 @@ pub fn build_fields_for_category(
     for desc in schema()
         .into_iter()
         .filter(|d| d.category == category.schema_name())
+        // Global-only fields (e.g. the theme) are not profile-overridable, so
+        // only surface them under Global scope. Otherwise a Profile/Repo edit
+        // would write an override the read path ignores, stranding the value
+        // (the empire->rose-pine flip). Enforces the documented `global_only`
+        // semantics that nothing else was checking.
+        .filter(|d| scope == SettingsScope::Global || d.profile_overridable)
     {
         // The per-target logging matrix expands one descriptor into N rows.
         if matches!(&desc.widget, WidgetKind::Custom { id } if id == "logging-targets") {

@@ -99,15 +99,12 @@ test.describe("Live aoe serve theme switching (#1189)", () => {
       )
       .toBe(true);
 
-    // Drive a theme switch by patching the profile-scoped settings
+    // Drive a theme switch by patching the dedicated global theme
     // endpoint the picker uses, then firing the same event the
-    // ThemeSettings.tsx save() handler dispatches.
-    const patch = await page.request.patch(
-      `${handle.baseUrl}/api/profiles/default/settings`,
-      {
-        data: { theme: { name: SWITCH_TO } },
-      },
-    );
+    // theme widget's save() handler dispatches.
+    const patch = await page.request.patch(`${handle.baseUrl}/api/theme`, {
+      data: { name: SWITCH_TO },
+    });
     expect(patch.ok()).toBe(true);
 
     await page.evaluate((name) => {

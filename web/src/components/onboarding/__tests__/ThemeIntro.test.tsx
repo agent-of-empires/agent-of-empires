@@ -14,19 +14,14 @@ import {
   waitFor,
 } from "@testing-library/react";
 
-const updateProfileSettings = vi.fn(() => Promise.resolve(true));
+const updateTheme = vi.fn(() => Promise.resolve(true));
 vi.mock("../../../lib/api", () => ({
   fetchThemes: vi.fn(() =>
     Promise.resolve(["default", "modus-vivendi", "empire"]),
   ),
-  fetchProfiles: vi.fn(() =>
-    Promise.resolve([
-      { name: "work", is_default: false },
-      { name: "default", is_default: true },
-    ]),
-  ),
-  updateProfileSettings: (name: string, updates: Record<string, unknown>) =>
-    updateProfileSettings(name, updates),
+  // The theme is a global preference, written via the dedicated /api/theme
+  // endpoint (not a profile settings PATCH).
+  updateTheme: (patch: { name?: string }) => updateTheme(patch),
 }));
 
 const dispatchSpy = vi.fn();
@@ -39,8 +34,8 @@ import { ThemeIntro } from "../ThemeIntro";
 afterEach(() => {
   cleanup();
   dispatchSpy.mockClear();
-  updateProfileSettings.mockClear();
-  updateProfileSettings.mockImplementation(() => Promise.resolve(true));
+  updateTheme.mockClear();
+  updateTheme.mockImplementation(() => Promise.resolve(true));
 });
 
 async function mount() {
@@ -58,13 +53,11 @@ describe("ThemeIntro", () => {
     expect(screen.getAllByRole("option")).toHaveLength(3);
   });
 
-  it("persists the picked theme to the default profile and repaints", async () => {
+  it("persists the picked theme globally and repaints", async () => {
     await mount();
     fireEvent.click(screen.getByRole("option", { name: "modus-vivendi" }));
     await waitFor(() =>
-      expect(updateProfileSettings).toHaveBeenCalledWith("default", {
-        theme: { name: "modus-vivendi" },
-      }),
+      expect(updateTheme).toHaveBeenCalledWith({ name: "modus-vivendi" }),
     );
     expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi");
     expect(
@@ -82,11 +75,11 @@ describe("ThemeIntro", () => {
     );
     fireEvent.click(screen.getByRole("option", { name: "empire" }));
     await waitFor(() => expect(dispatchSpy).toHaveBeenCalledWith("empire"));
-    expect(updateProfileSettings).toHaveBeenCalledTimes(2);
+    expect(updateTheme).toHaveBeenCalledTimes(2);
   });
 
   it("shows an error and does not repaint when the save fails", async () => {
-    updateProfileSettings.mockImplementation(() => Promise.resolve(false));
+    updateTheme.mockImplementation(() => Promise.resolve(false));
     await mount();
     fireEvent.click(screen.getByRole("option", { name: "empire" }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());

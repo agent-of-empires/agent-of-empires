@@ -56,17 +56,10 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
   serve,
   page,
 }) => {
-  // The dashboard's `selectedProfile` resolves to whichever profile
-  // GET /api/profiles flags `is_default`. On a fresh `aoe serve` that
-  // is "main" (bootstrap profile), not "default", so we cannot
-  // hard-code the path; query the server and use whatever name it
-  // hands back.
-  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(
-    `${serve.baseUrl}/api/profiles`,
-  ).then((r) => r.json());
-  const defaultProfile =
-    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
-  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
+  // The theme is a global preference: the picker writes the dedicated
+  // /api/theme endpoint, so persistence is read back from the global
+  // settings (GET /api/settings), not a profile config.
+  const globalUrl = `${serve.baseUrl}/api/settings`;
 
   // Drive the picker through the actual settings UI, not the REST
   // endpoint, so the regression that landed the dispatch-before-PATCH
@@ -95,9 +88,9 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
 
   await themeSelect.selectOption(SWITCH_TO);
 
-  // Server-side: PATCH landed and the profile config reflects the pick.
+  // Server-side: PATCH landed and the global config reflects the pick.
   await expect(async () => {
-    const after = await fetch(profileUrl).then((r) => r.json());
+    const after = await fetch(globalUrl).then((r) => r.json());
     expect(after?.theme?.name).toBe(SWITCH_TO);
   }).toPass({ timeout: 5_000 });
 
@@ -129,12 +122,12 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
   const afterReload = await page.evaluate(async (url) => {
     const r = await fetch(url);
     return r.json();
-  }, profileUrl);
+  }, globalUrl);
   expect(afterReload?.theme?.name).toBe(SWITCH_TO);
 
   // Persistence across `aoe serve` restart (process exits, config.toml
   // is what survives). The restart() helper reuses the same port.
   await serve.restart();
-  const afterRestart = await fetch(profileUrl).then((r) => r.json());
+  const afterRestart = await fetch(globalUrl).then((r) => r.json());
   expect(afterRestart?.theme?.name).toBe(SWITCH_TO);
 });

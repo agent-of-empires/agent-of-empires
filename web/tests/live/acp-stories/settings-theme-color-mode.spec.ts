@@ -83,15 +83,14 @@ base(
       await expect(colorMode).toHaveValue(nextMode);
 
       // The PATCH lands; this poll reads the persisted value back via
-      // GET /api/profiles/<name>/settings so a regression that drops the
-      // write surfaces here, not as a missing event later.
-      const profiles: Array<{ name: string; is_default?: boolean }> =
-        await fetch(`${serve.baseUrl}/api/profiles`).then((r) => r.json());
-      const defaultProfile =
-        profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
-      const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
+      // GET /api/settings so a regression that drops the write surfaces
+      // here, not as a missing event later. Color mode is a global
+      // preference (like the theme), so it persists to the global config,
+      // not a profile.
       await expect(async () => {
-        const after = await fetch(profileUrl).then((r) => r.json());
+        const after = await fetch(`${serve.baseUrl}/api/settings`).then((r) =>
+          r.json(),
+        );
         expect(after?.theme?.color_mode).toBe(nextMode);
       }).toPass({ timeout: 5_000 });
 

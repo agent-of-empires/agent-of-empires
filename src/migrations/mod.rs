@@ -20,13 +20,14 @@ mod v009_update_check_mode;
 mod v010_drop_legacy_live_send_exit_chord;
 mod v011_relocate_sandbox_image;
 mod v012_acp_rename;
+mod v013_strip_profile_theme;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 12;
+const CURRENT_VERSION: u32 = 13;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -95,6 +96,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "acp_rename",
         run: v012_acp_rename::run,
+    },
+    Migration {
+        version: 13,
+        name: "strip_profile_theme",
+        run: v013_strip_profile_theme::run,
     },
 ];
 
