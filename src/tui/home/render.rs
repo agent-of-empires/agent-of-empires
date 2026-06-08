@@ -2362,10 +2362,7 @@ impl HomeView {
             Line::from(vec![
                 Span::styled("Press ", Style::default().fg(theme.dimmed)),
                 Span::styled(key, Style::default().fg(theme.hint).bold()),
-                Span::styled(
-                    " to unarchive it, then e to restart.",
-                    Style::default().fg(theme.dimmed),
-                ),
+                Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
             ]),
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);
@@ -2374,10 +2371,9 @@ impl HomeView {
 
     /// Calm placeholder shown when the selected session's pane is simply gone
     /// (the generic gone-error, no diagnostic detail). Replaces the red crash
-    /// error with a "Stopped, press e to restart" message; the row's real
-    /// status icon still signals the state in the sidebar.
+    /// error with a "Stopped, enter to start" message; the row's real status
+    /// icon still signals the state in the sidebar.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let key = if self.strict_hotkeys { "E" } else { "e" };
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2392,8 +2388,8 @@ impl HomeView {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Press ", Style::default().fg(theme.dimmed)),
-                Span::styled(key, Style::default().fg(theme.hint).bold()),
-                Span::styled(" to restart it.", Style::default().fg(theme.dimmed)),
+                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+                Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
             ]),
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);

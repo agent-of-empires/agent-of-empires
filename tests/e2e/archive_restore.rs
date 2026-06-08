@@ -112,7 +112,7 @@ fn test_archive_then_unarchive_cycle() {
         "stopped preview must not show the red corpse error\n{stopped}"
     );
     assert!(
-        stopped.contains("Stopped") && stopped.contains("Press e to restart"),
-        "stopped preview should explain the state and point at e\n{stopped}"
+        stopped.contains("Stopped") && stopped.contains("Press Enter to start"),
+        "stopped preview should explain the state and point at Enter\n{stopped}"
     );
 }
