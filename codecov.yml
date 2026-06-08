@@ -17,11 +17,7 @@
 comment:
   layout: "header, diff, files, components, sunburst, uncovered, footer"
   behavior: default
-  # Only post (or update) the PR comment when patch / project coverage
-  # actually moves. Reduces noise from comment edits on every push when
-  # the underlying numbers are unchanged. The `codecov/patch` and
-  # `codecov/project` status checks still gate merges either way.
-  require_changes: true
+  require_changes: false
   require_base: false
   require_head: false
   hide_project_coverage: false
