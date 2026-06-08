@@ -36,11 +36,12 @@ base(
         });
       });
 
-      // Reject the settings PATCH at the browser boundary. The rest of
-      // the surface (themes list, current theme, GETs against the
-      // profile) stays on the real serve so the rendering paths behave
-      // like production. Only the write path 500s.
-      await page.route(/.*\/api\/profiles\/[^/]+\/settings$/, (route) => {
+      // Reject the theme PATCH at the browser boundary. The rest of the
+      // surface (themes list, current theme) stays on the real serve so
+      // the rendering paths behave like production. The theme is a global
+      // preference, so the picker writes the dedicated /api/theme endpoint;
+      // only that write path 500s.
+      await page.route(/.*\/api\/theme$/, (route) => {
         if (route.request().method() === "PATCH") {
           return route.fulfill({ status: 500, body: "boom" });
         }

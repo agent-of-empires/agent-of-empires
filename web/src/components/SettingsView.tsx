@@ -12,6 +12,7 @@ import {
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
+  updateTheme,
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
@@ -327,6 +328,38 @@ export function SettingsView({
     [settings, saveField],
   );
 
+  // The theme name and color mode are global preferences, not
+  // profile-overridable: write them through the dedicated non-elevated
+  // /api/theme endpoint instead of the profile settings PATCH. Writing the
+  // theme into a profile let a stale override shadow the global pick on every
+  // Settings open/close (the empire->rose-pine flip). Profile-overridable rows
+  // in the same tab (e.g. idle decay) still write to the selected profile.
+  const saveThemeField = useCallback(
+    async (
+      section: string,
+      field: string,
+      value: unknown,
+    ): Promise<boolean> => {
+      const overridable = schema.some(
+        (d) =>
+          d.section === section && d.field === field && d.profile_overridable,
+      );
+      if (overridable) return saveSubField(section, field, value);
+      const sectionData = (settings?.theme ?? {}) as Record<string, unknown>;
+      updateLocal({ theme: { ...sectionData, [field]: value } });
+      setSaving(true);
+      setSaveError(null);
+      const ok = await updateTheme({ [field]: value });
+      setSaving(false);
+      if (!ok) {
+        setSaveError("Failed to save, please try again");
+        loadSettings();
+      }
+      return ok;
+    },
+    [schema, settings, updateLocal, loadSettings, saveSubField],
+  );
+
   const renderTabContent = () => {
     if (
       !settings &&
@@ -439,7 +472,7 @@ export function SettingsView({
             section="theme"
             schema={schema}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={saveThemeField}
           />
         );
       case "diff":

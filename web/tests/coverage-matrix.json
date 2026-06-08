@@ -103,7 +103,8 @@
       "specs": ["tests/live/settings-persistence-theme.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/SchemaSection.tsx"
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -2432,7 +2433,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/theme-onboarding.spec.ts"],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "onboarding.theme-welcome-unit",
@@ -2442,7 +2447,10 @@
         "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
         "src/lib/__tests__/onboarding.test.ts"
       ],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts"
+      ]
     },
     {
       "id": "shortcuts.single-source",

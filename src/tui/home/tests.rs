@@ -10370,4 +10370,65 @@ mod apply_session_id_updates {
             "no tmux session means no publish target"
         );
     }
+
+    /// Discarding unsaved Settings changes via a mouse click on the
+    /// confirmation dialog's [Yes] button must revert a live theme preview,
+    /// exactly like the keyboard discard path. Regression for the
+    /// empire -> rose-pine flip where the click path closed Settings but
+    /// never dispatched `SetTheme`, leaving the previewed theme applied until
+    /// the next restart.
+    #[test]
+    #[serial]
+    fn settings_mouse_discard_reverts_theme_preview() {
+        use crate::tui::dialogs::ConfirmDialog;
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_empty();
+        let view = &mut env.view;
+        view.open_settings();
+        assert!(view.settings_view.is_some(), "settings view should open");
+
+        // Stand in the state reached after the user previewed a theme (so the
+        // view has unsaved changes) and pressed Esc to close: the unsaved-
+        // changes confirm dialog floats over the settings takeover.
+        view.settings_close_confirm = true;
+        view.confirm_dialog = Some(ConfirmDialog::new(
+            "Unsaved Changes",
+            "You have unsaved changes. Discard them?",
+            "discard_settings",
+        ));
+
+        // Render once so the dialog's [Yes] button hit-rect is populated at the
+        // exact coordinates it draws.
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None);
+            })
+            .unwrap();
+
+        let yes = view
+            .confirm_dialog
+            .as_ref()
+            .unwrap()
+            .yes_button_area_for_test();
+        assert!(yes.width > 0, "render should populate the [Yes] hit-rect");
+
+        // Click the center of [Yes] to discard.
+        view.handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2);
+
+        // The click path must queue the same theme revert the keyboard path
+        // returns. Before the fix this was `None` and the previewed theme stuck.
+        assert!(
+            matches!(view.pending_dialog_click_action, Some(Action::SetTheme(_))),
+            "mouse discard should queue a SetTheme revert, got {:?}",
+            view.pending_dialog_click_action
+        );
+        assert!(view.settings_view.is_none(), "settings should be closed");
+        assert!(!view.settings_close_confirm, "confirm flag should reset");
+    }
 }

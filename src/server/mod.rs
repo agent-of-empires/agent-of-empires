@@ -1262,6 +1262,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
+        // Dedicated, non-elevated global-theme write: a cosmetic theme change
+        // must not trip the passphrase wall on `PATCH /api/settings`.
+        .route("/api/theme", patch(api::update_theme))
         .route("/api/sounds", get(api::list_sounds))
         .route("/api/sounds/file/{name}", get(api::serve_sound_file))
         // Push notifications

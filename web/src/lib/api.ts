@@ -180,6 +180,28 @@ export async function updateSettings(
 }
 
 /**
+ * Sets the global theme (name and/or color mode). Dedicated endpoint, not
+ * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
+ * must not trip the passphrase/elevation wall the general settings surface
+ * carries. Returns false on read-only servers (403) or network failure.
+ */
+export async function updateTheme(patch: {
+  name?: string;
+  color_mode?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch("/api/theme", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Marks the first-run dashboard tour as seen for this server. Single-purpose
  * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
  * passphrase/elevation wall. Returns false on read-only servers (403) or

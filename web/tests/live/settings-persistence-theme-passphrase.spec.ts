@@ -140,8 +140,11 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   servePreauthed,
   page,
 }) => {
-  const defaultProfile = await resolveDefaultProfile(servePreauthed);
-  const profileUrl = `${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
+  // The theme is a global preference written via the dedicated,
+  // non-elevated /api/theme endpoint, so persistence is read back from the
+  // global settings, not a profile config. The point of this test is that a
+  // passphrase user can change a cosmetic theme without an elevation prompt.
+  const globalUrl = `${servePreauthed.baseUrl}/api/settings`;
 
   await bootDashboardAndNavigate(page, servePreauthed, "/settings/theme");
 
@@ -176,7 +179,7 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   await themeSelect.selectOption(SWITCH_TO);
 
   await expect(async () => {
-    const after = await fetch(profileUrl, {
+    const after = await fetch(globalUrl, {
       headers: authHeaders(servePreauthed),
     }).then((r) => r.json());
     expect(after?.theme?.name).toBe(SWITCH_TO);
@@ -217,14 +220,14 @@ test("theme picker persists across reload + restart without passphrase prompt", 
     ),
     page.reload(),
   ]);
-  const afterReload = await fetch(profileUrl, {
+  const afterReload = await fetch(globalUrl, {
     headers: authHeaders(servePreauthed),
   }).then((r) => r.json());
   expect(afterReload?.theme?.name).toBe(SWITCH_TO);
 
   await servePreauthed.restart();
   await reLogin(servePreauthed);
-  const afterRestart = await fetch(profileUrl, {
+  const afterRestart = await fetch(globalUrl, {
     headers: authHeaders(servePreauthed),
   }).then((r) => r.json());
   expect(afterRestart?.theme?.name).toBe(SWITCH_TO);

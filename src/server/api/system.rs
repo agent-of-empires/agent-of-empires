@@ -283,6 +283,111 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
     Json(crate::session::settings_schema::schema())
 }
 
+/// Body of `PATCH /api/theme`. Either field may be omitted to leave it
+/// unchanged.
+#[derive(serde::Deserialize)]
+pub struct ThemePatch {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color_mode: Option<crate::session::config::ColorMode>,
+}
+
+/// `PATCH /api/theme` sets the global theme name and/or color mode and returns
+/// the freshly resolved theme so the caller can repaint.
+///
+/// The theme is a global preference (see `config::resolve_theme_name`): it
+/// lives in the global config, never a profile, so one theme paints every
+/// surface. This is a dedicated, non-elevated write (like the web-tour flag)
+/// rather than routing through `PATCH /api/settings`: a cosmetic theme change
+/// must not trip the passphrase wall that guards the general settings surface
+/// (`requires_elevation` keeps profile-settings preference writes off that wall
+/// for the same reason). `read_only` still blocks it.
+pub async fn update_theme(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    // Reject an unknown theme name so a typo can't repaint to the `default`
+    // fallback. Empty is allowed (clears back to the default builtin).
+    if let Some(name) = &patch.name {
+        if !name.is_empty()
+            && !crate::tui::styles::available_themes()
+                .iter()
+                .any(|t| t == name)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "unknown_theme",
+                    "message": format!("Unknown theme '{name}'"),
+                })),
+            )
+                .into_response();
+        }
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        // `Config::load()` (not `load_or_warn`) so a corrupt config.toml is not
+        // silently replaced with defaults, wiping every other setting, just to
+        // change a theme. Mirrors `mark_web_tour_seen`. A parse error surfaces
+        // as a 400 below.
+        let mut config = crate::session::Config::load()?;
+        if let Some(name) = patch.name {
+            config.theme.name = name;
+        }
+        if let Some(mode) = patch.color_mode {
+            config.theme.color_mode = mode;
+        }
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(
+            &config.effective_theme_name(),
+        ))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resolved)) => match serde_json::to_value(&resolved) {
+            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+            Err(e) => {
+                tracing::error!(target: "http.api.system", "theme serialization failed: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize theme"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "theme update failed: {}", e);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "update_failed", "message": "Failed to update theme"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "theme update panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Marks the web dashboard's first-run tour as seen for this server.
 ///
 /// Single-purpose write so the cosmetic flag never widens the
@@ -385,10 +490,10 @@ pub async fn get_resolved_theme(
     Json(resolved)
 }
 
-/// `GET /api/theme/current` returns the resolved theme for the active
-/// profile (the picker's current selection). Resolved through
-/// `profile_config::resolve_config_or_warn` so per-profile theme
-/// overrides land in the right place. Sync work runs in
+/// `GET /api/theme/current` returns the resolved theme to paint. Theme is a
+/// global preference, not profile-merged, so this reads the global config
+/// (see `config::resolve_theme_name`); every surface paints the same theme
+/// regardless of the active session profile. Sync work runs in
 /// `spawn_blocking`.
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
@@ -396,12 +501,7 @@ pub async fn get_current_theme(
     let profile = state.profile.clone();
     tracing::debug!(profile = %profile, "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
-        let cfg = crate::session::profile_config::resolve_config_or_warn(&profile);
-        let name = if cfg.theme.name.is_empty() {
-            "default".to_string()
-        } else {
-            cfg.theme.name
-        };
+        let name = crate::session::config::resolve_theme_name();
         crate::tui::styles::resolve_theme(&name)
     })
     .await

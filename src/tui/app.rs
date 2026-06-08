@@ -242,18 +242,12 @@ impl App {
         // Check if we need to show welcome or changelog dialogs
         let mut config = Config::load_or_warn();
 
-        // Load theme from config, defaulting to the `default` builtin if
-        // empty so the TUI matches the web dashboard's empty-name fallback.
-        let theme_name = if config.theme.name.is_empty() {
-            "default"
-        } else {
-            &config.theme.name
-        };
-        let palette_mode = matches!(
-            config.theme.color_mode,
-            crate::session::config::ColorMode::Palette
-        );
-        let theme = crate::tui::styles::load_theme_with_mode(theme_name, palette_mode);
+        // Theme is a global preference: read it from the global config, never
+        // profile-merged, so boot matches Settings-close and the web dashboard
+        // (see config::resolve_theme_name). Empty maps to the `default` builtin.
+        let theme_name = config.effective_theme_name();
+        let palette_mode = config.theme_palette_mode();
+        let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
         let current_version = env!("CARGO_PKG_VERSION").to_string();
 
         if no_agents {
@@ -264,7 +258,7 @@ impl App {
             // changelog so the warning is what the user sees first, and avoid
             // overwriting a malformed config.toml with defaults via save_config.
         } else if !config.app_state.has_seen_welcome {
-            home.show_intro(theme_name);
+            home.show_intro(&theme_name);
             config.app_state.has_seen_welcome = true;
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
@@ -463,17 +457,10 @@ impl App {
         // SetTheme dispatched from the Settings view preview/apply flow will
         // re-load the theme with raw RGB colors, "breaking the coloration"
         // on terminals that were working with the user's palette preference
-        // (Termius/mosh edge cases, 8-bit-only TTYs, etc.).
-        let palette_mode = crate::session::resolve_config(
-            self.home.active_profile.as_deref().unwrap_or("default"),
-        )
-        .map(|c| {
-            matches!(
-                c.theme.color_mode,
-                crate::session::config::ColorMode::Palette
-            )
-        })
-        .unwrap_or(false);
+        // (Termius/mosh edge cases, 8-bit-only TTYs, etc.). Read from the
+        // global config: theme (and its color_mode) is a global preference,
+        // not profile-merged.
+        let palette_mode = crate::session::config::resolve_theme_palette_mode();
         self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
         self.needs_redraw = true;
     }
