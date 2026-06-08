@@ -1234,7 +1234,20 @@ impl App {
             // `reload_storage_only` (storage + profile rediscovery only);
             // the heartbeat path calls full `reload()` to refresh the
             // status-hook config cache and mouse-capture toggle.
+            //
+            // Config kick runs before the storage-mirror block:
+            // `refresh_from_config` invalidates profile-derived state that
+            // the block reads. Same `live_idle` gate; recomputing
+            // `tool_hotkey_cache` mid live-send disrupts input.
             let live_idle = self.home.live_send.is_none();
+            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_dirty);
+            if config_kick {
+                let result = self.home.try_refresh_from_config_watcher();
+                handle_tick_reload_config(result, &mut self.home.reload_failure_state);
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
             // Only consume the dirty latch when we're eligible to act on
             // it (`live_idle`). When live-send is on, the latch must
@@ -1281,11 +1294,27 @@ impl App {
                 && self.home.info_dialog.is_none()
             {
                 let body = self.home.reload_failure_state.build_dialog_body();
-                self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Watcher Warning",
-                    &body,
-                ));
+                self.home.info_dialog =
+                    Some(crate::tui::dialogs::InfoDialog::new("Reload Failed", &body));
                 self.home.reload_failure_state.acknowledge_dialog();
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Recovery-edge cleanup: when every reload source returns to
+            // healthy and a stale Reload Failed dialog is still rendered,
+            // clear it so the user regains keyboard control. Without this,
+            // InfoDialog absorbs every key except Esc/Enter/Space (including
+            // q / Ctrl-C) for as long as the dialog is up, even after the
+            // underlying failure has recovered.
+            if !self.home.reload_failure_state.has_any_failure()
+                && self
+                    .home
+                    .info_dialog
+                    .as_ref()
+                    .is_some_and(|d| d.title() == "Reload Failed")
+            {
+                self.home.info_dialog = None;
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1987,6 +2016,10 @@ enum DiskRefreshDecision {
     None,
 }
 
+fn take_config_refresh_kick(live_idle: bool, config_dirty: &std::sync::atomic::AtomicBool) -> bool {
+    live_idle && config_dirty.swap(false, std::sync::atomic::Ordering::Acquire)
+}
+
 /// Pure refresh-policy decision. Inputs are plain values so this helper
 /// is side-effect free; callers are responsible for actually consuming
 /// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
@@ -2037,7 +2070,38 @@ fn handle_tick_reload_storage(
             "tick storage reload failed; preserving in-memory state, will retry on next tick"
         );
     }
-    state.record_storage(&result);
+    if state.record_storage(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "storage reload recovered"
+        );
+    }
+}
+
+/// Tick-driven config reload errors must never propagate out of the
+/// main loop AND must never silently flip safety-affecting settings to
+/// defaults. A malformed `config.toml` written by a peer process would
+/// otherwise either crash the TUI (if propagated) or silently disable
+/// settings like `confirm_before_quit` (if applied as default). This
+/// helper records the failure for one-shot dialog surfacing while
+/// keeping the previous in-memory config intact.
+fn handle_tick_reload_config(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick config reload failed; preserving in-memory config, will retry on next tick"
+        );
+    }
+    if state.record_config(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "config reload recovered"
+        );
+    }
 }
 
 /// What a `q` key press at the home screen should do. Factored out of the
@@ -2989,6 +3053,37 @@ mod tests {
             dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
             "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
         );
+    }
+
+    #[test]
+    fn config_refresh_kick_is_gated_by_live_send() {
+        let dirty = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            !take_config_refresh_kick(false, &dirty),
+            "live-send must defer config refreshes"
+        );
+        assert!(
+            dirty.load(std::sync::atomic::Ordering::Acquire),
+            "live-send must leave config_dirty latched for the next eligible tick"
+        );
+    }
+
+    #[test]
+    fn config_refresh_and_disk_refresh_can_coexist_in_one_tick() {
+        let config_dirty = std::sync::atomic::AtomicBool::new(true);
+        let disk_dirty = std::sync::atomic::AtomicBool::new(true);
+
+        let config_kick = take_config_refresh_kick(true, &config_dirty);
+        // Mirrors the tick-loop gating: live_idle is true here, so the
+        // caller swaps the latch and passes the consumed value to the
+        // pure helper.
+        let dirty = disk_dirty.swap(false, std::sync::atomic::Ordering::Acquire);
+        let disk_decision = decide_disk_refresh(true, true, dirty);
+
+        assert!(config_kick, "config refresh must be scheduled first");
+        assert_eq!(disk_decision, DiskRefreshDecision::Heartbeat);
+        assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

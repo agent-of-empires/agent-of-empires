@@ -302,6 +302,14 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
 }
 
 pub fn list_profiles() -> Result<Vec<String>> {
+    // Test-only failure injection: when set, the next call returns
+    // Err and the flag clears. Used by the file-watch regression test
+    // that locks the rewire-after-mutation error-handling path
+    // without requiring a platform-fragile permission denial.
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
     let base = get_app_dir()?;
     let profiles_dir = base.join("profiles");
 
@@ -311,6 +319,10 @@ pub fn list_profiles() -> Result<Vec<String>> {
 
     list_profile_names_in(&profiles_dir)
 }
+
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
 /// Symlinks are aliases used by the `cs`/`cxa` account-switcher (e.g.

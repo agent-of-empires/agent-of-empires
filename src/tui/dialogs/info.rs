@@ -92,6 +92,10 @@ impl InfoDialog {
         self
     }
 
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// A left-click anywhere inside the info dialog dismisses it,
     /// matching the keyboard's "any of Esc/Enter/Space closes" model.
     /// `None` when the click landed outside the dialog area, so the

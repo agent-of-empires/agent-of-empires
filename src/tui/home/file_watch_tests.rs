@@ -131,9 +131,238 @@ async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
         "rewire must drop+abort the entry for a removed profile"
     );
     assert_eq!(
-        live.subscriber_count(),
+        view.disk_watch_handles.len(),
         1,
-        "exactly one live subscription remains after the removal"
+        "exactly the surviving profile's disk_watch_handles entry remains; live `subscriber_count()` also includes config-watch subscriptions wired by `rewire_config_subscriptions` and is not the right invariant for the disk-only path"
+    );
+}
+
+/// Locks the config-watch remove/recreate path: deleting a profile must
+/// clear its typed key, and recreating it must restore the subscription
+/// count back to baseline without leaking an extra entry.
+#[tokio::test]
+#[serial]
+async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subscribe() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("cfg-leak").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("cfg-leak".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    use super::ConfigWatchKey;
+
+    view.rewire_config_subscriptions(&["cfg-leak".to_string()])
+        .expect("install profile sub");
+    let baseline = live.subscriber_count();
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
+        "precondition: profile config sub installed"
+    );
+
+    view.rewire_config_subscriptions(&[]).expect("remove all");
+    assert!(
+        !view
+            .config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
+        "remove must drop the per-profile entry"
+    );
+
+    view.rewire_config_subscriptions(&["cfg-leak".to_string()])
+        .expect("recreate profile sub");
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
+        "recreate must reinstall the per-profile entry"
+    );
+    assert_eq!(
+        live.subscriber_count(),
+        baseline,
+        "remove-then-recreate must converge to the same live subscription count, not double up"
+    );
+}
+
+/// In single-profile mode, `reload_storage_only` keeps disk
+/// subscriptions scoped to `self.storages.keys()` (just the active
+/// profile) while config subscriptions cover the full on-disk
+/// profile set. Widening disk wiring to `current_profiles` would
+/// watch peer profiles' sessions.json/groups.json that the user
+/// explicitly opted out of by passing `--profile X`.
+#[tokio::test]
+#[serial]
+async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("active-only").expect("seed active dir");
+    crate::session::get_profile_dir("peer-one").expect("seed peer 1 dir");
+    crate::session::get_profile_dir("peer-two").expect("seed peer 2 dir");
+
+    let mut view = HomeView::new(
+        Some("active-only".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.reload_storage_only().expect("reload");
+
+    use super::ConfigWatchKey;
+    assert_eq!(
+        view.disk_watch_handles.len(),
+        1,
+        "single-profile mode must keep disk watches scoped to the active profile only; \
+         got {} entries: {:?}",
+        view.disk_watch_handles.len(),
+        view.disk_watch_handles.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        view.disk_watch_handles.contains_key("active-only"),
+        "the active profile's disk watch must be present after reload"
+    );
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("peer-one")),
+        "peer profiles' CONFIG watches must be wired (asymmetric design): \
+         peer config edits propagate to picker UI / status-hook cache"
+    );
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("peer-two")),
+        "all on-disk profiles must have config watches in single-profile mode"
+    );
+}
+
+/// When `list_profiles()` fails after a successful create or delete,
+/// `rewire_after_profile_mutation` must surface a Watcher Warning to
+/// the user via `info_dialog` (in addition to logging a structured
+/// warn). The test seam in `crate::session` injects the failure
+/// without requiring a platform-fragile permission denial.
+#[tokio::test]
+#[serial]
+async fn rewire_after_profile_mutation_surfaces_dialog_when_list_profiles_fails() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("seam-test").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("seam-test".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    assert!(
+        view.info_dialog.is_none(),
+        "precondition: no dialog before the failure"
+    );
+
+    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+    view.rewire_after_profile_mutation("seam-test", "create_profile", "created");
+
+    assert!(
+        view.info_dialog.is_some(),
+        "list_profiles failure must surface a Watcher Warning dialog to the user; \
+         silently swallowing the error would leave info_dialog None"
+    );
+
+    assert!(
+        crate::session::list_profiles().is_ok(),
+        "seam must auto-clear after firing once"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn reload_storage_only_survives_list_profiles_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("reload-fallback").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("reload-fallback".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let writer = Storage::new("reload-fallback", live.clone()).expect("writer");
+    writer
+        .update(|instances, _groups| {
+            *instances = vec![Instance::new("fallback-row", "/tmp/fallback")];
+            Ok(())
+        })
+        .expect("peer write");
+
+    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+    view.reload_storage_only()
+        .expect("reload should degrade, not fail");
+
+    assert!(
+        view.instances
+            .iter()
+            .any(|inst| inst.title == "fallback-row"),
+        "reload must still refresh storage-backed instances when list_profiles fails"
+    );
+    assert!(
+        crate::session::list_profiles().is_ok(),
+        "seam must auto-clear after firing once"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("dialog-guard").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("dialog-guard".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+        "Existing dialog",
+        "keep me",
+    ));
+
+    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+    view.rewire_after_profile_mutation("dialog-guard", "delete_profile", "deleted");
+
+    assert!(
+        crate::session::list_profiles().is_ok(),
+        "seam must auto-clear after firing once"
+    );
+
+    let mut dialog = view.info_dialog.expect("existing dialog should survive");
+    let theme = crate::tui::styles::load_theme("empire");
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render dialog");
+    let buf = terminal.backend().buffer().clone();
+    let rendered: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+    assert!(
+        rendered.contains("Existing dialog"),
+        "rewire failure must not overwrite a pre-existing info dialog"
     );
 }
 

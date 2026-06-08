@@ -5,7 +5,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -71,6 +71,92 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     assert!(
         !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn config_watch_keys_distinguish_global_from_profile_named_global() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile_name = "<global>";
+    let _storage = Storage::new_unwatched(profile_name).unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some(profile_name.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::new().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(view.config_watch_handles.len(), 2);
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::Global));
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::profile(profile_name)));
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "precondition: initial load shows warning dialog"
+    );
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert!(
+        view.info_dialog.is_none(),
+        "watcher-driven refresh must not reopen the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_reopens_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.info_dialog.is_some(),
+        "interactive refresh must still surface the hotkey warning dialog"
     );
 }
 
@@ -10322,7 +10408,8 @@ mod default_attach_mode {
             "cache should initialize to the historical Tmux default"
         );
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
-        env.view.refresh_from_config();
+        env.view
+            .refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(
             env.view.profile_default_attach_mode,
             NewSessionAttachMode::LiveSend,

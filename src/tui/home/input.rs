@@ -1310,7 +1310,7 @@ impl HomeView {
                 SettingsAction::Close => {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
-                    self.refresh_from_config();
+                    self.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
                     // Reload the theme from the global config (theme is a global
                     // preference, not profile-merged) so the repaint matches boot.
                     return Some(Action::SetTheme(
@@ -1937,6 +1937,11 @@ impl HomeView {
                         self.profile_picker_dialog = None;
                         match crate::session::create_profile(&name) {
                             Ok(()) => {
+                                self.rewire_after_profile_mutation(
+                                    &name,
+                                    "create_profile",
+                                    "created",
+                                );
                                 if let Err(e) = self.switch_profile(Some(name)) {
                                     tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
                                 }
@@ -1952,9 +1957,11 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
-                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
-                                    super::drop_disk_watch_entry(entry);
-                                }
+                                self.rewire_after_profile_mutation(
+                                    &name,
+                                    "delete_profile",
+                                    "deleted",
+                                );
                                 self.show_profile_picker();
                             }
                             Err(e) => {
