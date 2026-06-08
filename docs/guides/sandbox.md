@@ -71,13 +71,28 @@ environment = ["ANTHROPIC_API_KEY"]
 | `cpu_limit` | (none) | CPU limit (e.g., "4") |
 | `memory_limit` | (none) | Memory limit (e.g., "8g") |
 | `environment` | `[]` | Env vars for containers (bare KEY or KEY=VALUE, see below) |
-| `volume_ignores` | `[]` | Directories to exclude from the project mount via anonymous volumes |
+| `volume_ignores` | `[]` | Literal directory paths to exclude from the project mount via anonymous volumes (no glob expansion, see below) |
 | `volume_ignores_strategy` | `"anonymous"` | How `volume_ignores` are mounted: `"anonymous"` (default) or `"named"` (required on macOS/VirtioFS, see below) |
 | `extra_volumes` | `[]` | Additional volume mounts |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
 | `default_terminal_mode` | `"host"` | Paired terminal location: `"host"` (on host machine) or `"container"` (inside Docker) |
 
 ## Volume Mounts
+
+### Volume Ignores Are Literal Paths
+
+`volume_ignores` entries are literal directory paths, each resolved relative to the mounted workspace roots. Glob patterns are **not** expanded: Docker needs concrete mount paths at container-create time. An entry like `**/bin` or `target/*` is skipped with a warning rather than mounted, since concatenating it literally would create a real `**` directory inside the bind-mounted repo and leak it back onto the host.
+
+List each generated directory explicitly:
+
+```toml
+[sandbox]
+# Good: literal paths
+volume_ignores = ["node_modules", "target", "src/MyApp/bin", "src/MyApp/obj"]
+
+# Skipped with a warning: glob metacharacters (* ? [ ])
+# volume_ignores = ["**/bin", "**/obj"]
+```
 
 ### Volume Ignores Strategy (macOS/VirtioFS)
 
