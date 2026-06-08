@@ -409,3 +409,93 @@ async fn rewire_no_op_preserves_latched_watcher_init_failure() {
         "no-op rewire (unchanged set, no inode change) must preserve the watcher_init_error latch"
     );
 }
+
+#[test]
+fn reload_failure_state_record_storage_recovery_returns_true_and_clears_ack_latch() {
+    let mut state = super::ReloadFailureState::default();
+    let err: anyhow::Result<()> = Err(anyhow::anyhow!("disk unreadable"));
+    let ok: anyhow::Result<()> = Ok(());
+
+    assert!(
+        !state.record_storage(&err),
+        "first failure does not return true"
+    );
+    state.acknowledge_dialog();
+    assert!(!state.has_unacknowledged_failure());
+
+    assert!(
+        state.record_storage(&ok),
+        "failed-to-ok edge must return true so callers can emit an info log on recovery"
+    );
+    assert!(
+        !state.has_any_failure(),
+        "successful recovery clears the failure flag"
+    );
+    assert!(
+        !state.has_unacknowledged_failure(),
+        "recovery clears the ack latch so a fresh failure burst will surface a fresh dialog"
+    );
+}
+
+#[test]
+fn reload_failure_state_new_failure_during_acked_burst_re_arms_dialog() {
+    let mut state = super::ReloadFailureState::default();
+    let err1: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
+    let err2: anyhow::Result<()> = Err(anyhow::anyhow!("config broken"));
+
+    state.record_storage(&err1);
+    state.acknowledge_dialog();
+    assert!(
+        !state.has_unacknowledged_failure(),
+        "first failure acknowledged"
+    );
+
+    state.record_config(&err2);
+    assert!(
+        state.has_unacknowledged_failure(),
+        "a NEW source failing during an already-acknowledged burst re-arms the dialog so the user is notified about the additional failure"
+    );
+}
+
+#[test]
+fn reload_failure_state_dialog_body_aggregates_all_three_sources() {
+    let mut state = super::ReloadFailureState::default();
+    state.record_storage(&Err::<(), _>(anyhow::anyhow!("storage err")));
+    state.record_config(&Err::<(), _>(anyhow::anyhow!("config err")));
+    state.record_watcher_init_failure("subscribe denied");
+
+    let body = state.build_dialog_body();
+    assert!(
+        body.contains("- Storage: storage err"),
+        "missing storage line: {body}"
+    );
+    assert!(
+        body.contains("- Config: config err"),
+        "missing config line: {body}"
+    );
+    assert!(
+        body.contains("- Watcher init: subscribe denied"),
+        "missing watcher-init line: {body}"
+    );
+}
+
+#[test]
+fn reload_failure_state_watcher_init_failure_lifecycle() {
+    let mut state = super::ReloadFailureState::default();
+    state.record_watcher_init_failure("first install failed");
+    assert!(
+        state.has_unacknowledged_failure(),
+        "watcher_init_error contributes to has_any_failure"
+    );
+
+    state.acknowledge_dialog();
+    state.clear_watcher_init_failure();
+    assert!(
+        !state.has_any_failure(),
+        "clear_watcher_init_failure removes the latch"
+    );
+    assert!(
+        !state.has_unacknowledged_failure(),
+        "clearing the only failing source resets the ack latch"
+    );
+}
