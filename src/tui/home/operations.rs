@@ -1008,7 +1008,16 @@ impl HomeView {
             // seconds (Docker pull, agent splash, resume) and the loop shows a
             // "Reviving..." toast while it runs. Deferring also keeps this
             // method free of spawn side effects so unit tests stay clean.
-            self.pending_revive_session = Some(id);
+            //
+            // Structured (ACP) sessions have no tmux pane to respawn, so
+            // ensure_pane_ready would error; skip the revive and just leave
+            // them unarchived. Their worker lifecycle is managed elsewhere.
+            let is_structured = self
+                .get_instance(&id)
+                .is_some_and(|inst| inst.is_structured());
+            if !is_structured {
+                self.pending_revive_session = Some(id);
+            }
             return Ok(());
         }
 

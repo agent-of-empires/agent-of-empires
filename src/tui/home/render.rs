@@ -1737,23 +1737,31 @@ impl HomeView {
                     let idle_age = inst.idle_age();
                     let is_fresh_idle =
                         matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                    let (icon, icon_color) = match inst.status {
-                        Status::Running => (spinner_running(&inst.created_at), theme.running),
-                        Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
-                        Status::Idle if is_fresh_idle => (
-                            spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Idle => (
-                            ICON_IDLE,
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Unknown => (ICON_UNKNOWN, theme.waiting),
-                        Status::Stopped => (ICON_STOPPED, theme.dimmed),
-                        Status::Error => (ICON_ERROR, theme.error),
-                        Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
-                        Status::Deleting => (ICON_DELETING, theme.waiting),
-                        Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                    // An archived row is parked; its preview body renders the
+                    // "Archived" placeholder. Force the compact title icon to
+                    // the stopped glyph so the hoisted title can't show a live
+                    // spinner from a stale (pre-poll) status and contradict it.
+                    let (icon, icon_color) = if inst.is_archived() {
+                        (ICON_STOPPED, theme.dimmed)
+                    } else {
+                        match inst.status {
+                            Status::Running => (spinner_running(&inst.created_at), theme.running),
+                            Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
+                            Status::Idle if is_fresh_idle => (
+                                spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Idle => (
+                                ICON_IDLE,
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Unknown => (ICON_UNKNOWN, theme.waiting),
+                            Status::Stopped => (ICON_STOPPED, theme.dimmed),
+                            Status::Error => (ICON_ERROR, theme.error),
+                            Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
+                            Status::Deleting => (ICON_DELETING, theme.waiting),
+                            Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                        }
                     };
                     Line::from(vec![
                         Span::raw(" "),
