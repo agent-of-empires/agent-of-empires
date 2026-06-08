@@ -1865,12 +1865,26 @@ impl HomeView {
             .and_then(|id| self.get_instance(id))
             .is_some_and(|inst| inst.is_archived());
 
+        // A session whose pane is simply gone (killed, exited, server reboot)
+        // with no diagnostic detail carries the generic gone-error. Present
+        // that as a calm "Stopped" placeholder rather than the red crash error;
+        // a real crash leaves a specific message and still renders red. Covers
+        // the just-unarchived row, which sits Stopped until restarted.
+        let selected_stopped = !selected_archived
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| {
+                    inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
+                });
+
         // Keep the off-thread capture worker pointed at whatever pane this
         // view shows (and tuned to live-send vs. idle cadence) before any
         // refresh reads from it. Done once here, not per-branch, so the
-        // creating / no-selection / archived paths also retarget or tear it
-        // down (archived feeds `None` so the worker stops capturing).
-        let desired = if selected_archived {
+        // creating / no-selection / archived / stopped paths also retarget or
+        // tear it down (no live pane feeds `None` so the worker stops capturing).
+        let desired = if selected_archived || selected_stopped {
             None
         } else {
             self.displayed_pane_tmux_name()
@@ -1879,6 +1893,12 @@ impl HomeView {
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_stopped {
+            self.render_stopped_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -2346,6 +2366,34 @@ impl HomeView {
                     " to unarchive it, then e to restart.",
                     Style::default().fg(theme.dimmed),
                 ),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Calm placeholder shown when the selected session's pane is simply gone
+    /// (the generic gone-error, no diagnostic detail). Replaces the red crash
+    /// error with a "Stopped, press e to restart" message; the row's real
+    /// status icon still signals the state in the sidebar.
+    fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let key = if self.strict_hotkeys { "E" } else { "e" };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Stopped",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This session isn't running.",
+                Style::default().fg(theme.dimmed),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restart it.", Style::default().fg(theme.dimmed)),
             ]),
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);

@@ -101,4 +101,18 @@ fn test_archive_then_unarchive_cycle() {
         !after_unarchive.contains("Archived ("),
         "the Archived section should be gone once empty\n{after_unarchive}"
     );
+
+    // The unarchived row is Stopped (archive killed its pane). Once the poller
+    // stamps the gone-error, the preview must show the calm Stopped placeholder,
+    // not the red "tmux session is gone" crash error.
+    h.wait_for("isn't running");
+    let stopped = h.capture_screen();
+    assert!(
+        !stopped.contains("tmux session is gone"),
+        "stopped preview must not show the red corpse error\n{stopped}"
+    );
+    assert!(
+        stopped.contains("Stopped") && stopped.contains("Press e to restart"),
+        "stopped preview should explain the state and point at e\n{stopped}"
+    );
 }

@@ -87,6 +87,13 @@ impl Status {
 /// Failures (both tiers) propagate as `Err` so callers keep the existing
 /// `Status::Error` + `last_error` path. Only successful outcomes are
 /// enumerated; mirrors the `EnsureReadyOutcome` shape.
+/// `last_error` the status poller stamps when a session's tmux pane is simply
+/// absent (killed, exited, server reboot) and nothing more specific was
+/// captured from the pane. The preview treats this as the calm "Stopped" case
+/// rather than a red crash error, since it carries no diagnostic detail.
+pub const TMUX_SESSION_GONE_ERROR: &str =
+    "tmux session is gone. The agent process may have exited or been killed.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
@@ -3166,9 +3173,7 @@ impl Instance {
             // Clear any stale tmux-derived error so the UI doesn't show
             // a misleading message after a session is converted or
             // restarted in the structured view.
-            if self.last_error.as_deref()
-                == Some("tmux session is gone. The agent process may have exited or been killed.")
-            {
+            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
                 self.last_error = None;
             }
             if self.status == Status::Error {
@@ -3218,10 +3223,7 @@ impl Instance {
             );
             self.status = Status::Error;
             if self.last_error.is_none() {
-                self.last_error = Some(
-                    "tmux session is gone. The agent process may have exited or been killed."
-                        .to_string(),
-                );
+                self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
             }
             self.last_error_check = Some(std::time::Instant::now());
             return;
