@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 
 import type { BrowseResponse } from "../../lib/types";
 
@@ -15,7 +21,9 @@ vi.mock("../../lib/api", () => ({
 
 import { DirectoryBrowser } from "../DirectoryBrowser";
 
-function response(entries: BrowseResponse["entries"]): BrowseResponse & { ok: boolean } {
+function response(
+  entries: BrowseResponse["entries"],
+): BrowseResponse & { ok: boolean } {
   return { entries, has_more: false, ok: true };
 }
 
@@ -34,20 +42,35 @@ describe("DirectoryBrowser", () => {
   it("falls back to home when the initial path cannot be loaded", async () => {
     getHomePath.mockResolvedValue("/home/user");
     browseFilesystem.mockImplementation(async (path: string) => {
-      if (path === "/missing") return { entries: [], has_more: false, ok: false };
+      if (path === "/missing")
+        return { entries: [], has_more: false, ok: false };
       return response([dir("project")]);
     });
 
     render(<DirectoryBrowser initialPath="/missing" onSelect={vi.fn()} />);
 
-    await expect(screen.findByRole("option", { name: /project/i })).resolves.toBeTruthy();
-    expect(browseFilesystem).toHaveBeenNthCalledWith(1, "/missing", 100, undefined);
-    expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user", 100, undefined);
+    await expect(
+      screen.findByRole("option", { name: /project/i }),
+    ).resolves.toBeTruthy();
+    expect(browseFilesystem).toHaveBeenNthCalledWith(
+      1,
+      "/missing",
+      100,
+      undefined,
+    );
+    expect(browseFilesystem).toHaveBeenNthCalledWith(
+      2,
+      "/home/user",
+      100,
+      undefined,
+    );
   });
 
   it("ignores stale browse responses after a newer navigation finishes", async () => {
     getHomePath.mockResolvedValue("/home/user");
-    let resolveSlow: ((value: BrowseResponse & { ok: boolean }) => void) | undefined;
+    let resolveSlow:
+      | ((value: BrowseResponse & { ok: boolean }) => void)
+      | undefined;
     browseFilesystem.mockImplementation((path: string) => {
       if (path === "/home/user/slow") {
         return new Promise<BrowseResponse & { ok: boolean }>((resolve) => {
@@ -64,7 +87,11 @@ describe("DirectoryBrowser", () => {
     fireEvent.click(screen.getByRole("button", { name: "user" }));
 
     await waitFor(() => {
-      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, undefined);
+      expect(browseFilesystem).toHaveBeenCalledWith(
+        "/home/user",
+        100,
+        undefined,
+      );
     });
 
     expect(resolveSlow).toBeDefined();
@@ -78,11 +105,15 @@ describe("DirectoryBrowser", () => {
 
   it("requests filtered results from the server so entries past the first page can be found", async () => {
     getHomePath.mockResolvedValue("/home/user");
-    const firstPage = Array.from({ length: 100 }, (_, i) => dir(`project-${i + 1}`));
-    browseFilesystem.mockImplementation(async (_path: string, _limit: number, filter?: string) => {
-      if (filter === "z") return response([dir("z-project")]);
-      return { entries: firstPage, has_more: true, ok: true };
-    });
+    const firstPage = Array.from({ length: 100 }, (_, i) =>
+      dir(`project-${i + 1}`),
+    );
+    browseFilesystem.mockImplementation(
+      async (_path: string, _limit: number, filter?: string) => {
+        if (filter === "z") return response([dir("z-project")]);
+        return { entries: firstPage, has_more: true, ok: true };
+      },
+    );
 
     render(<DirectoryBrowser onSelect={vi.fn()} />);
 
@@ -96,6 +127,8 @@ describe("DirectoryBrowser", () => {
     await waitFor(() => {
       expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, "z");
     });
-    await expect(screen.findByRole("option", { name: /z-project/i })).resolves.toBeTruthy();
+    await expect(
+      screen.findByRole("option", { name: /z-project/i }),
+    ).resolves.toBeTruthy();
   });
 });

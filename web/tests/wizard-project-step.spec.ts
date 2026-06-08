@@ -23,7 +23,9 @@ async function mockBaseApis(page: Page) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "settings" || path === "about" || path === "system/update-status"
+          path === "settings" ||
+          path === "about" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -35,7 +37,13 @@ async function mockBaseApis(page: Page) {
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
-        { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" },
+        {
+          name: "claude",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+        },
       ],
     }),
   );
@@ -73,7 +81,9 @@ function seedRecentSession() {
 async function openWizard(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
 }
 
 test.describe("Wizard project step (#1219)", () => {
@@ -85,11 +95,20 @@ test.describe("Wizard project step (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openWizard(page);
-    await expect(page.getByRole("button", { name: "Recent", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Browse", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Clone URL", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Recent", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Browse", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Clone URL", exact: true }),
+    ).toBeVisible();
     // Recent entry visible (the seeded /tmp/example session).
-    const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
+    const recent = page
+      .getByRole("button")
+      .filter({ hasText: "/tmp/example" })
+      .first();
     await expect(recent).toBeVisible();
   });
 
@@ -121,8 +140,18 @@ test.describe("Wizard project step (#1219)", () => {
       r.fulfill({
         json: {
           entries: [
-            { name: "my-repo", path: "/home/user/my-repo", is_dir: true, is_git_repo: true },
-            { name: "docs", path: "/home/user/docs", is_dir: true, is_git_repo: false },
+            {
+              name: "my-repo",
+              path: "/home/user/my-repo",
+              is_dir: true,
+              is_git_repo: true,
+            },
+            {
+              name: "docs",
+              path: "/home/user/docs",
+              is_dir: true,
+              is_git_repo: false,
+            },
           ],
           has_more: false,
         },
@@ -138,10 +167,14 @@ test.describe("Wizard project step (#1219)", () => {
     await repoEntry.click();
     // Picking the repo flips back to the Recent tab and shows the selected path.
     await expect(page.getByText("Selected project")).toBeVisible();
-    await expect(page.getByText("/home/user/my-repo", { exact: false })).toBeVisible();
+    await expect(
+      page.getByText("/home/user/my-repo", { exact: false }),
+    ).toBeVisible();
   });
 
-  test("Browse tab can load entries beyond the first page", async ({ page }) => {
+  test("Browse tab can load entries beyond the first page", async ({
+    page,
+  }) => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) =>
       r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
@@ -156,7 +189,9 @@ test.describe("Wizard project step (#1219)", () => {
       };
     });
     await page.route("**/api/filesystem/browse**", (r) => {
-      const limit = Number(new URL(r.request().url()).searchParams.get("limit") ?? "100");
+      const limit = Number(
+        new URL(r.request().url()).searchParams.get("limit") ?? "100",
+      );
       r.fulfill({
         json: {
           entries: entries.slice(0, limit),
@@ -169,21 +204,31 @@ test.describe("Wizard project step (#1219)", () => {
     await page.goto("/");
     await openWizard(page);
 
-    await expect(page.getByRole("option").filter({ hasText: "project-001" })).toBeVisible();
-    await expect(page.getByRole("option").filter({ hasText: "project-125" })).toHaveCount(0);
+    await expect(
+      page.getByRole("option").filter({ hasText: "project-001" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("option").filter({ hasText: "project-125" }),
+    ).toHaveCount(0);
     await expect(page.getByText("Showing first 100 entries.")).toBeVisible();
 
     await page.getByRole("button", { name: "Load 100 more" }).click();
 
-    const finalEntry = page.getByRole("option").filter({ hasText: "project-125" });
+    const finalEntry = page
+      .getByRole("option")
+      .filter({ hasText: "project-125" });
     await expect(finalEntry).toBeVisible();
     await expect(page.getByText("Load 100 more")).toHaveCount(0);
     await finalEntry.click();
     await expect(page.getByText("Selected project")).toBeVisible();
-    await expect(page.getByText("/home/user/project-125", { exact: false })).toBeVisible();
+    await expect(
+      page.getByText("/home/user/project-125", { exact: false }),
+    ).toBeVisible();
   });
 
-  test("Browse tab filters entries beyond the first page on the server", async ({ page }) => {
+  test("Browse tab filters entries beyond the first page on the server", async ({
+    page,
+  }) => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) =>
       r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
@@ -224,20 +269,30 @@ test.describe("Wizard project step (#1219)", () => {
     await page.goto("/");
     await openWizard(page);
 
-    await expect(page.getByRole("option").filter({ hasText: "project-001" })).toBeVisible();
-    await expect(page.getByRole("option").filter({ hasText: "z-project" })).toHaveCount(0);
+    await expect(
+      page.getByRole("option").filter({ hasText: "project-001" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("option").filter({ hasText: "z-project" }),
+    ).toHaveCount(0);
 
     await page.getByPlaceholder("Type to filter...").fill("z");
 
     const zProject = page.getByRole("option").filter({ hasText: "z-project" });
     await expect(zProject).toBeVisible();
-    await expect(page.getByRole("button", { name: "Load 100 more" })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Load 100 more" }),
+    ).toHaveCount(0);
     await zProject.click();
     await expect(page.getByText("Selected project")).toBeVisible();
-    await expect(page.getByText("/home/user/z-project", { exact: false })).toBeVisible();
+    await expect(
+      page.getByText("/home/user/z-project", { exact: false }),
+    ).toBeVisible();
   });
 
-  test("Clone tab: clone button disabled until URL non-empty", async ({ page }) => {
+  test("Clone tab: clone button disabled until URL non-empty", async ({
+    page,
+  }) => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) =>
       r.fulfill({ json: seedRecentSession() }),
@@ -255,7 +310,9 @@ test.describe("Wizard project step (#1219)", () => {
     await expect(cloneBtn).toBeDisabled();
   });
 
-  test("Clone tab: Advanced reveals destination + shallow toggle", async ({ page }) => {
+  test("Clone tab: Advanced reveals destination + shallow toggle", async ({
+    page,
+  }) => {
     await mockBaseApis(page);
     await page.route("**/api/sessions", (r) =>
       r.fulfill({ json: seedRecentSession() }),
@@ -269,7 +326,9 @@ test.describe("Wizard project step (#1219)", () => {
     await page.getByRole("button", { name: /Advanced/ }).click();
     await expect(page.locator("#clone-dest")).toBeVisible();
     await expect(
-      page.locator("label", { hasText: "Shallow clone" }).locator("input[type=checkbox]"),
+      page
+        .locator("label", { hasText: "Shallow clone" })
+        .locator("input[type=checkbox]"),
     ).toBeVisible();
   });
 });

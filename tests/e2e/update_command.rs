@@ -40,7 +40,7 @@ fn update_calls_brew_when_method_is_homebrew() {
     // dir to the `-dev` namespace.
     let app_dir = config_home
         .path()
-        .join(agent_of_empires::session::APP_DIR_NAME_LINUX);
+        .join(agent_of_empires::session::APP_DIR_NAME_XDG);
     fs::create_dir_all(&app_dir).unwrap();
 
     let cache = serde_json::json!({

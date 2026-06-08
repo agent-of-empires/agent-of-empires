@@ -9,19 +9,20 @@
 //!
 //! Section attribute (required):
 //! ```ignore
-//! #[setting_section(name = "cockpit", category = "Cockpit")]
+//! #[setting_section(name = "acp", category = "Acp")]
 //! ```
 //!
 //! Per-field attribute:
 //! ```ignore
-//! #[setting(label = "Cockpit enabled", widget = "toggle")]
+//! #[setting(label = "Acp enabled", widget = "toggle")]
 //! #[setting(label = "Node path", web = "local_only:host binary execution surface")]
 //! #[setting(skip)]   // not a user-facing setting
 //! ```
 //! Keys: `label`, `desc`, `category` (override the section default), `widget`,
 //! `min`, `max`, `step`, `multiline`, `mono`, `options` ("v:Label,v2:Label2"),
 //! `web` ("allow" | "elevation:reason" | "local_only:reason"),
-//! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" | "volume_list"),
+//! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
+//!   "volume_list" | "env_list" | "port_mapping_list"),
 //! `global_only` (flag: field is shown but not profile-overridable),
 //! `skip` (flag: exclude the field from the schema entirely).
 //! When `desc` is omitted, the field's doc comment is used.
@@ -301,6 +302,8 @@ fn build_validation(
         "nonempty" => quote!(ValidationKind::NonEmptyString),
         "memory_limit" => quote!(ValidationKind::MemoryLimit),
         "volume_list" => quote!(ValidationKind::VolumeList),
+        "env_list" => quote!(ValidationKind::EnvList),
+        "port_mapping_list" => quote!(ValidationKind::PortMappingList),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();
             if parts.is_empty() || parts.len() > 2 {

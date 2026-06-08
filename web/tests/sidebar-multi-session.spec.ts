@@ -280,7 +280,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await projectHeader.click({ button: "right" });
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
-    await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
+    await menu
+      .locator("[data-testid='sidebar-group-context-menu-rename']")
+      .click();
 
     const input = page.locator("[data-testid='sidebar-group-rename-input']");
     await input.fill("Client Alpha");
@@ -290,7 +292,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.getByLabel("Filter sessions").click();
     const filter = page.locator("[data-testid='sidebar-filter-input']");
     await filter.fill("client alpha");
-    await expect(page.locator("[data-testid='sidebar-group-header']")).toHaveCount(1);
+    await expect(
+      page.locator("[data-testid='sidebar-group-header']"),
+    ).toHaveCount(1);
     await filter.fill("");
 
     await projectHeader.click({ button: "right" });
@@ -335,6 +339,8 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
+    await expect(
+      menu.locator("[data-testid='sidebar-group-context-menu-rename']"),
+    ).toBeVisible();
   });
 });

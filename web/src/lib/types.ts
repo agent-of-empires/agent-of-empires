@@ -67,6 +67,11 @@ export interface SessionResponse {
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
   has_managed_worktree: boolean;
+  /** True when renaming this session also moves its worktree directory (the
+   *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
+   *  sidebar uses this to collapse the standalone "edit workdir name" action
+   *  into the unified rename. Populated by the list endpoint. See #1927. */
+  tie_workdir_to_name?: boolean;
   has_terminal: boolean;
   profile: string;
   cleanup_defaults: CleanupDefaults;
@@ -76,20 +81,20 @@ export interface SessionResponse {
   notify_on_waiting: boolean | null;
   notify_on_idle: boolean | null;
   notify_on_error: boolean | null;
-  /** True when this session uses ACP cockpit rendering instead of a
-   *  tmux-backed PTY. Absent on builds without the cockpit feature. */
-  cockpit_mode?: boolean;
-  /** Live cockpit worker lifecycle. `absent` for tmux sessions or
-   *  cockpit sessions whose worker has not been spawned yet; `resuming`
+  /** True when this session uses ACP acp rendering instead of a
+   *  tmux-backed PTY. Absent on builds without the acp feature. */
+  view?: "structured" | "terminal";
+  /** Live acp worker lifecycle. `absent` for tmux sessions or
+   *  acp sessions whose worker has not been spawned yet; `resuming`
    *  while the reconciler is mid-spawn or mid-attach; `running` once
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
-   *  chip and the per-session banner in the cockpit view. See #1088. */
-  cockpit_worker_state?: CockpitWorkerState;
-  /** True when this session's agent can run in cockpit: a built-in with
+   *  chip and the per-session banner in the acp view. See #1088. */
+  acp_worker_state?: AcpWorkerState;
+  /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
-   *  valid `agent_cockpit_cmd`. The terminal view's "switch to cockpit"
+   *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
    *  affordance reads this instead of a hardcoded tool list. Absent on
-   *  builds without the cockpit feature. */
+   *  builds without the acp feature. */
   acp_capable?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
@@ -103,11 +108,11 @@ export interface SessionResponse {
    *  populated on the create-session response; absent on subsequent fetches. */
   warnings?: string[];
   /** Latest plan snapshot summarised for the sidebar. Present only on
-   *  cockpit sessions whose agent has emitted a Plan. See #1061. */
+   *  acp sessions whose agent has emitted a Plan. See #1061. */
   plan_summary?: PlanSummary;
   /** Absolute RFC3339 timestamp at which the agent's pending
    *  `ScheduleWakeup` fires. Cleared once a fresh user prompt lands
-   *  after the scheduling call. Present only on cockpit sessions
+   *  after the scheduling call. Present only on acp sessions
    *  whose agent has called `ScheduleWakeup` since the last prompt.
    *  See #1091. */
   next_wakeup_at?: string;
@@ -251,12 +256,20 @@ export interface RichDiffHunk {
   lines: RichDiffLine[];
 }
 
-/** Response from /api/sessions/{id}/diff/file?path=... */
-export interface RichFileDiffResponse {
+/**
+ * Response from /api/sessions/{id}/diff/file?path=...
+ * Raw old/new file text that the client parses and renders itself via
+ * `@pierre/diffs` (virtualized, off-main-thread highlighting).
+ */
+export interface RichFileContentsResponse {
   file: RichDiffFile;
-  hunks: RichDiffHunk[];
+  old_content: string;
+  new_content: string;
+  /** Server-computed unified diff of old → new. Parsed client-side as text
+   *  (no client diff algorithm); empty for binary files. */
+  patch: string;
   is_binary: boolean;
-  /** True if the file was too large to diff inline. */
+  /** True if the file was too large to send inline; contents are empty. */
   truncated: boolean;
 }
 
@@ -297,19 +310,19 @@ export interface AgentInfo {
   host_only: boolean;
   installed: boolean;
   install_hint: string;
-  /** True when the agent can run in cockpit: a built-in with an ACP
-   *  adapter, or a custom agent that declares a valid `agent_cockpit_cmd`.
+  /** True when the agent can run in acp: a built-in with an ACP
+   *  adapter, or a custom agent that declares a valid `agent_acp_cmd`.
    *  The wizard reads this to decide whether a new session runs in
-   *  cockpit or tmux, replacing the hardcoded client-side tool list. */
+   *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
-  /** The ACP command a built-in agent launches in cockpit (e.g.
+  /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,
    *  whose command values are never serialized by the backend. */
-  cockpit_command?: string;
-  /** Registry args appended to `cockpit_command` (e.g. `["acp"]` for
+  acp_command?: string;
+  /** Registry args appended to `acp_command` (e.g. `["acp"]` for
    *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
-  cockpit_args?: string[];
+  acp_args?: string[];
 }
 
 /** Profile info returned by /api/profiles */
@@ -398,14 +411,15 @@ export interface CreateSessionRequest {
   command_override?: string;
   custom_instruction?: string;
   profile?: string;
-  /** Substrate selection: true → ACP-based cockpit (Beta),
+  /** Substrate selection: true → ACP-based acp (Beta),
    *  false → tmux passthrough (legacy). Server defaults to true on
    *  web-created sessions; the wizard may override. */
-  cockpit_mode?: boolean;
-  /** Optional cockpit model selected before the ACP worker starts. */
-  cockpit_model?: string;
-  /** Optional cockpit reasoning effort applied after ACP config options load. */
-  cockpit_effort?: string;
+  view?: "structured" | "terminal";
+  /** Optional acp model selected before the ACP worker starts. */
+  agent_model?: string;
+  agent_effort?: string;
+  /** Optional acp reasoning effort applied after ACP config options load. */
+  acp_effort?: string;
   /** Scratch mode: server provisions a fresh directory under
    *  `<app_dir>/scratch/<id>/` and ignores `path` (clients send `""`).
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
@@ -413,9 +427,9 @@ export interface CreateSessionRequest {
   scratch?: boolean;
 }
 
-/** Live cockpit worker lifecycle, mirrored from
- *  `crate::cockpit::supervisor::CockpitWorkerState`. See #1088. */
-export type CockpitWorkerState = "absent" | "resuming" | "running";
+/** Live acp worker lifecycle, mirrored from
+ *  `crate::acp::supervisor::AcpWorkerState`. See #1088. */
+export type AcpWorkerState = "absent" | "resuming" | "running";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //
@@ -458,7 +472,9 @@ export type SettingsValidation =
   | { rule: "range_u64"; min: number; max?: number }
   | { rule: "non_empty_string" }
   | { rule: "memory_limit" }
-  | { rule: "volume_list" };
+  | { rule: "volume_list" }
+  | { rule: "env_list" }
+  | { rule: "port_mapping_list" };
 
 /** One configurable field. The dotted `${section}.${field}` is its stable id. */
 export interface SettingsFieldDescriptor {

@@ -89,6 +89,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
+    /// Whether renaming this session also moves its worktree directory (the
+    /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
+    /// Populated by `list_sessions` from the per-profile config; single-session
+    /// responses leave it `false` and the sidebar reads the list value. #1927.
+    #[serde(default)]
+    pub tie_workdir_to_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -99,23 +105,24 @@ pub struct SessionResponse {
     pub notify_on_waiting: Option<bool>,
     pub notify_on_idle: Option<bool>,
     pub notify_on_error: Option<bool>,
-    /// True when this session uses ACP cockpit rendering instead of a
-    /// tmux-backed PTY. The web dashboard branches on this to pick
-    /// between the cockpit panels and the terminal view.
+    /// How this session is rendered: `structured` (ACP native rendering) or
+    /// `terminal` (tmux-backed PTY). The web dashboard branches on this to
+    /// pick the structured panels vs the terminal view.
     #[cfg(feature = "serve")]
-    pub cockpit_mode: bool,
-    /// Live cockpit worker lifecycle. `absent` for tmux sessions or
-    /// cockpit sessions whose worker has not been spawned/attached
+    #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
+    pub view: crate::session::View,
+    /// Live structured view worker lifecycle. `absent` for tmux sessions or
+    /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
     /// `running` once the supervisor holds a live worker. Drives the
     /// sidebar `Resuming…` chip and the per-session banner in the
-    /// cockpit view. See #1088.
+    /// structured view. See #1088.
     #[cfg(feature = "serve")]
-    pub cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
-    /// True when this session's agent can run in cockpit: a built-in
+    pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+    /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
-    /// declares a valid `agent_cockpit_cmd`. The web terminal view reads
-    /// this to decide whether the "switch to cockpit" affordance is
+    /// declares a valid `agent_acp_cmd`. The web terminal view reads
+    /// this to decide whether the "switch to structured view" affordance is
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
@@ -136,12 +143,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
-    /// cockpit sessions whose agent has emitted a Plan (directly via
+    /// structured view sessions whose agent has emitted a Plan (directly via
     /// ACP `SessionUpdate::Plan` or indirectly via the ExitPlanMode
     /// bridge in `acp_client::map_update_to_events`). See #1061.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_summary: Option<PlanSummary>,
-    /// Absolute RFC3339 timestamp at which the cockpit session's
+    /// Absolute RFC3339 timestamp at which the structured view session's
     /// `ScheduleWakeup` tool will fire (i.e. the next turn is expected
     /// to start). Cleared once a `UserPromptSent` lands after the
     /// scheduling tool call; the /loop skill's self-firing emits that
@@ -194,7 +201,7 @@ impl SessionResponse {
             claude_fullscreen,
             None,
             #[cfg(feature = "serve")]
-            crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            crate::acp::supervisor::AcpWorkerState::Absent,
             None,
             None,
         )
@@ -202,13 +209,12 @@ impl SessionResponse {
 
     /// Build a response with the per-session plan snapshot. Called from
     /// the REST sessions endpoint after a single bulk read of the
-    /// cockpit event store; see #1061.
+    /// structured view event store; see #1061.
     pub fn from_instance_with_plan(
         inst: &Instance,
         claude_fullscreen: bool,
         plan_summary: Option<PlanSummary>,
-        #[cfg(feature = "serve")]
-        cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState,
+        #[cfg(feature = "serve")] acp_worker_state: crate::acp::supervisor::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
     ) -> Self {
@@ -256,6 +262,8 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            // Overlaid per-profile in list_sessions; see the field doc.
+            tie_workdir_to_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -268,9 +276,9 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             #[cfg(feature = "serve")]
-            cockpit_mode: inst.cockpit_mode,
+            view: inst.view,
             #[cfg(feature = "serve")]
-            cockpit_worker_state,
+            acp_worker_state,
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
@@ -278,7 +286,7 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_capable: {
                 let resolved = inst
-                    .cockpit_agent
+                    .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(inst.tool.as_str());
@@ -310,8 +318,8 @@ impl SessionResponse {
 /// Project a stored `Plan` into the lightweight `PlanSummary` shape the
 /// sidebar consumes. Current step is the first non-Done entry; counts
 /// reflect the persisted step state from the agent's last PlanUpdated.
-fn plan_summary_from_plan(plan: crate::cockpit::state::Plan) -> PlanSummary {
-    use crate::cockpit::state::PlanStepStatus;
+fn plan_summary_from_plan(plan: crate::acp::state::Plan) -> PlanSummary {
+    use crate::acp::state::PlanStepStatus;
     let total = plan.steps.len() as u32;
     let completed = plan
         .steps
@@ -354,22 +362,22 @@ pub struct SessionsEnvelope {
 /// `SessionResponse.acp_capable` for built-in agents without allocating
 /// a registry per response row.
 #[cfg(feature = "serve")]
-fn builtin_acp_registry() -> &'static crate::cockpit::AgentRegistry {
-    static REG: std::sync::OnceLock<crate::cockpit::AgentRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(crate::cockpit::AgentRegistry::with_defaults)
+fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
+    static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
-/// True iff this custom agent declares a valid `agent_cockpit_cmd` in the
+/// True iff this custom agent declares a valid `agent_acp_cmd` in the
 /// given profile-resolved map. Built-in capability is handled separately
 /// in the constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
 fn custom_agent_acp_capable(
-    agent_cockpit_cmd: &std::collections::HashMap<String, String>,
+    agent_acp_cmd: &std::collections::HashMap<String, String>,
     tool: &str,
 ) -> bool {
-    agent_cockpit_cmd
+    agent_acp_cmd
         .get(tool)
-        .is_some_and(|cmd| crate::cockpit::AgentSpec::from_cockpit_cmd(tool, cmd).is_ok())
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
 pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
@@ -378,20 +386,20 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
-    let worker_states = state.cockpit_supervisor.worker_states_snapshot().await;
+    let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     let mut sessions: Vec<SessionResponse> = instances
         .iter()
         .map(|inst| {
-            let plan_summary = if inst.cockpit_mode {
+            let plan_summary = if inst.is_structured() {
                 state
-                    .cockpit_event_store
+                    .acp_event_store
                     .latest_plan(&inst.id)
                     .map(plan_summary_from_plan)
             } else {
                 None
             };
-            let (next_wakeup_at, next_wakeup_reason) = if inst.cockpit_mode {
-                match state.cockpit_event_store.latest_pending_wakeup(&inst.id) {
+            let (next_wakeup_at, next_wakeup_reason) = if inst.is_structured() {
+                match state.acp_event_store.latest_pending_wakeup(&inst.id) {
                     Some((at, reason)) => (Some(at.to_rfc3339()), reason),
                     None => (None, None),
                 }
@@ -399,16 +407,16 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 (None, None)
             };
             #[cfg(feature = "serve")]
-            let cockpit_worker_state = worker_states
+            let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
-                .unwrap_or(crate::cockpit::supervisor::CockpitWorkerState::Absent);
+                .unwrap_or(crate::acp::supervisor::AcpWorkerState::Absent);
             SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
                 plan_summary,
                 #[cfg(feature = "serve")]
-                cockpit_worker_state,
+                acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
             )
@@ -417,25 +425,24 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
     // constructor). Cache by (profile, project_path) since repo-local
-    // config can override agent_cockpit_cmd, so each distinct pair is
+    // config can override agent_acp_cmd, so each distinct pair is
     // resolved at most once.
     #[cfg(feature = "serve")]
     {
         use std::collections::HashMap;
-        let mut cockpit_cmd_cache: HashMap<(String, String), HashMap<String, String>> =
-            HashMap::new();
+        let mut acp_cmd_cache: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             if resp.acp_capable {
                 continue;
             }
             let key = (inst.source_profile.clone(), inst.project_path.clone());
-            let map = cockpit_cmd_cache.entry(key).or_insert_with(|| {
+            let map = acp_cmd_cache.entry(key).or_insert_with(|| {
                 crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &inst.source_profile,
                     std::path::Path::new(&inst.project_path),
                 )
                 .session
-                .agent_cockpit_cmd
+                .agent_acp_cmd
             });
             resp.acp_capable = custom_agent_acp_capable(map, &inst.tool);
         }
@@ -472,6 +479,25 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         };
         fresh
     };
+
+    // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
+    // the standalone workdir action for tied worktree sessions. Resolved once
+    // per distinct profile, not per session.
+    {
+        use std::collections::HashMap;
+        let mut tie_cache: HashMap<String, bool> = HashMap::new();
+        for session in &mut sessions {
+            if !session.has_managed_worktree {
+                continue;
+            }
+            let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                    .session
+                    .tie_workdir_to_name
+            });
+            session.tie_workdir_to_name = tied;
+        }
+    }
 
     // Resolve remote owners with a permanent cache on AppState
     {
@@ -687,6 +713,12 @@ pub async fn update_workspace_ordering(
 #[derive(Deserialize)]
 pub struct RenameSessionBody {
     pub title: String,
+    /// When the session is tied (`session.tie_workdir_to_name`) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match
+    /// the new title. Off by default; ignored for untied / non-worktree
+    /// sessions. See #1927.
+    #[serde(default)]
+    pub rename_branch: bool,
 }
 
 fn apply_session_title_rename(inst: &mut Instance, title: String) {
@@ -727,44 +759,160 @@ pub async fn rename_session(
             .into_response();
     }
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
+    // Serialize against other mutations on this session (start, delete,
+    // worktree edit) so the tied git move and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
         )
-            .into_response();
     };
 
-    apply_session_title_rename(inst, title.clone());
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title, so title and dir cannot drift.
+    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
+        .session
+        .tie_workdir_to_name
+        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
+    // What to write to disk + memory once any git side effect has landed.
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
 
-    if let Ok(storage) = Storage::new(&profile) {
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply_session_title_rename(inst, title_clone);
-                }
-                Ok(())
-            })
+    if tied {
+        // The dir move is gated on a quiescent worktree, exactly like the
+        // standalone worktree-name edit. A running session must be stopped
+        // first; the setting is the escape hatch for free-form relabeling.
+        if status.blocks_worktree_edit() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_running",
+                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                })),
+            )
+                .into_response();
+        }
+
+        let wt = worktree_info.expect("tied implies worktree_info is Some");
+        let cur = current_path.clone();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
+        let rename_branch = body.rename_branch;
+        let edit = tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::edit_worktree_workdir(
+                crate::session::worktree_edit::WorktreeEditRequest {
+                    worktree_info: &wt,
+                    current_path: std::path::Path::new(&cur),
+                    new_name: &leaf,
+                    rename_branch,
+                },
+            )
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
         })
-        .await
-        {
-            Ok(Ok(())) => {}
+        .await;
+
+        match edit {
+            Ok(Ok((path, branch))) => {
+                new_path = Some(path);
+                new_branch = branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
             Ok(Err(e)) => {
-                tracing::error!(target: "http.api.sessions", "Failed to save after rename: {e}")
+                tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
+                let (code, msg) = worktree_edit_error_response(&e);
+                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
             }
             Err(e) => {
-                tracing::error!(target: "http.api.sessions", "Rename persist join failed: {e}")
+                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                )
+                    .into_response();
             }
         }
     }
+
+    // Persist BEFORE mutating in-memory state: when a git move has landed, a
+    // silent persist failure would otherwise leave metadata pointing at the
+    // old path after a daemon restart, so it returns 500 rather than a
+    // misleading 200.
+    let persisted = {
+        let storage = Storage::new(&profile);
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        match storage {
+            Ok(storage) => tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        if let Some(path) = new_path_clone.as_deref() {
+                            apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
+                        }
+                        apply_session_title_rename(inst, title_clone);
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = persisted {
+        tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
+        // Persist-first: never fall through to mutate in-memory state on a
+        // failed write, or the rename silently reverts on restart. When a dir
+        // move already landed, say so; otherwise it is a plain title persist.
+        let message = if new_path.is_some() {
+            "Worktree was moved on disk, but persisting the new session metadata failed"
+        } else {
+            "Persisting the renamed session failed"
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+        )
+            .into_response();
+    }
+
+    let mut response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        if let Some(path) = new_path.as_deref() {
+            apply_worktree_name_edit(inst, path, new_branch.as_deref());
+        }
+        apply_session_title_rename(inst, title.clone());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+    // Single-session responses are not run through list_sessions' overlay, so
+    // carry the resolved tie value here too (#1927); otherwise a client that
+    // trusts the mutation response would see a managed worktree claim it is
+    // untied until the next list refresh.
+    response.tie_workdir_to_name = tied;
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -890,6 +1038,23 @@ pub async fn set_worktree_name(
         )
             .into_response();
     };
+    // When tied (#1927), the directory is not edited independently: it follows
+    // the title. Reject the standalone edit so no client can drift the two
+    // apart, pointing callers at the unified rename.
+    if worktree_info.managed_by_aoe
+        && crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "tied",
+                "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
     if status.blocks_worktree_edit() {
         return (
             StatusCode::CONFLICT,
@@ -1398,7 +1563,7 @@ pub async fn update_session_diff_base(
 // shape: read-only 403, in-memory write under `state.instance_lock`,
 // persist via `Storage::update` matching the notifications and diff-base
 // precedent above. Archive additionally tears down the tmux pane and (for
-// cockpit sessions) the supervisor's worker so the row is genuinely
+// structured view sessions) the supervisor's worker so the row is genuinely
 // parked. Mutual-exclusion invariants (e.g. archive clears pin/favorite,
 // pin clears archive+snooze) live in the `Instance` methods, so the
 // handlers never set fields directly. See #1581.
@@ -1532,7 +1697,7 @@ pub async fn update_session_archive(
 
     // Read the profile without mutating memory yet. Persisting first means
     // a storage failure returns 500 with disk and memory still in
-    // agreement, and the tmux/cockpit teardown below never fires on a write
+    // agreement, and the tmux/acp teardown below never fires on a write
     // that did not land. See #1589.
     let profile = {
         let instances = state.instances.read().await;
@@ -1566,7 +1731,7 @@ pub async fn update_session_archive(
     // Disk is durable; apply to memory and snapshot what the side effects
     // need. Clone the instance once so we can call its `kill()` method
     // outside the lock without re-borrowing.
-    let (was_cockpit_mode, inst_clone, kill_pane) = {
+    let (was_structured_view, inst_clone, kill_pane) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             tracing::error!(
@@ -1583,28 +1748,28 @@ pub async fn update_session_archive(
         }
         let response =
             SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-        let cockpit;
+        let structured_view;
         #[cfg(feature = "serve")]
         {
-            cockpit = inst.cockpit_mode;
+            structured_view = inst.is_structured();
         }
         #[cfg(not(feature = "serve"))]
         {
-            cockpit = false;
+            structured_view = false;
         }
         let inst_snap = inst.clone();
         drop(instances);
 
-        // Stash the cockpit flag + clone + response and break out to do
+        // Stash the structured-view flag + clone + response and break out to do
         // the side effects below. Return early on the non-archive path
         // because we have no work left to do; the kill_pane=false case
-        // is NOT a short-circuit because cockpit shutdown still has to
-        // run for cockpit-mode sessions (kill_pane is a tmux-only
+        // is NOT a short-circuit because structured view shutdown still has to
+        // run for structured view-mode sessions (kill_pane is a tmux-only
         // switch, per the request-body documentation).
         if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
-        (cockpit, inst_snap, body.kill_pane)
+        (structured_view, inst_snap, body.kill_pane)
     };
 
     // Best-effort tmux pane teardown for tmux-backed sessions. Mirrors
@@ -1613,8 +1778,8 @@ pub async fn update_session_archive(
     // because the on-disk archived flag is the source of truth. The
     // kill_pane=false body opt-out applies only here, so a caller can
     // archive a tmux session without killing its pane while still
-    // unconditionally stopping a cockpit worker on the other branch.
-    if !was_cockpit_mode {
+    // unconditionally stopping a structured view worker on the other branch.
+    if !was_structured_view {
         if kill_pane {
             let inst_for_kill = inst_clone.clone();
             match tokio::task::spawn_blocking(move || inst_for_kill.kill()).await {
@@ -1630,18 +1795,18 @@ pub async fn update_session_archive(
             }
         }
     } else {
-        // Cockpit sessions: shut down the worker so the supervisor's
+        // Acp sessions: shut down the worker so the supervisor's
         // reconciler does not race to respawn it. The reconciler also
-        // skips archived sessions (see cockpit_reconciler.rs), but
+        // skips archived sessions (see acp_reconciler.rs), but
         // shutting down here gives an immediate teardown rather than
         // waiting for the next poll tick. `shutdown` preserves the
         // agent transcript (no session/delete), so unarchiving resumes
         // the conversation instead of resetting it (#1710).
         #[cfg(feature = "serve")]
-        match state.cockpit_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
-                target: "cockpit.supervisor",
+                target: "acp.supervisor",
                 session = %id,
                 "shutdown during archive failed: {e}"
             ),
@@ -1707,7 +1872,7 @@ pub async fn update_session_snooze(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (was_cockpit_mode, profile) = {
+    let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1716,22 +1881,22 @@ pub async fn update_session_snooze(
             )
                 .into_response();
         };
-        let cockpit;
+        let structured_view;
         #[cfg(feature = "serve")]
         {
-            cockpit = inst.cockpit_mode;
+            structured_view = inst.is_structured();
         }
         #[cfg(not(feature = "serve"))]
         {
-            cockpit = false;
+            structured_view = false;
         }
-        (cockpit, inst.source_profile.clone())
+        (structured_view, inst.source_profile.clone())
     };
 
     let minutes = body.minutes;
 
     // Persist first; only mutate memory once disk is durable, and only fire
-    // the cockpit teardown below on a write that landed. See #1589.
+    // the structured view teardown below on a write that landed. See #1589.
     let persist_id = id.clone();
     if persist_session_update(profile, "snooze update", move |instances| {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
@@ -1763,9 +1928,9 @@ pub async fn update_session_snooze(
         }
     }
 
-    // For cockpit-mode sessions, snoozing tears down the worker the
+    // For structured view-mode sessions, snoozing tears down the worker the
     // same way archive does. Snooze is a "temporary archive" in the
-    // data model and the cockpit worker (claude-agent-acp subprocess)
+    // data model and the structured view worker (claude-agent-acp subprocess)
     // is heavy enough that keeping it idle while the row is sunk is a
     // resource hog. The reconciler skips snoozed sessions, so the
     // worker stays down until the snooze expires; the next reconciler
@@ -1775,18 +1940,18 @@ pub async fn update_session_snooze(
     // that respawn resumes the conversation instead of resetting it
     // (#1710).
     #[cfg(feature = "serve")]
-    if was_cockpit_mode && minutes.is_some() {
-        match state.cockpit_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+    if was_structured_view && minutes.is_some() {
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
-                target: "cockpit.supervisor",
+                target: "acp.supervisor",
                 session = %id,
                 "shutdown during snooze failed: {e}"
             ),
         }
     }
     #[cfg(not(feature = "serve"))]
-    let _ = was_cockpit_mode;
+    let _ = was_structured_view;
 
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -1866,20 +2031,20 @@ pub async fn delete_session(
         }
     }
 
-    // Tear down the cockpit worker FIRST so the ACP subprocess + its
+    // Tear down the structured view worker FIRST so the ACP subprocess + its
     // claude-agent-acp child don't leak past the session delete. The
     // supervisor's shutdown is best-effort: sessions without a worker
-    // (tmux-mode, or cockpit sessions whose worker never spawned)
+    // (tmux-mode, or structured view sessions whose worker never spawned)
     // return UnknownSession, which we ignore.
     #[cfg(feature = "serve")]
-    if instance.cockpit_mode {
+    if instance.is_structured() {
         // Permanent removal: release the agent's persisted transcript
         // too, since the session is going away for good. See #1710.
-        match state.cockpit_supervisor.shutdown_and_delete(&id).await {
-            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+        match state.acp_supervisor.shutdown_and_delete(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => {
                 tracing::warn!(
-                    target: "cockpit.supervisor",
+                    target: "acp.supervisor",
                     session = %id,
                     "shutdown during delete failed: {e}"
                 );
@@ -1888,12 +2053,12 @@ pub async fn delete_session(
         // Drop the per-session seq counter so a recreated session
         // with the same id (rare, but possible) starts cleanly from
         // seq=1.
-        state.cockpit_supervisor.forget_session(&id);
+        state.acp_supervisor.forget_session(&id);
         // On-disk history is the durable mirror; without this purge a
         // recreated session with the same id would inherit the deleted
         // session's transcript and the seq=1 first publish would
         // collide with a row already in the store.
-        state.cockpit_event_store.delete_session(&id);
+        state.acp_event_store.delete_session(&id);
     }
 
     // Run deletion on a blocking thread (may do git/docker/tmux operations)
@@ -2058,25 +2223,24 @@ pub struct CreateSessionBody {
     #[serde(default)]
     pub custom_instruction: Option<String>,
     pub profile: Option<String>,
-    /// Whether the new session should run in cockpit mode. The
-    /// bundled wizard always sends an explicit value (true for ACP-
-    /// capable tools when the master switch is on, false otherwise);
-    /// other API callers may omit the field, in which case it
-    /// defaults to false. Either way the value is re-gated by the
-    /// master switch below before being persisted, so a tampered
-    /// request can't escalate cockpit on past the master switch.
+    /// How the new session should render: `structured` or `terminal`. The
+    /// bundled wizard sends an explicit value (`structured` for ACP-capable
+    /// tools, `terminal` otherwise); other API callers may omit it, in which
+    /// case it defaults to `terminal`. The value is re-validated against real
+    /// ACP capability below before being persisted, so a tampered request
+    /// can't force the structured view on a non-ACP tool.
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_mode: bool,
+    pub view: crate::session::View,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_agent: Option<String>,
+    pub agent_name: Option<String>,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_model: Option<String>,
+    pub agent_model: Option<String>,
     #[cfg(feature = "serve")]
     #[serde(default)]
-    pub cockpit_effort: Option<String>,
+    pub agent_effort: Option<String>,
     /// Scratch session: server provisions a fresh directory under
     /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
     /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
@@ -2291,14 +2455,6 @@ pub async fn create_session(
         .collect();
     drop(instances);
 
-    // Snapshot the master-kill flag before moving into spawn_blocking
-    // so the post-spawn write path (which still needs `state`) keeps
-    // its handle.
-    #[cfg(feature = "serve")]
-    let cockpit_master_enabled = state
-        .cockpit_master_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
-
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
@@ -2375,15 +2531,15 @@ pub async fn create_session(
             }
         }
 
-        // Apply cockpit fields from the request body. cockpit_mode is
-        // silently downgraded to tmux when the master switch is off
-        // (`cockpit.enabled = false` in config.toml).
+        // Apply structured-view fields from the request body. structured_view is
+        // re-validated below against real ACP capability; non-ACP tools
+        // fall back to terminal view rather than erroring at spawn time.
         #[cfg(feature = "serve")]
-        let cockpit_effort = {
-            instance.cockpit_mode = body.cockpit_mode && cockpit_master_enabled;
-            instance.cockpit_agent = body.cockpit_agent;
-            let cockpit_agent_key = instance
-                .cockpit_agent
+        let agent_effort = {
+            instance.view = body.view;
+            instance.agent_name = body.agent_name;
+            let agent_key = instance
+                .agent_name
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(instance.tool.as_str())
@@ -2392,25 +2548,23 @@ pub async fn create_session(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
-            let defaults = resolved_config
-                .session
-                .cockpit_defaults_for(&cockpit_agent_key);
-            instance.cockpit_model = body
-                .cockpit_model
+            let defaults = resolved_config.session.acp_defaults_for(&agent_key);
+            instance.agent_model = body
+                .agent_model
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.model.clone()));
-            let mut cockpit_effort = body
-                .cockpit_effort
+            let mut agent_effort = body
+                .agent_effort
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.effort.clone()));
             // Don't trust the client's capability decision. Re-resolve
-            // whether this agent can actually run in cockpit; a custom
-            // agent without an `agent_cockpit_cmd` (or any non-ACP tool)
+            // whether this agent can actually run in structured view; a custom
+            // agent without an `agent_acp_cmd` (or any non-ACP tool)
             // falls back to tmux here rather than erroring at spawn time.
-            if instance.cockpit_mode {
-                let acp_registry = crate::cockpit::AgentRegistry::with_defaults();
+            if instance.is_structured() {
+                let acp_registry = crate::acp::AgentRegistry::with_defaults();
                 let resolved = instance
-                    .cockpit_agent
+                    .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
@@ -2420,19 +2574,23 @@ pub async fn create_session(
                         std::path::Path::new(&instance.project_path),
                     )
                     .session
-                    .agent_cockpit_cmd
+                    .agent_acp_cmd
                     .get(&instance.tool)
                     .is_some_and(|cmd| {
-                        crate::cockpit::AgentSpec::from_cockpit_cmd(&instance.tool, cmd).is_ok()
+                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
                     });
-                instance.cockpit_mode = capable;
+                instance.view = if capable {
+                    crate::session::View::Structured
+                } else {
+                    crate::session::View::Terminal
+                };
             }
 
-            if !instance.cockpit_mode {
-                cockpit_effort = None;
+            if !instance.is_structured() {
+                agent_effort = None;
             }
 
-            cockpit_effort
+            agent_effort
         };
 
         // Anything that fails between here and the final `Ok(..)`
@@ -2450,12 +2608,12 @@ pub async fn create_session(
                 Ok(())
             })?;
 
-            // Cockpit-mode sessions are not backed by tmux; the cockpit
+            // Acp-mode sessions are not backed by tmux; the structured view
             // supervisor spawns the ACP agent on demand. Skip the tmux
             // `start()` to avoid creating an empty pane that no one will
             // attach to.
             #[cfg(feature = "serve")]
-            let skip_tmux_start = instance.cockpit_mode;
+            let skip_tmux_start = instance.is_structured();
             #[cfg(not(feature = "serve"))]
             let skip_tmux_start = false;
             if !skip_tmux_start {
@@ -2489,7 +2647,7 @@ pub async fn create_session(
         return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
-            cockpit_effort,
+            agent_effort,
         ));
 
         #[cfg(not(feature = "serve"))]
@@ -2499,30 +2657,40 @@ pub async fn create_session(
 
     match result {
         #[cfg(feature = "serve")]
-        Ok(Ok((instance, warnings, cockpit_effort))) => {
+        Ok(Ok((instance, warnings, agent_effort))) => {
             let mut resp = SessionResponse::from_instance(
                 &instance,
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
             if !resp.acp_capable {
-                let cockpit_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
                     std::path::Path::new(&instance.project_path),
                 )
                 .session
-                .agent_cockpit_cmd;
-                resp.acp_capable = custom_agent_acp_capable(&cockpit_cmd, &instance.tool);
+                .agent_acp_cmd;
+                resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
             }
-            let cockpit_spawn_target = if instance.cockpit_mode {
+            let acp_spawn_target = if instance.is_structured() {
                 Some((
                     instance.id.clone(),
                     instance.tool.clone(),
-                    instance.cockpit_agent.clone(),
-                    instance.cockpit_model.clone(),
-                    cockpit_effort,
+                    instance.agent_name.clone(),
+                    instance.agent_model.clone(),
+                    agent_effort,
                     instance.project_path.clone(),
-                    instance.cockpit_acp_session_id.clone(),
+                    instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.command.clone(),
@@ -2552,10 +2720,10 @@ pub async fn create_session(
                 source_profile,
                 yolo_mode,
                 command,
-            )) = cockpit_spawn_target
+            )) = acp_spawn_target
             {
                 let agent = state
-                    .cockpit_supervisor
+                    .acp_supervisor
                     .pick_agent_for_tool(
                         &tool,
                         agent_override.as_deref(),
@@ -2564,13 +2732,13 @@ pub async fn create_session(
                     )
                     .await;
                 let command_override =
-                    crate::server::cockpit_reconciler::command_override_for_spawn(&tool, &command);
+                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
-                let supervisor = state.cockpit_supervisor.clone();
+                let supervisor = state.acp_supervisor.clone();
                 let state_for_check = state.clone();
                 tokio::spawn(async move {
                     let inst_lock = state_for_check.instance_lock(&id).await;
-                    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+                    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
                         &state_for_check.instances,
                         &inst_lock,
                         &id,
@@ -2582,7 +2750,7 @@ pub async fn create_session(
                         Err(e) => {
                             let message = format!("sandbox container ensure failed: {e}");
                             tracing::warn!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create failed: {message}"
                             );
@@ -2592,7 +2760,7 @@ pub async fn create_session(
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
                     if let Err(e) = supervisor
-                        .spawn(crate::cockpit::supervisor::SpawnRequest {
+                        .spawn(crate::acp::supervisor::SpawnRequest {
                             session_id: id.clone(),
                             agent: agent.clone(),
                             cwd,
@@ -2614,17 +2782,18 @@ pub async fn create_session(
                             .await
                             .iter()
                             .any(|i| i.id == id);
-                        let message = format!("Failed to start cockpit agent {agent:?}: {e}");
+                        let message =
+                            format!("Failed to start structured view agent {agent:?}: {e}");
                         if still_present {
                             tracing::warn!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create failed: {message}"
                             );
                             supervisor.publish_startup_error(&id, message);
                         } else {
                             tracing::debug!(
-                                target: "cockpit.supervisor",
+                                target: "acp.supervisor",
                                 session = %id,
                                 "auto-spawn after create error after session removed (ignored): {message}"
                             );
@@ -3169,37 +3338,30 @@ pub struct RichDiffFilesResponse {
     pub warning: Option<String>,
 }
 
+/// Contents-based diff response: raw old/new text that the web client parses
+/// and renders itself via `@pierre/diffs`. See [`MAX_CONTENTS_BYTES`].
 #[derive(Serialize)]
-pub struct RichDiffLine {
-    #[serde(rename = "type")]
-    pub change_type: String,
-    pub old_line_num: Option<usize>,
-    pub new_line_num: Option<usize>,
-    pub content: String,
-}
-
-#[derive(Serialize)]
-pub struct RichDiffHunk {
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
-    pub lines: Vec<RichDiffLine>,
-}
-
-#[derive(Serialize)]
-pub struct RichFileDiffResponse {
+pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
-    pub hunks: Vec<RichDiffHunk>,
+    pub old_content: String,
+    pub new_content: String,
+    /// Server-computed unified diff of old → new. The client parses this as
+    /// text (`parsePatchFiles`) instead of re-diffing the contents, which
+    /// would block the main thread on large files. Empty for binary files.
+    pub patch: String,
     pub is_binary: bool,
-    /// True if the file was too large to diff and hunks were omitted.
+    /// True if the file was too large to send inline; contents are omitted.
     pub truncated: bool,
 }
 
-/// Max combined bytes of old+new content before we bail on diffing.
-const MAX_DIFF_BYTES: usize = 2_000_000;
-/// Max combined line count of old+new before we bail on diffing.
-const MAX_DIFF_LINES: usize = 40_000;
+/// Caps for the contents-based diff endpoint. The client renders with a
+/// virtualized, off-main-thread highlighter (`@pierre/diffs`), so the DOM and
+/// main thread are no longer the bottleneck; the only real cost is JSON
+/// payload size and the client-side parse. The byte cap is the real guard
+/// against pathological payloads (minified bundles, generated code, data
+/// blobs); the line cap is a secondary backstop.
+const MAX_CONTENTS_BYTES: usize = 5_000_000;
+const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
 ///
@@ -3277,6 +3439,10 @@ struct DiffContext {
     /// CLI, or the TUI diff view's `b` keybind). Wins over the
     /// profile-level default and the auto-detected ref. See #970.
     base_branch_override: Option<String>,
+    /// The branch the worktree was created from, recorded at creation
+    /// time. Slots below the explicit override but above the profile
+    /// default and auto-detection. See #1951.
+    base_from_worktree: Option<String>,
 }
 
 /// Expand a session into the list of repos whose diffs the sidebar
@@ -3313,18 +3479,27 @@ async fn resolve_diff_repos(
     Ok(DiffContext {
         repos,
         base_branch_override: inst.base_branch_override.clone(),
+        base_from_worktree: inst
+            .worktree_info
+            .as_ref()
+            .and_then(|w| w.base_branch.clone()),
     })
 }
 
 /// Resolve the diff base for one repo path. Override (per-session)
-/// wins over the profile's `DiffConfig.default_branch`, which wins
-/// over auto-detection (`get_default_base_ref`). See #970.
+/// wins over the worktree's recorded base, which wins over the
+/// profile's `DiffConfig.default_branch`, which wins over
+/// auto-detection (`get_default_base_ref`). See #970, #1951.
 fn resolve_diff_base(
     override_value: Option<&str>,
+    worktree_base: Option<&str>,
     config_default: Option<&str>,
     repo_path: &std::path::Path,
 ) -> String {
     if let Some(v) = override_value.map(str::trim).filter(|v| !v.is_empty()) {
+        return v.to_string();
+    }
+    if let Some(v) = worktree_base.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
     if let Some(v) = config_default.map(str::trim).filter(|v| !v.is_empty()) {
@@ -3357,6 +3532,7 @@ pub async fn session_diff_files(
             let path = std::path::Path::new(&repo.path);
             let base_branch = resolve_diff_base(
                 ctx.base_branch_override.as_deref(),
+                ctx.base_from_worktree.as_deref(),
                 config_default.as_deref(),
                 path,
             );
@@ -3470,11 +3646,11 @@ pub async fn session_diff_file(
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
     let base_branch_override = ctx.base_branch_override.clone();
+    let base_from_worktree = ctx.base_from_worktree.clone();
 
     let result =
-        tokio::task::spawn_blocking(move || -> Result<RichFileDiffResponse, DiffFileError> {
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
             use crate::git::diff;
-            use similar::ChangeTag;
 
             let repo_path = std::path::Path::new(&project_path);
             let file_path = std::path::Path::new(&query.path);
@@ -3485,6 +3661,7 @@ pub async fn session_diff_file(
                 .clone();
             let base_branch = resolve_diff_base(
                 base_branch_override.as_deref(),
+                base_from_worktree.as_deref(),
                 config_default.as_deref(),
                 repo_path,
             );
@@ -3505,79 +3682,59 @@ pub async fn session_diff_file(
                 }
             }
 
-            let file_diff = diff::compute_file_diff(repo_path, file_path, &base_branch, 3)
+            // Hand the client raw old/new text plus a server-computed unified
+            // patch. `@pierre/diffs` parses and renders that patch client-side
+            // (virtualized, off-main-thread highlighting) without re-running
+            // the diff algorithm in the browser.
+            let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-
+            // additions/deletions aren't computed on this path; reuse the counts
+            // the changed-files scan already produced for the sidebar.
+            let (additions, deletions) = changed_files
+                .iter()
+                .find(|f| f.path == *file_path)
+                .map(|f| (f.additions, f.deletions))
+                .unwrap_or((0, 0));
             let file = RichDiffFileInfo {
-                path: file_diff.file.path.to_string_lossy().to_string(),
-                old_path: file_diff
-                    .file
-                    .old_path
-                    .map(|p| p.to_string_lossy().to_string()),
-                status: file_diff.file.status.label().to_string(),
-                additions: file_diff.file.additions,
-                deletions: file_diff.file.deletions,
+                path: contents.path.to_string_lossy().to_string(),
+                old_path: contents.old_path.map(|p| p.to_string_lossy().to_string()),
+                status: contents.status.label().to_string(),
+                additions,
+                deletions,
                 repo_name: selected_repo_name.clone(),
             };
-
-            // Size cap: avoid OOM'ing the browser on huge files (minified bundles,
-            // generated code, data blobs that slipped past .gitignore).
-            let total_line_count: usize = file_diff.hunks.iter().map(|h| h.lines.len()).sum();
-            let total_bytes: usize = file_diff
-                .hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .map(|l| l.content.len())
-                .sum();
-            if total_line_count > MAX_DIFF_LINES || total_bytes > MAX_DIFF_BYTES {
-                return Ok(RichFileDiffResponse {
+            let total_bytes =
+                contents.old_content.len() + contents.new_content.len() + contents.patch.len();
+            let total_lines =
+                contents.old_content.lines().count() + contents.new_content.lines().count();
+            let resp = if total_bytes > MAX_CONTENTS_BYTES || total_lines > MAX_CONTENTS_LINES {
+                RichFileContentsResponse {
                     file,
-                    hunks: Vec::new(),
-                    is_binary: file_diff.is_binary,
+                    old_content: String::new(),
+                    new_content: String::new(),
+                    patch: String::new(),
+                    is_binary: contents.is_binary,
                     truncated: true,
-                });
-            }
-
-            let hunks: Vec<RichDiffHunk> = file_diff
-                .hunks
-                .into_iter()
-                .map(|h| RichDiffHunk {
-                    old_start: h.old_start,
-                    old_lines: h.old_lines,
-                    new_start: h.new_start,
-                    new_lines: h.new_lines,
-                    lines: h
-                        .lines
-                        .into_iter()
-                        .map(|l| RichDiffLine {
-                            change_type: match l.tag {
-                                ChangeTag::Insert => "add".to_string(),
-                                ChangeTag::Delete => "delete".to_string(),
-                                ChangeTag::Equal => "equal".to_string(),
-                            },
-                            old_line_num: l.old_line_num,
-                            new_line_num: l.new_line_num,
-                            content: l.content,
-                        })
-                        .collect(),
-                })
-                .collect();
-
-            Ok(RichFileDiffResponse {
-                file,
-                hunks,
-                is_binary: file_diff.is_binary,
-                truncated: false,
-            })
+                }
+            } else {
+                RichFileContentsResponse {
+                    file,
+                    old_content: contents.old_content,
+                    new_content: contents.new_content,
+                    patch: contents.patch,
+                    is_binary: contents.is_binary,
+                    truncated: false,
+                }
+            };
+            Ok(
+                serde_json::to_value(resp)
+                    .expect("RichFileContentsResponse is always serializable"),
+            )
         })
         .await;
 
     match result {
-        Ok(Ok(resp)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(resp).expect("RichFileDiffResponse is always serializable")),
-        )
-            .into_response(),
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
         Ok(Err(DiffFileError::BadRequest(msg))) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "bad_request", "message": msg})),
@@ -3808,26 +3965,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_diff_base_prefers_override_then_config_then_auto() {
+    fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
         let tmp = tempfile::tempdir().unwrap();
         // Override wins over everything.
         assert_eq!(
-            resolve_diff_base(Some("release-1.2"), Some("develop"), tmp.path()),
+            resolve_diff_base(Some("release-1.2"), None, Some("develop"), tmp.path()),
             "release-1.2"
         );
-        // Config wins when no override; empty / whitespace override falls
-        // through to the next layer.
+        // Worktree base wins after override; whitespace override falls through.
         assert_eq!(
-            resolve_diff_base(Some("   "), Some("develop"), tmp.path()),
+            resolve_diff_base(
+                Some("   "),
+                Some("worktree-base"),
+                Some("develop"),
+                tmp.path()
+            ),
+            "worktree-base"
+        );
+        // Config wins when no override and no worktree base.
+        assert_eq!(
+            resolve_diff_base(None, None, Some("develop"), tmp.path()),
             "develop"
         );
-        assert_eq!(
-            resolve_diff_base(None, Some("develop"), tmp.path()),
-            "develop"
-        );
-        // Auto-detect when neither is set. The tmp dir is not a repo so
+        // Auto-detect when nothing is set. The tmp dir is not a repo so
         // `get_default_base_ref` returns Err -> "main" fallback.
-        assert_eq!(resolve_diff_base(None, None, tmp.path()), "main");
+        assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
     }
 
     #[test]
@@ -4127,13 +4289,13 @@ mod tests {
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
-            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+            config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             temp_home.join(crate::session::APP_DIR_NAME_OTHER)
         }
@@ -4457,9 +4619,9 @@ mod tests {
     fn step(
         id: &str,
         title: &str,
-        status: crate::cockpit::state::PlanStepStatus,
-    ) -> crate::cockpit::state::PlanStep {
-        crate::cockpit::state::PlanStep {
+        status: crate::acp::state::PlanStepStatus,
+    ) -> crate::acp::state::PlanStep {
+        crate::acp::state::PlanStep {
             id: id.into(),
             title: title.into(),
             detail: None,
@@ -4469,8 +4631,8 @@ mod tests {
 
     #[test]
     fn plan_summary_counts_done_steps_only() {
-        use crate::cockpit::state::PlanStepStatus::*;
-        let plan = crate::cockpit::state::Plan {
+        use crate::acp::state::PlanStepStatus::*;
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![
@@ -4488,10 +4650,10 @@ mod tests {
 
     #[test]
     fn plan_summary_current_step_skips_done_picks_first_non_done() {
-        use crate::cockpit::state::PlanStepStatus::*;
+        use crate::acp::state::PlanStepStatus::*;
         // First non-Done is the first Pending; InProgress later doesn't
         // override (matches the helper's `find(..)` semantics).
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![
@@ -4506,8 +4668,8 @@ mod tests {
 
     #[test]
     fn plan_summary_none_when_all_done() {
-        use crate::cockpit::state::PlanStepStatus::*;
-        let plan = crate::cockpit::state::Plan {
+        use crate::acp::state::PlanStepStatus::*;
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![step("a", "alpha", Done), step("b", "beta", Done)],
@@ -4520,9 +4682,9 @@ mod tests {
 
     #[test]
     fn plan_summary_truncates_long_current_step_title() {
-        use crate::cockpit::state::PlanStepStatus::*;
+        use crate::acp::state::PlanStepStatus::*;
         let long_title: String = "x".repeat(120);
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![step("a", &long_title, Pending)],
@@ -4535,7 +4697,7 @@ mod tests {
 
     #[test]
     fn plan_summary_empty_steps_yields_zero_total() {
-        let plan = crate::cockpit::state::Plan {
+        let plan = crate::acp::state::Plan {
             plan_id: "p1".into(),
             version: 1,
             steps: vec![],
@@ -4692,7 +4854,7 @@ fn default_revive() -> bool {
 enum SendKeysError {
     NotRunning,
     Transient(Status),
-    CockpitMode,
+    StructuredView,
     Tmux(anyhow::Error),
 }
 
@@ -4768,7 +4930,7 @@ pub async fn send_message(
                 Err(e) => {
                     let mapped = match e {
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
-                        EnsureReadyError::CockpitMode => SendKeysError::CockpitMode,
+                        EnsureReadyError::StructuredView => SendKeysError::StructuredView,
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
                     // ensure_pane_ready did not mutate user-visible
@@ -4780,7 +4942,7 @@ pub async fn send_message(
                     // post-cascade (Tier-2 bail: mutations committed).
                     // The Tmux outer arm syncs unconditionally and
                     // covers both shapes; the others (Transient /
-                    // CockpitMode) bail before any mutation.
+                    // StructuredView) bail before any mutation.
                     return Err(Box::new((
                         inst_owned,
                         EnsureReadyOutcome::AlreadyAlive,
@@ -4904,9 +5066,9 @@ pub async fn send_message(
                     })),
                 )
                     .into_response(),
-                SendKeysError::CockpitMode => (
+                SendKeysError::StructuredView => (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
+                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
                 )
                     .into_response(),
                 SendKeysError::Tmux(e) => {
@@ -5057,7 +5219,7 @@ mod workspace_ordering_tests {
 
     fn setup_test_home(temp: &std::path::Path) {
         std::env::set_var("HOME", temp);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
     }
 
@@ -5081,6 +5243,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            tie_workdir_to_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {
@@ -5093,9 +5256,9 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             #[cfg(feature = "serve")]
-            cockpit_mode: false,
+            view: crate::session::View::Terminal,
             #[cfg(feature = "serve")]
-            cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             #[cfg(feature = "serve")]
             acp_capable: false,
             claude_fullscreen: false,

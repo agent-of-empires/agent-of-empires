@@ -51,18 +51,14 @@ describe("SnoozeModal preset buttons", () => {
 describe("SnoozeModal dismissal", () => {
   it("Cancel button calls onCancel", () => {
     const onCancel = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />,
-    );
+    render(<SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />);
     fireEvent.click(screen.getByTestId("snooze-modal-cancel"));
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
   it("Escape dismisses the modal", () => {
     const onCancel = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />,
-    );
+    render(<SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />);
     // Modal's useEffect attaches keydown to document, so the event
     // needs to bubble there. document.body is the typical bubble
     // source under jsdom.
@@ -74,18 +70,14 @@ describe("SnoozeModal dismissal", () => {
 
   it("backdrop click dismisses the modal", () => {
     const onCancel = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />,
-    );
+    render(<SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />);
     fireEvent.click(screen.getByTestId("snooze-modal-backdrop"));
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
   it("inside-modal click does NOT dismiss", () => {
     const onCancel = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />,
-    );
+    render(<SnoozeModal title="t" onCancel={onCancel} onPick={() => {}} />);
     fireEvent.click(screen.getByTestId("snooze-modal"));
     expect(onCancel).not.toHaveBeenCalled();
   });
@@ -94,9 +86,7 @@ describe("SnoozeModal dismissal", () => {
 describe("SnoozeModal custom duration", () => {
   it("converts hours by default and fires onPick with minutes", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "3" },
     });
@@ -106,9 +96,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("respects the unit selector for minutes", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "45" },
     });
@@ -121,9 +109,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("converts days correctly", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "2" },
     });
@@ -136,9 +122,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("converts weeks correctly", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "1" },
     });
@@ -151,9 +135,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("rejects 0 and surfaces an inline error", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "0" },
     });
@@ -164,9 +146,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("rejects > 30 days and surfaces an inline error", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-custom-value"), {
       target: { value: "5" },
     });
@@ -180,9 +160,7 @@ describe("SnoozeModal custom duration", () => {
 
   it("submits on Enter", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     const input = screen.getByTestId("snooze-modal-custom-value");
     fireEvent.change(input, { target: { value: "2" } });
     fireEvent.keyDown(input, { key: "Enter" });
@@ -201,9 +179,7 @@ describe("SnoozeModal datetime-local 'until' path", () => {
 
   it("converts a future datetime to minutes-from-now and fires onPick", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     // datetime-local values are wall-clock in the user's timezone.
     // jsdom inherits the host TZ, so use a date 5 days out to make
     // the test robust against any reasonable TZ offset; the bound
@@ -222,9 +198,7 @@ describe("SnoozeModal datetime-local 'until' path", () => {
 
   it("rejects an empty datetime input", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.click(screen.getByTestId("snooze-modal-until-submit"));
     expect(onPick).not.toHaveBeenCalled();
     expect(screen.queryByTestId("snooze-modal-until-error")).not.toBeNull();
@@ -232,9 +206,7 @@ describe("SnoozeModal datetime-local 'until' path", () => {
 
   it("rejects a datetime in the past", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-until-value"), {
       target: { value: "2026-05-01T12:00" },
     });
@@ -245,9 +217,7 @@ describe("SnoozeModal datetime-local 'until' path", () => {
 
   it("rejects a datetime more than 30 days from now", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="t" onCancel={() => {}} onPick={onPick} />);
     fireEvent.change(screen.getByTestId("snooze-modal-until-value"), {
       target: { value: "2099-01-01T00:00" },
     });

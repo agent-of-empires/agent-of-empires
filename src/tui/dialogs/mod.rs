@@ -8,7 +8,6 @@ mod custom_instruction;
 mod delete_options;
 mod group_delete_options;
 mod group_picker;
-mod hook_trust;
 mod hooks_install;
 mod info;
 mod intro;
@@ -18,6 +17,7 @@ mod profile_picker;
 mod project_session_picker;
 mod projects;
 mod rename;
+mod repo_trust;
 mod restart;
 mod send_message;
 #[cfg(feature = "serve")]
@@ -39,7 +39,6 @@ pub use custom_instruction::CustomInstructionDialog;
 pub use delete_options::{DeleteDialogConfig, DeleteOptions, UnifiedDeleteDialog};
 pub use group_delete_options::{GroupDeleteOptions, GroupDeleteOptionsDialog};
 pub use group_picker::GroupPickerDialog;
-pub use hook_trust::{HookTrustAction, HookTrustDialog};
 pub use hooks_install::HooksInstallDialog;
 pub use info::InfoDialog;
 pub use intro::{IntroDialog, IntroOutcome};
@@ -50,6 +49,7 @@ pub use profile_picker::{ProfileEntry, ProfilePickerAction, ProfilePickerDialog}
 pub use project_session_picker::ProjectSessionPickerDialog;
 pub use projects::ProjectsDialog;
 pub use rename::{RenameData, RenameDialog, RenameMode};
+pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
 #[cfg(feature = "serve")]

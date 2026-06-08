@@ -23,10 +23,16 @@ export function DeleteSessionDialog({
   onConfirm,
   onCancel,
 }: Props) {
-  const [deleteWorktree, setDeleteWorktree] = useState(hasManagedWorktree && cleanupDefaults.delete_worktree);
+  const [deleteWorktree, setDeleteWorktree] = useState(
+    hasManagedWorktree && cleanupDefaults.delete_worktree,
+  );
   const [forceDelete, setForceDelete] = useState(false);
-  const [deleteBranch, setDeleteBranch] = useState(hasManagedWorktree && cleanupDefaults.delete_branch);
-  const [deleteSandbox, setDeleteSandbox] = useState(isSandboxed && cleanupDefaults.delete_sandbox);
+  const [deleteBranch, setDeleteBranch] = useState(
+    hasManagedWorktree && cleanupDefaults.delete_branch,
+  );
+  const [deleteSandbox, setDeleteSandbox] = useState(
+    isSandboxed && cleanupDefaults.delete_sandbox,
+  );
   // Scratch sessions default to remove. The user opts in to keep when they
   // realize mid-delete they want to rescue the files.
   const [keepScratch, setKeepScratch] = useState(false);
@@ -49,7 +55,15 @@ export function DeleteSessionDialog({
     } catch {
       setDeleting(false);
     }
-  }, [onConfirm, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
+  }, [
+    onConfirm,
+    deleteWorktree,
+    deleteBranch,
+    deleteSandbox,
+    forceDelete,
+    isScratch,
+    keepScratch,
+  ]);
 
   // Capture the previously focused element on mount and restore focus on
   // unmount so keyboard users return to the trigger (the sidebar row /
@@ -78,8 +92,7 @@ export function DeleteSessionDialog({
         const target = e.target as HTMLElement | null;
         if (target) {
           const tag = target.tagName;
-          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON")
-            return;
+          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON") return;
         }
         if (deleting) return;
         e.preventDefault();
@@ -128,7 +141,11 @@ export function DeleteSessionDialog({
                     checked={deleteWorktree}
                     onChange={setDeleteWorktree}
                     label="Delete worktree"
-                    detail={branchName ? `Removes worktree for branch "${branchName}"` : undefined}
+                    detail={
+                      branchName
+                        ? `Removes worktree for branch "${branchName}"`
+                        : undefined
+                    }
                     testId="delete-session-checkbox-worktree"
                   />
                   {deleteWorktree && (
@@ -146,7 +163,9 @@ export function DeleteSessionDialog({
                     checked={deleteBranch}
                     onChange={setDeleteBranch}
                     label="Delete branch"
-                    detail={branchName ? `Removes branch "${branchName}"` : undefined}
+                    detail={
+                      branchName ? `Removes branch "${branchName}"` : undefined
+                    }
                     testId="delete-session-checkbox-branch"
                   />
                 </>
@@ -190,8 +209,20 @@ export function DeleteSessionDialog({
           >
             {deleting && (
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  fill="none"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                />
               </svg>
             )}
             {deleting ? "Deleting..." : "Delete"}
@@ -246,7 +277,13 @@ function Checkbox({
       >
         {checked && (
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M2 5L4 7L8 3" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            <path
+              d="M2 5L4 7L8 3"
+              stroke="white"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           </svg>
         )}
       </span>
@@ -254,9 +291,7 @@ function Checkbox({
         <span className="text-[13px] text-text-secondary group-hover:text-text-primary transition-colors">
           {label}
         </span>
-        {detail && (
-          <span className="text-[12px] text-text-dim">{detail}</span>
-        )}
+        {detail && <span className="text-[12px] text-text-dim">{detail}</span>}
       </span>
     </label>
   );

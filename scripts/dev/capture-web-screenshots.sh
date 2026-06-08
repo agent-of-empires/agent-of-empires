@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Regenerate the web dashboard and cockpit documentation screenshots.
+# Regenerate the web dashboard and structured-view documentation screenshots.
 #
 # Drives a seeded `aoe serve` (and a scripted fake ACP agent for the
-# cockpit shots) through the live Playwright harness and writes hero PNGs
-# into docs/assets/web/ and docs/assets/cockpit/. See
+# structured-view shots) through the live Playwright harness and writes hero PNGs
+# into docs/assets/web/ and docs/assets/structured-view/. See
 # docs/assets/web/README.md for the maintenance contract.
 #
 # Usage:

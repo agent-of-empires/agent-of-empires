@@ -43,7 +43,7 @@ aoe add --cmd-override <CMD_OVERRIDE>
 
 A configured override also applies to plain `aoe add --cmd <agent>` (without `--cmd-override`): the agent name
 resolves through `agent_command_override` just as it does in the TUI. This means the override is honored consistently
-whether the session is started from the TUI, a tmux CLI session, or a `--cockpit` session. The on-PATH check that
+whether the session is started from the TUI, a terminal CLI session, or an structured-view session. The on-PATH check that
 `aoe add` runs before creating the session verifies the resolved override binary, so a session works even when only the
 wrapper (for example `opencode-plannotator`) is installed and the bare agent binary (`opencode`) is not.
 
@@ -51,13 +51,13 @@ wrapper (for example `opencode-plannotator`) is installed and the bare agent bin
 
 The new-session wizard previews the exact command a session will launch.
 The review step shows a "Launch command" row with the resolved command,
-post-override and post-arg-resolution; for a cockpit session this is the
+post-override and post-arg-resolution; for a structured view session this is the
 ACP registry command plus its args (for example `opencode acp`, or
 `opencode-plannotator acp` once an override is set), not the bare binary.
 Click the row to edit the command inline: the edit sets the per-session
 command override, while the registry args stay read-only so they are
-never duplicated. Note that extra args are ignored for cockpit sessions;
-use the command override to change a cockpit launch command.
+never duplicated. Note that extra args are ignored for structured view sessions;
+use the command override to change a structured view launch command.
 
 ## Priority order
 

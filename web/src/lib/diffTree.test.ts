@@ -79,10 +79,7 @@ describe("buildDiffTree", () => {
   });
 
   it("collapsing a parent hides nested directories too", () => {
-    const files = [
-      makeFile("src/cli/add.rs"),
-      makeFile("src/main.rs"),
-    ];
+    const files = [makeFile("src/cli/add.rs"), makeFile("src/main.rs")];
     const nodes = buildDiffTree(files, new Set(["src"]));
     // Only the src dir should be visible
     expect(nodes).toHaveLength(1);
@@ -98,7 +95,9 @@ describe("buildDiffTree", () => {
     ];
     const nodes = buildDiffTree(files, new Set());
     // Expected: a_dir, a_dir/z.rs, b_dir, b_dir/a.rs, a_file.rs, z_file.rs
-    expect(nodes.map((n) => (n.kind === "dir" ? `dir:${n.name}` : n.file.path))).toEqual([
+    expect(
+      nodes.map((n) => (n.kind === "dir" ? `dir:${n.name}` : n.file.path)),
+    ).toEqual([
       "dir:a_dir",
       "a_dir/z.rs",
       "dir:b_dir",

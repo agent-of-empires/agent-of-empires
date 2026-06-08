@@ -2,7 +2,7 @@
 //
 // Unit tests for requestSessionInputFocus (#1454): the pure dispatch +
 // pending-latch helper the sidebar select handlers delegate to. Covers the
-// coarse-pointer suppression and the cockpit / non-cockpit target choice,
+// coarse-pointer suppression and the structured view / non-structured view target choice,
 // asserting both the dispatched event and the stashed latch.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,8 +36,8 @@ afterEach(() => {
 describe("requestSessionInputFocus", () => {
   it("does nothing on a coarse pointer", () => {
     const done = captureDispatch();
-    requestSessionInputFocus({ cockpit_mode: true }, true);
-    requestSessionInputFocus({ cockpit_mode: false }, true);
+    requestSessionInputFocus({ view: "structured" }, true);
+    requestSessionInputFocus({ view: "terminal" }, true);
     const events = done();
     expect(events).toHaveLength(0);
     expect(consumePendingTerminalFocus("composer")).toBe(false);
@@ -51,9 +51,9 @@ describe("requestSessionInputFocus", () => {
     expect(consumePendingTerminalFocus("agent")).toBe(false);
   });
 
-  it("targets the composer for cockpit sessions on a fine pointer", () => {
+  it("targets the composer for structured view sessions on a fine pointer", () => {
     const done = captureDispatch();
-    requestSessionInputFocus({ cockpit_mode: true }, false);
+    requestSessionInputFocus({ view: "structured" }, false);
     const events = done();
     expect(events).toEqual([{ target: "composer" }]);
     // Latch was set for the not-yet-mounted case.
@@ -61,9 +61,9 @@ describe("requestSessionInputFocus", () => {
     expect(consumePendingTerminalFocus("composer")).toBe(false);
   });
 
-  it("targets the agent terminal for non-cockpit sessions on a fine pointer", () => {
+  it("targets the agent terminal for non-structured view sessions on a fine pointer", () => {
     const done = captureDispatch();
-    requestSessionInputFocus({ cockpit_mode: false }, false);
+    requestSessionInputFocus({ view: "terminal" }, false);
     const events = done();
     expect(events).toEqual([{ target: "agent" }]);
     expect(consumePendingTerminalFocus("agent")).toBe(true);

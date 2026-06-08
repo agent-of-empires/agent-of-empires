@@ -134,7 +134,11 @@ export function RightPanel({
   }, []);
 
   return (
-    <div ref={containerRef} {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800 md:pb-1.5">
+    <div
+      ref={containerRef}
+      {...tourAnchor(TOUR_ANCHORS.rightPanel)}
+      className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800 md:pb-1.5"
+    >
       {/* Upper: file list */}
       <div
         style={{ flexBasis: `${topRatio * 100}%` }}
@@ -176,7 +180,8 @@ export function RightPanel({
       {/* Lower: paired terminal */}
       <div
         style={{ flexBasis: `${(1 - topRatio) * 100}%` }}
-        className="flex flex-col min-h-0">
+        className="flex flex-col min-h-0"
+      >
         <PairedShellPane session={session} sessionId={sessionId} />
       </div>
     </div>

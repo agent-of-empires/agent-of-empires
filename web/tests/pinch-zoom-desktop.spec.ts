@@ -90,33 +90,30 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
       return;
     }
 
-    await page.evaluate(
-      ({ deltaY, ctrlKey, times, xRatio, yRatio }) => {
-        const target = Array.from(
-          document.querySelectorAll<HTMLElement>(".xterm"),
-        ).find((el) => {
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
-        });
-        if (!target) throw new Error(".xterm not mounted");
-        const rect = target.getBoundingClientRect();
-        const clientX = rect.left + rect.width * (xRatio ?? 0.5);
-        const clientY = rect.top + rect.height * (yRatio ?? 0.5);
-        for (let i = 0; i < (times ?? 1); i++) {
-          target.dispatchEvent(
-            new WheelEvent("wheel", {
-              bubbles: true,
-              cancelable: true,
-              deltaY,
-              ctrlKey,
-              clientX,
-              clientY,
-            }),
-          );
-        }
-      },
-      opts,
-    );
+    await page.evaluate(({ deltaY, ctrlKey, times, xRatio, yRatio }) => {
+      const target = Array.from(
+        document.querySelectorAll<HTMLElement>(".xterm"),
+      ).find((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      if (!target) throw new Error(".xterm not mounted");
+      const rect = target.getBoundingClientRect();
+      const clientX = rect.left + rect.width * (xRatio ?? 0.5);
+      const clientY = rect.top + rect.height * (yRatio ?? 0.5);
+      for (let i = 0; i < (times ?? 1); i++) {
+        target.dispatchEvent(
+          new WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            deltaY,
+            ctrlKey,
+            clientX,
+            clientY,
+          }),
+        );
+      }
+    }, opts);
   }
 
   test("Ctrl+wheel up increases desktopFontSize after debounce", async ({

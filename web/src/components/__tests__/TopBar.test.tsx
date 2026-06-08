@@ -58,7 +58,9 @@ describe("TopBar", () => {
   });
 
   it("does not render the DEV badge when isDevBuild=false", () => {
-    const { queryByLabelText, queryByText } = renderTopBar({ isDevBuild: false });
+    const { queryByLabelText, queryByText } = renderTopBar({
+      isDevBuild: false,
+    });
     expect(queryByLabelText("Debug build")).toBeNull();
     expect(queryByText("DEV")).toBeNull();
   });

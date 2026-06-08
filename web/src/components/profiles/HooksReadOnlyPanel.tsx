@@ -38,10 +38,9 @@ export function HooksReadOnlyPanel({ groups }: Props) {
         Lifecycle hooks
       </h3>
       <p className="mt-1 text-xs text-text-dim">
-        Lifecycle hooks run shell commands when sessions are created,
-        launched, and destroyed. To prevent remote code execution, the
-        dashboard shows them read-only; edit hooks in your config file or the
-        TUI settings.
+        Lifecycle hooks run shell commands when sessions are created, launched,
+        and destroyed. To prevent remote code execution, the dashboard shows
+        them read-only; edit hooks in your config file or the TUI settings.
       </p>
       <ul className="mt-3 flex flex-col gap-3">
         {groups.map((group) => {

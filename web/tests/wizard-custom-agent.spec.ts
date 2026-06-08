@@ -17,9 +17,7 @@ async function mockWizardApis(page: Page, agents: unknown[]) {
   await page.route("**/api/system/update-status", (route) =>
     route.fulfill({ json: {} }),
   );
-  await page.route("**/api/about", (route) =>
-    route.fulfill({ json: { cockpit_master_enabled: true } }),
-  );
+  await page.route("**/api/about", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/docker/status", (route) =>
     route.fulfill({ json: { available: false, runtime: null } }),
   );
@@ -59,8 +57,13 @@ async function mockWizardApis(page: Page, agents: unknown[]) {
 async function openWizardOnAgentStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
+  const recent = page
+    .getByRole("button")
+    .filter({ hasText: "/tmp/example" })
+    .first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   const next = page.getByRole("button", { name: "Next" });
@@ -75,7 +78,8 @@ test.describe("wizard custom agent picker", () => {
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({
     page,
   }) => {
-    let captured: { tool?: string; cockpit_mode?: boolean } | null = null;
+    let captured: { tool?: string; view?: "structured" | "terminal" } | null =
+      null;
     await mockWizardApis(page, [
       {
         name: "claude",
@@ -131,16 +135,18 @@ test.describe("wizard custom agent picker", () => {
     await openWizardOnAgentStep(page);
 
     await expect(page.getByText("No agents installed")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: /remote-helper/ })).toBeVisible();
-    await expect(page.getByRole("button", { name: /remote-helper/ })).toContainText(
-      "Custom",
-    );
+    await expect(
+      page.getByRole("button", { name: /remote-helper/ }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /remote-helper/ }),
+    ).toContainText("Custom");
     await expect(page.getByRole("button", { name: /claude/ })).toHaveCount(0);
 
     await page.getByRole("button", { name: /remote-helper/ }).click();
     await expect(
       page.getByText(
-        /Custom agents run in the terminal unless they define agent_cockpit_cmd/,
+        /Custom agents run in the terminal unless they define agent_acp_cmd/,
       ),
     ).toBeVisible();
     await expect(page.locator("body")).not.toContainText(hiddenBinary);
@@ -159,7 +165,7 @@ test.describe("wizard custom agent picker", () => {
     await page.getByRole("button", { name: /Launch session/ }).click();
 
     await expect.poll(() => captured?.tool).toBe(customAgentName);
-    expect(captured?.cockpit_mode).toBe(false);
+    expect(captured?.view === "structured").toBe(false);
     await expect(page.locator("body")).not.toContainText(hiddenBinary);
     await expect(page.locator("body")).not.toContainText(hiddenCommand);
     await expect(page.locator("body")).not.toContainText(hiddenDetectAs);

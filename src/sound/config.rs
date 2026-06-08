@@ -52,8 +52,8 @@ pub struct SoundConfig {
     #[setting(label = "On Error", widget = "optional_text")]
     pub on_error: Option<String>,
 
-    /// Cockpit only. Played in the browser when a session needs permission.
-    /// Specify file name with extension. Surfaced by the cockpit's approval
+    /// Acp only. Played in the browser when a session needs permission.
+    /// Specify file name with extension. Surfaced by the acp's approval
     /// hook (host-side playback intentionally has no approval transition; the
     /// host audio device is the wrong side of the wire when the user is
     /// running the dashboard on a separate machine). See #1038.

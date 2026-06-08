@@ -1,5 +1,5 @@
 // Convert an `(old_string, new_string)` pair into a `RichDiffHunk`
-// plus add/del counts, so the cockpit Edit/Write card can drive its
+// plus add/del counts, so the structured view Edit/Write card can drive its
 // body and its `+N −N` chip off a single line-diff pass. Uses
 // `@pierre/diffs` `parseDiffFromFile`, the same diff engine the diff
 // surfaces render with. See #1073 / #1074.

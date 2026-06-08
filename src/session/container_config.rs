@@ -2524,7 +2524,7 @@ mod tests {
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Create a project directory with repo config
@@ -2615,7 +2615,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
     fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Main repo with repo config under .agent-of-empires/
@@ -2690,7 +2690,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_installs_codex_hooks_files() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -2744,7 +2744,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_refuses_unsafe_instance_id() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -2785,7 +2785,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_respects_profile_hooks_disabled() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
@@ -2838,7 +2838,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let mut global = crate::session::config::Config::default();
@@ -2905,7 +2905,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
     fn test_refresh_agent_configs_preserves_codex_hooks_and_trust_state() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let codex_dir = temp_home.path().join(".codex");
@@ -2968,7 +2968,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -3011,7 +3011,7 @@ trusted_hash = "keep"
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
@@ -3069,15 +3069,15 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
             .path()
             .join(".config")
-            .join(crate::session::APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
 
         let profiles_dir = app_dir.join("profiles");
@@ -3217,7 +3217,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
     fn test_volume_ignores_applied_to_parent_repo_mount() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, repo_path) = setup_regular_repo();
@@ -3334,7 +3334,7 @@ volume_ignores = ["target", "node_modules"]
     fn test_volume_ignores_applied_to_bare_repo_worktree() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_worktree();
@@ -3549,7 +3549,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_default_adc_when_flag_set_and_tool_is_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3575,7 +3575,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_custom_path_from_google_application_credentials() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
 
@@ -3605,7 +3605,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_unset() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3626,7 +3626,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_tool_is_not_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3649,7 +3649,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_is_empty_string() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3672,7 +3672,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_adc_file_missing() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");

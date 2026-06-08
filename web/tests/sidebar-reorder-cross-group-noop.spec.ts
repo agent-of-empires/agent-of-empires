@@ -16,7 +16,9 @@ import {
   type MockSessionInput,
 } from "./helpers/sidebarMocks";
 
-test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
+test("dragging a row onto a different repo group is a no-op", async ({
+  page,
+}) => {
   const repoA = "/tmp/repo-a";
   const repoB = "/tmp/repo-b";
   const sessions: MockSessionInput[] = [

@@ -133,40 +133,6 @@ async fn attach_token_headers(response: &mut Response, state: &AppState) {
     );
 }
 
-const MAX_DEVICES: usize = 100;
-
-/// Record a successful device connection for tracking.
-async fn record_device(state: &AppState, ip: IpAddr, user_agent: &str) {
-    let ip_str = ip.to_string();
-    let ua = user_agent.to_string();
-    let mut devices = state.devices.write().await;
-    if let Some(device) = devices
-        .iter_mut()
-        .find(|d| d.ip == ip_str && d.user_agent == ua)
-    {
-        device.last_seen = chrono::Utc::now();
-        device.request_count += 1;
-    } else {
-        if devices.len() >= MAX_DEVICES {
-            if let Some(oldest_idx) = devices
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, d)| d.last_seen)
-                .map(|(i, _)| i)
-            {
-                devices.remove(oldest_idx);
-            }
-        }
-        devices.push(super::DeviceInfo {
-            ip: ip_str,
-            user_agent: ua,
-            first_seen: chrono::Utc::now(),
-            last_seen: chrono::Utc::now(),
-            request_count: 1,
-        });
-    }
-}
-
 /// Extract all token candidates from the request (cookie, query parameter, and
 /// Authorization header). Returns them in priority order so callers can try
 /// each until one validates. A stale cookie must not prevent a valid query
@@ -226,7 +192,7 @@ fn extract_ws_protocols(request: &Request) -> Vec<String> {
 }
 
 /// Strip a possible trailing slash from a path so suffix matches are
-/// not bypassed by `/api/sessions/123/cockpit/prompt/` (axum routes
+/// not bypassed by `/api/sessions/123/acp/prompt/` (axum routes
 /// both forms to the same handler). Cheap and explicit.
 fn normalize_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
@@ -381,7 +347,7 @@ fn log_loopback_bypass_token(client_ip: IpAddr, path: &str) {
 ///
 /// Scope is intentionally narrow: only persistent-config writes that
 /// can plant code for the owner's next session spawn. Daily-use
-/// surfaces (cockpit prompt, terminal attach, session lifecycle,
+/// surfaces (structured view prompt, terminal attach, session lifecycle,
 /// approval resolution) rely on the session cookie + device binding
 /// alone, matching the SSH model the user wanted. See discussion on
 /// #1137. The protected attack class is the persisted-tamper pattern:
@@ -442,6 +408,20 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
             return false;
         }
         return true;
+    }
+
+    // Device / login-session management. Revoking another device's
+    // session or signing every device out is a credential-management
+    // action; gate it behind step-up so a stolen session+binding cannot
+    // lock the legitimate owner out without re-proving the passphrase.
+    // See #1235.
+    if path == "/api/login/logout-all" && method == Method::POST {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("/api/login/sessions/") {
+        if method == Method::DELETE && !rest.is_empty() {
+            return true;
+        }
     }
 
     false
@@ -624,11 +604,11 @@ pub async fn auth_middleware(
 ) -> Response {
     let client_ip = resolve_client_ip(addr, request.headers());
 
-    // Trace cockpit ws specifically so we can see whether the
-    // browser ever reached the server when the cockpit live updates
+    // Trace structured view ws specifically so we can see whether the
+    // browser ever reached the server when the structured view live updates
     // get stuck. Other ws paths (terminal) are not as load-bearing
     // for diagnostics today.
-    if request.uri().path().contains("/cockpit/ws") {
+    if request.uri().path().contains("/acp/ws") {
         let token_sources: Vec<&'static str> = extract_tokens(&request)
             .iter()
             .map(|(_, src)| match src {
@@ -644,7 +624,7 @@ pub async fn auth_middleware(
             ip = %client_ip,
             token_sources = ?token_sources,
             ws_protocol_count = ws_protocols.len(),
-            "auth_middleware entered for cockpit ws"
+            "auth_middleware entered for structured view ws"
         );
     }
 
@@ -820,14 +800,6 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
     }
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    record_device(&state, client_ip, user_agent.as_str()).await;
-
     let path = request.uri().path().to_string();
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
@@ -917,13 +889,6 @@ async fn handle_session_authenticated(
     request
         .extensions_mut()
         .insert(AuthenticatedTokenHash(owner_hash));
-
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-    record_device(state, client_ip, user_agent).await;
 
     let path = request.uri().path().to_string();
     let method = request.method().clone();
@@ -1176,7 +1141,7 @@ mod tests {
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", loopback),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback),
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
@@ -1192,7 +1157,7 @@ mod tests {
             PassphraseWallEntryAction::Continue
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", remote),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", remote),
             PassphraseWallEntryAction::Continue
         );
 
@@ -1411,9 +1376,7 @@ mod tests {
 
         // Non-exempt: must refresh (sliding window).
         assert!(should_refresh_session_cookie("/api/sessions"));
-        assert!(should_refresh_session_cookie(
-            "/api/sessions/abc/cockpit/ws"
-        ));
+        assert!(should_refresh_session_cookie("/api/sessions/abc/acp/ws"));
         assert!(should_refresh_session_cookie("/api/settings"));
         // /api/login/elevate is gated by the session check (not
         // exempt), so its response should slide the window.
@@ -1481,7 +1444,9 @@ mod tests {
         // the browser and server agree on when the session is gone.
         let mgr = LoginManager::new(Some("test"));
         let binding = vec![0xAB; 32];
-        let session_id = mgr.create_session(&binding).await;
+        let session_id = mgr
+            .create_session(&binding, "127.0.0.1", "test-agent")
+            .await;
         assert!(mgr.validate_session(&session_id, &binding).await);
 
         let cookie = super::super::login::build_login_cookie(&session_id, false);
@@ -1535,21 +1500,18 @@ mod tests {
             &Method::GET,
             "/api/sessions/abc/ws-readonly"
         ));
+        assert!(!requires_elevation(&Method::GET, "/sessions/abc/acp/ws"));
         assert!(!requires_elevation(
-            &Method::GET,
-            "/sessions/abc/cockpit/ws"
+            &Method::POST,
+            "/api/sessions/abc/acp/prompt"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/prompt"
+            "/api/sessions/abc/acp/cancel"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/cancel"
-        ));
-        assert!(!requires_elevation(
-            &Method::POST,
-            "/api/sessions/abc/cockpit/approvals/nonce1"
+            "/api/sessions/abc/acp/approvals/nonce1"
         ));
         assert!(!requires_elevation(&Method::POST, "/api/sessions"));
         assert!(!requires_elevation(&Method::DELETE, "/api/sessions/abc"));
@@ -1566,6 +1528,7 @@ mod tests {
         assert!(!requires_elevation(&Method::POST, "/api/git/clone"));
         assert!(!requires_elevation(&Method::POST, "/api/projects"));
         assert!(!requires_elevation(&Method::DELETE, "/api/projects/myproj"));
+        assert!(!requires_elevation(&Method::PATCH, "/api/projects/myproj"));
         assert!(!requires_elevation(&Method::POST, "/api/push/subscribe"));
         assert!(!requires_elevation(&Method::POST, "/api/push/unsubscribe"));
         // Cosmetic UI state: marking the web tour seen flips one bool and
@@ -1590,5 +1553,18 @@ mod tests {
         assert!(!requires_elevation(&Method::GET, "/api/about"));
         assert!(!requires_elevation(&Method::POST, "/api/login"));
         assert!(!requires_elevation(&Method::POST, "/api/login/elevate"));
+
+        // Device / login-session management IS gated: revoking another
+        // device or signing everyone out is credential management, so a
+        // stolen session+binding cannot do it without re-proving the
+        // passphrase. See #1235.
+        assert!(requires_elevation(&Method::POST, "/api/login/logout-all"));
+        assert!(requires_elevation(
+            &Method::DELETE,
+            "/api/login/sessions/abc123"
+        ));
+        // But listing devices (read-only) and self-logout are not gated.
+        assert!(!requires_elevation(&Method::GET, "/api/devices"));
+        assert!(!requires_elevation(&Method::POST, "/api/logout"));
     }
 }

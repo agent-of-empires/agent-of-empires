@@ -9,9 +9,9 @@ How `agent-of-empires` ships. Maintainer-facing reference for the weekly automat
 - Default semver bump is **patch**. The maintainer reviews the PR, optionally edits the version bump on the branch (patch -> minor / major), then clicks merge.
 - Merging the PR fires `.github/workflows/tag-release-pr.yml`, which tags the merge commit. The tag push triggers `.github/workflows/release.yml`, which builds the four platform binaries and publishes the GitHub release + ClawHub artifact.
 
-The staging PR body still embeds a plain newest-first commit list for the maintainer's review. The user-facing `CHANGELOG.md` and GitHub Release body are now generated separately by [git-cliff](https://github.com/orhun/git-cliff), grouped by conventional-commit prefix; see [`cliff.toml`](../../cliff.toml) and the "Changelog visibility" section of [`CONTRIBUTING.md`](../../CONTRIBUTING.md). Folding the staging PR body into the same grouped view remains on the to-do list under #1387.
+The staging PR body embeds a plain newest-first commit list for maintainer review only. The user-facing `CHANGELOG.md` and GitHub Release body are generated separately by [git-cliff](https://github.com/orhun/git-cliff), grouped by conventional-commit prefix; see [`cliff.toml`](https://github.com/agent-of-empires/agent-of-empires/blob/main/cliff.toml) and the "Changelog visibility" section of [`CONTRIBUTING.md`](https://github.com/agent-of-empires/agent-of-empires/blob/main/CONTRIBUTING.md). Folding the staging PR body into the same grouped render is queued under #1387.
 
-The maintainer's only manual step on a normal release is: review the PR, optionally edit the version bump, click merge.
+The maintainer's only manual step on a normal release: review the PR, optionally edit the bump, merge.
 
 ## Weekly release-staging PR
 
@@ -30,7 +30,7 @@ The workflow:
 3. Refuses to run if the tag or the staging branch already exists.
 4. Bumps `Cargo.toml` + `Cargo.lock` on a new branch `release-staging/vX.Y.Z` via `cargo set-version` + `cargo generate-lockfile`.
 5. Regenerates `CHANGELOG.md` via `git cliff --tag vX.Y.Z` and stages it in the same release commit so the staging PR shows the changelog diff for review.
-6. Dumps every commit since the last `v*` tag (newest first, `--no-merges`, with author + short SHA + date) into the PR body as a separate maintainer-review summary. Folding that summary into the same prefix-grouped git-cliff render is queued under #1387.
+6. Dumps every commit since the last `v*` tag (newest first, `--no-merges`, author + short SHA + date) into the PR body as a maintainer-review summary.
 7. Opens the PR labeled `release-staging`, with a `<!-- release-version: X.Y.Z -->` marker in the body.
 
 ### Adjusting the bump in-flight
@@ -89,7 +89,3 @@ We follow semver, but the autopick is patch. Maintainer adjusts when:
 - **Patch:** bug fixes, refactors, docs, perf, internal CI / tests.
 
 If you are uncertain, the safer call is the bigger bump.
-
-## Out of scope
-
-The staging PR body's plain newest-first commit list is still intended for maintainer review only. Folding that body into the same git-cliff grouped render that drives `CHANGELOG.md` and the Release body is queued under #1387.

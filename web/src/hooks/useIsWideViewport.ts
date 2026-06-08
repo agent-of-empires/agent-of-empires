@@ -12,9 +12,10 @@ import { useEffect, useState } from "react";
  *  force a touch laptop into the mobile UI and squash a narrow desktop
  *  window into a cramped split. */
 export function useIsWideViewport(): boolean {
-  const [isWide, setIsWide] = useState(() =>
-    typeof window !== "undefined" &&
-    Boolean(window.matchMedia?.("(min-width: 768px)").matches),
+  const [isWide, setIsWide] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(min-width: 768px)").matches),
   );
   useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;

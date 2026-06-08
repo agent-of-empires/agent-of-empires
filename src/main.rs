@@ -43,8 +43,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // If the user passed --daemon-url, mirror the value into the env
-    // var so the cockpit::client::discovery layer (used by both the
-    // remote TUI home and the `aoe cockpit *` verbs) picks it up
+    // var so the acp::client::discovery layer (used by both the
+    // remote TUI home and the `aoe acp *` verbs) picks it up
     // through the same code path the env-only path uses. This avoids a
     // second "is the flag set?" check in every callsite.
     if let Some(url) = &cli.daemon_url {
@@ -128,10 +128,26 @@ async fn main() -> Result<()> {
                     SubscriberTarget::File(p, _) => Some(p.clone()),
                     SubscriberTarget::Stdout => None,
                 };
+                // Only the serve daemon multiplexes many sessions, so it is
+                // the one process that tees session-scoped tracing into each
+                // session's acp-workers/<id>.log (#1864). The acp module is
+                // serve-gated, so the tee only exists in serve builds.
+                #[cfg(feature = "serve")]
+                let session_tee = if matches!(
+                    ctx,
+                    ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
+                ) {
+                    Some(agent_of_empires::acp::session_tee::SessionTeeLayer::new())
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "serve"))]
+                let session_tee: Option<logging::TeeLayer> = None;
                 let res = logging::init_subscriber_with_options(
                     resolution.target,
                     filter,
                     log_cfg.show_spans,
+                    session_tee,
                 );
                 if let Some(w) = resolution.warning {
                     // Emit through the subscriber that just came up.
@@ -240,6 +256,10 @@ async fn main() -> Result<()> {
             };
         }
         Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
+        Some(Commands::Mcp { command }) => {
+            let profile = cli.profile.clone().unwrap_or_default();
+            return cli::mcp::run(&profile, command).await;
+        }
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         _ => {}
@@ -299,9 +319,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "serve")]
         Some(Commands::Url(args)) => cli::url::run(args),
         #[cfg(feature = "serve")]
-        Some(Commands::Cockpit { command }) => cli::cockpit::run(command).await,
+        Some(Commands::Acp { command }) => cli::acp::run(command).await,
         #[cfg(feature = "serve")]
-        Some(Commands::CockpitRunner(args)) => agent_of_empires::cockpit::runner::run(*args).await,
+        Some(Commands::AcpRunner(args)) => agent_of_empires::acp::runner::run(*args).await,
         None => {
             // Fold the drift notice into the existing startup-warning channel
             // so the TUI surfaces both (debug-log + drift, if both fire) in a

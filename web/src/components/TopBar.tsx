@@ -86,7 +86,13 @@ export function TopBar({
           className="flex items-center gap-1.5 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
           aria-label="Go to dashboard"
         >
-          <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm" />
+          <img
+            src="/icon-192.png"
+            alt=""
+            width="18"
+            height="18"
+            className="rounded-sm"
+          />
           <span className="font-mono text-xs leading-none">aoe</span>
         </button>
       </div>
@@ -144,7 +150,10 @@ export function TopBar({
           </button>
         )}
 
-        <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />
+        <OverflowMenu
+          items={overflowItems}
+          triggerDataTour={TOUR_ANCHORS.topbarMore}
+        />
       </div>
     </header>
   );

@@ -33,10 +33,11 @@ use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
     ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog,
-    IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
-    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog,
-    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog, WorktreeNameDialog,
+    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
+    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
+    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
+    WorktreeNameDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -92,99 +93,159 @@ pub(super) enum DragKind {
     PreviewSelect,
 }
 
+/// The output pane's text layout, captured at render time so the input
+/// handlers (which run between frames) can map a screen cell to the
+/// absolute content line beneath it and back. `pane` is the on-screen
+/// rect the parsed agent output is painted into (the info header and
+/// banner are already stripped off); `first_line` is the index of the
+/// content line drawn on `pane`'s top row (i.e. `compute_scroll`'s
+/// result for the current scroll offset); `total_lines` is the parsed
+/// scrollback length. The output Paragraph renders with no wrap and no
+/// horizontal scroll, so screen row `pane.y + k` shows content line
+/// `first_line + k`, and screen col `pane.x + c` shows content column
+/// `c`. A `total_lines` of 0 means "no selectable content" (creating /
+/// no-selection / empty panes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PreviewTextView {
+    pub(super) pane: ratatui::layout::Rect,
+    pub(super) first_line: usize,
+    pub(super) total_lines: usize,
+}
+
+impl PreviewTextView {
+    /// True when `(col, row)` lands on a row/col that maps to real
+    /// content. Used to gate drag-select start.
+    pub(super) fn contains(self, col: u16, row: u16) -> bool {
+        self.total_lines > 0
+            && self
+                .pane
+                .contains(ratatui::layout::Position::from((col, row)))
+    }
+
+    /// Absolute parsed-text index of the line painted on screen row
+    /// `row`, clamped into the pane and the scrollback.
+    fn abs_line_at_row(self, row: u16) -> usize {
+        let pane = self.pane;
+        let max_y = pane.bottom().saturating_sub(1);
+        let cy = row.clamp(pane.y, max_y);
+        let mut line = self.first_line + (cy - pane.y) as usize;
+        if self.total_lines > 0 {
+            line = line.min(self.total_lines - 1);
+        }
+        line
+    }
+
+    /// Map a screen cell to selection coords `(col_offset, from_bottom)`,
+    /// clamped into the pane and the scrollback. `col_offset` is 0-based
+    /// from the pane's left edge; `from_bottom` counts lines up from the
+    /// newest captured line (0 = the bottom line). See `PreviewSelection`
+    /// for why selections anchor to the bottom rather than an absolute
+    /// index.
+    pub(super) fn screen_to_content(self, col: u16, row: u16) -> (u16, usize) {
+        let pane = self.pane;
+        let max_x = pane.right().saturating_sub(1);
+        let col_off = col.clamp(pane.x, max_x) - pane.x;
+        let abs = self.abs_line_at_row(row);
+        (
+            col_off,
+            self.total_lines.saturating_sub(1).saturating_sub(abs),
+        )
+    }
+
+    /// Absolute parsed-text index for a `from_bottom` distance under this
+    /// view's current `total_lines`. The inverse of the `from_bottom` term
+    /// in `screen_to_content`.
+    fn abs_from_bottom(self, from_bottom: usize) -> usize {
+        self.total_lines
+            .saturating_sub(1)
+            .saturating_sub(from_bottom)
+    }
+}
+
 /// Flow-style text selection in the preview pane, matching tmux's
-/// default mouse selection: from the anchor cell, the selection runs
-/// in reading order (left-to-right, top-to-bottom) wrapping across
-/// every row in between, and ends at the extent cell. Coordinates are
-/// absolute terminal cells (matching the frame buffer's coords) so the
-/// renderer can apply a reversed-style highlight without re-deriving
-/// pane geometry.
+/// default mouse selection: from the anchor cell, the selection runs in
+/// reading order (left-to-right, top-to-bottom) wrapping across every
+/// row in between, and ends at the extent cell.
+///
+/// Coordinates are *content* coords, not screen cells: `col` is a 0-based
+/// offset from the output pane's left edge and `from_bottom` counts lines
+/// up from the newest captured line (0 = the bottom line). Anchoring to
+/// the bottom (not an absolute index) is load-bearing: in live mode the
+/// preview re-captures every frame, and the captured window *grows from
+/// the top* as the user scrolls back (`capture_lines_for` adds the scroll
+/// offset), so an absolute index would silently point at an older line as
+/// the window grew, the exact bug where a drag-to-scroll copied the wrong
+/// range. Distance from the newest line is invariant under that top-side
+/// growth, so the highlight and the copy stay locked to the same text as
+/// the user scrolls. The renderer re-derives screen rects each frame from
+/// the live `PreviewTextView` via `screen_flow_rects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewSelection {
-    /// Cell the user pressed Down(Left) on.
-    pub(super) anchor: (u16, u16),
+    /// Content cell the user pressed Down(Left) on: `(col_offset, from_bottom)`.
+    pub(super) anchor: (u16, usize),
     /// Current (or final) extent. Equals `anchor` at drag start.
-    pub(super) extent: (u16, u16),
+    pub(super) extent: (u16, usize),
     /// True once Up(Left) has fired. The renderer keeps the highlight
-    /// visible after release until the user dismisses it (next key,
-    /// click, or scroll), so they can verify what was copied.
+    /// visible after release until the user dismisses it (next key or
+    /// click), so they can verify what was copied.
     pub(super) finalized: bool,
 }
 
 impl PreviewSelection {
-    /// Anchor and extent ordered in reading order (row first, then
-    /// column). The first tuple is the cell where the selection starts
-    /// in the flow; the second is where it ends. A drag that runs
-    /// up-and-right still resolves to the higher row as the start.
-    pub(super) fn ordered(self) -> ((u16, u16), (u16, u16)) {
-        let (ac, ar) = self.anchor;
-        let (ec, er) = self.extent;
-        if (ar, ac) <= (er, ec) {
-            ((ac, ar), (ec, er))
+    /// Anchor and extent resolved to absolute parsed-text indices under
+    /// `total_lines` and ordered in reading order (line first, then
+    /// column). The first tuple is where the selection starts in the flow;
+    /// the second is where it ends. A drag that runs up-and-right still
+    /// resolves to the higher line as the start.
+    pub(super) fn ordered_abs(self, view: PreviewTextView) -> ((u16, usize), (u16, usize)) {
+        let (ac, ad) = self.anchor;
+        let (ec, ed) = self.extent;
+        let a = (ac, view.abs_from_bottom(ad));
+        let e = (ec, view.abs_from_bottom(ed));
+        if (a.1, a.0) <= (e.1, e.0) {
+            (a, e)
         } else {
-            ((ec, er), (ac, ar))
+            (e, a)
         }
     }
 
-    /// Decompose the selection into one to three flow-shape `Rect`
-    /// segments inside `preview_area`. Returns an empty vec when the
-    /// preview area is zero-sized. The shape is the tmux default:
-    ///
-    /// * single-row selection: one segment between the two columns.
-    /// * multi-row selection: (1) start col to the preview's right
-    ///   edge on the first row, (2) full-width middle rows when any
-    ///   exist, (3) the preview's left edge to the end col on the
-    ///   last row.
-    pub(super) fn flow_rects(
-        self,
-        preview_area: ratatui::layout::Rect,
-    ) -> Vec<ratatui::layout::Rect> {
+    /// Decompose the selection into per-row flow-shape screen `Rect`s,
+    /// clipped to the visible window described by `view`. Lines above or
+    /// below the visible window are skipped (the highlight just doesn't
+    /// paint there); a partially-visible multi-line selection runs to the
+    /// pane's right edge on every row but its last and from the left edge
+    /// on every row but its first, matching the tmux default flow shape.
+    /// Returns an empty vec when the pane is zero-sized.
+    pub(super) fn screen_flow_rects(self, view: PreviewTextView) -> Vec<ratatui::layout::Rect> {
+        let pane = view.pane;
         let mut out = Vec::new();
-        if preview_area.width == 0 || preview_area.height == 0 {
+        if pane.width == 0 || pane.height == 0 {
             return out;
         }
-        let ((start_col, start_row), (end_col, end_row)) = self.ordered();
-        let left = preview_area.x;
-        let right_excl = preview_area.right();
-
-        if start_row == end_row {
-            let lo = start_col.min(end_col);
-            let hi = start_col.max(end_col);
-            let width = hi.saturating_sub(lo).saturating_add(1);
-            out.push(ratatui::layout::Rect {
-                x: lo,
-                y: start_row,
-                width,
-                height: 1,
-            });
-            return out;
-        }
-
-        let first_width = right_excl.saturating_sub(start_col);
-        if first_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: start_col,
-                y: start_row,
-                width: first_width,
-                height: 1,
-            });
-        }
-        if end_row > start_row + 1 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: start_row + 1,
-                width: preview_area.width,
-                height: end_row - start_row - 1,
-            });
-        }
-        let last_width = end_col.saturating_sub(left).saturating_add(1);
-        if last_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: end_row,
-                width: last_width,
-                height: 1,
-            });
+        let ((start_col, start_line), (end_col, end_line)) = self.ordered_abs(view);
+        let top = view.first_line;
+        let bottom_excl = top + pane.height as usize;
+        for line in start_line..=end_line {
+            if line < top || line >= bottom_excl {
+                continue;
+            }
+            let row = pane.y + (line - top) as u16;
+            let left_off = if line == start_line { start_col } else { 0 };
+            let right_off_excl = if line == end_line {
+                end_col.saturating_add(1).min(pane.width)
+            } else {
+                pane.width
+            };
+            let left = pane.x + left_off.min(pane.width);
+            let right_excl = pane.x + right_off_excl;
+            if right_excl > left {
+                out.push(ratatui::layout::Rect {
+                    x: left,
+                    y: row,
+                    width: right_excl - left,
+                    height: 1,
+                });
+            }
         }
         out
     }
@@ -199,7 +260,7 @@ pub(super) struct GroupRenameContext {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
-    Agent,
+    Structured,
     Terminal,
     /// Previewing a tool session (lazygit, yazi, etc.)
     Tool(String),
@@ -405,9 +466,9 @@ pub struct HomeView {
     /// position when opened; the renderer clamps it into view.
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
-    pub(super) hook_trust_dialog: Option<HookTrustDialog>,
-    /// Session data pending hook trust approval
-    pub(super) pending_hook_trust_data: Option<NewSessionData>,
+    pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
+    /// Session data pending repo trust approval (hooks and/or project MCP)
+    pub(super) pending_repo_trust_data: Option<NewSessionData>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
@@ -451,7 +512,7 @@ pub struct HomeView {
     /// (and reset to Agent) by `prepare_live_send` so each action
     /// carries its own target without a stale value leaking into a
     /// later live-send call. Defaults to Agent for the historical
-    /// path (Tab in Agent view).
+    /// path (Tab in Structured view).
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
     /// Live-send mode: when `Some`, every key event in the home view is
     /// translated to a tmux send-keys call against this session's pane
@@ -495,7 +556,7 @@ pub struct HomeView {
     pub(super) live_send_pending_leader: bool,
     /// When true, the session list (sidebar) is hidden so the preview pane
     /// gets the full terminal width. Toggled from live mode via the leader
-    /// (`leader b`) for a distraction-free agent view; reset on live-send
+    /// (`leader b`) for a distraction-free structured view; reset on live-send
     /// exit so the list always reappears in the normal home view.
     pub(super) sidebar_collapsed: bool,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
@@ -575,7 +636,7 @@ pub struct HomeView {
     pub(super) preview_area: Rect,
     /// Sub-rect of `preview_area` where the agent's captured pane content
     /// is actually painted: `preview_area` minus the info header when
-    /// the user has it expanded (Agent view, non-compact). When the
+    /// the user has it expanded (Structured view, non-compact). When the
     /// info header is hidden or the layout is compact, this matches
     /// `preview_area` exactly.
     ///
@@ -595,6 +656,12 @@ pub struct HomeView {
     /// every consumer of "how many rows are visible" agrees with what's on
     /// screen.
     pub(super) preview_visible_rows: usize,
+    /// Snapshot of the output pane's text layout from the last render,
+    /// used by the drag-select handlers to map screen cells to absolute
+    /// content lines (and back) between frames. Set in `render_preview`
+    /// for the output-bearing paths; left at `total_lines == 0` for the
+    /// creating / no-selection paths so a drag there is inert.
+    pub(super) preview_text_view: PreviewTextView,
     /// Outer rect of the preview pane (block + borders + content), captured
     /// during `render_preview`. The live-send preview-only fast path uses
     /// this to call back into `render_preview` with the correct OUTER area,
@@ -676,6 +743,21 @@ pub struct HomeView {
     /// `Down(Left)` over a draggable target (the list/preview divider
     /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
     pub(super) drag_state: Option<DragKind>,
+
+    /// Last pointer cell reported during a `PreviewSelect` drag, `None`
+    /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
+    /// to keep scrolling while the cursor is held at the pane edge:
+    /// crossterm only emits `Drag` events on movement, so without a
+    /// ticker-driven scroll, holding still at the edge wouldn't advance.
+    pub(super) preview_drag_pos: Option<(u16, u16)>,
+
+    /// When the edge auto-scroll last advanced a line. Paces the scroll to
+    /// a steady cadence so it doesn't race: the event loop wakes more often
+    /// than the ticker (capture-worker wakes, post-key wakes), and stepping
+    /// once per wake made the scroll speed lurch with pane activity.
+    /// Reset whenever the cursor leaves the edge so re-entering scrolls at
+    /// once.
+    pub(super) preview_autoscroll_at: Option<std::time::Instant>,
 
     /// In-app text selection over the preview pane, populated only in
     /// live-send mode (where terminal-native drag-select doesn't reach
@@ -860,8 +942,8 @@ impl HomeView {
             restart_dialog: None,
             context_menu: None,
             group_rename_context: None,
-            hook_trust_dialog: None,
-            pending_hook_trust_data: None,
+            repo_trust_dialog: None,
+            pending_repo_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             intro_dialog: None,
@@ -919,6 +1001,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             tool_preview_cache: PreviewCache::default(),
             preview_scroll_offset: 0,
+            preview_text_view: PreviewTextView::default(),
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),
             preview_visible_rows: 0,
@@ -947,6 +1030,8 @@ impl HomeView {
             divider_col: None,
             main_area_width: 0,
             drag_state: None,
+            preview_drag_pos: None,
+            preview_autoscroll_at: None,
             preview_selection: None,
             preview_copy_pending: false,
             preview_copy_text: None,
@@ -2350,7 +2435,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
@@ -2387,7 +2472,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
@@ -2484,6 +2569,23 @@ impl HomeView {
     /// leaving live mode hands the resize off and back).
     pub(super) fn clear_preview_pane_sync(&mut self) {
         self.preview_pane_synced = None;
+    }
+
+    /// Expand the synthetic Archived section if it is collapsed, persisting
+    /// the change. Used when archiving a session in the non-Attention sort so
+    /// the freshly archived row is visible and can stay selected under the
+    /// cursor. No-op (and no save) when the section is already open.
+    pub(super) fn reveal_archived_section(&mut self) {
+        if !self.archived_section_collapsed {
+            return;
+        }
+        self.archived_section_collapsed = false;
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.archived_section_collapsed = Some(false);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+            }
+        }
     }
 
     pub fn toggle_archived_section(&mut self) {
@@ -3820,16 +3922,16 @@ impl HomeView {
     /// the session was filed under (the home view's active profile may
     /// already have moved on); falls back to `config_profile()` when
     /// the instance has no recorded profile. Returns `None` for
-    /// cockpit-mode sessions because the attach-mode / click-action
-    /// settings all have cockpit-specific bypass paths upstream;
-    /// callers treat `None` as "skip this setting, the cockpit path
+    /// structured view-mode sessions because the attach-mode / click-action
+    /// settings all have structured view-specific bypass paths upstream;
+    /// callers treat `None` as "skip this setting, the structured view path
     /// handles activation."
     fn resolve_session_config_for(
         &self,
         session_id: &str,
     ) -> Option<crate::session::SessionConfig> {
         let inst = self.get_instance(session_id)?;
-        if inst.is_cockpit_mode() {
+        if inst.is_structured() {
             return None;
         }
         let profile = if inst.source_profile.is_empty() {
@@ -3840,9 +3942,29 @@ impl HomeView {
         Some(crate::session::resolve_config_or_warn(&profile).session)
     }
 
+    /// Whether renaming this session should also move its worktree directory
+    /// leaf, per the resolved `session.tie_workdir_to_name` setting. True only
+    /// for aoe-managed worktree sessions. Unlike `resolve_session_config_for`,
+    /// this does not bypass structured-view sessions: the directory tie is
+    /// orthogonal to the view. See #1927.
+    pub(super) fn tie_workdir_applies_for(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        let profile = if inst.source_profile.is_empty() {
+            self.config_profile()
+        } else {
+            inst.source_profile.clone()
+        };
+        let tie = crate::session::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name;
+        inst.tie_workdir_applies(tie)
+    }
+
     /// Resolve `new_session_attach_mode` for a freshly-created session.
     /// See `resolve_session_config_for` for the profile-resolution and
-    /// cockpit-bypass rules.
+    /// structured view-bypass rules.
     pub fn new_session_attach_mode(
         &self,
         session_id: &str,
@@ -3852,20 +3974,20 @@ impl HomeView {
     }
 
     /// Resolve `click_action` for an existing session row when the
-    /// user single-clicks it in the Agent view. See
+    /// user single-clicks it in the Structured view. See
     /// `resolve_session_config_for` for resolution rules; `None`
-    /// (cockpit) is treated by the caller as "fall through to the
+    /// (structured view) is treated by the caller as "fall through to the
     /// historical live-send path," which `start_live_send` itself
-    /// short-circuits for cockpit anyway.
+    /// short-circuits for structured view anyway.
     pub(super) fn click_action(&self, session_id: &str) -> Option<crate::session::ClickAction> {
         self.resolve_session_config_for(session_id)
             .map(|s| s.click_action)
     }
 
     /// Resolve `default_attach_mode` for an existing session row when
-    /// the user activates it (Enter / double-click) in the Agent view.
+    /// the user activates it (Enter / double-click) in the Structured view.
     /// See `resolve_session_config_for` for resolution rules; callers
-    /// short-circuit to the cockpit-specific activation path before
+    /// short-circuit to the structured view-specific activation path before
     /// consulting this setting.
     pub(super) fn default_attach_mode(
         &self,

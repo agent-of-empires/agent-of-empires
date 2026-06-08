@@ -13,3 +13,4 @@ regex = "1"
 [target.'cfg(unix)'.dependencies]
 ctrlc = "3"
 nix = { version = "0.31", features = ["signal"] }
+notify = "8.2"

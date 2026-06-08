@@ -72,11 +72,29 @@ In the TUI, enable the Worktree checkbox to create a new branch and worktree. By
 
 The web dashboard's new-session wizard folds the worktree controls behind an "Advanced" disclosure on the session step, leaving only the session title visible by default. Inside Advanced, a "Base branch" disclosure beneath the worktree name input shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same Advanced section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
 
+## Tying the Title and Worktree Directory
+
+By default a worktree session's title and its worktree directory name stay tied: renaming the session moves the directory to match, and a new session's directory leaf is derived from its title (so "Auth refactor" lands in `.../auth-refactor` rather than a random codename). This is controlled by the `session.tie_workdir_to_name` setting (default `true`), which applies only to aoe-managed worktree sessions. Non-worktree (scratch, plain tmux) and attached worktree sessions ignore it.
+
+```toml
+[session]
+tie_workdir_to_name = true
+```
+
+When tied:
+
+- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug first, then sets the title only if the move succeeds, so the two cannot drift on a partial failure.
+- The git branch is never swept in by a title rename. Pass `--rename-branch` to `aoe session rename` (or `rename_branch: true` to the PATCH) to rename it too; it stays opt-in because a branch may carry an upstream or an open PR.
+- The session must be stopped first. Moving the directory of a running worktree is unsafe, so a tied rename of a running session is refused with a clear message. Stop the session, or disable the setting, to relabel it freely.
+- Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
+
+Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.
+
 ## Editing the Workdir Name After Creation
 
-When a worktree session was created with an auto-generated name, you can change its workdir (worktree directory) name later. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
+When `session.tie_workdir_to_name` is **off**, a worktree session's workdir (worktree directory) name is edited independently of its title. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
 
-v1 supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
+This supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
 
 | Surface | How |
 |---------|-----|
@@ -85,7 +103,7 @@ v1 supports only sessions whose worktree is aoe-managed (`worktree_info.managed_
 | Web | Right-click the session row, choose "Edit workdir name", enter a name, and optionally check "Also rename git branch". |
 | REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": <bool> }` |
 
-The new directory and branch persist across reload and restart. See #1723.
+The new directory and branch persist across reload and restart. See #1723 and #1927.
 
 ## Configuration
 
@@ -117,17 +135,11 @@ On the delete side, aoe runs `git submodule deinit -f --all` before `git worktre
 ### Path Template Examples
 
 ```toml
-# Default (sibling directory) - used for non-bare repos
+# Default (sibling directory), used for non-bare repos
 path_template = "../{repo-name}-worktrees/{branch}"
-
-# Bare repo default (worktrees as siblings)
-bare_repo_path_template = "./{branch}"
 
 # Nested in repo
 path_template = "./worktrees/{branch}"
-
-# Absolute path
-path_template = "/absolute/path/to/worktrees/{repo-name}/{branch}"
 
 # With session ID for uniqueness
 path_template = "../wt/{branch}-{session-id}"
@@ -159,26 +171,6 @@ git fetch <remote> <branch> failed for <repo>: <stderr>
 
 The session is still created when the fetch fails. The worktree branches off whatever local ref already exists, which may be stale. Multi-repo sessions emit one warning per repo whose fetch failed, so a single bad remote in a workspace of five repos shows up as one toast rather than aborting the whole workspace. See issue \#1511 for the rationale.
 
-## Performance & Debug Logging
-
-`create_worktree` is instrumented end-to-end so a slow run can be diagnosed from `debug.log` (`AGENT_OF_EMPIRES_DEBUG=1`):
-
-```
-INFO worktree create: start branch=... path=...
-INFO worktree create: prune done in 12ms
-INFO git fetch origin/main ok in 1.7s
-INFO worktree create: fetch step done in 1.7s
-INFO worktree create: branch resolve done in 2ms
-INFO worktree create: git worktree add done in 90ms (518 files, 5690035 bytes checked out)
-INFO worktree create: convert .git file done in 120µs
-INFO worktree create: submodules (initialized count=1) done in 2.0s
-INFO worktree create: TOTAL 3.9s branch=... path=... warnings=0
-```
-
-Network IO (`git fetch`, `git submodule update`) dominates almost every slow run. `git worktree add` itself only checks out tracked files; it does **not** copy `node_modules`, `.venv`, `target/`, or any other gitignored content.
-
-For multi-repo workspaces, the per-repo `create_worktree` calls run concurrently via `std::thread::scope`, so wall-clock time is roughly that of the slowest single repo rather than the sum across repos.
-
 ## Cleanup Behavior
 
 | Scenario | Cleanup Prompt? |
@@ -188,9 +180,9 @@ For multi-repo workspaces, the per-repo `create_worktree` calls run concurrently
 | `--delete-worktree` flag | Yes (deletes worktree) |
 | Non-worktree session | No |
 
-## Auto-Detection
+## Bare Repos
 
-AOE automatically detects bare repos and uses `bare_repo_path_template` instead of `path_template`, creating worktrees as siblings within the project directory.
+AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory. See [Workflow](workflow.md) for the bare-repo setup.
 
 ## File Locations
 
@@ -198,12 +190,3 @@ AOE automatically detects bare repos and uses `bare_repo_path_template` instead 
 |------|------|
 | Config | `~/.agent-of-empires/config.toml` |
 | Sessions | `~/.agent-of-empires/profiles/<profile>/sessions.json` |
-
-## Error Messages
-
-| Error | Solution |
-|-------|----------|
-| "Not in a git repository" | Navigate to a git repo first |
-| "Worktree already exists" | Use different branch name or add `{session-id}` to template |
-| "Failed to remove worktree" | May need manual cleanup with `git worktree remove` |
-| "Branch already exists" (CLI) | Branch exists; remove `-b` flag to use existing branch |

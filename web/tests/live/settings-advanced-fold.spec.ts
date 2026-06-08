@@ -5,8 +5,8 @@
 // /settings/sandbox, confirm the advanced knobs are folded away by default,
 // expand the fold, edit sandbox.cpu_limit, and assert the value reaches the
 // profile config and survives a page reload. Sandbox is used (rather than
-// Cockpit) because `cockpit` is not an allowed profile-settings section, so
-// cockpit knobs do not round-trip through PATCH /api/profiles/{p}/settings.
+// Structured view) because `acp` is not an allowed profile-settings section, so
+// structured-view knobs do not round-trip through PATCH /api/profiles/{p}/settings.
 
 import { test, expect } from "../helpers/liveTest";
 
@@ -29,18 +29,21 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
 
   // A high-level control is visible immediately; the advanced knob is folded
   // away by default.
-  await expect(page.getByText("Sandbox enabled by default")).toBeVisible({
+  await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(
-    page.locator("label", { hasText: /^CPU limit$/ }),
-  ).toHaveCount(0);
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
+    0,
+  );
 
   // Expand the Advanced fold.
-  await page.getByRole("button", { name: /Advanced/ }).first().click();
+  await page
+    .getByRole("button", { name: /Advanced/ })
+    .first()
+    .click();
 
   const cpuInput = page
-    .locator("label", { hasText: /^CPU limit$/ })
+    .locator("label", { hasText: /^CPU Limit$/ })
     .locator("..")
     .locator('input[type="text"]');
   await expect(cpuInput).toBeVisible({ timeout: 5_000 });
@@ -58,22 +61,25 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
   // Frontend-side: after reload the fold is collapsed again (component-local,
   // not persisted), and re-expanding shows the persisted value.
   await page.reload();
-  await expect(page.getByText("Sandbox enabled by default")).toBeVisible({
+  await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(
-    page.locator("label", { hasText: /^CPU limit$/ }),
-  ).toHaveCount(0);
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
+    0,
+  );
 
-  await page.getByRole("button", { name: /Advanced/ }).first().click();
+  await page
+    .getByRole("button", { name: /Advanced/ })
+    .first()
+    .click();
   await expect(cpuInput).toHaveValue(newValue, { timeout: 5_000 });
 });
 
-// The other three folded tabs (Worktree, Cockpit, Logging) each render their
+// The other three folded tabs (Worktree, Structured view, Logging) each render their
 // advanced fields only once the fold is expanded. Drive each one in the
 // browser so the relocated field markup is exercised end to end (the unit
 // suite asserts the same hide/expand behavior; this is the real-DOM pass).
-test("worktree, cockpit, and logging advanced folds expand in the browser", async ({
+test("worktree, structured-view, and logging advanced folds expand in the browser", async ({
   serve,
   page,
 }) => {
@@ -81,19 +87,36 @@ test("worktree, cockpit, and logging advanced folds expand in the browser", asyn
     // Worktree is schema-driven (#1692): labels + the advanced fold come from
     // the settings schema, so they match the TUI ("Enabled by Default",
     // "Bare Repo Template") rather than the old hand-written web copy.
-    { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
-    { tab: "cockpit", anchor: "Cockpit master switch", field: /^Replay buffer bytes$/ },
-    { tab: "logging", anchor: "Default level", field: /^Output$/ },
+    {
+      tab: "worktree",
+      anchor: "Enabled by Default",
+      field: /^Bare Repo Template$/,
+    },
+    {
+      tab: "structured-view",
+      anchor: "Show tool-call durations",
+      field: /^Replay buffer bytes$/,
+    },
+    {
+      tab: "logging",
+      anchor: "Default level",
+      field: /^Output \(restart req\.\)$/,
+    },
   ];
 
   for (const { tab, anchor, field } of cases) {
     await page.goto(`${serve.baseUrl}/settings/${tab}`);
-    await expect(page.getByText(anchor).first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(anchor).first()).toBeVisible({
+      timeout: 10_000,
+    });
 
     // Folded away by default.
     await expect(page.locator("label", { hasText: field })).toHaveCount(0);
 
-    await page.getByRole("button", { name: /Advanced/ }).first().click();
+    await page
+      .getByRole("button", { name: /Advanced/ })
+      .first()
+      .click();
     await expect(page.locator("label", { hasText: field })).toBeVisible({
       timeout: 5_000,
     });

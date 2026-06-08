@@ -25,9 +25,7 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   await expect(page.getByPlaceholder(PALETTE_PLACEHOLDER)).toBeVisible();
 
   await page.getByPlaceholder(PALETTE_PLACEHOLDER).fill("scratch");
-  await page
-    .getByRole("option", { name: /New scratch session/i })
-    .click();
+  await page.getByRole("option", { name: /New scratch session/i }).click();
 
   const wizard = page.locator(
     'div.fixed.inset-0.z-50:has(h1:has-text("New session"))',
@@ -80,7 +78,7 @@ test("palette hides creation commands in read-only mode", async ({
   await expect(
     page.getByRole("option", { name: /New scratch session/i }),
   ).toHaveCount(0);
-  await expect(
-    page.getByRole("option", { name: /New session/i }),
-  ).toHaveCount(0);
+  await expect(page.getByRole("option", { name: /New session/i })).toHaveCount(
+    0,
+  );
 });

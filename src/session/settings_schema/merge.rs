@@ -59,11 +59,11 @@ mod tests {
 
     #[test]
     fn override_leaf_keeps_siblings() {
-        let mut base = json!({"cockpit": {"enabled": false, "default_agent": "aoe-agent"}});
-        merge_json(&mut base, &json!({"cockpit": {"enabled": true}}));
+        let mut base = json!({"acp": {"enabled": false, "default_agent": "aoe-agent"}});
+        merge_json(&mut base, &json!({"acp": {"enabled": true}}));
         assert_eq!(
             base,
-            json!({"cockpit": {"enabled": true, "default_agent": "aoe-agent"}})
+            json!({"acp": {"enabled": true, "default_agent": "aoe-agent"}})
         );
     }
 
@@ -76,29 +76,29 @@ mod tests {
 
     #[test]
     fn absent_key_inherits() {
-        let mut base = json!({"cockpit": {"enabled": false, "max_concurrent_workers": 5}});
-        merge_json(&mut base, &json!({"cockpit": {"enabled": true}}));
-        assert_eq!(base["cockpit"]["max_concurrent_workers"], json!(5));
+        let mut base = json!({"acp": {"enabled": false, "max_concurrent_workers": 5}});
+        merge_json(&mut base, &json!({"acp": {"enabled": true}}));
+        assert_eq!(base["acp"]["max_concurrent_workers"], json!(5));
     }
 
     #[test]
     fn clear_removes_field_and_prunes_empty_section() {
-        let mut overrides = json!({"cockpit": {"enabled": true}});
-        assert!(clear_path(&mut overrides, "cockpit", "enabled"));
+        let mut overrides = json!({"acp": {"enabled": true}});
+        assert!(clear_path(&mut overrides, "acp", "enabled"));
         assert_eq!(overrides, json!({}));
     }
 
     #[test]
     fn clear_keeps_other_fields() {
-        let mut overrides = json!({"cockpit": {"enabled": true, "replay_bytes": 1024}});
-        assert!(clear_path(&mut overrides, "cockpit", "enabled"));
-        assert_eq!(overrides, json!({"cockpit": {"replay_bytes": 1024}}));
+        let mut overrides = json!({"acp": {"enabled": true, "replay_bytes": 1024}});
+        assert!(clear_path(&mut overrides, "acp", "enabled"));
+        assert_eq!(overrides, json!({"acp": {"replay_bytes": 1024}}));
     }
 
     #[test]
     fn clear_missing_is_noop() {
-        let mut overrides = json!({"cockpit": {"enabled": true}});
+        let mut overrides = json!({"acp": {"enabled": true}});
         assert!(!clear_path(&mut overrides, "sandbox", "cpu_limit"));
-        assert_eq!(overrides, json!({"cockpit": {"enabled": true}}));
+        assert_eq!(overrides, json!({"acp": {"enabled": true}}));
     }
 }

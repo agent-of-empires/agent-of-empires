@@ -29,10 +29,7 @@
 // re-navigation that would 401.
 
 import { test as base, expect, type Page } from "@playwright/test";
-import {
-  spawnAoeServe,
-  type ServeHandle,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, type ServeHandle } from "../helpers/aoeServe";
 import { seedAuth } from "../helpers/liveTest";
 
 const SWITCH_TO = "dracula";
@@ -57,7 +54,8 @@ function authHeaders(handle: ServeHandle): Record<string, string> {
   // browser.
   const out: Record<string, string> = {};
   if (handle.sessionCookie) {
-    out["Cookie"] = `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
+    out["Cookie"] =
+      `${handle.sessionCookie.name}=${handle.sessionCookie.value}`;
   }
   if (handle.deviceBindingSecret) {
     out["X-Aoe-Device-Binding"] = handle.deviceBindingSecret;
@@ -86,12 +84,16 @@ async function reLogin(handle: ServeHandle): Promise<void> {
     }),
   });
   if (!res.ok) {
-    throw new Error(`re-login after restart failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `re-login after restart failed: ${res.status} ${await res.text()}`,
+    );
   }
   const setCookie = res.headers.get("set-cookie") ?? "";
   const match = /aoe_session=([^;]+)/.exec(setCookie);
   if (!match) {
-    throw new Error(`re-login did not set aoe_session cookie. Set-Cookie: ${setCookie}`);
+    throw new Error(
+      `re-login did not set aoe_session cookie. Set-Cookie: ${setCookie}`,
+    );
   }
   handle.sessionCookie = { name: "aoe_session", value: match[1] };
 }
@@ -101,7 +103,9 @@ async function resolveDefaultProfile(handle: ServeHandle): Promise<string> {
     `${handle.baseUrl}/api/profiles`,
     { headers: authHeaders(handle) },
   ).then((r) => r.json());
-  return profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
+  return (
+    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main"
+  );
 }
 
 async function bootDashboardAndNavigate(
@@ -145,9 +149,11 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   // on 403 elevation_required, so a flaky "dialog never opened" race
   // can't silently let the test pass.
   await page.evaluate(() => {
-    (window as unknown as { __elevationFired?: boolean }).__elevationFired = false;
+    (window as unknown as { __elevationFired?: boolean }).__elevationFired =
+      false;
     window.addEventListener("aoe:elevation-required", () => {
-      (window as unknown as { __elevationFired?: boolean }).__elevationFired = true;
+      (window as unknown as { __elevationFired?: boolean }).__elevationFired =
+        true;
     });
   });
 
@@ -159,18 +165,20 @@ test("theme picker persists across reload + restart without passphrase prompt", 
   await expect
     .poll(
       async () =>
-        await themeSelect.evaluate((sel: HTMLSelectElement, target) =>
-          Array.from(sel.options).some((o) => o.value === target),
-        SWITCH_TO),
+        await themeSelect.evaluate(
+          (sel: HTMLSelectElement, target) =>
+            Array.from(sel.options).some((o) => o.value === target),
+          SWITCH_TO,
+        ),
       { timeout: 5_000 },
     )
     .toBe(true);
   await themeSelect.selectOption(SWITCH_TO);
 
   await expect(async () => {
-    const after = await fetch(profileUrl, { headers: authHeaders(servePreauthed) }).then(
-      (r) => r.json(),
-    );
+    const after = await fetch(profileUrl, {
+      headers: authHeaders(servePreauthed),
+    }).then((r) => r.json());
     expect(after?.theme?.name).toBe(SWITCH_TO);
   }).toPass({ timeout: 5_000 });
 
@@ -209,16 +217,16 @@ test("theme picker persists across reload + restart without passphrase prompt", 
     ),
     page.reload(),
   ]);
-  const afterReload = await fetch(profileUrl, { headers: authHeaders(servePreauthed) }).then(
-    (r) => r.json(),
-  );
+  const afterReload = await fetch(profileUrl, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
   expect(afterReload?.theme?.name).toBe(SWITCH_TO);
 
   await servePreauthed.restart();
   await reLogin(servePreauthed);
-  const afterRestart = await fetch(profileUrl, { headers: authHeaders(servePreauthed) }).then(
-    (r) => r.json(),
-  );
+  const afterRestart = await fetch(profileUrl, {
+    headers: authHeaders(servePreauthed),
+  }).then((r) => r.json());
   expect(afterRestart?.theme?.name).toBe(SWITCH_TO);
 });
 

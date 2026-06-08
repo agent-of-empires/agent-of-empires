@@ -76,7 +76,11 @@ export interface TerminalTimingDump extends TerminalTimingSnapshot {
     wsControlRttMs: number[];
     serverBusyMs: number[];
   };
-  connection: { effectiveType?: string; rtt?: number; downlink?: number } | null;
+  connection: {
+    effectiveType?: string;
+    rtt?: number;
+    downlink?: number;
+  } | null;
 }
 
 /** Token returned by `onBinaryFrame` when that frame resolved an armed
@@ -184,7 +188,12 @@ export class TerminalTiming {
 
   /** Resolve a pong. `clientT` is the value echoed back unchanged;
    *  `serverBusyUs` is the server's own recv-to-send duration. */
-  onPong(seq: number, clientT: number, serverBusyUs: number, now: number): void {
+  onPong(
+    seq: number,
+    clientT: number,
+    serverBusyUs: number,
+    now: number,
+  ): void {
     if (!this.pendingPing || this.pendingPing.seq !== seq) return;
     this.pendingPing = null;
     push(this.wsRtt, now - clientT);
@@ -239,7 +248,8 @@ export class TerminalTiming {
 
   summaryLine(): string {
     const s = this.snapshot();
-    const stack = s.derived.stackP50 === null ? "n/a" : `${s.derived.stackP50}ms`;
+    const stack =
+      s.derived.stackP50 === null ? "n/a" : `${s.derived.stackP50}ms`;
     return (
       `[terminal.timing] renderer=${s.renderer} ` +
       `key-socket p50/p95=${s.ttfbSocketMs.p50}/${s.ttfbSocketMs.p95}ms ` +

@@ -46,10 +46,9 @@ describe("buildCommentsMarkdown", () => {
   });
 
   it("renders range wording", () => {
-    const md = buildCommentsMarkdown(
-      [mk({ startLine: 10, endLine: 14 })],
-      { isMultiRepo: false },
-    );
+    const md = buildCommentsMarkdown([mk({ startLine: 10, endLine: 14 })], {
+      isMultiRepo: false,
+    });
     expect(md).toContain("### `src/foo.rs` lines 10-14 (new)");
   });
 
@@ -73,18 +72,16 @@ describe("buildCommentsMarkdown", () => {
   });
 
   it("prefixes repo when isMultiRepo", () => {
-    const md = buildCommentsMarkdown(
-      [mk({ repoName: "repoA" })],
-      { isMultiRepo: true },
-    );
+    const md = buildCommentsMarkdown([mk({ repoName: "repoA" })], {
+      isMultiRepo: true,
+    });
     expect(md).toContain("### [repoA] `src/foo.rs`");
   });
 
   it("does not prefix repo when not multi-repo even if repoName set", () => {
-    const md = buildCommentsMarkdown(
-      [mk({ repoName: "repoA" })],
-      { isMultiRepo: false },
-    );
+    const md = buildCommentsMarkdown([mk({ repoName: "repoA" })], {
+      isMultiRepo: false,
+    });
     expect(md).not.toContain("[repoA]");
   });
 
@@ -127,7 +124,9 @@ describe("buildDiffCommentsPrompt", () => {
       isMultiRepo: false,
     });
     expect(built.outro).toBe("Please address these comments.");
-    expect(built.assembledMarkdown).toMatch(/Please address these comments\.\n$/);
+    expect(built.assembledMarkdown).toMatch(
+      /Please address these comments\.\n$/,
+    );
   });
 
   it("uses provided outro when set", () => {
@@ -136,7 +135,9 @@ describe("buildDiffCommentsPrompt", () => {
     });
     expect(built.outro).toBe("Custom outro");
     expect(built.assembledMarkdown).toMatch(/Custom outro\n$/);
-    expect(built.assembledMarkdown).not.toContain("Please address these comments.");
+    expect(built.assembledMarkdown).not.toContain(
+      "Please address these comments.",
+    );
   });
 
   it("prepends intro when set", () => {
@@ -150,9 +151,14 @@ describe("buildDiffCommentsPrompt", () => {
   });
 
   it("trims surrounding whitespace from intro/outro", () => {
-    const built = buildDiffCommentsPrompt([mk({})], "  intro  \n", "   outro   ", {
-      isMultiRepo: false,
-    });
+    const built = buildDiffCommentsPrompt(
+      [mk({})],
+      "  intro  \n",
+      "   outro   ",
+      {
+        isMultiRepo: false,
+      },
+    );
     expect(built.intro).toBe("intro");
     expect(built.outro).toBe("outro");
     expect(built.assembledMarkdown.startsWith("intro\n")).toBe(true);

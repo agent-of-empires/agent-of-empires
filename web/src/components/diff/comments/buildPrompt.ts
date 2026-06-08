@@ -12,7 +12,7 @@ const DEFAULT_OUTRO = "Please address these comments.";
 const SENTINEL_PREFIX = "<!-- aoe:diff-comments:v1 ";
 const SENTINEL_SUFFIX = " -->";
 
-/** Structured fields the cockpit transcript needs to render the rich
+/** Structured fields the structured view transcript needs to render the rich
  *  `DiffCommentsUserCard`. Produced two ways: freshly by
  *  `buildDiffCommentsPrompt` (the typed-event send path), and by
  *  `parseDiffCommentsSentinel` when decoding legacy prompts that still
@@ -90,7 +90,7 @@ export function parseDiffCommentsSentinel(
 }
 
 /** Strip the sentinel prefix from a prompt body, returning the visible
- *  markdown the agent reads. Used by the cockpit renderer so the
+ *  markdown the agent reads. Used by the structured view renderer so the
  *  structured card doesn't show the raw HTML comment line. */
 export function stripDiffCommentsSentinel(text: string): string {
   if (!text.startsWith(SENTINEL_PREFIX)) return text;

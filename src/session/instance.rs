@@ -87,6 +87,13 @@ impl Status {
 /// Failures (both tiers) propagate as `Err` so callers keep the existing
 /// `Status::Error` + `last_error` path. Only successful outcomes are
 /// enumerated; mirrors the `EnsureReadyOutcome` shape.
+/// `last_error` the status poller stamps when a session's tmux pane is simply
+/// absent (killed, exited, server reboot) and nothing more specific was
+/// captured from the pane. The preview treats this as the calm "Stopped" case
+/// rather than a red crash error, since it carries no diagnostic detail.
+pub const TMUX_SESSION_GONE_ERROR: &str =
+    "tmux session is gone. The agent process may have exited or been killed.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
@@ -96,7 +103,7 @@ pub enum StartOutcome {
     /// conversation is gone. `stale_sid` is the sid that was cleared.
     Restarted { stale_sid: String },
     /// No resume cascade ran. Either no prior sid, the agent doesn't support
-    /// resume, the sid was invalid, the session is cockpit-mode (no tmux
+    /// resume, the sid was invalid, the session is structured view-mode (no tmux
     /// pane), or the tmux session was already alive when entered (so
     /// `start_with_size_opts` was a no-op and the probe had nothing to
     /// detect). The pane is alive on return; whether a fresh launch
@@ -121,7 +128,7 @@ pub enum LaunchSidOutcome {
     /// or `None`. No prior conversation continued.
     Fresh,
     /// `start_with_size_opts` short-circuited before `apply_session_flags`
-    /// ran: cockpit-mode session, or pre-existing tmux pane (kill_clean
+    /// ran: structured view-mode session, or pre-existing tmux pane (kill_clean
     /// cache race). `agent_session_id` was not mutated this call.
     Skipped,
 }
@@ -179,6 +186,26 @@ pub enum EnsureReadyOutcome {
     Started { stale_sid: Option<String> },
 }
 
+/// How a session is rendered. `Structured` uses the ACP-based native
+/// rendering (plan panels, tool-call cards, approvals); `Terminal` streams
+/// the raw tmux/PTY through xterm.js. `Terminal` is the conservative
+/// deserialization default; session creation sets the value explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum View {
+    #[default]
+    Terminal,
+    Structured,
+}
+
+impl View {
+    /// `skip_serializing_if` predicate: only the non-default `Structured`
+    /// value is persisted, mirroring the old `structured_view` bool shape.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, View::Terminal)
+    }
+}
+
 /// Errors `ensure_pane_ready` can return. Separating transient lifecycle
 /// states from real tmux failures lets HTTP callers map them to 409 (retry)
 /// vs 500 (real failure) instead of lumping everything as a tmux error.
@@ -186,8 +213,8 @@ pub enum EnsureReadyOutcome {
 pub enum EnsureReadyError {
     /// Instance is mid-lifecycle (Creating/Deleting). Caller should retry.
     Transient(Status),
-    /// Instance is cockpit-mode (no backing tmux pane); send is not supported.
-    CockpitMode,
+    /// Instance is structured view-mode (no backing tmux pane); send is not supported.
+    StructuredView,
     /// Underlying tmux operation failed.
     Tmux(anyhow::Error),
 }
@@ -201,9 +228,9 @@ impl std::fmt::Display for EnsureReadyError {
                     "Session is mid-lifecycle ({status:?}); cannot send right now"
                 )
             }
-            EnsureReadyError::CockpitMode => write!(
+            EnsureReadyError::StructuredView => write!(
                 f,
-                "Cockpit-mode sessions have no tmux pane; send is not supported"
+                "Acp-mode sessions have no tmux pane; send is not supported"
             ),
             EnsureReadyError::Tmux(e) => write!(f, "{e}"),
         }
@@ -390,9 +417,9 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<DateTime<Utc>>,
 
-    /// Internal cockpit idle-dormancy marker. Set by the reconciler's
-    /// idle-reap pass when a cockpit worker is shut down for inactivity
-    /// (`cockpit.auto_stop_idle_secs`); while set, the reconciler skips
+    /// Internal structured view idle-dormancy marker. Set by the reconciler's
+    /// idle-reap pass when a structured view worker is shut down for inactivity
+    /// (`acp.auto_stop_idle_secs`); while set, the reconciler skips
     /// respawning the worker, so the session stays stopped until the
     /// user comes back. Cleared by `touch_last_accessed()` (the same
     /// wake path that clears archive/snooze), so the next prompt revives
@@ -486,32 +513,33 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
-    /// Whether this session uses the ACP cockpit instead of a tmux pane.
-    /// When true, aoe spawns an ACP agent subprocess and renders structured
-    /// events natively; tmux integration is bypassed for this session.
+    /// How this session is rendered: `Structured` (ACP native rendering) or
+    /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
+    /// subprocess and renders structured events natively; tmux integration is
+    /// bypassed for this session.
     #[cfg(feature = "serve")]
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub cockpit_mode: bool,
-    /// Optional cockpit agent name (e.g., "claude-code", "aoe-agent",
-    /// "gemini"). When None, the cockpit picks the default for the
+    #[serde(default, skip_serializing_if = "View::is_terminal")]
+    pub view: View,
+    /// Optional structured view agent name (e.g., "claude-code", "aoe-agent",
+    /// "gemini"). When None, the structured view picks the default for the
     /// session's tool.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cockpit_agent: Option<String>,
+    pub agent_name: Option<String>,
     /// Optional model id forwarded to aoe-agent (e.g., "claude-opus-4-7",
     /// "gpt-5", "llama3.3:ollama").
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cockpit_model: Option<String>,
+    pub agent_model: Option<String>,
     /// Agent-assigned ACP session id captured from `session/new`. When
     /// the agent advertises `agent_capabilities.load_session = true`
     /// (claude-agent-acp does), the next spawn calls `session/load`
     /// with this id so the agent reloads its on-disk transcript and
     /// the model retains context across `aoe serve` restarts. Cleared
-    /// on cockpit_disable, session delete, or `session/load` failure.
+    /// on acp_disable, session delete, or `session/load` failure.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cockpit_acp_session_id: Option<String>,
+    pub acp_session_id: Option<String>,
 
     // Runtime state (not serialized)
     #[serde(skip)]
@@ -767,13 +795,13 @@ impl Instance {
             notify_on_error: None,
             base_branch_override: None,
             #[cfg(feature = "serve")]
-            cockpit_mode: false,
+            view: View::Terminal,
             #[cfg(feature = "serve")]
-            cockpit_agent: None,
+            agent_name: None,
             #[cfg(feature = "serve")]
-            cockpit_model: None,
+            agent_model: None,
             #[cfg(feature = "serve")]
-            cockpit_acp_session_id: None,
+            acp_session_id: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -781,6 +809,18 @@ impl Instance {
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
         }
+    }
+
+    /// Whether a title rename should also move the worktree directory leaf,
+    /// given the resolved `session.tie_workdir_to_name` setting. True only for
+    /// aoe-managed worktree sessions: non-worktree (scratch, plain tmux) and
+    /// externally-attached worktrees are always a no-op. See #1927.
+    pub fn tie_workdir_applies(&self, tie_setting: bool) -> bool {
+        tie_setting
+            && self
+                .worktree_info
+                .as_ref()
+                .is_some_and(|w| w.managed_by_aoe)
     }
 
     /// Stamp `last_accessed_at` to the current time AND wake the session
@@ -803,14 +843,14 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
-    /// Whether this session's cockpit worker was auto-stopped for
+    /// Whether this session's structured view worker was auto-stopped for
     /// inactivity and should not be respawned by the reconciler until the
     /// user wakes it. See `idle_dormant_since` and #1689.
     pub fn is_idle_dormant(&self) -> bool {
         self.idle_dormant_since.is_some()
     }
 
-    /// Mark the session dormant after its cockpit worker was auto-stopped
+    /// Mark the session dormant after its structured view worker was auto-stopped
     /// for inactivity. Idempotent: re-marking refreshes the timestamp.
     pub fn mark_idle_dormant(&mut self) {
         self.idle_dormant_since = Some(Utc::now());
@@ -1210,14 +1250,13 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session runs through the ACP cockpit (managed by
-    /// `aoe serve`'s supervisor) rather than a tmux pane. Always false
-    /// when the `serve` feature is disabled, since the field doesn't
-    /// exist and no session can be in cockpit mode.
-    pub fn is_cockpit_mode(&self) -> bool {
+    /// True when this session renders in the structured (ACP) view rather
+    /// than a tmux pane. Always false when the `serve` feature is disabled,
+    /// since the field doesn't exist and no session can be structured.
+    pub fn is_structured(&self) -> bool {
         #[cfg(feature = "serve")]
         {
-            self.cockpit_mode
+            self.view == View::Structured
         }
         #[cfg(not(feature = "serve"))]
         {
@@ -1627,17 +1666,17 @@ impl Instance {
         // Validate before any shell-command construction in
         // `build_launch_command` (covers `status_hook_env_prefix` and
         // the sandbox docker_args interpolation). Runs before the
-        // cockpit short-circuit so a tampered id surfaces as `Err` for
-        // cockpit sessions too.
+        // structured view short-circuit so a tampered id surfaces as `Err` for
+        // structured view sessions too.
         crate::session::validate_instance_id(&self.id)
             .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
 
-        // Cockpit-mode sessions are not backed by tmux. The cockpit
+        // Acp-mode sessions are not backed by tmux. The structured view
         // worker supervisor spawns the ACP agent process directly;
-        // calling start() on a cockpit session is a no-op (status
+        // calling start() on a structured view session is a no-op (status
         // updates flow through the ACP event channel, not tmux).
         #[cfg(feature = "serve")]
-        if self.cockpit_mode {
+        if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
 
@@ -1696,7 +1735,7 @@ impl Instance {
     }
 
     /// Build the launch command string the way `start_with_size_opts` would,
-    /// but without creating a tmux session. Returns `None` for cockpit or
+    /// but without creating a tmux session. Returns `None` for structured view or
     /// other modes where there is no command to launch.
     ///
     /// Side effects mirror the start path: agent status hooks are installed,
@@ -1807,14 +1846,14 @@ impl Instance {
             .hooks
             .on_launch;
 
-        // Check if repo has trusted hooks that override
-        match super::repo_config::check_hook_trust(Path::new(&self.project_path)) {
-            Ok(super::repo_config::HookTrustStatus::Trusted(hooks))
-                if !hooks.on_launch.is_empty() =>
-            {
-                resolved_on_launch = hooks.on_launch.clone();
+        // Check if repo has trusted hooks that override. Only the hooks surface
+        // matters here; untrusted project MCP must not suppress trusted hooks.
+        if let Ok(trust) = super::repo_config::check_repo_trust(Path::new(&self.project_path)) {
+            if let Some(hooks) = trust.hooks.trusted() {
+                if !hooks.on_launch.is_empty() {
+                    resolved_on_launch = hooks.on_launch;
+                }
             }
-            _ => {}
         }
 
         if resolved_on_launch.is_empty() {
@@ -2715,9 +2754,9 @@ impl Instance {
     /// (~100ms macOS grace) + Tier-2 spawn + a second `RESUME_PROBE_MAX`
     /// window: ~6-7s total worst-case.
     ///
-    /// Cockpit-mode sessions short-circuit (no tmux pane to probe).
-    /// `StartOutcome::Fresh` is honest there: cockpit's resume concept lives
-    /// in `cockpit_acp_session_id` and is handled by the ACP supervisor, not
+    /// Acp-mode sessions short-circuit (no tmux pane to probe).
+    /// `StartOutcome::Fresh` is honest there: structured view's resume concept lives
+    /// in `acp_session_id` and is handled by the ACP supervisor, not
     /// by this cascade.
     pub(crate) fn start_with_resume_fallback(
         &mut self,
@@ -2726,7 +2765,7 @@ impl Instance {
     ) -> Result<StartOutcome> {
         // Clear `Status::Error` on entry so a successful relaunch from any
         // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
-        // `aoe session restart [id|--all]`, cockpit-mode short-circuit)
+        // `aoe session restart [id|--all]`, structured view-mode short-circuit)
         // does not leave a stale error chip up. REST `ensure_session`
         // re-asserts `status=Starting`, `last_error=None` pre-call as
         // defense in depth.
@@ -2745,7 +2784,7 @@ impl Instance {
         }
 
         #[cfg(feature = "serve")]
-        if self.cockpit_mode {
+        if self.is_structured() {
             let _ = self.start_with_size_opts(size, skip_on_launch)?;
             return Ok(StartOutcome::Fresh);
         }
@@ -2937,7 +2976,7 @@ impl Instance {
     /// - Already alive: no-op.
     ///
     /// Bails on Creating/Deleting (transient lifecycle states) and on
-    /// cockpit-mode sessions (no backing tmux pane).
+    /// structured view-mode sessions (no backing tmux pane).
     ///
     /// On `Started` / `Respawned`, polls briefly so keystrokes don't race the
     /// agent's startup splash. Best-effort: returns after the timeout even if
@@ -2961,8 +3000,8 @@ impl Instance {
             return Err(EnsureReadyError::Transient(self.status));
         }
         #[cfg(feature = "serve")]
-        if self.cockpit_mode {
-            return Err(EnsureReadyError::CockpitMode);
+        if self.is_structured() {
+            return Err(EnsureReadyError::StructuredView);
         }
         let session = self.tmux_session().map_err(EnsureReadyError::Tmux)?;
         if !session.exists() {
@@ -3125,18 +3164,16 @@ impl Instance {
             return;
         }
 
-        // Cockpit-mode sessions are not backed by a tmux pane; the cockpit
+        // Acp-mode sessions are not backed by a tmux pane; the structured view
         // worker supervisor owns their lifecycle and emits typed health
         // events over the broadcast. Probing tmux here only ever produces
         // a spurious "tmux session is gone" Error transition.
         #[cfg(feature = "serve")]
-        if self.cockpit_mode {
+        if self.is_structured() {
             // Clear any stale tmux-derived error so the UI doesn't show
             // a misleading message after a session is converted or
-            // restarted with cockpit_mode on.
-            if self.last_error.as_deref()
-                == Some("tmux session is gone. The agent process may have exited or been killed.")
-            {
+            // restarted in the structured view.
+            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
                 self.last_error = None;
             }
             if self.status == Status::Error {
@@ -3186,10 +3223,7 @@ impl Instance {
             );
             self.status = Status::Error;
             if self.last_error.is_none() {
-                self.last_error = Some(
-                    "tmux session is gone. The agent process may have exited or been killed."
-                        .to_string(),
-                );
+                self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
             }
             self.last_error_check = Some(std::time::Instant::now());
             return;
@@ -3235,15 +3269,26 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                self.status = if detection_tool == "codex" && hook_status == Status::Running {
+                // Codex and Claude both report Running from hooks while their
+                // pane is actually parked on a blocking prompt, so when the
+                // hook says Running we capture the pane and let the agent's
+                // reconciler downgrade it (Codex: plan/numbered prompts;
+                // Claude: tool-approval prompts, see #1913).
+                let reconciles_running = detection_tool == "codex" || detection_tool == "claude";
+                self.status = if reconciles_running && hook_status == Status::Running {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
-                            tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                            if detection_tool == "codex" {
+                                tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                            } else {
+                                tmux::reconcile_claude_hook_status(hook_status, &pane_content)
+                            }
                         }
                         Err(e) => {
                             tracing::trace!(
-                                "status '{}': codex hook fallback pane capture failed: {}",
+                                "status '{}': {} hook fallback pane capture failed: {}",
                                 self.title,
+                                detection_tool,
                                 e
                             );
                             hook_status
@@ -3494,11 +3539,18 @@ fn resolve_detected_status(
     match detected {
         Status::Idle if has_command_override => {
             // Custom commands run agents through wrapper scripts that appear
-            // as shell processes to tmux. Only declare Error when the pane is
-            // actually dead; don't use shell-stale since the shell IS the
-            // expected wrapper process.
+            // as shell processes to tmux, so we can't trust the pane's current
+            // command here; decide from pane *content* instead. A pane that is
+            // still rendering the agent TUI is genuinely parked at its prompt,
+            // so a detected Idle is real and we keep it (otherwise on_idle /
+            // on_waiting status hooks never fire for wrapped agents, e.g. an
+            // opencode session launched via agent_command_override, see #2022).
+            // Only declare Error when the pane is actually dead; a live pane
+            // without recognizable agent content stays Unknown.
             if is_dead {
                 Status::Error
+            } else if pane_has_agent_content(pane_content, tool) {
+                Status::Idle
             } else {
                 Status::Unknown
             }
@@ -3639,7 +3691,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let mut inst = Instance::new("wrapped", "/tmp/test");
@@ -3660,7 +3712,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let codex_home = tmp.path().join("profile-codex-home");
@@ -3690,7 +3742,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
@@ -3715,7 +3767,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = CodexHomeGuard::unset();
         std::env::set_var("HOME", tmp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
         let mut global = crate::session::config::Config::default();
@@ -4302,12 +4354,12 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn test_ensure_pane_ready_bails_on_cockpit_mode() {
+    fn test_ensure_pane_ready_bails_on_structured() {
         let mut inst = Instance::new("test", "/tmp/test");
-        inst.cockpit_mode = true;
+        inst.view = View::Structured;
         match inst.ensure_pane_ready() {
-            Err(EnsureReadyError::CockpitMode) => {}
-            other => panic!("expected CockpitMode, got {other:?}"),
+            Err(EnsureReadyError::StructuredView) => {}
+            other => panic!("expected StructuredView, got {other:?}"),
         }
     }
 
@@ -4777,24 +4829,24 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn test_instance_cockpit_acp_session_id_roundtrip() {
+    fn test_instance_acp_acp_session_id_roundtrip() {
         let mut inst = Instance::new("Test", "/tmp/test");
-        inst.cockpit_mode = true;
-        inst.cockpit_acp_session_id = Some("acp-uuid-1234".to_string());
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("acp-uuid-1234".to_string());
 
         let json = serde_json::to_string(&inst).unwrap();
-        assert!(json.contains("cockpit_acp_session_id"));
+        assert!(json.contains("acp_session_id"));
         let deserialized: Instance = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            deserialized.cockpit_acp_session_id,
+            deserialized.acp_session_id,
             Some("acp-uuid-1234".to_string())
         );
 
         // None should not be serialized.
         let mut inst2 = Instance::new("Test", "/tmp/test");
-        inst2.cockpit_mode = true;
+        inst2.view = View::Structured;
         let json2 = serde_json::to_string(&inst2).unwrap();
-        assert!(!json2.contains("cockpit_acp_session_id"));
+        assert!(!json2.contains("acp_session_id"));
     }
 
     #[test]
@@ -5112,9 +5164,9 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn start_with_size_opts_returns_skipped_for_cockpit_mode() {
+    fn start_with_size_opts_returns_skipped_for_structured() {
         let mut inst = Instance::new("Test", "/tmp/test");
-        inst.cockpit_mode = true;
+        inst.view = View::Structured;
         let outcome = inst.start_with_size_opts(None, false).unwrap();
         assert_eq!(outcome, LaunchSidOutcome::Skipped);
     }
@@ -5366,6 +5418,19 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_detected_status_command_override_agent_content_stays_idle() {
+        // A wrapped agent (agent_command_override) whose pane still renders the
+        // agent TUI must keep its detected Idle so on_idle / on_waiting status
+        // hooks fire; previously the override masked every Idle to Unknown and
+        // those hooks never ran (#2022).
+        let content = "ctrl+p commands \u{2022} OpenCode 1.16.2";
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, false, true, content, "opencode"),
+            Status::Idle
+        );
+    }
+
+    #[test]
     fn test_pane_has_agent_content_agent_ui() {
         let opencode_idle = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
         assert!(pane_has_agent_content(opencode_idle, "opencode"));
@@ -5610,7 +5675,7 @@ mod tests {
         fn persist_session_to_storage_skips_on_cas_mismatch() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("cas-persist-mismatch").unwrap();
@@ -5639,7 +5704,7 @@ mod tests {
         fn persist_session_to_storage_writes_on_cas_match() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("cas-persist-match").unwrap();
@@ -5668,7 +5733,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_persist() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("reconcile-test").unwrap();
@@ -5707,7 +5772,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_clear() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("reconcile-clear").unwrap();
@@ -5857,7 +5922,7 @@ mod tests {
         fn reconcile_from_disk_picks_up_peer_resume_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("intent-reconcile").unwrap();
@@ -5923,7 +5988,7 @@ mod tests {
         fn reconcile_sidecar_adopts_fresh_sid_for_claude_default() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-adopt";
@@ -5961,7 +6026,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_tool_not_claude() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-tool";
@@ -5993,7 +6058,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_intent_use() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-use";
@@ -6025,7 +6090,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_intent_cleared() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-cleared";
@@ -6057,7 +6122,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_sid_in_retroactive_excludes() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-noop-excluded";
@@ -6091,7 +6156,7 @@ mod tests {
         fn reconcile_sidecar_noop_when_sidecar_absent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-absent";
@@ -6120,7 +6185,7 @@ mod tests {
         fn reconcile_sidecar_reloads_on_cas_skip() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "sidecar-cas-skip";
@@ -6172,7 +6237,7 @@ mod tests {
         fn persist_session_id_reloads_memory_on_skipped() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-skipped-reload").unwrap();
@@ -6209,7 +6274,7 @@ mod tests {
         fn persist_session_id_atomic_writes_both_fields_on_match() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-atomic-match").unwrap();
@@ -6252,7 +6317,7 @@ mod tests {
         fn persist_session_id_writes_sid_only_on_default_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-default-intent").unwrap();
@@ -6294,7 +6359,7 @@ mod tests {
         fn persist_session_id_persists_sid_when_intent_cas_mismatches() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("persist-intent-mismatch").unwrap();
@@ -6348,7 +6413,7 @@ mod tests {
         fn persist_session_id_skipped_reloads_both_fields() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage =
@@ -6407,7 +6472,7 @@ mod tests {
         fn clear_for_resume_fallback_atomically_clears_and_downgrades() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-happy";
@@ -6433,7 +6498,7 @@ mod tests {
         fn clear_for_resume_fallback_intent_already_default() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-default";
@@ -6458,7 +6523,7 @@ mod tests {
         fn clear_for_resume_fallback_preserves_user_repin() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-repin";
@@ -6498,7 +6563,7 @@ mod tests {
         fn clear_for_resume_fallback_skips_on_sid_cas_mismatch() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-sid-mismatch";
@@ -6543,7 +6608,7 @@ mod tests {
         fn clear_for_resume_fallback_heals_legacy_stuck_state() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-heal-legacy";
@@ -6580,7 +6645,7 @@ mod tests {
         fn clear_for_resume_fallback_skips_on_user_repin_with_none_sid() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-repin-none-sid";
@@ -6621,7 +6686,7 @@ mod tests {
         fn clear_for_resume_fallback_intent_cleared_not_downgraded() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-intent-cleared";
@@ -6650,7 +6715,7 @@ mod tests {
         fn clear_for_resume_fallback_returns_failed_on_missing_row() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let profile = "fallback-clear-missing";
@@ -6672,14 +6737,14 @@ mod tests {
         #[cfg(feature = "serve")]
         #[test]
         #[serial]
-        fn restart_outcome_for_cockpit_session_is_fresh() {
+        fn restart_outcome_for_acp_session_is_fresh() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let mut inst = Instance::new("cockpit_test", "/tmp/x");
-            inst.cockpit_mode = true;
+            let mut inst = Instance::new("acp_test", "/tmp/x");
+            inst.view = crate::session::instance::View::Structured;
             inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
             inst.tool = "claude".to_string();
 
@@ -6700,7 +6765,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage = crate::session::storage::Storage::new("fb-test").unwrap();
@@ -6774,7 +6839,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let _storage = crate::session::storage::Storage::new("fb-test-live").unwrap();
@@ -6856,7 +6921,7 @@ mod tests {
             }
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let _storage = crate::session::storage::Storage::new("fb-test-grace").unwrap();
@@ -6986,7 +7051,7 @@ mod tests {
 
         fn isolate_home(temp: &TempDir) {
             std::env::set_var("HOME", temp.path());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
         }
 
@@ -7234,5 +7299,128 @@ mod tests {
                 "no tmux session must exist after refusal for id={poisoned:?}"
             );
         }
+    }
+
+    struct KillTmuxOnDrop(String);
+    impl Drop for KillTmuxOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+        }
+    }
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end regression for #1913 through the real status pipeline.
+    ///
+    /// A sandboxed (or hook-equipped) Claude session reports `running` from
+    /// its hook while the pane is actually parked on a tool-approval prompt:
+    /// the `Notification` -> waiting write gets clobbered by a running-mapped
+    /// hook that re-fires during concurrent turn activity, and Claude keeps
+    /// its live spinner rendered below the prompt. Before the fix the pipeline
+    /// trusted the hook's `running` and showed green; now it captures the pane
+    /// and reconciles to Waiting.
+    #[test]
+    #[serial_test::serial]
+    fn update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let mut inst = Instance::new("aoe_test_1913_wait", "/tmp");
+        assert_eq!(inst.tool, "claude");
+
+        // Pane shows the approval prompt with the live spinner still active
+        // below it, the exact shape from the issue screenshot. The spinner
+        // line means the bare pane detector would say Running, so a green
+        // reading here can only come from reconciliation doing its job.
+        let pane = "  Bash command\n    \
+touch /tmp/aoe_test_1913/marker.txt\n    Create marker file\n  \
+Do you want to proceed?\n  \u{276f} 1. Yes\n    \
+2. Yes, and always allow access to this project\n    3. No\n  \
+Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
+\u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)\n";
+        let pane_file = std::env::temp_dir().join(format!("aoe_test_1913_{}.txt", inst.id));
+        std::fs::write(&pane_file, pane).expect("write pane fixture");
+
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        // Single-quote the path so a temp dir with spaces or shell
+        // metacharacters (e.g. macOS `$TMPDIR`) can't break the launch
+        // command; embedded single quotes are closed/escaped/reopened.
+        let quoted_pane_file =
+            format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let launch = format!("cat {quoted_pane_file}; sleep 300");
+        let created = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                &launch,
+            ])
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        // The clobbered hook state that produced the green row.
+        let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
+        std::fs::create_dir_all(&dir).expect("create hook dir");
+        std::fs::write(dir.join("status"), "running").expect("write status");
+        assert_eq!(
+            crate::hooks::read_hook_status(&inst.id),
+            Some(Status::Running),
+            "precondition: the raw hook signal is the Running that showed green"
+        );
+
+        // Wait for the pane to actually paint the cat output before the
+        // authoritative read; a fixed sleep is flaky under parallel test load.
+        let mut painted = false;
+        for _ in 0..50 {
+            let cap = std::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", &session_name])
+                .output();
+            if let Ok(out) = cap {
+                if String::from_utf8_lossy(&out.stdout).contains("Do you want to proceed?") {
+                    painted = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(painted, "approval prompt never painted into the tmux pane");
+
+        // `Session::exists()` reads a process-global 2s session cache that a
+        // concurrent test may have snapshotted before this session existed,
+        // which surfaces as a spurious Error (and the 30s error latch would
+        // then pin it). Refresh from live tmux now that the pane is painted so
+        // the single authoritative read sees a true existence result.
+        crate::tmux::refresh_session_cache();
+        inst.update_status();
+
+        std::fs::remove_file(&pane_file).ok();
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+
+        assert_eq!(
+            inst.status,
+            Status::Waiting,
+            "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
+        );
     }
 }

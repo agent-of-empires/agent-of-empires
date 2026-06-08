@@ -103,18 +103,21 @@ impl DiffView {
     /// that have a session id should use `new_for_session` so the
     /// override persists.
     pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None)
+        Self::new_for_session(repo_path, None, String::new(), None, None)
     }
 
     /// Create a diff view bound to a session. `base_override` (the
     /// session's persisted `base_branch_override`) wins over the
-    /// profile default and auto-detection. Subsequent calls to
-    /// `select_branch` persist the new ref back to the session record.
+    /// worktree's recorded base branch (`worktree_base`), which wins
+    /// over the profile default and auto-detection. Subsequent calls
+    /// to `select_branch` persist the new ref back to the session
+    /// record.
     pub fn new_for_session(
         repo_path: PathBuf,
         session_id: Option<String>,
         profile: String,
         base_override: Option<String>,
+        worktree_base: Option<String>,
     ) -> anyhow::Result<Self> {
         // Use the profile-merged config so a per-profile Diff override (e.g.
         // split_view) is honored on open. The session-agnostic path (empty
@@ -130,6 +133,13 @@ impl DiffView {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                worktree_base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
             .or_else(|| config.diff.default_branch.clone())
             .or_else(|| get_default_base_ref(&repo_path).ok())
             .unwrap_or_else(|| "main".to_string());

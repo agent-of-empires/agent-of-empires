@@ -1,6 +1,6 @@
 // Mode-picker channel resolution (#1764).
 //
-// The cockpit composer's mode picker can be driven by three different
+// The structured view composer's mode picker can be driven by three different
 // sources depending on what the active agent advertises over ACP. This
 // module owns the precedence and the read/write pairing so the picker
 // never reads one channel while writing another (the bug that trapped
@@ -22,11 +22,7 @@
 // When none apply (a non-claude agent that advertised nothing), the
 // picker renders nothing rather than a vocabulary the agent rejects.
 
-import type {
-  CockpitState,
-  ConfigOptionDescriptor,
-  SessionMode,
-} from "./cockpitTypes";
+import type { AcpState, ConfigOptionDescriptor, SessionMode } from "./acpTypes";
 
 /** Claude's historical four-mode taxonomy. Used only as the
  *  `capabilities.legacyModeFallback` fallback; not an ACP default. */
@@ -36,10 +32,30 @@ export const LEGACY_MODES: ReadonlyArray<{
   name: string;
   description: string;
 }> = [
-  { id: "default", legacyId: "Default", name: "Default", description: "Approve each tool individually" },
-  { id: "plan", legacyId: "Plan", name: "Plan", description: "Plan first, no edits applied" },
-  { id: "accept_edits", legacyId: "AcceptEdits", name: "Accept edits", description: "Auto-approve safe file edits" },
-  { id: "bypass_permissions", legacyId: "BypassPermissions", name: "Yolo", description: "Skip all approvals (destructive)" },
+  {
+    id: "default",
+    legacyId: "Default",
+    name: "Default",
+    description: "Approve each tool individually",
+  },
+  {
+    id: "plan",
+    legacyId: "Plan",
+    name: "Plan",
+    description: "Plan first, no edits applied",
+  },
+  {
+    id: "accept_edits",
+    legacyId: "AcceptEdits",
+    name: "Accept edits",
+    description: "Auto-approve safe file edits",
+  },
+  {
+    id: "bypass_permissions",
+    legacyId: "BypassPermissions",
+    name: "Yolo",
+    description: "Skip all approvals (destructive)",
+  },
 ];
 
 export interface ModeOption {
@@ -75,11 +91,11 @@ export type ModeChannel =
     };
 
 export interface ResolveModeChannelArgs {
-  configOptions: CockpitState["configOptions"];
-  availableModes: CockpitState["availableModes"];
+  configOptions: AcpState["configOptions"];
+  availableModes: AcpState["availableModes"];
   currentModeId: string | null;
   legacyMode: SessionMode;
-  pendingConfigOption: CockpitState["pendingConfigOption"];
+  pendingConfigOption: AcpState["pendingConfigOption"];
   /** From the active agent's profile (`capabilities.legacyModeFallback`). */
   allowLegacyFallback: boolean;
 }
@@ -87,9 +103,7 @@ export interface ResolveModeChannelArgs {
 function findModeConfig(
   options: ConfigOptionDescriptor[],
 ): ConfigOptionDescriptor | undefined {
-  return options.find(
-    (o) => o.category === "mode" && o.options.length > 0,
-  );
+  return options.find((o) => o.category === "mode" && o.options.length > 0);
 }
 
 /** Resolve the mode-picker channel, or null when the picker should not

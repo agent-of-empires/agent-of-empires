@@ -49,7 +49,7 @@ pub enum SettingsCategory {
     StatusHooks,
     Hooks,
     Web,
-    Cockpit,
+    Acp,
     Diff,
     Logging,
 }
@@ -70,7 +70,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Cockpit => "Cockpit",
+            Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
@@ -93,7 +93,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Cockpit => "Cockpit",
+            Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
@@ -189,8 +189,8 @@ pub enum ListItemValidation {
     CustomAgent,
     /// `name=builtin`, where `builtin` is a known agent.
     DetectAs,
-    /// `name=command`, an ACP launch command split into argv (cockpit).
-    CockpitCmd,
+    /// `name=command`, an ACP launch command split into argv (acp).
+    AcpCmd,
     /// Host/sandbox env entry (`KEY=value` etc).
     EnvEntry,
 }
@@ -241,7 +241,7 @@ impl SettingField {
                     }
                     "custom_agents" => ListItemValidation::CustomAgent,
                     "agent_detect_as" => ListItemValidation::DetectAs,
-                    "agent_cockpit_cmd" => ListItemValidation::CockpitCmd,
+                    "agent_acp_cmd" => ListItemValidation::AcpCmd,
                     _ => ListItemValidation::None,
                 }
             }
@@ -261,6 +261,25 @@ impl SettingField {
                 if section == "session" && field == "snooze_duration_minutes" =>
             {
                 validate_snooze_duration(*n)
+            }
+            // acp_defaults is edited as raw JSON; require a JSON object so a
+            // typo is rejected at commit instead of wiping the map.
+            (
+                FieldKind::Schema {
+                    widget: WidgetKind::Custom { id },
+                    ..
+                },
+                FieldValue::Text(s),
+            ) if id == "acp-defaults" => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(());
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) if v.is_object() => Ok(()),
+                    Ok(_) => Err("Must be a JSON object (agent -> {model, effort})".to_string()),
+                    Err(e) => Err(format!("Invalid JSON: {e}")),
+                }
             }
             // Sound files must exist on disk if named.
             (FieldKind::Schema { section, .. }, FieldValue::OptionalText(Some(name)))
@@ -349,7 +368,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "agent_command_override"
                 | "custom_agents"
                 | "agent_detect_as"
-                | "agent_cockpit_cmd"
+                | "agent_acp_cmd"
         )
 }
 
@@ -442,6 +461,17 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             let options = volume_options();
             let selected = volume_to_index(current.as_f64().unwrap_or(1.0));
             FieldValue::Select { selected, options }
+        }
+        "acp-defaults" => {
+            // Edited as raw JSON in an inline field; validation on commit
+            // rejects anything that is not a JSON object, so a typo cannot
+            // wipe the map.
+            let text = if current.is_null() {
+                "{}".to_string()
+            } else {
+                serde_json::to_string(current).unwrap_or_else(|_| "{}".to_string())
+            };
+            FieldValue::Text(text)
         }
         // logging-targets is expanded into per-target rows during build and
         // never lands here.
@@ -538,6 +568,18 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
             .get(*selected)
             .map(|s| json!(volume_from_option(s)))
             .unwrap_or(Value::Null),
+        ("acp-defaults", FieldValue::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return json!({});
+            }
+            // Commit-time validation guarantees a valid object here; fall back
+            // to an empty map rather than corrupt the leaf if it ever slips.
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(v) if v.is_object() => v,
+                _ => json!({}),
+            }
+        }
         _ => Value::Null,
     }
 }
@@ -995,6 +1037,37 @@ mod tests {
     }
 
     #[test]
+    fn acp_defaults_custom_widget_round_trips_json() {
+        let current = json!({"opencode": {"model": "x", "effort": "high"}});
+        let fv = custom_value_from_json("acp-defaults", &current);
+        let FieldValue::Text(s) = &fv else {
+            panic!("acp-defaults must build a Text field");
+        };
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text(s.clone())),
+            current,
+        );
+
+        // Empty text and a null current both resolve to an empty map, never a
+        // corrupt leaf.
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text(String::new())),
+            json!({}),
+        );
+        assert!(matches!(
+            custom_value_from_json("acp-defaults", &Value::Null),
+            FieldValue::Text(t) if t == "{}"
+        ));
+
+        // Non-object JSON (which validation rejects before commit) degrades to
+        // an empty map rather than writing a string/array into the field.
+        assert_eq!(
+            custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
+            json!({}),
+        );
+    }
+
+    #[test]
     fn profile_field_inherits_after_global_change() {
         let mut global = Config::default();
         let profile = ProfileConfig::default();
@@ -1169,11 +1242,11 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_fields_have_advanced_section_marker() {
+    fn acp_fields_have_advanced_section_marker() {
         let global = Config::default();
         let profile = ProfileConfig::default();
         let fields = build_fields_for_category(
-            SettingsCategory::Cockpit,
+            SettingsCategory::Acp,
             SettingsScope::Global,
             &global,
             &profile,
@@ -1181,27 +1254,25 @@ mod tests {
         let header_idx = fields
             .iter()
             .position(|f| matches!(f.value, FieldValue::SectionHeader))
-            .expect("cockpit should contain an Advanced section header");
+            .expect("acp should contain an Advanced section header");
         assert_eq!(fields[header_idx].label, "Advanced");
         for ident in [
-            "cockpit.enabled",
-            "cockpit.default_for_claude",
-            "cockpit.default_agent",
-            "cockpit.replay_events",
-            "cockpit.node_path",
-            "cockpit.show_tool_durations",
+            "acp.default_agent",
+            "acp.replay_events",
+            "acp.node_path",
+            "acp.show_tool_durations",
         ] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos < header_idx, "{ident} must precede the Advanced header");
         }
         for ident in [
-            "cockpit.max_concurrent_workers",
-            "cockpit.max_concurrent_resumes",
-            "cockpit.queue_drain_mode",
-            "cockpit.replay_bytes",
-            "cockpit.force_end_turn_threshold_secs",
-            "cockpit.silent_orphan_grace_secs",
-            "cockpit.silent_orphan_fast_grace_secs",
+            "acp.max_concurrent_workers",
+            "acp.max_concurrent_resumes",
+            "acp.queue_drain_mode",
+            "acp.replay_bytes",
+            "acp.force_end_turn_threshold_secs",
+            "acp.silent_orphan_grace_secs",
+            "acp.silent_orphan_fast_grace_secs",
         ] {
             let pos = fields.iter().position(|f| f.ident() == ident).unwrap();
             assert!(pos > header_idx, "{ident} must follow the Advanced header");

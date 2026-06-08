@@ -7,9 +7,8 @@ session's pane. You get the ambient awareness of the dashboard and the
 immediacy of typing directly to the agent, without tmux taking over the
 whole terminal.
 
-Contrast with a full attach: `tmux attach` replaces the entire screen
-with the agent until you detach with `Ctrl+b d`. In live mode the
-dashboard never leaves, so you can watch other sessions' states while
+Unlike a full `tmux attach` (which replaces the screen until you detach),
+the dashboard never leaves, so you can watch other sessions' states while
 you work.
 
 ## Entering and leaving

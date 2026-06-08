@@ -72,7 +72,7 @@ fn default_off_emits_nothing() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .is_none());
 }
@@ -144,7 +144,7 @@ fn snapshot_buckets_are_sanitized() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
 
@@ -171,7 +171,7 @@ fn snapshot_buckets_are_sanitized() {
 
     // The feature-adoption map is present with its fixed allowlisted keys
     // (values reflect config; all false under a default config).
-    for key in ["worktree", "sandbox", "cockpit", "auto_update"] {
+    for key in ["worktree", "sandbox", "auto_update"] {
         assert!(
             snapshot.features.contains_key(key),
             "features map missing allowlisted key `{key}`"
@@ -202,7 +202,7 @@ fn form_factor_maps_are_a_presence_set_on_the_wire() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     let empty_wire = serde_json::to_string(&snapshot).expect("serialize");
@@ -211,8 +211,8 @@ fn form_factor_maps_are_a_presence_set_on_the_wire() {
         "empty web_clients_seen must be skipped, not emitted as {{}}"
     );
     assert!(
-        !empty_wire.contains("cockpit_clients_seen"),
-        "empty cockpit_clients_seen must be skipped, not emitted as {{}}"
+        !empty_wire.contains("structured_clients_seen"),
+        "empty structured_clients_seen must be skipped, not emitted as {{}}"
     );
 
     // With classes recorded (as the daemon would from its client counters), the
@@ -290,7 +290,7 @@ fn substrate_census_counts_each_bucket() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
 
@@ -332,7 +332,7 @@ fn substrate_buckets_are_mutually_exclusive_and_sum_to_total() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
 
@@ -375,7 +375,7 @@ fn substrate_keys_are_only_allowlisted_vocab() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
 
@@ -402,7 +402,7 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let counts = telemetry::CockpitInteractionCounts::default();
+    let counts = telemetry::StructuredInteractionCounts::default();
     let none = telemetry::build_usage_snapshot(
         Surface::Serve,
         &[],
@@ -446,7 +446,7 @@ fn events_carry_distinct_idempotency_uuid() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert!(!snap.uuid.is_empty(), "snapshot uuid must be non-empty");
@@ -471,7 +471,7 @@ fn events_carry_distinct_idempotency_uuid() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("second snapshot built");
     assert_ne!(
@@ -498,7 +498,7 @@ fn opted_out_builds_no_uuid() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .is_none());
 }
@@ -517,7 +517,7 @@ fn snapshot_carries_registered_usage_signals() {
     let counters = UsageSeenCounters::new();
     assert!(counters.record("web"));
     assert!(counters.record("web"));
-    assert!(counters.record("cockpit"));
+    assert!(counters.record("structured_view"));
 
     let snapshot = telemetry::build_usage_snapshot(
         Surface::Serve,
@@ -526,11 +526,11 @@ fn snapshot_carries_registered_usage_signals() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(snapshot.usage_seen.get("web"), Some(&2));
-    assert_eq!(snapshot.usage_seen.get("cockpit"), Some(&1));
+    assert_eq!(snapshot.usage_seen.get("structured_view"), Some(&1));
 }
 
 /// User story (#1881): the dashboard feature signals (diff panel, diff comments,
@@ -556,7 +556,7 @@ fn snapshot_carries_feature_usage_signals() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(snapshot.usage_seen.get("diff_panel"), Some(&1));
@@ -586,7 +586,7 @@ fn unregistered_usage_signal_is_rejected_and_never_reported() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert!(!snapshot.usage_seen.contains_key("not_a_signal"));
@@ -609,7 +609,7 @@ fn usage_seen_keys_are_only_allowlisted_short_names() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
 
@@ -648,7 +648,7 @@ fn serve_snapshot_carries_coarse_deployment_mode() {
         0,
         Some("passphrase"),
         Some("tailscale"),
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(tailscale.auth_mode.as_deref(), Some("passphrase"));
@@ -661,7 +661,7 @@ fn serve_snapshot_carries_coarse_deployment_mode() {
         0,
         Some("token"),
         Some("local"),
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(local.auth_mode.as_deref(), Some("token"));
@@ -687,28 +687,28 @@ fn opted_out_serve_builds_no_snapshot_with_deployment_mode() {
         0,
         Some("none"),
         Some("tunnel"),
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .is_none());
 }
 
-/// User stories (#1888): the cockpit-interaction counts fold into the snapshot.
+/// User stories (#1888): the structured-interaction counts fold into the snapshot.
 /// Three approvals (2 allow, 1 deny), one agent switch, two substrate toggles,
 /// plan mode entered, and one queued prompt produce the expected aggregates,
 /// and the decision map carries only the nonzero allowlisted keys.
 #[test]
 #[serial]
-fn snapshot_carries_cockpit_interaction_counts() {
+fn snapshot_carries_acp_interaction_counts() {
     let _tmp = isolate();
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let counts = telemetry::CockpitInteractionCounts {
+    let counts = telemetry::StructuredInteractionCounts {
         approvals_allow: 2,
         approvals_allow_always: 0,
         approvals_deny: 1,
         agent_switches: 1,
-        substrate_toggles: 2,
+        view_toggles: 2,
         plan_mode_seen: true,
         prompts_queued: 1,
     };
@@ -728,29 +728,29 @@ fn snapshot_carries_cockpit_interaction_counts() {
     assert_eq!(snap.approvals_by_decision.get("deny"), Some(&1));
     assert!(!snap.approvals_by_decision.contains_key("allow_always"));
     assert_eq!(snap.agent_switches, 1);
-    assert_eq!(snap.substrate_toggles, 2);
+    assert_eq!(snap.view_toggles, 2);
     assert!(snap.plan_mode_seen);
     assert_eq!(snap.prompts_queued, 1);
     // Schema version bumped for the v8 field set.
     assert_eq!(snap.schema, telemetry::SCHEMA_VERSION);
 }
 
-/// Privacy-reviewer story (#1888): the cockpit-interaction signals are counts
+/// Privacy-reviewer story (#1888): the structured-interaction signals are counts
 /// and a closed decision-key set only. No prompt text, tool name, file path, or
 /// agent command can ride along, and the decision map keys stay allowlisted.
 #[test]
 #[serial]
-fn cockpit_interaction_payload_is_counts_and_allowlisted_keys_only() {
+fn acp_interaction_payload_is_counts_and_allowlisted_keys_only() {
     let _tmp = isolate();
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let counts = telemetry::CockpitInteractionCounts {
+    let counts = telemetry::StructuredInteractionCounts {
         approvals_allow: 3,
         approvals_allow_always: 4,
         approvals_deny: 5,
         agent_switches: 6,
-        substrate_toggles: 7,
+        view_toggles: 7,
         plan_mode_seen: true,
         prompts_queued: 8,
     };
@@ -776,11 +776,11 @@ fn cockpit_interaction_payload_is_counts_and_allowlisted_keys_only() {
     let json: serde_json::Value = serde_json::to_value(&snap).expect("snapshot serializes to JSON");
     let obj = json.as_object().expect("snapshot is a JSON object");
 
-    // The cockpit-interaction fields are all integers or a bool, never strings.
+    // The structured-interaction fields are all integers or a bool, never strings.
     for field in [
         "approvals_resolved",
         "agent_switches",
-        "substrate_toggles",
+        "view_toggles",
         "prompts_queued",
     ] {
         assert!(
@@ -1052,7 +1052,7 @@ fn version_health_reflects_cached_update() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(snapshot.update_status, UpdateStatus::MajorBehind);
@@ -1074,7 +1074,7 @@ fn version_health_reflects_cached_update() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     assert_eq!(snapshot.update_releases_behind, ReleasesBehind::OneBehind);
@@ -1100,7 +1100,7 @@ fn version_health_never_leaks_version_string() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .expect("snapshot built when opted in");
     let event = telemetry::build_process_start(Surface::Tui).expect("event built when opted in");
@@ -1145,7 +1145,7 @@ fn opted_out_emits_nothing_even_with_version_health_available() {
         0,
         None,
         None,
-        &telemetry::CockpitInteractionCounts::default(),
+        &telemetry::StructuredInteractionCounts::default(),
     )
     .is_none());
 }

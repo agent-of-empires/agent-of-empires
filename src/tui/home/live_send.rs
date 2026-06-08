@@ -541,6 +541,16 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// would lag the first fast capture by ~250ms.
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the displayed pane is the live-send target. Only then does the
+    /// worker pay for the cursor query (a one-line `display-message` folded
+    /// into the same fork) and publish a cursor; otherwise `cursor` stays
+    /// `None` so a backgrounded or merely-browsed preview paints no cursor.
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Newest pane cursor, refreshed every live cycle (even when the captured
+    /// text is unchanged, so a bare cursor move still updates). Cleared on
+    /// `set_live(false)` and `set_target`. The render loop reads it via
+    /// `current_cursor` to place a real terminal cursor over the live preview.
+    cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -563,6 +573,8 @@ impl LiveCaptureWorker {
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(false));
+        let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -570,6 +582,8 @@ impl LiveCaptureWorker {
         let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
+        let live_cell = live.clone();
+        let cursor_cell = cursor.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -592,13 +606,27 @@ impl LiveCaptureWorker {
                 if lines > 0 && !name.is_empty() {
                     let session = crate::tmux::Session::from_name(&name);
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // Only the live-send target pays for the cursor query; it
+                    // folds into the same fork as the capture, so a live cycle
+                    // is still one `tmux` invocation. Backgrounded / browsed
+                    // previews capture text only and carry no cursor.
+                    let is_live = live_cell.load(Ordering::Relaxed);
                     // A failed fork reads as "gone". For preserve panes that
                     // means hold the last-good frame (drop it); for forward
                     // panes (terminals) surface it as empty so stale text clears.
-                    let capture = match session.capture_pane(lines) {
-                        Ok(content) => Some(content),
-                        Err(_) if forward_empty => Some(String::new()),
-                        Err(_) => None,
+                    let (capture, cursor_now) = if is_live {
+                        match session.capture_pane_with_cursor(lines) {
+                            Ok((content, cur)) => (Some(content), cur),
+                            Err(_) if forward_empty => (Some(String::new()), None),
+                            Err(_) => (None, None),
+                        }
+                    } else {
+                        let cap = match session.capture_pane(lines) {
+                            Ok(content) => Some(content),
+                            Err(_) if forward_empty => Some(String::new()),
+                            Err(_) => None,
+                        };
+                        (cap, None)
                     };
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
@@ -606,15 +634,23 @@ impl LiveCaptureWorker {
                         // them; only changed captures reach (and wake) the
                         // render loop, so an idle pane never repaints.
                         let changed = last_captured.as_deref() != Some(content.as_str());
-                        if (forward_empty || !content.is_empty()) && changed {
-                            // Publish only if the target hasn't changed during
-                            // the fork. Otherwise these are the *old* pane's
-                            // bytes and would flash under the new view's header
-                            // (`set_target` also clears the mailbox, but the
-                            // fork may have started before that switch).
-                            let still_current =
-                                target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
-                            if still_current {
+                        // Recheck the target once for both publishes: a retarget
+                        // mid-fork means these bytes (and this cursor) belong to
+                        // the old pane and must not land under the new view.
+                        // `set_target` also clears the mailbox, but the fork may
+                        // have started before that switch.
+                        let still_current =
+                            target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
+                        if still_current {
+                            // Cursor refreshes every live cycle, independent of
+                            // the content dedup: a bare cursor move leaves the
+                            // captured cells unchanged but must still update the
+                            // painted cursor. When not live, `cursor_now` is None
+                            // so the slot clears and no cursor is painted.
+                            if let Ok(mut guard) = cursor_cell.lock() {
+                                *guard = cursor_now;
+                            }
+                            if (forward_empty || !content.is_empty()) && changed {
                                 if let Ok(mut guard) = slot.lock() {
                                     *guard = Some(content.clone());
                                 }
@@ -644,6 +680,8 @@ impl LiveCaptureWorker {
             forward_empty,
             nudge,
             stop,
+            live,
+            cursor,
         }
     }
 
@@ -687,6 +725,11 @@ impl LiveCaptureWorker {
                 if let Ok(mut latest) = self.latest.lock() {
                     *latest = None;
                 }
+                // Drop the old pane's cursor too, so it can't flash over the
+                // new pane's first frame before the next live capture lands.
+                if let Ok(mut cursor) = self.cursor.lock() {
+                    *cursor = None;
+                }
                 true
             } else {
                 false
@@ -705,6 +748,15 @@ impl LiveCaptureWorker {
     /// reconcile so entering/leaving live mode retunes the worker in place
     /// without a respawn.
     pub(in crate::tui) fn set_live(&self, live: bool) {
+        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
+        if !live {
+            // Drop any painted cursor the moment the displayed pane stops
+            // being the live-send target, so a backgrounded preview doesn't
+            // keep a stale cursor from the last live cycle.
+            if let Ok(mut guard) = self.cursor.lock() {
+                *guard = None;
+            }
+        }
         let ms = if live {
             LIVE_CAPTURE_INTERVAL_FAST_MS
         } else {
@@ -734,6 +786,14 @@ impl LiveCaptureWorker {
     /// render loop then keeps the current preview).
     pub(in crate::tui) fn take_latest(&self) -> Option<String> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// The newest live-send cursor, or `None` when the displayed pane isn't
+    /// the live-send target (or its cursor is hidden). Cloned, not taken, so
+    /// the cursor persists across frames until the next live cycle refreshes
+    /// it. The render loop maps this onto the preview output rect.
+    pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
+        self.cursor.lock().ok().and_then(|guard| *guard)
     }
 }
 

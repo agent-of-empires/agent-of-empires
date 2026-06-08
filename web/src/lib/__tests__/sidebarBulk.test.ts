@@ -40,7 +40,9 @@ describe("bucketSelectionForBulk", () => {
     // Server says live, but a pending optimistic pin makes it eligible only
     // for Unpin, not Pin.
     const workspaces = [ws("w", {})];
-    const overlay = new Map([["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })]]);
+    const overlay = new Map([
+      ["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })],
+    ]);
     const b = bucketSelectionForBulk(
       workspaces,
       (id) => overlay.get(id) ?? EMPTY_OPTIMISTIC,

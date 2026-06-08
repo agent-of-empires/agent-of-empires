@@ -62,10 +62,8 @@ If you installed shell completions as a static file, regenerate it after an upda
 
 ## Uninstall
 
-To remove Agent of Empires:
-
 ```bash
 aoe uninstall
 ```
 
-This will guide you through removing the binary, configuration, and tmux settings.
+Prompts to remove the binary, configuration (the app data dir), and tmux settings.

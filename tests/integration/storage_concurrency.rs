@@ -118,10 +118,10 @@ fn test_update_with_groups_and_instances_round_trip() -> Result<()> {
 }
 
 /// Concurrent per-field updates on the same instance must not clobber each
-/// other. Mirrors the cockpit-handler / status-poll pattern: thread A
+/// other. Mirrors the structured view-handler / status-poll pattern: thread A
 /// mutates one field (`title`, simulating status poll), thread B mutates
-/// a different field (`notify_on_idle`, standing in for the cockpit
-/// handler's `cockpit_mode`; the latter is `#[cfg(feature = "serve")]`,
+/// a different field (`notify_on_idle`, standing in for the structured view
+/// handler's `structured_view`; the latter is `#[cfg(feature = "serve")]`,
 /// `notify_on_idle` is always available and exhibits the same lost-update
 /// class). Both should land. Regression guard for review #5: a
 /// wholesale-replace closure (using a pre-lock snapshot) would lose one

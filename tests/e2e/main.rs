@@ -17,9 +17,11 @@
 
 mod harness;
 
+mod acp_focus_isolation_e2e;
+mod acp_session_log_tee_e2e;
+mod acp_tool_cards_e2e;
+mod archive_restore;
 mod cli;
-mod cockpit_focus_isolation_e2e;
-mod cockpit_tool_cards_e2e;
 mod command_palette;
 mod errors;
 mod intro;

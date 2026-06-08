@@ -8,7 +8,13 @@
 // and the focus latch deterministically with a mocked useTerminal.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import {
@@ -41,7 +47,8 @@ const termEl = vi.hoisted(() => ({ current: null as HTMLElement | null }));
 
 vi.mock("../../lib/api", () => ({
   ensureSession: vi.fn(),
-  ensureTerminal: (id: string, container: boolean) => ensureTerminal(id, container),
+  ensureTerminal: (id: string, container: boolean) =>
+    ensureTerminal(id, container),
 }));
 
 vi.mock("../../hooks/useTerminal", () => ({
@@ -122,10 +129,10 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function renderReady(props: Partial<Parameters<typeof PairedShellPane>[0]> = {}) {
-  render(
-    <PairedShellPane session={session()} sessionId="sess-1" {...props} />,
-  );
+async function renderReady(
+  props: Partial<Parameters<typeof PairedShellPane>[0]> = {},
+) {
+  render(<PairedShellPane session={session()} sessionId="sess-1" {...props} />);
   await waitFor(() =>
     expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
   );
@@ -292,7 +299,9 @@ describe("PairedShellPane", () => {
       expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
     );
     fireEvent.click(screen.getByRole("button", { name: /^Container$/ }));
-    await waitFor(() => expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true));
+    await waitFor(() =>
+      expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true),
+    );
   });
 
   it("reserves keyboard padding in fullViewport mode", async () => {

@@ -494,7 +494,7 @@ impl IntroDialog {
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(
-                "mobile cockpit are all supported, and all optional. Use what",
+                "mobile structured view are all supported, and all optional. Use what",
                 Style::default().fg(theme.text),
             )),
             Line::from(Span::styled(

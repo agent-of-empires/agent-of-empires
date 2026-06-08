@@ -5,9 +5,33 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
 /** Animated spinner frames from rattles (https://github.com/vyfor/rattles) */
 const RATTLES: Record<string, { frames: string[]; interval: number }> = {
-  dots:         { frames: ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"], interval: 220 },
-  orbit:        { frames: ["⠃","⠉","⠘","⠰","⢠","⣀","⡄","⠆"], interval: 400 },
-  breathe:      { frames: ["⠀","⠂","⠌","⡑","⢕","⢝","⣫","⣟","⣿","⣟","⣫","⢝","⢕","⡑","⠌","⠂","⠀"], interval: 180 },
+  dots: {
+    frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+    interval: 220,
+  },
+  orbit: { frames: ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"], interval: 400 },
+  breathe: {
+    frames: [
+      "⠀",
+      "⠂",
+      "⠌",
+      "⡑",
+      "⢕",
+      "⢝",
+      "⣫",
+      "⣟",
+      "⣿",
+      "⣟",
+      "⣫",
+      "⢝",
+      "⢕",
+      "⡑",
+      "⠌",
+      "⠂",
+      "⠀",
+    ],
+    interval: 180,
+  },
 };
 
 /** Which statuses get animated spinners vs static glyphs */
@@ -75,7 +99,9 @@ export function StatusGlyph({
   const epoch = Number.isNaN(parsed) ? 0 : parsed;
   const [frame, setFrame] = useState(() => {
     if (!rattle) return 0;
-    return Math.floor((Date.now() - epoch) / rattle.interval) % rattle.frames.length;
+    return (
+      Math.floor((Date.now() - epoch) / rattle.interval) % rattle.frames.length
+    );
   });
 
   useEffect(() => {
@@ -83,9 +109,12 @@ export function StatusGlyph({
     const r = rattle;
     const computeFrame = () =>
       Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
-    setFrame(computeFrame());
+    const initial = setTimeout(() => setFrame(computeFrame()), 0);
     const id = setInterval(() => setFrame(computeFrame()), r.interval);
-    return () => clearInterval(id);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(id);
+    };
   }, [rattle, epoch]);
 
   if (!rattle) {

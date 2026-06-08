@@ -1,10 +1,16 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
-import { SwitchSubstrateAction } from "./cockpit/SwitchSubstrateAction";
+import { SwitchViewAction } from "./acp/SwitchViewAction";
 import { ensureSession } from "../lib/api";
 import { isAcpCapable } from "../lib/acpCapableTools";
 import { safeSetItem } from "../lib/safeStorage";
@@ -20,20 +26,15 @@ import "@xterm/xterm/css/xterm.css";
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** When false (the default) the switch-to-cockpit pill is hidden
-   *  entirely so users with the master switch off aren't tempted
-   *  by a button that the server will reject. */
-  cockpitMasterEnabled?: boolean;
+  /** When false (the default) the switch-to-structured view pill is hidden
+   *  entirely so it only shows where switching to the structured view is
+   *  actually offered. */
 }
 
 const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
-export function TerminalView({
-  session,
-  active = true,
-  cockpitMasterEnabled = false,
-}: Props) {
+export function TerminalView({ session, active = true }: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
     "pending",
   );
@@ -57,12 +58,28 @@ export function TerminalView({
     active,
   );
   const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
+  const [trackedSessionId, setTrackedSessionId] = useState(session.id);
+  if (session.id !== trackedSessionId) {
+    setTrackedSessionId(session.id);
+    setEnsureState("pending");
+    setEnsureError(null);
+  }
+  const lastEnsuredSessionIdRef = useRef<string | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
   // On mobile, pad the viewport by the live keyboard occlusion so the
   // terminal pane shrinks while the soft keyboard is up and grows back when
   // it dismisses. On desktop keyboardOcclusion stays 0 and this is a no-op.
   const appliedKeyboardPadding = keyboardOcclusion;
+
+  const focusSelf = useCallback(() => {
+    const ta = termRef.current?.element?.querySelector("textarea");
+    if (ta instanceof HTMLElement) {
+      ta.focus();
+      return true;
+    }
+    return false;
+  }, [termRef]);
 
   // Sync React state → hook ref in an effect. The mobile toolbar toggles
   // `ctrlActive` but the onData callback reads the ref to decide whether
@@ -77,20 +94,35 @@ export function TerminalView({
   }, [clearCtrlRef]);
 
   useEffect(() => {
+    if (lastEnsuredSessionIdRef.current === session.id) {
+      if (active) activate();
+      if (consumePendingTerminalFocus("agent")) focusSelf();
+      return;
+    }
     const controller = new AbortController();
-    setEnsureState("pending");
-    setEnsureError(null);
     ensureSession(session.id, controller.signal).then((res) => {
       if (controller.signal.aborted) return;
       if (res.ok) {
+        lastEnsuredSessionIdRef.current = session.id;
         setEnsureState("ready");
+        if (active) activate();
       } else {
         setEnsureState("error");
         setEnsureError(res.message ?? "Could not start session.");
       }
     });
     return () => controller.abort();
-  }, [session.id]);
+  }, [session.id, active, activate, focusSelf]);
+
+  // Drain a pending agent-focus latch only once the terminal is rendered:
+  // while ensureState is "pending"/"error" the splash is shown and the xterm
+  // textarea is not mounted, so consuming the latch in the boot/retry
+  // callbacks would clear it before focusSelf() could find anything to focus.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (ensureState !== "ready") return;
+    if (consumePendingTerminalFocus("agent")) focusSelf();
+  }, [ensureState, focusSelf]);
 
   const retryEnsure = useCallback(() => {
     setEnsureState((prev) => {
@@ -100,7 +132,9 @@ export function TerminalView({
       ensureSession(session.id, controller.signal).then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
+          lastEnsuredSessionIdRef.current = session.id;
           setEnsureState("ready");
+          if (active) activate();
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -108,7 +142,7 @@ export function TerminalView({
       });
       return "pending";
     });
-  }, [session.id]);
+  }, [session.id, active, activate]);
 
   const [hintDismissed, setHintDismissed] = useState(() => {
     try {
@@ -130,18 +164,6 @@ export function TerminalView({
     return () => clearTimeout(t);
   }, [appliedKeyboardPadding]);
 
-  // Returns true if focus was applied. Mirrors PairedTerminal so the same
-  // pending-latch fallback covers both terminals when the terminal hasn't
-  // mounted yet (ensureSession round-trip on a fresh session).
-  const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element?.querySelector("textarea");
-    if (ta instanceof HTMLElement) {
-      ta.focus();
-      return true;
-    }
-    return false;
-  }, [termRef]);
-
   // Cmd+` shortcut focuses this terminal when "agent" is the dispatched target.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
@@ -152,15 +174,6 @@ export function TerminalView({
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
   }, [focusSelf]);
-
-  useEffect(() => {
-    if (ensureState !== "ready") return;
-    if (consumePendingTerminalFocus("agent")) focusSelf();
-  }, [ensureState, focusSelf]);
-
-  useEffect(() => {
-    if (active && ensureState === "ready") activate();
-  }, [active, ensureState, activate]);
 
   // Auto-keyboard-open on initial connect removed (#1178): the
   // KeyboardFab is always visible and lets the user open the keyboard
@@ -236,15 +249,14 @@ export function TerminalView({
       className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5"
       style={rootStyle}
     >
-      {/* Top-right substrate switch — discreet pill that lets the
-          user flip this session into cockpit mode. Only rendered
-          when the cockpit master switch is on, and only enabled
+      {/* Top-right view switch, a discreet pill that lets the
+          user flip this session into structured view mode. Only enabled
           for tools whose ACP adapter we ship. */}
-      {session?.id && cockpitMasterEnabled && (
+      {session?.id && (
         <div className="absolute right-2 top-2 z-10">
-          <SwitchSubstrateAction
+          <SwitchViewAction
             sessionId={session.id}
-            cockpitMode={false}
+            structuredView={false}
             acpCapable={isAcpCapable(session.tool, session.acp_capable)}
             variant="icon"
           />
@@ -253,21 +265,24 @@ export function TerminalView({
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">
-            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/{maxRetries})
+            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/
+            {maxRetries})
           </span>
         </div>
       )}
-      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
-        <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Connection lost</span>
-          <button
-            onClick={manualReconnect}
-            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      {!state.connected &&
+        !state.reconnecting &&
+        state.retryCount >= maxRetries && (
+          <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+            <span className="text-xs text-status-error">Connection lost</span>
+            <button
+              onClick={manualReconnect}
+              className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
       <div
         data-term="agent"

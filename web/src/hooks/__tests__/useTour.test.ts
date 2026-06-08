@@ -30,7 +30,7 @@ describe("shouldAutoLaunch", () => {
 
   it("does not launch outside the dashboard scope", () => {
     expect(shouldAutoLaunch({ ...base, scope: "session" })).toBe(false);
-    expect(shouldAutoLaunch({ ...base, scope: "cockpit" })).toBe(false);
+    expect(shouldAutoLaunch({ ...base, scope: "structured-view" })).toBe(false);
   });
 
   it("does not auto-launch on coarse pointers", () => {

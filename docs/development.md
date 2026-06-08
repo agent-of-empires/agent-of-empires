@@ -12,6 +12,89 @@ The release binary is at `target/release/aoe`.
 
 The web dashboard needs the `serve` feature and Node.js: `cargo build --release --features serve`. See [Web Dashboard Development](development/web-dashboard.md).
 
+## Faster rebuilds across worktrees (kache)
+
+AoE's normal workflow keeps several git worktrees in flight at once (one per
+branch). Each worktree has its own `target/`, so a cold `cargo build` in a fresh
+worktree recompiles all ~400 dependency crates from scratch, even when
+`Cargo.lock` is identical to a worktree that built them minutes ago. That is
+both slow (minutes of dependency compilation) and wasteful on disk (each
+`target/` holds its own multi-gigabyte copy of the same artifacts).
+
+[kache](https://github.com/kunobi-ninja/kache) is an optional, opt-in fix for
+this. It is a content-addressed rustc wrapper: it compiles each crate once,
+stores the artifact in a shared local store (`~/Library/Caches/kache` on macOS,
+`~/.cache/kache` on Linux), and **shares it into each worktree's `target/`
+without copying** by reflinking it (a copy-on-write clone, on APFS/btrfs/xfs) or
+hardlinking it (on filesystems without reflink support, such as ext4). The first
+build of a given `Cargo.lock` populates the store; every later build, in any
+worktree, restores the dependency artifacts instead of recompiling them. Each
+worktree still produces its own `target/debug/aoe` binary, and the shared blocks
+mean one physical copy of each dependency artifact backs all worktrees, so both
+build time and disk usage drop.
+
+kache is **not** required and is deliberately **not** committed to the repo (no
+`rustc-wrapper` in `.cargo/config.toml`): a plain `cargo build` with no extra
+setup works exactly as it does today, and CI, the Nix build, and release builds
+never touch kache, so shipped release binaries stay compiled by plain `rustc`.
+Each developer turns it on for themselves with two environment variables.
+
+### Opting in
+
+Install a prebuilt binary (the prebuilt avoids compiling kache; see the
+bootstrap caveat below):
+
+```bash
+cargo binstall kache         # prebuilt binary, recommended
+# or
+mise use -g github:kunobi-ninja/kache@latest
+```
+
+Enable it for your shell (for example in `~/.zshrc` or `~/.bashrc`):
+
+```bash
+export RUSTC_WRAPPER=kache
+export CARGO_INCREMENTAL=0   # kache and incremental compilation are mutually exclusive
+```
+
+Then build as usual; `rustc` now routes through kache and your per-worktree
+`target/debug/aoe` is unchanged:
+
+```bash
+cargo build --all-features
+```
+
+Watch cache hits and deduplicated bytes live with `kache monitor`, or print a
+non-interactive summary with `kache stats`. To go back to plain `rustc`, unset
+`RUSTC_WRAPPER` (or point it at another wrapper, e.g. `export
+RUSTC_WRAPPER=sccache` for a time-only cache without disk dedup).
+
+### Caveats
+
+- **Same filesystem only.** Reflinks and hardlinks cannot span filesystems, so
+  the kache store and your worktrees' `target/` dirs must live on one volume. A
+  worktree on a different mount falls back to copying (still cached, no disk
+  dedup).
+- **Native-linking crates still rebuild.** Dependencies with build scripts that
+  link C libraries (`git2`, `openssl-sys`, `ring`) are not cacheable and
+  recompile each time. They are a minority of total build time.
+- **`--features serve` and stale assets.** The web dashboard embeds `web/dist`
+  at compile time via `rust-embed` (the `debug-embed` feature embeds in debug
+  builds too). `build.rs` emits `rerun-if-changed=web/src` (and the other web
+  inputs), so rebuilding the frontend dirties the crate and kache recompiles it;
+  a cache hit therefore should not serve stale embedded assets. If you ever
+  suspect a stale bundle, `cargo clean -p agent-of-empires` forces a rebuild.
+- **macOS:** kache excludes its store from Spotlight indexing and Time Machine
+  automatically.
+- **Bootstrap.** Prefer the prebuilt install above. If you do build kache from
+  source with `cargo install` while `RUSTC_WRAPPER=kache` is already exported,
+  cargo tries to use kache to compile kache and fails; unset the variable for
+  that one command.
+
+You can confirm the dependency artifacts are actually shared and deduplicated
+across two target dirs with `scripts/verify-shared-target.sh` (see the script
+header for usage).
+
 ## Running
 
 ```bash
@@ -21,8 +104,8 @@ AOE_LOG_LEVEL=trace cargo run        # Pick the log level explicitly
 AOE_ACP_TRACE=1 cargo run            # Plus raw ACP JSON-RPC firehose; useful for
                                      # verifying sub-agent linkage
                                      # (`_meta.claudeCode.parentToolUseId` round-trip)
-                                     # and other adapter-side _meta fields. Cockpit
-                                     # also logs a `cockpit.acp` debug line whenever
+                                     # and other adapter-side _meta fields. Structured view
+                                     # also logs a `acp.protocol.tool_dispatch` debug line whenever
                                      # it links a child tool call to a parent Task.
 AOE_TERMINAL_TRACE=1 cargo run       # Plus per-message bytes for the web terminal WS (spammy)
 aoe logs                       # View debug.log via lnav/bat/less (auto-detects)
@@ -41,15 +124,26 @@ Builds the serve-enabled binary, then runs `aoe serve` (8081) and the Vite dev
 server (5173) together with hot module reload. Open
 [http://localhost:5173](http://localhost:5173); Vite proxies `/api` and the
 `/sessions/*/ws` relays to the backend (via `VITE_PROXY`). One Ctrl-C stops
-both. Ports are overridable with `--serve-port` / `--web-port`. See the
-[web dashboard guide](guides/web-dashboard.md#frontend-development) for the
-manual two-shell alternative.
+both. Ports are overridable with `--serve-port` / `--web-port`. See
+[Web Dashboard Development](development/web-dashboard.md#manual-frontend-loop)
+for the manual two-shell alternative.
+
+Add `--watch` to auto-rebuild the Rust backend on source edits:
+
+```bash
+cargo xtask dev --watch
+```
+
+It watches `src/**`, `Cargo.toml`, and `Cargo.lock`; on a change it runs
+`cargo build --features serve` and, if that succeeds, restarts `aoe serve`. A
+failed build leaves the running backend in place and prints the error. The Vite
+dev server is never restarted, so frontend HMR keeps working and the browser
+reconnects through the proxy once the backend is back. Note that the backend
+restart drops all live terminal and cockpit WebSocket connections.
 
 ### Dev namespace
 
-Debug builds use an isolated namespace so a local `cargo run` shares no
-state with an installed release `aoe`. Run them side-by-side without
-collisions on sessions, settings, the tmux server, or `aoe serve`.
+Debug builds use an isolated namespace so a local `cargo run` shares no state with an installed release `aoe`; run them side-by-side without colliding on sessions, settings, tmux, or `aoe serve`. `debug.log` lives in the app dir, so it's isolated too. The dev namespace starts empty (nothing migrates from your real dir); wipe it any time with `rm -rf ~/.agent-of-empires-dev` (Linux: the XDG equivalent).
 
 | | Release | Debug (`cargo run`) |
 | --- | --- | --- |
@@ -58,15 +152,7 @@ collisions on sessions, settings, the tmux server, or `aoe serve`.
 | `tmux` session prefix | `aoe_` | `aoe_dev_` |
 | `aoe serve` default port | `8080` | `8081` |
 
-`debug.log` lives inside the app dir, so it is isolated automatically. Debug builds start with an empty namespace on first run, so
-nothing migrates from your real `~/.agent-of-empires`. Wipe dev state any
-time with `rm -rf ~/.agent-of-empires-dev` (or the Linux XDG equivalent);
-release data is untouched.
-
-`cargo build --profile dev-release` is treated as a release build for
-namespace purposes, so it shares the app dir, tmux prefix, and `aoe serve`
-port with an installed release `aoe`. Use the default `dev` profile when
-you want the isolated `-dev` namespace.
+`cargo build --profile dev-release` counts as a release build for namespacing (shares app dir, tmux prefix, serve port); use the default `dev` profile for the isolated `-dev` namespace.
 
 ## Testing
 
@@ -79,52 +165,8 @@ cargo check      # Fast type-check
 
 Some integration tests require `tmux` to be available and will skip if it's not installed.
 
-## Generating the Demo GIF
+## Demo GIFs (rarely touched)
 
-The demo GIF in the docs is created using [VHS](https://github.com/charmbracelet/vhs).
+**TUI demo** (`docs/assets/demo.gif`): uses [VHS](https://github.com/charmbracelet/vhs). `brew install vhs`, `cargo build --release --features serve`, then `vhs assets/demo.tape` from the repo root. The tape runs `aoe -p demo` and cleans its own demo profile, so your real profile is untouched.
 
-```bash
-# Install VHS (macOS)
-brew install vhs
-
-# Build aoe with the serve feature so the tape can exercise remote access
-cargo build --release --features serve
-
-# Generate the GIF (from repo root). The tape cleans its own profile
-# (`~/.config/agent-of-empires/profiles/demo` on Linux,
-# `~/.agent-of-empires/profiles/demo` on macOS) and demo scratch repo.
-vhs assets/demo.tape
-```
-
-This writes `docs/assets/demo.gif`. The tape runs `aoe -p demo` so your real profile is untouched.
-
-## Generating the Web Dashboard GIFs
-
-`docs/assets/web-desktop.gif` and `docs/assets/web-mobile.gif` are recorded against a real `aoe serve` backend with real opencode sessions, no mocks. The recorder lives in `web/scripts/record-web-demo.mjs`.
-
-```bash
-# 1. Build with the serve feature.
-cargo build --release --features serve
-
-# 2. Set up an isolated profile with two scratch git repos and two opencode sessions.
-SANDBOX=/tmp/aoe-webdemo
-rm -rf "$SANDBOX"
-mkdir -p "$SANDBOX/home/.config" "$SANDBOX/projects/api-server" "$SANDBOX/projects/web-app"
-for d in "$SANDBOX/projects/"*; do
-  (cd "$d" && git init -q && git config user.email t@t && git config user.name t \
-    && touch README.md && git add . && git commit -q -m init)
-done
-export HOME=$SANDBOX/home XDG_CONFIG_HOME=$SANDBOX/home/.config
-target/release/aoe add "$SANDBOX/projects/api-server" -t "API Server" -c opencode
-target/release/aoe add "$SANDBOX/projects/web-app"    -t "Web App"    -c opencode
-
-# 3. Start the server (no auth, localhost only).
-target/release/aoe serve --host 127.0.0.1 --port 8181 --no-auth &
-
-# 4. Record both viewports. Each run drives the live dashboard with Playwright,
-#    captures WebM, and converts to GIF with ffmpeg.
-node web/scripts/record-web-demo.mjs --viewport desktop --port 8181
-node web/scripts/record-web-demo.mjs --viewport mobile  --port 8181
-```
-
-opencode's free tier needs no credentials, so the sessions produce real LLM responses inside the recording. Reset between runs by killing tmux (`HOME=$SANDBOX/home tmux kill-server`) so each session starts fresh.
+**Web dashboard GIFs** (`docs/assets/web-{desktop,mobile}.gif`): recorded against a real `aoe serve` with real opencode sessions (no mocks) by `web/scripts/record-web-demo.mjs`, which drives the live dashboard with Playwright and converts WebM to GIF via ffmpeg. The recipe (build with `--features serve`, set up an isolated `$HOME`/`XDG_CONFIG_HOME` profile with two scratch git repos + two `opencode` sessions, `aoe serve --no-auth`, then run the recorder per viewport) is at the top of that script. opencode's free tier needs no credentials, so recordings get real LLM responses; reset between runs with `HOME=$SANDBOX/home tmux kill-server`.

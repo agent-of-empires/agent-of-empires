@@ -14,7 +14,7 @@ export const LOGIN_REQUIRED_EVENT = "aoe:login-required";
 
 /** Dispatched on `window` when an authenticated request hits a sensitive
  *  route whose login session is not currently elevated (the server
- *  returns `403 elevation_required`). Cockpit/terminal hooks listen for
+ *  returns `403 elevation_required`). Structured view/terminal hooks listen for
  *  this to pop an inline passphrase prompt. See #1131. */
 export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
 
@@ -66,10 +66,13 @@ export function isLoginAttemptPath(path: string): boolean {
  * Safe to call multiple times; only the first call installs the wrapper.
  */
 export function installFetchErrorToasts(): void {
-  if ((window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched) {
+  if (
+    (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched
+  ) {
     return;
   }
-  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched = true;
+  (window as unknown as { __aoeFetchPatched?: boolean }).__aoeFetchPatched =
+    true;
 
   const original = window.fetch.bind(window);
 
@@ -126,7 +129,7 @@ export function installFetchErrorToasts(): void {
       }
       if (res.status === 403 && isApi) {
         // `elevation_required` signals a sensitive route called without
-        // a current 15-min passphrase confirmation. The cockpit/terminal
+        // a current 15-min passphrase confirmation. The structured view/terminal
         // surfaces listen for this and pop the inline prompt.
         try {
           const data = (await res.clone().json()) as { error?: unknown };
@@ -152,9 +155,7 @@ export function installFetchErrorToasts(): void {
       // When the server is known to be down, suppress per-request toasts.
       // The DisconnectBanner handles the user-facing notification instead.
       if (isApi && !isServerDown()) {
-        reportError(
-          `Network error contacting ${path}. Check your connection.`,
-        );
+        reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;
     }
@@ -228,7 +229,9 @@ function attachAuthHeader(
 function isSameOrigin(url: string): boolean {
   if (url.startsWith("/")) return true;
   try {
-    return new URL(url, window.location.origin).origin === window.location.origin;
+    return (
+      new URL(url, window.location.origin).origin === window.location.origin
+    );
   } catch {
     return false;
   }

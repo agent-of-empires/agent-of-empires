@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn agent_command_fields_are_stripped() {
         // The agent-command tamper surface (binary override, argv, custom
-        // agents, detect-as, cockpit cmd) is `local_only`: stripped from the
+        // agents, detect-as, acp cmd) is `local_only`: stripped from the
         // body before merge so it can never reach disk from the web. Replaces
         // SESSION_BLOCKED_FIELDS.
         for field in [
@@ -226,7 +226,7 @@ mod tests {
             "agent_extra_args",
             "custom_agents",
             "agent_detect_as",
-            "agent_cockpit_cmd",
+            "agent_acp_cmd",
         ] {
             let mut body = json!({"session": {field: {"claude": "x"}, "yolo_mode_default": true}});
             strip_local_only(&mut body);
@@ -314,7 +314,7 @@ mod tests {
     fn invalid_value_rejected() {
         // default_agent is NonEmptyString.
         let err = validate_patch(
-            &json!({"cockpit": {"default_agent": "  "}}),
+            &json!({"acp": {"default_agent": "  "}}),
             Scope::Global,
             true,
         )
@@ -328,7 +328,7 @@ mod tests {
         // A null clears a profile override; it must pass validation even for a
         // field whose normal validation would reject null.
         assert!(validate_patch(
-            &json!({"cockpit": {"default_agent": null}}),
+            &json!({"acp": {"default_agent": null}}),
             Scope::Profile,
             true
         )
@@ -336,15 +336,15 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_is_now_web_writable_except_node_path() {
-        // The single-source fix: cockpit settings are reachable from the web
+    fn acp_is_now_web_writable_except_node_path() {
+        // The single-source fix: acp settings are reachable from the web
         // (the old curated allowlist rejected the whole section). A bundled
         // patch keeps the safe knob and silently drops the local_only
-        // node_path (matches the COCKPIT_BLOCKED_FIELDS strip contract).
-        let mut body = json!({"cockpit": {"enabled": true, "node_path": "/tmp/evil-node"}});
+        // node_path (matches the ACP_BLOCKED_FIELDS strip contract).
+        let mut body = json!({"acp": {"show_tool_durations": true, "node_path": "/tmp/evil-node"}});
         strip_local_only(&mut body);
-        assert!(body["cockpit"].get("node_path").is_none());
-        assert_eq!(body["cockpit"]["enabled"], json!(true));
+        assert!(body["acp"].get("node_path").is_none());
+        assert_eq!(body["acp"]["show_tool_durations"], json!(true));
         assert!(validate_patch(&body, Scope::Profile, true).is_ok());
     }
 

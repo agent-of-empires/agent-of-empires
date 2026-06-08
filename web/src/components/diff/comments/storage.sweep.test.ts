@@ -2,7 +2,7 @@
 //
 // sweepOrphanComments iterates window.localStorage, so it needs a real DOM
 // storage (jsdom) rather than the node-env fake used by storage.test.ts.
-// Mirrors the sweepOrphanDrafts coverage in cockpitDrafts.test.ts (#1842).
+// Mirrors the sweepOrphanDrafts coverage in acpDrafts.test.ts (#1842).
 
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -42,10 +42,10 @@ describe("sweepOrphanComments", () => {
   });
 
   it("leaves unrelated keys untouched", () => {
-    window.localStorage.setItem("cockpit:draft:foo", "keep me");
+    window.localStorage.setItem("acp:draft:foo", "keep me");
     saveComments("orphan", { ...EMPTY_STORAGE, comments: [mkComment({})] });
     sweepOrphanComments(new Set());
-    expect(window.localStorage.getItem("cockpit:draft:foo")).toBe("keep me");
+    expect(window.localStorage.getItem("acp:draft:foo")).toBe("keep me");
     expect(window.localStorage.getItem(storageKey("orphan"))).toBeNull();
   });
 

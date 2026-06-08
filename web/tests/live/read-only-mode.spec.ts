@@ -86,7 +86,7 @@ test("dashboard suppresses mutation UI in read-only", async ({
 
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeHidden({ timeout: 2_000 });
+  await expect(page.getByRole("heading", { name: "New session" })).toBeHidden({
+    timeout: 2_000,
+  });
 });

@@ -307,9 +307,9 @@ describe("resolveEffectiveSnoozedUntil", () => {
     // Regression: clicking a preset must flip the chip immediately,
     // not wait for the round-trip. Optimistic value wins over the
     // (still-null) server prop until the next poll mirrors it.
-    expect(
-      resolveEffectiveSnoozedUntil("2099-01-01T00:00:00Z", null),
-    ).toBe("2099-01-01T00:00:00Z");
+    expect(resolveEffectiveSnoozedUntil("2099-01-01T00:00:00Z", null)).toBe(
+      "2099-01-01T00:00:00Z",
+    );
   });
 
   it("uses an explicit null override to hide the chip pre-PATCH on unsnooze", () => {
@@ -719,7 +719,10 @@ describe("workspaceIsUrgent / workspaceIsFavorited (#1640)", () => {
   it("is urgent when any session carries the flag", () => {
     expect(
       workspaceIsUrgent(
-        workspace("w", [session({ id: "a" }), session({ id: "b", urgent: true })]),
+        workspace("w", [
+          session({ id: "a" }),
+          session({ id: "b", urgent: true }),
+        ]),
       ),
     ).toBe(true);
     expect(workspaceIsUrgent(workspace("w", [session({ id: "a" })]))).toBe(
@@ -744,7 +747,9 @@ describe("compareWorkspacesByAttention (#1640)", () => {
   // recency key, drives ordering in the pure-rank cases.
   const TS = "2025-06-01T00:00:00Z";
   const wsStatus = (id: string, status: string) =>
-    workspace(id, [session({ id: `${id}-s`, status: status as never, created_at: TS })]);
+    workspace(id, [
+      session({ id: `${id}-s`, status: status as never, created_at: TS }),
+    ]);
 
   function order(list: Workspace[]): string[] {
     return [...list].sort(compareWorkspacesByAttention).map((w) => w.id);
@@ -772,10 +777,7 @@ describe("compareWorkspacesByAttention (#1640)", () => {
       session({ id: "u", status: "Running", urgent: true, created_at: TS }),
     ]);
     const plainWaiting = wsStatus("waiting", "Waiting");
-    expect(order([plainWaiting, urgentRunning])).toEqual([
-      "urgent",
-      "waiting",
-    ]);
+    expect(order([plainWaiting, urgentRunning])).toEqual(["urgent", "waiting"]);
   });
 
   it("breaks ties within a rank by favorite, then newest activity, then id", () => {
@@ -866,9 +868,9 @@ describe("repoGroup attention helpers (#1640)", () => {
         workspace("w2", [session({ id: "b", urgent: true })]),
       ]),
     ).toBe(true);
-    expect(
-      repoGroupIsUrgent([workspace("w1", [session({ id: "a" })])]),
-    ).toBe(false);
+    expect(repoGroupIsUrgent([workspace("w1", [session({ id: "a" })])])).toBe(
+      false,
+    );
   });
 });
 

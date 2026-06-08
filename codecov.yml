@@ -71,12 +71,12 @@ component_management:
     statuses: []
   individual_components:
     # ============================================================
-    # COCKPIT (native agent rendering)
+    # STRUCTURED VIEW (native structured rendering)
     # ============================================================
-    - component_id: "cockpit-ui"
-      name: "Cockpit UI"
+    - component_id: "structured-view-ui"
+      name: "Structured View UI"
       paths:
-        - "web/src/components/cockpit/**"
+        - "web/src/components/acp/**"
 
     # ============================================================
     # DIFF VIEWER + COMMENTS

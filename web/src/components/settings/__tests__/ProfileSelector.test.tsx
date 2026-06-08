@@ -125,22 +125,19 @@ describe("ProfileSelector create-name validation", () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["work"],
-    ["work-2"],
-    ["work_2"],
-    ["A"],
-    ["my-profile_42"],
-  ])("accepts %s and calls createProfile with the trimmed value", async (good) => {
-    const { getByText } = mount();
-    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+  it.each([["work"], ["work-2"], ["work_2"], ["A"], ["my-profile_42"]])(
+    "accepts %s and calls createProfile with the trimmed value",
+    async (good) => {
+      const { getByText } = mount();
+      await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
-    const input = await openCreatePanel(getByText);
-    fireEvent.change(input, { target: { value: `  ${good}  ` } });
-    submit(input);
+      const input = await openCreatePanel(getByText);
+      fireEvent.change(input, { target: { value: `  ${good}  ` } });
+      submit(input);
 
-    await waitFor(() => expect(mockCreate).toHaveBeenCalledWith(good));
-  });
+      await waitFor(() => expect(mockCreate).toHaveBeenCalledWith(good));
+    },
+  );
 
   it("createProfile failure surfaces 'Failed to create profile'", async () => {
     mockCreate.mockResolvedValueOnce(false);
@@ -186,9 +183,7 @@ describe("ProfileSelector rename validation", () => {
     submit(input);
 
     expect(mockRename).not.toHaveBeenCalled();
-    expect(
-      document.querySelector('input[placeholder="New name"]'),
-    ).toBeNull();
+    expect(document.querySelector('input[placeholder="New name"]')).toBeNull();
   });
 
   it("rename to invalid name shows error and skips API call", async () => {
@@ -274,10 +269,11 @@ describe("ProfileSelector delete confirm gating", () => {
     );
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
 
-    const deleteBtn = await waitFor(() =>
-      Array.from(container.querySelectorAll("button")).find(
-        (b) => b.textContent === "Delete",
-      ) as HTMLButtonElement,
+    const deleteBtn = await waitFor(
+      () =>
+        Array.from(container.querySelectorAll("button")).find(
+          (b) => b.textContent === "Delete",
+        ) as HTMLButtonElement,
     );
 
     // First click: confirm() returns false -> no API call.

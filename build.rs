@@ -6,7 +6,7 @@ fn main() {
     build_frontend();
 }
 
-/// Emit `AOE_BUILD_VERSION`, the build identity stamped on each cockpit
+/// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
 /// worker record so the daemon can tell whether a surviving worker is
 /// running the current binary or an older one (see issue #1754).
 ///

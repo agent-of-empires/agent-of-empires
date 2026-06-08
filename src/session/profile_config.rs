@@ -13,7 +13,7 @@ use super::get_profile_dir;
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
 /// Every override is a section table keyed by config-section name (e.g.
-/// `sandbox`, `cockpit`) mirroring the `Config` JSON shape; an absent key
+/// `sandbox`, `acp`) mirroring the `Config` JSON shape; an absent key
 /// inherits the global value. There are no typed per-section structs: a field
 /// is overridable purely by virtue of existing in the `Config` schema, so
 /// adding one never touches this file. Merging is the generic recursive
@@ -157,6 +157,29 @@ pub fn validate_volume_format(volume: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate a sandbox env entry: bare `KEY` or `KEY=VALUE`. The key is
+/// letters, digits, and underscores and must not start with a digit; the
+/// value (after `=`) is unconstrained. Mirrors the dashboard's client-side
+/// check so the schema drives both surfaces.
+pub fn validate_env_format(entry: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(=.*)?$").unwrap();
+    if re.is_match(entry) {
+        Ok(())
+    } else {
+        Err("Must be KEY or KEY=VALUE (letters, digits, underscores)".to_string())
+    }
+}
+
+/// Validate a `host:container` port mapping (digits only on both sides).
+pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^\d+:\d+$").unwrap();
+    if re.is_match(mapping) {
+        Ok(())
+    } else {
+        Err("Must be port:port (e.g. 3000:3000)".to_string())
+    }
 }
 
 /// Validate Docker memory limit format (e.g., "512m", "2g")
@@ -609,12 +632,10 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_configs_with_cockpit_overrides() {
+    fn test_merge_configs_with_acp_overrides() {
         let global = Config::default();
-        assert!(!global.cockpit.enabled);
 
-        let profile = profile_from(json!({"cockpit": {
-            "enabled": true,
+        let profile = profile_from(json!({"acp": {
             "default_agent": "claude-code",
             "max_concurrent_workers": 9,
             "replay_bytes": 1024,
@@ -622,32 +643,31 @@ mod tests {
         }}));
 
         let merged = merge_configs(global, &profile);
-        assert!(merged.cockpit.enabled);
-        assert_eq!(merged.cockpit.default_agent, "claude-code");
-        assert_eq!(merged.cockpit.max_concurrent_workers, 9);
-        assert_eq!(merged.cockpit.replay_bytes, 1024);
-        assert_eq!(merged.cockpit.node_path, "/opt/node");
+        assert_eq!(merged.acp.default_agent, "claude-code");
+        assert_eq!(merged.acp.max_concurrent_workers, 9);
+        assert_eq!(merged.acp.replay_bytes, 1024);
+        assert_eq!(merged.acp.node_path, "/opt/node");
         // Not overridden: inherits global default.
-        assert!(merged.cockpit.show_tool_durations);
+        assert!(merged.acp.show_tool_durations);
     }
 
     #[test]
-    fn test_merge_configs_cockpit_inherits_when_none() {
+    fn test_merge_configs_acp_inherits_when_none() {
         let mut global = Config::default();
-        global.cockpit.default_agent = "from-global".to_string();
-        global.cockpit.max_concurrent_workers = 7;
+        global.acp.default_agent = "from-global".to_string();
+        global.acp.max_concurrent_workers = 7;
 
-        let profile = profile_from(json!({"cockpit": {"enabled": true}}));
+        let profile = profile_from(json!({"acp": {"replay_events": 42}}));
         let merged = merge_configs(global, &profile);
-        assert!(merged.cockpit.enabled);
-        assert_eq!(merged.cockpit.default_agent, "from-global");
-        assert_eq!(merged.cockpit.max_concurrent_workers, 7);
+        assert_eq!(merged.acp.replay_events, 42);
+        assert_eq!(merged.acp.default_agent, "from-global");
+        assert_eq!(merged.acp.max_concurrent_workers, 7);
     }
 
     #[test]
     fn generic_merge_inherits_with_empty_overrides() {
         let mut global = Config::default();
-        global.cockpit.max_concurrent_workers = 7;
+        global.acp.max_concurrent_workers = 7;
         let generic = merge_configs_generic(&global, &json!({}));
         assert_eq!(
             serde_json::to_value(&global).unwrap(),

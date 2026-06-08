@@ -103,10 +103,14 @@ export function selectionReducer(
         if (action.validIds.has(id)) next.add(id);
         else changed = true;
       }
-      const anchorValid = state.anchorId != null && action.validIds.has(state.anchorId);
+      const anchorValid =
+        state.anchorId != null && action.validIds.has(state.anchorId);
       if (!anchorValid && state.anchorId != null) changed = true;
       if (!changed) return state;
-      return { selectedIds: next, anchorId: anchorValid ? state.anchorId : null };
+      return {
+        selectedIds: next,
+        anchorId: anchorValid ? state.anchorId : null,
+      };
     }
   }
 }

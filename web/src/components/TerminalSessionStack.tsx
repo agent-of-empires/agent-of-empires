@@ -9,7 +9,6 @@ import { TerminalView } from "./TerminalView";
 interface Props {
   activeSessionId: string;
   sessions: SessionResponse[];
-  cockpitMasterEnabled: boolean;
   persistent: boolean;
   maxPersistentTerminals?: number;
 }
@@ -17,7 +16,6 @@ interface Props {
 export function TerminalSessionStack({
   activeSessionId,
   sessions,
-  cockpitMasterEnabled,
   persistent,
   maxPersistentTerminals = DEFAULT_PERSISTENT_TERMINALS,
 }: Props) {
@@ -74,11 +72,7 @@ export function TerminalSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView
-              session={session}
-              active={active}
-              cockpitMasterEnabled={cockpitMasterEnabled}
-            />
+            <TerminalView session={session} active={active} />
           </div>
         );
       })}

@@ -18,7 +18,9 @@ import {
 
 test.use({ ...devices["iPhone 13"] });
 
-test("touch press-and-hold drag reorders the row and PUTs the new order", async ({ page }) => {
+test("touch press-and-hold drag reorders the row and PUTs the new order", async ({
+  page,
+}) => {
   const sessions = threeSessionsInOneRepo();
   const handle = await installSidebarMocks(page, { sessions });
 

@@ -59,9 +59,7 @@ export async function openMobileSidebar(page: Page) {
   }
   await page.waitForFunction(
     () => {
-      const row = document.querySelector(
-        '[data-testid="sidebar-session-row"]',
-      );
+      const row = document.querySelector('[data-testid="sidebar-session-row"]');
       if (!row) return false;
       const r = (row as HTMLElement).getBoundingClientRect();
       return r.x >= 0 && r.width > 0;
@@ -164,4 +162,3 @@ export function seedRepos(
     for (const fn of fns) fn(seedEnv);
   };
 }
-

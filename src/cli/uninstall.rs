@@ -45,16 +45,18 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
 
-    // Collect all possible data directory locations
-    #[cfg(target_os = "linux")]
+    // Collect all possible data directory locations. The home-dotfile path is
+    // always included (it is the macOS default and the pre-XDG Linux location),
+    // alongside the XDG path, so either layout is cleaned up.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let data_dirs = {
         let mut dirs = vec![home_dir.join(".agent-of-empires")];
-        if let Some(config_dir) = dirs::config_dir() {
-            dirs.push(config_dir.join("agent-of-empires"));
+        if let Ok(base) = crate::session::xdg_config_base() {
+            dirs.push(base.join("agent-of-empires"));
         }
         dirs
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let data_dirs = vec![home_dir.join(".agent-of-empires")];
 
     let mut found_items: Vec<FoundItem> = Vec::new();

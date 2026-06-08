@@ -1,4 +1,7 @@
-import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
+import type {
+  SettingsFieldDescriptor,
+  SettingsValidation,
+} from "../../lib/types";
 import {
   CollapsibleSection,
   ListField,
@@ -8,6 +11,7 @@ import {
   TextField,
   ToggleField,
 } from "./FormFields";
+import { CUSTOM_SETTINGS_WIDGETS } from "./customWidgetRegistry";
 
 interface Props {
   /** Config section name (e.g. "sandbox"). */
@@ -17,10 +21,19 @@ interface Props {
   /** Current values for this section (from the effective config JSON). */
   values: Record<string, unknown>;
   /** Persist one field. Mirrors `saveField`'s (section, field, value) shape;
-   *  passing `null` clears a profile override server-side. */
+   *  passing `null` clears a profile override server-side. May be async
+   *  (returns Promise<boolean>) or sync. */
   onSaveField: (section: string, field: string, value: unknown) => unknown;
   /** Subtitle for the auto-generated "Advanced" fold. */
   advancedSubtitle?: string;
+  /** Section-level post-save hook, run once after any field in this section
+   *  saves successfully. Used by the acp section to refresh `serverAbout`
+   *  (consumed live by ToolCards / the composer); widget-specific effects
+   *  (e.g. theme repaint) live in the custom widget itself, not here. */
+  onAfterSave?: (
+    descriptor: SettingsFieldDescriptor,
+    value: unknown,
+  ) => Promise<void> | void;
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -28,20 +41,57 @@ interface Props {
 function listValidator(
   validation: SettingsValidation,
 ): ((value: string) => string | null) | undefined {
-  if (validation.rule === "volume_list") {
-    return (v) => (v.includes(":") ? null : "Must contain ':' (host:container)");
+  switch (validation.rule) {
+    case "volume_list":
+      return (v) =>
+        v.includes(":") ? null : "Must contain ':' (host:container)";
+    case "env_list":
+      return (v) =>
+        /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v)
+          ? null
+          : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
+    case "port_mapping_list":
+      return (v) =>
+        /^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)";
+    default:
+      return undefined;
   }
-  return undefined;
+}
+
+/** Global-only fields are shown but not profile-overridable; surface that so a
+ *  per-profile edit does not look profile-scoped when it is not. */
+function describe(d: SettingsFieldDescriptor): string {
+  if (d.profile_overridable) return d.description;
+  const note = "Applies to all profiles (not profile-overridable).";
+  return d.description ? `${d.description} ${note}` : note;
+}
+
+/** Visible placeholder for a `custom` widget whose `id` has no registered web
+ *  component. Rendering this (rather than silently dropping the field) keeps a
+ *  schema/web mismatch obvious instead of letting a setting vanish. */
+function UnsupportedCustomWidget({
+  d,
+  id,
+}: {
+  d: SettingsFieldDescriptor;
+  id: string;
+}) {
+  return (
+    <div className="text-xs text-status-error bg-status-error/10 rounded-lg p-3">
+      No web control registered for "{d.label}" (custom widget "{id}"). Edit it
+      from the TUI or <code>config.toml</code>.
+    </div>
+  );
 }
 
 /** Render one schema-backed field with the matching FormFields control. */
 function renderField(
   d: SettingsFieldDescriptor,
   values: Record<string, unknown>,
-  onSaveField: Props["onSaveField"],
+  save: (value: unknown) => Promise<boolean>,
 ) {
   const raw = values[d.field];
-  const save = (value: unknown) => onSaveField(d.section, d.field, value);
+  const description = describe(d);
   const widget = d.widget;
 
   switch (widget.kind) {
@@ -50,7 +100,7 @@ function renderField(
         <ToggleField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           checked={typeof raw === "boolean" ? raw : false}
           onChange={save}
         />
@@ -60,7 +110,7 @@ function renderField(
         <TextField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           value={typeof raw === "string" ? raw : ""}
           onChange={(v) => save(v)}
           mono={widget.mono}
@@ -72,7 +122,7 @@ function renderField(
         <TextField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           value={typeof raw === "string" ? raw : ""}
           // Empty clears the value (and the override, server-side).
           onChange={(v) => save(v || null)}
@@ -84,7 +134,7 @@ function renderField(
         <NumberField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           value={typeof raw === "number" ? raw : 0}
           onChange={save}
           min={widget.min}
@@ -96,7 +146,7 @@ function renderField(
         <SliderField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           value={typeof raw === "number" ? raw : widget.min}
           onChange={save}
           min={widget.min}
@@ -109,11 +159,9 @@ function renderField(
         <SelectField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           value={
-            typeof raw === "string"
-              ? raw
-              : (widget.options[0]?.value ?? "")
+            typeof raw === "string" ? raw : (widget.options[0]?.value ?? "")
           }
           onChange={save}
           options={widget.options}
@@ -124,16 +172,26 @@ function renderField(
         <ListField
           key={d.field}
           label={d.label}
-          description={d.description}
+          description={description}
           items={Array.isArray(raw) ? (raw as string[]) : []}
           onChange={save}
           validate={listValidator(d.validation)}
         />
       );
-    case "custom":
-      // Bespoke widgets (theme picker, sound mode, logging matrix, ...) keep
-      // their hand-written components; the generic renderer skips them.
-      return null;
+    case "custom": {
+      const Widget = CUSTOM_SETTINGS_WIDGETS[widget.id];
+      if (!Widget) {
+        return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} />;
+      }
+      return (
+        <Widget
+          key={d.field}
+          descriptor={{ ...d, description }}
+          value={raw}
+          save={save}
+        />
+      );
+    }
   }
 }
 
@@ -142,7 +200,8 @@ function renderField(
  * form rows from `GET /api/settings/schema` instead of hand-written per-field
  * JSX, so adding a config field surfaces here automatically. Fields the
  * dashboard may not write (`local_only`) are skipped; `advanced` fields are
- * grouped under an "Advanced" fold to match the TUI.
+ * grouped under an "Advanced" fold to match the TUI. `custom` widgets render
+ * via the custom-widget registry (`customWidgets.tsx`).
  */
 export function SchemaSection({
   section,
@@ -150,6 +209,7 @@ export function SchemaSection({
   values,
   onSaveField,
   advancedSubtitle,
+  onAfterSave,
 }: Props) {
   const fields = schema.filter(
     (d) => d.section === section && d.web_write.policy !== "local_only",
@@ -157,12 +217,33 @@ export function SchemaSection({
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
 
+  // Wrap onSaveField so a successful save in this section runs the optional
+  // section-level hook once. Custom widgets receive this same `save`, so their
+  // own success-gated effects compose with it.
+  const makeSave =
+    (d: SettingsFieldDescriptor) =>
+    async (value: unknown): Promise<boolean> => {
+      const result = onSaveField(d.section, d.field, value);
+      const ok = result instanceof Promise ? await result : result !== false;
+      // The setting is already persisted; a failing post-save hook (e.g. a
+      // serverAbout refresh that errors) must not turn a successful save into
+      // a failed one.
+      if (ok && onAfterSave) {
+        try {
+          await onAfterSave(d, value);
+        } catch (err) {
+          console.warn("settings onAfterSave hook failed", err);
+        }
+      }
+      return ok;
+    };
+
   return (
     <div className="space-y-4">
-      {primary.map((d) => renderField(d, values, onSaveField))}
+      {primary.map((d) => renderField(d, values, makeSave(d)))}
       {advanced.length > 0 && (
         <CollapsibleSection title="Advanced" subtitle={advancedSubtitle}>
-          {advanced.map((d) => renderField(d, values, onSaveField))}
+          {advanced.map((d) => renderField(d, values, makeSave(d)))}
         </CollapsibleSection>
       )}
     </div>

@@ -20,12 +20,14 @@ vi.mock("../../lib/api", () => ({
   fetchProjects: vi.fn(),
   createProject: vi.fn(),
   deleteProject: vi.fn(),
+  updateProject: vi.fn(),
 }));
 
-import { fetchProjects, createProject } from "../../lib/api";
+import { fetchProjects, createProject, updateProject } from "../../lib/api";
 
 const mockFetch = fetchProjects as ReturnType<typeof vi.fn>;
 const mockCreate = createProject as ReturnType<typeof vi.fn>;
+const mockUpdate = updateProject as ReturnType<typeof vi.fn>;
 
 afterEach(() => {
   cleanup();
@@ -103,6 +105,52 @@ describe("ProjectsView default base branch", () => {
 
     expect(await screen.findByText("plain")).toBeTruthy();
     expect(screen.queryByText(/base branch:/i)).toBeNull();
+  });
+
+  it("edits a project's base branch via the edit modal", async () => {
+    mockFetch.mockResolvedValue([
+      {
+        name: "extra",
+        path: "/repo/extra",
+        scope: "global",
+        default_base_branch: "develop",
+      },
+    ]);
+    mockUpdate.mockResolvedValue({ ok: true });
+
+    render(<ProjectsView onClose={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+
+    const input = screen.getByDisplayValue("develop");
+    fireEvent.change(input, { target: { value: "release" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "release"),
+    );
+  });
+
+  it("clears the base branch by saving an empty value in the edit modal", async () => {
+    mockFetch.mockResolvedValue([
+      {
+        name: "extra",
+        path: "/repo/extra",
+        scope: "global",
+        default_base_branch: "develop",
+      },
+    ]);
+    mockUpdate.mockResolvedValue({ ok: true });
+
+    render(<ProjectsView onClose={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByDisplayValue("develop"), {
+      target: { value: "  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null),
+    );
   });
 
   it("clears the base branch field when the add form is cancelled", async () => {

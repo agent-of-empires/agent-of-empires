@@ -28,6 +28,18 @@ use crate::git::GitWorktree;
 use crate::session::builder::git_sanitize_branch_name;
 use crate::session::WorktreeInfo;
 
+/// Derive the worktree directory leaf for a tied session from its title.
+///
+/// Reuses the creation-time title slugger (`branch_name_from_title`) so a tied
+/// rename produces the same leaf the session would have been created with: an
+/// accent-folded, lowercased, dash-collapsed single path component. It never
+/// yields an empty string, a path separator, or `.`/`..` (it falls back to
+/// `"session"`), so the result is always a safe sibling-leaf name. Feeding it
+/// back through [`edit_worktree_workdir`]'s internal sanitizer is idempotent.
+pub fn worktree_leaf_from_title(title: &str) -> String {
+    crate::session::builder::branch_name_from_title(title)
+}
+
 /// Inputs for an in-place worktree workdir edit.
 pub struct WorktreeEditRequest<'a> {
     /// The session's current worktree metadata.
@@ -178,6 +190,25 @@ mod tests {
             created_at: Utc::now(),
             base_branch: None,
         }
+    }
+
+    #[test]
+    fn leaf_from_title_slugifies() {
+        assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
+        assert_eq!(
+            worktree_leaf_from_title("Fix: the/thing (v2)"),
+            "fix-the-thing-v2"
+        );
+    }
+
+    #[test]
+    fn leaf_from_title_never_empty_or_traversal() {
+        // Punctuation-only and dot titles fall back / collapse rather than
+        // producing an empty leaf or a "."/".." path component.
+        assert_eq!(worktree_leaf_from_title("..."), "session");
+        assert_eq!(worktree_leaf_from_title("   "), "session");
+        let leaf = worktree_leaf_from_title("../escape");
+        assert!(!leaf.contains('/') && leaf != ".." && !leaf.is_empty());
     }
 
     #[test]

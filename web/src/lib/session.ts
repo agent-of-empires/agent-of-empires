@@ -95,13 +95,13 @@ export function getStatusTextClass(
  *  has just finished and is awaiting the user's next prompt. Fresh-idle is
  *  bucketed with active so dashboard counts and filters surface it. */
 export function isSessionActive(
-  session:
-    | Pick<SessionResponse, "status" | "idle_entered_at">
-    | SessionStatus,
+  session: Pick<SessionResponse, "status" | "idle_entered_at"> | SessionStatus,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): boolean {
   if (typeof session === "string") {
-    return session === "Running" || session === "Waiting" || session === "Starting";
+    return (
+      session === "Running" || session === "Waiting" || session === "Starting"
+    );
   }
   return (
     session.status === "Running" ||

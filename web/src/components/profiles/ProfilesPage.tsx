@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   createProfile,
@@ -56,34 +56,25 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   const [renaming, setRenaming] = useState(false);
   const [inputValue, setInputValue] = useState("");
 
-  const reload = useCallback(async () => {
-    const list = await fetchProfiles();
-    setProfiles(list);
-    setSelected((current) => {
-      if (list.some((p) => p.name === current)) return current;
-      return list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "";
-    });
-  }, []);
-
-  useEffect(() => {
-    reload();
-  }, [reload]);
-
-  // Load the selected profile's settings (hook overrides + description) and
-  // the global hooks together. A request id guards against a slow response
-  // for a previously-selected profile winning after a fast switch.
+  // A request id guards against a slow response for a previously-selected
+  // profile winning after a fast switch.
   const loadSeq = useRef(0);
-  useEffect(() => {
-    if (!selected) {
+
+  const loadProfileSettings = (name: string) => {
+    const seq = ++loadSeq.current;
+    if (!name) {
       setProfileSettings(null);
+      setGlobalHooks(undefined);
+      setDescription("");
+      setError(null);
       return;
     }
-    const seq = ++loadSeq.current;
-    Promise.all([getProfileSettings(selected), fetchSettings()])
+    Promise.all([getProfileSettings(name), fetchSettings()])
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
         setGlobalHooks(global?.hooks as HooksOverride | undefined);
+        setError(null);
         setDescription(
           typeof profile?.description === "string" ? profile.description : "",
         );
@@ -92,9 +83,31 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
         if (seq !== loadSeq.current) return;
         setProfileSettings(null);
         setGlobalHooks(undefined);
+        setDescription("");
         setError("Failed to load profile settings");
       });
-  }, [selected]);
+  };
+
+  const reload = async () => {
+    const list = await fetchProfiles();
+    setProfiles(list);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const list = await fetchProfiles();
+      if (cancelled) return;
+      setProfiles(list);
+      const current =
+        list.find((p) => p.is_default)?.name ?? list[0]?.name ?? "";
+      setSelected(current);
+      loadProfileSettings(current);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const closeInput = () => {
     setCreating(false);
@@ -117,6 +130,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
     }
     closeInput();
     setSelected(trimmed);
+    loadProfileSettings(trimmed);
     await reload();
   };
 
@@ -138,6 +152,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
     }
     closeInput();
     setSelected(trimmed);
+    loadProfileSettings(trimmed);
     await reload();
   };
 
@@ -148,7 +163,10 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       setError("Failed to delete profile");
       return;
     }
-    if (selected === name) setSelected("");
+    if (selected === name) {
+      setSelected("");
+      loadProfileSettings("");
+    }
     await reload();
   };
 
@@ -258,7 +276,10 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
             <button
               key={p.name}
               type="button"
-              onClick={() => setSelected(p.name)}
+              onClick={() => {
+                setSelected(p.name);
+                loadProfileSettings(p.name);
+              }}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm text-left cursor-pointer ${
                 p.name === selected
                   ? "bg-surface-700 text-text-primary"

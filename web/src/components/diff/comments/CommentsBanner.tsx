@@ -8,8 +8,8 @@ interface Props {
 
 /** Floating chip rendered above the right-panel diff list. Visible
  *  whenever the active session has at least one comment and supports
- *  the feature (cockpit-only). The send button is disabled while the
- *  cockpit worker is not running so the prompt doesn't sink. */
+ *  the feature (acp-only). The send button is disabled while the
+ *  structured view worker is not running so the prompt doesn't sink. */
 export function CommentsBanner({
   count,
   sendEnabled,

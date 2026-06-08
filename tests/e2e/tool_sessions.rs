@@ -221,7 +221,7 @@ hotkey = "Alt+t"
     // animated spinner, every 5s on disk refresh, or on any key event).
     h.wait_for(MARKER);
 
-    // Esc returns to the agent view.
+    // Esc returns to the structured view.
     h.send_keys("Escape");
     h.wait_for_absent("Tool: echotool", Duration::from_secs(5));
 

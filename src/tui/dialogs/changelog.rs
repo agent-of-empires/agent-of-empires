@@ -662,16 +662,16 @@ mod tests {
 
     #[test]
     fn strip_bold_scope_prefix_extracts_scope() {
-        let (scope, rest) = strip_bold_scope_prefix("**cockpit:** Restore something");
-        assert_eq!(scope.as_deref(), Some("cockpit"));
+        let (scope, rest) = strip_bold_scope_prefix("**acp:** Restore something");
+        assert_eq!(scope.as_deref(), Some("acp"));
         assert_eq!(rest, "Restore something");
     }
 
     #[test]
     fn strip_bold_scope_prefix_handles_multi_part_scope() {
         let (scope, rest) =
-            strip_bold_scope_prefix("**cockpit/ws:** Restore drop-cancels-reader semantics");
-        assert_eq!(scope.as_deref(), Some("cockpit/ws"));
+            strip_bold_scope_prefix("**acp/ws:** Restore drop-cancels-reader semantics");
+        assert_eq!(scope.as_deref(), Some("acp/ws"));
         assert_eq!(rest, "Restore drop-cancels-reader semantics");
     }
 

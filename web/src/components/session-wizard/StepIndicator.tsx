@@ -1,4 +1,10 @@
-export type StepId = "project" | "session" | "agent" | "container" | "advanced" | "review";
+export type StepId =
+  | "project"
+  | "session"
+  | "agent"
+  | "container"
+  | "advanced"
+  | "review";
 
 export interface StepDef {
   id: StepId;

@@ -279,7 +279,9 @@ test.describe("Mobile proxy input keydown handling", () => {
         constructor(url: string | URL, protocols?: string | string[]) {
           super(url, protocols);
           const origSend = this.send.bind(this);
-          this.send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+          this.send = (
+            data: string | ArrayBufferLike | Blob | ArrayBufferView,
+          ) => {
             if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
               const bytes = new Uint8Array(
                 data instanceof ArrayBuffer ? data : data.buffer,
@@ -323,18 +325,26 @@ test.describe("Mobile proxy input keydown handling", () => {
   }
 
   test("Enter key sends carriage return via proxy keydown", async ({
-    page, browserName,
+    page,
+    browserName,
   }) => {
-    test.skip(browserName !== "webkit", "proxy input requires pointer:coarse (mobile only)");
+    test.skip(
+      browserName !== "webkit",
+      "proxy input requires pointer:coarse (mobile only)",
+    );
     await setupWithWsSpy(page);
     const sent = await sendKeyAndGetPtySent(page, "Enter", "Enter");
     expect(sent).toContain("\r");
   });
 
   test("Backspace key sends DEL (0x7f) via proxy keydown", async ({
-    page, browserName,
+    page,
+    browserName,
   }) => {
-    test.skip(browserName !== "webkit", "proxy input requires pointer:coarse (mobile only)");
+    test.skip(
+      browserName !== "webkit",
+      "proxy input requires pointer:coarse (mobile only)",
+    );
     await setupWithWsSpy(page);
     const sent = await sendKeyAndGetPtySent(page, "Backspace", "Backspace");
     expect(sent).toContain("\x7f");

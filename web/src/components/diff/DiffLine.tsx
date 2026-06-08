@@ -8,7 +8,7 @@ interface Props {
   line: RichDiffLine;
   tokens?: SyntaxToken[];
   /** Hide the per-side line-number gutters. Used inside compact embedded
-   *  diffs (e.g. the cockpit Edit card) where snippet line numbers add
+   *  diffs (e.g. the structured view Edit card) where snippet line numbers add
    *  more clutter than signal. */
   hideLineNumbers?: boolean;
   /** Render the hover-revealed "+" gutter button for the diff-comments
@@ -93,7 +93,9 @@ function DiffLineImpl({
             {showPlus && (
               <button
                 type="button"
-                onClick={() => onPlusClick(plusHunkIndex, plusSide, plusLineNum)}
+                onClick={() =>
+                  onPlusClick(plusHunkIndex, plusSide, plusLineNum)
+                }
                 aria-label={`Add comment on ${plusSide} line ${plusLineNum}`}
                 // `tabIndex={-1}` keeps the hover-revealed button out of
                 // the tab order; otherwise keyboard users would land on

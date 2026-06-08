@@ -1,6 +1,6 @@
-// Browser-side approval sound for the cockpit.
+// Browser-side approval sound for the structured view.
 //
-// When the cockpit transitions from "no pending approvals" to "at least
+// When the structured view transitions from "no pending approvals" to "at least
 // one pending approval", play the configured sound (from `[sound]` in
 // the daemon's config) in the browser. The host-side sound module only
 // fires on session-status transitions and runs on the server host, so
@@ -17,7 +17,7 @@
 //     does not run through that interceptor, so the bytes are fetched
 //     and handed to Audio via `URL.createObjectURL`.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import { fetchSettings, fetchSounds, fetchSoundBlob } from "../lib/api";
 
 interface SoundSettings {
@@ -39,13 +39,13 @@ const SETTINGS_TTL_MS = 30_000;
 let cachedSound: CachedSound | null = null;
 
 /** Grace window after mount during which 0->>=1 transitions are
- *  swallowed. The cockpit WS replays every stored event for the
+ *  swallowed. The structured view WS replays every stored event for the
  *  session on connect, so a fresh page load on a session with pending
  *  approvals would otherwise ring the chime even though nothing new
  *  happened. The OS push only fires on the live broadcast edge in the
  *  supervisor (no replay path), so the two channels stay consistent.
  *
- *  Reconnects do not unmount `CockpitView`, so this gate only swallows
+ *  Reconnects do not unmount `StructuredView`, so this gate only swallows
  *  the initial-load case; new approvals that arrive while the socket
  *  is offline still chime after the reducer applies them on reconnect. */
 const REPLAY_QUIET_MS = 1500;
@@ -74,9 +74,7 @@ async function loadSettings(): Promise<SoundSettings | null> {
   return cachedSettings;
 }
 
-async function resolveSoundName(
-  sound: SoundSettings,
-): Promise<string | null> {
+async function resolveSoundName(sound: SoundSettings): Promise<string | null> {
   const override = sound.on_approval?.trim();
   if (override) return override;
   if (typeof sound.mode === "object" && sound.mode !== null) {
@@ -132,25 +130,30 @@ async function playApprovalSound(): Promise<void> {
  *  approval sound. Pure passive: the hook does not mount any UI and
  *  has no return value. */
 export function useApprovalSound(pendingCount: number): void {
-  const lastCount = useRef(pendingCount);
-  // `mountedAt` is set once in the mount effect rather than in the
-  // useRef initialiser so `Date.now()` isn't re-evaluated on every
-  // render. The sentinel 0 doubles as a "not yet armed" marker; the
-  // transition effect treats 0 the same as a too-recent mount.
-  const mountedAt = useRef<number>(0);
+  const [trackedPendingCount, setTrackedPendingCount] = useState(pendingCount);
+  const [quietPeriodDone, setQuietPeriodDone] = useState(false);
+  // Bumped on a committed 0 -> >=1 edge; the effect below plays the chime.
+  // Keeping playback in an effect (not the render-time block) keeps the hook
+  // pure and avoids duplicate/late chimes under re-render or replay.
+  const [playbackToken, setPlaybackToken] = useState(0);
+
   useEffect(() => {
-    mountedAt.current = Date.now();
+    const timer = setTimeout(() => {
+      setQuietPeriodDone(true);
+    }, REPLAY_QUIET_MS);
+    return () => clearTimeout(timer);
   }, []);
+
   useEffect(() => {
-    const prev = lastCount.current;
-    lastCount.current = pendingCount;
-    if (prev !== 0 || pendingCount === 0) return;
-    if (
-      mountedAt.current === 0 ||
-      Date.now() - mountedAt.current < REPLAY_QUIET_MS
-    ) {
-      return;
+    if (playbackToken === 0) return;
+    const timer = setTimeout(() => void playApprovalSound(), 0);
+    return () => clearTimeout(timer);
+  }, [playbackToken]);
+
+  if (pendingCount !== trackedPendingCount) {
+    if (trackedPendingCount === 0 && pendingCount !== 0 && quietPeriodDone) {
+      setPlaybackToken((t) => t + 1);
     }
-    void playApprovalSound();
-  }, [pendingCount]);
+    setTrackedPendingCount(pendingCount);
+  }
 }

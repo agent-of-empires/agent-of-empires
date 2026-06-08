@@ -141,6 +141,12 @@ pub struct RenameArgs {
     /// New group for the session (empty string to ungroup)
     #[arg(short, long)]
     group: Option<String>,
+
+    /// When the session is tied (session.tie_workdir_to_name) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match.
+    /// Off by default; ignored for untied / non-worktree sessions.
+    #[arg(long)]
+    rename_branch: bool,
 }
 
 #[derive(Args)]
@@ -390,7 +396,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // instances always come back blank.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "start")?;
+    bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -427,31 +433,31 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Cockpit-mode sessions are not backed by tmux; their ACP worker is owned
+/// Acp-mode sessions are not backed by tmux; their ACP worker is owned
 /// by `aoe serve`'s supervisor (auto-spawned by the reconciler within ~2s
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
 ///
-/// `cockpit_mode` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in cockpit
+/// `structured_view` is gated behind the `serve` feature; without it the
+/// field doesn't exist on `Instance` and no session can be in structured view
 /// mode, so this is a no-op shim.
 #[cfg(feature = "serve")]
-fn bail_if_cockpit(inst: &crate::session::Instance, verb: &str) -> Result<()> {
-    if inst.cockpit_mode {
+fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
+    if inst.is_structured() {
         bail!(
-            "cockpit sessions are managed by `aoe serve`; \
+            "structured view sessions are managed by `aoe serve`; \
              cannot `aoe session {verb}` from the CLI.\n\
-             The ACP worker is auto-spawned within ~2s of `aoe add --cockpit` \
+             The ACP worker is auto-spawned within ~2s of an structured-view session \
              while serve is running, or on next `aoe serve` startup.\n\
-             To control a cockpit session, use the web dashboard or the REST API."
+             To control an structured-view session, use the web dashboard or the REST API."
         );
     }
     Ok(())
 }
 
 #[cfg(not(feature = "serve"))]
-fn bail_if_cockpit(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
+fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
@@ -462,7 +468,7 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "stop")?;
+    bail_if_acp(inst, "stop")?;
     let session_id = inst.id.clone();
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -665,7 +671,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 }
 
 /// Sessions in `Deleting` or `Creating` are mid-transition; restarting them
-/// would race the deletion/boot path. Cockpit-mode sessions are skipped
+/// would race the deletion/boot path. Acp-mode sessions are skipped
 /// because their lifecycle is owned by `aoe serve`'s supervisor, not
 /// tmux: a CLI-side restart would no-op silently and (with the explicit
 /// bail in `restart_session`) flood `--all` with per-session errors.
@@ -679,7 +685,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
         .filter(|_i| {
             #[cfg(feature = "serve")]
             {
-                !_i.cockpit_mode
+                !_i.is_structured()
             }
             #[cfg(not(feature = "serve"))]
             {
@@ -697,7 +703,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // rehydrate `source_profile` for config resolution.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "restart")?;
+    bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
@@ -813,7 +819,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
-    bail_if_cockpit(inst, "attach")?;
+    bail_if_acp(inst, "attach")?;
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     if !tmux_session.exists() {
@@ -1015,11 +1021,56 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .trim()
         .to_string();
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
+    let title_changed = old_title != effective_title;
+
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title (and optionally the branch), so
+    // the two cannot drift. Decided per-session from the resolved setting.
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
+
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
+    if tied && (title_changed || args.rename_branch) {
+        let current_path = inst.project_path.clone();
+        let worktree_info = inst
+            .worktree_info
+            .clone()
+            .expect("tie_workdir_applies implies worktree_info is Some");
+        // Persisted status can lag the live tmux pane; moving a running
+        // worktree is unsafe, so recompute before enforcing the gate.
+        let mut live = inst.clone();
+        crate::tmux::refresh_session_cache();
+        live.update_status();
+        if live.status.blocks_worktree_edit() {
+            bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
+        }
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+        match crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &worktree_info,
+                current_path: std::path::Path::new(&current_path),
+                new_name: &leaf,
+                rename_branch: args.rename_branch,
+            },
+        ) {
+            Ok(outcome) => {
+                new_path = Some(outcome.new_path.to_string_lossy().to_string());
+                new_branch = outcome.new_branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
+            Err(e) => return Err(e.into()),
+        }
+    } else if args.rename_branch {
+        bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
+    }
 
     // Phase 2 (unlocked): tmux rename if the title changed. Side effect on
     // the running tmux server, fast but external state, do it outside the
     // closure.
-    if old_title != effective_title {
+    if title_changed {
         let tmux_session = crate::tmux::Session::new(&id, &old_title)?;
         if tmux_session.exists() {
             let new_tmux_name = crate::tmux::Session::generate_name(&id, &effective_title);
@@ -1036,12 +1087,20 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // sessions are preserved. `create_group` is idempotent and only runs
     // when the closure actually mutated `group_path`, so `groups.json` is
     // rewritten only on real group changes (cf. `update`'s diff check).
-    storage.update(|instances, groups| {
+    let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
         inst.title = effective_title.clone();
+        if let Some(path) = &new_path {
+            inst.project_path = path.clone();
+        }
+        if let Some(branch) = &new_branch {
+            if let Some(wt) = inst.worktree_info.as_mut() {
+                wt.branch = branch.clone();
+            }
+        }
         if let Some(group) = &new_group {
             inst.group_path = group.clone();
         }
@@ -1052,9 +1111,23 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             *groups = group_tree.get_all_groups();
         }
         Ok(())
-    })?;
+    });
+    if let Err(e) = persist {
+        // When the git move already landed, surface that the disk and metadata
+        // are out of sync rather than a bare persist error.
+        if let Some(path) = &new_path {
+            bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {e}. Re-run to retry.");
+        }
+        return Err(e);
+    }
 
-    if old_title != effective_title {
+    if let Some(path) = &new_path {
+        println!("✓ Worktree moved to: {}", path);
+        if let Some(branch) = &new_branch {
+            println!("  Branch renamed to: {}", branch);
+        }
+    }
+    if title_changed {
         println!("✓ Renamed session: {} → {}", old_title, effective_title);
     } else {
         println!("✓ Updated session: {}", effective_title);
@@ -1092,6 +1165,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
+    // When tied (#1927) the directory follows the title, so reject the
+    // standalone edit and point at the unified rename instead.
+    if inst.tie_workdir_applies(
+        crate::session::profile_config::resolve_config_or_warn(profile)
+            .session
+            .tie_workdir_to_name,
+    ) {
+        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+    }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
     // enforcing the guard.
@@ -1205,9 +1287,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             #[cfg(feature = "serve")]
-            if inst.cockpit_mode {
+            if inst.is_structured() {
                 anyhow::bail!(
-                    "cannot set resume target on cockpit-mode session '{}'; cockpit manages its own conversation lifecycle via ACP",
+                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
                     inst.title
                 );
             }
@@ -1465,7 +1547,7 @@ mod stale_history_suffix_tests {
 }
 
 #[cfg(all(test, feature = "serve"))]
-mod cockpit_reject_tests {
+mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, Storage};
     use serial_test::serial;
@@ -1473,15 +1555,15 @@ mod cockpit_reject_tests {
 
     #[tokio::test]
     #[serial]
-    async fn set_session_id_rejects_cockpit_mode_session() {
+    async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-        let storage = Storage::new("cockpit-reject").unwrap();
-        let mut inst = Instance::new("cockpit_session", "/tmp/x");
-        inst.cockpit_mode = true;
+        let storage = Storage::new("acp-reject").unwrap();
+        let mut inst = Instance::new("acp_session", "/tmp/x");
+        inst.view = crate::session::View::Structured;
         let id = inst.id.clone();
         let on_disk = inst.clone();
         storage
@@ -1495,7 +1577,7 @@ mod cockpit_reject_tests {
             .unwrap();
 
         let result = set_session_id(
-            "cockpit-reject",
+            "acp-reject",
             SetSessionIdArgs {
                 identifier: id.clone(),
                 session_id: "11111111-1111-1111-1111-111111111111".to_string(),
@@ -1503,11 +1585,11 @@ mod cockpit_reject_tests {
         )
         .await;
 
-        let err = result.expect_err("set-session-id must reject cockpit-mode sessions");
+        let err = result.expect_err("set-session-id must reject structured view-mode sessions");
         let msg = format!("{:#}", err);
         assert!(
-            msg.contains("cockpit"),
-            "error must mention cockpit: {}",
+            msg.contains("acp"),
+            "error must mention structured view: {}",
             msg
         );
 

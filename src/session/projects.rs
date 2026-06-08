@@ -65,9 +65,10 @@ pub struct Project {
     pub name: String,
     pub path: String,
     /// Default base branch for new worktree branches created against this
-    /// project's repo in a multi-repo workspace. When `None`, resolution falls
-    /// back to the global/profile `worktree.default_base_branch`, then the
-    /// repo's detected default branch.
+    /// project's repo, whether it is the launch repo or an extra repo in a
+    /// multi-repo workspace. An explicit session base wins; when `None`,
+    /// resolution falls back to the global/profile `worktree.default_base_branch`,
+    /// then the repo's detected default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
     /// Populated by the loader; not persisted.
@@ -285,6 +286,45 @@ pub fn remove(
     Ok(removed)
 }
 
+/// Set or clear the default base branch on the entry matching `name_or_path`
+/// in the given scope. `base` is normalized via `Project::with_base_branch`
+/// (trimmed; empty becomes unset). Returns the updated project, or `NotFound`
+/// if no entry matches.
+///
+/// This is a read-modify-write over the scope's registry file. There is no
+/// optimistic-concurrency guard; for a single-user local tool last-writer-wins
+/// across racing `aoe` processes is acceptable.
+pub fn update_base_branch(
+    profile: &str,
+    scope: ProjectScope,
+    name_or_path: &str,
+    base: Option<String>,
+) -> std::result::Result<Project, RegistryError> {
+    let mut existing = match scope {
+        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
+        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
+    };
+
+    let canonical_target = canonical_key(name_or_path);
+    let idx = existing
+        .iter()
+        .position(|p| {
+            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
+        })
+        .ok_or_else(|| {
+            RegistryError::NotFound(format!(
+                "No project '{}' in {} scope",
+                name_or_path,
+                scope.as_str()
+            ))
+        })?;
+
+    existing[idx] = existing[idx].clone().with_base_branch(base);
+    let updated = existing[idx].clone();
+    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
+    Ok(updated)
+}
+
 /// Resolve a list of project names against the merged registry. Errors on the
 /// first unknown name with the available names listed.
 pub fn resolve_names(profile: &str, names: &[String]) -> Result<Vec<Project>> {
@@ -322,7 +362,7 @@ mod tests {
 
     fn setup(temp: &Path) {
         std::env::set_var("HOME", temp);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
     }
 
@@ -362,6 +402,52 @@ mod tests {
         let loaded = load_global()?;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].default_base_branch.as_deref(), Some("develop"));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn update_base_branch_sets_clears_and_reports_not_found() -> Result<()> {
+        let temp = tempdir()?;
+        setup(temp.path());
+        let repo = temp.path().join("repoUpd");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("repoUpd", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+
+        // Set, looking the project up by name.
+        let updated = update_base_branch(
+            "default",
+            ProjectScope::Global,
+            "repoUpd",
+            Some("develop".into()),
+        )?;
+        assert_eq!(updated.default_base_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            load_global()?[0].default_base_branch.as_deref(),
+            Some("develop")
+        );
+
+        // Whitespace clears it back to unset, looking up by canonical path.
+        let cleared = update_base_branch(
+            "default",
+            ProjectScope::Global,
+            &repo.to_string_lossy(),
+            Some("   ".into()),
+        )?;
+        assert_eq!(cleared.default_base_branch, None);
+        assert_eq!(load_global()?[0].default_base_branch, None);
+
+        // Unknown project is a NotFound.
+        assert!(matches!(
+            update_base_branch("default", ProjectScope::Global, "nope", Some("x".into())),
+            Err(RegistryError::NotFound(_))
+        ));
         Ok(())
     }
 

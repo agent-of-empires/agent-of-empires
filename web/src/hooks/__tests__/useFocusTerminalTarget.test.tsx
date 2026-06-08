@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// Unit tests for useFocusTerminalTarget (#1454): the hook the cockpit
+// Unit tests for useFocusTerminalTarget (#1454): the hook the structured view
 // Composer uses to receive sidebar-select focus. Covers the three paths:
 //  - a matching dispatch focuses the ref while mounted,
 //  - a dispatch with the ref missing stashes the pending latch,
@@ -23,7 +23,10 @@ afterEach(() => {
   consumePendingTerminalFocus("agent");
 });
 
-function renderWithElement(target: "composer" | "agent", el: HTMLElement | null) {
+function renderWithElement(
+  target: "composer" | "agent",
+  el: HTMLElement | null,
+) {
   return renderHook(() => {
     const ref = useRef<HTMLElement | null>(el);
     useFocusTerminalTarget(target, ref);

@@ -4,10 +4,7 @@ import type { BranchInfo } from "../../lib/api";
 import { buildDiffTree, type DiffTreeNode } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { fetchBranches, setSessionDiffBase } from "../../lib/api";
-import {
-  CopyPathContextMenu,
-  type PathMenuState,
-} from "./CopyPathContextMenu";
+import { CopyPathContextMenu, type PathMenuState } from "./CopyPathContextMenu";
 
 interface Props {
   files: RichDiffFile[];
@@ -171,7 +168,10 @@ function TreeView({
               onMouseEnter={() => onFocusIndex(i)}
               aria-expanded={!node.collapsed}
               className={`w-full text-left py-1.5 cursor-pointer transition-colors flex items-center gap-1.5 text-text-muted hover:bg-surface-800/50 ${focusRing}`}
-              style={{ paddingLeft: `${node.depth * 16 + 12 + indentOffset}px`, paddingRight: 12 }}
+              style={{
+                paddingLeft: `${node.depth * 16 + 12 + indentOffset}px`,
+                paddingRight: 12,
+              }}
             >
               <svg
                 className={`w-3 h-3 shrink-0 text-text-dim transition-transform duration-75 ${
@@ -219,7 +219,10 @@ function TreeView({
                 ? "bg-surface-850 text-text-primary"
                 : "text-text-secondary hover:bg-surface-800/50"
             } ${focusRing}`}
-            style={{ paddingLeft: `${node.depth * 16 + 12 + indentOffset}px`, paddingRight: 12 }}
+            style={{
+              paddingLeft: `${node.depth * 16 + 12 + indentOffset}px`,
+              paddingRight: 12,
+            }}
           >
             <span
               className={`shrink-0 font-mono text-[12px] w-3 text-center ${STATUS_COLORS[file.status] ?? "text-text-muted"}`}
@@ -332,8 +335,7 @@ export function DiffFileList({
   const itemCount = viewMode === "tree" ? treeNodes.length : files.length;
 
   // Clamp focused index when item count shrinks
-  const clampedFocusedIndex =
-    focusedIndex >= itemCount ? -1 : focusedIndex;
+  const clampedFocusedIndex = focusedIndex >= itemCount ? -1 : focusedIndex;
 
   // Keyboard navigation
   const handleKeyDown = useCallback(
@@ -360,7 +362,8 @@ export function DiffFileList({
           break;
         }
         case "ArrowRight": {
-          const rNode = viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
+          const rNode =
+            viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
           if (rNode?.kind === "dir" && rNode.collapsed) {
             e.preventDefault();
             toggleDir(rNode.path);
@@ -368,7 +371,8 @@ export function DiffFileList({
           break;
         }
         case "ArrowLeft": {
-          const lNode = viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
+          const lNode =
+            viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
           if (lNode?.kind === "dir" && !lNode.collapsed) {
             e.preventDefault();
             toggleDir(lNode.path);
@@ -394,7 +398,15 @@ export function DiffFileList({
         }
       }
     },
-    [itemCount, clampedFocusedIndex, viewMode, treeNodes, files, toggleDir, onSelectFile],
+    [
+      itemCount,
+      clampedFocusedIndex,
+      viewMode,
+      treeNodes,
+      files,
+      toggleDir,
+      onSelectFile,
+    ],
   );
 
   const [pathMenu, setPathMenu] = useState<PathMenuState | null>(null);
@@ -442,8 +454,7 @@ export function DiffFileList({
                 {files.length} file{files.length !== 1 ? "s" : ""}
               </span>
               <span className="font-mono text-[11px]">
-                <span className="text-status-running">+{totalAdditions}</span>
-                {" "}
+                <span className="text-status-running">+{totalAdditions}</span>{" "}
                 <span className="text-status-error">-{totalDeletions}</span>
               </span>
             </>
@@ -455,7 +466,11 @@ export function DiffFileList({
             <button
               onClick={toggleViewMode}
               className="ml-auto shrink-0 p-1 rounded text-text-dim hover:text-text-muted hover:bg-surface-800/50 transition-colors cursor-pointer"
-              title={viewMode === "flat" ? "Switch to tree view" : "Switch to flat list"}
+              title={
+                viewMode === "flat"
+                  ? "Switch to tree view"
+                  : "Switch to flat list"
+              }
             >
               {viewMode === "flat" ? (
                 // Tree icon
@@ -581,7 +596,10 @@ function MultiRepoGroups({
         const adds = repoFiles.reduce((s, f) => s + f.additions, 0);
         const dels = repoFiles.reduce((s, f) => s + f.deletions, 0);
         return (
-          <div key={name || "_default"} className="border-b border-surface-700/20 last:border-b-0">
+          <div
+            key={name || "_default"}
+            className="border-b border-surface-700/20 last:border-b-0"
+          >
             <button
               type="button"
               onClick={() => onToggleRepo(name)}
@@ -607,7 +625,9 @@ function MultiRepoGroups({
                 {repoFiles.length}
               </span>
               <span className="font-mono text-[11px] flex items-center gap-1">
-                {adds > 0 && <span className="text-status-running">+{adds}</span>}
+                {adds > 0 && (
+                  <span className="text-status-running">+{adds}</span>
+                )}
                 {dels > 0 && <span className="text-status-error">-{dels}</span>}
               </span>
             </button>
@@ -888,7 +908,11 @@ function BasePicker({
               >
                 <span className="truncate">{b.name}</span>
                 <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
-                  {b.is_current ? "current" : b.remote_only ? "remote" : "local"}
+                  {b.is_current
+                    ? "current"
+                    : b.remote_only
+                      ? "remote"
+                      : "local"}
                 </span>
               </li>
             ))}

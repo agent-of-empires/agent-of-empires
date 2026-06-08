@@ -1,7 +1,7 @@
 // Centralised localStorage helpers that swallow QuotaExceededError, private-mode
 // SecurityError, and other storage-disabled throws. Use these for any non-critical
 // write where best-effort persistence is acceptable. Modules that need to know
-// whether the write succeeded (e.g. cockpit state cache for eviction-on-quota)
+// whether the write succeeded (e.g. structured view state cache for eviction-on-quota)
 // can branch on safeSetItem's boolean return. Modules that must hard-fail on
 // quota (token.ts auth secret, deviceBinding.ts) continue to call
 // `window.localStorage.setItem` directly with an `eslint-disable-next-line` and

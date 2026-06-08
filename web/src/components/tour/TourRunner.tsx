@@ -57,7 +57,11 @@ const STYLES: Partial<Styles> = {
     color: "var(--color-text-primary)",
     fontSize: 13,
   },
-  tooltipTitle: { color: "var(--color-brand-500)", fontSize: 14, fontWeight: 600 },
+  tooltipTitle: {
+    color: "var(--color-brand-500)",
+    fontSize: 14,
+    fontWeight: 600,
+  },
   tooltipContent: { padding: "10px 4px" },
   buttonPrimary: {
     backgroundColor: "var(--color-brand-600)",

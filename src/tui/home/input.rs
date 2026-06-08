@@ -14,10 +14,10 @@ use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HookTrustAction,
-    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
-    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
-    RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
+    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
+    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
+    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -257,6 +257,23 @@ pub(super) fn build_tool_hotkey_cache(
         .collect()
 }
 
+/// Pull the cell symbols in columns `[from, to_excl)` out of a parsed
+/// scrollback `Line`. The line is laid back out into a one-row buffer at
+/// the pane width so wide characters, combining marks, and right-edge
+/// truncation resolve exactly as ratatui rendered them on screen; reading
+/// cell symbols then mirrors the old frame-buffer extraction cell for
+/// cell. Unwritten cells read as a single space, which the caller trims.
+fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width: u16) -> String {
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+    buf.set_line(0, 0, line, width);
+    let hi = to_excl.min(width);
+    let mut out = String::new();
+    for col in from..hi {
+        out.push_str(buf[(col, 0)].symbol());
+    }
+    out
+}
+
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
@@ -368,10 +385,16 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return false;
         }
-        if self.hit_preview(col, row) {
+        // Seed the selection in content coords so it survives a scroll
+        // and can span more than one page. `contains` also requires the
+        // pane to hold real scrollback, so a drag over an empty / not-yet
+        // -captured pane is a no-op rather than a phantom selection.
+        let view = self.preview_text_view;
+        if view.contains(col, row) {
+            let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
-                anchor: (col, row),
-                extent: (col, row),
+                anchor: cell,
+                extent: cell,
                 finalized: false,
             });
             self.drag_state = Some(DragKind::PreviewSelect);
@@ -449,23 +472,23 @@ impl HomeView {
                 true
             }
             Some(DragKind::PreviewSelect) => {
+                let view = self.preview_text_view;
+                let pane = view.pane;
+                if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+                    return false;
+                }
+                // Record the live pointer cell so the ticker-driven
+                // auto-scroll (`tick_preview_autoscroll`) can keep
+                // extending while the cursor is held at the edge. The
+                // scroll itself is NOT done here: crossterm only emits
+                // Drag events on movement, so scrolling per-event makes
+                // a held cursor stall and a moving one lurch one line per
+                // event. The ticker advances it smoothly instead.
+                self.preview_drag_pos = Some((col, row));
+                let new_extent = view.screen_to_content(col, row);
                 let Some(sel) = self.preview_selection.as_mut() else {
                     return false;
                 };
-                // Clamp the drag extent to the preview pane so a
-                // mouse-out below the pane (very common: users drag down
-                // through the last visible row, expecting the selection
-                // to stop at the bottom) doesn't try to highlight
-                // chrome rows on neighbouring widgets.
-                let area = self.preview_area;
-                if area.width == 0 || area.height == 0 {
-                    return false;
-                }
-                let max_x = area.right().saturating_sub(1);
-                let max_y = area.bottom().saturating_sub(1);
-                let clamped_x = col.clamp(area.x, max_x);
-                let clamped_y = row.clamp(area.y, max_y);
-                let new_extent = (clamped_x, clamped_y);
                 if sel.extent == new_extent {
                     return false;
                 }
@@ -474,6 +497,86 @@ impl HomeView {
             }
             None => false,
         }
+    }
+
+    /// Advance an edge-held preview drag by one line. Driven by the event
+    /// loop's ~33ms ticker (not by mouse events) so holding the cursor at
+    /// the pane's top or bottom edge scrolls continuously and grows the
+    /// selection past a single page. Returns whether anything moved, so
+    /// the caller can redraw.
+    pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
+            return false;
+        }
+        let Some((col, row)) = self.preview_drag_pos else {
+            return false;
+        };
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+            return false;
+        }
+        let at_top = row <= pane.y;
+        let at_bottom = row >= pane.bottom().saturating_sub(1);
+        if !at_top && !at_bottom {
+            // Cursor pulled back inside the pane: arm the next edge entry
+            // to scroll immediately rather than wait out the interval.
+            self.preview_autoscroll_at = None;
+            return false;
+        }
+        // Pace the scroll to a steady cadence regardless of how often the
+        // loop woke this iteration, so the speed is even instead of racing
+        // with capture-worker activity.
+        const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.preview_autoscroll_at {
+            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
+                return false;
+            }
+        }
+        let scrolled = if at_top {
+            self.scroll_preview_offset(1)
+        } else {
+            self.scroll_preview_offset(-1)
+        };
+        if !scrolled {
+            return false;
+        }
+        self.preview_autoscroll_at = Some(now);
+        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+        // Pin the extent to the now-revealed edge line in `from_bottom`
+        // terms, which the new scroll offset gives directly: the bottom
+        // visible line sits `offset` lines up from the newest line, the top
+        // visible line `offset + height - 1`. Deriving it from the offset
+        // (not the stale pre-scroll `total_lines`) keeps it correct even
+        // before the next frame re-captures.
+        let offset = self.preview_scroll_offset as usize;
+        let from_bottom = if at_top {
+            offset + (pane.height as usize).saturating_sub(1)
+        } else {
+            offset
+        };
+        if let Some(sel) = self.preview_selection.as_mut() {
+            sel.extent = (col_off, from_bottom);
+        }
+        true
+    }
+
+    /// Shift the preview scroll offset by `delta` lines (positive scrolls
+    /// up toward older output), clamped to the captured window. Returns
+    /// whether the offset actually moved. Factored out of the wheel
+    /// handlers so the edge auto-scroll can move the pane without dragging
+    /// the whole `handle_scroll_*` routing along with it.
+    fn scroll_preview_offset(&mut self, delta: i32) -> bool {
+        let cache = self.active_preview_cache();
+        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
+        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
+        if new == self.preview_scroll_offset {
+            return false;
+        }
+        self.preview_scroll_offset = new;
+        true
     }
 
     /// End any active drag. For the list divider, persist the final
@@ -491,6 +594,10 @@ impl HomeView {
         let Some(state) = self.drag_state.take() else {
             return false;
         };
+        // The pointer is up, so edge auto-scroll stops; drop the tracked
+        // position so a finalized highlight doesn't keep scrolling.
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
         match state {
             DragKind::ListDivider { .. } => {
                 self.save_list_width();
@@ -525,68 +632,52 @@ impl HomeView {
         matches!(self.drag_state, Some(DragKind::PreviewSelect))
     }
 
-    /// Read the characters underneath the current preview selection
-    /// from the rendered frame buffer, joined into a tmux-style flow
-    /// string. Called from `paint_preview_selection` on the render
-    /// that follows `handle_drag_end`, when `preview_copy_pending`
-    /// is set and the buffer still holds the cells the user dragged
-    /// over.
+    /// Join the text under the current preview selection into a tmux-style
+    /// flow string. Called from `paint_preview_selection` on the render
+    /// that follows `handle_drag_end`, when `preview_copy_pending` is set.
     ///
-    /// The frame buffer is the authoritative source: it carries exactly
-    /// what the user sees, with ansi-to-tui decoding and scroll already
-    /// applied. Reading the parsed `Text` upstream of the renderer would
-    /// duplicate the wrap math and skew when the preview is mid-scroll.
-    pub(super) fn extract_preview_selection_text(
-        &self,
-        buffer: &ratatui::buffer::Buffer,
-    ) -> Option<String> {
+    /// The selection is anchored to absolute scrollback lines, so this
+    /// reads straight from the active cache's parsed `Text` rather than
+    /// the visible frame buffer. That is what makes a multi-page copy work:
+    /// the buffer only holds the current page, but the parsed cache holds
+    /// the whole captured window, including the lines that have scrolled
+    /// off screen. Each line is laid back out into a one-row buffer at the
+    /// pane width so column slicing handles wide chars and truncation
+    /// exactly as the on-screen render did.
+    pub(super) fn extract_preview_selection_text(&self) -> Option<String> {
         let sel = self.preview_selection?;
-        let preview = self.preview_area;
-        let buf_area = buffer.area;
-        let preview = preview.intersection(buf_area);
-        if preview.width == 0 || preview.height == 0 {
+        let view = self.preview_text_view;
+        let width = view.pane.width;
+        if width == 0 || view.total_lines == 0 {
             return None;
         }
-        let ((start_col, start_row), (end_col, end_row)) = sel.ordered();
-        if start_row == end_row && start_col == end_col {
+        let lines = self.active_preview_cache().parsed_text.as_ref()?;
+        // Resolve `from_bottom` distances to absolute indices against the
+        // SAME `total_lines` the renderer used this frame, so the copied
+        // range matches the painted highlight cell for cell.
+        let ((start_col, start_line), (end_col, end_line)) = sel.ordered_abs(view);
+        if start_line == end_line && start_col == end_col {
             return None;
         }
-        let preview_right_excl = preview.right();
-        let preview_left = preview.x;
         let mut out = String::new();
-        for row in start_row..=end_row {
-            if row < preview.y || row >= preview.bottom() {
-                if row < end_row {
-                    out.push('\n');
-                }
-                continue;
-            }
-            let row_start_col = if row == start_row {
-                start_col.max(preview_left)
+        for line_idx in start_line..=end_line {
+            let from = if line_idx == start_line { start_col } else { 0 };
+            let to_excl = if line_idx == end_line {
+                end_col.saturating_add(1).min(width)
             } else {
-                preview_left
+                width
             };
-            let row_end_excl = if row == end_row {
-                end_col.saturating_add(1).min(preview_right_excl)
-            } else {
-                preview_right_excl
-            };
-            if row_end_excl <= row_start_col {
-                if row < end_row {
-                    out.push('\n');
+            if let Some(line) = lines.lines.get(line_idx) {
+                if to_excl > from {
+                    // Trim only trailing whitespace per row, not leading:
+                    // a selection over indented code keeps the indentation,
+                    // while right-edge padding on unfilled rows doesn't
+                    // bloat the paste.
+                    let slice = slice_line_columns(line, from, to_excl, width);
+                    out.push_str(slice.trim_end());
                 }
-                continue;
             }
-            let mut line = String::new();
-            for col in row_start_col..row_end_excl {
-                line.push_str(buffer[(col, row)].symbol());
-            }
-            // Trim only trailing whitespace per row, not leading: a
-            // selection over indented code keeps the indentation,
-            // while padding at the right edge of the preview (the
-            // common case for unfilled rows) doesn't bloat the paste.
-            out.push_str(line.trim_end());
-            if row < end_row {
+            if line_idx < end_line {
                 out.push('\n');
             }
         }
@@ -611,10 +702,13 @@ impl HomeView {
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
             // Cancel any in-progress drag too so the next Up(Left)
-            // doesn't re-finalize a stale selection.
+            // doesn't re-finalize a stale selection, and stop the edge
+            // auto-scroll from chasing a now-cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
                 self.drag_state = None;
             }
+            self.preview_drag_pos = None;
+            self.preview_autoscroll_at = None;
             // A pending capture from a previous finalized drag is
             // moot once the selection is gone; drop it so the next
             // selection starts clean.
@@ -1003,37 +1097,42 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.hook_trust_dialog {
+        if let Some(dialog) = &self.repo_trust_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
-                        self.hook_trust_dialog = None;
-                        self.pending_hook_trust_data = None;
+                        self.repo_trust_dialog = None;
+                        self.pending_repo_trust_data = None;
                     }
                     DialogResult::Submit(action) => {
-                        self.hook_trust_dialog = None;
-                        if let Some(data) = self.pending_hook_trust_data.take() {
+                        self.repo_trust_dialog = None;
+                        if let Some(data) = self.pending_repo_trust_data.take() {
                             let emit = match action {
-                                HookTrustAction::Trust {
-                                    hooks,
+                                RepoTrustAction::Trust {
                                     hooks_hash,
+                                    mcp_hash,
                                     project_path,
+                                    hooks,
                                 } => {
+                                    // If persisting trust fails, abort creation:
+                                    // launching anyway leaves a split state where
+                                    // hooks are treated as approved but project MCP
+                                    // stays gated off (it is read back from the
+                                    // unwritten hashes).
                                     if let Err(e) = repo_config::trust_repo(
                                         std::path::Path::new(&project_path),
-                                        &hooks_hash,
+                                        hooks_hash.as_deref(),
+                                        mcp_hash.as_deref(),
                                     ) {
-                                        tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                        None
+                                    } else {
+                                        self.create_session_with_hooks(data, hooks)
                                     }
-                                    let merged =
-                                        repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                    self.create_session_with_hooks(data, merged)
                                 }
-                                HookTrustAction::Skip => {
-                                    let fallback =
-                                        repo_config::resolve_global_profile_hooks(&data.profile);
-                                    self.create_session_with_hooks(data, fallback)
+                                RepoTrustAction::Skip { hooks } => {
+                                    self.create_session_with_hooks(data, hooks)
                                 }
                             };
                             self.pending_dialog_click_action = emit;
@@ -1410,36 +1509,38 @@ impl HomeView {
             return None;
         }
 
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
-                    self.hook_trust_dialog = None;
-                    self.pending_hook_trust_data = None;
+                    self.repo_trust_dialog = None;
+                    self.pending_repo_trust_data = None;
                 }
                 DialogResult::Submit(action) => {
-                    self.hook_trust_dialog = None;
-                    if let Some(data) = self.pending_hook_trust_data.take() {
+                    self.repo_trust_dialog = None;
+                    if let Some(data) = self.pending_repo_trust_data.take() {
                         match action {
-                            HookTrustAction::Trust {
-                                hooks,
+                            RepoTrustAction::Trust {
                                 hooks_hash,
+                                mcp_hash,
                                 project_path,
+                                hooks,
                             } => {
+                                // Abort creation if trust cannot be persisted, to
+                                // avoid a split state (hooks approved but project
+                                // MCP gated off the unwritten hashes).
                                 if let Err(e) = repo_config::trust_repo(
                                     std::path::Path::new(&project_path),
-                                    &hooks_hash,
+                                    hooks_hash.as_deref(),
+                                    mcp_hash.as_deref(),
                                 ) {
-                                    tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                    return None;
                                 }
-                                let merged =
-                                    repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                return self.create_session_with_hooks(data, merged);
+                                return self.create_session_with_hooks(data, hooks);
                             }
-                            HookTrustAction::Skip => {
-                                let fallback =
-                                    repo_config::resolve_global_profile_hooks(&data.profile);
-                                return self.create_session_with_hooks(data, fallback);
+                            RepoTrustAction::Skip { hooks } => {
+                                return self.create_session_with_hooks(data, hooks);
                             }
                         }
                     }
@@ -1857,7 +1958,7 @@ impl HomeView {
         // Dynamic tool session hotkeys (checked before everything else).
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
             if matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name) {
-                self.view_mode = ViewMode::Agent;
+                self.view_mode = ViewMode::Structured;
             } else {
                 self.view_mode = ViewMode::Tool(tool_name);
                 self.preview_scroll_offset = 0;
@@ -1875,7 +1976,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
-                self.view_mode = ViewMode::Agent;
+                self.view_mode = ViewMode::Structured;
                 return None;
             }
             _ => {}
@@ -1996,7 +2097,7 @@ impl HomeView {
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
-                    self.view_mode = ViewMode::Agent;
+                    self.view_mode = ViewMode::Structured;
                 } else if !self.tool_configs.is_empty() {
                     self.open_tool_picker();
                 }
@@ -2031,8 +2132,8 @@ impl HomeView {
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
                 self.view_mode = match self.view_mode {
-                    ViewMode::Agent => ViewMode::Terminal,
-                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Agent,
+                    ViewMode::Structured => ViewMode::Terminal,
+                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
                 };
             }
             ActionId::SendMessage => self.open_send_message_dialog(),
@@ -2193,7 +2294,17 @@ impl HomeView {
         let session_id_owned = inst.id.clone();
         let profile = inst.source_profile.clone();
         let base_override = inst.base_branch_override.clone();
-        match DiffView::new_for_session(repo_path, Some(session_id_owned), profile, base_override) {
+        let worktree_base = inst
+            .worktree_info
+            .as_ref()
+            .and_then(|w| w.base_branch.clone());
+        match DiffView::new_for_session(
+            repo_path,
+            Some(session_id_owned),
+            profile,
+            base_override,
+            worktree_base,
+        ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {
                 tracing::error!(target: "tui.input", "Failed to open diff view: {}", e);
@@ -2552,7 +2663,7 @@ impl HomeView {
     }
 
     /// Resolve the action that "activating" the currently-selected session
-    /// should produce (cockpit open, attach to tmux session, attach to a
+    /// should produce (structured view open, attach to tmux session, attach to a
     /// tool session, etc.). Returns `None` for in-flight sessions
     /// (`Creating`/`Deleting`) and when no session is selected. Shared
     /// between the `Enter` keybind and double-click activation so the two
@@ -2563,25 +2674,25 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_cockpit_mode() {
+            if inst.is_structured() {
                 #[cfg(feature = "serve")]
                 {
-                    return Some(Action::OpenCockpit(id));
+                    return Some(Action::OpenStructuredView(id));
                 }
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Cockpit session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with --features serve to attach".to_string(),
                     ));
                 }
             }
         }
         match self.view_mode {
-            ViewMode::Agent => {
+            ViewMode::Structured => {
                 // `default_attach_mode = LiveSend` swaps the historical
                 // tmux attach for live-send mode on Enter / double-click.
-                // Cockpit was already handled above (the resolver also
-                // returns None for cockpit, so the match is double-safe);
+                // Acp was already handled above (the resolver also
+                // returns None for structured view, so the match is double-safe);
                 // Terminal view honors the same setting (live-send onto
                 // the paired terminal pane); Tool view keeps its
                 // existing AttachToolSession path.
@@ -2591,9 +2702,9 @@ impl HomeView {
                 // double-click on the live row would otherwise re-run
                 // ensure_pane_ready and respawn the worker for no
                 // reason. `start_live_send` returns `None` for that
-                // and for cockpit/creating rows; in either of those
-                // cases we leave activation alone (cockpit was already
-                // dispatched to OpenCockpit above; same-target re-click
+                // and for structured view/creating rows; in either of those
+                // cases we leave activation alone (structured view was already
+                // dispatched to OpenStructuredView above; same-target re-click
                 // is intentionally a no-op).
                 if matches!(
                     self.default_attach_mode(&id),
@@ -2605,7 +2716,7 @@ impl HomeView {
                 }
             }
             ViewMode::Terminal => {
-                // Mirror Agent view: when `default_attach_mode = LiveSend`,
+                // Mirror Structured view: when `default_attach_mode = LiveSend`,
                 // Enter on the terminal row enters live-send mode against
                 // the paired terminal pane (host or container, whichever
                 // is currently shown). Otherwise fall back to the
@@ -2633,7 +2744,7 @@ impl HomeView {
 
     /// Resolve the "Tab swap" action that fires when
     /// `default_attach_mode = LiveSend`: Enter takes the live-send
-    /// slot, so Tab takes the tmux-attach slot. Mirrors the cockpit
+    /// slot, so Tab takes the tmux-attach slot. Mirrors the structured view
     /// and in-flight guards from `activate_selected_session`; returns
     /// the same per-view-mode attach actions Enter produces under the
     /// historical default.
@@ -2643,21 +2754,21 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_cockpit_mode() {
+            if inst.is_structured() {
                 #[cfg(feature = "serve")]
                 {
-                    return Some(Action::OpenCockpit(id));
+                    return Some(Action::OpenStructuredView(id));
                 }
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Cockpit session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with --features serve to attach".to_string(),
                     ));
                 }
             }
         }
         match self.view_mode {
-            ViewMode::Agent => Some(Action::AttachSession(id)),
+            ViewMode::Structured => Some(Action::AttachSession(id)),
             ViewMode::Terminal => {
                 let terminal_mode = if let Some(inst) = self.get_instance(&id) {
                     if inst.is_sandboxed() {
@@ -2807,11 +2918,11 @@ impl HomeView {
     /// its scroll boundary or has no session selected.
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Any scroll repositions the preview content under the
-        // selection rect, so a leftover highlight from a previous drag
-        // would point at unrelated text. Drop it before changing
-        // offsets so the highlight disappears alongside the scroll.
-        self.clear_preview_selection();
+        // A preview selection is anchored to absolute scrollback lines,
+        // not screen cells, so scrolling no longer invalidates it: the
+        // highlight tracks its text as the pane moves and the copy spans
+        // the full range even where it has scrolled off screen. So we
+        // deliberately do NOT clear it here.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_up(STEP);
             return true;
@@ -2842,7 +2953,7 @@ impl HomeView {
         }
 
         let active_cache = match self.view_mode {
-            ViewMode::Agent => &self.preview_cache,
+            ViewMode::Structured => &self.preview_cache,
             ViewMode::Terminal => {
                 let terminal_mode = self
                     .selected_session
@@ -2972,7 +3083,13 @@ impl HomeView {
             self.context_menu = Some(if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                ContextMenuDialog::for_session(anchor)
+                let is_archived = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => {
+                        self.get_instance(id).is_some_and(|inst| inst.is_archived())
+                    }
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session(anchor, is_archived)
             });
             return true;
         }
@@ -3034,6 +3151,13 @@ impl HomeView {
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
+            ContextMenuAction::ToggleArchive => {
+                // The right-click already moved the cursor onto the row, so the
+                // toggle acts on the same session the menu was opened for.
+                if let Err(e) = self.toggle_archive_at_cursor() {
+                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -3168,6 +3292,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
+        // Tied mode (#1927) collapses naming into a single Rename action: the
+        // directory follows the title, so route the standalone workdir edit to
+        // the rename dialog instead of editing the directory independently.
+        if self.tie_workdir_applies_for(&id) {
+            self.open_rename_for_selected();
+            return;
+        }
         let snapshot = self.get_instance(&id).map(|inst| {
             (
                 inst.worktree_info.clone(),
@@ -3218,12 +3349,12 @@ impl HomeView {
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
-        // Deletion only allowed in Agent View.
+        // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
             let hint = if self.strict_hotkeys {
-                "Terminals cannot be deleted directly. Switch to Agent View (press Shift+T) and delete the agent session instead."
+                "Terminals cannot be deleted directly. Switch to Structured View (press Shift+T) and delete the agent session instead."
             } else {
-                "Terminals cannot be deleted directly. Switch to Agent View (press 't') and delete the agent session instead."
+                "Terminals cannot be deleted directly. Switch to Structured View (press 't') and delete the agent session instead."
             };
             self.info_dialog = Some(InfoDialog::new("Cannot Delete Terminal", hint));
             return;
@@ -3317,7 +3448,7 @@ impl HomeView {
     /// the `Enter` keybind would have produced) so users can still
     /// drop into a full tmux attach without going through live mode.
     /// Returns the action for the caller to dispatch, or `None` for
-    /// no-op clicks (group toggle, cockpit/creating rows, same-session
+    /// no-op clicks (group toggle, structured view/creating rows, same-session
     /// re-clicks while already live). The caller redraws unconditionally
     /// so the moved cursor / toggled group always paints before the
     /// action executes. Gated by `has_dialog()` (via
@@ -3382,7 +3513,20 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Single-click behavior is user-configurable via
+                // An archived row is parked: its pane was killed on archive.
+                // A single click is a "let me look at this" gesture, so it
+                // must NOT enter live-send, because `start_live_send` would
+                // respawn the pane (ensure_pane_ready) and the live-send path
+                // would auto-unarchive it (touch_last_accessed), silently
+                // resurrecting a session the user deliberately parked. Stop at
+                // the cursor update so the row just gets selected. Bringing it
+                // back stays explicit: `z` to unarchive, or a deliberate
+                // double-click / Enter to open it.
+                let archived = self
+                    .get_instance(&id)
+                    .map(|inst| inst.is_archived())
+                    .unwrap_or(false);
+                // Single-click behavior is otherwise user-configurable via
                 // `SessionConfig::click_action`. `LiveSend` (default,
                 // historical behavior) enters live-send for the clicked
                 // row, or switches the live target when already in live
@@ -3390,13 +3534,15 @@ impl HomeView {
                 // the user can browse preview content without ever
                 // entering live-send; double-click still activates via
                 // `default_attach_mode`. `click_action` returns `None`
-                // for cockpit-mode sessions, where `start_live_send`
+                // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
                 // is fine.
-                if matches!(
-                    self.click_action(&id),
-                    Some(crate::session::ClickAction::SelectOnly)
-                ) {
+                if archived
+                    || matches!(
+                        self.click_action(&id),
+                        Some(crate::session::ClickAction::SelectOnly)
+                    )
+                {
                     None
                 } else {
                     self.start_live_send()
@@ -3443,7 +3589,7 @@ impl HomeView {
         if let Some(dialog) = &mut self.no_agents_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(picker) = &mut self.tool_picker_dialog {
@@ -3497,9 +3643,8 @@ impl HomeView {
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
     pub fn handle_scroll_down(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Mirror handle_scroll_up: a stale highlight pinned to cells
-        // whose content just moved would mislead, so drop it first.
-        self.clear_preview_selection();
+        // Mirror handle_scroll_up: the selection is anchored to scrollback
+        // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_down(STEP);
             return true;
@@ -3662,22 +3807,22 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
-        // Cockpit-mode sessions are not tmux-backed (HomeView's attach
+        // Acp-mode sessions are not tmux-backed (HomeView's attach
         // path special-cases them away from tmux). Live-send has no
         // target in that mode, so silently no-op rather than enqueue
         // an Action::EnterLiveSend that would fail downstream.
-        if inst.is_cockpit_mode() {
+        if inst.is_structured() {
             return None;
         }
         // Pick the live-send target based on which pane the user is
-        // currently previewing. Agent view → agent pane (historical
+        // currently previewing. Structured view → agent pane (historical
         // default). Terminal view → the paired host or container
         // terminal pane, so 'm'/Tab compose against the same shell
         // the user sees. Tool view stays out of live-send (no clean
         // target for lazygit/yazi etc.; let the caller fall back to
         // AttachToolSession).
         self.pending_live_send_target = match &self.view_mode {
-            ViewMode::Agent => live_send::LiveSendTarget::Agent,
+            ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
                 if inst.is_sandboxed() && self.get_terminal_mode(&id) == TerminalMode::Container {
                     live_send::LiveSendTarget::ContainerTerminal
@@ -3853,7 +3998,7 @@ impl HomeView {
 
     /// Returns `Some(reason)` if the live-send target has drifted out
     /// from under us between entry and now. Three drift modes:
-    /// - Instance row deleted (peer / web cockpit / another aoe killed
+    /// - Instance row deleted (peer / web structured view / another aoe killed
     ///   it).
     /// - Title renamed (which regenerates the tmux session name; the
     ///   worker is now targeting a stale name).
@@ -3916,13 +4061,13 @@ impl HomeView {
         self.send_message_dialog = Some(dialog);
     }
 
-    /// Compose target for the current view: agent in Agent view, the
+    /// Compose target for the current view: agent in Structured view, the
     /// paired host/container terminal in Terminal view. Tool view has
     /// no clean compose target (the tool owns the pane), so it falls
     /// through to Agent for the historical paste/letter-capture path.
     pub(super) fn current_send_target(&self) -> live_send::LiveSendTarget {
         match &self.view_mode {
-            ViewMode::Agent => live_send::LiveSendTarget::Agent,
+            ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
                 if let Some(id) = self.selected_session.as_deref() {
                     if let Some(inst) = self.get_instance(id) {
@@ -4115,33 +4260,70 @@ impl HomeView {
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
-        match repo_config::check_hook_trust(std::path::Path::new(&data.path)) {
-            Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                use crate::tui::dialogs::HookTrustDialog;
-                let merged_hooks = repo_config::merge_hooks_for_display(&data.profile, &hooks);
-                self.hook_trust_dialog = Some(HookTrustDialog::new(
-                    hooks,
-                    merged_hooks,
-                    hooks_hash,
-                    data.path.clone(),
-                ));
-                self.pending_hook_trust_data = Some(data);
-                None
-            }
-            Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                let merged = repo_config::merge_hooks_with_config(&data.profile, repo_hooks);
-                self.create_session_with_hooks(data, merged)
-            }
-            Ok(repo_config::HookTrustStatus::NoHooks) => {
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
-            }
+        use crate::session::TrustSurface;
+        let trust = match repo_config::check_repo_trust(std::path::Path::new(&data.path)) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to check repo hooks: {}", e);
+                tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
                 let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
+                return self.create_session_with_hooks(data, fallback);
             }
+        };
+
+        let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+            TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
+                Some(h.clone())
+            }
+            TrustSurface::Absent => None,
+        };
+        let hooks_hash = match &trust.hooks {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_hash = match &trust.mcp {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_servers = match &trust.mcp {
+            TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => s.clone(),
+            TrustSurface::Absent => Vec::new(),
+        };
+
+        // Hooks to run if approved (repo hooks, else global) vs skipped
+        // (already-trusted repo hooks still run; newly-prompted hooks fall back
+        // to the global set, matching the prior TUI skip behavior).
+        let hooks_on_trust = match &repo_hooks {
+            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
+            None => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+        let hooks_on_skip = match &trust.hooks {
+            TrustSurface::Trusted(h) => {
+                repo_config::merge_hooks_with_config(&data.profile, h.clone())
+            }
+            _ => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+
+        if !trust.needs_prompt() {
+            return self.create_session_with_hooks(data, hooks_on_trust);
         }
+
+        use crate::tui::dialogs::RepoTrustDialog;
+        let merged_hooks = repo_hooks
+            .as_ref()
+            .map(|h| repo_config::merge_hooks_for_display(&data.profile, h))
+            .unwrap_or_default();
+        self.repo_trust_dialog = Some(RepoTrustDialog::new(
+            merged_hooks,
+            repo_hooks.unwrap_or_default(),
+            mcp_servers,
+            hooks_on_trust,
+            hooks_on_skip,
+            hooks_hash,
+            mcp_hash,
+            data.path.clone(),
+        ));
+        self.pending_repo_trust_data = Some(data);
+        None
     }
 
     /// Create a session with optional hooks. Delegates to the background

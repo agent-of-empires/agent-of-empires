@@ -9,7 +9,7 @@ interface Props {
   comments: DiffComment[];
   isMultiRepo: boolean;
   /** Same gate as the banner Send button. Reflects
-   *  `cockpit_mode && cockpit_worker_state === "running"`. False
+   *  `structured_view && acp_worker_state === "running"`. False
    *  disables the Send button so prompts don't sink when the worker
    *  isn't ready. */
   sendEnabled: boolean;
@@ -69,7 +69,7 @@ export function SendCommentsDialog({
     });
     try {
       const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt/diff-comments`,
+        `/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt/diff-comments`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -48,7 +48,10 @@ function lastResize(handle: MockHandle): ResizeMsg | undefined {
 
 // Override visualViewport.height (and optionally innerHeight) to simulate
 // a keyboard event. Matches the helper in mobile-keyboard.spec.ts.
-async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?: boolean }) {
+async function setKeyboard(
+  page: Page,
+  opts: { open: boolean; px?: number; pwa?: boolean },
+) {
   await page.evaluate(
     ({ open, px, pwa }) => {
       const vv = window.visualViewport;

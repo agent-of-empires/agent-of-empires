@@ -89,7 +89,8 @@ pub struct AddArgs {
     #[arg(short = 'y', long)]
     yolo: bool,
 
-    /// Automatically trust repository hooks without prompting
+    /// Automatically trust this repository's hooks and project-local MCP
+    /// servers without prompting
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
 
@@ -101,20 +102,17 @@ pub struct AddArgs {
     #[arg(long)]
     cmd_override: Option<String>,
 
-    /// Use cockpit mode (ACP-based native rendering) for this session.
-    /// Overrides the default-for-claude setting in cockpit config.
+    /// Render this session in the structured view (ACP-based native
+    /// rendering) instead of the default terminal view. `aoe add` defaults
+    /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
+    /// (or `--agent`) to opt into the structured rendering. Ignored for
+    /// tools with no ACP adapter.
     #[cfg(feature = "serve")]
-    #[arg(long, conflicts_with = "no_cockpit")]
-    cockpit: bool,
+    #[arg(long = "structured-view")]
+    structured_view: bool,
 
-    /// Force terminal/PTY mode for this session, overriding the
-    /// default-for-claude cockpit setting.
-    #[cfg(feature = "serve")]
-    #[arg(long = "no-cockpit", conflicts_with = "cockpit")]
-    no_cockpit: bool,
-
-    /// Pick a specific cockpit agent (e.g., aoe-agent, claude-code).
-    /// Implies --cockpit.
+    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
+    /// claude-code).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
@@ -219,6 +217,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
+
+    // Phase 1 (unlocked): pre-flight read of the current persisted state to
+    // resolve `--parent`, generate a non-colliding title, and make best-effort
+    // duplicate / parent decisions before any side effects. Final duplicate
+    // enforcement happens under the flock in phase 3.
+    //
+    // The title is resolved here, before worktree creation, so a tied worktree
+    // session (`session.tie_workdir_to_name`) can seed its directory leaf from
+    // the title and start out aligned (#1927). The path-dependent duplicate
+    // check still runs later, once `path` points at the worktree.
+    let storage = Storage::new(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let final_title = resolve_session_title(&args, &instances)?;
 
     if let Some(branch_raw) = &args.worktree_branch {
         use crate::git::GitWorktree;
@@ -327,7 +338,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     &config.worktree.path_template
                 };
-                let worktree_path = git_wt.compute_path(branch, template, session_id_short)?;
+                // Tied sessions name the directory after the title, not the
+                // branch, so the two cannot drift. The branch still creates the
+                // worktree below; only the path leaf changes. (#1927)
+                let leaf_seed_owned;
+                let leaf_seed = if config.session.tie_workdir_to_name {
+                    leaf_seed_owned =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&final_title);
+                    leaf_seed_owned.as_str()
+                } else {
+                    branch
+                };
+                let worktree_path = git_wt.compute_path(leaf_seed, template, session_id_short)?;
 
                 if worktree_path.exists() {
                     bail!(
@@ -375,13 +397,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    let storage = Storage::new(profile)?;
-    // Phase 1 (unlocked): pre-flight read of the current persisted state to
-    // resolve `--parent`, generate a non-colliding title, and make
-    // best-effort duplicate / parent decisions before any side effects.
-    // Final duplicate enforcement happens under the flock in phase 3.
-    let (instances, _groups) = storage.load_with_groups()?;
-
     // Resolve parent session if specified
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
@@ -395,55 +410,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // Generate title: use provided title, or branch name for worktree sessions, or random civ.
-    // With --interactive (and no --title), prompt for the name TUI-style,
-    // prefilling the generated default. The chosen title, whatever its
-    // source, runs through the same duplicate (title + path) check.
-    let final_title = if let Some(title) = &args.title {
-        let trimmed_title = title.trim();
-        if is_duplicate_session(&instances, trimmed_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                trimmed_title
-            );
-            cleanup_partial_session(
-                &path,
-                worktree_info_opt.as_ref(),
-                workspace_info_opt.as_ref(),
-                args.create_branch,
-                None,
-            );
-            return Ok(());
-        }
-        trimmed_title.to_string()
-    } else {
-        let default_title = if let Some(ref branch) = args.worktree_branch {
-            branch.trim().to_string()
-        } else {
-            let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-            civilizations::generate_random_title(&existing_titles)
-        };
-        let chosen_title = if args.interactive {
-            prompt_session_title(&default_title)?
-        } else {
-            default_title
-        };
-        if is_duplicate_session(&instances, &chosen_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                chosen_title
-            );
-            cleanup_partial_session(
-                &path,
-                worktree_info_opt.as_ref(),
-                workspace_info_opt.as_ref(),
-                args.create_branch,
-                None,
-            );
-            return Ok(());
-        }
-        chosen_title
-    };
+    // The title was resolved before worktree creation (so a tied session could
+    // seed its directory leaf from it); run the path-dependent duplicate check
+    // now that `path` points at the final worktree/workspace directory.
+    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
+        println!(
+            "Session already exists with same title and path: {}",
+            final_title
+        );
+        cleanup_partial_session(
+            &path,
+            worktree_info_opt.as_ref(),
+            workspace_info_opt.as_ref(),
+            args.create_branch,
+            None,
+        );
+        return Ok(());
+    }
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
@@ -581,121 +564,127 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Cockpit mode: explicit --cockpit overrides config; --no-cockpit
-    // forces terminal mode; otherwise honor the config default for
-    // claude on supported platforms.
-    //
-    // `cockpit.enabled = false` in config.toml is the master switch
-    // that gates `--cockpit`. The toggle lives in the web settings.
+    // View selection. The terminal view (raw tmux/PTY) is the default so the
+    // CLI matches the TUI; the web wizard is the surface that defaults to
+    // structured. `--structured-view` (or `--agent`, which names a specific
+    // ACP agent) opts into the structured rendering; a non-ACP tool always
+    // runs in the terminal view.
     #[cfg(feature = "serve")]
     {
-        let user_picked_cockpit = args.cockpit || args.agent.is_some();
-        let user_forced_terminal = args.no_cockpit;
-        if user_picked_cockpit && !config.cockpit.enabled {
+        // `--agent` is an explicit structured-view choice: the user named a
+        // specific ACP agent, so a missing adapter is a hard error rather
+        // than a silent downgrade.
+        let user_picked_agent = args.agent.is_some();
+        let user_wants_structured = args.structured_view || user_picked_agent;
+        instance.agent_name = args.agent.clone();
+        instance.agent_model = args.model.clone();
+
+        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let agent_name = pick_acp_agent_name(
+            &registry,
+            &config.session,
+            &instance.tool,
+            instance.agent_name.as_deref(),
+        );
+        // Capability is judged against the explicit `--agent` (or, with none,
+        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
+        // otherwise every tool would look ACP-capable via the bundled default
+        // and `--structured-view` could never be rejected for a non-ACP tool
+        // (it would silently substitute aoe-agent). Mirrors the server create
+        // path in `src/server/api/sessions.rs`.
+        let capability_key = instance
+            .agent_name
+            .as_deref()
+            .unwrap_or(instance.tool.as_str());
+        let acp_capable = registry.get(capability_key).is_some()
+            || config.session.agent_acp_cmd.contains_key(capability_key)
+            || config.session.agent_acp_cmd.contains_key(&instance.tool);
+
+        if user_picked_agent && !acp_capable {
             bail!(
-                "Cockpit is disabled by config (`cockpit.enabled = false` in config.toml). \
-                 Toggle it on (e.g. via the web settings) and try again, or omit --cockpit \
-                 for a tmux session."
+                "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
+                 `[session.agent_acp_cmd]` command.\n\
+                 Run `aoe acp doctor` to see configured agents, or omit --agent for a \
+                 terminal-view session."
             );
         }
-        instance.cockpit_mode = if user_forced_terminal {
-            false
-        } else if user_picked_cockpit {
-            true
-        } else {
-            config.cockpit.enabled && config.cockpit.default_for_claude && instance.tool == "claude"
-        };
-        instance.cockpit_agent = args.agent.clone();
-        instance.cockpit_model = args.model.clone();
 
-        // Precondition: cockpit sessions are only usable if the resolved
-        // ACP adapter binary is on PATH. Persisting a session whose
-        // adapter is missing produces a silent failure mode where the
-        // dashboard shows the session, the supervisor's reconciler
-        // tries to spawn, AcpClient::spawn fails with "No such file
-        // or directory", and the user sees a 404 on their first
-        // prompt. Bail at add-time with the install hint instead.
-        // `--no-cockpit` and the implicit-default branch don't trip
-        // this — only sessions the user explicitly opted into cockpit
-        // for, where missing tooling is a hard error rather than a
-        // silent fallback to tmux.
-        if instance.cockpit_mode && user_picked_cockpit {
-            // A custom agent explicitly opted into cockpit must declare an
-            // ACP command; otherwise we'd silently fall back to aoe-agent
-            // and launch the wrong thing. Fail loudly instead.
-            let has_override = instance
-                .cockpit_agent
-                .as_deref()
-                .is_some_and(|s| !s.is_empty());
-            let is_custom = config.session.custom_agents.contains_key(&instance.tool);
-            if is_custom
-                && !has_override
-                && !config
-                    .session
-                    .agent_cockpit_cmd
-                    .contains_key(&instance.tool)
-            {
-                bail!(
-                    "custom agent `{tool}` has no `agent_cockpit_cmd`, so it can't run in cockpit.\n\
-                     Add an ACP launch command under `[session.agent_cockpit_cmd]`, e.g.\n\
-                     {tool} = \"ocp run sp acp\"\n\
-                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                    tool = instance.tool
-                );
-            }
-            let registry = crate::cockpit::agent_registry::AgentRegistry::with_defaults();
-            let agent_name = pick_cockpit_agent_name(
-                &registry,
-                &config.session,
-                &instance.tool,
-                instance.cockpit_agent.as_deref(),
+        if args.structured_view && !acp_capable {
+            bail!(
+                "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
+                 Run `aoe acp doctor` to see configured agents, or drop --structured-view \
+                 for a terminal-view session.",
+                instance.tool
             );
-            // Resolve the spec from the registry (built-in) or the custom
-            // agent's configured ACP command, then verify the binary is on
-            // PATH. A missing adapter is a hard error at add-time rather
-            // than a silent 404 on the first prompt.
+        }
+
+        instance.view = if user_wants_structured && acp_capable {
+            crate::session::View::Structured
+        } else {
+            crate::session::View::Terminal
+        };
+
+        // Precondition: the structured view needs the resolved ACP adapter
+        // binary on PATH. A missing adapter would otherwise surface as a
+        // silent 404 on the first prompt. When the user explicitly named
+        // an agent (--agent) we bail; otherwise (the default path) we fall
+        // back to the terminal view with a warning so `aoe add` still
+        // succeeds on a machine without the adapter installed.
+        if instance.is_structured() {
             let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
                 Some(spec) => (spec.clone(), true),
-                None => match config.session.agent_cockpit_cmd.get(&agent_name) {
+                None => match config.session.agent_acp_cmd.get(&agent_name) {
                     Some(cmd) => (
-                        crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                        crate::acp::AgentSpec::from_acp_cmd(&agent_name, cmd)
                             .map_err(|e| anyhow::anyhow!(e))?,
                         false,
                     ),
-                    None => bail!(
-                        "cockpit agent `{agent_name}` is not in the registry.\n\
-                         Run `aoe cockpit doctor` to see configured agents."
-                    ),
+                    None => match config.session.agent_acp_cmd.get(&instance.tool) {
+                        Some(cmd) => (
+                            crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd)
+                                .map_err(|e| anyhow::anyhow!(e))?,
+                            false,
+                        ),
+                        None => unreachable!("acp_capable implies a resolvable spec"),
+                    },
                 },
             };
-            // Overlay session.agent_command_override the same way the cockpit
-            // spawn path does, so the precondition checks the binary that will
-            // actually launch (e.g. opencode-plannotator), not the bare
-            // registry binary. Without this, a user who installed only the
-            // override binary gets a false "not installed" bail. See #1910.
-            if let Some(ovr) = crate::server::cockpit_reconciler::command_override_for_spawn(
+            // Overlay session.agent_command_override the same way the agent
+            // spawn path does, so the precondition checks the binary that
+            // will actually launch (e.g. opencode-plannotator), not the
+            // bare registry binary. See #1910.
+            if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
                 &instance.command,
             ) {
-                crate::cockpit::supervisor::apply_agent_command_override(
+                crate::acp::supervisor::apply_agent_command_override(
                     &agent_name,
                     spec_from_registry,
                     &ovr,
                     &mut spec,
                 )?;
             }
-            if !crate::cli::cockpit::command_present(&spec.command) {
-                let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
+            if !crate::cli::acp::command_present(&spec.command) {
+                let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                     .unwrap_or("install via your package manager and re-run");
-                bail!(
-                    "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
-                     Install: {}\n\
-                     Or run: aoe cockpit doctor --fix\n\
-                     Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
-                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                    spec.command,
-                    hint
+                if user_picked_agent {
+                    bail!(
+                        "ACP adapter `{}` is not installed or not on $PATH.\n\
+                         Install: {}\n\
+                         Or run: aoe acp doctor --fix\n\
+                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
+                         Or use the terminal view: drop --agent / --structured-view.",
+                        spec.command,
+                        hint
+                    );
+                }
+                eprintln!(
+                    "warning: ACP adapter `{}` is not installed; this session will use the \
+                     terminal view. Install it ({}) or run `aoe acp doctor --fix`, then \
+                     switch the session to the structured view.",
+                    spec.command, hint
                 );
+                instance.view = crate::session::View::Terminal;
             }
         }
     }
@@ -750,25 +739,57 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             // hooks so the project-less contract stays intact.
             repo_config::resolve_global_profile_hooks(profile)
         } else {
-            match repo_config::check_hook_trust(&original_project_path) {
-                Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                    let should_trust = if args.trust_hooks {
+            // Repo trust now covers two surfaces: lifecycle hooks and project
+            // MCP servers (#1985). Hooks run here at create time; project MCP is
+            // forwarded later by the daemon, but its trust is recorded through
+            // the same single approval so an untrusted repo's `.mcp.json` is
+            // never forwarded. Hooks are resolved independently of MCP so an
+            // unapproved (or absent) MCP file never suppresses trusted hooks.
+            use repo_config::TrustSurface;
+            match repo_config::check_repo_trust(&original_project_path) {
+                Ok(trust) => {
+                    let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+                        TrustSurface::Trusted(h) => Some(h.clone()),
+                        TrustSurface::NeedsTrust { config, .. } => Some(config.clone()),
+                        TrustSurface::Absent => None,
+                    };
+                    let hooks_hash_write = match &trust.hooks {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_hash_write = match &trust.mcp {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_servers = match &trust.mcp {
+                        TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => {
+                            Some(s.clone())
+                        }
+                        TrustSurface::Absent => None,
+                    };
+
+                    let approved = if !trust.needs_prompt() || args.trust_hooks {
                         true
                     } else {
-                        // Show the final merged set (repo overrides global/profile
-                        // per type) with source labels, mirroring the TUI trust
-                        // dialog, so the prompt reflects exactly what will run (#596).
-                        println!(
-                            "\nHooks for this session (repo overrides global config per type):"
-                        );
-                        let merged = repo_config::merge_hooks_for_display(profile, &hooks);
-                        for group in repo_config::hook_display_groups(&merged, &hooks, true) {
-                            println!("  {}:{}", group.name, group.source_label());
-                            for cmd in &group.commands {
-                                println!("    {}", cmd);
+                        if let Some(ref hooks) = repo_hooks {
+                            println!(
+                                "\nHooks for this session (repo overrides global config per type):"
+                            );
+                            let merged = repo_config::merge_hooks_for_display(profile, hooks);
+                            for group in repo_config::hook_display_groups(&merged, hooks, true) {
+                                println!("  {}:{}", group.name, group.source_label());
+                                for cmd in &group.commands {
+                                    println!("    {}", cmd);
+                                }
                             }
                         }
-                        print!("\nTrust and run these hooks? [y/N] ");
+                        if let Some(ref servers) = mcp_servers {
+                            println!("\nProject MCP servers from .mcp.json (values redacted):");
+                            for server in servers {
+                                println!("  {}", server.redacted_summary());
+                            }
+                        }
+                        print!("\nTrust this repo (hooks and project MCP shown above)? [y/N] ");
                         use std::io::Write;
                         std::io::stdout().flush()?;
                         let mut input = String::new();
@@ -776,23 +797,43 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         input.trim().eq_ignore_ascii_case("y")
                     };
 
-                    if should_trust {
-                        repo_config::trust_repo(&original_project_path, &hooks_hash)?;
-                        println!("✓ Repository hooks trusted");
-                        repo_config::merge_hooks_with_config(profile, hooks)
+                    if approved {
+                        if hooks_hash_write.is_some() || mcp_hash_write.is_some() {
+                            repo_config::trust_repo(
+                                &original_project_path,
+                                hooks_hash_write.as_deref(),
+                                mcp_hash_write.as_deref(),
+                            )?;
+                            if hooks_hash_write.is_some() {
+                                println!("✓ Repository hooks trusted");
+                            }
+                            if mcp_hash_write.is_some() {
+                                println!("✓ Project MCP servers trusted");
+                            }
+                        }
+                        match repo_hooks {
+                            Some(h) => repo_config::merge_hooks_with_config(profile, h),
+                            None => repo_config::resolve_global_profile_hooks(profile),
+                        }
                     } else {
-                        println!("Hooks skipped (session created without running hooks)");
-                        None
+                        println!(
+                            "Skipped (session created without trusting repo hooks or project MCP)"
+                        );
+                        // Already-trusted hooks still run; only newly-prompted
+                        // surfaces are declined.
+                        match &trust.hooks {
+                            TrustSurface::Trusted(h) => {
+                                repo_config::merge_hooks_with_config(profile, h.clone())
+                            }
+                            TrustSurface::NeedsTrust { .. } => None,
+                            TrustSurface::Absent => {
+                                repo_config::resolve_global_profile_hooks(profile)
+                            }
+                        }
                     }
                 }
-                Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                    repo_config::merge_hooks_with_config(profile, repo_hooks)
-                }
-                Ok(repo_config::HookTrustStatus::NoHooks) => {
-                    repo_config::resolve_global_profile_hooks(profile)
-                }
                 Err(e) => {
-                    tracing::warn!(target: "cli.add", "Failed to check repo hooks: {}", e);
+                    tracing::warn!(target: "cli.add", "Failed to check repo trust: {}", e);
                     repo_config::resolve_global_profile_hooks(profile)
                 }
             }
@@ -808,7 +849,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     println!("  {}", cmd);
                 }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
-                repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                if instance.sandbox_info.is_some() {
+                    instance.get_container_for_instance()?;
+                    let workdir = instance.container_workdir();
+                    if let Some(ref sandbox) = instance.sandbox_info {
+                        repo_config::execute_hooks_in_container(
+                            &hooks.on_create,
+                            &sandbox.container_name,
+                            &workdir,
+                            &hook_env,
+                        )?;
+                    }
+                } else {
+                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                }
                 println!("✓ on_create hooks completed");
             }
         }
@@ -910,12 +964,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     #[cfg(feature = "serve")]
-    let is_cockpit = instance.cockpit_mode;
+    let is_acp = instance.is_structured();
     #[cfg(not(feature = "serve"))]
-    let is_cockpit = false;
+    let is_acp = false;
 
-    if is_cockpit {
-        // Cockpit sessions aren't backed by tmux: their ACP worker is
+    if is_acp {
+        // Acp sessions aren't backed by tmux: their ACP worker is
         // owned by `aoe serve`'s supervisor, which the
         // status_poll_loop reconciler auto-spawns within ~2s of the
         // session appearing on disk. `--launch` and the
@@ -928,7 +982,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if args.launch {
             println!();
             println!(
-                "(--launch is a no-op for cockpit sessions; \
+                "(--launch is a no-op for structured view sessions; \
                  lifecycle is managed by `aoe serve`.)"
             );
         }
@@ -996,6 +1050,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 /// "auto-generates if empty" field. Empty input or EOF keeps
 /// `default_title`; a non-empty line is trimmed and used. Only reached in
 /// `--interactive` mode, which already verified stdin is a terminal.
+/// Resolve the session title string (no path-dependent duplicate check).
+///
+/// `--title` wins; otherwise the default is the worktree branch name, or a
+/// random civilization name for non-worktree sessions. `--interactive` prompts
+/// with that default prefilled. Resolved before worktree creation so a tied
+/// session can derive its directory leaf from the title (#1927); the duplicate
+/// check runs later once the worktree path is known.
+fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
+    if let Some(title) = &args.title {
+        return Ok(title.trim().to_string());
+    }
+    let default_title = if let Some(ref branch) = args.worktree_branch {
+        branch.trim().to_string()
+    } else {
+        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+        civilizations::generate_random_title(&existing_titles)
+    };
+    if args.interactive {
+        prompt_session_title(&default_title)
+    } else {
+        Ok(default_title)
+    }
+}
+
 fn prompt_session_title(default_title: &str) -> Result<String> {
     use std::io::Write;
 
@@ -1067,11 +1145,11 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_cockpit_cmd` → legacy
+/// registry entry → custom agent with `agent_acp_cmd` → legacy
 /// (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
-fn pick_cockpit_agent_name(
-    registry: &crate::cockpit::agent_registry::AgentRegistry,
+fn pick_acp_agent_name(
+    registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,
     tool: &str,
     explicit_override: Option<&str>,
@@ -1084,7 +1162,7 @@ fn pick_cockpit_agent_name(
     if registry.get(tool).is_some() {
         return tool.to_string();
     }
-    if session.agent_cockpit_cmd.contains_key(tool) {
+    if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
     }
     if tool == "claude" {

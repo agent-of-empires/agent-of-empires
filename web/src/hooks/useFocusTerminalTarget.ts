@@ -18,7 +18,7 @@ import {
  * intent is stashed back on the latch.
  *
  * Mirrors the inline wiring TerminalView uses for the "agent" target; the
- * cockpit Composer uses it for "composer".
+ * structured view Composer uses it for "composer".
  */
 export function useFocusTerminalTarget(
   target: TerminalFocusTarget,

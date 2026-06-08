@@ -35,6 +35,7 @@ export const docsNav: NavSection[] = [
       { title: "tmux Status Bar", href: "/guides/tmux-status-bar/", description: "Show live session status in your tmux status bar." },
       { title: "Agent Command Overrides", href: "/guides/agent-override/", description: "Customize the command used to launch each agent." },
       { title: "Tool Sessions", href: "/guides/tool-sessions/", description: "Run plain shell or tool sessions alongside your agents." },
+      { title: "MCP Servers", href: "/guides/mcp-servers/", description: "Forward configured MCP servers to structured-view agents." },
       { title: "Session Resume (Claude)", href: "/guides/session-resume/", description: "Resume a previous Claude Code conversation in a session." },
       { title: "Shell Completions", href: "/guides/shell-completions/", description: "Install and refresh tab-completion for the aoe CLI." },
       { title: "Sound Effects", href: "/docs/sounds/", description: "Play sounds when agents need input or finish work." },
@@ -53,15 +54,12 @@ export const docsNav: NavSection[] = [
     ],
   },
   {
-    title: "Cockpit",
+    title: "Structured View",
     items: [
-      { title: "Overview", href: "/docs/cockpit/" },
-      { title: "Setup", href: "/docs/cockpit/setup/" },
-      { title: "Interface", href: "/docs/cockpit/interface/" },
-      { title: "Modes, Approvals & Models", href: "/docs/cockpit/controls/" },
-      { title: "Persistence & Recovery", href: "/docs/cockpit/persistence/" },
-      { title: "Troubleshooting", href: "/docs/cockpit/troubleshooting/" },
-      { title: "Multi-Agent Support", href: "/docs/cockpit/multi-agent/" },
+      { title: "Overview", href: "/docs/structured-view/" },
+      { title: "Interface", href: "/docs/structured-view/interface/" },
+      { title: "Modes, Approvals & Models", href: "/docs/structured-view/controls/" },
+      { title: "Troubleshooting", href: "/docs/structured-view/troubleshooting/" },
     ],
   },
   {
@@ -79,6 +77,7 @@ export const docsNav: NavSection[] = [
     items: [
       { title: "Development", href: "/docs/development/" },
       { title: "Adding a New Agent", href: "/docs/development/adding-agents/" },
+      { title: "Adding a Setting", href: "/docs/development/adding-settings/" },
       { title: "Logging", href: "/docs/development/logging/" },
       { title: "Playwright + Vitest testing", href: "/docs/development/playwright/" },
       { title: "Releases", href: "/docs/development/releases/" },
@@ -86,6 +85,14 @@ export const docsNav: NavSection[] = [
         title: "Web Dashboard Development",
         href: "/docs/development/web-dashboard/",
       },
+    ],
+  },
+  {
+    title: "Internals (Contributor)",
+    items: [
+      { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
+      { title: "Sandbox Internals", href: "/docs/development/internals/sandbox/" },
+      { title: "Session & Worktree Internals", href: "/docs/development/internals/sessions/" },
     ],
   },
 ];

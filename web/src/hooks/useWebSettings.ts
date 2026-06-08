@@ -92,7 +92,9 @@ export function useWebSettings() {
     const current = getSnapshot();
     const next = { ...current, ...patch };
     if (!safeSetItem(STORAGE_KEY, JSON.stringify(next))) {
-      console.warn("aoe-web-settings: failed to persist (storage full or disabled)");
+      console.warn(
+        "aoe-web-settings: failed to persist (storage full or disabled)",
+      );
     }
     cachedRaw = null;
     emitChange();

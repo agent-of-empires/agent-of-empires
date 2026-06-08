@@ -4,7 +4,7 @@ This guide covers the recommended setup and daily workflow for using `aoe` with 
 
 ## Project Setup: Bare Git Repos
 
-The recommended way to set up a project is using a "bare repo" structure. This keeps your main repository and all worktrees organized under a single directory:
+The recommended setup is a "bare repo" structure, keeping the main repository and all worktrees under one directory:
 
 ```
 my-project/
@@ -18,29 +18,17 @@ my-project/
 ### Initial Setup
 
 ```bash
-# Clone as bare repo
 git clone --bare git@github.com:user/repo.git my-project/.bare
-
 cd my-project
-
-# Create .git file pointing to bare repo
 echo "gitdir: ./.bare" > .git
-
-# Configure fetch to get all branches
 git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
 git fetch origin
-
-# Create your main worktree
 git worktree add main main
 ```
 
-Now when you run `aoe` from `my-project/`, new worktrees are created as siblings (e.g., `my-project/feat-api/`) rather than in a separate directory.
+Run `aoe` from `my-project/` and new worktrees are created as siblings (e.g. `my-project/feat-api/`) rather than in a separate directory.
 
-### Why Bare Repos?
-
-- **Clean organization**: Everything lives under one project directory
-- **Sandbox-friendly**: All paths stay within the project root (important for Docker sandboxing)
-- **Easy navigation**: Switch between branches by switching directories
+Bare repos keep all paths within the project root (required for Docker sandboxing) and let you switch branches by switching directories.
 
 ## Single-Window Workflow
 
@@ -48,7 +36,7 @@ Run `aoe` in a single terminal and toggle between views:
 
 | Key | View | Purpose |
 |-----|------|---------|
-| (default) | Agent View | Manage and interact with AI coding agents |
+| (default) | Structured View | Manage and interact with AI coding agents |
 | `t` | Terminal View | Access paired terminals for git, builds, tests |
 
 ### Daily Workflow
@@ -60,7 +48,7 @@ cd ~/scm/my-project
 aoe
 ```
 
-You'll see your sessions in Agent View. Keep one session on `main` for general questions and pulling updates.
+You'll see your sessions in Structured View. Keep one session on `main` for general questions and pulling updates.
 
 **2. Update main** (Terminal View)
 
@@ -68,7 +56,7 @@ You'll see your sessions in Agent View. Keep one session on `main` for general q
 - Select your main session, press `Enter` to attach to its terminal
 - Run `git pull origin main`
 - Detach with `Ctrl+b d`
-- Press `t` to return to Agent View
+- Press `t` to return to Structured View
 
 **3. Create a new session**
 
@@ -84,7 +72,7 @@ This creates:
 
 To override the generated name, focus Worktree and press `Ctrl+P`, then fill in `Name`.
 
-**4. Work on your feature** (Agent View)
+**4. Work on your feature** (Structured View)
 
 - Select your session and press `Enter` to attach
 - Interact with the agent
@@ -99,7 +87,7 @@ To override the generated name, focus Worktree and press `Ctrl+P`, then fill in 
 
 **6. Clean up when done**
 
-- In Agent View, select the session and press `d` to delete
+- In Structured View, select the session and press `d` to delete
 - Answer `Y` to also remove the worktree
 
 ## Tips
@@ -113,11 +101,11 @@ To override the generated name, focus Worktree and press `Ctrl+P`, then fill in 
 
 | Key | Action |
 |-----|--------|
-| `t` | Toggle between Agent View and Terminal View |
+| `t` | Toggle between Structured View and Terminal View |
 | `D` | Open [Diff View](diff-view.md) to review git changes |
-| `Enter` | Attach to agent (Agent View) or terminal (Terminal View) |
+| `Enter` | Attach to agent (Structured View) or terminal (Terminal View) |
 | `n` | Create new session |
-| `d` | Delete session (Agent View only) |
+| `d` | Delete session (Structured View only) |
 | `?` | Show help |
 | `Ctrl+b d` | Detach from tmux (return to aoe) |
 

@@ -33,7 +33,9 @@ function stubToasts() {
 // dispatching events that should close the menu.
 async function flushFrame() {
   await act(async () => {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   });
 }
 
@@ -48,7 +50,10 @@ async function flushMicrotasks() {
 
 function openMenu(onClose: () => void) {
   return render(
-    <CopyPathContextMenu menu={{ x: 12, y: 34, path: "src/app/foo.rs" }} onClose={onClose} />,
+    <CopyPathContextMenu
+      menu={{ x: 12, y: 34, path: "src/app/foo.rs" }}
+      onClose={onClose}
+    />,
   );
 }
 

@@ -39,9 +39,7 @@ export function CollapsibleSection({
               {title}
             </span>
             {subtitle && (
-              <div className="text-[11px] text-text-dim mt-0.5">
-                {subtitle}
-              </div>
+              <div className="text-[11px] text-text-dim mt-0.5">{subtitle}</div>
             )}
           </div>
           {badge && (
@@ -135,7 +133,12 @@ export function TextField({
           onChange={(e) => setLocal(e.target.value)}
           onFocus={() => setFocused(true)}
           onBlur={commit}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); } }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              commit();
+            }
+          }}
           placeholder={placeholder}
           rows={3}
           className={cls + " resize-y"}
@@ -147,7 +150,9 @@ export function TextField({
           onChange={(e) => setLocal(e.target.value)}
           onFocus={() => setFocused(true)}
           onBlur={commit}
-          onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+          }}
           placeholder={placeholder}
           className={cls}
         />
@@ -178,9 +183,7 @@ export function SelectField({
     <div>
       {label && (
         <label
-          className={
-            labelClassName ?? "block text-sm text-text-bright mb-1"
-          }
+          className={labelClassName ?? "block text-sm text-text-bright mb-1"}
         >
           {label}
         </label>
@@ -241,7 +244,9 @@ export function NumberField({
         onChange={(e) => setLocal(e.target.value)}
         onFocus={() => setFocused(true)}
         onBlur={commit}
-        onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
         min={min}
         max={max}
         className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
@@ -418,9 +423,7 @@ export function ListField({
               Cancel
             </button>
           </div>
-          {error && (
-            <div className="text-xs text-red-400 mt-1">{error}</div>
-          )}
+          {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
         </div>
       )}
     </div>

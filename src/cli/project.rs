@@ -73,8 +73,9 @@ pub struct ProjectAddArgs {
     allow_override: bool,
 
     /// Default base branch for new worktree branches created against this
-    /// project in a multi-repo workspace. When omitted, falls back to the
-    /// global/profile `worktree.default_base_branch`, then the repo's
+    /// project, whether it is the launch repo or an extra repo in a multi-repo
+    /// workspace. An explicit session base wins; when omitted, falls back to
+    /// the global/profile `worktree.default_base_branch`, then the repo's
     /// detected default branch.
     #[arg(long = "base-branch")]
     base_branch: Option<String>,

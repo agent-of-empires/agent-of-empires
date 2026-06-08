@@ -25,7 +25,13 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   await page.route("**/api/login/status", (r) =>
     r.fulfill({ json: { required: false, authenticated: true } }),
   );
-  for (const path of ["themes", "groups", "devices", "about", "system/update-status"]) {
+  for (const path of [
+    "themes",
+    "groups",
+    "devices",
+    "about",
+    "system/update-status",
+  ]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json: path === "about" || path === "system/update-status" ? {} : [],
@@ -40,22 +46,23 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   );
   await page.route("**/api/docker/status", (r) =>
     r.fulfill({
-      json: { available: opts.docker ?? false, runtime: opts.docker ? "docker" : null },
+      json: {
+        available: opts.docker ?? false,
+        runtime: opts.docker ? "docker" : null,
+      },
     }),
   );
   await page.route("**/api/agents", (r) =>
     r.fulfill({
-      json:
-        opts.agents ??
-        [
-          {
-            name: "claude",
-            binary: "claude",
-            host_only: false,
-            installed: true,
-            install_hint: "",
-          },
-        ],
+      json: opts.agents ?? [
+        {
+          name: "claude",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+        },
+      ],
     }),
   );
   await page.route("**/api/sessions", (r) => {
@@ -93,14 +100,21 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
 async function openAgentStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
+  await expect(
+    page.getByRole("heading", { name: "New session" }),
+  ).toBeVisible();
+  const recent = page
+    .getByRole("button")
+    .filter({ hasText: "/tmp/example" })
+    .first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByText("Name your session")).toBeVisible();
   await page.getByRole("button", { name: "Next" }).click();
-  await expect(page.getByRole("heading", { name: "Which AI agent?" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Which AI agent?" }),
+  ).toBeVisible();
 }
 
 test.describe("Wizard agent step (#1219)", () => {
@@ -112,7 +126,12 @@ test.describe("Wizard agent step (#1219)", () => {
         { name: "claude", installed: true, host_only: false },
         { name: "codex", installed: true, host_only: false },
         { name: "antigravity", installed: true, host_only: false },
-        { name: "uninstalled-tool", installed: false, host_only: false, install_hint: "brew install x" },
+        {
+          name: "uninstalled-tool",
+          installed: false,
+          host_only: false,
+          install_hint: "brew install x",
+        },
       ],
     });
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -120,15 +139,22 @@ test.describe("Wizard agent step (#1219)", () => {
     await openAgentStep(page);
     const claudeBtn = page.getByRole("button", { name: "claude", exact: true });
     const codexBtn = page.getByRole("button", { name: "codex", exact: true });
-    const antigravityBtn = page.getByRole("button", { name: "antigravity", exact: true });
+    const antigravityBtn = page.getByRole("button", {
+      name: "antigravity",
+      exact: true,
+    });
     await expect(claudeBtn).toBeVisible();
     await expect(codexBtn).toBeVisible();
     await expect(antigravityBtn).toBeVisible();
     // Uninstalled agents are hidden from the picker grid.
-    await expect(page.getByRole("button", { name: "uninstalled-tool", exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "uninstalled-tool", exact: true }),
+    ).toHaveCount(0);
   });
 
-  test("profile picker is hidden when there is only one profile", async ({ page }) => {
+  test("profile picker is hidden when there is only one profile", async ({
+    page,
+  }) => {
     await mockApis(page, { profiles: [{ name: "default", is_default: true }] });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -173,8 +199,12 @@ test.describe("Wizard agent step (#1219)", () => {
     // old <select>.selectOption call.
     await page.getByRole("radio", { name: /yolo-sandbox/ }).click();
     // Both toggles flip on because APPLY_PROFILE_DEFAULTS dispatched.
-    const sandboxToggle = page.locator("label", { hasText: "Run in a safe container" }).locator("role=switch");
-    const yoloToggle = page.locator("label", { hasText: "Auto-approve actions" }).locator("role=switch");
+    const sandboxToggle = page
+      .locator("label", { hasText: "Run in a safe container" })
+      .locator("role=switch");
+    const yoloToggle = page
+      .locator("label", { hasText: "Auto-approve actions" })
+      .locator("role=switch");
     await expect(sandboxToggle).toHaveAttribute("aria-checked", "true");
     await expect(yoloToggle).toHaveAttribute("aria-checked", "true");
     expect(settingsCalls).toContain("yolo-sandbox");
@@ -211,7 +241,9 @@ test.describe("Wizard agent step (#1219)", () => {
     await expect(page.getByRole("radio", { name: /no-desc/ })).toBeVisible();
   });
 
-  test("sandbox toggle is disabled when Docker is not running", async ({ page }) => {
+  test("sandbox toggle is disabled when Docker is not running", async ({
+    page,
+  }) => {
     await mockApis(page, { docker: false });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");

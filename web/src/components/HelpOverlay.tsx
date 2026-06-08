@@ -17,7 +17,10 @@ const TERMINAL_SHORTCUTS = [
 ];
 
 const MOBILE_GESTURES = [
-  { key: "Two fingers", desc: "Swipe up/down to scroll the terminal (tmux copy-mode)" },
+  {
+    key: "Two fingers",
+    desc: "Swipe up/down to scroll the terminal (tmux copy-mode)",
+  },
   { key: "Tap pane", desc: "Open the soft keyboard" },
   { key: "Long-press ↑↓", desc: "Drag horizontally to emit ← →" },
   { key: "Hold session", desc: "Long-press a session to rename it" },
@@ -59,9 +62,7 @@ export function HelpOverlay({ onClose }: Props) {
                   <kbd className="font-mono text-sm bg-surface-900 border border-surface-700 rounded px-1.5 py-0.5 text-brand-500 min-w-[32px] text-center">
                     {s.key}
                   </kbd>
-                  <span className="text-sm text-text-secondary">
-                    {s.desc}
-                  </span>
+                  <span className="text-sm text-text-secondary">{s.desc}</span>
                 </div>
               ))}
             </div>
@@ -77,9 +78,7 @@ export function HelpOverlay({ onClose }: Props) {
                   <kbd className="font-mono text-sm bg-surface-900 border border-surface-700 rounded px-1.5 py-0.5 text-accent-600 min-w-[32px] text-center">
                     {s.key}
                   </kbd>
-                  <span className="text-sm text-text-secondary">
-                    {s.desc}
-                  </span>
+                  <span className="text-sm text-text-secondary">{s.desc}</span>
                 </div>
               ))}
             </div>

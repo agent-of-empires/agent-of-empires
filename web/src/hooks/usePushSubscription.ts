@@ -34,11 +34,10 @@ const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
   // iOS uses navigator.standalone; other platforms use the display-mode
   // media query. Both are worth checking.
-  const ios = (window.navigator as unknown as { standalone?: boolean })
-    .standalone === true;
-  const displayMode = window.matchMedia?.(
-    "(display-mode: standalone)",
-  ).matches;
+  const ios =
+    (window.navigator as unknown as { standalone?: boolean }).standalone ===
+    true;
+  const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
 
@@ -116,10 +115,10 @@ export function usePushSubscription() {
   }, []);
 
   useEffect(() => {
-    // refresh() is the initial-mount fetch; setState-in-effect is the
-    // correct pattern here (nothing external to subscribe to, just a
-    // one-shot async read of feature availability + server status).
-    refresh();
+    const timer = setTimeout(() => {
+      void refresh();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [refresh]);
 
   const enable = useCallback(async () => {

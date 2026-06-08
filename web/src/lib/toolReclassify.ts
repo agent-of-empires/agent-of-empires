@@ -1,11 +1,11 @@
 // Tool-card presentation heuristic: reclassify ACP "execute" (Bash) tool
 // calls that are actually pure search shellouts (grep, rg, find, fd, …)
-// so the cockpit renders them in the search card instead of the heavier
+// so the structured view renders them in the search card instead of the heavier
 // bash card. The Rust `kind` stays faithful to ACP; this is purely a
 // frontend rendering concern.
 
-import type { ToolCall } from "./cockpitTypes";
-import { parseJsonObject, pickStr } from "./cockpitArgs";
+import type { ToolCall } from "./acpTypes";
+import { parseJsonObject, pickStr } from "./acpArgs";
 
 // Command starts with a known read-only search binary. `ripgrep` covers
 // the long form that some users still type out of habit.
@@ -29,7 +29,10 @@ export function reclassifyBash(tool: ToolCall): Reclassified {
   if (tool.kind !== "execute") {
     return { kind: tool.kind, provenance: null };
   }
-  const command = pickStr(parseJsonObject(tool.args_preview), "command")?.trim();
+  const command = pickStr(
+    parseJsonObject(tool.args_preview),
+    "command",
+  )?.trim();
   if (!command) {
     return { kind: tool.kind, provenance: null };
   }

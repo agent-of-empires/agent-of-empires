@@ -1,6 +1,6 @@
 //! Coarse client form-factor classification for the seen ping (issue #1883).
 //!
-//! The `seen` ping reports that the web dashboard / cockpit was opened. The
+//! The `seen` ping reports that the web dashboard / acp was opened. The
 //! snapshot's `os` / `arch` describe the daemon host, not the device the user
 //! is looking at, so a phone PWA talking to a Mac daemon was indistinguishable
 //! from a desktop tab. The frontend derives one of a **closed set** of coarse

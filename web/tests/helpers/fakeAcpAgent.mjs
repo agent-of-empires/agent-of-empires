@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Fake ACP agent for cockpit Playwright tests.
+// Fake ACP agent for structured view Playwright tests.
 //
 // Speaks just enough of the Agent Client Protocol (newline-delimited
-// JSON-RPC 2.0) for `src/cockpit/acp_client.rs` to drive a turn:
+// JSON-RPC 2.0) for `src/acp/acp_client.rs` to drive a turn:
 //
 //   initialize          -> return protocolVersion + agentCapabilities
 //   session/new         -> return a deterministic sessionId
-//   session/load        -> same shape; lets cockpit's Resume mode work
+//   session/load        -> same shape; lets structured view's Resume mode work
 //   session/prompt      -> emit scripted session/update notifications,
 //                          then return a stop response. Script entries
 //                          with `sessionUpdate: "permission_request"`
@@ -48,6 +48,7 @@
 
 import { createInterface } from "node:readline";
 import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 
 // Silently swallow EPIPE/EBADF on stdout/stderr writes. The fake is a
 // noisy stdout writer (one JSON line per session/update notification);
@@ -57,7 +58,7 @@ import { readFileSync, existsSync, appendFileSync } from "node:fs";
 // handler, Node treats that as an uncaught exception and exits the
 // process. The runner sees the child exit, deletes the worker_registry
 // entry, the supervisor's reap pass publishes Stopped {
-// reason: "user_stopped" }, and the UI banners "Cockpit worker
+// reason: "user_stopped" }, and the UI banners "Structured view worker
 // stopped" mid-turn. That matched the symptom in #1383 (see Once /
 // upon visible but "a time." never arriving in the composer-streamed
 // trace). Swallowing the error is safe: write failures here mean the
@@ -107,7 +108,9 @@ process.on("SIGPIPE", () => {
 process.on("SIGHUP", () => {
   fakeDebug("SIGHUP received (ignored)");
 });
-fakeDebug(`fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`);
+fakeDebug(
+  `fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`,
+);
 
 const DEFAULT_TURN = {
   updates: [
@@ -199,9 +202,7 @@ function sendRequest(method, params) {
 function resolveOutbound(msg) {
   const entry = pendingOutbound.get(msg.id);
   if (!entry) {
-    process.stderr.write(
-      `[fakeAcpAgent] response for unknown id ${msg.id}\n`,
-    );
+    process.stderr.write(`[fakeAcpAgent] response for unknown id ${msg.id}\n`);
     return;
   }
   pendingOutbound.delete(msg.id);
@@ -214,7 +215,7 @@ function resolveOutbound(msg) {
 
 // Default permission options when a `permission_request` script entry
 // omits its own. Covers every PermissionOptionKind aoe's
-// `pick_option_id` (src/cockpit/acp_client.rs) consults so an
+// `pick_option_id` (src/acp/acp_client.rs) consults so an
 // `allow` / `allow_always` / `deny` decision always maps cleanly.
 const DEFAULT_PERMISSION_OPTIONS = [
   { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -233,13 +234,29 @@ const cancelFlags = new Map();
 // FAKE_ACP_MODE_VIA_CONFIG_OPTION is set, the fake advertises its modes
 // ONLY as a `category:"mode"` config option (no ACP SessionModeState
 // `modes` field) and rejects any mode value outside this list, exactly
-// like `opencode acp`. Lets a test prove the cockpit picker reads the
+// like `opencode acp`. Lets a test prove the structured view picker reads the
 // config-option channel and never offers a phantom "default" mode.
 const OPENCODE_MODE_CHOICES = [
   { value: "build", name: "Build" },
   { value: "plan", name: "Plan" },
 ];
 const opencodeModeBySession = new Map();
+
+// Unstable `session_model` channel (ACP unstable_session_model, #1820).
+// Agents like Claude can advertise their model selector via the
+// SessionModelState field on the session/new (and session/load) response
+// instead of a generic config_option. Tests opt in with
+// FAKE_ACP_EMIT_SESSION_MODEL=1 (usually alongside
+// FAKE_ACP_EMIT_CONFIG_OPTIONS=0 so the unstable channel is the only
+// model source) and drive a switch via the same cockpit/config-option
+// endpoint using the reserved synthetic id, which aoe routes to
+// session/set_model.
+const SESSION_MODEL_CHOICES = [
+  { modelId: "fake-sonnet", name: "Fake Sonnet" },
+  { modelId: "fake-opus", name: "Fake Opus" },
+];
+const sessionModelBySession = new Map();
+
 function makeOpencodeModeOption(currentValue) {
   return {
     id: "mode",
@@ -261,7 +278,8 @@ async function emitSessionUpdates(sessionId, updates) {
       // Clamp the raw value: NaN, Infinity, or negative numbers would
       // make setTimeout fire immediately or behave unpredictably and
       // mask bad fixture data. Cap at 60s so a typo can't hang CI.
-      const raw = typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
+      const raw =
+        typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
       const ms = Math.min(60_000, Math.max(0, Math.floor(raw)));
       // Sleep in 50ms slices so a cancel notification arriving during
       // a long wait_ms doesn't have to wait for the full duration
@@ -298,7 +316,7 @@ async function emitSessionUpdates(sessionId, updates) {
       continue;
     }
     sendNotification("session/update", { sessionId, update: u });
-    // Inter-update tick so the cockpit reducer can apply each event in
+    // Inter-update tick so the structured view reducer can apply each event in
     // order rather than batching them. Bumped from 1ms to 5ms after
     // CI flakes (#1383): under 6-worker contention on the 4-core CI
     // runner, a 1ms tick didn't survive the event-loop pressure and
@@ -308,7 +326,7 @@ async function emitSessionUpdates(sessionId, updates) {
 }
 
 function makeSessionId() {
-  return `fake-acp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `fake-acp-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
 const INITIALIZE_RESULT = {
@@ -326,7 +344,7 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    version: "0.39.0",
+    version: "0.41.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
@@ -353,7 +371,7 @@ async function handleRequest(msg) {
   // ACP server per failure mode. Shape: script.failOn = { method:
   // "session/new", code: -32603, message: "Internal error", data: {...} }.
   // Single-shot by default; set `repeat: true` to keep failing on every
-  // call. See web/tests/live/cockpit-stories/startup-error-banner-native-binary.spec.ts.
+  // call. See web/tests/live/acp-stories/startup-error-banner-native-binary.spec.ts.
   if (script.failOn && script.failOn.method === method) {
     const f = script.failOn;
     sendError(
@@ -394,7 +412,7 @@ async function handleRequest(msg) {
       const sessionId = params?.sessionId ?? makeSessionId();
       // Test hook: when FAKE_ACP_COMMANDS is set, emit an
       // `available_commands_update` session/update notification right
-      // after the session/new response so the cockpit composer's
+      // after the session/new response so the structured view composer's
       // slash-command popover is populated for stories that drive the
       // `/` picker (e.g. composer-slash-pick-no-arg #1512).
       const commandsJson = process.env.FAKE_ACP_COMMANDS;
@@ -414,7 +432,7 @@ async function handleRequest(msg) {
               ...(c.accepts_input ? { input: { hint: c.hint ?? "" } } : {}),
             }));
             // Defer emission to the next tick so the session/new
-            // response lands first; the cockpit acp_client wires the
+            // response lands first; the structured view acp_client wires the
             // session id from the response before it can route follow-up
             // session/update notifications.
             setImmediate(() => {
@@ -436,7 +454,7 @@ async function handleRequest(msg) {
       // Mirror claude-agent-acp v0.37.0: the initial set of
       // per-session selectors (model + effort + mode) ships in the
       // session/new and session/load *response*, not as a subsequent
-      // notification. The cockpit's acp_client reads the response
+      // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
       const includeConfigOptions =
         process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
@@ -477,7 +495,44 @@ async function handleRequest(msg) {
           makeOpencodeModeOption(current),
         ];
       }
+      if (process.env.FAKE_ACP_EMIT_SESSION_MODEL === "1") {
+        const current =
+          sessionModelBySession.get(sessionId) ??
+          SESSION_MODEL_CHOICES[0].modelId;
+        sessionModelBySession.set(sessionId, current);
+        // ACP SessionModelState (camelCase wire shape per
+        // agent-client-protocol-schema unstable_session_model).
+        result.models = {
+          currentModelId: current,
+          availableModels: SESSION_MODEL_CHOICES.map((m) => ({
+            modelId: m.modelId,
+            name: m.name,
+          })),
+        };
+      }
       sendResult(id, result);
+      return;
+    }
+
+    case "session/setModel":
+    case "session/set_model": {
+      // Unstable model-switch channel (#1820). ACP wire method is
+      // `session/set_model` (snake_case); accept both spellings. The
+      // real adapter only acks with no state echo, so aoe synthesizes
+      // the follow-up ConfigOptionsUpdated itself. Tests opt into a
+      // rejection with FAKE_ACP_REJECT_SET_MODEL.
+      const sessionId = params?.sessionId;
+      const modelId = params?.modelId;
+      if (process.env.FAKE_ACP_REJECT_SET_MODEL) {
+        sendError(id, -32000, process.env.FAKE_ACP_REJECT_SET_MODEL);
+        return;
+      }
+      if (!SESSION_MODEL_CHOICES.some((m) => m.modelId === modelId)) {
+        sendError(id, -32000, `model not found: ${modelId}`);
+        return;
+      }
+      if (sessionId) sessionModelBySession.set(sessionId, modelId);
+      sendResult(id, {});
       return;
     }
 
@@ -547,7 +602,10 @@ async function handleRequest(msg) {
                   configId === "model"
                     ? [
                         { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-                        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+                        {
+                          value: "claude-sonnet-4-6",
+                          name: "Claude Sonnet 4.6",
+                        },
                       ]
                     : [
                         { value: "default", name: "Default" },
@@ -575,7 +633,7 @@ async function handleRequest(msg) {
       // Rate-limit park: a turn with `rateLimit` returns session/prompt as
       // a JSON-RPC error carrying the fingerprint aoe's
       // classify_rate_limit_error reads (errorKind "rate_limit" plus a
-      // resets_at), instead of a normal stopReason. The cockpit worker
+      // resets_at), instead of a normal stopReason. The structured view worker
       // then emits a typed RateLimit event and parks the session. See
       // #1281 / #1715. A cancel mid-turn still wins over the park.
       if (!wasCancelled && turn.rateLimit) {
@@ -586,7 +644,9 @@ async function handleRequest(msg) {
         return;
       }
       sendResult(id, {
-        stopReason: wasCancelled ? "cancelled" : (turn.stopReason ?? "end_turn"),
+        stopReason: wasCancelled
+          ? "cancelled"
+          : (turn.stopReason ?? "end_turn"),
       });
       return;
     }
@@ -601,7 +661,9 @@ async function main() {
   const rl = createInterface({ input: process.stdin });
   process.stdin.on("end", () => fakeDebug("stdin end"));
   process.stdin.on("close", () => fakeDebug("stdin close"));
-  process.stdin.on("error", (err) => fakeDebug(`stdin error: ${err.code ?? err.message}`));
+  process.stdin.on("error", (err) =>
+    fakeDebug(`stdin error: ${err.code ?? err.message}`),
+  );
   rl.on("line", async (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -619,7 +681,10 @@ async function main() {
         process.stderr.write(`[fakeAcpAgent] handler error: ${err}\n`);
         sendError(msg.id, -32603, `internal: ${err}`);
       }
-    } else if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+    } else if (
+      msg.id !== undefined &&
+      (msg.result !== undefined || msg.error !== undefined)
+    ) {
       // Response to one of our outbound requests (e.g.
       // session/request_permission). Resolve the awaiting Promise.
       resolveOutbound(msg);

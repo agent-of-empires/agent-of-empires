@@ -11,7 +11,7 @@ export interface ParsedToolError {
    *  adapter sent `is_error: true` with no body. */
   body: string;
   /** Tag name when the original payload was wrapped in
-   *  `<tag>...</tag>`. The cockpit renders this as a small label
+   *  `<tag>...</tag>`. The structured view renders this as a small label
    *  outside the error body so the source is clear without polluting
    *  the message itself. Null when the payload was a bare string. */
   tag: string | null;
@@ -32,7 +32,9 @@ export interface ParsedToolError {
 // last one (defends against a doubled-wrapper artifact).
 const WRAPPER_RE = /<([a-zA-Z_][a-zA-Z0-9_-]*)>([\s\S]*?)<\/\1>/;
 
-export function parseToolError(text: string | undefined | null): ParsedToolError {
+export function parseToolError(
+  text: string | undefined | null,
+): ParsedToolError {
   const raw = (text ?? "").trim();
   if (!raw) return { body: "", tag: null };
   const m = WRAPPER_RE.exec(raw);

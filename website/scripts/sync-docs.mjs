@@ -41,6 +41,13 @@ const PAGES = [
       "Per-repo configuration and hooks for Agent of Empires sessions.",
   },
   {
+    source: "docs/guides/mcp-servers.md",
+    dest: "guides/mcp-servers.md",
+    title: "MCP Servers",
+    description:
+      "Forward configured MCP servers to structured-view agents via mcp.json.",
+  },
+  {
     source: "docs/guides/sandbox.md",
     dest: "guides/sandbox.md",
     title: "Docker Sandbox: Quick Reference",
@@ -175,6 +182,13 @@ const PAGES = [
       "Step-by-step guide for adding support for a new AI coding agent to AoE.",
   },
   {
+    source: "docs/development/adding-settings.md",
+    dest: "docs/development/adding-settings.md",
+    title: "Adding a Setting",
+    description:
+      "How to add a configuration setting with the single-source schema that drives the TUI, web dashboard, and server.",
+  },
+  {
     source: "docs/development/logging.md",
     dest: "docs/development/logging.md",
     title: "Logging",
@@ -203,6 +217,27 @@ const PAGES = [
       "Build the web dashboard from source, run the frontend dev workflow (cargo xtask dev and manual Vite + VITE_PROXY), and the server architecture.",
   },
   {
+    source: "docs/development/internals/structured-view.md",
+    dest: "docs/development/internals/structured-view.md",
+    title: "Structured View Internals",
+    description:
+      "Contributor reference for the ACP subsystem: worker lifecycle and persistence, stuck-turn watchdogs, rate-limit handling, agent profiles, and the security model.",
+  },
+  {
+    source: "docs/development/internals/sandbox.md",
+    dest: "docs/development/internals/sandbox.md",
+    title: "Sandbox Internals",
+    description:
+      "Contributor reference for Docker sandbox internals: shared agent credential sync, the container lifecycle, Vertex AI wiring, and GH_TOKEN forwarding.",
+  },
+  {
+    source: "docs/development/internals/sessions.md",
+    dest: "docs/development/internals/sessions.md",
+    title: "Session & Worktree Internals",
+    description:
+      "Contributor reference for the session layer: Claude conversation resume, worktree creation, scratch-session cleanup, and MCP server forwarding.",
+  },
+  {
     source: "docs/sounds.md",
     dest: "docs/sounds.md",
     title: "Sound Effects",
@@ -214,7 +249,7 @@ const PAGES = [
     dest: "docs/push-notifications.md",
     title: "Push Notifications",
     description:
-      "Browser and PWA push notifications for Agent of Empires session status changes and cockpit approvals.",
+      "Browser and PWA push notifications for Agent of Empires session status changes and structured view approvals.",
   },
   {
     source: "docs/features.md",
@@ -259,53 +294,32 @@ const PAGES = [
       "Complete command-line reference for the aoe CLI tool.",
   },
   {
-    source: "docs/cockpit.md",
-    dest: "docs/cockpit.md",
-    title: "Cockpit (Native Agent Rendering)",
+    source: "docs/structured-view.md",
+    dest: "docs/structured-view.md",
+    title: "Structured View (Web Dashboard)",
     description:
-      "Mobile-first native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
+      "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
-    source: "docs/cockpit/multi-agent.md",
-    dest: "docs/cockpit/multi-agent.md",
-    title: "Cockpit Multi-Agent Support",
+    source: "docs/structured-view/interface.md",
+    dest: "docs/structured-view/interface.md",
+    title: "Structured View Interface",
     description:
-      "Per-agent cockpit feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
+      "The TUI and web structured views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
   },
   {
-    source: "docs/cockpit/setup.md",
-    dest: "docs/cockpit/setup.md",
-    title: "Cockpit Setup",
-    description:
-      "Confirm prerequisites with aoe cockpit doctor, enable cockpit per session or globally, disable it, attach across machines, and drive it from the CLI.",
-  },
-  {
-    source: "docs/cockpit/interface.md",
-    dest: "docs/cockpit/interface.md",
-    title: "Cockpit Interface",
-    description:
-      "The TUI and web cockpit views: keybinds, composer behavior on desktop and touch, queued prompts, and timeline card grouping.",
-  },
-  {
-    source: "docs/cockpit/controls.md",
-    dest: "docs/cockpit/controls.md",
-    title: "Cockpit Modes, Approvals & Model Controls",
+    source: "docs/structured-view/controls.md",
+    dest: "docs/structured-view/controls.md",
+    title: "Structured View Modes, Approvals & Model Controls",
     description:
       "Permission modes, YOLO and bypassPermissions, approval cards and notifications, plus the model and reasoning-effort selectors.",
   },
   {
-    source: "docs/cockpit/persistence.md",
-    dest: "docs/cockpit/persistence.md",
-    title: "Cockpit Persistence & Recovery",
+    source: "docs/structured-view/troubleshooting.md",
+    dest: "docs/structured-view/troubleshooting.md",
+    title: "Structured View Troubleshooting",
     description:
-      "How cockpit workers survive an aoe serve restart, what session deletion cleans up, and how conversation context is rehydrated.",
-  },
-  {
-    source: "docs/cockpit/troubleshooting.md",
-    dest: "docs/cockpit/troubleshooting.md",
-    title: "Cockpit Troubleshooting",
-    description:
-      "The cockpit security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
+      "The structured view security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
   },
   {
     source: "docs/guides/tool-sessions.md",
@@ -342,25 +356,27 @@ const URL_MAP = {
   "docs/github-integration.md": "/docs/github-integration/",
   "docs/development.md": "/docs/development/",
   "docs/development/adding-agents.md": "/docs/development/adding-agents/",
+  "docs/development/adding-settings.md": "/docs/development/adding-settings/",
   "docs/development/logging.md": "/docs/development/logging/",
   "docs/development/playwright.md": "/docs/development/playwright/",
   "docs/development/releases.md": "/docs/development/releases/",
   "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
+  "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",
+  "docs/development/internals/sandbox.md": "/docs/development/internals/sandbox/",
+  "docs/development/internals/sessions.md": "/docs/development/internals/sessions/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
-  "docs/cockpit.md": "/docs/cockpit/",
-  "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
-  "docs/cockpit/setup.md": "/docs/cockpit/setup/",
-  "docs/cockpit/interface.md": "/docs/cockpit/interface/",
-  "docs/cockpit/controls.md": "/docs/cockpit/controls/",
-  "docs/cockpit/persistence.md": "/docs/cockpit/persistence/",
-  "docs/cockpit/troubleshooting.md": "/docs/cockpit/troubleshooting/",
+  "docs/structured-view.md": "/docs/structured-view/",
+  "docs/structured-view/interface.md": "/docs/structured-view/interface/",
+  "docs/structured-view/controls.md": "/docs/structured-view/controls/",
+  "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
   "docs/api.md": "/docs/api/",
   "docs/telemetry.md": "/docs/telemetry/",
   // Guides
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
+  "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
@@ -451,8 +467,8 @@ function computeLayoutPath(dest) {
 }
 
 function escapeYaml(str) {
-  if (/[:"']/.test(str)) {
-    return `"${str.replace(/"/g, '\\"')}"`;
+  if (/[:"'\\]/.test(str)) {
+    return `"${str.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   }
   return str;
 }

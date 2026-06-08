@@ -127,6 +127,11 @@ pub enum ValidationKind {
     MemoryLimit,
     /// Each list entry must be `host:container[:options]`.
     VolumeList,
+    /// Each list entry must be a sandbox env entry: bare `KEY` or `KEY=VALUE`
+    /// (key is letters, digits, underscores; must not start with a digit).
+    EnvList,
+    /// Each list entry must be a `host:container` port mapping (digits only).
+    PortMappingList,
 }
 
 /// One configurable field, emitted by the `SettingsSection` derive. Owned
@@ -134,7 +139,7 @@ pub enum ValidationKind {
 /// without lifetime juggling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDescriptor {
-    /// Top-level config section, e.g. `"cockpit"`. Matches the `[section]`
+    /// Top-level config section, e.g. `"acp"`. Matches the `[section]`
     /// table in `config.toml` and the override key in a profile.
     pub section: String,
     /// Field name within the section, e.g. `"max_concurrent_workers"`.

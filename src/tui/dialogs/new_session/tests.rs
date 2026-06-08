@@ -1151,7 +1151,7 @@ fn test_profile_switch_reloads_sandbox_env_without_session_override() {
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
     std::env::set_var("HOME", temp_home.path());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
     std::env::set_var("OLD_THING", "1");
     std::env::set_var("NEW_THING", "2");
@@ -1226,7 +1226,7 @@ fn test_set_path_reloads_repo_sandbox_env_without_session_override() {
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
     std::env::set_var("HOME", temp_home.path());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
     let app_dir = crate::session::get_app_dir().expect("app dir");
@@ -1291,7 +1291,7 @@ fn test_sandbox_config_refreshes_typed_path_repo_env_without_session_override() 
     let old_home = std::env::var_os("HOME");
     let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
     std::env::set_var("HOME", temp_home.path());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
     let app_dir = crate::session::get_app_dir().expect("app dir");

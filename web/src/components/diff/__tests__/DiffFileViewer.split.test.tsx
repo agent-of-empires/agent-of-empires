@@ -1,15 +1,21 @@
 // @vitest-environment jsdom
 //
 // Covers the unified/split toggle in DiffFileViewer, its localStorage
-// persistence via useWebSettings, and that the width ResizeObserver attaches
-// even when the diff container mounts after an initial loading phase.
+// persistence via useWebSettings, that the width ResizeObserver attaches even
+// when the diff container mounts after an initial loading phase, and that the
+// selected layout is forwarded to the Pierre renderer as `options.diffStyle`.
+//
+// The Pierre renderer (`@pierre/diffs/react`) manipulates the DOM and spins up
+// workers, neither of which runs under jsdom, so it's mocked here with a light
+// stand-in that surfaces the diffStyle it was handed. Round-trip rendering is
+// covered by the live Playwright suite instead.
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DiffFileViewer } from "../DiffFileViewer";
-import type { RichFileDiffResponse } from "../../../lib/types";
+import type { RichFileContentsResponse } from "../../../lib/types";
 
-const diff: RichFileDiffResponse = {
+const contents: RichFileContentsResponse = {
   file: {
     path: "a.ts",
     old_path: null,
@@ -17,49 +23,54 @@ const diff: RichFileDiffResponse = {
     additions: 1,
     deletions: 1,
   },
-  hunks: [
-    {
-      old_start: 1,
-      old_lines: 2,
-      new_start: 1,
-      new_lines: 2,
-      lines: [
-        { type: "equal", old_line_num: 1, new_line_num: 1, content: "ctx\n" },
-        { type: "delete", old_line_num: 2, new_line_num: null, content: "old\n" },
-        { type: "add", old_line_num: null, new_line_num: 2, content: "new\n" },
-      ],
-    },
-  ],
+  old_content: "ctx\nold\n",
+  new_content: "ctx\nnew\n",
+  // Server-computed unified diff (similar-crate format).
+  patch: "--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n",
   is_binary: false,
   truncated: false,
 };
 
-// Mutable mock state so a test can start in the loading phase (no diff) and
-// then have the diff arrive, exercising the late-mount path of the container.
 const mock = vi.hoisted(() => ({
-  diff: undefined as RichFileDiffResponse | undefined,
+  contents: undefined as RichFileContentsResponse | undefined,
   observe: vi.fn(),
 }));
 
-vi.mock("../../../hooks/useFileDiff", () => ({
-  useFileDiff: () => ({
-    diff: mock.diff,
-    loading: mock.diff === undefined,
+vi.mock("../../../hooks/useFileContents", () => ({
+  useFileContents: () => ({
+    contents: mock.contents,
+    loading: mock.contents === undefined,
     error: null,
     refresh: vi.fn(),
   }),
 }));
 
-vi.mock("../../../hooks/useHighlightedLines", () => ({
-  useHighlightedLines: () => ({ tokens: null }),
+// Stand in for the Pierre renderer: surface the diffStyle on a data attribute
+// and render the file name so the header assertions still resolve.
+vi.mock("@pierre/diffs/react", () => ({
+  FileDiff: ({
+    options,
+    fileDiff,
+  }: {
+    options: { diffStyle: string };
+    fileDiff: { name: string };
+  }) => (
+    <div data-testid="pierre-diff" data-diff-style={options.diffStyle}>
+      {fileDiff.name}
+    </div>
+  ),
+  Virtualizer: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="virtualizer">{children}</div>
+  ),
+  WorkerPoolContextProvider: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
 }));
 
 beforeEach(() => {
   window.localStorage.clear();
-  mock.diff = diff;
+  mock.contents = contents;
   mock.observe.mockClear();
-  // Stub ResizeObserver to immediately report a wide viewport (and record
-  // observe calls) so the split path is available when the toggle is activated.
   class WideRO {
     cb: ResizeObserverCallback;
     constructor(cb: ResizeObserverCallback) {
@@ -88,11 +99,16 @@ describe("DiffFileViewer split layout", () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
     expect(
-      screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+      screen
+        .getByRole("button", { name: "Split" })
+        .getAttribute("aria-pressed"),
     ).toBe("false");
+    expect(
+      screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
+    ).toBe("unified");
   });
 
-  it("switches to split and persists the preference", async () => {
+  it("switches to split, forwards diffStyle, and persists the preference", async () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
 
@@ -100,25 +116,28 @@ describe("DiffFileViewer split layout", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+        screen
+          .getByRole("button", { name: "Split" })
+          .getAttribute("aria-pressed"),
       ).toBe("true");
     });
-
     expect(
-      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}").diffViewLayout,
+      screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
+    ).toBe("split");
+    expect(
+      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}")
+        .diffViewLayout,
     ).toBe("split");
   });
 
   it("attaches the width observer when the diff container mounts after loading", async () => {
-    // Start in the loading phase: the scroll container is behind the early
-    // returns, so it is not mounted and the observer must not have attached.
-    mock.diff = undefined;
-    const { rerender } = render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
+    mock.contents = undefined;
+    const { rerender } = render(
+      <DiffFileViewer sessionId="s1" filePath="a.ts" />,
+    );
     expect(mock.observe).not.toHaveBeenCalled();
 
-    // Diff arrives: the container mounts and the callback ref must attach the
-    // observer (a one-shot mount effect would have missed this late mount).
-    mock.diff = diff;
+    mock.contents = contents;
     rerender(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
     expect(mock.observe).toHaveBeenCalled();

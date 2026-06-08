@@ -14,15 +14,19 @@ export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
+  // Capture the launcher before moving focus into the palette, then restore
+  // it on close so Esc / backdrop-close return keyboard users to where they
+  // were instead of dropping focus on <body>. autoFocus cannot restore focus,
+  // and capturing in a post-commit effect would already see the input.
   useEffect(() => {
-    if (open) {
-      previousFocusRef.current = document.activeElement as HTMLElement | null;
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => {
-        clearTimeout(t);
-        previousFocusRef.current?.focus?.();
-      };
-    }
+    if (!open) return;
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => {
+      clearTimeout(t);
+      const prev = previousFocusRef.current;
+      if (prev?.isConnected) prev.focus();
+    };
   }, [open]);
 
   const grouped = useMemo(() => {
@@ -118,7 +122,9 @@ export function CommandPalette({ open, onClose, actions }: Props) {
                         </span>
                       )}
                       {action.icon && (
-                        <span className="shrink-0 text-text-muted">{action.icon}</span>
+                        <span className="shrink-0 text-text-muted">
+                          {action.icon}
+                        </span>
                       )}
                       <span className="truncate">{action.title}</span>
                       {action.subtitle && (
@@ -142,7 +148,9 @@ export function CommandPalette({ open, onClose, actions }: Props) {
 
         <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
           <span>↑↓ navigate · ↵ select · esc close</span>
-          <span>{actions.length} action{actions.length === 1 ? "" : "s"}</span>
+          <span>
+            {actions.length} action{actions.length === 1 ? "" : "s"}
+          </span>
         </div>
       </Command>
     </div>

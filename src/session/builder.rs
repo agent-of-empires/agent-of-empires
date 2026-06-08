@@ -98,9 +98,28 @@ pub(crate) fn resolve_base_branch(
         .or_else(|| normalize_base(global))
 }
 
+/// Resolve one repo's effective base branch, consulting its registered
+/// per-project default. The registry stores each project at its repo root, so
+/// the lookup keys on `find_main_repo(repo_path)`; `repo_path` itself may be a
+/// subdirectory or a worktree, which would miss a root-keyed entry. Precedence:
+/// explicit session base > per-project default > global/profile default.
+fn resolve_repo_base_branch(
+    repo_path: &std::path::Path,
+    session: Option<&str>,
+    project_bases: &std::collections::HashMap<String, String>,
+    global: Option<&str>,
+) -> Option<String> {
+    let main_repo =
+        GitWorktree::find_main_repo(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let key = crate::session::projects::canonical_key(&main_repo.to_string_lossy());
+    let project = project_bases.get(&key).map(String::as_str);
+    resolve_base_branch(session, project, global)
+}
+
 /// Map of canonical repo path to configured default base branch for every
 /// registered project (global + profile) that sets one. Used to fill in the
-/// per-project layer of `resolve_base_branch` when building a workspace.
+/// per-project layer of `resolve_repo_base_branch` for the launch repo and any
+/// extra repos when building a session.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
     crate::session::projects::load_merged(profile)
         .unwrap_or_else(|e| {
@@ -110,7 +129,7 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
             tracing::warn!(
                 target: "session.create",
                 "Failed to load project registry for base-branch defaults; \
-                 extra repos fall back to the global default: {e}"
+                 repos fall back to the global default: {e}"
             );
             Vec::new()
         })
@@ -462,20 +481,18 @@ pub fn build_instance(
             let session_base = params.base_branch.as_deref();
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
-            let resolve_extra = |path: &std::path::Path| -> Option<String> {
-                let project = project_bases
-                    .get(&crate::session::projects::canonical_key(
-                        &path.to_string_lossy(),
-                    ))
-                    .map(String::as_str);
-                resolve_base_branch(session_base, project, global_default)
-            };
 
-            // The primary repo is the launch repo, not a registered extra
-            // project, so it never consults the per-project layer: explicit
-            // session base, then the global/profile default.
+            // Every repo, including the launch repo, forks from its own
+            // registered per-project default when no explicit session base is
+            // given. Keyed by repo root so a launch path inside a subdirectory
+            // still matches a root-registered project.
             let primary = WorkspaceRepoSpec {
-                base_branch: resolve_base_branch(session_base, None, global_default),
+                base_branch: resolve_repo_base_branch(
+                    &primary_path,
+                    session_base,
+                    &project_bases,
+                    global_default,
+                ),
                 path: primary_path,
             };
             let extra_repos: Vec<WorkspaceRepoSpec> = params
@@ -484,7 +501,12 @@ pub fn build_instance(
                 .map(|p| {
                     let path = PathBuf::from(p);
                     WorkspaceRepoSpec {
-                        base_branch: resolve_extra(&path),
+                        base_branch: resolve_repo_base_branch(
+                            &path,
+                            session_base,
+                            &project_bases,
+                            global_default,
+                        ),
                         path,
                     }
                 })
@@ -567,11 +589,14 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // Single-repo sessions only have the launch repo, so fall back
-                // from the explicit session base to the global/profile default.
-                let base = resolve_base_branch(
+                // The launch repo forks from its registered per-project default
+                // when no explicit session base is given (then global/profile,
+                // then auto-detect). Keyed by repo root via the shared helper.
+                let project_bases = project_base_branches(profile);
+                let base = resolve_repo_base_branch(
+                    &main_repo_path,
                     params.base_branch.as_deref(),
-                    None,
+                    &project_bases,
                     config.worktree.default_base_branch.as_deref(),
                 );
 
@@ -1251,6 +1276,58 @@ mod tests {
         assert_eq!(resolve_base_branch(Some("  "), None, None), None);
     }
 
+    #[test]
+    fn resolve_repo_base_branch_keys_launch_repo_by_root() {
+        let (parent, _tip) = init_repo_with_branch("proj", "release");
+        let root = parent.path().join("proj");
+        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(key, "develop".to_string());
+
+        // No explicit session base: the launch repo forks from its registered
+        // per-project default.
+        assert_eq!(
+            resolve_repo_base_branch(&root, None, &bases, Some("global")),
+            Some("develop".to_string())
+        );
+
+        // Explicit session base still wins over the per-project default.
+        assert_eq!(
+            resolve_repo_base_branch(&root, Some("hotfix"), &bases, Some("global")),
+            Some("hotfix".to_string())
+        );
+
+        // No registered entry for this repo: fall back to the global default.
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            resolve_repo_base_branch(&root, None, &empty, Some("global")),
+            Some("global".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_repo_base_branch_matches_when_launching_from_a_worktree() {
+        // A session launched from a linked worktree of the registered repo
+        // still resolves the project default, because find_main_repo maps the
+        // worktree back to its main repo (the registry's key).
+        let (parent, _tip) = init_repo_with_branch("proj", "release");
+        let root = parent.path().join("proj");
+        let main_wt = GitWorktree::new(root.clone()).unwrap();
+        let wt_path = parent.path().join("proj-wt");
+        main_wt
+            .create_worktree("wt-branch", &wt_path, true, None)
+            .unwrap();
+
+        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(key, "develop".to_string());
+
+        assert_eq!(
+            resolve_repo_base_branch(&wt_path, None, &bases, None),
+            Some("develop".to_string())
+        );
+    }
+
     /// Create a repo with `main` plus a second branch holding a distinct
     /// commit. Returns the parent TempDir and the second branch's tip oid so a
     /// test can assert a worktree forked from it instead of `main`.
@@ -1341,13 +1418,13 @@ mod tests {
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let config_home = temp_home.join(".config");
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
-            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+            config_home.join(crate::session::APP_DIR_NAME_XDG)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             temp_home.join(crate::session::APP_DIR_NAME_OTHER)
         }

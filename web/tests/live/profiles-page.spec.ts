@@ -30,9 +30,7 @@ test("create profile via + New round-trips through POST /api/profiles", async ({
   page,
 }) => {
   await page.goto(`${serve.baseUrl}/profiles`);
-  await expect(
-    page.getByRole("heading", { name: "Profiles" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 
   await page.getByRole("button", { name: "+ New profile" }).click();
   const nameInput = page.getByPlaceholder("Profile name");
@@ -136,9 +134,7 @@ test("lifecycle hooks render read-only with the explain-why note", async ({
   await page.goto(`${serve.baseUrl}/profiles`);
   await page.getByRole("button", { name: "main" }).click();
 
-  const panel = page
-    .locator("section", { hasText: "Lifecycle hooks" })
-    .first();
+  const panel = page.locator("section", { hasText: "Lifecycle hooks" }).first();
   await expect(panel).toBeVisible();
   await expect(panel.getByText(/remote code execution/i)).toBeVisible();
   // Read-only invariant: the hooks panel exposes no form controls.

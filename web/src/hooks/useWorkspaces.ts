@@ -56,9 +56,10 @@ export function useWorkspaces(sessions: SessionResponse[]): Workspace[] {
       );
       const title = first.title.trim();
       const projectName = projectPath.split("/").pop() ?? projectPath;
-      const displayName = groupSessions.length === 1
-        ? title || branch || projectName
-        : branch || projectName;
+      const displayName =
+        groupSessions.length === 1
+          ? title || branch || projectName
+          : branch || projectName;
 
       workspaces.push({
         id,

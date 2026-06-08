@@ -66,24 +66,26 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
 * [`aoe telemetry disable`↴](#aoe-telemetry-disable)
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
+* [`aoe mcp`↴](#aoe-mcp)
+* [`aoe mcp list`↴](#aoe-mcp-list)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
-* [`aoe cockpit`↴](#aoe-cockpit)
-* [`aoe cockpit doctor`↴](#aoe-cockpit-doctor)
-* [`aoe cockpit agents`↴](#aoe-cockpit-agents)
-* [`aoe cockpit ps`↴](#aoe-cockpit-ps)
-* [`aoe cockpit stop`↴](#aoe-cockpit-stop)
-* [`aoe cockpit kill`↴](#aoe-cockpit-kill)
-* [`aoe cockpit logs`↴](#aoe-cockpit-logs)
-* [`aoe cockpit restart`↴](#aoe-cockpit-restart)
-* [`aoe cockpit history`↴](#aoe-cockpit-history)
-* [`aoe cockpit status`↴](#aoe-cockpit-status)
-* [`aoe cockpit prompt`↴](#aoe-cockpit-prompt)
-* [`aoe cockpit approve`↴](#aoe-cockpit-approve)
-* [`aoe cockpit cancel`↴](#aoe-cockpit-cancel)
-* [`aoe cockpit tail`↴](#aoe-cockpit-tail)
-* [`aoe cockpit attach`↴](#aoe-cockpit-attach)
-* [`aoe cockpit switch-agent`↴](#aoe-cockpit-switch-agent)
+* [`aoe acp`↴](#aoe-acp)
+* [`aoe acp doctor`↴](#aoe-acp-doctor)
+* [`aoe acp agents`↴](#aoe-acp-agents)
+* [`aoe acp ps`↴](#aoe-acp-ps)
+* [`aoe acp stop`↴](#aoe-acp-stop)
+* [`aoe acp kill`↴](#aoe-acp-kill)
+* [`aoe acp logs`↴](#aoe-acp-logs)
+* [`aoe acp restart`↴](#aoe-acp-restart)
+* [`aoe acp history`↴](#aoe-acp-history)
+* [`aoe acp status`↴](#aoe-acp-status)
+* [`aoe acp prompt`↴](#aoe-acp-prompt)
+* [`aoe acp approve`↴](#aoe-acp-approve)
+* [`aoe acp cancel`↴](#aoe-acp-cancel)
+* [`aoe acp tail`↴](#aoe-acp-tail)
+* [`aoe acp attach`↴](#aoe-acp-attach)
+* [`aoe acp switch-agent`↴](#aoe-acp-switch-agent)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
 * [`aoe completion`↴](#aoe-completion)
@@ -116,9 +118,10 @@ Run without arguments to launch the TUI dashboard.
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
 * `telemetry` — Manage anonymous opt-in usage telemetry
+* `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
-* `cockpit` — Cockpit (ACP-based native agent rendering) management
+* `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
 * `completion` — Generate shell completions
@@ -126,7 +129,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions)
-* `--daemon-url <DAEMON_URL>` — Attach to a remote cockpit daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
 
 
 
@@ -158,12 +161,11 @@ Add a new session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
-* `--trust-hooks` — Automatically trust repository hooks without prompting
+* `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
-* `--cockpit` — Use cockpit mode (ACP-based native rendering) for this session. Overrides the default-for-claude setting in cockpit config
-* `--no-cockpit` — Force terminal/PTY mode for this session, overriding the default-for-claude cockpit setting
-* `--agent <AGENT>` — Pick a specific cockpit agent (e.g., aoe-agent, claude-code). Implies --cockpit
+* `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
+* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., aoe-agent, claude-code)
 * `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
@@ -231,7 +233,7 @@ Get or set the running daemon's log filter at runtime. Pass a bare level (debug/
 
 ###### **Options:**
 
-* `--filter <FILTER>` — Raw EnvFilter directive. Use this for per-target tuning, e.g. `--filter cockpit.acp=trace,info`. Bare `--filter debug` is rejected; use the positional `level` form instead
+* `--filter <FILTER>` — Raw EnvFilter directive. Use this for per-target tuning, e.g. `--filter acp.protocol=trace,info`. Bare `--filter debug` is rejected; use the positional `level` form instead
 * `--get` — Print the current filter without changing it
 
 
@@ -400,6 +402,7 @@ Rename a session
 
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
+* `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
 
 
 
@@ -758,7 +761,7 @@ Add a project to the registry
   Possible values: `global`, `profile`
 
 * `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
-* `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project in a multi-repo workspace. When omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
+* `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project, whether it is the launch repo or an extra repo in a multi-repo workspace. An explicit session base wins; when omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
 
 
 
@@ -990,6 +993,31 @@ Generate a fresh anonymous install id (only while opted in)
 
 
 
+## `aoe mcp`
+
+Inspect the effective MCP server set (provenance, conflicts, drift)
+
+**Usage:** `aoe mcp <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+
+
+
+## `aoe mcp list`
+
+List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+
+**Usage:** `aoe mcp list [OPTIONS]`
+
+###### **Options:**
+
+* `--agent <AGENT>` — Agent whose effective set to resolve. Defaults to the configured default tool. MCP forwarding is per-agent because the agent-native layer differs
+* `--json` — Output machine-readable JSON instead of a table
+
+
+
 ## `aoe serve`
 
 Start a web dashboard for remote session access
@@ -1037,37 +1065,37 @@ Print the current dashboard URL of a running `aoe serve` daemon
 
 
 
-## `aoe cockpit`
+## `aoe acp`
 
-Cockpit (ACP-based native agent rendering) management
+Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
-**Usage:** `aoe cockpit <COMMAND>`
+**Usage:** `aoe acp <COMMAND>`
 
 ###### **Subcommands:**
 
-* `doctor` — Verify the cockpit can start: Node runtime, configured agents, provider auth (claude login)
-* `agents` — List configured cockpit agents (claude-code, aoe-agent, etc.)
-* `ps` — List running cockpit workers (detached or attached)
-* `stop` — Gracefully stop a cockpit worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+* `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
+* `agents` — List configured agents (claude-code, aoe-agent, etc.)
+* `ps` — List running agent workers (detached or attached)
+* `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
-* `logs` — Tail the runner's log file for a cockpit session
-* `restart` — Restart a wedged cockpit worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
-* `history` — Print the persisted transcript for a cockpit session
-* `status` — Print live status for a cockpit session: highest/lowest seq, and whether the on-disk retention window has truncated history
-* `prompt` — Send a prompt to a cockpit session's agent
+* `logs` — Tail the runner's log file for an agent session
+* `restart` — Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+* `history` — Print the persisted transcript for an agent session
+* `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
+* `prompt` — Send a prompt to an agent session's agent
 * `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
-* `cancel` — Cancel the in-flight prompt for a cockpit session
-* `tail` — Stream the cockpit broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
-* `attach` — Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
-* `switch-agent` — Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+* `cancel` — Cancel the in-flight prompt for an agent session
+* `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
+* `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
+* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
 
 
 
-## `aoe cockpit doctor`
+## `aoe acp doctor`
 
-Verify the cockpit can start: Node runtime, configured agents, provider auth (claude login)
+Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 
-**Usage:** `aoe cockpit doctor [OPTIONS]`
+**Usage:** `aoe acp doctor [OPTIONS]`
 
 ###### **Options:**
 
@@ -1076,19 +1104,19 @@ Verify the cockpit can start: Node runtime, configured agents, provider auth (cl
 
 
 
-## `aoe cockpit agents`
+## `aoe acp agents`
 
-List configured cockpit agents (claude-code, aoe-agent, etc.)
+List configured agents (claude-code, aoe-agent, etc.)
 
-**Usage:** `aoe cockpit agents`
+**Usage:** `aoe acp agents`
 
 
 
-## `aoe cockpit ps`
+## `aoe acp ps`
 
-List running cockpit workers (detached or attached)
+List running agent workers (detached or attached)
 
-**Usage:** `aoe cockpit ps [OPTIONS]`
+**Usage:** `aoe acp ps [OPTIONS]`
 
 ###### **Options:**
 
@@ -1096,11 +1124,11 @@ List running cockpit workers (detached or attached)
 
 
 
-## `aoe cockpit stop`
+## `aoe acp stop`
 
-Gracefully stop a cockpit worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
 
-**Usage:** `aoe cockpit stop [OPTIONS] [SESSION]`
+**Usage:** `aoe acp stop [OPTIONS] [SESSION]`
 
 ###### **Arguments:**
 
@@ -1108,18 +1136,18 @@ Gracefully stop a cockpit worker (SIGTERM the runner, agent receives stdin EOF).
 
 ###### **Options:**
 
-* `--all` — Stop every running cockpit worker
+* `--all` — Stop every running agent worker
 * `--timeout-secs <TIMEOUT_SECS>` — Seconds to wait after SIGTERM before escalating to SIGKILL
 
   Default value: `5`
 
 
 
-## `aoe cockpit kill`
+## `aoe acp kill`
 
 SIGKILL a worker immediately (use when `stop` doesn't take)
 
-**Usage:** `aoe cockpit kill <SESSION>`
+**Usage:** `aoe acp kill <SESSION>`
 
 ###### **Arguments:**
 
@@ -1127,11 +1155,11 @@ SIGKILL a worker immediately (use when `stop` doesn't take)
 
 
 
-## `aoe cockpit logs`
+## `aoe acp logs`
 
-Tail the runner's log file for a cockpit session
+Tail the runner's log file for an agent session
 
-**Usage:** `aoe cockpit logs [OPTIONS]`
+**Usage:** `aoe acp logs [OPTIONS]`
 
 ###### **Options:**
 
@@ -1140,11 +1168,11 @@ Tail the runner's log file for a cockpit session
 
 
 
-## `aoe cockpit restart`
+## `aoe acp restart`
 
-Restart a wedged cockpit worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
 
-**Usage:** `aoe cockpit restart <SESSION>`
+**Usage:** `aoe acp restart <SESSION>`
 
 ###### **Arguments:**
 
@@ -1152,15 +1180,15 @@ Restart a wedged cockpit worker: stop the existing runner, then let the daemon's
 
 
 
-## `aoe cockpit history`
+## `aoe acp history`
 
-Print the persisted transcript for a cockpit session
+Print the persisted transcript for an agent session
 
-**Usage:** `aoe cockpit history [OPTIONS] <SESSION>`
+**Usage:** `aoe acp history [OPTIONS] <SESSION>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
 
 ###### **Options:**
 
@@ -1171,15 +1199,15 @@ Print the persisted transcript for a cockpit session
 
 
 
-## `aoe cockpit status`
+## `aoe acp status`
 
-Print live status for a cockpit session: highest/lowest seq, and whether the on-disk retention window has truncated history
+Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 
-**Usage:** `aoe cockpit status [OPTIONS] <SESSION>`
+**Usage:** `aoe acp status [OPTIONS] <SESSION>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
 
 ###### **Options:**
 
@@ -1187,28 +1215,28 @@ Print live status for a cockpit session: highest/lowest seq, and whether the on-
 
 
 
-## `aoe cockpit prompt`
+## `aoe acp prompt`
 
-Send a prompt to a cockpit session's agent
+Send a prompt to an agent session's agent
 
-**Usage:** `aoe cockpit prompt <SESSION> <TEXT>`
+**Usage:** `aoe acp prompt <SESSION> <TEXT>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
 * `<TEXT>` — Prompt text. Pass `-` to read from stdin
 
 
 
-## `aoe cockpit approve`
+## `aoe acp approve`
 
 Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
 
-**Usage:** `aoe cockpit approve [OPTIONS] <SESSION> <NONCE>`
+**Usage:** `aoe acp approve [OPTIONS] <SESSION> <NONCE>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
 * `<NONCE>` — Approval nonce, as printed in the pending-approval banner
 
 ###### **Options:**
@@ -1218,27 +1246,27 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 
 
-## `aoe cockpit cancel`
+## `aoe acp cancel`
 
-Cancel the in-flight prompt for a cockpit session
+Cancel the in-flight prompt for an agent session
 
-**Usage:** `aoe cockpit cancel <SESSION>`
-
-###### **Arguments:**
-
-* `<SESSION>` — Cockpit session id
-
-
-
-## `aoe cockpit tail`
-
-Stream the cockpit broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
-
-**Usage:** `aoe cockpit tail [OPTIONS] <SESSION>`
+**Usage:** `aoe acp cancel <SESSION>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
+
+
+
+## `aoe acp tail`
+
+Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
+
+**Usage:** `aoe acp tail [OPTIONS] <SESSION>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Acp session id
 
 ###### **Options:**
 
@@ -1248,27 +1276,27 @@ Stream the cockpit broadcast for a session to stdout as JSON lines (one frame pe
 
 
 
-## `aoe cockpit attach`
+## `aoe acp attach`
 
-Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
+Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
 
-**Usage:** `aoe cockpit attach <SESSION>`
-
-###### **Arguments:**
-
-* `<SESSION>` — Cockpit session id
-
-
-
-## `aoe cockpit switch-agent`
-
-Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
-
-**Usage:** `aoe cockpit switch-agent [OPTIONS] <SESSION> <TARGET>`
+**Usage:** `aoe acp attach <SESSION>`
 
 ###### **Arguments:**
 
-* `<SESSION>` — Cockpit session id
+* `<SESSION>` — Acp session id
+
+
+
+## `aoe acp switch-agent`
+
+Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+
+**Usage:** `aoe acp switch-agent [OPTIONS] <SESSION> <TARGET>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Acp session id
 * `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
 
 ###### **Options:**

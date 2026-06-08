@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  classifyMcp,
-  humanizeServer,
-  humanizeVerb,
-} from "./mcpClassify";
-import type { ToolCall } from "./cockpitTypes";
+import { classifyMcp, humanizeServer, humanizeVerb } from "./mcpClassify";
+import type { ToolCall } from "./acpTypes";
 
 function tool(name: string, args: Record<string, unknown> = {}): ToolCall {
   return {
@@ -36,7 +32,9 @@ describe("classifyMcp", () => {
   });
 
   it("handles servers with hyphens in their name", () => {
-    const r = classifyMcp(tool("mcp__db-toolbox-preprod__preprod_cluster_dbsize"));
+    const r = classifyMcp(
+      tool("mcp__db-toolbox-preprod__preprod_cluster_dbsize"),
+    );
     expect(r.isMcp).toBe(true);
     if (r.isMcp) {
       expect(r.server).toBe("db-toolbox-preprod");

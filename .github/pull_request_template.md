@@ -26,7 +26,7 @@ story" that deserves a regression test. Pick one option per surface; if you
 think a test isn't warranted, say why so reviewers can sanity-check.
 -->
 
-**Web dashboard / cockpit (Playwright user story)**
+**Web dashboard / structured view (Playwright user story)**
 - [ ] N/A: this PR doesn't change a user-facing dashboard flow
 - [ ] Added or updated a Playwright spec under `web/tests/` and updated `web/tests/coverage-matrix.json`
 - [ ] Skipped a test, because: <!-- explain (e.g. pure styling tweak, copy change) -->

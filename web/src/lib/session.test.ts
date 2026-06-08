@@ -41,7 +41,9 @@ describe("IDLE_DECAY_WINDOW_MS default", () => {
 
 describe("idleAgeMs", () => {
   it("returns null for non-Idle sessions", () => {
-    expect(idleAgeMs(session("Running", new Date(NOW - 1000).toISOString()))).toBeNull();
+    expect(
+      idleAgeMs(session("Running", new Date(NOW - 1000).toISOString())),
+    ).toBeNull();
   });
 
   it("returns null when idle_entered_at is missing", () => {

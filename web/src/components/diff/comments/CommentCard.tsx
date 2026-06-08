@@ -10,7 +10,7 @@ interface Props {
 }
 
 /** Saved-comment view. Body is rendered as markdown via the existing
- *  cockpit Markdown component. Switching to edit mode reuses
+ *  structured view Markdown component. Switching to edit mode reuses
  *  CommentForm. Stale comments show a `[stale]` chip; they remain
  *  editable so the user can rewrite or delete them. */
 export function CommentCard({ anchored, onSave, onDelete }: Props) {

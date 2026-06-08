@@ -1,40 +1,41 @@
 //! HTTP REST handlers for the web dashboard backend.
 //!
 //! Originally a single 2,151-line module; split into:
-//!   - `sessions` — session CRUD, ensure-* lifecycle endpoints, and rich diff
-//!   - `git`      — repo cloning and branch listing
-//!   - `system`   — agents, settings, themes, profiles, filesystem,
+//!   - `sessions`: session CRUD, ensure-* lifecycle endpoints, and rich diff
+//!   - `git`: repo cloning and branch listing
+//!   - `system`: agents, settings, themes, profiles, filesystem,
 //!     groups, docker, about, devices
-//!   - this file  — shared validation helpers + module declarations and
+//!   - this file: shared validation helpers + module declarations and
 //!     re-exports so external callers keep `api::*` paths.
 
 pub(super) use super::AppState;
 
 #[cfg(feature = "serve")]
-mod client_log;
+mod acp;
 #[cfg(feature = "serve")]
-mod cockpit;
+mod client_log;
 mod git;
 mod log_level;
+mod mcp;
 mod projects;
 mod sessions;
 mod system;
 mod telemetry;
 
 #[cfg(feature = "serve")]
-pub use cockpit::{
-    cockpit_attachment, cockpit_cancel, cockpit_context_primer, cockpit_disable, cockpit_enable,
-    cockpit_files, cockpit_force_end_turn, cockpit_prompt, cockpit_prompt_diff_comments,
-    cockpit_replay, cockpit_set_config_option, cockpit_set_mode, cockpit_worker_log,
-    list_cockpit_agents, resolve_approval, set_cockpit_master, shutdown_cockpit, spawn_cockpit,
-    switch_cockpit_agent,
+pub use acp::{
+    acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
+    acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
+    acp_set_mode, acp_worker_log, list_acp_agents, resolve_approval, shutdown_acp, spawn_acp,
+    switch_acp_agent,
 };
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
-pub use projects::{create_project, delete_project, list_projects};
+pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
+pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
     list_sessions, read_output, rename_session, send_message, session_diff_file,
@@ -45,12 +46,12 @@ pub use sessions::{
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
-    get_settings, get_settings_schema, get_update_status, list_agents, list_devices, list_groups,
-    list_profiles, list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
+    get_settings, get_settings_schema, get_update_status, list_agents, list_groups, list_profiles,
+    list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
     update_profile_settings, update_settings,
 };
 pub use telemetry::{
-    get_telemetry_status, post_telemetry_cockpit_interaction, post_telemetry_seen,
+    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
 
@@ -162,6 +163,11 @@ mod tests {
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
+            (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
                 &["patch_log_level"],
@@ -169,7 +175,7 @@ mod tests {
             (
                 "api/projects.rs",
                 include_str!("projects.rs"),
-                &["create_project", "delete_project"],
+                &["create_project", "delete_project", "update_project"],
             ),
             (
                 "api/system.rs",
@@ -185,21 +191,20 @@ mod tests {
                 ],
             ),
             (
-                "api/cockpit.rs",
-                include_str!("cockpit.rs"),
+                "api/acp.rs",
+                include_str!("acp.rs"),
                 &[
-                    "spawn_cockpit",
-                    "shutdown_cockpit",
-                    "cockpit_prompt",
-                    "cockpit_prompt_diff_comments",
-                    "cockpit_cancel",
-                    "cockpit_force_end_turn",
-                    "cockpit_enable",
-                    "cockpit_disable",
-                    "cockpit_set_mode",
-                    "cockpit_set_config_option",
+                    "spawn_acp",
+                    "shutdown_acp",
+                    "acp_prompt",
+                    "acp_prompt_diff_comments",
+                    "acp_cancel",
+                    "acp_force_end_turn",
+                    "acp_enable",
+                    "acp_disable",
+                    "acp_set_mode",
+                    "acp_set_config_option",
                     "resolve_approval",
-                    "set_cockpit_master",
                 ],
             ),
             (
@@ -213,7 +218,7 @@ mod tests {
                 &[
                     "set_telemetry_consent",
                     "post_telemetry_seen",
-                    "post_telemetry_cockpit_interaction",
+                    "post_telemetry_structured_interaction",
                 ],
             ),
         ];
@@ -221,7 +226,7 @@ mod tests {
         let guard_patterns: &[&str] = &[
             "state.read_only",
             "self.read_only",
-            // Cockpit handlers use the shared helper from api/cockpit.rs.
+            // Acp handlers use the shared helper from api/acp.rs.
             "read_only_block(",
         ];
         let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
@@ -305,6 +310,11 @@ mod tests {
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
+            (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
                 &["patch_log_level"],
@@ -312,7 +322,7 @@ mod tests {
             (
                 "api/projects.rs",
                 include_str!("projects.rs"),
-                &["create_project", "delete_project"],
+                &["create_project", "delete_project", "update_project"],
             ),
             (
                 "api/system.rs",
@@ -327,21 +337,20 @@ mod tests {
                 ],
             ),
             (
-                "api/cockpit.rs",
-                include_str!("cockpit.rs"),
+                "api/acp.rs",
+                include_str!("acp.rs"),
                 &[
-                    "spawn_cockpit",
-                    "shutdown_cockpit",
-                    "cockpit_prompt",
-                    "cockpit_prompt_diff_comments",
-                    "cockpit_cancel",
-                    "cockpit_force_end_turn",
-                    "cockpit_enable",
-                    "cockpit_disable",
-                    "cockpit_set_mode",
-                    "cockpit_set_config_option",
+                    "spawn_acp",
+                    "shutdown_acp",
+                    "acp_prompt",
+                    "acp_prompt_diff_comments",
+                    "acp_cancel",
+                    "acp_force_end_turn",
+                    "acp_enable",
+                    "acp_disable",
+                    "acp_set_mode",
+                    "acp_set_config_option",
                     "resolve_approval",
-                    "set_cockpit_master",
                 ],
             ),
             (
@@ -350,7 +359,7 @@ mod tests {
                 &[
                     "set_telemetry_consent",
                     "post_telemetry_seen",
-                    "post_telemetry_cockpit_interaction",
+                    "post_telemetry_structured_interaction",
                 ],
             ),
             (
@@ -444,7 +453,7 @@ mod tests {
         assert_eq!(
             SHELL_METACHARACTERS.len(),
             expected.len(),
-            "SHELL_METACHARACTERS size changed — every addition/removal must be \
+            "SHELL_METACHARACTERS size changed; every addition/removal must be \
              reviewed as a security change, not a refactor tidy-up"
         );
         for c in expected {

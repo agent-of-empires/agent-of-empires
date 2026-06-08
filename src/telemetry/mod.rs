@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use events::{
-    CliUsage, CockpitInteractionCounts, ProcessStart, Surface, UsageSnapshot, SCHEMA_VERSION,
+    CliUsage, ProcessStart, StructuredInteractionCounts, Surface, UsageSnapshot, SCHEMA_VERSION,
 };
 pub use form_factor::WebClientFormFactor;
 pub use state::{
@@ -232,7 +232,7 @@ struct InstanceMetrics {
     running: u32,
     idle: u32,
     error: u32,
-    cockpit: u32,
+    acp: u32,
     sandboxed: u32,
     yolo: u32,
     pinned: u32,
@@ -257,7 +257,7 @@ pub(crate) fn instance_buckets(inst: &Instance) -> (String, String) {
         inst.detect_as.as_str()
     };
     #[cfg(feature = "serve")]
-    let model = inst.cockpit_model.as_deref();
+    let model = inst.agent_model.as_deref();
     #[cfg(not(feature = "serve"))]
     let model: Option<&str> = None;
     (
@@ -274,7 +274,7 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
     // sum to `session_total`.
     let mut by_substrate: BTreeMap<String, u32> =
         SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect();
-    let (mut running, mut idle, mut error, mut cockpit, mut sandboxed, mut yolo) =
+    let (mut running, mut idle, mut error, mut acp, mut sandboxed, mut yolo) =
         (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
     let (mut pinned, mut snoozed, mut archived) = (0u32, 0u32, 0u32);
 
@@ -285,14 +285,14 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
             crate::session::Status::Error => error += 1,
             _ => {}
         }
-        // Cockpit fields only exist in `serve` builds; treat them as absent
+        // Acp fields only exist in `serve` builds; treat them as absent
         // otherwise so the aggregation stays surface-agnostic.
         #[cfg(feature = "serve")]
-        let is_cockpit = inst.cockpit_mode;
+        let is_structured = inst.is_structured();
         #[cfg(not(feature = "serve"))]
-        let is_cockpit = false;
-        if is_cockpit {
-            cockpit += 1;
+        let is_structured = false;
+        if is_structured {
+            acp += 1;
         }
         if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
             sandboxed += 1;
@@ -348,7 +348,7 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
         running,
         idle,
         error,
-        cockpit,
+        acp,
         sandboxed,
         yolo,
         pinned,
@@ -370,7 +370,7 @@ pub fn build_usage_snapshot(
     session_creates_since_last_snapshot: u32,
     auth_mode: Option<&str>,
     serve_mode: Option<&str>,
-    cockpit_counts: &CockpitInteractionCounts,
+    acp_counts: &StructuredInteractionCounts,
 ) -> Option<UsageSnapshot> {
     // Load the global, pre-profile-merge config exactly once and reuse it for
     // both the opt-in gate and `active_features`, instead of parsing
@@ -401,7 +401,7 @@ pub fn build_usage_snapshot(
         instances,
         usage_seen,
         session_creates_since_last_snapshot,
-        cockpit_counts,
+        acp_counts,
     );
     // Layer the serve-only deployment metadata on top of the pure snapshot, so
     // `assemble_usage_snapshot` stays focused on session/feature bucketing.
@@ -429,7 +429,7 @@ fn assemble_usage_snapshot(
     instances: &[Instance],
     usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
-    cockpit_counts: &CockpitInteractionCounts,
+    acp_counts: &StructuredInteractionCounts,
 ) -> UsageSnapshot {
     let features = features::active_features(config);
 
@@ -455,7 +455,7 @@ fn assemble_usage_snapshot(
         session_running: metrics.running,
         session_idle: metrics.idle,
         session_error: metrics.error,
-        session_cockpit: metrics.cockpit,
+        session_structured: metrics.acp,
         session_sandboxed: metrics.sandboxed,
         session_yolo: metrics.yolo,
         // Point-in-time default: equals the instant total. The serve loop
@@ -477,18 +477,18 @@ fn assemble_usage_snapshot(
         // empty and `build_serve_snapshot` fills them from the daemon's client
         // counters after assembly. Always empty for TUI/CLI (no web client).
         web_clients_seen: BTreeMap::new(),
-        cockpit_clients_seen: BTreeMap::new(),
+        structured_clients_seen: BTreeMap::new(),
         session_creates_since_last_snapshot,
         // Set by `build_usage_snapshot` for the serve surface; the pure
         // assembler leaves them unset.
         auth_mode: None,
         serve_mode: None,
-        approvals_resolved: cockpit_counts.approvals_resolved(),
-        approvals_by_decision: cockpit_counts.approvals_by_decision(),
-        agent_switches: cockpit_counts.agent_switches,
-        substrate_toggles: cockpit_counts.substrate_toggles,
-        plan_mode_seen: cockpit_counts.plan_mode_seen,
-        prompts_queued: cockpit_counts.prompts_queued,
+        approvals_resolved: acp_counts.approvals_resolved(),
+        approvals_by_decision: acp_counts.approvals_by_decision(),
+        agent_switches: acp_counts.agent_switches,
+        view_toggles: acp_counts.view_toggles,
+        plan_mode_seen: acp_counts.plan_mode_seen,
+        prompts_queued: acp_counts.prompts_queued,
     }
 }
 
@@ -778,7 +778,7 @@ mod tests {
             session_running: 1,
             session_idle: 6,
             session_error: 0,
-            session_cockpit: 0,
+            session_structured: 0,
             session_sandboxed: 2,
             session_yolo: 0,
             peak_concurrent_sessions: 7,
@@ -793,14 +793,14 @@ mod tests {
             features: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
-            cockpit_clients_seen: BTreeMap::new(),
+            structured_clients_seen: BTreeMap::new(),
             session_creates_since_last_snapshot: 0,
             auth_mode: None,
             serve_mode: None,
             approvals_resolved: 0,
             approvals_by_decision: BTreeMap::new(),
             agent_switches: 0,
-            substrate_toggles: 0,
+            view_toggles: 0,
             plan_mode_seen: false,
             prompts_queued: 0,
         }
@@ -879,7 +879,7 @@ mod tests {
                 0,
                 None,
                 None,
-                &CockpitInteractionCounts::default()
+                &StructuredInteractionCounts::default()
             )
             .is_none(),
             "opted-out install must not build a snapshot"
@@ -995,7 +995,7 @@ mod tests {
             std::slice::from_ref(&inst),
             usage_signals::zeroed(),
             3,
-            &CockpitInteractionCounts::default(),
+            &StructuredInteractionCounts::default(),
         );
 
         assert_eq!(snapshot.install_id, "test-install-id");

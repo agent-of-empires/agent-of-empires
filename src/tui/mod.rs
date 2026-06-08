@@ -3,8 +3,6 @@
 mod app;
 mod attached_status_hooks;
 pub(crate) mod clipboard;
-#[cfg(feature = "serve")]
-pub(crate) mod cockpit_view;
 mod components;
 mod creation_poller;
 mod deletion_poller;
@@ -17,6 +15,8 @@ pub(crate) mod responsive;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
+#[cfg(feature = "serve")]
+pub(crate) mod structured_view;
 pub(crate) mod styles;
 
 pub use app::*;
@@ -59,12 +59,12 @@ use crate::update::check_for_update;
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
-    // local home view for the remote cockpit picker so the user never
+    // local home view for the remote structured view picker so the user never
     // sees a session list that doesn't reflect the daemon they pointed
     // us at. Tmux check + migrations are intentionally skipped here:
     // the remote machine owns those, this side is a pure client.
     #[cfg(feature = "serve")]
-    if let Some(endpoint) = crate::cockpit::client::discovery::discover_env() {
+    if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
         let _ = startup_warning; // remote mode skips the local startup-warning channel
         let _ = profile;
         return remote_home::run_standalone(endpoint).await;

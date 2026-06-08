@@ -577,16 +577,16 @@ mod tests {
     fn test_build_docker_env_args_uses_passed_profile_not_global_default() {
         let temp_home = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Determine app dir layout (matches session::get_app_dir_path).
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
             .path()
             .join(".config")
-            .join(crate::session::APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
 
         let profiles_dir = app_dir.join("profiles");

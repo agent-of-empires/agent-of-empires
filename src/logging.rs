@@ -2,7 +2,7 @@
 //!
 //! Single source of truth for env-var resolution, default-filter
 //! construction, and the reloadable subscriber handle. Both the main
-//! daemon and cockpit runner subprocesses use this module so they
+//! daemon and structured view runner subprocesses use this module so they
 //! agree on what `AOE_LOG_LEVEL=debug` means.
 //!
 //! The process-global `FilterController` is exposed via free
@@ -27,7 +27,7 @@ use crate::session::config::{LoggingConfig, RotationKind};
 /// Which context the running process is in. Drives whether `[logging].output`
 /// is honored or coerced to `File`. Contexts where the stdout sink would
 /// corrupt the UI (TUI alt-screen) or get discarded (daemon child's
-/// detached stdio, cockpit runner) force the file sink.
+/// detached stdio, structured view runner) force the file sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessContext {
     Tui,
@@ -122,7 +122,7 @@ impl From<&LoggingConfig> for RotationPolicy {
 /// the same level.
 pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "agent_of_empires",
-    "cockpit",
+    "acp",
     "terminal",
     "auth",
     "process",
@@ -161,12 +161,12 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
 /// `http.request`, `cli.serve`, `tui.home`) work fine even when not
 /// listed; they just won't have a one-click row in the settings UI.
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
-    "cockpit.acp",
-    "cockpit.acp.stderr",
-    "cockpit.acp.tool_dispatch",
-    "cockpit.supervisor",
-    "cockpit.event_store",
-    "cockpit.runner",
+    "acp.protocol",
+    "acp.protocol.stderr",
+    "acp.protocol.tool_dispatch",
+    "acp.supervisor",
+    "acp.event_store",
+    "acp.runner",
     "terminal.ws",
     "terminal.ws.bytes",
     "auth.token",
@@ -191,7 +191,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
 ];
 
 /// Apply a persisted `LoggingConfig` to the running subscriber + persist
-/// runtime_filter so cockpit runners pick it up via the notify watcher.
+/// runtime_filter so structured view runners pick it up via the notify watcher.
 /// Both the TUI save path and the web `PATCH /api/settings` path call
 /// this after `save_config`, so settings changes take effect live
 /// without a daemon restart.
@@ -212,14 +212,19 @@ pub fn apply_persisted_config(
     };
     match set_filter(&filter) {
         Ok(swap) => {
-            tracing::info!(
-                target: "log.runtime",
-                previous = %swap.previous,
-                current = %swap.current,
-                source = "settings",
-                "filter swapped"
-            );
-            persist_runtime_filter(&swap.current, app_dir);
+            // Skip the log and the disk write on a no-op: persisting an
+            // unchanged directive needlessly re-fires every runner's watcher
+            // (#1894).
+            if swap.changed {
+                tracing::info!(
+                    target: "log.runtime",
+                    previous = %swap.previous,
+                    current = %swap.current,
+                    source = "settings",
+                    "filter swapped"
+                );
+                persist_runtime_filter(&swap.current, app_dir);
+            }
         }
         Err(LogFilterError::Unavailable) => {
             // No reload handle installed (e.g. TUI process). Still persist
@@ -424,14 +429,30 @@ impl FilterController {
     }
 
     fn swap(&self, filter: EnvFilter, directive: String) -> Result<SwapResult, LogFilterError> {
-        let previous = self.current();
+        // Hold the `current` lock across the compare and the modify so two
+        // concurrent swaps cannot interleave and both observe `changed`.
+        let mut current = self.current.lock().unwrap();
+        let previous = current.clone();
+        // No-op: the active directive already equals the requested one.
+        // Skip the reload-handle modify entirely and report `changed=false`
+        // so callers stay silent. A no-op swap that logged at INFO is what
+        // fed the file-watch OOM loop in #1894: the log line landed in the
+        // watched dir and re-triggered the watcher.
+        if previous == directive {
+            return Ok(SwapResult {
+                previous,
+                current: directive,
+                changed: false,
+            });
+        }
         self.inner
             .modify(|f| *f = filter)
             .map_err(|e| LogFilterError::Invalid(e.to_string()))?;
-        *self.current.lock().unwrap() = directive.clone();
+        *current = directive.clone();
         Ok(SwapResult {
             previous,
             current: directive,
+            changed: true,
         })
     }
 }
@@ -440,6 +461,10 @@ impl FilterController {
 pub struct SwapResult {
     pub previous: String,
     pub current: String,
+    /// `false` when the requested directive already matched the active one,
+    /// so the swap was a no-op. Callers gate logging and persistence on this
+    /// to avoid the self-sustaining file-watch loop (#1894).
+    pub changed: bool,
 }
 
 #[derive(Debug)]
@@ -464,8 +489,18 @@ impl std::fmt::Display for LogFilterError {
 
 impl std::error::Error for LogFilterError {}
 
+/// Optional top-of-stack layer injected at subscriber init. Only the
+/// serve daemon supplies a real one (the per-session tee, see
+/// `crate::acp::session_tee`); the acp module is `serve`-gated, so without
+/// that feature the slot is the no-op `Identity` layer and callers always
+/// pass `None`.
+#[cfg(feature = "serve")]
+pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
+#[cfg(not(feature = "serve"))]
+pub type TeeLayer = tracing_subscriber::layer::Identity;
+
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
-    init_subscriber_with_options(target, filter, false)
+    init_subscriber_with_options(target, filter, false, None)
 }
 
 /// Event formatter that mirrors the default Full output (RFC3339-ish
@@ -509,6 +544,7 @@ pub fn init_subscriber_with_options(
     target: SubscriberTarget,
     filter: String,
     show_spans: bool,
+    session_tee: Option<TeeLayer>,
 ) -> InitResult {
     let parsed = match EnvFilter::builder().with_regex(false).parse(&filter) {
         Ok(f) => f,
@@ -546,6 +582,7 @@ pub fn init_subscriber_with_options(
                     Registry::default()
                         .with(reload_layer)
                         .with(fmt_layer)
+                        .with(session_tee)
                         .try_init()
                         .map_err(|e| e.to_string())
                 } else {
@@ -556,6 +593,7 @@ pub fn init_subscriber_with_options(
                     Registry::default()
                         .with(reload_layer)
                         .with(fmt_layer)
+                        .with(session_tee)
                         .try_init()
                         .map_err(|e| e.to_string())
                 }
@@ -571,6 +609,7 @@ pub fn init_subscriber_with_options(
                 Registry::default()
                     .with(reload_layer)
                     .with(fmt_layer)
+                    .with(session_tee)
                     .try_init()
                     .map_err(|e| e.to_string())
             } else {
@@ -580,6 +619,7 @@ pub fn init_subscriber_with_options(
                 Registry::default()
                     .with(reload_layer)
                     .with(fmt_layer)
+                    .with(session_tee)
                     .try_init()
                     .map_err(|e| e.to_string())
             }
@@ -884,7 +924,7 @@ pub fn set_level(level: LogLevel) -> Result<SwapResult, LogFilterError> {
 }
 
 /// Path of the shared runtime-filter file inside `app_dir`. Daemon writes
-/// here on every successful swap; cockpit runner subprocesses watch it
+/// here on every successful swap; structured view runner subprocesses watch it
 /// with `notify` and apply the same filter to their own subscribers.
 pub fn runtime_filter_path(app_dir: &std::path::Path) -> std::path::PathBuf {
     app_dir.join("runtime_filter")
@@ -915,7 +955,7 @@ pub fn persist_runtime_filter(directive: &str, app_dir: &std::path::Path) {
 }
 
 /// Background task: watch `<app_dir>/runtime_filter` and apply changes
-/// to this process's `FilterController`. Used by the cockpit runner so
+/// to this process's `FilterController`. Used by the structured view runner so
 /// the daemon's `aoe log-level` propagates to runners without restart.
 ///
 /// Subscribes via the shared [`crate::file_watch::FileWatchService`] (one
@@ -974,13 +1014,16 @@ fn apply_filter_file(path: &std::path::Path) {
         return;
     }
     match set_filter(directive) {
-        Ok(swap) => tracing::info!(
+        // No-op swaps stay silent: logging here would write into the watched
+        // dir and re-trigger the watcher (#1894).
+        Ok(swap) if swap.changed => tracing::info!(
             target: "log.runtime",
             previous = %swap.previous,
             current = %swap.current,
             source = "file-watch",
             "runner filter swapped"
         ),
+        Ok(_) => {}
         Err(e) => tracing::warn!(
             target: "log.runtime",
             error = %e,
@@ -1004,6 +1047,44 @@ mod tests {
         assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
         assert_eq!(LogLevel::parse("trace "), Some(LogLevel::Trace));
         assert_eq!(LogLevel::parse("bogus"), None);
+    }
+
+    /// Build a `FilterController` backed by a reload handle, installed as
+    /// the thread-local default subscriber so the reload handle's `modify`
+    /// can upgrade its weak reference. The returned guard must outlive the
+    /// controller; the default is thread-scoped, so it does not collide
+    /// with the process-global subscriber other tests install.
+    fn test_controller(initial: &str) -> (FilterController, tracing::subscriber::DefaultGuard) {
+        let filter = EnvFilter::builder()
+            .with_regex(false)
+            .parse(initial)
+            .expect("valid initial filter");
+        let (layer, handle) = reload::Layer::new(filter);
+        let guard = tracing::subscriber::set_default(Registry::default().with(layer));
+        let controller = FilterController {
+            inner: handle,
+            current: Mutex::new(initial.to_string()),
+        };
+        (controller, guard)
+    }
+
+    #[test]
+    fn swap_reports_changed_then_noop() {
+        let (c, _guard) = test_controller("agent_of_empires=info");
+        let first = c.set_filter("agent_of_empires=debug").expect("swap ok");
+        assert!(
+            first.changed,
+            "first swap to a new directive must report changed"
+        );
+        assert_eq!(first.previous, "agent_of_empires=info");
+        assert_eq!(first.current, "agent_of_empires=debug");
+
+        // Re-applying the identical directive (the #1894 file-watch case)
+        // must be a silent no-op so callers do not log or persist.
+        let second = c.set_filter("agent_of_empires=debug").expect("swap ok");
+        assert!(!second.changed, "identical re-apply must report no-op");
+        assert_eq!(second.previous, second.current);
+        assert_eq!(c.current(), "agent_of_empires=debug");
     }
 
     #[test]
@@ -1121,8 +1202,8 @@ mod tests {
     #[test]
     fn controller_accepts_targeted_filter() {
         with_test_controller("info", |c| {
-            c.set_filter("cockpit.acp=trace,info").unwrap();
-            assert_eq!(c.current(), "cockpit.acp=trace,info");
+            c.set_filter("acp.protocol=trace,info").unwrap();
+            assert_eq!(c.current(), "acp.protocol=trace,info");
         });
     }
 
@@ -1141,7 +1222,7 @@ mod tests {
         with_test_controller("info", |c| {
             // Unknown level name; EnvFilter rejects.
             assert!(matches!(
-                c.set_filter("cockpit=notalevel").unwrap_err(),
+                c.set_filter("acp=notalevel").unwrap_err(),
                 LogFilterError::Invalid(_)
             ));
         });

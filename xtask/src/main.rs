@@ -31,6 +31,10 @@ struct DevArgs {
     /// Port for the Vite dev server
     #[arg(long, default_value_t = 5173)]
     web_port: u16,
+    /// Watch `src/**`, `Cargo.toml`, and `Cargo.lock`; on change rebuild and
+    /// restart `aoe serve` (Vite stays up). Unix-only, same as the base command.
+    #[arg(long)]
+    watch: bool,
 }
 
 fn main() {
@@ -48,15 +52,94 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
+/// Build the serve-enabled debug binary. Returns whether the build succeeded so
+/// the watch loop can keep the old backend running on a failed rebuild.
+#[cfg(unix)]
+fn build_serve() -> bool {
+    use std::process::Command;
+    eprintln!("[xtask dev] building aoe (--features serve)...");
+    Command::new("cargo")
+        .args(["build", "--features", "serve"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or_else(|e| {
+            eprintln!("[xtask dev] failed to run cargo build: {e}");
+            false
+        })
+}
+
+#[cfg(unix)]
+fn child_exited(child: &mut std::process::Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)))
+}
+
+/// SIGTERM a child's process group, wait out a grace period, then SIGKILL the
+/// group if it is still alive. Reaps the child either way.
+#[cfg(unix)]
+fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use std::time::{Duration, Instant};
+    if child_exited(child) {
+        let _ = child.wait();
+        return;
+    }
+    let pid = Pid::from_raw(child.id() as i32);
+    let _ = killpg(pid, Signal::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child_exited(child) {
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = killpg(pid, Signal::SIGKILL);
+    let _ = child.wait();
+}
+
+/// Wait until the backend port is bindable again before respawning, so a restart
+/// does not race the old listener and fail with "address already in use".
+#[cfg(unix)]
+fn wait_for_port(port: u16, timeout: std::time::Duration) {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("[xtask dev] port {port} still busy after waiting; respawning anyway");
+}
+
+/// Whether a changed path should trigger a backend rebuild: any `.rs` file, or
+/// the root `Cargo.toml` / `Cargo.lock`. The watch scope (src/ recursively plus
+/// the project root non-recursively) already excludes target/ and node_modules,
+/// so a plain extension and file-name check is enough.
+#[cfg(unix)]
+fn is_watch_relevant(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        return true;
+    }
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("Cargo.toml") | Some("Cargo.lock")
+    )
+}
+
 /// Build the serve-enabled binary, then run it alongside the Vite dev server.
 /// Vite proxies `/api` and the `/sessions/*/ws` relays to the backend via the
 /// `VITE_PROXY` env var it already honors. Each child runs in its own process
 /// group so a single Ctrl-C tears the whole tree down (npm spawns vite, vite
 /// may spawn esbuild) with no orphans.
+///
+/// With `--watch`, edits under `src/**` (plus `Cargo.toml` / `Cargo.lock`)
+/// rebuild the backend and restart `aoe serve`; the Vite child is left running
+/// so frontend HMR and the browser session survive the backend bounce.
 #[cfg(unix)]
 fn run_dev(args: DevArgs) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,13 +148,8 @@ fn run_dev(args: DevArgs) {
 
     // Build up front so build output doesn't interleave with Vite's startup
     // and a broken build fails fast before either server comes up.
-    eprintln!("[xtask dev] building aoe (--features serve)...");
-    let built = Command::new("cargo")
-        .args(["build", "--features", "serve"])
-        .status()
-        .expect("failed to run cargo build");
-    if !built.success() {
-        std::process::exit(built.code().unwrap_or(1));
+    if !build_serve() {
+        std::process::exit(1);
     }
 
     // Honor CARGO_TARGET_DIR; cargo wrote the debug binary under it.
@@ -90,12 +168,19 @@ fn run_dev(args: DevArgs) {
     // shortcuts when stdin is a TTY) would raise SIGTTOU and suspend the
     // child. Shutdown is driven by signals here, not per-server keystrokes,
     // so neither child needs the terminal.
-    let mut serve = Command::new(&bin)
-        .args(["serve", "--no-auth", "--port", &args.serve_port.to_string()])
-        .stdin(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .expect("failed to spawn `aoe serve`");
+    let serve_port = args.serve_port;
+    let spawn_serve = || -> Child {
+        Command::new(&bin)
+            .args(["serve", "--no-auth", "--port", &serve_port.to_string()])
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn `aoe serve`")
+    };
+
+    // Tracked as an Option so a backend that exits under --watch can be marked
+    // dead and respawned on the next rebuild without tearing down Vite.
+    let mut serve: Option<Child> = Some(spawn_serve());
 
     let mut vite = match Command::new("npm")
         .args([
@@ -120,55 +205,115 @@ fn run_dev(args: DevArgs) {
             // serve is already up; tear its group down before bailing so we
             // don't orphan a backend on the serve port.
             eprintln!("[xtask dev] failed to spawn `npm run dev`: {e}");
-            let _ = killpg(Pid::from_raw(serve.id() as i32), Signal::SIGTERM);
-            let _ = serve.wait();
+            if let Some(mut serve) = serve.take() {
+                terminate_group(&mut serve, Duration::from_secs(2));
+            }
             std::process::exit(1);
         }
     };
 
     eprintln!(
-        "[xtask dev] aoe serve on :{} | open http://localhost:{}",
-        args.serve_port, args.web_port
+        "[xtask dev] aoe serve on :{} | open http://localhost:{}{}",
+        args.serve_port,
+        args.web_port,
+        if args.watch {
+            " | watching src for changes"
+        } else {
+            ""
+        }
     );
 
-    let exited = |child: &mut Child| matches!(child.try_wait(), Ok(Some(_)));
+    // Watch src/** plus the root Cargo.toml/Cargo.lock when --watch is set. The
+    // watcher must stay bound for the loop's lifetime; dropping it ends delivery.
+    let (watch_tx, watch_rx) = std::sync::mpsc::channel::<()>();
+    let _watcher = if args.watch {
+        use notify::{RecursiveMode, Watcher};
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if event.paths.iter().any(|p| is_watch_relevant(p)) {
+                    let _ = watch_tx.send(());
+                }
+            }
+        })
+        .expect("failed to create file watcher");
+        // src/ recursively for .rs edits; the project root non-recursively so an
+        // editor's atomic-save rename-replace of Cargo.toml/Cargo.lock is caught
+        // (a direct file watch would detach when the inode is swapped).
+        watcher
+            .watch(Path::new("src"), RecursiveMode::Recursive)
+            .expect("failed to watch src/");
+        watcher
+            .watch(Path::new("."), RecursiveMode::NonRecursive)
+            .expect("failed to watch project root");
+        Some(watcher)
+    } else {
+        drop(watch_tx);
+        None
+    };
 
-    // Supervise: stop when Ctrl-C arrives or either child dies on its own.
+    // Trailing debounce: the first change arms a deadline; rapid follow-up saves
+    // (rustfmt, editor temp-file dances) collapse into a single rebuild.
+    let debounce = Duration::from_millis(300);
+    let mut rebuild_at: Option<Instant> = None;
+
+    // Supervise: stop on Ctrl-C, on Vite exiting, or (without --watch) on the
+    // backend exiting. Under --watch, rebuild and restart the backend on change.
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        if exited(&mut serve) {
-            eprintln!("[xtask dev] `aoe serve` exited; stopping vite");
-            break;
-        }
-        if exited(&mut vite) {
+        if child_exited(&mut vite) {
             eprintln!("[xtask dev] vite exited; stopping `aoe serve`");
             break;
         }
+        if let Some(child) = serve.as_mut() {
+            if child_exited(child) {
+                if args.watch {
+                    eprintln!("[xtask dev] `aoe serve` exited; waiting for a change to rebuild");
+                    let _ = child.wait();
+                    serve = None;
+                } else {
+                    eprintln!("[xtask dev] `aoe serve` exited; stopping vite");
+                    break;
+                }
+            }
+        }
+
+        if args.watch {
+            let mut saw_change = false;
+            while watch_rx.try_recv().is_ok() {
+                saw_change = true;
+            }
+            if saw_change {
+                rebuild_at = Some(Instant::now() + debounce);
+            }
+            if let Some(at) = rebuild_at {
+                if Instant::now() >= at {
+                    rebuild_at = None;
+                    eprintln!("[xtask dev] change detected; rebuilding aoe...");
+                    if build_serve() {
+                        if let Some(mut old) = serve.take() {
+                            terminate_group(&mut old, Duration::from_secs(2));
+                        }
+                        wait_for_port(serve_port, Duration::from_secs(5));
+                        serve = Some(spawn_serve());
+                        eprintln!("[xtask dev] aoe serve restarted on :{serve_port}");
+                    } else {
+                        eprintln!("[xtask dev] build failed; keeping the running backend");
+                    }
+                }
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Signal each process group: SIGTERM, brief grace, then SIGKILL so the
+    // Signal each live process group: SIGTERM, brief grace, then SIGKILL so the
     // ports are always freed even if a child ignores the term.
-    let groups = [serve.id() as i32, vite.id() as i32];
-    for pid in groups {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGTERM);
+    terminate_group(&mut vite, Duration::from_secs(2));
+    if let Some(mut child) = serve.take() {
+        terminate_group(&mut child, Duration::from_secs(2));
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if exited(&mut serve) && exited(&mut vite) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if !(exited(&mut serve) && exited(&mut vite)) {
-        for pid in groups {
-            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-        }
-    }
-    let _ = serve.wait();
-    let _ = vite.wait();
 }
 
 fn generate_cli_docs() {
@@ -367,4 +512,35 @@ fn check_skill_file(
 
     referenced.extend(skill_commands);
     has_error
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::is_watch_relevant;
+    use std::path::Path;
+
+    #[test]
+    fn rust_sources_are_relevant() {
+        assert!(is_watch_relevant(Path::new("src/main.rs")));
+        assert!(is_watch_relevant(Path::new("src/server/mod.rs")));
+        assert!(is_watch_relevant(Path::new(
+            "/abs/agent-of-empires/src/tui/app.rs"
+        )));
+    }
+
+    #[test]
+    fn cargo_manifests_are_relevant() {
+        assert!(is_watch_relevant(Path::new("Cargo.toml")));
+        assert!(is_watch_relevant(Path::new("./Cargo.lock")));
+        assert!(is_watch_relevant(Path::new("/abs/repo/Cargo.toml")));
+    }
+
+    #[test]
+    fn unrelated_paths_are_ignored() {
+        assert!(!is_watch_relevant(Path::new("README.md")));
+        assert!(!is_watch_relevant(Path::new("target/debug/aoe")));
+        assert!(!is_watch_relevant(Path::new(".git/index")));
+        assert!(!is_watch_relevant(Path::new("Cargo.toml.swp")));
+        assert!(!is_watch_relevant(Path::new("web/src/App.tsx")));
+    }
 }

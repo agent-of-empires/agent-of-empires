@@ -1,12 +1,10 @@
 // Live-backend spec: right panel's diff viewer rendering a 1000-line
 // file and a binary file (#1221).
 //
-// The diff viewer is non-virtualized: every row maps to a DOM node, so
-// a 1000-line modification produces ~1000 elements. Playwright's
-// auto-scroll resolves visibility, which lets us assert mid-file rows
-// without a hand-rolled scroll script. The binary-file path renders the
-// "Binary file changed" placeholder instead of hunks; see
-// `web/src/components/diff/DiffFileViewer.tsx:439`.
+// The diff viewer virtualizes via @pierre/diffs: off-screen rows are not in
+// the DOM until scrolled near, so we assert a deep row is absent on first
+// paint and present after scrolling the viewer to the bottom. The binary-file
+// path renders the "Binary file changed" placeholder instead of a diff.
 
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -72,7 +70,9 @@ base(
       // Two files surface: big.txt (modified) and image.png (added).
       // The dashboard renders both a desktop and a mobile right panel
       // (one hidden via CSS); first() picks the desktop copy.
-      await expect(page.getByText("2 files", { exact: true }).first()).toBeVisible({
+      await expect(
+        page.getByText("2 files", { exact: true }).first(),
+      ).toBeVisible({
         timeout: 15_000,
       });
 
@@ -85,14 +85,28 @@ base(
       await expect(page.getByText("big.txt").first()).toBeVisible({
         timeout: 10_000,
       });
+      // The renderer mounts.
+      await expect(page.locator("diffs-container").first()).toBeVisible({
+        timeout: 10_000,
+      });
 
-      // Mid-file row: every replaced line emits an "edit N: lorem ..."
-      // line. Use a unique line number near the end of the file so
-      // Playwright must scroll the diff viewer to bring it into view.
-      // `edit 950:` is unambiguous and well past the initial viewport.
-      const midRow = page.getByText("edit 950:", { exact: false }).first();
-      await midRow.scrollIntoViewIfNeeded({ timeout: 10_000 });
-      await expect(midRow).toBeVisible();
+      // Virtualization: a row near the end of this 1000-line replacement
+      // ("edit 999: lorem ...") is not in the DOM on first paint.
+      await expect(page.getByText("edit 999:", { exact: false })).toHaveCount(
+        0,
+      );
+
+      // Scroll the diff viewer to the bottom; the virtualizer mounts rows as
+      // they approach the viewport.
+      await page.evaluate(() => {
+        const host = document.querySelector("diffs-container");
+        let el = host?.parentElement as HTMLElement | null;
+        while (el && el.scrollHeight <= el.clientHeight) el = el.parentElement;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+      await expect(
+        page.getByText("edit 999:", { exact: false }).first(),
+      ).toBeVisible({ timeout: 15_000 });
 
       // Switch to the binary file. Click via the row text.
       await page

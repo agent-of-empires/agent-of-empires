@@ -98,50 +98,180 @@ describe("matchShortcut behavior (no binding changed by the refactor)", () => {
     isInput?: boolean;
     expected: ShortcutDef["id"] | null;
   }> = [
-    { name: "mac Meta+K -> palette", event: ev({ key: "k", metaKey: true }), mac: true, expected: "palette" },
-    { name: "mac Ctrl+K -> no match", event: ev({ key: "k", ctrlKey: true }), mac: true, expected: null },
-    { name: "other Ctrl+K -> palette", event: ev({ key: "k", ctrlKey: true }), mac: false, expected: "palette" },
-    { name: "other Meta+K -> palette", event: ev({ key: "k", metaKey: true }), mac: false, expected: "palette" },
-    { name: "palette fires inside an input", event: ev({ key: "k", metaKey: true }), mac: true, isInput: true, expected: "palette" },
-    { name: "Meta+Backquote -> terminalFocus", event: ev({ key: "`", code: "Backquote", metaKey: true }), mac: true, expected: "terminalFocus" },
-    { name: "Meta+Alt+B (KeyB) -> rightPanel", event: ev({ key: "b", code: "KeyB", metaKey: true, altKey: true }), mac: true, expected: "rightPanel" },
-    { name: "Meta+B (KeyB) -> sidebar", event: ev({ key: "b", code: "KeyB", metaKey: true }), mac: true, expected: "sidebar" },
-    { name: "Mac Option+B (key '∫', code KeyB) still -> rightPanel", event: ev({ key: "∫", code: "KeyB", metaKey: true, altKey: true }), mac: true, expected: "rightPanel" },
-    { name: "Meta+Shift+N -> newScratch", event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }), mac: true, expected: "newScratch" },
-    { name: "newScratch fires inside an input", event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }), mac: true, isInput: true, expected: "newScratch" },
-    { name: "Escape -> escape (no modifiers)", event: ev({ key: "Escape" }), mac: true, expected: "escape" },
-    { name: "Escape fires inside an input", event: ev({ key: "Escape" }), mac: true, isInput: true, expected: "escape" },
-    { name: "Escape fires even with a modifier", event: ev({ key: "Escape", metaKey: true }), mac: true, expected: "escape" },
+    {
+      name: "mac Meta+K -> palette",
+      event: ev({ key: "k", metaKey: true }),
+      mac: true,
+      expected: "palette",
+    },
+    {
+      name: "mac Ctrl+K -> no match",
+      event: ev({ key: "k", ctrlKey: true }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "other Ctrl+K -> palette",
+      event: ev({ key: "k", ctrlKey: true }),
+      mac: false,
+      expected: "palette",
+    },
+    {
+      name: "other Meta+K -> palette",
+      event: ev({ key: "k", metaKey: true }),
+      mac: false,
+      expected: "palette",
+    },
+    {
+      name: "palette fires inside an input",
+      event: ev({ key: "k", metaKey: true }),
+      mac: true,
+      isInput: true,
+      expected: "palette",
+    },
+    {
+      name: "Meta+Backquote -> terminalFocus",
+      event: ev({ key: "`", code: "Backquote", metaKey: true }),
+      mac: true,
+      expected: "terminalFocus",
+    },
+    {
+      name: "Meta+Alt+B (KeyB) -> rightPanel",
+      event: ev({ key: "b", code: "KeyB", metaKey: true, altKey: true }),
+      mac: true,
+      expected: "rightPanel",
+    },
+    {
+      name: "Meta+B (KeyB) -> sidebar",
+      event: ev({ key: "b", code: "KeyB", metaKey: true }),
+      mac: true,
+      expected: "sidebar",
+    },
+    {
+      name: "Mac Option+B (key '∫', code KeyB) still -> rightPanel",
+      event: ev({ key: "∫", code: "KeyB", metaKey: true, altKey: true }),
+      mac: true,
+      expected: "rightPanel",
+    },
+    {
+      name: "Meta+Shift+N -> newScratch",
+      event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }),
+      mac: true,
+      expected: "newScratch",
+    },
+    {
+      name: "newScratch fires inside an input",
+      event: ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true }),
+      mac: true,
+      isInput: true,
+      expected: "newScratch",
+    },
+    {
+      name: "Escape -> escape (no modifiers)",
+      event: ev({ key: "Escape" }),
+      mac: true,
+      expected: "escape",
+    },
+    {
+      name: "Escape fires inside an input",
+      event: ev({ key: "Escape" }),
+      mac: true,
+      isInput: true,
+      expected: "escape",
+    },
+    {
+      name: "Escape fires even with a modifier",
+      event: ev({ key: "Escape", metaKey: true }),
+      mac: true,
+      expected: "escape",
+    },
     { name: "n -> new", event: ev({ key: "n" }), mac: true, expected: "new" },
-    { name: "N (no mod) -> no match (case sensitive)", event: ev({ key: "N" }), mac: true, expected: null },
+    {
+      name: "N (no mod) -> no match (case sensitive)",
+      event: ev({ key: "N" }),
+      mac: true,
+      expected: null,
+    },
     { name: "D -> diff", event: ev({ key: "D" }), mac: true, expected: "diff" },
-    { name: "d -> no match (case sensitive)", event: ev({ key: "d" }), mac: true, expected: null },
-    { name: "s -> settings", event: ev({ key: "s" }), mac: true, expected: "settings" },
-    { name: "S -> no match (case sensitive)", event: ev({ key: "S" }), mac: true, expected: null },
+    {
+      name: "d -> no match (case sensitive)",
+      event: ev({ key: "d" }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "s -> settings",
+      event: ev({ key: "s" }),
+      mac: true,
+      expected: "settings",
+    },
+    {
+      name: "S -> no match (case sensitive)",
+      event: ev({ key: "S" }),
+      mac: true,
+      expected: null,
+    },
     { name: "? -> help", event: ev({ key: "?" }), mac: true, expected: "help" },
-    { name: "single-key blocked inside an input", event: ev({ key: "n" }), mac: true, isInput: true, expected: null },
-    { name: "single-key blocked when Ctrl held", event: ev({ key: "n", ctrlKey: true }), mac: true, expected: null },
-    { name: "single-key blocked when Alt held", event: ev({ key: "n", altKey: true }), mac: true, expected: null },
+    {
+      name: "single-key blocked inside an input",
+      event: ev({ key: "n" }),
+      mac: true,
+      isInput: true,
+      expected: null,
+    },
+    {
+      name: "single-key blocked when Ctrl held",
+      event: ev({ key: "n", ctrlKey: true }),
+      mac: true,
+      expected: null,
+    },
+    {
+      name: "single-key blocked when Alt held",
+      event: ev({ key: "n", altKey: true }),
+      mac: true,
+      expected: null,
+    },
   ];
 
   for (const c of cases) {
     it(c.name, () => {
-      const matched = matchShortcut(c.event, { mac: c.mac, isInput: c.isInput ?? false });
+      const matched = matchShortcut(c.event, {
+        mac: c.mac,
+        isInput: c.isInput ?? false,
+      });
       expect(matched?.shortcut.id ?? null).toBe(c.expected);
     });
   }
 
   it("propagates the per-shortcut preventDefault / stopPropagation flags", () => {
-    const palette = matchShortcut(ev({ key: "k", metaKey: true }), { mac: true, isInput: false });
-    expect(palette).toMatchObject({ preventDefault: true, stopPropagation: true });
+    const palette = matchShortcut(ev({ key: "k", metaKey: true }), {
+      mac: true,
+      isInput: false,
+    });
+    expect(palette).toMatchObject({
+      preventDefault: true,
+      stopPropagation: true,
+    });
 
     // terminalFocus deliberately does not stopPropagation.
-    const term = matchShortcut(ev({ key: "`", code: "Backquote", metaKey: true }), { mac: true, isInput: false });
-    expect(term).toMatchObject({ preventDefault: true, stopPropagation: false });
+    const term = matchShortcut(
+      ev({ key: "`", code: "Backquote", metaKey: true }),
+      { mac: true, isInput: false },
+    );
+    expect(term).toMatchObject({
+      preventDefault: true,
+      stopPropagation: false,
+    });
 
     // escape neither prevents nor stops.
-    const esc = matchShortcut(ev({ key: "Escape" }), { mac: true, isInput: false });
-    expect(esc).toMatchObject({ preventDefault: false, stopPropagation: false });
+    const esc = matchShortcut(ev({ key: "Escape" }), {
+      mac: true,
+      isInput: false,
+    });
+    expect(esc).toMatchObject({
+      preventDefault: false,
+      stopPropagation: false,
+    });
   });
 });
 
@@ -149,7 +279,10 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
   // Build the event that should fire each shortcut, then assert exactly one
   // shortcut in the whole registry matches it. If a future binding overlaps an
   // existing one, this turns red regardless of array order.
-  function triggeringEvent(s: ShortcutDef): { event: ShortcutKeyEvent; isInput: boolean } {
+  function triggeringEvent(s: ShortcutDef): {
+    event: ShortcutKeyEvent;
+    isInput: boolean;
+  } {
     const t = s.trigger;
     const e = ev({});
     if (t.scope === "global") {
@@ -158,7 +291,10 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
       if (t.alt) e.altKey = true;
       if (t.code) {
         e.code = t.code;
-        e.key = t.code === "Backquote" ? "`" : t.code.replace(/^Key/, "").toLowerCase();
+        e.key =
+          t.code === "Backquote"
+            ? "`"
+            : t.code.replace(/^Key/, "").toLowerCase();
       }
       if (t.key) e.key = t.key;
     } else {
@@ -167,7 +303,10 @@ describe("array order is cosmetic (predicates are mutually exclusive)", () => {
     return { event: e, isInput: false };
   }
 
-  function allMatchingIds(event: ShortcutKeyEvent, opts: { mac: boolean; isInput: boolean }): string[] {
+  function allMatchingIds(
+    event: ShortcutKeyEvent,
+    opts: { mac: boolean; isInput: boolean },
+  ): string[] {
     const mod = opts.mac ? event.metaKey : event.metaKey || event.ctrlKey;
     const hasMetaCtrlAlt = event.metaKey || event.ctrlKey || event.altKey;
     const ids: string[] = [];
@@ -208,7 +347,10 @@ describe("tour drift guard", () => {
   it("every tour shortcut hint id resolves to a registered shortcut", () => {
     for (const step of TOUR_STEPS) {
       for (const hint of step.shortcutHints ?? []) {
-        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}" is not registered`).toBeDefined();
+        expect(
+          SHORTCUTS_BY_ID[hint.id],
+          `step "${step.id}" hint "${hint.id}" is not registered`,
+        ).toBeDefined();
       }
     }
   });

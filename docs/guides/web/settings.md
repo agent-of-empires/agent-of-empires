@@ -13,16 +13,19 @@ For running the server, see the [Web Dashboard overview](../web-dashboard.md).
 Settings are organized into the same groups as the TUI:
 
 - **Appearance**: Theme.
-- **Sessions**: Session defaults and Cockpit (the cockpit master
-  switch plus the replay and watchdog tuning knobs; see
-  [Cockpit Setup](../../cockpit/setup.md)).
+- **Sessions**: Session defaults and Structured view (the replay and watchdog
+  tuning knobs; see [Structured View Internals](../../development/internals/structured-view.md#global-tuning-acp)).
 - **Environment**: Sandbox, Worktree, and Tmux.
 - **Notifications**: Sound and Notifications (web push; see
   [Push notifications](../../push-notifications.md)).
 - **Web Dashboard**: Terminal, Security, and Connected Devices.
 - **System**: Updates and Logging.
 
-Every field that exists in the TUI settings is editable here too.
+Every config field that exists in the TUI settings is editable here too: the
+panel is generated from the same settings schema as the TUI, so a field
+declared once appears on both surfaces and they never drift. The only host-side
+knob the dashboard does not surface is the host environment list, which stays
+TUI/`config.toml`-only.
 
 ## Profiles
 
@@ -36,25 +39,28 @@ below).
 ## Connected devices
 
 Under **Web Dashboard > Connected Devices**, the dashboard lists every
-device that has authenticated, with a browser and OS label parsed from
-the user agent and a relative "last seen" time. The list polls every
-ten seconds and refreshes when you return to the tab, so a device that
-just connected (or went quiet) shows up without a manual reload. This is
-the surface for spotting an unexpected session and is also where token
-rotation and rate-limit lockouts surface.
+signed-in login session as a device, with a browser and OS label parsed
+from the user agent, the origin IP, and a relative "last seen" time. The
+session you are using is labeled "this device". The list polls every ten
+seconds and refreshes when you return to the tab, so a device that just
+signed in (or went quiet) shows up without a manual reload. This is the
+surface for spotting an unexpected session.
+
+Each other device has a **Revoke** button that ends just that session,
+and **Sign out all devices** signs every device out at once (including
+this one). Both are step-up actions: the first click after a fresh page
+load surfaces the passphrase prompt (see Step-up elevation below).
+
+Sessions are persisted to an owner-only file under the app dir, so they
+survive an `aoe serve` restart: signed-in devices stay signed in across
+a daemon bounce (config edit, `aoe update`, crash) instead of being
+re-prompted for the passphrase. Changing the passphrase drops every
+persisted session. To opt out and force re-authentication on every
+restart, turn off **Persist login sessions** under Web Dashboard, or set
+`auth.persist_sessions = false` in `config.toml`.
 
 ## Step-up elevation
 
-When passphrase login is configured, day-to-day actions (sending
-prompts, resolving approvals, switching mode) never re-prompt. Editing
-persisted config is different: saving the global settings panel,
-creating / deleting / renaming a profile, editing a profile, or changing
-the default profile requires that your login session has been elevated
-within the last 15 minutes via `POST /api/login/elevate`. The first such
-action after a fresh page load surfaces an inline passphrase prompt;
-subsequent edits inside the 15-minute window go through without
-re-prompting.
+When passphrase login is configured, day-to-day actions (sending prompts, resolving approvals, switching mode) never re-prompt. Editing persisted config is different: saving the global settings panel, creating / deleting / renaming a profile, editing a profile, or changing the default profile requires that your login session was elevated within the last 15 minutes via `POST /api/login/elevate`. The first such action after a page load surfaces an inline passphrase prompt; subsequent edits inside the window go through without re-prompting.
 
-This narrow gate covers the persisted-tamper attack (an attacker with a
-stolen session planting a malicious Docker image, worktree template, or
-profile) without putting friction on the conversation surface.
+This narrow gate covers the persisted-tamper attack (a stolen session planting a malicious Docker image, worktree template, or profile) without friction on the conversation surface.

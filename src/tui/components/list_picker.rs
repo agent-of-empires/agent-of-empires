@@ -1,6 +1,6 @@
 //! Reusable list picker overlay component
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
@@ -142,15 +142,16 @@ impl ListPicker {
                 self.active = false;
                 result
             }
-            KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Arrow keys only for navigation: every printable char belongs to
+            // the filter input (a "j" or "k" in a project/branch/group name
+            // must be typable), matching DirPicker and the command palette.
+            KeyCode::Up => {
                 if self.selected > 0 {
                     self.selected -= 1;
                 }
                 ListPickerResult::Continue
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Down => {
                 if filtered_len > 0 && self.selected < filtered_len - 1 {
                     self.selected += 1;
                 }
@@ -273,7 +274,7 @@ impl ListPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -343,15 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn test_navigation_jk() {
+    fn test_j_and_k_type_into_filter_not_navigate() {
         let mut picker = ListPicker::new("Test");
-        picker.activate(sample_items());
+        picker.activate(vec![
+            "jukebox".to_string(),
+            "kanban".to_string(),
+            "webapp".to_string(),
+        ]);
 
         picker.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.selected, 0, "'j' must not move the selection");
+        assert_eq!(picker.filter.value(), "j");
+        assert_eq!(picker.filtered_items().len(), 1);
 
+        picker.handle_key(key(KeyCode::Backspace));
         picker.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(picker.selected, 0);
+        picker.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(picker.selected, 0, "'k' must not move the selection");
+        assert_eq!(picker.filter.value(), "ka");
+        assert_eq!(*picker.filtered_items()[0], "kanban");
     }
 
     #[test]
