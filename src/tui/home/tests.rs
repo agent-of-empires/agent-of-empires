@@ -5831,6 +5831,59 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
 }
 
+/// A project whose only remaining member is archived must NOT leave an empty
+/// phantom header in the main (non-archived) flow. The archived session shows
+/// under the Archived section instead; an empty project header would be
+/// undeletable in project mode ("Project groups are automatic").
+#[test]
+#[serial]
+fn archived_only_project_leaves_no_phantom_header() {
+    use crate::session::{config::GroupByMode, is_within_archived_section};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+
+    // Drain beta down to a single ARCHIVED member: archive beta-error, then
+    // delete beta-running (the "last visible session in the group").
+    let beta_error = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "beta-error")
+        .map(|i| i.id.clone())
+        .unwrap();
+    let beta_running = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "beta-running")
+        .map(|i| i.id.clone())
+        .unwrap();
+    env.view
+        .apply_user_action(&beta_error, |inst| inst.archive())
+        .unwrap();
+    env.view.instances.retain(|i| i.id != beta_running);
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Count "beta" headers that live OUTSIDE the Archived section.
+    let mut in_archived = false;
+    let mut main_beta_headers = 0;
+    for item in &env.view.flat_items {
+        if let Item::Group { path, name, .. } = item {
+            if is_within_archived_section(path) {
+                in_archived = true;
+            } else if name == "beta" && !in_archived {
+                main_beta_headers += 1;
+            }
+        }
+    }
+    assert_eq!(
+        main_beta_headers, 0,
+        "archived-only project must not render a header in the main flow; got flat_items: {:?}",
+        env.view.flat_items
+    );
+}
+
 /// Collapsing the Archived umbrella in Project mode hides both sub-folder
 /// headers and their session rows.
 #[test]

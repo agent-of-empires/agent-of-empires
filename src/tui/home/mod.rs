@@ -2745,7 +2745,20 @@ impl HomeView {
             })
             .collect();
 
-        let mut tree = GroupTree::new_with_groups(&grouped, &[]);
+        // Project headers are derived purely from the live sessions, not a
+        // persisted group list, so build the tree from non-archived members
+        // only. An archived session already shows under the synthetic
+        // Archived section (nested by project below); if it also seeded a
+        // project node here, a project whose only remaining member is
+        // archived would render an empty phantom header in the main flow.
+        // That header is undeletable in project mode ("Project groups are
+        // automatic"), leaving the user no way to clear it.
+        let tree_seed: Vec<Instance> = grouped
+            .iter()
+            .filter(|i| !i.is_archived())
+            .cloned()
+            .collect();
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &[]);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
