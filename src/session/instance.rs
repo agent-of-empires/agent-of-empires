@@ -804,6 +804,18 @@ impl Instance {
         }
     }
 
+    /// Whether a title rename should also move the worktree directory leaf,
+    /// given the resolved `session.tie_workdir_to_name` setting. True only for
+    /// aoe-managed worktree sessions: non-worktree (scratch, plain tmux) and
+    /// externally-attached worktrees are always a no-op. See #1927.
+    pub fn tie_workdir_applies(&self, tie_setting: bool) -> bool {
+        tie_setting
+            && self
+                .worktree_info
+                .as_ref()
+                .is_some_and(|w| w.managed_by_aoe)
+    }
+
     /// Stamp `last_accessed_at` to the current time AND wake the session
     /// from any sink state. Call this on user-initiated interactions
     /// (attach, send keys, etc.); every existing call site already does.
@@ -1827,14 +1839,14 @@ impl Instance {
             .hooks
             .on_launch;
 
-        // Check if repo has trusted hooks that override
-        match super::repo_config::check_hook_trust(Path::new(&self.project_path)) {
-            Ok(super::repo_config::HookTrustStatus::Trusted(hooks))
-                if !hooks.on_launch.is_empty() =>
-            {
-                resolved_on_launch = hooks.on_launch.clone();
+        // Check if repo has trusted hooks that override. Only the hooks surface
+        // matters here; untrusted project MCP must not suppress trusted hooks.
+        if let Ok(trust) = super::repo_config::check_repo_trust(Path::new(&self.project_path)) {
+            if let Some(hooks) = trust.hooks.trusted() {
+                if !hooks.on_launch.is_empty() {
+                    resolved_on_launch = hooks.on_launch;
+                }
             }
-            _ => {}
         }
 
         if resolved_on_launch.is_empty() {

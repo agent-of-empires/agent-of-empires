@@ -332,6 +332,95 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
     assert!(!git_wt.branch_exists("old-name"));
 }
 
+// Tied workdir/title (#1927)
+
+use agent_of_empires::session::worktree_edit::worktree_leaf_from_title;
+
+#[test]
+fn tie_workdir_applies_only_for_managed_worktrees() {
+    // Non-worktree session: never tied, regardless of the setting.
+    let scratch = Instance::new("Scratch", "/tmp/x");
+    assert!(!scratch.tie_workdir_applies(true));
+
+    // Managed worktree: tied follows the setting.
+    let mut managed = Instance::new("S", "/tmp/wt");
+    managed.worktree_info = Some(managed_info("b", std::path::Path::new("/tmp/repo")));
+    assert!(managed.tie_workdir_applies(true));
+    assert!(!managed.tie_workdir_applies(false));
+
+    // Attached (unmanaged) worktree: never tied.
+    let mut attached = Instance::new("S", "/tmp/wt");
+    attached.worktree_info = Some(WorktreeInfo {
+        managed_by_aoe: false,
+        ..managed_info("b", std::path::Path::new("/tmp/repo"))
+    });
+    assert!(!attached.tie_workdir_applies(true));
+}
+
+#[test]
+#[serial]
+fn tied_rename_moves_dir_to_title_leaf_without_touching_branch() {
+    // Models the surface flow: a tied rename derives the directory leaf from
+    // the new title and moves the worktree, leaving the branch alone.
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let old_path = repo_dir.path().join("byzantines");
+    git_wt
+        .create_worktree("byzantines", &old_path, true, None)
+        .unwrap();
+    let info = managed_info("byzantines", repo_dir.path());
+
+    let leaf = worktree_leaf_from_title("Auth Refactor");
+    assert_eq!(leaf, "auth-refactor");
+    let outcome = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &old_path,
+        new_name: &leaf,
+        rename_branch: false,
+    })
+    .unwrap();
+
+    let new_path = repo_dir.path().join("auth-refactor");
+    assert_eq!(outcome.new_path, new_path);
+    assert_eq!(outcome.new_branch, None);
+    assert!(!old_path.exists());
+    assert!(new_path.exists());
+    // Branch is never swept in by a tied title rename.
+    assert!(git_wt.branch_exists("byzantines"));
+}
+
+#[test]
+#[serial]
+fn tied_rename_into_occupied_leaf_keeps_title_and_dir_in_sync() {
+    // A title whose leaf collides with a sibling directory fails the move, so
+    // the surface keeps the old title too: the two never drift apart.
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let old_path = repo_dir.path().join("aaa");
+    git_wt
+        .create_worktree("aaa", &old_path, true, None)
+        .unwrap();
+    let occupied = repo_dir.path().join("taken");
+    git_wt
+        .create_worktree("taken", &occupied, true, None)
+        .unwrap();
+    let info = managed_info("aaa", repo_dir.path());
+
+    let leaf = worktree_leaf_from_title("Taken");
+    assert_eq!(leaf, "taken");
+    let err = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &old_path,
+        new_name: &leaf,
+        rename_branch: false,
+    })
+    .unwrap_err();
+    assert!(matches!(err, WorktreeEditError::TargetExists(_)));
+    assert!(old_path.exists());
+}
+
 #[test]
 #[serial]
 fn edit_workdir_rejects_invalid_cases_without_partial_changes() {

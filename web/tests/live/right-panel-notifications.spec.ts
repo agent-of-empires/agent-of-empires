@@ -8,7 +8,7 @@
 //      asserts the toggle exists and that the paired-terminal pane
 //      mounts.
 //   2) Comments-banner notification flow on a structured view session. Once a
-//      user stages a comment via the diff "+" gutter, the
+//      user stages a comment by selecting a diff gutter line, the
 //      `CommentsBanner` (`src/components/diff/comments/CommentsBanner.tsx`)
 //      surfaces a notification chip in the right panel with the comment
 //      count, plus Send and Discard-all actions. This exercises the
@@ -81,8 +81,8 @@ base(
         const projectDir = join(home, "project");
         initWorkingRepo(projectDir);
         // Commit a baseline so the modified version produces a real
-        // hunk with gutter "+" buttons (the comments UI requires
-        // line numbers on at least one side).
+        // hunk with selectable gutter line numbers (the comments UI
+        // requires line numbers on at least one side).
         writeFiles(projectDir, { "notes.md": "line a\nline b\nline c\n" });
         commitAll(projectDir, "baseline");
         writeFiles(projectDir, { "notes.md": "line A\nline B\nline C\n" });
@@ -145,15 +145,15 @@ base(
         .first()
         .click();
 
-      // First gutter "+" click sets range start; the same line again
-      // closes the range and opens the inline form. The buttons are
-      // opacity-0 until hover; click via aria-label + force to bypass
-      // the visibility-driven actionability checks.
-      const plus = page.getByRole("button", {
-        name: /Add comment on new line 1/,
-      });
-      await plus.first().click({ force: true });
-      await plus.first().click({ force: true });
+      // Select a line to comment by clicking its @pierre/diffs gutter line
+      // number. The renderer exposes `[data-line-number-content]` cells that
+      // contain only the number; a single click selects the line and opens
+      // the inline comment form.
+      const gutterLine1 = page
+        .locator("[data-line-number-content]")
+        .filter({ hasText: /^1$/ });
+      await expect(gutterLine1.first()).toBeVisible({ timeout: 10_000 });
+      await gutterLine1.first().click();
 
       // Form textarea autofocuses; type a body and save.
       const textarea = page.getByPlaceholder(/Leave a comment/);

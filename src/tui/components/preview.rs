@@ -503,7 +503,12 @@ fn banner_block_area(output: Rect, banner: Rect) -> Rect {
 /// Pick the row offset passed to `Paragraph::scroll`. Zero user offset shows
 /// the bottom of the cached pane (live-follow). A positive offset scrolls the
 /// same number of lines back, saturating at the top of the capture.
-fn compute_scroll(line_count: usize, visible_height: usize, user_offset: u16) -> u16 {
+///
+/// Exposed at crate visibility so the preview drag-select code can map a
+/// screen row to the absolute content line under it: the value returned here
+/// is the index of the parsed-text line painted on the output pane's top row,
+/// so `first_line + (screen_row - pane.y)` is the line beneath any cell.
+pub(crate) fn compute_scroll(line_count: usize, visible_height: usize, user_offset: u16) -> u16 {
     if line_count <= visible_height {
         return 0;
     }

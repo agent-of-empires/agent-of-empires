@@ -325,62 +325,14 @@ pub fn compute_file_diff(
     context_lines: usize,
 ) -> Result<FileDiff> {
     let repo = super::open_repo_at(repo_path)?;
-    let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?;
+    let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
 
-    let base_tree = get_merge_base_tree(&repo, base_branch)?;
-
-    // Get old content from base tree (as bytes first to check for binary)
-    let old_bytes = get_blob_bytes(&repo, &base_tree, file_path);
-    let old_is_binary = old_bytes
-        .as_ref()
-        .map(|b| is_binary_bytes(b))
-        .unwrap_or(false);
-
-    // Get new content from working directory (as bytes first to check for binary)
-    let full_path = workdir.join(file_path);
-    let new_bytes = if full_path.exists() {
-        std::fs::read(&full_path).ok()
-    } else {
-        None
-    };
-    let new_is_binary = new_bytes
-        .as_ref()
-        .map(|b| is_binary_bytes(b))
-        .unwrap_or(false);
-
-    let is_binary = old_is_binary || new_is_binary;
-
-    // Convert to strings (safe now that we've checked for binary)
-    let old_content = old_bytes
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-    let new_content = new_bytes
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-
-    // Determine file status
-    let index = repo.index()?;
-    let is_conflicted = index.has_conflicts()
-        && index.conflicts()?.any(|c| {
-            c.ok()
-                .and_then(|c| c.our.or(c.their).or(c.ancestor))
-                .and_then(|e| {
-                    std::str::from_utf8(&e.path)
-                        .ok()
-                        .map(|p| Path::new(p) == file_path)
-                })
-                .unwrap_or(false)
-        });
-
-    let status = if is_conflicted {
-        FileStatus::Conflicted
-    } else if old_content.is_empty() && !new_content.is_empty() {
-        FileStatus::Added
-    } else if !old_content.is_empty() && new_content.is_empty() && !full_path.exists() {
-        FileStatus::Deleted
-    } else {
-        FileStatus::Modified
-    };
+    let FileState {
+        old_content,
+        new_content,
+        is_binary,
+        status,
+    } = read_file_state(&repo, &workdir, file_path, base_branch)?;
 
     if is_binary {
         return Ok(FileDiff {
@@ -468,6 +420,150 @@ pub fn compute_file_diff(
         },
         hunks,
         is_binary: false,
+    })
+}
+
+/// Raw old/new contents of a single file plus its status.
+///
+/// Feeds the contents-based diff endpoint, which lets the web client parse
+/// and render diffs itself (via `@pierre/diffs`) instead of consuming
+/// server-computed hunks. Additions/deletions are intentionally absent: the
+/// renderer derives them, and the file-list endpoint already carries per-file
+/// counts for the sidebar.
+#[derive(Debug, Clone)]
+pub struct FileContents {
+    pub path: PathBuf,
+    pub old_path: Option<PathBuf>,
+    pub status: FileStatus,
+    pub old_content: String,
+    pub new_content: String,
+    /// Unified diff of old → new, computed server-side so the web client can
+    /// parse it as text instead of re-running a (slow, main-thread) diff
+    /// algorithm on the raw contents. Empty for binary files.
+    pub patch: String,
+    pub is_binary: bool,
+}
+
+/// Read the old (base-tree) and new (working-dir) contents of a single file
+/// plus a server-computed unified diff of the two.
+///
+/// The diff is computed here, natively, precisely so the web client never
+/// has to: `@pierre/diffs` parses the patch text and only offloads
+/// highlighting to its worker pool.
+pub fn compute_file_contents(
+    repo_path: &Path,
+    file_path: &Path,
+    base_branch: &str,
+) -> Result<FileContents> {
+    let repo = super::open_repo_at(repo_path)?;
+    let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
+    let state = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    // libgit2's xdiff, not the `similar` crate: xdiff is C compiled optimized
+    // regardless of cargo profile and carries git's pathological-input
+    // heuristics. `similar`'s Myers took ~20s on a +10k/-13k lockfile churn
+    // in a debug build; xdiff handles the same input in milliseconds.
+    let patch = if state.is_binary {
+        String::new()
+    } else {
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(3);
+        let mut patch = git2::Patch::from_buffers(
+            state.old_content.as_bytes(),
+            Some(file_path),
+            state.new_content.as_bytes(),
+            Some(file_path),
+            Some(&mut opts),
+        )?;
+        String::from_utf8_lossy(&patch.to_buf()?).into_owned()
+    };
+    Ok(FileContents {
+        path: file_path.to_path_buf(),
+        old_path: None,
+        status: state.status,
+        old_content: state.old_content,
+        new_content: state.new_content,
+        patch,
+        is_binary: state.is_binary,
+    })
+}
+
+/// Intermediate result shared by [`compute_file_diff`] and
+/// [`compute_file_contents`]: the raw old/new text, binary flag, and status.
+struct FileState {
+    old_content: String,
+    new_content: String,
+    is_binary: bool,
+    status: FileStatus,
+}
+
+/// Read a file's base-tree and working-dir contents, detect binary, and
+/// classify its status (added/deleted/modified/conflicted).
+fn read_file_state(
+    repo: &git2::Repository,
+    workdir: &Path,
+    file_path: &Path,
+    base_branch: &str,
+) -> Result<FileState> {
+    let base_tree = get_merge_base_tree(repo, base_branch)?;
+
+    // Get old content from base tree (as bytes first to check for binary)
+    let old_bytes = get_blob_bytes(repo, &base_tree, file_path);
+    let old_is_binary = old_bytes
+        .as_ref()
+        .map(|b| is_binary_bytes(b))
+        .unwrap_or(false);
+
+    // Get new content from working directory (as bytes first to check for binary)
+    let full_path = workdir.join(file_path);
+    let new_bytes = if full_path.exists() {
+        std::fs::read(&full_path).ok()
+    } else {
+        None
+    };
+    let new_is_binary = new_bytes
+        .as_ref()
+        .map(|b| is_binary_bytes(b))
+        .unwrap_or(false);
+
+    let is_binary = old_is_binary || new_is_binary;
+
+    // Convert to strings (safe now that we've checked for binary)
+    let old_content = old_bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    let new_content = new_bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+
+    // Determine file status
+    let index = repo.index()?;
+    let is_conflicted = index.has_conflicts()
+        && index.conflicts()?.any(|c| {
+            c.ok()
+                .and_then(|c| c.our.or(c.their).or(c.ancestor))
+                .and_then(|e| {
+                    std::str::from_utf8(&e.path)
+                        .ok()
+                        .map(|p| Path::new(p) == file_path)
+                })
+                .unwrap_or(false)
+        });
+
+    let status = if is_conflicted {
+        FileStatus::Conflicted
+    } else if old_content.is_empty() && !new_content.is_empty() {
+        FileStatus::Added
+    } else if !old_content.is_empty() && new_content.is_empty() && !full_path.exists() {
+        FileStatus::Deleted
+    } else {
+        FileStatus::Modified
+    };
+
+    Ok(FileState {
+        old_content,
+        new_content,
+        is_binary,
+        status,
     })
 }
 
@@ -971,6 +1067,86 @@ mod tests {
         assert!(!diff.is_binary);
         assert!(!diff.hunks.is_empty());
         assert!(diff.file.additions > 0);
+    }
+
+    #[test]
+    fn test_compute_file_contents_modified() {
+        let (dir, _repo) = setup_test_repo();
+
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1 modified\nline 2\nline 3\nnew line 4\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert!(!c.is_binary);
+        assert_eq!(c.status, FileStatus::Modified);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert_eq!(
+            c.new_content,
+            "line 1 modified\nline 2\nline 3\nnew line 4\n"
+        );
+        // Server-computed unified diff with git-style headers.
+        assert!(c.patch.contains("--- a/test.txt"));
+        assert!(c.patch.contains("+++ b/test.txt"));
+        assert!(c.patch.contains("@@"));
+        assert!(c.patch.contains("-line 1\n"));
+        assert!(c.patch.contains("+line 1 modified\n"));
+    }
+
+    #[test]
+    fn test_compute_file_contents_added() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::write(dir.path().join("brand_new.txt"), "hello\nworld\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("brand_new.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Added);
+        assert!(c.old_content.is_empty());
+        assert_eq!(c.new_content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_compute_file_contents_deleted() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::remove_file(dir.path().join("test.txt")).unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Deleted);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert!(c.new_content.is_empty());
+    }
+
+    #[test]
+    fn test_compute_file_contents_matches_diff_inputs() {
+        // The contents path must hand back exactly the old/new text the legacy
+        // hunk path diffs, so the client-side parse reproduces the same diff.
+        let (dir, _repo) = setup_test_repo();
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1\nchanged\nline 3\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+        let d = compute_file_diff(dir.path(), Path::new("test.txt"), "HEAD", 3).unwrap();
+
+        // Reconstruct old/new from the hunk lines and compare.
+        let mut old_from_hunks = String::new();
+        let mut new_from_hunks = String::new();
+        for h in &d.hunks {
+            for l in &h.lines {
+                match l.tag {
+                    ChangeTag::Delete => old_from_hunks.push_str(&l.content),
+                    ChangeTag::Insert => new_from_hunks.push_str(&l.content),
+                    ChangeTag::Equal => {
+                        old_from_hunks.push_str(&l.content);
+                        new_from_hunks.push_str(&l.content);
+                    }
+                }
+            }
+        }
+        assert_eq!(c.old_content, old_from_hunks);
+        assert_eq!(c.new_content, new_from_hunks);
     }
 
     #[test]

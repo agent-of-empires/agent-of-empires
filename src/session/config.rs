@@ -951,6 +951,20 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
     pub confirm_before_quit: bool,
+
+    /// Keep an aoe-managed worktree session's directory leaf in sync with its
+    /// title. When enabled (default), renaming the session also moves its
+    /// worktree directory, and new sessions derive the directory leaf from the
+    /// title. Renaming a tied worktree session requires it to be stopped first.
+    /// The git branch is never swept in; it keeps its own opt-in toggle.
+    /// No-op for non-worktree sessions.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Tie Worktree Directory to Session Name",
+        widget = "toggle",
+        category = "Worktree"
+    )]
+    pub tie_workdir_to_name: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1060,6 +1074,7 @@ impl Default for SessionConfig {
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
             confirm_before_quit: true,
+            tie_workdir_to_name: true,
         }
     }
 }

@@ -719,6 +719,51 @@ impl HomeView {
                 Some(g) => g.to_string(),      // Set new (empty string means ungroup)
             };
 
+            // Tied mode (#1927): a worktree session's directory leaf follows
+            // its title, so move the directory in lockstep before persisting
+            // the new title. The move is gated on a stopped session; a running
+            // session surfaces a warning and nothing is renamed. Applied below
+            // in both the profile-move and the standard persist paths.
+            let mut new_path: Option<String> = None;
+            if current_title != effective_title && self.tie_workdir_applies_for(&id) {
+                let snapshot = self
+                    .get_instance(&id)
+                    .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
+                if let Some((Some(worktree_info), status, project_path)) = snapshot {
+                    if status.blocks_worktree_edit() {
+                        self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                            "Stop the Session to Rename",
+                            "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                        ));
+                        return Ok(());
+                    }
+                    let leaf =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+                    match crate::session::worktree_edit::edit_worktree_workdir(
+                        crate::session::worktree_edit::WorktreeEditRequest {
+                            worktree_info: &worktree_info,
+                            current_path: std::path::Path::new(&project_path),
+                            new_name: &leaf,
+                            rename_branch: false,
+                        },
+                    ) {
+                        Ok(outcome) => {
+                            new_path = Some(outcome.new_path.to_string_lossy().to_string())
+                        }
+                        // Leaf maps to the current dir: nothing to move, just
+                        // rename the title.
+                        Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
+                        Err(e) => {
+                            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                                "Rename Failed",
+                                &format!("Could not move the worktree directory: {e}"),
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             // Handle profile change (move session to different profile)
             if let Some(target_profile) = new_profile {
                 let current_profile = self
@@ -769,10 +814,17 @@ impl HomeView {
                     // Update source_profile and save (handles moving between profiles)
                     instance.source_profile = target_profile.to_string();
                     let new_title = instance.title.clone();
+                    let moved_path = new_path.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
-                    self.mutate_instance(&id, |inst| {
-                        inst.title = new_title;
-                    });
+                    // apply_user_action (not mutate_instance + save) so a tied
+                    // worktree's moved project_path actually persists; save()
+                    // via merge_from_tui does not write project_path. (#1927)
+                    self.apply_user_action(&id, |inst| {
+                        inst.title = new_title.clone();
+                        if let Some(path) = &moved_path {
+                            inst.project_path = path.clone();
+                        }
+                    })?;
 
                     self.rebuild_group_trees();
                     if !effective_group.is_empty() {
@@ -810,6 +862,9 @@ impl HomeView {
             self.apply_user_action(&id, |inst| {
                 inst.title = effective_title.clone();
                 inst.group_path = effective_group.clone();
+                if let Some(path) = &new_path {
+                    inst.project_path = path.clone();
+                }
             })?;
 
             // Rebuild group trees and create group if needed

@@ -76,33 +76,24 @@ fn test_trust_untrust_cycle() {
     let project_path = project_dir.path();
     let hooks_hash = "test_hash_123";
 
+    use agent_of_empires::session::repo_config::{is_repo_trusted, trust_repo};
+
     // Initially not trusted
-    let is_trusted =
-        agent_of_empires::session::repo_config::is_repo_trusted(project_path, hooks_hash).unwrap();
-    assert!(!is_trusted);
+    assert!(!is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
 
     // Trust it
-    agent_of_empires::session::repo_config::trust_repo(project_path, hooks_hash).unwrap();
-    let is_trusted =
-        agent_of_empires::session::repo_config::is_repo_trusted(project_path, hooks_hash).unwrap();
-    assert!(is_trusted);
+    trust_repo(project_path, Some(hooks_hash), None).unwrap();
+    assert!(is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
 
     // Different hash should not be trusted
-    let is_trusted =
-        agent_of_empires::session::repo_config::is_repo_trusted(project_path, "different_hash")
-            .unwrap();
-    assert!(!is_trusted);
+    assert!(!is_repo_trusted(project_path, Some("different_hash"), None).unwrap());
 
     // Re-trust with new hash (simulating hooks changed)
-    agent_of_empires::session::repo_config::trust_repo(project_path, "new_hash").unwrap();
+    trust_repo(project_path, Some("new_hash"), None).unwrap();
     // Old hash no longer trusted
-    let is_trusted =
-        agent_of_empires::session::repo_config::is_repo_trusted(project_path, hooks_hash).unwrap();
-    assert!(!is_trusted);
+    assert!(!is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
     // New hash is trusted
-    let is_trusted =
-        agent_of_empires::session::repo_config::is_repo_trusted(project_path, "new_hash").unwrap();
-    assert!(is_trusted);
+    assert!(is_repo_trusted(project_path, Some("new_hash"), None).unwrap());
 }
 
 #[test]
@@ -151,7 +142,7 @@ fn test_changed_hooks_invalidate_trust() {
 #[test]
 #[serial]
 fn test_hook_trust_invalidated_on_config_change() {
-    use agent_of_empires::session::repo_config::{check_hook_trust, trust_repo, HookTrustStatus};
+    use agent_of_empires::session::repo_config::{check_repo_trust, trust_repo, TrustSurface};
 
     let temp_home = TempDir::new().unwrap();
     set_temp_home(temp_home.path());
@@ -165,21 +156,19 @@ on_create = ["echo setup"]
     );
 
     // Initially untrusted
-    let status = check_hook_trust(repo.path()).unwrap();
-    assert!(
-        matches!(status, HookTrustStatus::NeedsTrust { .. }),
-        "Hooks should initially need trust"
-    );
+    let trust = check_repo_trust(repo.path()).unwrap();
+    let hash = match &trust.hooks {
+        TrustSurface::NeedsTrust { hash, .. } => hash.clone(),
+        _ => panic!("Hooks should initially need trust"),
+    };
 
     // Trust the hooks
-    if let HookTrustStatus::NeedsTrust { hooks_hash, .. } = &status {
-        trust_repo(repo.path(), hooks_hash).unwrap();
-    }
+    trust_repo(repo.path(), Some(&hash), None).unwrap();
 
     // Now should be trusted
-    let status = check_hook_trust(repo.path()).unwrap();
+    let trust = check_repo_trust(repo.path()).unwrap();
     assert!(
-        matches!(status, HookTrustStatus::Trusted(_)),
+        matches!(trust.hooks, TrustSurface::Trusted(_)),
         "Hooks should be trusted after trust_repo"
     );
 
@@ -195,9 +184,9 @@ on_create = ["echo setup", "echo extra"]
     .unwrap();
 
     // Should no longer be trusted (hash changed)
-    let status = check_hook_trust(repo.path()).unwrap();
+    let trust = check_repo_trust(repo.path()).unwrap();
     assert!(
-        matches!(status, HookTrustStatus::NeedsTrust { .. }),
+        trust.hooks.needs_trust(),
         "Modified hooks should need re-trust"
     );
 }
@@ -205,7 +194,7 @@ on_create = ["echo setup", "echo extra"]
 #[test]
 #[serial]
 fn test_hook_re_trust_after_change() {
-    use agent_of_empires::session::repo_config::{check_hook_trust, trust_repo, HookTrustStatus};
+    use agent_of_empires::session::repo_config::{check_repo_trust, trust_repo, TrustSurface};
 
     let temp_home = TempDir::new().unwrap();
     set_temp_home(temp_home.path());
@@ -218,10 +207,12 @@ on_create = ["echo v1"]
     );
 
     // Trust v1
-    let status = check_hook_trust(repo.path()).unwrap();
-    if let HookTrustStatus::NeedsTrust { hooks_hash, .. } = &status {
-        trust_repo(repo.path(), hooks_hash).unwrap();
-    }
+    let trust = check_repo_trust(repo.path()).unwrap();
+    let hash = match &trust.hooks {
+        TrustSurface::NeedsTrust { hash, .. } => hash.clone(),
+        _ => panic!("v1 hooks should initially need trust"),
+    };
+    trust_repo(repo.path(), Some(&hash), None).unwrap();
 
     // Modify to v2
     let config_dir = repo.path().join(".agent-of-empires");
@@ -235,16 +226,16 @@ on_create = ["echo v2"]
     .unwrap();
 
     // Re-trust v2
-    let status = check_hook_trust(repo.path()).unwrap();
-    assert!(matches!(status, HookTrustStatus::NeedsTrust { .. }));
-    if let HookTrustStatus::NeedsTrust { hooks_hash, .. } = &status {
-        trust_repo(repo.path(), hooks_hash).unwrap();
+    let trust = check_repo_trust(repo.path()).unwrap();
+    assert!(trust.hooks.needs_trust());
+    if let TrustSurface::NeedsTrust { hash, .. } = &trust.hooks {
+        trust_repo(repo.path(), Some(hash), None).unwrap();
     }
 
     // Should now be trusted again
-    let status = check_hook_trust(repo.path()).unwrap();
+    let trust = check_repo_trust(repo.path()).unwrap();
     assert!(
-        matches!(status, HookTrustStatus::Trusted(_)),
+        matches!(trust.hooks, TrustSurface::Trusted(_)),
         "Re-trusted hooks should be trusted"
     );
 }

@@ -158,7 +158,7 @@ Add a new session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
-* `--trust-hooks` — Automatically trust repository hooks without prompting
+* `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
@@ -399,6 +399,7 @@ Rename a session
 
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
+* `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
 
 
 

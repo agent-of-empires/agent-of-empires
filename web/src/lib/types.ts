@@ -67,6 +67,11 @@ export interface SessionResponse {
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
   has_managed_worktree: boolean;
+  /** True when renaming this session also moves its worktree directory (the
+   *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
+   *  sidebar uses this to collapse the standalone "edit workdir name" action
+   *  into the unified rename. Populated by the list endpoint. See #1927. */
+  tie_workdir_to_name?: boolean;
   has_terminal: boolean;
   profile: string;
   cleanup_defaults: CleanupDefaults;
@@ -251,12 +256,20 @@ export interface RichDiffHunk {
   lines: RichDiffLine[];
 }
 
-/** Response from /api/sessions/{id}/diff/file?path=... */
-export interface RichFileDiffResponse {
+/**
+ * Response from /api/sessions/{id}/diff/file?path=...
+ * Raw old/new file text that the client parses and renders itself via
+ * `@pierre/diffs` (virtualized, off-main-thread highlighting).
+ */
+export interface RichFileContentsResponse {
   file: RichDiffFile;
-  hunks: RichDiffHunk[];
+  old_content: string;
+  new_content: string;
+  /** Server-computed unified diff of old → new. Parsed client-side as text
+   *  (no client diff algorithm); empty for binary files. */
+  patch: string;
   is_binary: boolean;
-  /** True if the file was too large to diff inline. */
+  /** True if the file was too large to send inline; contents are empty. */
   truncated: boolean;
 }
 

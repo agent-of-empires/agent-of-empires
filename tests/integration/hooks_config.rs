@@ -89,7 +89,7 @@ fn test_repo_hooks_override_both_fields() -> Result<()> {
 }
 
 // T016: Global/profile hooks are NOT subject to trust checking.
-// This is a design invariant: check_hook_trust() only reads .agent-of-empires/config.toml,
+// This is a design invariant: check_repo_trust() only reads .agent-of-empires/config.toml,
 // so global/profile hooks never enter the trust pipeline. We verify that
 // resolve_config returns hooks without any trust gate.
 #[test]

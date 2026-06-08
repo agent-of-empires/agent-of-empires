@@ -2,7 +2,7 @@ import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
   RichDiffFilesResponse,
-  RichFileDiffResponse,
+  RichFileContentsResponse,
   AgentInfo,
   ProfileInfo,
   ProfileSettingsResponse,
@@ -121,14 +121,19 @@ export function getSessionDiffFiles(
   return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
 }
 
-export function getSessionFileDiff(
+/**
+ * Fetch raw old/new contents plus a server-computed unified patch for a
+ * file; the client renders the patch via `@pierre/diffs` without re-diffing.
+ * See {@link RichFileContentsResponse}.
+ */
+export function getSessionFileContents(
   id: string,
   filePath: string,
   repoName?: string,
-): Promise<RichFileDiffResponse | null> {
+): Promise<RichFileContentsResponse | null> {
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
-  return fetchJson<RichFileDiffResponse>(
+  return fetchJson<RichFileContentsResponse>(
     `/api/sessions/${id}/diff/file?${params.toString()}`,
   );
 }
@@ -1012,19 +1017,33 @@ export async function logout(): Promise<void> {
   }
 }
 
+/**
+ * Rename a session's title. When the session is a tied aoe-managed worktree
+ * (session.tie_workdir_to_name), the server also moves the worktree directory
+ * to match and returns 409 if the session is running, so the message is
+ * surfaced to the caller. See #1927.
+ */
 export async function renameSession(
   id: string,
   title: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; message?: string }> {
   try {
     const res = await fetch(`/api/sessions/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
     });
-    return res.ok;
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 

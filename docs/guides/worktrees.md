@@ -72,11 +72,29 @@ In the TUI, enable the Worktree checkbox to create a new branch and worktree. By
 
 The web dashboard's new-session wizard folds the worktree controls behind an "Advanced" disclosure on the session step, leaving only the session title visible by default. Inside Advanced, a "Base branch" disclosure beneath the worktree name input shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same Advanced section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
 
+## Tying the Title and Worktree Directory
+
+By default a worktree session's title and its worktree directory name stay tied: renaming the session moves the directory to match, and a new session's directory leaf is derived from its title (so "Auth refactor" lands in `.../auth-refactor` rather than a random codename). This is controlled by the `session.tie_workdir_to_name` setting (default `true`), which applies only to aoe-managed worktree sessions. Non-worktree (scratch, plain tmux) and attached worktree sessions ignore it.
+
+```toml
+[session]
+tie_workdir_to_name = true
+```
+
+When tied:
+
+- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug first, then sets the title only if the move succeeds, so the two cannot drift on a partial failure.
+- The git branch is never swept in by a title rename. Pass `--rename-branch` to `aoe session rename` (or `rename_branch: true` to the PATCH) to rename it too; it stays opt-in because a branch may carry an upstream or an open PR.
+- The session must be stopped first. Moving the directory of a running worktree is unsafe, so a tied rename of a running session is refused with a clear message. Stop the session, or disable the setting, to relabel it freely.
+- Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
+
+Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.
+
 ## Editing the Workdir Name After Creation
 
-When a worktree session was created with an auto-generated name, you can change its workdir (worktree directory) name later. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
+When `session.tie_workdir_to_name` is **off**, a worktree session's workdir (worktree directory) name is edited independently of its title. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
 
-v1 supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
+This supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
 
 | Surface | How |
 |---------|-----|
@@ -85,7 +103,7 @@ v1 supports only sessions whose worktree is aoe-managed (`worktree_info.managed_
 | Web | Right-click the session row, choose "Edit workdir name", enter a name, and optionally check "Also rename git branch". |
 | REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": <bool> }` |
 
-The new directory and branch persist across reload and restart. See #1723.
+The new directory and branch persist across reload and restart. See #1723 and #1927.
 
 ## Configuration
 

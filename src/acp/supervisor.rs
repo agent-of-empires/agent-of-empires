@@ -473,19 +473,26 @@ fn command_matches_binary(command: &str, binary: &str) -> bool {
             .is_some_and(|name| name == binary)
 }
 
-/// Resolve the MCP servers to forward for a spawn: the agent's native config
-/// (lowest precedence) merged under the global `<app_dir>/mcp.json`. Runs on a
+/// Resolve the MCP servers to forward for a spawn, lowest precedence first: the
+/// agent's native config, merged under the global `<app_dir>/mcp.json`, merged
+/// under the session's per-profile `<profile_dir>/mcp.json` (issue #1986),
+/// merged under the trusted project-local `.mcp.json` (issue #1985). Runs on a
 /// blocking thread (callers spawn_blocking it) because a native config can be
 /// large. Each layer is isolated: a missing, unreadable, or malformed source
 /// warns and contributes nothing rather than aborting, so a single broken file
-/// never blocks the spawn.
+/// never blocks the spawn. `profile` is the session's `source_profile`; an empty
+/// or `None` value resolves to the default profile. `cwd` is the session's
+/// working directory, from which the project-local repo (and its `.mcp.json`)
+/// is resolved.
 fn resolve_mcp_layers(
     agent_key: &str,
     session_id: &str,
+    profile: Option<&str>,
+    cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::McpServer> {
     use crate::acp::mcp_config::{
-        load_global_mcp_servers, load_native_mcp_servers_from_home, merge_by_precedence, summarize,
-        McpLayer,
+        load_global_mcp_servers, load_native_mcp_servers_from_home, load_profile_mcp_servers,
+        merge_by_precedence, project_servers_to_acp, summarize, McpLayer,
     };
 
     let native = match load_native_mcp_servers_from_home(agent_key) {
@@ -526,6 +533,84 @@ fn resolve_mcp_layers(
         }
     };
 
+    // Per-profile layer: `<profile_dir>/mcp.json` for the session's profile,
+    // resolved read-only so a session under a profile with no MCP file never
+    // creates a stub directory. An empty/None profile resolves to the default.
+    let per_profile = match crate::session::get_profile_dir_path(profile.unwrap_or_default()) {
+        Ok(profile_dir) => match load_profile_mcp_servers(&profile_dir) {
+            Ok(servers) => servers,
+            Err(e) => {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    error = %e,
+                    "failed to load per-profile MCP config; forwarding none from it"
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "could not resolve profile dir for MCP config; forwarding none from it"
+            );
+            Vec::new()
+        }
+    };
+
+    // Project-local layer (#1985): the repo's `.mcp.json`, highest precedence,
+    // but forwarded ONLY when the repo is trusted for the file's current
+    // fingerprint. A repo-provided stdio server launches its `command` the
+    // moment the session spawns, so an untrusted (or changed) file is a
+    // zero-click RCE surface: skip it and log, exactly like the create-time
+    // trust gate refuses to run untrusted hooks. The file is read from the main
+    // repo (resolved from a worktree path), the same source the trust dialog
+    // reviewed, so the forwarded set equals the reviewed set. The gate runs on
+    // every spawn and respawn, so an edit to `.mcp.json` re-locks it until the
+    // user re-approves at session-create.
+    let source = crate::session::repo_config::repo_config_source_path(cwd);
+    let project_local = match crate::session::project_mcp::load_project_mcp_servers(&source) {
+        Ok(servers) if servers.is_empty() => Vec::new(),
+        Ok(servers) => {
+            let hash = crate::session::project_mcp::fingerprint(&servers);
+            match crate::session::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
+                Ok(true) => project_servers_to_acp(servers),
+                Ok(false) => {
+                    warn!(
+                        target: "acp.mcp",
+                        session = %session_id,
+                        repo = %source.display(),
+                        count = servers.len(),
+                        "skipping project-local MCP servers: repo not trusted at this .mcp.json fingerprint; review and approve by creating a session for this repo in the TUI or CLI"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    warn!(
+                        target: "acp.mcp",
+                        session = %session_id,
+                        repo = %source.display(),
+                        error = %e,
+                        "could not check project-local MCP trust; forwarding none from it"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                repo = %source.display(),
+                error = %e,
+                "failed to load project-local MCP config; forwarding none from it"
+            );
+            Vec::new()
+        }
+    };
+
     let merged = merge_by_precedence(vec![
         McpLayer {
             label: "agent-native",
@@ -534,6 +619,14 @@ fn resolve_mcp_layers(
         McpLayer {
             label: "global",
             servers: global,
+        },
+        McpLayer {
+            label: "per-profile",
+            servers: per_profile,
+        },
+        McpLayer {
+            label: "project-local",
+            servers: project_local,
         },
     ]);
 
@@ -1318,25 +1411,31 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resolve the MCP servers to forward on session/new and session/load:
         // the agent's own native config (lowest precedence) merged under the
-        // global `<app_dir>/mcp.json`, so a server defined in both is taken from
-        // the global file. Disk reads and parsing run off the async runtime
-        // because a native config (e.g. `~/.claude.json`) can be large. Any
-        // broken layer warns and contributes nothing rather than failing the
-        // spawn; project-local and per-profile sources are deferred (follow-ups).
+        // global `<app_dir>/mcp.json`, the per-profile `<profile_dir>/mcp.json`
+        // (#1986), and the trusted project-local `.mcp.json` (#1985), so a server
+        // defined in several is taken from the highest layer. The project-local
+        // layer is only forwarded when the repo is trusted for the file's current
+        // fingerprint; otherwise it is skipped and logged. Disk reads and parsing
+        // run off the async runtime because a native config (e.g. `~/.claude.json`)
+        // can be large. Any broken layer warns and contributes nothing rather than
+        // failing the spawn.
         let mcp_agent = agent.clone();
         let mcp_session = session_id.clone();
-        let mcp_servers =
-            tokio::task::spawn_blocking(move || resolve_mcp_layers(&mcp_agent, &mcp_session))
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(
-                        target: "acp.mcp",
-                        session = %session_id,
-                        error = %e,
-                        "MCP resolution task failed; forwarding no servers"
-                    );
-                    Vec::new()
-                });
+        let mcp_profile = source_profile.clone();
+        let mcp_cwd = cwd.clone();
+        let mcp_servers = tokio::task::spawn_blocking(move || {
+            resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref(), &mcp_cwd)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "MCP resolution task failed; forwarding no servers"
+            );
+            Vec::new()
+        });
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
@@ -1776,13 +1875,23 @@ impl<S: BroadcastSink> Supervisor<S> {
                     tokio::time::sleep(RESPAWN_BACKOFF).await;
 
                     // Re-resolve the MCP layers rather than reusing the list
-                    // cached at first spawn: edits to the agent's native config
-                    // or `<app_dir>/mcp.json` made since then are forwarded on
-                    // `session/load` too, so a respawn must pick them up.
+                    // cached at first spawn: edits to the agent's native config,
+                    // `<app_dir>/mcp.json`, the per-profile `mcp.json`, or the
+                    // trusted project-local `.mcp.json` made since then are
+                    // forwarded on `session/load` too, so a respawn must pick them
+                    // up. The project-local trust gate runs here as well, so an
+                    // edited `.mcp.json` is re-locked until the repo is re-trusted.
                     let mcp_agent = respawn_config.agent_key.clone();
                     let mcp_session = session_id.clone();
+                    let mcp_profile = respawn_config.source_profile.clone();
+                    let mcp_cwd = respawn_config.cwd.clone();
                     respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
-                        resolve_mcp_layers(&mcp_agent, &mcp_session)
+                        resolve_mcp_layers(
+                            &mcp_agent,
+                            &mcp_session,
+                            mcp_profile.as_deref(),
+                            &mcp_cwd,
+                        )
                     })
                     .await
                     .unwrap_or_else(|e| {
@@ -2994,13 +3103,15 @@ mod tests {
     }
 
     /// `resolve_mcp_layers` is the supervisor's own resolver: it reads the
-    /// agent's native config (HOME-relative) and the global `<app_dir>/mcp.json`,
-    /// then merges with global winning name collisions. The integration test in
-    /// `tests/integration/acp_mcp.rs` precomputes the merge itself and so never
-    /// covers this wiring; this test exercises it end to end against temp dirs.
+    /// agent's native config (HOME-relative), the global `<app_dir>/mcp.json`,
+    /// and the session's per-profile `<profile_dir>/mcp.json` (#1986), then
+    /// merges lowest-first so the per-profile layer wins, then global, then
+    /// native. The integration test in `tests/integration/acp_mcp.rs` precomputes
+    /// the merge itself and so never covers this wiring; this test exercises it
+    /// end to end against temp dirs.
     #[tokio::test]
     #[serial_test::serial]
-    async fn resolve_mcp_layers_merges_native_under_global() {
+    async fn resolve_mcp_layers_merges_native_global_and_profile() {
         let tmp = tempfile::TempDir::new().unwrap();
         // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
         // these env vars, which is the existing pattern in this module.
@@ -3033,28 +3144,121 @@ mod tests {
         )
         .unwrap();
 
-        let merged = tokio::task::spawn_blocking(|| resolve_mcp_layers("claude", "resolve-test"))
-            .await
-            .unwrap();
+        // Per-profile layer for profile "work": adds "profile-only" and overrides
+        // "shared" again. Highest precedence, so it must win "shared".
+        let profile_dir = crate::session::get_profile_dir_path("work").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("mcp.json"),
+            r#"{ "mcpServers": {
+                "profile-only": { "command": "p" },
+                "shared": { "command": "from-profile" }
+            } }"#,
+        )
+        .unwrap();
+
+        // cwd with no `.mcp.json`: the project-local layer contributes nothing,
+        // so this case still resolves to native + global + profile only.
+        let cwd = tmp.path().to_path_buf();
+        let merged = tokio::task::spawn_blocking(move || {
+            resolve_mcp_layers("claude", "resolve-test", Some("work"), &cwd)
+        })
+        .await
+        .unwrap();
 
         let val = serde_json::to_value(&merged).unwrap();
         let arr = val.as_array().expect("mcp_servers serializes to an array");
-        assert_eq!(arr.len(), 3, "native + global union, got {val}");
+        assert_eq!(arr.len(), 4, "native + global + profile union, got {val}");
         let shared = arr
             .iter()
             .find(|s| s["name"] == "shared")
             .expect("shared server present");
         assert_eq!(
-            shared["command"], "from-global",
-            "global must win the name collision, got {val}"
+            shared["command"], "from-profile",
+            "per-profile must win the name collision, got {val}"
         );
+        for expected in ["native-only", "global-only", "profile-only"] {
+            assert!(
+                arr.iter().any(|s| s["name"] == expected),
+                "{expected} must survive the merge, got {val}"
+            );
+        }
+    }
+
+    /// Project-local `.mcp.json` (#1985) is the top layer, but gated on repo
+    /// trust: untrusted -> skipped; trusted at the file's fingerprint -> wins
+    /// every other layer on a name collision.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_mcp_layers_gates_project_local_on_trust() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; matches the sibling resolver test.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mcp.json"),
+            r#"{ "mcpServers": { "shared": { "command": "from-global" } } }"#,
+        )
+        .unwrap();
+
+        // A repo dir (no .git, so it is its own trust source) with a project file
+        // that defines "project-only" and overrides "shared".
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{ "mcpServers": {
+                "project-only": { "command": "pl" },
+                "shared": { "command": "from-project" }
+            } }"#,
+        )
+        .unwrap();
+
+        // Untrusted: project-local is skipped, "shared" stays the global value.
+        let cwd = repo.clone();
+        let merged = tokio::task::spawn_blocking(move || {
+            resolve_mcp_layers("claude", "resolve-test", None, &cwd)
+        })
+        .await
+        .unwrap();
+        let val = serde_json::to_value(&merged).unwrap();
+        let arr = val.as_array().unwrap();
         assert!(
-            arr.iter().any(|s| s["name"] == "native-only"),
-            "native-only must survive the merge, got {val}"
+            !arr.iter().any(|s| s["name"] == "project-only"),
+            "untrusted project-local must be skipped, got {val}"
         );
+        assert_eq!(
+            arr.iter().find(|s| s["name"] == "shared").unwrap()["command"],
+            "from-global",
+            "untrusted project-local must not override global, got {val}"
+        );
+
+        // Trust the repo at the file's current fingerprint, then re-resolve.
+        let servers = crate::session::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::project_mcp::fingerprint(&servers);
+        crate::session::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+
+        let cwd = repo.clone();
+        let merged = tokio::task::spawn_blocking(move || {
+            resolve_mcp_layers("claude", "resolve-test", None, &cwd)
+        })
+        .await
+        .unwrap();
+        let val = serde_json::to_value(&merged).unwrap();
+        let arr = val.as_array().unwrap();
         assert!(
-            arr.iter().any(|s| s["name"] == "global-only"),
-            "global-only must survive the merge, got {val}"
+            arr.iter().any(|s| s["name"] == "project-only"),
+            "trusted project-local must be forwarded, got {val}"
+        );
+        assert_eq!(
+            arr.iter().find(|s| s["name"] == "shared").unwrap()["command"],
+            "from-project",
+            "trusted project-local must win the name collision, got {val}"
         );
     }
 

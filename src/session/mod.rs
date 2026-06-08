@@ -12,6 +12,7 @@ pub mod idle_reap;
 mod instance;
 pub mod poller;
 pub mod profile_config;
+pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
@@ -53,10 +54,10 @@ pub use profile_config::{
 pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use repo_config::{
-    check_hook_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
+    check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
-    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTrustStatus, HooksConfig,
-    RepoConfig,
+    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HooksConfig, RepoConfig,
+    RepoTrust, TrustSurface,
 };
 pub(crate) use storage::atomic_write;
 pub use storage::{load_workspace_ordering, update_workspace_ordering, Storage, WorkspaceOrdering};
