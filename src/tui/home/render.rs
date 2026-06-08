@@ -2138,9 +2138,14 @@ impl HomeView {
         }
 
         // In live-send mode, place a real terminal cursor over the preview at
-        // the agent pane's cursor cell. `capture-pane` carries only text, so
-        // without this the "feels-attached" preview shows no cursor even
-        // though a direct tmux attach would (#cursor-in-live-preview).
+        // the target pane's cursor cell. `capture-pane` carries only cell text
+        // (plus SGR color), not the cursor, so without this the
+        // "feels-attached" preview shows no cursor for programs that rely on
+        // the hardware cursor (shells, codex, anything using DECTCEM) even
+        // though a direct tmux attach would. Programs that paint their own
+        // caret into the cells (e.g. Claude Code's reverse-video block) hide
+        // the hardware cursor, so `cursor_flag` is 0 and this paints nothing
+        // over them, avoiding a double cursor.
         if let Some(pos) = self.live_preview_cursor_pos() {
             frame.set_cursor_position(pos);
         }
