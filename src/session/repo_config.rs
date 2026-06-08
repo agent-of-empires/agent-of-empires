@@ -902,11 +902,15 @@ fn run_hooks_streamed(
                 detail.push_str(&format!("\n{}:\n{}", label, lines.join("\n")));
             }
             if commands.len() > 1 {
-                detail.push_str(&format!(
-                    "\n(hook {} of {}; remaining hooks skipped)",
-                    idx + 1,
-                    commands.len()
-                ));
+                if idx + 1 < commands.len() {
+                    detail.push_str(&format!(
+                        "\n(hook {} of {}; remaining hooks skipped)",
+                        idx + 1,
+                        commands.len()
+                    ));
+                } else {
+                    detail.push_str(&format!("\n(hook {} of {})", idx + 1, commands.len()));
+                }
             }
             let _ = progress_tx.send(HookProgress::Output(detail.clone()));
             anyhow::bail!(detail);
@@ -1698,6 +1702,20 @@ mod tests {
             "got: {}",
             msg
         );
+    }
+
+    /// When the last hook fails there is nothing left to skip, so the position
+    /// text omits the "remaining hooks skipped" suffix.
+    #[test]
+    fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("last hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("(hook 2 of 2)"), "got: {}", msg);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
     }
 
     /// A single hook keeps the error free of position noise.
