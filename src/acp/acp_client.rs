@@ -389,6 +389,14 @@ const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from
 /// against the adapter ignoring the signal, not against socket /
 /// stdout / process-level wedges that prevent the PromptResponse from
 /// reaching the daemon at all. See #1196.
+///
+/// claude-agent-acp >=0.41.0 (upstream #680) also force-resolves a
+/// prompt loop wedged in a `TaskOutput { block: true }` poll against a
+/// hung background task: ~30s after the first cancel it returns
+/// `cancelled` instead of hanging forever. The 0.41.0 floor (see
+/// `agent_compat`) guarantees that path, so a cancel during off-protocol
+/// background work no longer rides the 30-minute
+/// `OFF_PROTOCOL_WORK_GRACE_FLOOR` below before recovering.
 pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Vendor-agnostic silent-orphan grace fallback used when no config
@@ -405,8 +413,11 @@ const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::fr
 /// The watchdog stays armed but uses this as a floor against the
 /// configured base grace, so an operator who deliberately set a higher
 /// `silent_orphan_grace_secs` still wins. Finite by design: if claude-
-/// agent-acp hangs DURING the off-protocol wait, the watchdog still
-/// recovers after 30 minutes rather than holding the turn open forever.
+/// agent-acp hangs DURING the off-protocol wait with no cancel sent, the
+/// watchdog still recovers after 30 minutes rather than holding the turn
+/// open forever. When a cancel IS sent, claude-agent-acp >=0.41.0
+/// (upstream #680) force-resolves the wedge in ~30s, so this 30-minute
+/// floor only governs the un-cancelled quiet-wait case.
 /// See #1360, #1401, and upstream `agentclientprotocol/claude-agent-acp#336`.
 const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 

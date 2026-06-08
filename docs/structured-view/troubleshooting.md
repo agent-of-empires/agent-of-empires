@@ -53,14 +53,14 @@ install is incomplete. Reinstall aoe via your package manager (e.g.,
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
-aoe requires `claude-agent-acp` v0.39.0 or newer. Install the official adapter:
+aoe requires `claude-agent-acp` v0.41.0 or newer. Install the official adapter:
 
 ```bash
 npm install -g @agentclientprotocol/claude-agent-acp@latest
 ```
 
 Then run `claude login` if you haven't already. If an older version is pinned by
-an internal mirror, ship 0.39.0 from the mirror or run the `@latest` install
+an internal mirror, ship 0.41.0 from the mirror or run the `@latest` install
 above before starting `aoe serve`.
 
 ### "Failed to start structured view agent" while the adapter is installed
