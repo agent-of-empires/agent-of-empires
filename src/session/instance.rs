@@ -2989,6 +2989,21 @@ impl Instance {
     /// `finalize_launch` writes those fields and they would otherwise be
     /// dropped with the clone. See `apply_post_restart_sync`.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        self.ready_pane(true)
+    }
+
+    /// Like `ensure_pane_ready`, but returns as soon as the pane is (re)spawned
+    /// without polling for it to settle past the boot shell. Callers that need
+    /// to land keystrokes immediately (send / live-send) must use
+    /// `ensure_pane_ready` so the keys don't hit the boot prompt. Restore uses
+    /// this: it has nothing to send, only needs the session Running again, and
+    /// must not block the TUI event loop for the readiness probe (up to 3s).
+    /// The status poller and preview capture pick the pane up on the next tick.
+    pub fn respawn_pane_detached(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        self.ready_pane(false)
+    }
+
+    fn ready_pane(&mut self, wait: bool) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -3006,7 +3021,9 @@ impl Instance {
             let outcome = self
                 .start_with_resume_fallback(None, false)
                 .map_err(EnsureReadyError::Tmux)?;
-            self.wait_for_pane_ready(&session);
+            if wait {
+                self.wait_for_pane_ready(&session);
+            }
             let stale_sid = match outcome {
                 StartOutcome::Restarted { stale_sid } => Some(stale_sid),
                 StartOutcome::Resumed | StartOutcome::Fresh => None,
@@ -3017,7 +3034,9 @@ impl Instance {
             let outcome = self
                 .restart_with_size(None)
                 .map_err(EnsureReadyError::Tmux)?;
-            self.wait_for_pane_ready(&session);
+            if wait {
+                self.wait_for_pane_ready(&session);
+            }
             let stale_sid = match outcome {
                 StartOutcome::Restarted { stale_sid } => Some(stale_sid),
                 StartOutcome::Resumed | StartOutcome::Fresh => None,
