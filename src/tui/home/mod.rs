@@ -961,6 +961,31 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
 /// once per failure burst, not once per tick. The dialog body aggregates
 /// every currently-failing source (storage and config) into a single
 /// message.
+/// Distinguishes create vs delete in `rewire_after_profile_mutation`
+/// so call sites cannot drift in a parallel-string convention; the two
+/// methods produce the structured-log label and the user-facing
+/// past-tense word.
+pub(super) enum ProfileMutation {
+    Create,
+    Delete,
+}
+
+impl ProfileMutation {
+    fn op_label(&self) -> &'static str {
+        match self {
+            Self::Create => "create_profile",
+            Self::Delete => "delete_profile",
+        }
+    }
+
+    fn past_tense(&self) -> &'static str {
+        match self {
+            Self::Create => "created",
+            Self::Delete => "deleted",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ReloadFailureState {
     storage_failed: bool,
@@ -1960,16 +1985,16 @@ impl HomeView {
     }
 
     /// Rewire disk + config subscriptions after a successful profile
-    /// create or delete. `op_label` is `"create_profile"` or
-    /// `"delete_profile"` (used in tracing fields and log messages);
-    /// `past_tense` is `"created"` or `"deleted"` (used in the
-    /// user-facing dialog text).
+    /// create or delete. The mutation enum produces both the structured-
+    /// log label and the user-facing past-tense word so call sites
+    /// cannot drift in a parallel-string convention.
     pub(super) fn rewire_after_profile_mutation(
         &mut self,
         profile_name: &str,
-        op_label: &str,
-        past_tense: &str,
+        mutation: ProfileMutation,
     ) {
+        let op_label = mutation.op_label();
+        let past_tense = mutation.past_tense();
         match crate::session::list_profiles() {
             Ok(profiles) => {
                 if let Err(e) = self.rewire_disk_subscriptions(&profiles) {

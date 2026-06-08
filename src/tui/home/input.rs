@@ -1939,8 +1939,7 @@ impl HomeView {
                             Ok(()) => {
                                 self.rewire_after_profile_mutation(
                                     &name,
-                                    "create_profile",
-                                    "created",
+                                    crate::tui::home::ProfileMutation::Create,
                                 );
                                 if let Err(e) = self.switch_profile(Some(name)) {
                                     tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
@@ -1959,8 +1958,7 @@ impl HomeView {
                             Ok(()) => {
                                 self.rewire_after_profile_mutation(
                                     &name,
-                                    "delete_profile",
-                                    "deleted",
+                                    crate::tui::home::ProfileMutation::Delete,
                                 );
                                 self.show_profile_picker();
                             }

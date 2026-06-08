@@ -267,8 +267,8 @@ async fn rewire_after_profile_mutation_surfaces_dialog_when_list_profiles_fails(
         "precondition: no dialog before the failure"
     );
 
-    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
-    view.rewire_after_profile_mutation("seam-test", "create_profile", "created");
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+    view.rewire_after_profile_mutation("seam-test", super::ProfileMutation::Create);
 
     assert!(
         view.info_dialog.is_some(),
@@ -306,7 +306,7 @@ async fn reload_storage_only_survives_list_profiles_failure() {
         })
         .expect("peer write");
 
-    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
     view.reload_storage_only()
         .expect("reload should degrade, not fail");
 
@@ -343,8 +343,8 @@ async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
         "keep me",
     ));
 
-    crate::session::FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
-    view.rewire_after_profile_mutation("dialog-guard", "delete_profile", "deleted");
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+    view.rewire_after_profile_mutation("dialog-guard", super::ProfileMutation::Delete);
 
     assert!(
         crate::session::list_profiles().is_ok(),

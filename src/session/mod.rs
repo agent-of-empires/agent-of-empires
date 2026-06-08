@@ -324,6 +324,28 @@ pub fn list_profiles() -> Result<Vec<String>> {
 pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// RAII guard for the `FAIL_NEXT_LIST_PROFILES` test seam. `new` sets
+/// the flag; `drop` clears it unconditionally so a panic between set
+/// and the next `list_profiles` call does not leak the seam into a
+/// subsequent test that picks up the stale `true` value.
+#[cfg(test)]
+pub(crate) struct FailNextListProfilesGuard;
+
+#[cfg(test)]
+impl FailNextListProfilesGuard {
+    pub(crate) fn new() -> Self {
+        FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextListProfilesGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_LIST_PROFILES.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
 /// Symlinks are aliases used by the `cs`/`cxa` account-switcher (e.g.
 /// `forit-work -> default`) so multiple Claude account names share a single
