@@ -525,7 +525,13 @@ mod tests {
             .unwrap_or(false)
     }
 
+    // Serialized like every test that talks to the shared tmux server: a
+    // non-serial test that kills the server's last session makes the server
+    // exit, and a `#[serial]` peer whose `new-session` connects inside that
+    // teardown window fails with "server exited unexpectedly" (CI flake on
+    // update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt).
     #[test]
+    #[serial_test::serial]
     fn kill_session_if_present_swallows_missing_session() {
         if !tmux_available() {
             return;
@@ -538,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn kill_session_if_present_kills_existing_session() {
         if !tmux_available() {
             return;

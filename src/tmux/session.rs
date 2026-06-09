@@ -691,7 +691,8 @@ mod tests {
         // `printf` (no trailing newline, no shell prompt, no input echo) parks
         // the cursor deterministically just past the written text: "hello" is
         // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
-        // alive across the capture.
+        // alive across the capture; generous so a test thread starved by
+        // parallel suite load can't outlive the pane before capturing.
         let status = Command::new("tmux")
             .args([
                 "new-session",
@@ -702,17 +703,28 @@ mod tests {
                 "40",
                 "-y",
                 "10",
-                "sh -c 'printf hello; sleep 5'",
+                "sh -c 'printf hello; sleep 60'",
             ])
             .status()
             .expect("tmux new-session");
         assert!(status.success());
-        std::thread::sleep(std::time::Duration::from_millis(400));
 
+        // Poll until the pane has painted; a fixed sleep is flaky under
+        // parallel test load (the pane needs the shell to spawn and printf
+        // to run before capture sees anything).
         let session = Session::from_name(&name);
-        let (content, cursor) = session
-            .capture_pane_with_cursor(5)
-            .expect("capture with cursor");
+        let mut painted = (String::new(), None);
+        for _ in 0..50 {
+            let (content, cursor) = session
+                .capture_pane_with_cursor(5)
+                .expect("capture with cursor");
+            if content.contains("hello") {
+                painted = (content, cursor);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let (content, cursor) = painted;
 
         // The capture content is the same text the plain path would return:
         // the cursor line must have been split off, not leak into the body.
