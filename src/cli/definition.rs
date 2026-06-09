@@ -16,6 +16,7 @@ use super::list::ListArgs;
 #[cfg(feature = "serve")]
 use super::log_level::LogLevelArgs;
 use super::logs::LogsArgs;
+use super::mcp::McpCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::remove::RemoveArgs;
@@ -151,6 +152,12 @@ pub enum Commands {
         command: TelemetryCommands,
     },
 
+    /// Inspect the effective MCP server set (provenance, conflicts, drift)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+
     /// Start a web dashboard for remote session access
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
@@ -221,6 +228,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "sounds",
     "theme",
     "telemetry",
+    "mcp",
     "serve",
     "url",
     "acp",
@@ -260,6 +268,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Sounds { .. } => "sounds",
         Commands::Theme { .. } => "theme",
         Commands::Telemetry { .. } => "telemetry",
+        Commands::Mcp { .. } => "mcp",
         #[cfg(feature = "serve")]
         Commands::Serve(_) => "serve",
         #[cfg(feature = "serve")]

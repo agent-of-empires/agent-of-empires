@@ -865,14 +865,23 @@ export const SessionRow = memo(function SessionRow({
     // single session has no title yet, label is the branch and accepting
     // the prefilled value should still set the title.
     if (!trimmed || trimmed === sessionTitle || !sessionId) return;
-    await renameSession(sessionId, trimmed);
+    // For a tied worktree session the rename also moves the directory and can
+    // fail (e.g. 409 while running); surface the server message. See #1927.
+    const result = await renameSession(sessionId, trimmed);
+    if (!result.ok && result.message) {
+      reportError(result.message);
+    }
   };
 
   // Editing the workdir name moves the worktree directory, so it is only
-  // offered for an aoe-managed worktree session that is not running. See
-  // #1723.
+  // offered for an aoe-managed worktree session that is not running. When the
+  // session is tied (#1927) naming collapses into the rename action, so the
+  // standalone workdir edit is hidden.
   const canEditWorkdir =
-    !!firstSession?.has_managed_worktree && !runningSession && !!sessionId;
+    !!firstSession?.has_managed_worktree &&
+    !firstSession?.tie_workdir_to_name &&
+    !runningSession &&
+    !!sessionId;
 
   const openWorkdirModal = () => {
     setContextMenu(null);

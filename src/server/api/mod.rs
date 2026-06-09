@@ -16,9 +16,10 @@ mod acp;
 mod client_log;
 mod git;
 mod log_level;
+mod mcp;
 mod projects;
 mod sessions;
-mod system;
+pub(crate) mod system;
 mod telemetry;
 
 #[cfg(feature = "serve")]
@@ -33,6 +34,7 @@ pub use acp::{
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
+pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
@@ -46,7 +48,7 @@ pub use system::{
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
     get_settings, get_settings_schema, get_update_status, list_agents, list_groups, list_profiles,
     list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
-    update_profile_settings, update_settings,
+    update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
@@ -160,6 +162,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
             (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
@@ -302,6 +309,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
             (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),

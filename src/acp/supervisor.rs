@@ -490,146 +490,12 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::McpServer> {
-    use crate::acp::mcp_config::{
-        load_global_mcp_servers, load_native_mcp_servers_from_home, load_profile_mcp_servers,
-        merge_by_precedence, project_servers_to_acp, summarize, McpLayer,
-    };
+    use crate::session::mcp_model::{resolve_effective, summarize};
 
-    let native = match load_native_mcp_servers_from_home(agent_key) {
-        Ok(servers) => servers,
-        Err(e) => {
-            warn!(
-                target: "acp.mcp",
-                session = %session_id,
-                agent = %agent_key,
-                error = %e,
-                "failed to load native MCP config; forwarding none from it"
-            );
-            Vec::new()
-        }
-    };
-
-    let global = match crate::session::get_app_dir() {
-        Ok(app_dir) => match load_global_mcp_servers(&app_dir) {
-            Ok(servers) => servers,
-            Err(e) => {
-                warn!(
-                    target: "acp.mcp",
-                    session = %session_id,
-                    error = %e,
-                    "failed to load global MCP config; forwarding none from it"
-                );
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            warn!(
-                target: "acp.mcp",
-                session = %session_id,
-                error = %e,
-                "could not resolve app dir for MCP config; forwarding none from it"
-            );
-            Vec::new()
-        }
-    };
-
-    // Per-profile layer: `<profile_dir>/mcp.json` for the session's profile,
-    // resolved read-only so a session under a profile with no MCP file never
-    // creates a stub directory. An empty/None profile resolves to the default.
-    let per_profile = match crate::session::get_profile_dir_path(profile.unwrap_or_default()) {
-        Ok(profile_dir) => match load_profile_mcp_servers(&profile_dir) {
-            Ok(servers) => servers,
-            Err(e) => {
-                warn!(
-                    target: "acp.mcp",
-                    session = %session_id,
-                    error = %e,
-                    "failed to load per-profile MCP config; forwarding none from it"
-                );
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            warn!(
-                target: "acp.mcp",
-                session = %session_id,
-                error = %e,
-                "could not resolve profile dir for MCP config; forwarding none from it"
-            );
-            Vec::new()
-        }
-    };
-
-    // Project-local layer (#1985): the repo's `.mcp.json`, highest precedence,
-    // but forwarded ONLY when the repo is trusted for the file's current
-    // fingerprint. A repo-provided stdio server launches its `command` the
-    // moment the session spawns, so an untrusted (or changed) file is a
-    // zero-click RCE surface: skip it and log, exactly like the create-time
-    // trust gate refuses to run untrusted hooks. The file is read from the main
-    // repo (resolved from a worktree path), the same source the trust dialog
-    // reviewed, so the forwarded set equals the reviewed set. The gate runs on
-    // every spawn and respawn, so an edit to `.mcp.json` re-locks it until the
-    // user re-approves at session-create.
-    let source = crate::session::repo_config::repo_config_source_path(cwd);
-    let project_local = match crate::session::project_mcp::load_project_mcp_servers(&source) {
-        Ok(servers) if servers.is_empty() => Vec::new(),
-        Ok(servers) => {
-            let hash = crate::session::project_mcp::fingerprint(&servers);
-            match crate::session::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
-                Ok(true) => project_servers_to_acp(servers),
-                Ok(false) => {
-                    warn!(
-                        target: "acp.mcp",
-                        session = %session_id,
-                        repo = %source.display(),
-                        count = servers.len(),
-                        "skipping project-local MCP servers: repo not trusted at this .mcp.json fingerprint; review and approve by creating a session for this repo in the TUI or CLI"
-                    );
-                    Vec::new()
-                }
-                Err(e) => {
-                    warn!(
-                        target: "acp.mcp",
-                        session = %session_id,
-                        repo = %source.display(),
-                        error = %e,
-                        "could not check project-local MCP trust; forwarding none from it"
-                    );
-                    Vec::new()
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                target: "acp.mcp",
-                session = %session_id,
-                repo = %source.display(),
-                error = %e,
-                "failed to load project-local MCP config; forwarding none from it"
-            );
-            Vec::new()
-        }
-    };
-
-    let merged = merge_by_precedence(vec![
-        McpLayer {
-            label: "agent-native",
-            servers: native,
-        },
-        McpLayer {
-            label: "global",
-            servers: global,
-        },
-        McpLayer {
-            label: "per-profile",
-            servers: per_profile,
-        },
-        McpLayer {
-            label: "project-local",
-            servers: project_local,
-        },
-    ]);
-
+    // One resolver for forwarding and the management surfaces (#1996): assemble
+    // the trust-gated, provenance-tagged effective set, then convert only the
+    // winning definitions to ACP wire values just before forwarding.
+    let merged = resolve_effective(agent_key, profile, cwd);
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -639,7 +505,7 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    merged
+    crate::acp::mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect())
 }
 
 /// Overlay an instance command override onto a resolved `AgentSpec`.

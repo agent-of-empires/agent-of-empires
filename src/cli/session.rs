@@ -141,6 +141,12 @@ pub struct RenameArgs {
     /// New group for the session (empty string to ungroup)
     #[arg(short, long)]
     group: Option<String>,
+
+    /// When the session is tied (session.tie_workdir_to_name) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match.
+    /// Off by default; ignored for untied / non-worktree sessions.
+    #[arg(long)]
+    rename_branch: bool,
 }
 
 #[derive(Args)]
@@ -268,7 +274,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.favorite();
@@ -280,7 +286,7 @@ async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unfavorite();
@@ -292,7 +298,7 @@ async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
@@ -329,7 +335,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         let id = super::resolve_session(&args.identifier, instances)?
             .id
@@ -358,7 +364,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     crate::session::validate_snooze_duration(raw_minutes).map_err(|e| anyhow::anyhow!("{}", e))?;
     let minutes = raw_minutes as u32;
 
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.snooze(minutes);
@@ -370,7 +376,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
 }
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unsnooze();
@@ -382,7 +388,7 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
     // `source_profile` so config resolution honors the right profile.
@@ -456,7 +462,7 @@ fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
 }
 
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier, do tmux/container shutdown.
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
@@ -517,7 +523,7 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
     // across the parallel restart fan-out below; phase 3 re-loads under
@@ -691,7 +697,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier and
     // rehydrate `source_profile` for config resolution.
@@ -809,7 +815,7 @@ async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time:
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -828,7 +834,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -891,7 +897,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = if let Some(id) = &args.identifier {
@@ -977,7 +983,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("At least one of --title or --group must be specified");
     }
 
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
     // no identifier given) and the old/new title pair so we can do the
@@ -1015,11 +1021,56 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .trim()
         .to_string();
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
+    let title_changed = old_title != effective_title;
+
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title (and optionally the branch), so
+    // the two cannot drift. Decided per-session from the resolved setting.
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
+
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
+    if tied && (title_changed || args.rename_branch) {
+        let current_path = inst.project_path.clone();
+        let worktree_info = inst
+            .worktree_info
+            .clone()
+            .expect("tie_workdir_applies implies worktree_info is Some");
+        // Persisted status can lag the live tmux pane; moving a running
+        // worktree is unsafe, so recompute before enforcing the gate.
+        let mut live = inst.clone();
+        crate::tmux::refresh_session_cache();
+        live.update_status();
+        if live.status.blocks_worktree_edit() {
+            bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
+        }
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+        match crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &worktree_info,
+                current_path: std::path::Path::new(&current_path),
+                new_name: &leaf,
+                rename_branch: args.rename_branch,
+            },
+        ) {
+            Ok(outcome) => {
+                new_path = Some(outcome.new_path.to_string_lossy().to_string());
+                new_branch = outcome.new_branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
+            Err(e) => return Err(e.into()),
+        }
+    } else if args.rename_branch {
+        bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
+    }
 
     // Phase 2 (unlocked): tmux rename if the title changed. Side effect on
     // the running tmux server, fast but external state, do it outside the
     // closure.
-    if old_title != effective_title {
+    if title_changed {
         let tmux_session = crate::tmux::Session::new(&id, &old_title)?;
         if tmux_session.exists() {
             let new_tmux_name = crate::tmux::Session::generate_name(&id, &effective_title);
@@ -1036,12 +1087,20 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // sessions are preserved. `create_group` is idempotent and only runs
     // when the closure actually mutated `group_path`, so `groups.json` is
     // rewritten only on real group changes (cf. `update`'s diff check).
-    storage.update(|instances, groups| {
+    let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
         inst.title = effective_title.clone();
+        if let Some(path) = &new_path {
+            inst.project_path = path.clone();
+        }
+        if let Some(branch) = &new_branch {
+            if let Some(wt) = inst.worktree_info.as_mut() {
+                wt.branch = branch.clone();
+            }
+        }
         if let Some(group) = &new_group {
             inst.group_path = group.clone();
         }
@@ -1052,9 +1111,23 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             *groups = group_tree.get_all_groups();
         }
         Ok(())
-    })?;
+    });
+    if let Err(e) = persist {
+        // When the git move already landed, surface that the disk and metadata
+        // are out of sync rather than a bare persist error.
+        if let Some(path) = &new_path {
+            bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {e}. Re-run to retry.");
+        }
+        return Err(e);
+    }
 
-    if old_title != effective_title {
+    if let Some(path) = &new_path {
+        println!("✓ Worktree moved to: {}", path);
+        if let Some(branch) = &new_branch {
+            println!("  Branch renamed to: {}", branch);
+        }
+    }
+    if title_changed {
         println!("✓ Renamed session: {} → {}", old_title, effective_title);
     } else {
         println!("✓ Updated session: {}", effective_title);
@@ -1064,7 +1137,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?
@@ -1092,6 +1165,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
     };
+    // When tied (#1927) the directory follows the title, so reject the
+    // standalone edit and point at the unified rename instead.
+    if inst.tie_workdir_applies(
+        crate::session::profile_config::resolve_config_or_warn(profile)
+            .session
+            .tie_workdir_to_name,
+    ) {
+        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+    }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
     // enforcing the guard.
@@ -1152,7 +1234,7 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::new(profile_name) {
+        if let Ok(storage) = Storage::new_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if let Some(inst) = instances.iter().find(|i| {
                     let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
@@ -1201,7 +1283,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(trimmed)
     };
 
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             #[cfg(feature = "serve")]
@@ -1243,7 +1325,7 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
     }
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let instances = storage.load()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -1479,7 +1561,7 @@ mod acp_reject_tests {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-        let storage = Storage::new("acp-reject").unwrap();
+        let storage = Storage::new_unwatched("acp-reject").unwrap();
         let mut inst = Instance::new("acp_session", "/tmp/x");
         inst.view = crate::session::View::Structured;
         let id = inst.id.clone();

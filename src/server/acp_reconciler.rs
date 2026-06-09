@@ -567,22 +567,23 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         // Persist BEFORE shutdown: a daemon restart must keep the worker
         // stopped, and if persistence fails we must not orphan a killed
         // worker that the next tick would respawn.
-        let persisted = if let Ok(storage) = crate::session::Storage::new(&profile) {
-            let id_persist = id.clone();
-            tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                        inst.mark_idle_dormant();
-                    }
-                    Ok(())
+        let persisted =
+            if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
+                let id_persist = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            inst.mark_idle_dormant();
+                        }
+                        Ok(())
+                    })
                 })
-            })
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false)
-        } else {
-            false
-        };
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            } else {
+                false
+            };
         if !persisted {
             // Roll back the in-memory mark and leave the worker alive; retry
             // on the next interval.
@@ -618,7 +619,9 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
                         inst.idle_dormant_since = None;
                     }
                 }
-                if let Ok(storage) = crate::session::Storage::new(&profile) {
+                if let Ok(storage) =
+                    crate::session::Storage::new(&profile, state.file_watch.clone())
+                {
                     let id_clear = id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         storage.update(|instances, _groups| {

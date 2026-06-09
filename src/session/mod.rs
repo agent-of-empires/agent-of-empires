@@ -10,6 +10,9 @@ pub(crate) mod environment;
 mod groups;
 pub mod idle_reap;
 mod instance;
+pub mod mcp_model;
+pub mod mcp_overrides;
+pub mod mcp_state;
 pub mod poller;
 pub mod profile_config;
 pub mod project_mcp;
@@ -45,6 +48,7 @@ pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
     Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    TMUX_SESSION_GONE_ERROR,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
@@ -908,7 +912,7 @@ mod tests {
         assert_eq!(resolved, "default");
         assert!(dir.join("profiles").join("default").exists());
 
-        let storage = Storage::new("default").unwrap();
+        let storage = Storage::new_unwatched("default").unwrap();
         assert_eq!(storage.profile(), "default");
     }
 

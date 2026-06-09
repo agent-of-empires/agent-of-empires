@@ -61,15 +61,16 @@ export {
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the structured view composer textarea.
- *  - `newline`: insert a newline natively, suppress the primitive's
- *    Send. Used on touch-primary devices so multi-line drafting
- *    matches WhatsApp / Slack / ChatGPT mobile conventions (#1129).
  *  - `send`: dispatch via our custom send path; covers the
  *    mid-turn queue branch (#1031) where ComposerPrimitive.Input
  *    hard-blocks Enter on its own.
- *  - `default`: let the primitive run its built-in keymap (desktop
- *    Enter-to-send, Shift+Enter for newline, etc.). */
-export type EnterAction = "newline" | "send" | "default";
+ *  - `default`: let the primitive run its built-in keymap. On
+ *    desktop that is Enter-to-send / Shift+Enter for newline. On
+ *    touch-primary devices the `unstable_insertNewlineOnTouchEnter`
+ *    prop on ComposerPrimitive.Input downgrades plain Enter to a
+ *    native newline, so the on-screen Return key never dispatches
+ *    (#1129); we no longer intercept it here. */
+export type EnterAction = "send" | "default";
 
 /** Pure decision helper for the composer's Enter keystroke. Extracted
  *  so the decision matrix can be unit-tested without mounting the
@@ -88,7 +89,13 @@ export function decideEnterAction(
   if (event.key !== "Enter") return "default";
   if (event.isComposing) return "default";
   if (event.shiftKey || event.ctrlKey || event.metaKey) return "default";
-  if (ctx.isMobile) return "newline";
+  // Touch-primary devices: ComposerPrimitive.Input's
+  // `unstable_insertNewlineOnTouchEnter` resolves the submit mode to
+  // "none", so plain Enter inserts a newline natively and never
+  // submits. Fall through to "default" and let the primitive own it;
+  // crucially this also keeps mobile mid-turn Enter from hitting the
+  // "send" queue path below.
+  if (ctx.isMobile) return "default";
   if (ctx.turnActive) return "send";
   return "default";
 }
@@ -689,6 +696,15 @@ export function Composer({
             <ComposerPrimitive.Input
               ref={taRef}
               rows={2}
+              // On touch-primary devices (phone / tablet without a
+              // hardware keyboard) plain Enter inserts a newline
+              // instead of dispatching; messages send only via the
+              // explicit Send button. Detected upstream via the
+              // `(pointer: coarse) and (not (any-pointer: fine))`
+              // media query, matching WhatsApp / Slack / ChatGPT
+              // mobile conventions. Replaces our former consumer-side
+              // caret re-insertion dance. See assistant-ui#4091 / #1129.
+              unstable_insertNewlineOnTouchEnter
               // assistant-ui's default Escape binding cancels the active
               // run (see ComposerPrimitive.Input's `cancelOnEscape`
               // default). The structured view deliberately keeps cancel behind
@@ -766,21 +782,19 @@ export function Composer({
                 dictationGuard.flushOnBlur();
               }}
               onKeyDown={(e) => {
-                // Three-way Enter dispatch. See decideEnterAction for
+                // Two-way Enter dispatch. See decideEnterAction for
                 // the full matrix; the inline branches below handle
                 // each outcome:
-                //   - "newline": touch-primary device, plain Enter.
-                //     Stop assistant-ui's bubble-phase Send and let
-                //     the textarea insert a newline natively (no
-                //     preventDefault). Mobile users tap the Send
-                //     button to dispatch.
                 //   - "send": desktop, mid-turn, plain Enter.
                 //     ComposerPrimitive.Input hard-blocks Enter while
                 //     thread.isRunning && !queue (#1031), so we
                 //     intercept and route through our queue path.
                 //   - "default": modifier keys, IME compose, non-Enter
-                //     keys, or desktop idle Enter; let the primitive's
-                //     built-in keymap run.
+                //     keys, desktop idle Enter, or any touch-primary
+                //     Enter; let the primitive's built-in keymap run.
+                //     Touch-primary plain Enter is downgraded to a
+                //     native newline by the Input's
+                //     `unstable_insertNewlineOnTouchEnter` prop.
                 const action = decideEnterAction(
                   {
                     key: e.key,
@@ -792,10 +806,6 @@ export function Composer({
                   { isMobile, turnActive },
                 );
                 if (action === "default") return;
-                if (action === "newline") {
-                  e.stopPropagation();
-                  return;
-                }
                 // action === "send"
                 e.preventDefault();
                 e.stopPropagation();

@@ -961,7 +961,12 @@ fn run_hooks_streamed(
 
     let in_container = matches!(target, HookTarget::Container { .. });
 
-    for cmd in commands {
+    // Streamed lines are consumed live by the progress channel and gone by
+    // the time a failure dialog renders, so keep a bounded tail to attach to
+    // the error; it's the only context that survives to the user.
+    const ERROR_TAIL_LINES: usize = 20;
+
+    for (idx, cmd) in commands.iter().enumerate() {
         tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
         let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
 
@@ -980,16 +985,43 @@ fn run_hooks_streamed(
             .spawn()
             .with_context(|| format!("Failed to execute hook: {}", cmd))?;
 
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut total_lines = 0usize;
         if let Some(stdout) = child.stdout.take() {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                total_lines += 1;
+                if tail.len() == ERROR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
                 let _ = progress_tx.send(HookProgress::Output(line));
             }
         }
 
         let status = child.wait()?;
         if !status.success() {
-            let detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            let mut detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            if !tail.is_empty() {
+                let label = if total_lines > tail.len() {
+                    format!("output (last {} of {} lines)", tail.len(), total_lines)
+                } else {
+                    "output".to_string()
+                };
+                let lines: Vec<String> = tail.into();
+                detail.push_str(&format!("\n{}:\n{}", label, lines.join("\n")));
+            }
+            if commands.len() > 1 {
+                if idx + 1 < commands.len() {
+                    detail.push_str(&format!(
+                        "\n(hook {} of {}; remaining hooks skipped)",
+                        idx + 1,
+                        commands.len()
+                    ));
+                } else {
+                    detail.push_str(&format!("\n(hook {} of {})", idx + 1, commands.len()));
+                }
+            }
             let _ = progress_tx.send(HookProgress::Output(detail.clone()));
             anyhow::bail!(detail);
         }
@@ -1745,6 +1777,85 @@ trusted_at = "2026-01-31T00:00:00Z"
             "SSH_ASKPASS must be defanged, got:\n{}",
             joined
         );
+    }
+
+    /// A failing streamed hook's error must carry the hook's output, not just
+    /// the exit code. Streamed hooks merge stderr into stdout and send it down
+    /// the progress channel, which the TUI discards once creation fails; the
+    /// returned error is the only context that reaches the "Creation Failed"
+    /// dialog (via `CreationResult::Error`), so it has to include the output
+    /// that explains why the hook failed.
+    #[test]
+    fn streamed_hook_failure_error_includes_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The failure detail lives in a script file, not the hook command
+        // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
+        // command text says nothing about why they failed.
+        let script = tmp.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'fatal: dependency xyz not found' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let probe = "sh hook.sh".to_string();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&[probe], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("exit code 3"), "got: {}", msg);
+        assert!(
+            msg.contains("fatal: dependency xyz not found"),
+            "error must include the hook's output so the TUI dialog shows the \
+             actual failure, not just the exit code; got:\n{}",
+            msg
+        );
+    }
+
+    /// With multiple on_create hooks the failure detail says which hook
+    /// failed and that the rest were skipped, so the user doesn't assume
+    /// later hooks ran.
+    #[test]
+    fn streamed_hook_failure_names_position_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec![
+            "true".to_string(),
+            "sh -c 'exit 7'".to_string(),
+            "true".to_string(),
+        ];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("second hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("(hook 2 of 3; remaining hooks skipped)"),
+            "got: {}",
+            msg
+        );
+    }
+
+    /// When the last hook fails there is nothing left to skip, so the position
+    /// text omits the "remaining hooks skipped" suffix.
+    #[test]
+    fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("last hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("(hook 2 of 2)"), "got: {}", msg);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
+    }
+
+    /// A single hook keeps the error free of position noise.
+    #[test]
+    fn streamed_hook_failure_omits_position_when_single() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
     }
 
     /// The CLI/captured path leaves the terminal attached so users running

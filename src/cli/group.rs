@@ -77,7 +77,7 @@ pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
 }
 
 async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, groups) = storage.load_with_groups()?;
 
     let group_tree = GroupTree::new_with_groups(&instances, &groups);
@@ -126,7 +126,7 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 }
 
 async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     let name = args.name.trim().to_string();
     let group_path = if let Some(parent) = &args.parent {
@@ -150,7 +150,7 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
 }
 
 async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let name = args.name.trim().to_string();
     let force = args.force;
 
@@ -195,7 +195,7 @@ async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
 }
 
 async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let identifier = args.identifier.trim().to_string();
     let group = args.group.trim().to_string();
 

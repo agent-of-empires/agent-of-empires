@@ -692,6 +692,13 @@ pub fn build_instance(
         };
         warnings.extend(crate::session::validate_env_entries(effective_env));
 
+        // Glob patterns in volume_ignores are skipped at mount time (they would
+        // materialize a literal `**` dir inside the bind mount, #2036). Surface
+        // the skip here so it isn't silent, matching the env-var warning above.
+        warnings.extend(crate::session::container_config::validate_volume_ignores(
+            &config.sandbox.volume_ignores,
+        ));
+
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,

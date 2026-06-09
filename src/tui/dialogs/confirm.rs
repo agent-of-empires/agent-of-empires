@@ -102,6 +102,13 @@ impl ConfirmDialog {
         &self.action
     }
 
+    /// The `[Yes]` button hit-rect, populated on `render`. Test-only so a
+    /// click path can be exercised at the exact coordinates the dialog draws.
+    #[cfg(test)]
+    pub(crate) fn yes_button_area_for_test(&self) -> ratatui::layout::Rect {
+        self.yes_button_area
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => DialogResult::Cancel,

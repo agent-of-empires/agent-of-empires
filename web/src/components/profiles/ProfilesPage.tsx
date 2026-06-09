@@ -59,9 +59,13 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
   // A request id guards against a slow response for a previously-selected
   // profile winning after a fast switch.
   const loadSeq = useRef(0);
+  // Set once the user edits the description, so the async load's late
+  // `setDescription` can't clobber an in-progress edit.
+  const descriptionDirty = useRef(false);
 
   const loadProfileSettings = (name: string) => {
     const seq = ++loadSeq.current;
+    descriptionDirty.current = false;
     if (!name) {
       setProfileSettings(null);
       setGlobalHooks(undefined);
@@ -75,9 +79,11 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
         setProfileSettings(profile);
         setGlobalHooks(global?.hooks as HooksOverride | undefined);
         setError(null);
-        setDescription(
-          typeof profile?.description === "string" ? profile.description : "",
-        );
+        if (!descriptionDirty.current) {
+          setDescription(
+            typeof profile?.description === "string" ? profile.description : "",
+          );
+        }
       })
       .catch(() => {
         if (seq !== loadSeq.current) return;
@@ -185,6 +191,7 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
       setError("Failed to save description");
       return;
     }
+    descriptionDirty.current = false;
     await reload();
   };
 
@@ -348,7 +355,10 @@ export function ProfilesPage({ onClose, readOnly }: Props) {
                     type="text"
                     value={description}
                     disabled={readOnly}
-                    onChange={(e) => setDescription(e.target.value)}
+                    onChange={(e) => {
+                      descriptionDirty.current = true;
+                      setDescription(e.target.value);
+                    }}
                     placeholder="What this profile is for"
                     className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-sm text-text-primary focus:border-brand-600 focus:outline-none disabled:opacity-60"
                   />

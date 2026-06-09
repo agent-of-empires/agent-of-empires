@@ -232,4 +232,59 @@ describe("ProfilesPage", () => {
     });
     expect(sawHooks).toBe(false);
   });
+
+  // Regression: selecting a profile loads its settings asynchronously and the
+  // load's `.then` writes the description field. A user who starts typing
+  // before that resolves must keep their edit; the late load must not reset
+  // the field (which previously made Save PATCH the loaded value, or null).
+  it("keeps a description edit made while the profile load is still in flight", async () => {
+    // Gate every settings GET so the load stays pending while we type.
+    let releaseLoad: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    fetchSpy.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? "GET";
+      if (/^\/api\/profiles\/[^/]+\/settings$/.test(url) && method === "GET") {
+        return gate.then(() =>
+          jsonResponse({ description: "from-server", hooks: {} }),
+        );
+      }
+      return Promise.resolve(route(url, init as RequestInit | undefined));
+    });
+
+    const api = mount();
+    await selectWork(api);
+    const field = (await waitFor(() =>
+      api.getByPlaceholderText("What this profile is for"),
+    )) as HTMLInputElement;
+
+    // Edit while the settings GET is still pending.
+    fireEvent.change(field, { target: { value: "client repos" } });
+    expect(field.value).toBe("client repos");
+
+    // Resolve the load. "echo global" (from the global-settings GET) renders
+    // only after the load's `.then` runs, so it is a deterministic signal
+    // that the load applied and React flushed.
+    releaseLoad();
+    await waitFor(() => api.getByText("echo global"));
+
+    // The edit survives; the loaded "from-server" value never reaches it.
+    expect(field.value).toBe("client repos");
+    expect(api.queryByDisplayValue("from-server")).toBeNull();
+
+    // Save must carry the user's value, not the clobbered/empty one.
+    fireEvent.click(api.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      const patch = findCall(
+        (url, init) =>
+          url === "/api/profiles/work/settings" && init?.method === "PATCH",
+      );
+      expect(patch).toBeTruthy();
+      expect(JSON.parse(patch![1]!.body as string)).toEqual({
+        description: "client repos",
+      });
+    });
+  });
 });

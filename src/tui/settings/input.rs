@@ -1007,7 +1007,7 @@ mod tests {
         fn fresh_view() -> (TempDir, SettingsView) {
             let temp = TempDir::new().unwrap();
             setup_test_home(&temp);
-            let _ = Storage::new("test").unwrap();
+            let _ = Storage::new_unwatched("test").unwrap();
             let view = SettingsView::new("test", None).unwrap();
             (temp, view)
         }
@@ -1172,7 +1172,7 @@ mod tests {
         fn fresh_view() -> (TempDir, SettingsView) {
             let temp = TempDir::new().unwrap();
             setup_test_home(&temp);
-            let _ = Storage::new("test").unwrap();
+            let _ = Storage::new_unwatched("test").unwrap();
             let view = SettingsView::new("test", None).unwrap();
             (temp, view)
         }

@@ -67,13 +67,16 @@ describe("decideEnterAction (#1129)", () => {
     }
   });
 
-  it("mobile + plain Enter -> 'newline' (idle and mid-turn alike)", () => {
+  it("mobile + plain Enter -> 'default' (primitive inserts newline via unstable_insertNewlineOnTouchEnter, idle and mid-turn alike)", () => {
     expect(
       decideEnterAction(plainEnter, { isMobile: true, turnActive: false }),
-    ).toBe("newline");
+    ).toBe("default");
+    // Mid-turn on mobile must still be "default", never "send": the
+    // mobile guard precedes the turnActive queue branch so the
+    // on-screen Return never dispatches or queues.
     expect(
       decideEnterAction(plainEnter, { isMobile: true, turnActive: true }),
-    ).toBe("newline");
+    ).toBe("default");
   });
 
   it("desktop + mid-turn + plain Enter -> 'send' (queue path)", () => {

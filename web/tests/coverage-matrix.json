@@ -3,6 +3,23 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "settings.mcp-servers",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/mcp-servers.spec.ts"],
+      "components": ["web/src/components/McpServers.tsx"]
+    },
+    {
+      "id": "settings.mcp-servers.handlers",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/McpServers.test.tsx",
+        "src/lib/api.mcp.test.ts"
+      ],
+      "components": ["web/src/components/McpServers.tsx"]
+    },
+    {
       "id": "dashboard.golden-path",
       "kind": "live-playwright",
       "risk": "high",
@@ -86,7 +103,8 @@
       "specs": ["tests/live/settings-persistence-theme.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/SchemaSection.tsx"
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -328,6 +346,13 @@
         "src/lib/api.test.ts",
         "src/components/profiles/__tests__/ProfilesPage.test.tsx"
       ],
+      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+    },
+    {
+      "id": "profiles.description-edit-race",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/profiles/__tests__/ProfilesPage.test.tsx"],
       "components": ["web/src/components/profiles/ProfilesPage.tsx"]
     },
     {
@@ -2425,7 +2450,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/theme-onboarding.spec.ts"],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "onboarding.theme-welcome-unit",
@@ -2435,7 +2464,10 @@
         "src/components/onboarding/__tests__/ThemeIntro.test.tsx",
         "src/lib/__tests__/onboarding.test.ts"
       ],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts"
+      ]
     },
     {
       "id": "shortcuts.single-source",
@@ -2452,6 +2484,13 @@
         "web/src/hooks/useKeyboardShortcuts.ts",
         "web/src/lib/tourSteps.ts"
       ]
+    },
+    {
+      "id": "sessions.file-watch-peer-propagation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/file-watch-peer-propagation.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     }
   ]
 }

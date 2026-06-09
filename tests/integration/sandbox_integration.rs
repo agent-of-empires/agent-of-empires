@@ -71,7 +71,7 @@ fn test_sandbox_info_persists_across_save_load() {
     let temp = tempfile::TempDir::new().unwrap();
     std::env::set_var("HOME", temp.path());
 
-    let storage = Storage::new("sandbox_test").unwrap();
+    let storage = Storage::new_unwatched("sandbox_test").unwrap();
 
     let mut inst = Instance::new("sandbox-session", "/tmp/project");
     inst.sandbox_info = Some(SandboxInfo {

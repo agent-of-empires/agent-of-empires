@@ -71,8 +71,10 @@ impl HomeView {
 
         // Ensure target profile storage exists
         if !self.storages.contains_key(&target_profile) {
-            self.storages
-                .insert(target_profile.clone(), Storage::new(&target_profile)?);
+            self.storages.insert(
+                target_profile.clone(),
+                Storage::new(&target_profile, self.file_watch.clone())?,
+            );
         }
 
         self.add_instance(instance.clone());
@@ -217,8 +219,10 @@ impl HomeView {
                     anyhow::bail!("Profile '{}' does not exist", target_profile);
                 }
                 if !self.storages.contains_key(target_profile) {
-                    self.storages
-                        .insert(target_profile.to_string(), Storage::new(target_profile)?);
+                    self.storages.insert(
+                        target_profile.to_string(),
+                        Storage::new(target_profile, self.file_watch.clone())?,
+                    );
                 }
                 if !self.group_trees.contains_key(target_profile) {
                     self.group_trees.insert(
@@ -587,7 +591,8 @@ impl HomeView {
         // Ensure target profile storage exists when moving across profiles
         if let Some(tp) = new_profile {
             if tp != ctx.old_profile && !self.storages.contains_key(tp) {
-                self.storages.insert(tp.to_string(), Storage::new(tp)?);
+                self.storages
+                    .insert(tp.to_string(), Storage::new(tp, self.file_watch.clone())?);
             }
         }
 
@@ -719,6 +724,51 @@ impl HomeView {
                 Some(g) => g.to_string(),      // Set new (empty string means ungroup)
             };
 
+            // Tied mode (#1927): a worktree session's directory leaf follows
+            // its title, so move the directory in lockstep before persisting
+            // the new title. The move is gated on a stopped session; a running
+            // session surfaces a warning and nothing is renamed. Applied below
+            // in both the profile-move and the standard persist paths.
+            let mut new_path: Option<String> = None;
+            if current_title != effective_title && self.tie_workdir_applies_for(&id) {
+                let snapshot = self
+                    .get_instance(&id)
+                    .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
+                if let Some((Some(worktree_info), status, project_path)) = snapshot {
+                    if status.blocks_worktree_edit() {
+                        self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                            "Stop the Session to Rename",
+                            "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                        ));
+                        return Ok(());
+                    }
+                    let leaf =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+                    match crate::session::worktree_edit::edit_worktree_workdir(
+                        crate::session::worktree_edit::WorktreeEditRequest {
+                            worktree_info: &worktree_info,
+                            current_path: std::path::Path::new(&project_path),
+                            new_name: &leaf,
+                            rename_branch: false,
+                        },
+                    ) {
+                        Ok(outcome) => {
+                            new_path = Some(outcome.new_path.to_string_lossy().to_string())
+                        }
+                        // Leaf maps to the current dir: nothing to move, just
+                        // rename the title.
+                        Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
+                        Err(e) => {
+                            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                                "Rename Failed",
+                                &format!("Could not move the worktree directory: {e}"),
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             // Handle profile change (move session to different profile)
             if let Some(target_profile) = new_profile {
                 let current_profile = self
@@ -762,17 +812,26 @@ impl HomeView {
 
                     // Ensure target profile storage exists
                     if !self.storages.contains_key(target_profile) {
-                        self.storages
-                            .insert(target_profile.to_string(), Storage::new(target_profile)?);
+                        self.storages.insert(
+                            target_profile.to_string(),
+                            Storage::new(target_profile, self.file_watch.clone())?,
+                        );
                     }
 
                     // Update source_profile and save (handles moving between profiles)
                     instance.source_profile = target_profile.to_string();
                     let new_title = instance.title.clone();
+                    let moved_path = new_path.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
-                    self.mutate_instance(&id, |inst| {
-                        inst.title = new_title;
-                    });
+                    // apply_user_action (not mutate_instance + save) so a tied
+                    // worktree's moved project_path actually persists; save()
+                    // via merge_from_tui does not write project_path. (#1927)
+                    self.apply_user_action(&id, |inst| {
+                        inst.title = new_title.clone();
+                        if let Some(path) = &moved_path {
+                            inst.project_path = path.clone();
+                        }
+                    })?;
 
                     self.rebuild_group_trees();
                     if !effective_group.is_empty() {
@@ -810,6 +869,9 @@ impl HomeView {
             self.apply_user_action(&id, |inst| {
                 inst.title = effective_title.clone();
                 inst.group_path = effective_group.clone();
+                if let Some(path) = &new_path {
+                    inst.project_path = path.clone();
+                }
             })?;
 
             // Rebuild group trees and create group if needed
@@ -943,7 +1005,9 @@ impl HomeView {
             // Re-seat the cursor on the just-unarchived session. After the
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
-            // ends up on whatever row slid into that slot.
+            // ends up on whatever row slid into that slot. The session stays
+            // Stopped (archive killed its pane); the user restarts it with `e`
+            // when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
             return Ok(());
         }
@@ -958,9 +1022,23 @@ impl HomeView {
         }
 
         self.apply_user_action(&id, |inst| inst.archive())?;
-        self.flat_items = self.build_flat_items();
         if self.sort_order == crate::session::config::SortOrder::Attention {
+            // Attention sort is a triage flow: archiving sinks the row and the
+            // cursor advances to the next item that needs attention. That path
+            // already lands selection on a live row, so it never showed the
+            // dead-pane/selection-swap jank the default sort did.
+            self.flat_items = self.build_flat_items();
             self.select_top_attention(None);
+        } else {
+            // Keep the just-archived session selected instead of letting the
+            // cursor snap to whatever neighbor slid into its slot. Reveal the
+            // Archived section so the row is visible, rebuild, then re-seat the
+            // cursor onto it. The preview then renders a calm "Archived"
+            // placeholder (render_archived_preview) instead of the killed
+            // pane's "No output available", and a second `z` unarchives it.
+            self.reveal_archived_section();
+            self.flat_items = self.build_flat_items();
+            self.select_session_by_id(&id);
         }
         Ok(())
     }

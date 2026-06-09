@@ -11,7 +11,7 @@ use crate::common::setup_temp_home;
 fn test_create_group_and_persist() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let instances: Vec<Instance> = vec![];
     let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
     group_tree.create_group("work");
@@ -34,7 +34,7 @@ fn test_create_group_and_persist() -> Result<()> {
 fn test_nested_group_persistence() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let instances: Vec<Instance> = vec![];
     let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
     group_tree.create_group("work/frontend");
@@ -58,7 +58,7 @@ fn test_nested_group_persistence() -> Result<()> {
 fn test_delete_group_persists() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let instances: Vec<Instance> = vec![];
 
     // Create and save a group
@@ -95,7 +95,7 @@ fn test_delete_group_persists() -> Result<()> {
 fn test_move_session_between_groups() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let mut instance = Instance::new("Movable", "/path/movable");
     instance.group_path = "group-a".to_string();
 
@@ -132,7 +132,7 @@ fn test_move_session_between_groups() -> Result<()> {
 fn test_group_with_sessions_round_trip() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
 
     let mut inst1 = Instance::new("Frontend", "/path/frontend");
     inst1.group_path = "work".to_string();
@@ -173,7 +173,7 @@ fn test_group_with_sessions_round_trip() -> Result<()> {
 fn test_empty_groups_persist() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let instances: Vec<Instance> = vec![];
 
     let mut group_tree = GroupTree::new_with_groups(&instances, &[]);

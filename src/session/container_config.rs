@@ -963,6 +963,38 @@ impl<'a> ContainerAgentSelection<'a> {
     }
 }
 
+/// `volume_ignores` entries are treated as literal directory paths and concatenated
+/// onto each mount base. Glob patterns are not expanded (Docker needs concrete mount
+/// paths at container-create time), so an entry like `**/bin` would materialize a
+/// literal `**` directory inside the bind-mounted repo, leaking onto the host (#2036).
+/// Detect such entries so we can skip and warn instead of creating junk mount targets.
+fn has_glob_metachars(entry: &str) -> bool {
+    entry.contains(['*', '?', '[', ']'])
+}
+
+/// Produce user-facing warnings for `volume_ignores` entries that `build_container_config`
+/// will skip because they contain glob metacharacters. Mirrors that skip so session
+/// creation can surface the same information in the TUI warnings dialog (#2036), the way
+/// [`validate_env_entries`](crate::session::validate_env_entries) surfaces unset env vars.
+pub(crate) fn validate_volume_ignores<I, S>(entries: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let s = e.as_ref();
+            has_glob_metachars(s).then(|| {
+                format!(
+                    "Warning: volume_ignores entry '{}' was skipped; glob patterns are not supported, list literal directory paths instead",
+                    s
+                )
+            })
+        })
+        .collect()
+}
+
 /// Produce a deterministic Docker volume name for a named volume_ignores mount.
 ///
 /// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
@@ -1282,14 +1314,33 @@ pub(crate) fn build_container_config(
         }
     }
 
+    // Glob patterns are not supported: they would be concatenated literally and create
+    // a real `**`/`*` directory inside the bind-mounted repo, leaking onto the host (#2036).
+    // Skip glob-like entries with a warning rather than mounting a bogus path.
+    let literal_ignores: Vec<&String> = sandbox_config
+        .volume_ignores
+        .iter()
+        .filter(|ignore| {
+            if has_glob_metachars(ignore) {
+                tracing::warn!(
+                    target: "session.profile",
+                    "Ignoring volume_ignores entry '{}': glob patterns are not supported, entries must be literal directory paths",
+                    ignore
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     // Expand all volume_ignores paths and filter conflicts with extra_volumes.
     // (extra_volumes take precedence over volume_ignores)
     // Conflicts: exact match, anonymous is a parent of extra, or inside extra.
     let expanded_ignore_paths: Vec<String> = volume_ignore_bases
         .iter()
         .flat_map(|base_path| {
-            sandbox_config
-                .volume_ignores
+            literal_ignores
                 .iter()
                 .map(move |ignore| format!("{}/{}", base_path, ignore))
         })
@@ -2604,6 +2655,91 @@ extra_volumes = ["/host/data:/container/data:ro"]
             volume_pairs.contains(&("/host/data", "/container/data")),
             "extra_volumes should include /host/data:/container/data, got: {:?}",
             volume_pairs
+        );
+    }
+
+    #[test]
+    fn test_has_glob_metachars() {
+        assert!(has_glob_metachars("**/bin"));
+        assert!(has_glob_metachars("**/obj/"));
+        assert!(has_glob_metachars("target/*"));
+        assert!(has_glob_metachars("build?"));
+        assert!(has_glob_metachars("cache[0-9]"));
+        assert!(!has_glob_metachars("target"));
+        assert!(!has_glob_metachars("node_modules"));
+        assert!(!has_glob_metachars("src/bin"));
+        assert!(!has_glob_metachars(".venv"));
+    }
+
+    #[test]
+    fn test_validate_volume_ignores_warns_only_on_globs() {
+        let warnings = validate_volume_ignores(["**/bin/", "target", "**/obj/", "node_modules"]);
+        assert_eq!(warnings.len(), 2, "got: {:?}", warnings);
+        assert!(warnings[0].contains("**/bin/"));
+        assert!(warnings[1].contains("**/obj/"));
+        assert!(validate_volume_ignores(["target", ".venv"]).is_empty());
+    }
+
+    /// Regression test for #2036: glob-like volume_ignores entries must be skipped
+    /// rather than concatenated into literal mount targets (which leaked a `**`
+    /// directory onto the host through the bind mount). Literal entries still mount.
+    #[test]
+    #[serial_test::serial]
+    fn test_volume_ignores_skips_glob_entries() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+volume_ignores = ["**/bin/", "**/obj/", "target"]
+"#,
+        )
+        .unwrap();
+
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let project_path_str = project_dir.path().to_str().unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
+        let expected_target = format!("/workspace/{}/target", dir_name);
+        assert!(
+            config.anonymous_volumes.contains(&expected_target),
+            "literal 'target' entry should still mount, got: {:?}",
+            config.anonymous_volumes
+        );
+        assert!(
+            !config
+                .anonymous_volumes
+                .iter()
+                .any(|p| p.contains('*') || p.contains('?')),
+            "glob-like entries must not produce literal mount targets, got: {:?}",
+            config.anonymous_volumes
         );
     }
 

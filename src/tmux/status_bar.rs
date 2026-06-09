@@ -110,16 +110,13 @@ pub fn apply_all_tmux_options(
     use crate::tui::styles::load_theme;
 
     if should_apply_tmux_status_bar() {
-        let config = crate::session::config::Config::load_or_warn();
-        let theme_name = if config.theme.name.is_empty() {
-            "empire"
-        } else {
-            &config.theme.name
-        };
+        // Theme is a global preference; match the TUI's empty-name fallback
+        // (`default`) so the status bar can't paint a different theme.
+        let theme_name = crate::session::config::resolve_theme_name();
         // Always use truecolor here: tmux receives hex color values (#rrggbb)
         // and manages its own escape-sequence rendering via TERM/terminfo.
         // Palette mode only affects the TUI's direct terminal output.
-        let theme = load_theme(theme_name);
+        let theme = load_theme(&theme_name);
 
         if let Err(e) = apply_status_bar(session_name, title, branch, sandbox, &theme) {
             tracing::debug!(target: "tmux.status", "Failed to apply tmux status bar: {}", e);

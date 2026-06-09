@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_of_empires::file_watch::FileWatchService;
 use agent_of_empires::logging;
 
 const VALID_DIRECTIVE_A: &str = "agent_of_empires=info,hyper=warn";
@@ -66,7 +65,7 @@ async fn watch_runtime_filter_byte_identical_behavior() {
     // the directive almost immediately.
     write_runtime_filter(&app_dir, VALID_DIRECTIVE_A);
 
-    let svc = FileWatchService::new().expect("init service");
+    let svc = agent_of_empires::file_watch::test_support::new_filewatch().expect("init service");
     let watch_handle = tokio::spawn(logging::watch_runtime_filter(
         Arc::clone(&svc),
         app_dir.clone(),

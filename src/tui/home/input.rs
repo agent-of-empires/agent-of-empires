@@ -759,6 +759,24 @@ impl HomeView {
         }
     }
 
+    /// Discard unsaved Settings changes: force-close the view, clear the
+    /// confirm state, and revert any live theme preview back to the saved
+    /// config theme. Shared by the keyboard (Esc/q -> confirm) and mouse
+    /// (click [Yes]) discard paths so the two can't drift. The mouse path
+    /// previously skipped the theme revert, so discarding via a click left a
+    /// previewed theme applied until the next restart.
+    pub(super) fn discard_settings_changes(&mut self) -> Action {
+        if let Some(ref mut settings) = self.settings_view {
+            settings.force_close();
+        }
+        self.settings_view = None;
+        self.confirm_dialog = None;
+        self.settings_close_confirm = false;
+        // Theme is a global preference, not profile-merged: revert any live
+        // preview to the saved global theme so boot and Settings agree.
+        Action::SetTheme(crate::session::config::resolve_theme_name())
+    }
+
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
@@ -855,18 +873,19 @@ impl HomeView {
                         let dont_ask_again = dialog.dont_ask_again();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
-                            // Discard branch: force-close settings (the
-                            // keyboard path runs the same sequence).
-                            if let Some(ref mut settings) = self.settings_view {
-                                settings.force_close();
+                            // Discard branch: run the exact same sequence as the
+                            // keyboard path, including the theme revert. Omitting
+                            // it here stranded a live theme preview until the next
+                            // restart when the user discarded via a mouse click.
+                            self.pending_dialog_click_action =
+                                Some(self.discard_settings_changes());
+                        } else {
+                            if action == "quit" && dont_ask_again {
+                                self.disable_confirm_before_quit();
                             }
-                            self.settings_view = None;
-                            self.settings_close_confirm = false;
+                            self.pending_dialog_click_action =
+                                self.dispatch_confirm_submit(&action);
                         }
-                        if action == "quit" && dont_ask_again {
-                            self.disable_confirm_before_quit();
-                        }
-                        self.pending_dialog_click_action = self.dispatch_confirm_submit(&action);
                     }
                 }
             }
@@ -1192,19 +1211,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(_) => {
                         // User chose to discard changes
-                        if let Some(ref mut settings) = self.settings_view {
-                            settings.force_close();
-                        }
-                        self.settings_view = None;
-                        self.confirm_dialog = None;
-                        self.settings_close_confirm = false;
-                        let config = resolve_config_or_warn(&self.config_profile());
-                        let theme_name = if config.theme.name.is_empty() {
-                            "default".to_string()
-                        } else {
-                            config.theme.name
-                        };
-                        return Some(Action::SetTheme(theme_name));
+                        return Some(self.discard_settings_changes());
                     }
                 }
             }
@@ -1220,14 +1227,11 @@ impl HomeView {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
                     self.refresh_from_config();
-                    // Reload theme from saved config
-                    let config = resolve_config_or_warn(&self.config_profile());
-                    let theme_name = if config.theme.name.is_empty() {
-                        "default".to_string()
-                    } else {
-                        config.theme.name
-                    };
-                    return Some(Action::SetTheme(theme_name));
+                    // Reload the theme from the global config (theme is a global
+                    // preference, not profile-merged) so the repaint matches boot.
+                    return Some(Action::SetTheme(
+                        crate::session::config::resolve_theme_name(),
+                    ));
                 }
                 SettingsAction::UnsavedChangesWarning => {
                     // Show confirmation dialog
@@ -1838,6 +1842,9 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
+                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
+                                    super::drop_disk_watch_entry(entry);
+                                }
                                 self.show_profile_picker();
                             }
                             Err(e) => {
@@ -2304,6 +2311,7 @@ impl HomeView {
             profile,
             base_override,
             worktree_base,
+            self.file_watch.clone(),
         ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {
@@ -2338,7 +2346,7 @@ impl HomeView {
         }
     }
 
-    fn open_settings(&mut self) {
+    pub(super) fn open_settings(&mut self) {
         let project_path = self
             .selected_session
             .as_ref()
@@ -3083,7 +3091,13 @@ impl HomeView {
             self.context_menu = Some(if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                ContextMenuDialog::for_session(anchor)
+                let is_archived = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => {
+                        self.get_instance(id).is_some_and(|inst| inst.is_archived())
+                    }
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session(anchor, is_archived)
             });
             return true;
         }
@@ -3145,6 +3159,13 @@ impl HomeView {
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
+            ContextMenuAction::ToggleArchive => {
+                // The right-click already moved the cursor onto the row, so the
+                // toggle acts on the same session the menu was opened for.
+                if let Err(e) = self.toggle_archive_at_cursor() {
+                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -3279,6 +3300,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
+        // Tied mode (#1927) collapses naming into a single Rename action: the
+        // directory follows the title, so route the standalone workdir edit to
+        // the rename dialog instead of editing the directory independently.
+        if self.tie_workdir_applies_for(&id) {
+            self.open_rename_for_selected();
+            return;
+        }
         let snapshot = self.get_instance(&id).map(|inst| {
             (
                 inst.worktree_info.clone(),
@@ -3493,7 +3521,20 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Single-click behavior is user-configurable via
+                // An archived row is parked: its pane was killed on archive.
+                // A single click is a "let me look at this" gesture, so it
+                // must NOT enter live-send, because `start_live_send` would
+                // respawn the pane (ensure_pane_ready) and the live-send path
+                // would auto-unarchive it (touch_last_accessed), silently
+                // resurrecting a session the user deliberately parked. Stop at
+                // the cursor update so the row just gets selected. Bringing it
+                // back stays explicit: `z` to unarchive, or a deliberate
+                // double-click / Enter to open it.
+                let archived = self
+                    .get_instance(&id)
+                    .map(|inst| inst.is_archived())
+                    .unwrap_or(false);
+                // Single-click behavior is otherwise user-configurable via
                 // `SessionConfig::click_action`. `LiveSend` (default,
                 // historical behavior) enters live-send for the clicked
                 // row, or switches the live target when already in live
@@ -3504,10 +3545,12 @@ impl HomeView {
                 // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
                 // is fine.
-                if matches!(
-                    self.click_action(&id),
-                    Some(crate::session::ClickAction::SelectOnly)
-                ) {
+                if archived
+                    || matches!(
+                        self.click_action(&id),
+                        Some(crate::session::ClickAction::SelectOnly)
+                    )
+                {
                     None
                 } else {
                     self.start_live_send()

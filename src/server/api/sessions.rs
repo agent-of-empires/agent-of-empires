@@ -89,6 +89,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
+    /// Whether renaming this session also moves its worktree directory (the
+    /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
+    /// Populated by `list_sessions` from the per-profile config; single-session
+    /// responses leave it `false` and the sidebar reads the list value. #1927.
+    #[serde(default)]
+    pub tie_workdir_to_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -256,6 +262,8 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            // Overlaid per-profile in list_sessions; see the field doc.
+            tie_workdir_to_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -472,6 +480,25 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         fresh
     };
 
+    // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
+    // the standalone workdir action for tied worktree sessions. Resolved once
+    // per distinct profile, not per session.
+    {
+        use std::collections::HashMap;
+        let mut tie_cache: HashMap<String, bool> = HashMap::new();
+        for session in &mut sessions {
+            if !session.has_managed_worktree {
+                continue;
+            }
+            let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                    .session
+                    .tie_workdir_to_name
+            });
+            session.tie_workdir_to_name = tied;
+        }
+    }
+
     // Resolve remote owners with a permanent cache on AppState
     {
         let cache = state.remote_owner_cache.read().await;
@@ -686,6 +713,12 @@ pub async fn update_workspace_ordering(
 #[derive(Deserialize)]
 pub struct RenameSessionBody {
     pub title: String,
+    /// When the session is tied (`session.tie_workdir_to_name`) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match
+    /// the new title. Off by default; ignored for untied / non-worktree
+    /// sessions. See #1927.
+    #[serde(default)]
+    pub rename_branch: bool,
 }
 
 fn apply_session_title_rename(inst: &mut Instance, title: String) {
@@ -726,44 +759,160 @@ pub async fn rename_session(
             .into_response();
     }
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
+    // Serialize against other mutations on this session (start, delete,
+    // worktree edit) so the tied git move and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
         )
-            .into_response();
     };
 
-    apply_session_title_rename(inst, title.clone());
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title, so title and dir cannot drift.
+    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
+        .session
+        .tie_workdir_to_name
+        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
+    // What to write to disk + memory once any git side effect has landed.
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
 
-    if let Ok(storage) = Storage::new(&profile) {
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply_session_title_rename(inst, title_clone);
-                }
-                Ok(())
-            })
+    if tied {
+        // The dir move is gated on a quiescent worktree, exactly like the
+        // standalone worktree-name edit. A running session must be stopped
+        // first; the setting is the escape hatch for free-form relabeling.
+        if status.blocks_worktree_edit() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_running",
+                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                })),
+            )
+                .into_response();
+        }
+
+        let wt = worktree_info.expect("tied implies worktree_info is Some");
+        let cur = current_path.clone();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
+        let rename_branch = body.rename_branch;
+        let edit = tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::edit_worktree_workdir(
+                crate::session::worktree_edit::WorktreeEditRequest {
+                    worktree_info: &wt,
+                    current_path: std::path::Path::new(&cur),
+                    new_name: &leaf,
+                    rename_branch,
+                },
+            )
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
         })
-        .await
-        {
-            Ok(Ok(())) => {}
+        .await;
+
+        match edit {
+            Ok(Ok((path, branch))) => {
+                new_path = Some(path);
+                new_branch = branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
             Ok(Err(e)) => {
-                tracing::error!(target: "http.api.sessions", "Failed to save after rename: {e}")
+                tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
+                let (code, msg) = worktree_edit_error_response(&e);
+                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
             }
             Err(e) => {
-                tracing::error!(target: "http.api.sessions", "Rename persist join failed: {e}")
+                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                )
+                    .into_response();
             }
         }
     }
+
+    // Persist BEFORE mutating in-memory state: when a git move has landed, a
+    // silent persist failure would otherwise leave metadata pointing at the
+    // old path after a daemon restart, so it returns 500 rather than a
+    // misleading 200.
+    let persisted = {
+        let storage = Storage::new(&profile, state.file_watch.clone());
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        match storage {
+            Ok(storage) => tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        if let Some(path) = new_path_clone.as_deref() {
+                            apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
+                        }
+                        apply_session_title_rename(inst, title_clone);
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = persisted {
+        tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
+        // Persist-first: never fall through to mutate in-memory state on a
+        // failed write, or the rename silently reverts on restart. When a dir
+        // move already landed, say so; otherwise it is a plain title persist.
+        let message = if new_path.is_some() {
+            "Worktree was moved on disk, but persisting the new session metadata failed"
+        } else {
+            "Persisting the renamed session failed"
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+        )
+            .into_response();
+    }
+
+    let mut response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        if let Some(path) = new_path.as_deref() {
+            apply_worktree_name_edit(inst, path, new_branch.as_deref());
+        }
+        apply_session_title_rename(inst, title.clone());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+    // Single-session responses are not run through list_sessions' overlay, so
+    // carry the resolved tie value here too (#1927); otherwise a client that
+    // trusts the mutation response would see a managed worktree claim it is
+    // untied until the next list refresh.
+    response.tie_workdir_to_name = tied;
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -889,6 +1038,23 @@ pub async fn set_worktree_name(
         )
             .into_response();
     };
+    // When tied (#1927), the directory is not edited independently: it follows
+    // the title. Reject the standalone edit so no client can drift the two
+    // apart, pointing callers at the unified rename.
+    if worktree_info.managed_by_aoe
+        && crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "tied",
+                "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
     if status.blocks_worktree_edit() {
         return (
             StatusCode::CONFLICT,
@@ -948,7 +1114,7 @@ pub async fn set_worktree_name(
             .into_response()
     };
 
-    let storage = match Storage::new(&profile) {
+    let storage = match Storage::new(&profile, state.file_watch.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
@@ -1081,11 +1247,16 @@ pub async fn update_session_group(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_group = group.clone();
-    if persist_session_update(profile, "group update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            apply_session_group(inst, persist_group);
-        }
-    })
+    if persist_session_update(
+        profile,
+        "group update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                apply_session_group(inst, persist_group);
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1163,12 +1334,13 @@ where
 async fn persist_session_update<F>(
     profile: String,
     label: &'static str,
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     mutate: F,
 ) -> Result<(), ()>
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile) {
+    let storage = match Storage::new(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
@@ -1270,13 +1442,18 @@ pub async fn update_session_notifications(
     // Persist first; only mutate memory once disk is durable so a write
     // failure leaves the two in agreement. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "notification update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            apply(&mut inst.notify_on_waiting, waiting);
-            apply(&mut inst.notify_on_idle, idle);
-            apply(&mut inst.notify_on_error, error);
-        }
-    })
+    if persist_session_update(
+        profile,
+        "notification update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                apply(&mut inst.notify_on_waiting, waiting);
+                apply(&mut inst.notify_on_idle, idle);
+                apply(&mut inst.notify_on_error, error);
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1363,11 +1540,16 @@ pub async fn update_session_diff_base(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_override = new_override.clone();
-    if persist_session_update(profile, "diff-base update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            inst.base_branch_override = persist_override;
-        }
-    })
+    if persist_session_update(
+        profile,
+        "diff-base update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.base_branch_override = persist_override;
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1471,15 +1653,20 @@ pub async fn update_session_pin(
 
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "pin update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            if pinned {
-                inst.pin();
-            } else {
-                inst.unpin();
+    if persist_session_update(
+        profile,
+        "pin update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if pinned {
+                    inst.pin();
+                } else {
+                    inst.unpin();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1547,15 +1734,20 @@ pub async fn update_session_archive(
 
     let archived = body.archived;
     let persist_id = id.clone();
-    if persist_session_update(profile, "archive update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            if archived {
-                inst.archive();
-            } else {
-                inst.unarchive();
+    if persist_session_update(
+        profile,
+        "archive update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if archived {
+                    inst.archive();
+                } else {
+                    inst.unarchive();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1732,14 +1924,19 @@ pub async fn update_session_snooze(
     // Persist first; only mutate memory once disk is durable, and only fire
     // the structured view teardown below on a write that landed. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "snooze update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            match minutes {
-                Some(m) => inst.snooze(m),
-                None => inst.unsnooze(),
+    if persist_session_update(
+        profile,
+        "snooze update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                match minutes {
+                    Some(m) => inst.snooze(m),
+                    None => inst.unsnooze(),
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1924,7 +2121,7 @@ pub async fn delete_session(
             // would silently re-add the entry from disk on the next tick
             // and the user would see "deleted" then the session
             // reappearing seconds later.
-            let storage = match Storage::new(&profile) {
+            let storage = match Storage::new(&profile, state.file_watch.clone()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(target: "http.api.sessions",
@@ -2289,6 +2486,8 @@ pub async fn create_session(
         .collect();
     drop(instances);
 
+    let file_watch_for_create = state.file_watch.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
@@ -2435,7 +2634,7 @@ pub async fn create_session(
         // tripped. Matches the CLI cleanup path in
         // `cleanup_partial_session(... scratch_dir: Some(...))`.
         let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile)?;
+            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
@@ -2497,6 +2696,16 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
             if !resp.acp_capable {
                 let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
@@ -4549,7 +4758,7 @@ mod tests {
         let _ = isolated_app_dir(temp_home.path());
 
         let profile = "persist-success";
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let seed = make_test_instance();
         let id = seed.id.clone();
         storage
@@ -4560,15 +4769,20 @@ mod tests {
             .unwrap();
 
         let persist_id = id.clone();
-        persist_session_update(profile.to_string(), "test", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.base_branch_override = Some("release/x".to_string());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "test",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.base_branch_override = Some("release/x".to_string());
+                }
+            },
+        )
         .await
         .expect("persist should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         let inst = reloaded.iter().find(|i| i.id == id).unwrap();
         assert_eq!(
             inst.base_branch_override.as_deref(),
@@ -4590,7 +4804,13 @@ mod tests {
         let dir = crate::session::get_profile_dir(profile).unwrap();
         std::fs::create_dir_all(dir.join("sessions.json")).unwrap();
 
-        let result = persist_session_update(profile.to_string(), "test", |_instances| {}).await;
+        let result = persist_session_update(
+            profile.to_string(),
+            "test",
+            crate::file_watch::FileWatchService::noop(),
+            |_instances| {},
+        )
+        .await;
         assert!(result.is_err(), "a storage failure must surface as Err");
     }
 
@@ -4606,7 +4826,7 @@ mod tests {
         let _ = isolated_app_dir(temp_home.path());
 
         let profile = "group-edit";
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let seed = make_test_instance(); // seeded in "work/projects"
         let id = seed.id.clone();
         storage
@@ -4618,15 +4838,20 @@ mod tests {
 
         // Move to a brand-new group.
         let set_id = id.clone();
-        persist_session_update(profile.to_string(), "group update", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
-                apply_session_group(inst, "team/alpha".to_string());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "group update",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
+                    apply_session_group(inst, "team/alpha".to_string());
+                }
+            },
+        )
         .await
         .expect("set should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(
             reloaded.iter().find(|i| i.id == id).unwrap().group_path,
             "team/alpha",
@@ -4635,15 +4860,20 @@ mod tests {
 
         // Clear to ungrouped via the empty-string sentinel.
         let clear_id = id.clone();
-        persist_session_update(profile.to_string(), "group update", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
-                apply_session_group(inst, String::new());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "group update",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
+                    apply_session_group(inst, String::new());
+                }
+            },
+        )
         .await
         .expect("clear should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(
             reloaded.iter().find(|i| i.id == id).unwrap().group_path,
             "",
@@ -4818,7 +5048,7 @@ pub async fn send_message(
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
-                if let Ok(storage) = Storage::new(&profile) {
+                if let Ok(storage) = Storage::new(&profile, state.file_watch.clone()) {
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if !outcome_already_alive {
@@ -5067,6 +5297,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            tie_workdir_to_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

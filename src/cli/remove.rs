@@ -42,7 +42,7 @@ fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
 
     // Phase 1 (unlocked): identify the target and run the slow deletion
     // side effects (worktree removal, branch deletion, container teardown,

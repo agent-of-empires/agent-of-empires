@@ -108,6 +108,15 @@ export interface ServeHandle {
   home: string;
   /** Directory prepended to PATH (contains the fake `claude` shim). */
   shimBin: string;
+  /**
+   * The exact env (isolated HOME / XDG_CONFIG_HOME / TMPDIR / PATH with the
+   * shim) the daemon and seed ran with. Specs that drive `aoe` CLI
+   * subprocesses against the same isolated state (e.g. `aoe session rename`
+   * from a peer process) MUST pass this as `spawnSync(..., { env })`. Passing
+   * `undefined` inherits the Playwright worker's env, which points at the
+   * real `~/.config` and makes the CLI miss the seeded session.
+   */
+  env: NodeJS.ProcessEnv;
   proc: ChildProcess;
   authMode: AuthMode;
   passphrase?: string;
@@ -728,6 +737,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     port,
     home,
     shimBin,
+    env: seedEnv,
     proc,
     authMode,
     passphrase,

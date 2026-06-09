@@ -91,6 +91,38 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Map a tmux pane cursor onto the preview's output rect for live-send.
+///
+/// `output` is the rect the captured pane text paints into; `visible_rows` is
+/// its height in rows; `cursor` carries the pane's `(x, y)` (counted from the
+/// top of the visible screen) plus `pane_height`. Assumes the preview is at
+/// the live tail, where the bottom captured line pins to the bottom of
+/// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
+/// + cursor.y`. When the pane is sized to the output area (the live-send
+/// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
+/// only bites for the frame or two after a resize. A hidden cursor, or one
+/// that maps outside `output` (e.g. a pane taller than the output area clips
+/// its top rows), yields `None` so nothing is painted.
+fn map_live_preview_cursor(
+    output: Rect,
+    visible_rows: usize,
+    cursor: crate::tmux::PaneCursor,
+) -> Option<Position> {
+    if !cursor.visible {
+        return None;
+    }
+    let row = output.y as i32 + (visible_rows as i32 - cursor.pane_height as i32) + cursor.y as i32;
+    let col = output.x as i32 + cursor.x as i32;
+    if row < output.y as i32
+        || row >= output.y as i32 + output.height as i32
+        || col < output.x as i32
+        || col >= output.x as i32 + output.width as i32
+    {
+        return None;
+    }
+    Some(Position::new(col as u16, row as u16))
+}
+
 /// Number of pane lines to capture for the preview, accounting for the user's
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
 /// fresh capture on every wheel tick.
@@ -1737,23 +1769,31 @@ impl HomeView {
                     let idle_age = inst.idle_age();
                     let is_fresh_idle =
                         matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                    let (icon, icon_color) = match inst.status {
-                        Status::Running => (spinner_running(&inst.created_at), theme.running),
-                        Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
-                        Status::Idle if is_fresh_idle => (
-                            spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Idle => (
-                            ICON_IDLE,
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Unknown => (ICON_UNKNOWN, theme.waiting),
-                        Status::Stopped => (ICON_STOPPED, theme.dimmed),
-                        Status::Error => (ICON_ERROR, theme.error),
-                        Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
-                        Status::Deleting => (ICON_DELETING, theme.waiting),
-                        Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                    // An archived row is parked; its preview body renders the
+                    // "Archived" placeholder. Force the compact title icon to
+                    // the stopped glyph so the hoisted title can't show a live
+                    // spinner from a stale (pre-poll) status and contradict it.
+                    let (icon, icon_color) = if inst.is_archived() {
+                        (ICON_STOPPED, theme.dimmed)
+                    } else {
+                        match inst.status {
+                            Status::Running => (spinner_running(&inst.created_at), theme.running),
+                            Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
+                            Status::Idle if is_fresh_idle => (
+                                spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Idle => (
+                                ICON_IDLE,
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Unknown => (ICON_UNKNOWN, theme.waiting),
+                            Status::Stopped => (ICON_STOPPED, theme.dimmed),
+                            Status::Error => (ICON_ERROR, theme.error),
+                            Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
+                            Status::Deleting => (ICON_DELETING, theme.waiting),
+                            Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                        }
                     };
                     Line::from(vec![
                         Span::raw(" "),
@@ -1847,12 +1887,59 @@ impl HomeView {
         self.preview_text_view = crate::tui::home::PreviewTextView::default();
         frame.render_widget(block, area);
 
+        // An archived session's pane was killed on archive, so there's nothing
+        // live to capture. Short-circuit every view mode to a calm "Archived"
+        // placeholder instead of forking captures that come back empty and
+        // surface as "No output available".
+        let selected_archived = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_archived());
+
+        // A session whose pane is simply gone (killed, exited, server reboot)
+        // with no diagnostic detail carries the generic gone-error. Present
+        // that as a calm "Stopped" placeholder rather than the red crash error;
+        // a real crash leaves a specific message and still renders red. Covers
+        // the just-unarchived row, which sits Stopped until restarted.
+        //
+        // Only in Structured view: the gone-error is about the agent pane, but
+        // Tool / Terminal views show a different, independently-live pane (a tool
+        // session can be running while the agent has exited), so the placeholder
+        // must not hide that pane's output there.
+        let selected_stopped = !selected_archived
+            && matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| {
+                    inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
+                });
+
         // Keep the off-thread capture worker pointed at whatever pane this
         // view shows (and tuned to live-send vs. idle cadence) before any
         // refresh reads from it. Done once here, not per-branch, so the
-        // creating / no-selection paths also retarget or tear it down.
-        let desired = self.displayed_pane_tmux_name();
+        // creating / no-selection / archived / stopped paths also retarget or
+        // tear it down (no live pane feeds `None` so the worker stops capturing).
+        let desired = if selected_archived || selected_stopped {
+            None
+        } else {
+            self.displayed_pane_tmux_name()
+        };
         self.sync_preview_capture_worker(desired);
+
+        if selected_archived {
+            self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_stopped {
+            self.render_stopped_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
 
         match self.view_mode {
             ViewMode::Structured => {
@@ -2105,12 +2192,42 @@ impl HomeView {
             }
         }
 
+        // In live-send mode, place a real terminal cursor over the preview at
+        // the target pane's cursor cell. `capture-pane` carries only cell text
+        // (plus SGR color), not the cursor, so without this the
+        // "feels-attached" preview shows no cursor for programs that rely on
+        // the hardware cursor (shells, codex, anything using DECTCEM) even
+        // though a direct tmux attach would. Programs that paint their own
+        // caret into the cells (e.g. Claude Code's reverse-video block) hide
+        // the hardware cursor, so `cursor_flag` is 0 and this paints nothing
+        // over them, avoiding a double cursor.
+        if let Some(pos) = self.live_preview_cursor_pos() {
+            frame.set_cursor_position(pos);
+        }
+
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
         // only populate `preview_selection` while a drag is live or a
         // finalized highlight is showing, so this branch is a no-op
         // otherwise.
         self.paint_preview_selection(frame, theme);
+    }
+
+    /// Where to paint the live-send cursor this frame, or `None` to paint no
+    /// cursor. Maps the agent pane's `(cursor_x, cursor_y)` (counted from the
+    /// top of the visible screen) onto the preview's output rect.
+    ///
+    /// Only fires while live-send is active and the preview is at the live
+    /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
+    /// live cursor would land on the wrong row. The capture worker only
+    /// publishes a cursor when the displayed pane IS the live-send target, so
+    /// a `Some` here already means "this pane is the one being driven."
+    fn live_preview_cursor_pos(&self) -> Option<Position> {
+        if self.live_send.is_none() || self.preview_scroll_offset != 0 {
+            return None;
+        }
+        let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
     }
 
     /// Apply the drag-select highlight to cells inside the preview
@@ -2282,6 +2399,69 @@ impl HomeView {
                 .style(Style::default().fg(theme.dimmed));
             frame.render_widget(hint, inner);
         }
+    }
+
+    /// Calm placeholder shown in the preview pane when the selected session is
+    /// archived. Archiving kills the pane, so the normal capture path would
+    /// render an empty body ("No output available"); this explains the state
+    /// instead and points at `z` to bring the row back to the active list.
+    fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| inst.title.clone())
+            .unwrap_or_default();
+        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let parked = if title.is_empty() {
+            "This session is parked. Its agent was stopped.".to_string()
+        } else {
+            format!("\"{}\" is parked. Its agent was stopped.", title)
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Archived",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(parked, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Calm placeholder shown when the selected session's pane is simply gone
+    /// (the generic gone-error, no diagnostic detail). Replaces the red crash
+    /// error with a "Stopped, enter to start" message; the row's real status
+    /// icon still signals the state in the sidebar.
+    fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Stopped",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This session isn't running.",
+                Style::default().fg(theme.dimmed),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+                Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -2637,6 +2817,55 @@ mod tests {
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
+
+    fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x,
+            y,
+            visible,
+            pane_height,
+        }
+    }
+
+    #[test]
+    fn live_cursor_maps_directly_when_pane_matches_output() {
+        // Pane sized to the output area (the steady-state live-send case): the
+        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y).
+        let output = Rect::new(40, 5, 80, 24);
+        let pos = map_live_preview_cursor(output, 24, pane_cursor(3, 2, true, 24));
+        assert_eq!(pos, Some(Position::new(43, 7)));
+    }
+
+    #[test]
+    fn live_cursor_anchored_to_bottom_when_pane_taller_than_output() {
+        // Pane is 24 rows but only 10 are visible (top clipped). The bottom 10
+        // pin to the output, so a cursor on the last screen row (y=23) lands on
+        // the output's last row; a cursor in the clipped top maps out and drops.
+        let output = Rect::new(0, 0, 80, 10);
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 23, true, 24)),
+            Some(Position::new(0, 9)),
+        );
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 5, true, 24)),
+            None,
+        );
+    }
+
+    #[test]
+    fn live_cursor_hidden_or_out_of_bounds_paints_nothing() {
+        let output = Rect::new(0, 0, 80, 24);
+        // DECTCEM-hidden cursor: nothing to paint.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(3, 2, false, 24)),
+            None,
+        );
+        // Column past the output width is dropped rather than clamped.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(80, 2, true, 24)),
+            None,
+        );
+    }
 
     #[test]
     fn truncate_to_width_passthrough_when_fits() {

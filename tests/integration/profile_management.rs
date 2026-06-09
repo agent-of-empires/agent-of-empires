@@ -28,7 +28,7 @@ fn test_list_profiles_includes_default() -> Result<()> {
     let _temp = setup_temp_home();
 
     // Trigger creation of default profile dir by accessing it
-    let _ = Storage::new("default")?;
+    let _ = Storage::new_unwatched("default")?;
 
     let profiles = list_profiles()?;
     assert!(profiles.contains(&"default".to_string()));
@@ -119,7 +119,7 @@ fn test_profile_session_isolation() -> Result<()> {
     create_profile("beta")?;
 
     // Save a session in profile alpha
-    let storage_a = Storage::new("alpha")?;
+    let storage_a = Storage::new_unwatched("alpha")?;
     let instance = Instance::new("Alpha Session", "/path/alpha");
     let seeded = vec![instance];
     storage_a.update(|i, g| {
@@ -129,7 +129,7 @@ fn test_profile_session_isolation() -> Result<()> {
     })?;
 
     // Load from profile beta - should be empty
-    let storage_b = Storage::new("beta")?;
+    let storage_b = Storage::new_unwatched("beta")?;
     let loaded = storage_b.load()?;
     assert!(loaded.is_empty(), "Profile beta should have no sessions");
 
@@ -148,7 +148,7 @@ fn test_rename_profile() -> Result<()> {
 
     create_profile("old_name")?;
     // Add a session so we can verify data moves with the rename
-    let storage = Storage::new("old_name")?;
+    let storage = Storage::new_unwatched("old_name")?;
     let instance = Instance::new("Test Session", "/path/test");
     let seeded = vec![instance];
     storage.update(|i, g| {
@@ -164,7 +164,7 @@ fn test_rename_profile() -> Result<()> {
     assert!(profiles.contains(&"new_name".to_string()));
 
     // Verify sessions moved with the profile
-    let new_storage = Storage::new("new_name")?;
+    let new_storage = Storage::new_unwatched("new_name")?;
     let sessions = new_storage.load()?;
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].title, "Test Session");

@@ -218,6 +218,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
 
+    // Phase 1 (unlocked): pre-flight read of the current persisted state to
+    // resolve `--parent`, generate a non-colliding title, and make best-effort
+    // duplicate / parent decisions before any side effects. Final duplicate
+    // enforcement happens under the flock in phase 3.
+    //
+    // The title is resolved here, before worktree creation, so a tied worktree
+    // session (`session.tie_workdir_to_name`) can seed its directory leaf from
+    // the title and start out aligned (#1927). The path-dependent duplicate
+    // check still runs later, once `path` points at the worktree.
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let final_title = resolve_session_title(&args, &instances)?;
+
     if let Some(branch_raw) = &args.worktree_branch {
         use crate::git::GitWorktree;
         use crate::session::WorktreeInfo;
@@ -325,7 +338,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     &config.worktree.path_template
                 };
-                let worktree_path = git_wt.compute_path(branch, template, session_id_short)?;
+                // Tied sessions name the directory after the title, not the
+                // branch, so the two cannot drift. The branch still creates the
+                // worktree below; only the path leaf changes. (#1927)
+                let leaf_seed_owned;
+                let leaf_seed = if config.session.tie_workdir_to_name {
+                    leaf_seed_owned =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&final_title);
+                    leaf_seed_owned.as_str()
+                } else {
+                    branch
+                };
+                let worktree_path = git_wt.compute_path(leaf_seed, template, session_id_short)?;
 
                 if worktree_path.exists() {
                     bail!(
@@ -373,13 +397,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    let storage = Storage::new(profile)?;
-    // Phase 1 (unlocked): pre-flight read of the current persisted state to
-    // resolve `--parent`, generate a non-colliding title, and make
-    // best-effort duplicate / parent decisions before any side effects.
-    // Final duplicate enforcement happens under the flock in phase 3.
-    let (instances, _groups) = storage.load_with_groups()?;
-
     // Resolve parent session if specified
     let mut group_path = args.group.clone();
     let parent_id = if let Some(parent_ref) = &args.parent {
@@ -393,55 +410,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // Generate title: use provided title, or branch name for worktree sessions, or random civ.
-    // With --interactive (and no --title), prompt for the name TUI-style,
-    // prefilling the generated default. The chosen title, whatever its
-    // source, runs through the same duplicate (title + path) check.
-    let final_title = if let Some(title) = &args.title {
-        let trimmed_title = title.trim();
-        if is_duplicate_session(&instances, trimmed_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                trimmed_title
-            );
-            cleanup_partial_session(
-                &path,
-                worktree_info_opt.as_ref(),
-                workspace_info_opt.as_ref(),
-                args.create_branch,
-                None,
-            );
-            return Ok(());
-        }
-        trimmed_title.to_string()
-    } else {
-        let default_title = if let Some(ref branch) = args.worktree_branch {
-            branch.trim().to_string()
-        } else {
-            let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-            civilizations::generate_random_title(&existing_titles)
-        };
-        let chosen_title = if args.interactive {
-            prompt_session_title(&default_title)?
-        } else {
-            default_title
-        };
-        if is_duplicate_session(&instances, &chosen_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                chosen_title
-            );
-            cleanup_partial_session(
-                &path,
-                worktree_info_opt.as_ref(),
-                workspace_info_opt.as_ref(),
-                args.create_branch,
-                None,
-            );
-            return Ok(());
-        }
-        chosen_title
-    };
+    // The title was resolved before worktree creation (so a tied session could
+    // seed its directory leaf from it); run the path-dependent duplicate check
+    // now that `path` points at the final worktree/workspace directory.
+    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
+        println!(
+            "Session already exists with same title and path: {}",
+            final_title
+        );
+        cleanup_partial_session(
+            &path,
+            worktree_info_opt.as_ref(),
+            workspace_info_opt.as_ref(),
+            args.create_branch,
+            None,
+        );
+        return Ok(());
+    }
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
@@ -1065,6 +1050,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 /// "auto-generates if empty" field. Empty input or EOF keeps
 /// `default_title`; a non-empty line is trimmed and used. Only reached in
 /// `--interactive` mode, which already verified stdin is a terminal.
+/// Resolve the session title string (no path-dependent duplicate check).
+///
+/// `--title` wins; otherwise the default is the worktree branch name, or a
+/// random civilization name for non-worktree sessions. `--interactive` prompts
+/// with that default prefilled. Resolved before worktree creation so a tied
+/// session can derive its directory leaf from the title (#1927); the duplicate
+/// check runs later once the worktree path is known.
+fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
+    if let Some(title) = &args.title {
+        return Ok(title.trim().to_string());
+    }
+    let default_title = if let Some(ref branch) = args.worktree_branch {
+        branch.trim().to_string()
+    } else {
+        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+        civilizations::generate_random_title(&existing_titles)
+    };
+    if args.interactive {
+        prompt_session_title(&default_title)
+    } else {
+        Ok(default_title)
+    }
+}
+
 fn prompt_session_title(default_title: &str) -> Result<String> {
     use std::io::Write;
 

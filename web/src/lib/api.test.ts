@@ -24,6 +24,7 @@ import {
   setSessionPin,
   setSessionSnooze,
   updateProfileSettings,
+  updateTheme,
   PROFILE_WRITABLE_SECTIONS,
   updateSessionGroup,
   type ServerAbout,
@@ -320,5 +321,39 @@ describe("isDebugBuild", () => {
 
   it("returns false when the about payload is undefined", () => {
     expect(isDebugBuild(undefined)).toBe(false);
+  });
+});
+
+// The theme is a global preference written through the dedicated, non-elevated
+// PATCH /api/theme endpoint (not the profile settings PATCH that the picker used
+// to hit). These pin the request shape and the boolean result contract so the
+// api-client surface stays covered when Playwright is gated off.
+describe("updateTheme", () => {
+  it("PATCHes /api/theme with the name and returns true on ok", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "dracula" }));
+    const ok = await updateTheme({ name: "dracula" });
+    expect(ok).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/theme");
+    expect(init!.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ name: "dracula" });
+  });
+
+  it("forwards a color_mode-only patch", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({}));
+    await updateTheme({ color_mode: "palette" });
+    expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({
+      color_mode: "palette",
+    });
+  });
+
+  it("returns false on a non-ok response", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    expect(await updateTheme({ name: "dracula" })).toBe(false);
+  });
+
+  it("returns false on a network error", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await updateTheme({ name: "dracula" })).toBe(false);
   });
 });

@@ -12,10 +12,12 @@
 //! where a stop kills the pane and leaves a restartable `Stopped` row.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
 use super::{Instance, Status, Storage};
+use crate::file_watch::FileWatchService;
 
 /// A plain session the reaper intends to auto-stop, with the inputs the
 /// caller needs to claim it (`profile` to open the right storage, the resolved
@@ -135,11 +137,12 @@ pub fn should_auto_stop_session(
 /// (already claimed by the peer reaper, woken by the user, or gone).
 pub fn claim_idle_stop(
     profile: &str,
+    file_watch: Arc<FileWatchService>,
     session_id: &str,
     now: DateTime<Utc>,
     threshold_secs: u32,
 ) -> anyhow::Result<Option<Instance>> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new(profile, file_watch)?;
     storage.update(|instances, _groups| {
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);
@@ -403,7 +406,7 @@ mod tests {
 
         let inst = idle_instance("claimable");
         let id = inst.id.clone();
-        let storage = Storage::new("test-profile").unwrap();
+        let storage = Storage::new_unwatched("test-profile").unwrap();
         storage
             .update(|instances, _groups| {
                 instances.push(inst);
@@ -412,10 +415,12 @@ mod tests {
             .unwrap();
 
         let now = Utc::now();
-        let first = claim_idle_stop("test-profile", &id, now, 60).unwrap();
+        let first =
+            claim_idle_stop("test-profile", FileWatchService::noop(), &id, now, 60).unwrap();
         assert!(first.is_some(), "first claim should win");
 
-        let second = claim_idle_stop("test-profile", &id, now, 60).unwrap();
+        let second =
+            claim_idle_stop("test-profile", FileWatchService::noop(), &id, now, 60).unwrap();
         assert!(
             second.is_none(),
             "second claim must not re-stop the session"

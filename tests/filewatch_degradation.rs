@@ -1,6 +1,6 @@
 //! Graceful-degradation integration test for `AOE_FILE_WATCH=off`.
 //!
-//! With `AOE_FILE_WATCH=off`, `FileWatchService::new()` must return the
+//! With `AOE_FILE_WATCH=off`, `agent_of_empires::file_watch::test_support::new_filewatch()` must return the
 //! noop fallback. Subscribers register but never receive events: the
 //! dispatcher does not exist, the drain thread does not exist, and the
 //! receiver returned by `subscribe_channel` is paired with a dropped
@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
+use agent_of_empires::file_watch::{FileMatcher, WatchSpec};
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -52,7 +52,7 @@ impl Drop for EnvGuard {
 #[serial]
 async fn aoe_file_watch_off_returns_noop_service() {
     let _guard = EnvGuard::set("AOE_FILE_WATCH", "off");
-    let svc = FileWatchService::new().expect("noop init");
+    let svc = agent_of_empires::file_watch::test_support::new_filewatch().expect("noop init");
     let tmp = TempDir::new().expect("tempdir");
     let target: PathBuf = tmp.path().join("watched");
     let (mut rx, _h) = svc

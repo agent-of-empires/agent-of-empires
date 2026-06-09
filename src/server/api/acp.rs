@@ -591,7 +591,7 @@ pub async fn switch_acp_agent(
             }
         }
     }
-    if let Ok(storage) = crate::session::Storage::new(&profile_for_save) {
+    if let Ok(storage) = crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
         if let Err(e) = storage.update(|instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
                 inst.agent_name = Some(target_for_save.clone());
@@ -689,7 +689,7 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
                 .map(|i| i.source_profile.clone())
                 .unwrap_or_default()
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile) {
+        if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
             let id_clone = id.to_string();
             let session_id_for_log = id.to_string();
             match tokio::task::spawn_blocking(move || {
@@ -1337,8 +1337,9 @@ pub async fn acp_enable(
     }
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
+    let file_watch_for_save = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save)?;
+        let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Structured;
@@ -1520,8 +1521,9 @@ pub async fn acp_disable(
     }
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
+    let file_watch_for_save = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save)?;
+        let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;

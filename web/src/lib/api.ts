@@ -180,6 +180,28 @@ export async function updateSettings(
 }
 
 /**
+ * Sets the global theme (name and/or color mode). Dedicated endpoint, not
+ * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
+ * must not trip the passphrase/elevation wall the general settings surface
+ * carries. Returns false on read-only servers (403) or network failure.
+ */
+export async function updateTheme(patch: {
+  name?: string;
+  color_mode?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch("/api/theme", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Marks the first-run dashboard tour as seen for this server. Single-purpose
  * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
  * passphrase/elevation wall. Returns false on read-only servers (403) or
@@ -1017,19 +1039,33 @@ export async function logout(): Promise<void> {
   }
 }
 
+/**
+ * Rename a session's title. When the session is a tied aoe-managed worktree
+ * (session.tie_workdir_to_name), the server also moves the worktree directory
+ * to match and returns 409 if the session is running, so the message is
+ * surfaced to the caller. See #1927.
+ */
 export async function renameSession(
   id: string,
   title: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; message?: string }> {
   try {
     const res = await fetch(`/api/sessions/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
     });
-    return res.ok;
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
@@ -1241,4 +1277,97 @@ export async function deleteSession(
       error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
     };
   }
+}
+
+// --- MCP servers (#1996) ---
+
+export interface McpServerView {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  envNames?: string[];
+  headerNames?: string[];
+  provenance: string;
+  shadowed?: string[];
+}
+
+export interface McpConflictView {
+  name: string;
+  agent: string;
+  previous: string;
+  current: string;
+  fingerprint: string;
+}
+
+export interface McpServersResponse {
+  agent: string;
+  effective: McpServerView[];
+  keptOnRemoval: McpServerView[];
+  conflicts: McpConflictView[];
+  driftPaused: boolean;
+}
+
+export function fetchMcpServers(
+  agent?: string,
+): Promise<McpServersResponse | null> {
+  const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return fetchJson<McpServersResponse>(`/api/mcp/servers${q}`);
+}
+
+async function postMcp(url: string, body: unknown): Promise<Response | null> {
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  }
+}
+
+export type McpResolveResult = "applied" | "stale" | "error";
+
+export async function resolveMcpConflict(
+  name: string,
+  agent: string,
+  winner: "aoe" | "native",
+  fingerprint: string,
+): Promise<McpResolveResult> {
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/resolve`,
+    {
+      agent,
+      winner,
+      fingerprint,
+    },
+  );
+  if (!res) return "error";
+  if (res.ok) return "applied";
+  if (res.status === 409) return "stale";
+  return "error";
+}
+
+export async function keepMcpServer(
+  name: string,
+  agent: string,
+): Promise<boolean> {
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/keep`,
+    { agent },
+  );
+  return !!res && res.ok;
+}
+
+export async function dropMcpServer(
+  name: string,
+  agent: string,
+): Promise<boolean> {
+  const res = await postMcp(
+    `/api/mcp/servers/${encodeURIComponent(name)}/drop`,
+    { agent },
+  );
+  return !!res && res.ok;
 }

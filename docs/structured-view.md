@@ -20,9 +20,9 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
-| `claude` | `claude-agent-acp` (Zed, requires ≥0.39.0) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
+| `claude` | `claude-agent-acp` (Zed, requires ≥0.41.0) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
 | `codex` | `codex-acp` (Zed) | `npm install -g @zed-industries/codex-acp` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
-| `opencode` | `opencode acp` (native) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
+| `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
 | `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
@@ -47,7 +47,7 @@ Each feature fires for any ACP agent, only when the agent's profile opts in, or 
 | Subagent indentation | ✓ | — | unverified | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
-Codex/opencode/gemini support is built from adapter docs and code reading rather than hands-on walkthroughs, so some tool aliases may need adjustment; file an issue with the observed `tool.kind` + `tool.name`. Mode picker, slash palette, and usage display depend on the adapter advertising the matching channels; when it doesn't, the UI stays empty rather than showing stale state. How profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
+Codex/opencode/gemini support is built from adapter docs and code reading rather than hands-on walkthroughs, so some tool aliases may need adjustment; file an issue with the observed `tool.kind` + `tool.name`. opencode ≥1.16.0 is recommended: it classifies `apply_patch` as `edit` and `task` as `think`, populates `external_directory` permission context, and emits clean read-tool content. Older opencode still works but falls back to generic tool cards, verbose read text, and blind permission prompts. Mode picker, slash palette, and usage display depend on the adapter advertising the matching channels; when it doesn't, the UI stays empty rather than showing stale state. How profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
 
 ## Quickstart
 

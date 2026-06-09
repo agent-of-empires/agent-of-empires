@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Project-local MCP config filename, read from the repository root.
@@ -54,13 +54,13 @@ struct RawServer {
 /// so the fingerprint is order-independent. Values are kept in memory for the
 /// fingerprint (a changed token is an effective config change), but the display
 /// helpers redact them so secrets never reach a screen or log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMcpServer {
     pub name: String,
     pub transport: ProjectMcpTransport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectMcpTransport {
     Stdio {
         command: String,
@@ -138,22 +138,31 @@ fn redacted_remote(
 /// agent configs, a project file is small and fully under review, so a single
 /// bad entry fails the whole parse rather than being silently dropped.
 pub fn load_project_mcp_servers(repo_path: &Path) -> Result<Vec<ProjectMcpServer>> {
-    let path = repo_path.join(PROJECT_MCP_FILE);
-    let text = match std::fs::read_to_string(&path) {
+    load_standard_mcp_servers(&repo_path.join(PROJECT_MCP_FILE))
+}
+
+/// Read and parse a standard `.mcp.json`-shaped file at `path` into
+/// transport-resolved servers. A missing file yields an empty list; a
+/// present-but-malformed file is an error the caller surfaces. Shared by the
+/// project-local layer and the AoE-owned global/per-profile `mcp.json` layers
+/// (`session::mcp_model`), which all use this exact on-disk shape.
+pub(crate) fn load_standard_mcp_servers(path: &Path) -> Result<Vec<ProjectMcpServer>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("reading project MCP config at {}", path.display()))
+            return Err(e).with_context(|| format!("reading MCP config at {}", path.display()))
         }
     };
-    parse_project_mcp_servers(&text)
-        .with_context(|| format!("parsing project MCP config at {}", path.display()))
+    parse_standard_mcp_servers(&text)
+        .with_context(|| format!("parsing MCP config at {}", path.display()))
 }
 
-/// Parse `.mcp.json` text into transport-resolved servers. Split from the file
-/// read so the conversion rules are unit-testable without touching disk.
-fn parse_project_mcp_servers(text: &str) -> Result<Vec<ProjectMcpServer>> {
+/// Parse standard `.mcp.json` text into transport-resolved servers. Split from
+/// the file read so the conversion rules are unit-testable without touching
+/// disk. Public so `session::mcp_model` reuses the exact same standard-shape
+/// parse for the global and per-profile layers.
+pub fn parse_standard_mcp_servers(text: &str) -> Result<Vec<ProjectMcpServer>> {
     let parsed: ProjectMcpFile = serde_json::from_str(text)?;
     parsed
         .mcp_servers
@@ -268,27 +277,28 @@ mod tests {
             "alpha": { "command": "a", "args": ["--x"], "env": { "TOKEN": "secret" } },
             "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer x" } }
         } }"#;
-        let servers = parse_project_mcp_servers(text).unwrap();
+        let servers = parse_standard_mcp_servers(text).unwrap();
         assert_eq!(names(&servers), vec!["alpha", "remote", "zebra"]);
     }
 
     #[test]
     fn stdio_without_command_is_error() {
         assert!(
-            parse_project_mcp_servers(r#"{ "mcpServers": { "x": { "args": ["--y"] } } }"#).is_err()
+            parse_standard_mcp_servers(r#"{ "mcpServers": { "x": { "args": ["--y"] } } }"#)
+                .is_err()
         );
     }
 
     #[test]
     fn remote_without_url_is_error() {
         assert!(
-            parse_project_mcp_servers(r#"{ "mcpServers": { "x": { "type": "http" } } }"#).is_err()
+            parse_standard_mcp_servers(r#"{ "mcpServers": { "x": { "type": "http" } } }"#).is_err()
         );
     }
 
     #[test]
     fn unknown_type_is_error() {
-        assert!(parse_project_mcp_servers(
+        assert!(parse_standard_mcp_servers(
             r#"{ "mcpServers": { "x": { "type": "pigeon", "url": "u" } } }"#
         )
         .is_err());
@@ -303,11 +313,11 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic_and_order_independent() {
-        let a = parse_project_mcp_servers(
+        let a = parse_standard_mcp_servers(
             r#"{ "mcpServers": { "fs": { "command": "c", "env": { "A": "1", "B": "2" } } } }"#,
         )
         .unwrap();
-        let b = parse_project_mcp_servers(
+        let b = parse_standard_mcp_servers(
             r#"{ "mcpServers": { "fs": { "command": "c", "env": { "B": "2", "A": "1" } } } }"#,
         )
         .unwrap();
@@ -316,11 +326,11 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_when_secret_value_changes() {
-        let a = parse_project_mcp_servers(
+        let a = parse_standard_mcp_servers(
             r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "old" } } } }"#,
         )
         .unwrap();
-        let b = parse_project_mcp_servers(
+        let b = parse_standard_mcp_servers(
             r#"{ "mcpServers": { "fs": { "command": "c", "env": { "TOKEN": "new" } } } }"#,
         )
         .unwrap();
@@ -333,7 +343,7 @@ mod tests {
 
     #[test]
     fn redacted_summary_hides_values_shows_names() {
-        let servers = parse_project_mcp_servers(
+        let servers = parse_standard_mcp_servers(
             r#"{ "mcpServers": {
                 "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "supersecret" } },
                 "remote": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer hunter2" } }

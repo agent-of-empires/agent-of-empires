@@ -17,7 +17,7 @@ use crate::common::setup_temp_home;
 fn test_concurrent_updates_no_lost_updates() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     storage.update(|i, g| {
         *i = [].to_vec();
         *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
@@ -31,7 +31,7 @@ fn test_concurrent_updates_no_lost_updates() -> Result<()> {
             let start = Arc::clone(&start);
             scope.spawn(move || {
                 start.wait();
-                let storage = Storage::new("default").unwrap();
+                let storage = Storage::new_unwatched("default").unwrap();
                 storage
                     .update(|instances, _groups| {
                         instances.push(Instance::new(
@@ -94,7 +94,7 @@ fn test_concurrent_workspace_ordering_merge() -> Result<()> {
 fn test_update_with_groups_and_instances_round_trip() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     storage.update(|i, g| {
         *i = [].to_vec();
         *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
@@ -131,7 +131,7 @@ fn test_update_with_groups_and_instances_round_trip() -> Result<()> {
 fn test_concurrent_per_field_updates_no_clobber() -> Result<()> {
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let seed = vec![Instance::new("session", "/tmp/session")];
     storage.update(|i, g| {
         *i = seed.to_vec();
@@ -148,7 +148,7 @@ fn test_concurrent_per_field_updates_no_clobber() -> Result<()> {
     let start_b = Arc::clone(&start);
 
     let thread_a = std::thread::spawn(move || -> Result<()> {
-        let storage = Storage::new("default")?;
+        let storage = Storage::new_unwatched("default")?;
         start_a.wait();
         for i in 0..n_iterations {
             storage.update(|all, _groups| {
@@ -162,7 +162,7 @@ fn test_concurrent_per_field_updates_no_clobber() -> Result<()> {
     });
 
     let thread_b = std::thread::spawn(move || -> Result<()> {
-        let storage = Storage::new("default")?;
+        let storage = Storage::new_unwatched("default")?;
         start_b.wait();
         for _ in 0..n_iterations {
             storage.update(|all, _groups| {
@@ -204,7 +204,7 @@ fn test_update_propagates_disk_write_failure() -> Result<()> {
 
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let seed = vec![Instance::new("session", "/tmp/s")];
     storage.update(|i, g| {
         *i = seed.to_vec();
@@ -283,7 +283,7 @@ fn test_cross_process_no_lost_updates() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     let n = 8usize;
     storage.update(|instances, _groups| {
         for i in 0..n {
@@ -328,7 +328,7 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     storage.update(|instances, _groups| {
         instances.push(Instance::new("blocked", "/tmp/aoe-test-blocked"));
         Ok(())
@@ -339,7 +339,7 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
     let parent_held = std::sync::Arc::new(std::sync::Barrier::new(2));
     let parent_held_in_thread = parent_held.clone();
 
-    let storage_clone = Storage::new("default")?;
+    let storage_clone = Storage::new_unwatched("default")?;
     let parent_handle = std::thread::spawn(move || {
         storage_clone
             .update(|_instances, _groups| {
@@ -381,14 +381,14 @@ fn test_lock_released_on_panic_unwind() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     storage.update(|instances, _groups| {
         instances.push(Instance::new("victim", "/tmp/aoe-test-victim"));
         Ok(())
     })?;
     let id = storage.load()?[0].id.clone();
 
-    let storage_clone = Storage::new("default")?;
+    let storage_clone = Storage::new_unwatched("default")?;
     let parent_handle = std::thread::spawn(move || {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<()> = storage_clone.update(|_, _| -> Result<()> {
@@ -423,7 +423,7 @@ fn test_cross_process_lock_released_on_child_kill() -> Result<()> {
 
     let _temp = setup_temp_home();
 
-    let storage = Storage::new("default")?;
+    let storage = Storage::new_unwatched("default")?;
     storage.update(|insts, _| {
         insts.push(Instance::new("victim-kill", "/tmp/aoe-test-victim-kill"));
         Ok(())
@@ -504,8 +504,8 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
 
-    let s_a = Storage::new("profile-a")?;
-    let s_b = Storage::new("profile-b")?;
+    let s_a = Storage::new_unwatched("profile-a")?;
+    let s_b = Storage::new_unwatched("profile-b")?;
     s_a.update(|insts, _| {
         insts.push(Instance::new("a-1", "/tmp/aoe-test-a"));
         Ok(())
@@ -518,7 +518,7 @@ fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let id_b = s_b.load()?[0].id.clone();
 
     let hold = std::time::Duration::from_millis(500);
-    let storage_clone = Storage::new("profile-a")?;
+    let storage_clone = Storage::new_unwatched("profile-a")?;
     let parent_held = Arc::new(Barrier::new(2));
     let parent_held_inner = parent_held.clone();
     let parent_handle = std::thread::spawn(move || {
