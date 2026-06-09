@@ -5985,6 +5985,77 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     );
 }
 
+/// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
+/// `--allow-override`) must fully unpin in a single press. `load_merged` only
+/// surfaces the shadowing profile entry, so removing just that one would
+/// re-surface the global entry and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path.
+#[test]
+#[serial]
+fn unpin_clears_both_global_and_profile_entries_for_a_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Same path pinned globally and profile-scoped (override allows the shadow).
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    projects::add(
+        "test",
+        ProjectScope::Profile,
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        true,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "dual"))
+        .expect("dual header present");
+    env.view.cursor = idx;
+    env.view.update_selected();
+
+    // One press must fully unpin.
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("dual"),
+        "dual must read as unpinned after a single press"
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "global entry must be removed"
+    );
+    assert!(
+        projects::load_profile("test").unwrap().is_empty(),
+        "profile entry must be removed"
+    );
+    let names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "dual"),
+        "unpinned dual must drop from the view, got {names:?}"
+    );
+}
+
 /// Pressing `g` to flip `group_by` keeps the cursor on the previously
 /// selected session, even when the list reshapes (Manual flat list →
 /// Project grouped list). Previously `apply_group_by` clamped by index,

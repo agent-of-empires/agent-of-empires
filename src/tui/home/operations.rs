@@ -65,40 +65,43 @@ impl HomeView {
             let Some(existing) = existing else {
                 return;
             };
-            // A global entry lives in one shared file, so the profile arg is
-            // irrelevant. A profile-scoped entry can belong to ANY loaded
-            // profile: all-profiles mode merges every profile's registry into
-            // `registered_projects`, but `config_profile()` is only the default
-            // profile, so removing against it misses the entry and the header
-            // never clears. Try each loaded profile until one owns it.
-            let result = match existing.scope {
-                ProjectScope::Global => {
-                    projects::remove(&profile, ProjectScope::Global, &existing.path)
+            // Unpin means "this repo is no longer pinned anywhere", so clear
+            // every registry entry for its canonical path rather than just the
+            // one `load_merged` happened to surface. A path can sit in more than
+            // one scope at once (`--allow-override` lets a profile entry shadow
+            // a global one); removing only the visible entry would re-surface
+            // the shadowed one and leave the header pinned after a "success"
+            // dialog. `registered_projects` also drops which profile each entry
+            // came from in all-profiles mode, and `config_profile()` is only
+            // the default, so sweep the global file plus every loaded profile.
+            let target = existing.path.clone();
+            let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
+            if !profiles.contains(&profile) {
+                profiles.push(profile.clone());
+            }
+            // Global lives in one shared file, so the profile arg is irrelevant.
+            let mut removals = vec![projects::remove(&profile, ProjectScope::Global, &target)];
+            for p in &profiles {
+                removals.push(projects::remove(p, ProjectScope::Profile, &target));
+            }
+            let mut removed_any = false;
+            let mut hard_err: Option<projects::RegistryError> = None;
+            for res in removals {
+                match res {
+                    Ok(_) => removed_any = true,
+                    Err(projects::RegistryError::NotFound(_)) => {}
+                    Err(e) => hard_err = Some(e),
                 }
-                ProjectScope::Profile => {
-                    let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
-                    if !profiles.contains(&profile) {
-                        profiles.push(profile.clone());
-                    }
-                    let mut outcome = Err(projects::RegistryError::NotFound(format!(
-                        "No pinned project '{}' found in any loaded profile",
-                        label
-                    )));
-                    for p in profiles {
-                        match projects::remove(&p, ProjectScope::Profile, &existing.path) {
-                            Ok(removed) => {
-                                outcome = Ok(removed);
-                                break;
-                            }
-                            Err(projects::RegistryError::NotFound(_)) => continue,
-                            Err(e) => {
-                                outcome = Err(e);
-                                break;
-                            }
-                        }
-                    }
-                    outcome
-                }
+            }
+            // Surface a real I/O/parse failure even if some entry was removed;
+            // a partial unpin the user can't see is worse than a visible error.
+            let result: Result<(), projects::RegistryError> = match (hard_err, removed_any) {
+                (Some(e), _) => Err(e),
+                (None, true) => Ok(()),
+                (None, false) => Err(projects::RegistryError::NotFound(format!(
+                    "No pinned project '{}' found in any loaded scope",
+                    label
+                ))),
             };
             match result {
                 Ok(_) => {
