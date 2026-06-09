@@ -3234,13 +3234,20 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let is_archived = match &self.flat_items[idx] {
-                    super::Item::Session { id, .. } => {
-                        self.get_instance(id).is_some_and(|inst| inst.is_archived())
-                    }
-                    super::Item::Group { .. } => false,
+                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self
+                        .get_instance(id)
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
+                        .unwrap_or((false, false)),
+                    super::Item::Group { .. } => (false, false),
                 };
-                ContextMenuDialog::for_session(anchor, is_archived)
+                // Snooze is an Attention-sort triage primitive: the `'h'`
+                // keybinding only fires in Attention sort, so the menu omits
+                // the Snooze row everywhere else to keep the mouse and keyboard
+                // paths in step.
+                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
+                    .then_some(is_snoozed);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze)
             });
             return true;
         }
@@ -3307,6 +3314,14 @@ impl HomeView {
                 // toggle acts on the same session the menu was opened for.
                 if let Err(e) = self.toggle_archive_at_cursor() {
                     tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                }
+            }
+            ContextMenuAction::ToggleSnooze => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive:
+                // snoozing an active row opens the duration picker, unsnoozing
+                // wakes it immediately.
+                if let Err(e) = self.toggle_snooze_at_cursor() {
+                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),

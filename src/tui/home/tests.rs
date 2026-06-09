@@ -3863,6 +3863,82 @@ fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
 
 #[test]
 #[serial]
+fn test_session_context_menu_snooze_opens_duration_dialog() {
+    use crate::session::config::SortOrder;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    // Snooze is offered in Attention sort (it mirrors the Attention-gated `h`
+    // keybinding); dispatching it on an active session opens the duration
+    // picker, the same path the keyboard takes.
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_some(),
+        "context-menu Snooze on an active session must open the duration picker"
+    );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_snooze_wakes_snoozed_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+    let id = env
+        .view
+        .selected_session
+        .clone()
+        .expect("a session should be selected");
+
+    // Pre-snooze the session so the toggle takes the wake path.
+    env.view.snooze_session_for(&id, 60).unwrap();
+    assert!(
+        env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "session should be snoozed before the toggle"
+    );
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "waking a snoozed session must not open the duration picker"
+    );
+    assert!(
+        !env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "context-menu Snooze on a snoozed session must wake it immediately"
+    );
+}
+
+#[test]
+#[serial]
 fn test_shift_n_does_nothing_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.handle_key(key(KeyCode::Char('N')), None);
@@ -10401,6 +10477,7 @@ mod right_click_context_menu {
     //! `d`. Click-outside dismisses the menu.
 
     use super::*;
+    use crate::session::config::SortOrder;
     use crate::session::Item;
     use crate::tui::dialogs::ContextMenuAction;
     use ratatui::layout::Rect;
@@ -10491,8 +10568,12 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
+        // Attention sort surfaces the full session menu (Rename / Archive /
+        // Snooze / Delete), so Delete is three Downs away.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
-        // Session menu is Rename / Archive / Delete; Delete is two Downs away.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
@@ -10573,6 +10654,8 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
+        // Default sort here is Newest, where Snooze is gated out, so the
+        // archived-row menu is just Rename / Unarchive / Delete.
         assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
 
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
@@ -10580,6 +10663,46 @@ mod right_click_context_menu {
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
             "context-menu Unarchive must unarchive the session"
+        );
+    }
+
+    /// The Snooze row mirrors the `'h'` keybinding, which only fires in
+    /// Attention sort. So the right-click session menu must omit Snooze in
+    /// every other sort and include it in Attention sort.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_gates_snooze_to_attention_sort() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+
+        let menu_actions = |env: &TestEnv| -> Vec<ContextMenuAction> {
+            env.view
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .items_for_test()
+                .iter()
+                .map(|(a, _)| *a)
+                .collect()
+        };
+
+        // Newest sort (the default): no Snooze row.
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            !menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must be hidden outside Attention sort"
+        );
+        env.view.context_menu = None;
+
+        // Attention sort: Snooze row present.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must appear in Attention sort"
         );
     }
 
