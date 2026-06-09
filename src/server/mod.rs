@@ -1815,11 +1815,34 @@ fn serve_embedded_file(
 /// binary shipped new assets. Revalidation is cheap: the ETag above
 /// turns it into a 304.
 fn cache_control_for(path: &str) -> &'static str {
-    if path.starts_with("assets/") {
+    if is_content_hashed_asset(path) {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
     }
+}
+
+/// True for `assets/<name>-<hash>.<ext>` where `<hash>` is a Rollup
+/// content hash: 8 chars (the default length) of the base64url
+/// alphabet, immediately preceded by `-`. The `assets/` prefix alone is
+/// not enough: should a non-hashed file ever land there through a Vite
+/// config change, a year of `immutable` would pin clients to it.
+/// Misclassifying a hashed file the other way is harmless; it just
+/// revalidates via ETag like everything else.
+fn is_content_hashed_asset(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("assets/") else {
+        return false;
+    };
+    let Some((stem, _ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    if bytes.len() < 9 || bytes[bytes.len() - 9] != b'-' {
+        return false;
+    }
+    bytes[bytes.len() - 8..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// Kind tag for a local IPv4 address. Ordering in this enum is also the
@@ -3858,12 +3881,26 @@ mod tests {
             cache_control_for("assets/index-DKenwdW0.js"),
             "public, max-age=31536000, immutable"
         );
+        // Rollup hashes draw from the base64url alphabet (`_` and `-`
+        // included), and chunk base names can themselves contain `-`.
+        assert_eq!(
+            cache_control_for("assets/StructuredView-DM_xphSL.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for("assets/theme-bootstrap-Ab12Cd34.css"),
+            "public, max-age=31536000, immutable"
+        );
         assert_eq!(cache_control_for("index.html"), "no-cache");
         assert_eq!(cache_control_for("sw.js"), "no-cache");
         assert_eq!(
             cache_control_for("fonts/GeistMono-Regular.woff2"),
             "no-cache"
         );
+        // Un-hashed files under assets/ must NOT be pinned for a year.
+        assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
+        assert_eq!(cache_control_for("assets/readme"), "no-cache");
+        assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
     }
 
     #[test]
