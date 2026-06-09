@@ -2146,7 +2146,9 @@ export function WorkspaceSidebar({
   // project is a bigger hammer than a single row, so it confirms first
   // (matching the TUI's `z`-over-a-project prompt). Reversible, so a plain
   // confirm rather than a destructive warning; the bulk fan-out reuses the
-  // same per-session path as multi-select archive.
+  // same per-session path as multi-select archive. The caller must pass the
+  // unfiltered group (see `fullGroup`/`fullSubgroup` below) so an active
+  // search filter doesn't shrink "archive all" to the visible matches.
   const onArchiveGroup = useCallback(
     (group: SidebarGroup) => {
       const wss = archivableWorkspaces(group);
@@ -2157,6 +2159,13 @@ export function WorkspaceSidebar({
     },
     [onBulkArchive],
   );
+
+  // Unfiltered flat-axis groups keyed by id, so the group header's
+  // "Archive all" count and action can resolve full project membership even
+  // while a search filter has sliced the rendered `workspaces`. The nested
+  // repo header already carries full membership (`filteredNested` copies
+  // `ng.repo` unchanged); only the flat header and nested subgroups need it.
+  const groupById = useMemo(() => new Map(groups.map((g) => [g.id, g])), [groups]);
 
   // Interpret a row click: plain click clears the selection and navigates
   // (today's behavior), modifier clicks build the selection instead. The row
@@ -2382,14 +2391,18 @@ export function WorkspaceSidebar({
                   const renderGroupBody = (group: SidebarGroup, dragHandle?: DragHandleProps) => {
                     const showExpanded = q ? true : !group.collapsed;
                     const hasActiveChild = group.workspaces.some((v) => v.workspace.id === displayedActiveId);
+                    // Header archive count + action operate on the full group,
+                    // not the filter-sliced one, so "Archive all" never silently
+                    // skips hidden members. Rows below still render `group`.
+                    const fullGroup = groupById.get(group.id) ?? group;
                     return (
                       <>
                         <SidebarGroupHeader
-                          group={{ ...group, collapsed: !showExpanded }}
+                          group={{ ...fullGroup, collapsed: !showExpanded }}
                           hasActiveChild={!showExpanded && hasActiveChild}
                           onClick={() => !q && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
-                          onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(group)}
+                          onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
                               ? onCreateSession(group.repoPath)
@@ -2491,6 +2504,12 @@ export function WorkspaceSidebar({
                       // footer below, exactly like the flat axes, so
                       // each subgroup renders only its live tier.
                       const liveWorkspaces = sg.workspaces.filter((v) => !workspaceIsSunk(v.workspace));
+                      // Resolve the unfiltered subgroup so "Archive all"
+                      // covers the whole subgroup, not just filter matches.
+                      const fullSubgroup =
+                        nestedGroups
+                          .find((n) => n.repo.id === repo.id)
+                          ?.subgroups.find((s) => (s.groupPath ?? "") === groupPath) ?? sg;
                       return (
                         <div
                           key={`${repo.id}::${groupPath}`}
@@ -2499,11 +2518,11 @@ export function WorkspaceSidebar({
                           data-repo-id={repo.id}
                         >
                           <SidebarGroupHeader
-                            group={{ ...sg, collapsed: !subExpanded }}
+                            group={{ ...fullSubgroup, collapsed: !subExpanded }}
                             hasActiveChild={!subExpanded && subHasActiveChild}
                             onClick={() => !q && onToggleSubgroup(repo.id, groupPath)}
                             onUpdateAppearance={onUpdateRepoAppearance}
-                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(sg)}
+                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullSubgroup)}
                             onNewSession={onNew}
                             offline={offline}
                           />

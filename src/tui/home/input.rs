@@ -778,12 +778,19 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        let name = group_path.rsplit('/').next().unwrap_or(&group_path);
+        // Project mode groups by repo, Manual mode by user-assigned path; name
+        // the scope accordingly and show the full path so nested groups that
+        // share a leaf segment aren't ambiguous.
+        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
+            ("Archive project", "project")
+        } else {
+            ("Archive group", "group")
+        };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
             ConfirmDialog::new(
-                "Archive project",
-                &format!("Archive all {count} {noun} in \"{name}\"?"),
+                title,
+                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
                 "archive_group",
             )
             .neutral(),
