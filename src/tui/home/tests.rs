@@ -221,7 +221,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None);
+                view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -300,7 +300,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None);
+            env.view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
 
@@ -5060,7 +5060,7 @@ fn update_bar_renders_status_toast_without_update_info() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, Some(toast));
+            env.view.render(f, area, &theme, None, Some(toast), None);
         })
         .unwrap();
 
@@ -5081,6 +5081,116 @@ fn update_bar_renders_status_toast_without_update_info() {
     assert!(
         out.contains("[Ctrl+x] dismiss"),
         "expected the dismiss hint alongside the toast.\nFull buffer:\n{out}"
+    );
+}
+
+/// The sandbox-image update banner renders (with its `[u] pull` /
+/// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
+/// higher-priority banner is up. Guards the lowest-priority slot in
+/// `render_update_bar`.
+#[test]
+#[serial]
+fn update_bar_renders_sandbox_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, None, None, Some(&image_update));
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("sandbox image update available"),
+        "expected the sandbox image banner to render.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+        "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
+    );
+}
+
+/// The app-update banner wins the shared bottom row over a pending
+/// sandbox-image update: only one shows at a time, so the lower-priority
+/// image banner must stay hidden (and its `[u] pull` hint absent) while an
+/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
+#[test]
+#[serial]
+fn app_update_banner_takes_precedence_over_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(
+                f,
+                area,
+                &theme,
+                Some(&update_info),
+                None,
+                Some(&image_update),
+            );
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("update available 1.0.0"),
+        "expected the app update banner to win the row.\nFull buffer:\n{out}"
+    );
+    assert!(
+        !out.contains("sandbox image update available"),
+        "image banner must stay hidden while an app update is shown.\nFull buffer:\n{out}"
     );
 }
 
@@ -5171,7 +5281,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -7409,7 +7519,7 @@ mod scroll_pane_isolation {
             terminal
                 .draw(|f| {
                     let area = f.area();
-                    env.view.render(f, area, &theme, None, None);
+                    env.view.render(f, area, &theme, None, None, None);
                 })
                 .unwrap();
             env.view.preview_pane_area.width
@@ -9048,7 +9158,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -9099,7 +9209,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -11502,7 +11612,7 @@ mod apply_session_id_updates {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None);
+                view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 

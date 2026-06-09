@@ -759,10 +759,32 @@ impl HomeView {
                 }
                 None
             }
+            "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
         }
+    }
+
+    /// Open a neutral confirm dialog offering to pull the newer sandbox image
+    /// the registry check surfaced. The image is stashed in
+    /// `pending_image_pull` because the generic `ConfirmDialog` only carries an
+    /// action string; the Submit handler reads it back to emit the pull.
+    pub(crate) fn prompt_pull_sandbox_image(&mut self, image: String) {
+        if self.confirm_dialog.is_some() {
+            return;
+        }
+        self.pending_image_pull = Some(image.clone());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Update sandbox image",
+                &format!(
+                    "Pull the latest {image}? This downloads the new image and uses it for new sandbox sessions."
+                ),
+                "pull_sandbox_image",
+            )
+            .neutral(),
+        );
     }
 
     /// Confirm before archiving every active session under the focused group.
@@ -901,6 +923,7 @@ impl HomeView {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
                         self.pending_force_remove_session = None;
+                        self.pending_image_pull = None;
                         // The settings close path mirrors the keyboard
                         // route: Cancel here means "don't discard," so
                         // settings stays open and `settings_close_confirm`
@@ -1693,6 +1716,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
+                    self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();

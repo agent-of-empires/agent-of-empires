@@ -69,6 +69,36 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         self.base.image_exists_locally(image)
     }
 
+    fn local_image_digest(&self, image: &str) -> Option<String> {
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                // `RepoDigests` holds `repo@sha256:...` entries for the pulled
+                // manifest. One subprocess, newline-joined so a multi-registry
+                // image still lets us pick the entry matching this reference.
+                let output = self
+                    .base
+                    .command()
+                    .args([
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{range .RepoDigests}}{{println .}}{{end}}",
+                        image,
+                    ])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                super::image_update::pick_repo_digest(image, &stdout)
+            }
+            // Apple Container's `image inspect` doesn't expose a Docker-style
+            // repo digest; skip the staleness check there rather than guess.
+            RuntimeKind::AppleContainer => None,
+        }
+    }
+
     fn pull_image(&self, image: &str) -> Result<()> {
         self.base.pull_image(image)
     }

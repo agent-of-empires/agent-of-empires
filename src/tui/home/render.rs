@@ -11,6 +11,7 @@ use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
     ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
 };
+use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
@@ -452,6 +453,7 @@ impl HomeView {
         theme: &Theme,
         update_info: Option<&UpdateInfo>,
         update_status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -502,7 +504,8 @@ impl HomeView {
         // (update_info) and transient toasts (update_status); we need a row
         // for it whenever either is present, otherwise toasts fired without
         // a pending update would never reach the screen.
-        let has_update_bar = update_info.is_some() || update_status.is_some();
+        let has_update_bar =
+            update_info.is_some() || update_status.is_some() || image_update.is_some();
         let constraints = if has_update_bar {
             vec![
                 Constraint::Min(0),
@@ -581,7 +584,14 @@ impl HomeView {
         self.render_status_bar(frame, main_chunks[1], theme);
 
         if has_update_bar {
-            self.render_update_bar(frame, main_chunks[2], theme, update_info, update_status);
+            self.render_update_bar(
+                frame,
+                main_chunks[2],
+                theme,
+                update_info,
+                update_status,
+                image_update,
+            );
         }
 
         // Render dialogs on top
@@ -2799,11 +2809,13 @@ impl HomeView {
         theme: &Theme,
         info: Option<&UpdateInfo>,
         status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // Transient status takes precedence over the persistent update banner
-        // so users see the latest signal (e.g. "restart failed: ...") even
-        // when an update banner is also up.
+        // Precedence (highest first): transient status, app update, then the
+        // sandbox-image update. Only one banner shows at a time, so its keys
+        // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
+        // the ones above it clear.
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
@@ -2811,6 +2823,8 @@ impl HomeView {
                 " update available {} → {}  [u] update  [Ctrl+x] dismiss",
                 info.current_version, info.latest_version
             )
+        } else if image_update.is_some() {
+            " sandbox image update available  [u] pull  [Ctrl+x] dismiss".to_string()
         } else {
             return;
         };

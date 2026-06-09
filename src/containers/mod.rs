@@ -1,5 +1,6 @@
 pub mod container_interface;
 pub mod error;
+pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
 

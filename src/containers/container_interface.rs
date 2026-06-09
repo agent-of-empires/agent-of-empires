@@ -123,6 +123,13 @@ pub trait ContainerRuntimeInterface {
 
     fn image_exists_locally(&self, image: &str) -> bool;
 
+    /// The manifest digest (`sha256:...`) of the locally-stored image, read
+    /// from its repo digest. `None` when the image isn't present locally, was
+    /// built rather than pulled (no repo digest), or the runtime can't report
+    /// one. Used to compare against the registry to detect a stale sandbox
+    /// image; never pulls.
+    fn local_image_digest(&self, image: &str) -> Option<String>;
+
     // container management
     fn does_container_exist(&self, name: &str) -> Result<bool>;
 
