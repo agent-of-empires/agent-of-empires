@@ -14,7 +14,15 @@
 // See `docs/development/playwright.md` for the full recipe.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+  chmodSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -167,15 +175,21 @@ export interface ServeHandle {
  */
 export async function listSessions(
   baseUrl: string,
-): Promise<Array<{ id: string; title: string; status: string; [k: string]: unknown }>> {
+): Promise<
+  Array<{ id: string; title: string; status: string; [k: string]: unknown }>
+> {
   const res = await fetch(`${baseUrl}/api/sessions`);
   if (!res.ok) {
-    throw new Error(`GET /api/sessions failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `GET /api/sessions failed: ${res.status} ${await res.text()}`,
+    );
   }
   const body = await res.json();
   if (Array.isArray(body)) return body;
   if (body && Array.isArray(body.sessions)) return body.sessions;
-  throw new Error(`GET /api/sessions returned an unexpected shape: ${JSON.stringify(body).slice(0, 200)}`);
+  throw new Error(
+    `GET /api/sessions returned an unexpected shape: ${JSON.stringify(body).slice(0, 200)}`,
+  );
 }
 
 /**
@@ -192,7 +206,11 @@ export function seedSessionViaAoeAdd(opts: {
   title: string;
   tool?: string;
   subdir?: string;
-}): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
+}): (seedEnv: {
+  home: string;
+  shimBin: string;
+  env: NodeJS.ProcessEnv;
+}) => void {
   return ({ home, env }) => {
     const projectDir = join(home, opts.subdir ?? "project");
     mkdirSync(projectDir, { recursive: true });
@@ -207,11 +225,17 @@ export function seedSessionViaAoeAdd(opts: {
         GIT_COMMITTER_EMAIL: "t@t",
       },
     });
-    const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"], {
-      env,
-    });
+    const addRes = spawnSync(
+      resolveAoeBinary(),
+      ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"],
+      {
+        env,
+      },
+    );
     if (addRes.status !== 0) {
-      throw new Error(`aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`);
+      throw new Error(
+        `aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`,
+      );
     }
   };
 }
@@ -247,7 +271,11 @@ export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
  * `$HOME/.agent-of-empires[-dev]`. Debug builds carry the `-dev`
  * suffix, derived from the binary path the same way as `tmuxPrefixFor`.
  */
-export function appDirFor(home: string, xdg: string, binaryPath: string): string {
+export function appDirFor(
+  home: string,
+  xdg: string,
+  binaryPath: string,
+): string {
   const suffix = binaryPath.includes("/target/debug/") ? "-dev" : "";
   if (process.platform === "linux") {
     return join(xdg, `agent-of-empires${suffix}`);
@@ -305,7 +333,10 @@ async function killOrphanRunners(appDir: string): Promise<void> {
  * `waitForServer` resolves it is on disk; the loop is a small safety
  * net for systems where fs writes lag the listen socket by a few ms.
  */
-async function readTokenFile(tokenPath: string, deadlineMs: number): Promise<string> {
+async function readTokenFile(
+  tokenPath: string,
+  deadlineMs: number,
+): Promise<string> {
   const { readFile } = await import("node:fs/promises");
   const deadline = Date.now() + deadlineMs;
   let lastErr: unknown = "no attempts made";
@@ -323,7 +354,11 @@ async function readTokenFile(tokenPath: string, deadlineMs: number): Promise<str
   throw new Error(`token file ${tokenPath} not readable: ${lastErr}`);
 }
 
-function portFor(workerIndex: number, parallelIndex: number, attempt: number): number {
+function portFor(
+  workerIndex: number,
+  parallelIndex: number,
+  attempt: number,
+): number {
   // 5200 + worker*100 + parallel + attempt*7 covers ~14 retries per
   // (worker, parallel) slot before colliding with the next slot.
   return 5200 + workerIndex * 100 + parallelIndex + attempt * 7;
@@ -339,7 +374,9 @@ async function waitForServer(
   let lastErr: unknown = "no attempts made";
   while (Date.now() < deadline) {
     if (proc.exitCode !== null || proc.signalCode !== null) {
-      throw new Error(`aoe serve died before ready (exit=${proc.exitCode} signal=${proc.signalCode})`);
+      throw new Error(
+        `aoe serve died before ready (exit=${proc.exitCode} signal=${proc.signalCode})`,
+      );
     }
     try {
       const res = await fetch(`${baseUrl}/api/about`);
@@ -349,7 +386,11 @@ async function waitForServer(
       // the harness latch onto stale token-auth servers that other test
       // runs left running on the same port. Be precise per authMode.
       if (authMode === "none" && res.status === 200) return;
-      if ((authMode === "passphrase" || authMode === "token") && (res.status === 200 || res.status === 401)) return;
+      if (
+        (authMode === "passphrase" || authMode === "token") &&
+        (res.status === 200 || res.status === 401)
+      )
+        return;
       lastErr = `status ${res.status}`;
     } catch (err) {
       lastErr = err;
@@ -402,7 +443,9 @@ function writeFakeAcpShim(
   } else {
     scriptLines.push("unset FAKE_ACP_SCRIPT");
   }
-  scriptLines.push(`export FAKE_ACP_DEBUG_LOG=${JSON.stringify(fakeAcpDebugLog)}`);
+  scriptLines.push(
+    `export FAKE_ACP_DEBUG_LOG=${JSON.stringify(fakeAcpDebugLog)}`,
+  );
   for (const [key, value] of Object.entries(extraEnv ?? {})) {
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
@@ -428,13 +471,17 @@ async function loginWithPassphrase(
     }),
   });
   if (!res.ok) {
-    throw new Error(`POST /api/login failed: ${res.status} ${await res.text()}`);
+    throw new Error(
+      `POST /api/login failed: ${res.status} ${await res.text()}`,
+    );
   }
   const setCookie = res.headers.get("set-cookie") ?? "";
   // axum returns a single Set-Cookie; cookie name we want is "aoe_session".
   const match = /aoe_session=([^;]+)/.exec(setCookie);
   if (!match) {
-    throw new Error(`POST /api/login did not set aoe_session cookie. Set-Cookie was: ${setCookie}`);
+    throw new Error(
+      `POST /api/login did not set aoe_session cookie. Set-Cookie was: ${setCookie}`,
+    );
   }
   return { cookie: { name: "aoe_session", value: match[1] } };
 }
@@ -443,7 +490,8 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const aoeBinary = resolveAoeBinary();
   if (!existsSync(aoeBinary)) {
     throw new Error(
-      `aoe binary not found at ${aoeBinary}. ` + `Set AOE_E2E_BINARY or run liveGlobalSetup.ts to build it.`,
+      `aoe binary not found at ${aoeBinary}. ` +
+        `Set AOE_E2E_BINARY or run liveGlobalSetup.ts to build it.`,
     );
   }
 
@@ -471,7 +519,11 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   // is a POSIX-only limit, so the Darwin short-path workaround does
   // not apply to win32 either.
   const shortBase = process.platform === "win32" ? tmpdir() : "/tmp";
-  const home = realpathSync(mkdtempSync(join(shortBase, `aoe-pw-w${opts.workerIndex}-p${opts.parallelIndex}-`)));
+  const home = realpathSync(
+    mkdtempSync(
+      join(shortBase, `aoe-pw-w${opts.workerIndex}-p${opts.parallelIndex}-`),
+    ),
+  );
   const xdg = join(home, "config");
   const tmp = join(home, "tmp");
   const tmuxTmp = join(home, "tmux");
@@ -481,10 +533,30 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   }
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
-    writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
+    writeFakeAcpShim(
+      shimBin,
+      opts.fakeAcpScript,
+      fakeAcpDebugLog,
+      opts.extraEnv,
+    );
   } else {
     writeFakeClaudeShim(shimBin);
   }
+
+  // The agent pane command is wrapped in a login shell
+  // (`<shell> -lc 'stty susp undef; exec env <cmd>'`, see
+  // wrap_command_ignore_suspend in src/session/instance.rs). A login shell
+  // sources /etc/profile, and some CI runner images (Blacksmith's ubuntu-2404)
+  // reset PATH there, dropping the shim dir we put on `seedEnv.PATH` below.
+  // Without a ~/.profile to restore it, `env <shim>` fails with "No such file
+  // or directory" (exit 127) and the pane dies before running the fake agent.
+  // Seed a ~/.profile that re-prepends the shim dir, mirroring how a real
+  // user's ~/.profile typically adds ~/bin. (GitHub's runner image preserves
+  // the inherited PATH through the login shell, so this was previously
+  // invisible.)
+  writeFileSync(join(home, ".profile"), `export PATH="${shimBin}:$PATH"\n`, {
+    mode: 0o600,
+  });
 
   const authMode: AuthMode = opts.authMode ?? "none";
 
@@ -544,7 +616,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
   }
 
-  const passphrase = authMode === "passphrase" ? (opts.passphrase ?? DEFAULT_PASSPHRASE) : undefined;
+  const passphrase =
+    authMode === "passphrase"
+      ? (opts.passphrase ?? DEFAULT_PASSPHRASE)
+      : undefined;
 
   const spawnTimeoutMs = opts.spawnTimeoutMs ?? 10_000;
 
@@ -570,7 +645,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     return args;
   }
 
-  async function spawnOnce(args: string[], boundBaseUrl: string): Promise<ChildProcess> {
+  async function spawnOnce(
+    args: string[],
+    boundBaseUrl: string,
+  ): Promise<ChildProcess> {
     const child = spawn(aoeBinary, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: seedEnv,
@@ -602,7 +680,9 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
       } catch {
         // ignore
       }
-      const wrapped = spawnFailed ? new Error(`spawn failed before listen: ${String(err)}`) : err;
+      const wrapped = spawnFailed
+        ? new Error(`spawn failed before listen: ${String(err)}`)
+        : err;
       throw wrapped;
     }
   }
@@ -743,7 +823,11 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
 
   if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
     const deviceBindingSecret = randomBytes(32).toString("base64url");
-    const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
+    const { cookie } = await loginWithPassphrase(
+      baseUrl,
+      passphrase,
+      deviceBindingSecret,
+    );
     handle.sessionCookie = cookie;
     handle.deviceBindingSecret = deviceBindingSecret;
   }

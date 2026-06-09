@@ -15,12 +15,19 @@
 
 import { test, expect } from "@playwright/test";
 import { spawnSync } from "node:child_process";
-import { spawnAoeServe, listSessions, seedSessionViaAoeAdd, resolveAoeBinary } from "../helpers/aoeServe";
+import {
+  spawnAoeServe,
+  listSessions,
+  seedSessionViaAoeAdd,
+  resolveAoeBinary,
+} from "../helpers/aoeServe";
 
 const aoeBinary = resolveAoeBinary();
 
 test.describe.serial("file-watch peer propagation", () => {
-  test("peer rename surfaces within the watcher budget", async ({ page }, ti) => {
+  test("peer rename surfaces within the watcher budget", async ({
+    page,
+  }, ti) => {
     const serve = await spawnAoeServe({
       authMode: "none",
       workerIndex: ti.workerIndex,
@@ -33,24 +40,38 @@ test.describe.serial("file-watch peer propagation", () => {
         timeout: 10_000,
       });
 
-      const rename = spawnSync(aoeBinary, ["session", "rename", "peer-source", "-t", "peer-target"], {
-        env: serve.env,
-        stdio: "pipe",
-      });
+      const rename = spawnSync(
+        aoeBinary,
+        ["session", "rename", "peer-source", "-t", "peer-target"],
+        {
+          env: serve.env,
+          stdio: "pipe",
+        },
+      );
       expect(rename.status, rename.stderr.toString()).toBe(0);
 
       // Prove the daemon state flips through the watcher path before the 2s
       // poll fallback could refresh it.
       await expect
-        .poll(async () => (await listSessions(serve.baseUrl)).some((session) => session.title === "peer-target"), {
-          timeout: 1_500,
-        })
+        .poll(
+          async () =>
+            (await listSessions(serve.baseUrl)).some(
+              (session) => session.title === "peer-target",
+            ),
+          {
+            timeout: 1_500,
+          },
+        )
         .toBe(true);
 
       // Once the watcher has updated daemon state, the dashboard can take a
-      // little longer to repaint.
+      // little longer to repaint. The watcher budget is asserted above against
+      // the daemon API (1.5s); this is only the browser-repaint allowance, so
+      // give it the same headroom as the initial load (a slower CI runner can
+      // push the repaint just past a tight 3s window even though the daemon
+      // already flipped).
       await expect(page.getByText("peer-target")).toBeVisible({
-        timeout: 3_000,
+        timeout: 10_000,
       });
     } finally {
       await serve.stop();
