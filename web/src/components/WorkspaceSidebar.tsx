@@ -1647,7 +1647,9 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
         data-group-id={group.id}
         tabIndex={hasMenu ? 0 : undefined}
         aria-haspopup={hasMenu ? "menu" : undefined}
-        aria-label={hasMenu ? `Project actions for ${group.displayName}` : undefined}
+        aria-label={
+          hasMenu ? `${group.kind === "repo" ? "Project" : "Group"} actions for ${group.displayName}` : undefined
+        }
         onContextMenu={
           hasMenu
             ? (e) => {
