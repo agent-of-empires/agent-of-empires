@@ -65,7 +65,42 @@ impl HomeView {
             let Some(existing) = existing else {
                 return;
             };
-            match projects::remove(&profile, existing.scope, &existing.path) {
+            // A global entry lives in one shared file, so the profile arg is
+            // irrelevant. A profile-scoped entry can belong to ANY loaded
+            // profile: all-profiles mode merges every profile's registry into
+            // `registered_projects`, but `config_profile()` is only the default
+            // profile, so removing against it misses the entry and the header
+            // never clears. Try each loaded profile until one owns it.
+            let result = match existing.scope {
+                ProjectScope::Global => {
+                    projects::remove(&profile, ProjectScope::Global, &existing.path)
+                }
+                ProjectScope::Profile => {
+                    let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
+                    if !profiles.contains(&profile) {
+                        profiles.push(profile.clone());
+                    }
+                    let mut outcome = Err(projects::RegistryError::NotFound(format!(
+                        "No pinned project '{}' found in any loaded profile",
+                        label
+                    )));
+                    for p in profiles {
+                        match projects::remove(&p, ProjectScope::Profile, &existing.path) {
+                            Ok(removed) => {
+                                outcome = Ok(removed);
+                                break;
+                            }
+                            Err(projects::RegistryError::NotFound(_)) => continue,
+                            Err(e) => {
+                                outcome = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    outcome
+                }
+            };
+            match result {
                 Ok(_) => {
                     self.info_dialog = Some(InfoDialog::new(
                         "Project Unpinned",

@@ -5650,6 +5650,79 @@ fn p_key_opens_projects_dialog_off_project_header() {
     );
 }
 
+/// Pin a project, archive its only session, then unpin: the empty header must
+/// leave the main flow (the archived session stays under the Archived section).
+#[test]
+#[serial]
+fn unpin_archived_only_project_leaves_main_flow() {
+    use crate::session::{config::GroupByMode, is_within_archived_section};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pin beta.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "beta"))
+        .expect("beta header present");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("beta"));
+
+    // Archive both beta sessions.
+    let beta_ids: Vec<String> = env
+        .view
+        .instances
+        .iter()
+        .filter(|i| super::project_group_name(i) == "beta")
+        .map(|i| i.id.clone())
+        .collect();
+    for id in &beta_ids {
+        env.view
+            .apply_user_action(id, |inst| inst.archive())
+            .unwrap();
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Now unpin via the cursor on the empty main-flow beta header.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, path, .. } if name == "beta" && !is_within_archived_section(path)))
+        .expect("empty beta header present in main flow after archiving");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("beta"),
+        "beta must read as unpinned after the toggle; registry still has it"
+    );
+
+    // Count beta headers OUTSIDE the Archived section.
+    let mut in_archived = false;
+    let mut main_beta = 0;
+    for item in &env.view.flat_items {
+        if let Item::Group { path, name, .. } = item {
+            if is_within_archived_section(path) {
+                in_archived = true;
+            } else if name == "beta" && !in_archived {
+                main_beta += 1;
+            }
+        }
+    }
+    assert_eq!(
+        main_beta, 0,
+        "unpinned archived-only beta must not render in the main flow; got: {:?}",
+        env.view.flat_items
+    );
+}
+
 /// The pin must persist a project across its last session leaving the view:
 /// once pinned, the header remains even when no sessions reference it. This
 /// is the user-visible promise of #2047.
@@ -5834,6 +5907,82 @@ fn all_profiles_view_includes_profile_scoped_pins() {
         "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
     );
     assert!(view.is_project_label_pinned("lonely"));
+}
+
+/// Unpinning a PROFILE-scoped pin from all-profiles mode must actually clear
+/// it. Regression for #2055: the empty header surfaced from a non-default
+/// profile's registry, but the unpin removed against `config_profile()` (the
+/// default profile) rather than the profile that owned the entry, so the
+/// header never disappeared.
+#[test]
+#[serial]
+fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session, so all-profiles mode
+    // loads both registries.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` (NOT the default profile) with no sessions.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "lonely"))
+        .expect("lonely header present in all-profiles project view");
+    view.cursor = idx;
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !view.is_project_label_pinned("lonely"),
+        "lonely must read as unpinned after the toggle"
+    );
+    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    assert!(
+        projects::load_profile("beta").unwrap().is_empty(),
+        "the profile-scoped registry entry must be removed from disk"
+    );
+    let still: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !still.iter().any(|n| n == "lonely"),
+        "unpinned lonely must drop from the view, got {still:?}"
+    );
 }
 
 /// Pressing `g` to flip `group_by` keeps the cursor on the previously
