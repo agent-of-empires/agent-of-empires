@@ -3550,6 +3550,7 @@ pub async fn session_diff_files(
         Err(resp) => return resp,
     };
 
+    let scan_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         use crate::git::diff;
 
@@ -3570,7 +3571,9 @@ pub async fn session_diff_files(
                 path,
             );
             let warning = diff::check_merge_base_status(path, &base_branch);
-            let changed = diff::compute_changed_files(path, &base_branch).unwrap_or_default();
+            let changed = scan_state
+                .changed_files_cached(path, &base_branch)
+                .unwrap_or_default();
 
             for f in changed {
                 all_files.push(RichDiffFileInfo {
@@ -3680,6 +3683,7 @@ pub async fn session_diff_file(
     let selected_repo_name = selected_repo.name;
     let base_branch_override = ctx.base_branch_override.clone();
     let base_from_worktree = ctx.base_from_worktree.clone();
+    let scan_state = state.clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
@@ -3702,7 +3706,8 @@ pub async fn session_diff_file(
             // Validate the requested path against the set of actually-changed files.
             // This is the primary security boundary: only files modified on this
             // branch are diffable, preventing arbitrary file reads via ?path=...
-            let changed_files = diff::compute_changed_files(repo_path, &base_branch)
+            let changed_files = scan_state
+                .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             match validate_diff_path(repo_path, file_path, &changed_files) {
                 Ok(_) => {}

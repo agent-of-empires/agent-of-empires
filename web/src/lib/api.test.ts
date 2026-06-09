@@ -23,12 +23,15 @@ import {
   setSessionArchive,
   setSessionPin,
   setSessionSnooze,
+  getSettingsSchema,
   updateProfileSettings,
   updateTheme,
-  PROFILE_WRITABLE_SECTIONS,
+  profileWritableSections,
+  resetSettingsSchemaCache,
   updateSessionGroup,
   type ServerAbout,
 } from "./api";
+import type { SettingsFieldDescriptor } from "./types";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -189,25 +192,48 @@ describe("setSessionSnooze", () => {
   });
 });
 
+function fieldDescriptor(section: string, field: string): SettingsFieldDescriptor {
+  return {
+    section,
+    field,
+    category: "Test",
+    label: field,
+    description: "",
+    widget: { kind: "toggle" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  };
+}
+
+describe("profileWritableSections", () => {
+  it("derives the writable set from the schema plus `description`", () => {
+    const schema = [fieldDescriptor("theme", "name"), fieldDescriptor("session", "yolo_mode_default")];
+    const writable = profileWritableSections(schema);
+    expect(writable.has("theme")).toBe(true);
+    expect(writable.has("session")).toBe(true);
+    // The profile-only top-level field has no descriptor but is always writable.
+    expect(writable.has("description")).toBe(true);
+    // `hooks` is absent from the schema (an RCE surface), so it is never
+    // writable; the client cannot drift from the server on this.
+    expect(writable.has("hooks")).toBe(false);
+  });
+});
+
 describe("updateProfileSettings write guard", () => {
-  // PROFILE_WRITABLE_SECTIONS mirrors the server's
-  // ALLOWED_PROFILE_SETTINGS_SECTIONS (src/server/api/mod.rs). This literal
-  // pin fails CI if the client list drifts; keep it in sync with the Rust
-  // constant and its pinned regression test by hand.
-  it("pins the allowlist to the server's writable sections", () => {
-    expect([...PROFILE_WRITABLE_SECTIONS]).toEqual([
-      "theme",
-      "session",
-      "tmux",
-      "updates",
-      "sound",
-      "sandbox",
-      "worktree",
-      "web",
-      "logging",
-      "acp",
-      "description",
-    ]);
+  // The guard reads the live settings schema (cached) to decide which sections
+  // it may PATCH, so client and server derive from one source and cannot drift.
+  // A section newly added to the Rust schema is writable here automatically
+  // (the #1757 cockpit drift could not recur). Prime the cache with a known
+  // schema, then clear the spy so the assertions below only see PATCH traffic.
+  const schema = [fieldDescriptor("theme", "name"), fieldDescriptor("session", "yolo_mode_default")];
+
+  beforeEach(async () => {
+    resetSettingsSchemaCache();
+    fetchSpy.mockResolvedValueOnce(jsonResponse(schema));
+    await getSettingsSchema();
+    fetchSpy.mockReset();
   });
 
   it("refuses to send a body containing the blocked `hooks` section", async () => {
@@ -244,6 +270,21 @@ describe("updateProfileSettings write guard", () => {
     expect(JSON.parse(init!.body as string)).toEqual({
       description: "my profile",
     });
+  });
+
+  it("defers to the server when the schema is unavailable instead of blocking", async () => {
+    // A transient schema fetch failure must not block a legitimate save: with no
+    // schema to derive the allowlist from, the guard sends the PATCH and lets
+    // the server's authoritative validation decide.
+    resetSettingsSchemaCache();
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 503 })); // schema GET
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 })); // PATCH
+    const ok = await updateProfileSettings("work", { theme: { name: "empire" } });
+    expect(ok).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const [url, init] = fetchSpy.mock.calls[1]!;
+    expect(url).toBe("/api/profiles/work/settings");
+    expect(init?.method).toBe("PATCH");
   });
 });
 

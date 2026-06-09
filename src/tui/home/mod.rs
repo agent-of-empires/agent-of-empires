@@ -57,18 +57,7 @@ fn project_group_name(inst: &Instance) -> String {
         return "scratch".to_string();
     }
 
-    crate::session::projects::repo_label(project_repo_path(inst))
-}
-
-/// The repo path a session groups under in project view: its worktree's main
-/// repo when present, else its launch path. Shared by the group label and the
-/// pin action so a pinned project registers the same path the header derives
-/// from.
-fn project_repo_path(inst: &Instance) -> &str {
-    inst.worktree_info
-        .as_ref()
-        .map(|wt| wt.main_repo_path.as_str())
-        .unwrap_or(&inst.project_path)
+    crate::session::projects::repo_label(inst.repo_path())
 }
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
@@ -4335,7 +4324,7 @@ impl HomeView {
         self.instances
             .iter()
             .find(|i| project_group_name(i) == label)
-            .map(|i| crate::session::projects::canonical_key(project_repo_path(i)))
+            .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
     /// Whether the project-view header `label` is backed by a registered

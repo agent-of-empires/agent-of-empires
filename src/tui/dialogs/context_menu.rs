@@ -17,6 +17,10 @@ pub enum ContextMenuAction {
     ToggleArchive,
     /// Open the new-session dialog (mirrors the `'n'` hotkey).
     NewSession,
+    /// Open the new-session dialog prefilled from the right-clicked
+    /// project/group (mirrors `'N'` "new from selection" on a group),
+    /// so the mouse path matches the web sidebar's per-project "+".
+    NewFromGroup,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
@@ -80,6 +84,7 @@ impl ContextMenuDialog {
         Self::new(
             anchor,
             vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
                 (ContextMenuAction::Rename, "Rename Group"),
                 (ContextMenuAction::Delete, "Delete Group"),
             ],
@@ -88,16 +93,23 @@ impl ContextMenuDialog {
 
     /// Menu for a project header in project view. Project groups are
     /// automatic, so Rename/Delete don't apply (they'd only show the
-    /// "Project groups are automatic" info dialog). The one meaningful action
-    /// is pinning the project so it persists without any sessions. The label
-    /// flips based on the current pinned state.
+    /// "Project groups are automatic" info dialog). It keeps the group menu's
+    /// "New Session" (launch under this project) and adds the pin toggle so the
+    /// project can persist without any sessions. The pin label flips based on
+    /// the current pinned state.
     pub fn for_project_group(anchor: (u16, u16), is_pinned: bool) -> Self {
         let pin_label = if is_pinned {
             "Unpin project"
         } else {
             "Pin project"
         };
-        Self::new(anchor, vec![(ContextMenuAction::TogglePin, pin_label)])
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::TogglePin, pin_label),
+            ],
+        )
     }
 
     /// Menu shown when the user right-clicks the empty area of the
@@ -222,7 +234,21 @@ impl ContextMenuDialog {
                     'r' | 'R' => Some(ContextMenuAction::Rename),
                     'd' | 'D' => Some(ContextMenuAction::Delete),
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
-                    'n' | 'N' => Some(ContextMenuAction::NewSession),
+                    // `n` opens a new session from whichever new-session entry
+                    // the current menu carries: the group/project menu prefills
+                    // from the row (NewFromGroup), the empty-sidebar menu opens
+                    // a blank one (NewSession).
+                    'n' | 'N' => {
+                        if self
+                            .items
+                            .iter()
+                            .any(|(item, _)| *item == ContextMenuAction::NewFromGroup)
+                        {
+                            Some(ContextMenuAction::NewFromGroup)
+                        } else {
+                            Some(ContextMenuAction::NewSession)
+                        }
+                    }
                     'o' | 'O' => Some(ContextMenuAction::OpenSortPicker),
                     'g' | 'G' => Some(ContextMenuAction::OpenGroupPicker),
                     'p' | 'P' => Some(ContextMenuAction::TogglePin),
@@ -344,6 +370,48 @@ mod tests {
     }
 
     #[test]
+    fn group_menu_offers_new_session_first() {
+        let menu = ContextMenuDialog::for_group((0, 0));
+        let items: Vec<(ContextMenuAction, &str)> = menu
+            .items_for_test()
+            .iter()
+            .map(|(a, l)| (*a, *l))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::Rename, "Rename Group"),
+                (ContextMenuAction::Delete, "Delete Group"),
+            ]
+        );
+    }
+
+    #[test]
+    fn n_hotkey_in_group_menu_submits_new_from_group() {
+        let mut menu = ContextMenuDialog::for_group((0, 0));
+        // Pre-select Delete to prove the hotkey wins over the cursor.
+        menu.handle_key(key(KeyCode::Up));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewFromGroup)
+        ));
+    }
+
+    #[test]
+    fn n_hotkey_in_empty_sidebar_menu_submits_new_session() {
+        // The empty-sidebar menu carries the blank NewSession entry, so `n`
+        // must resolve there and never to the group-scoped NewFromGroup.
+        let mut menu = ContextMenuDialog::for_empty_sidebar((0, 0));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewSession)
+        ));
+    }
+
+    #[test]
     fn archived_session_menu_labels_unarchive() {
         let menu = ContextMenuDialog::for_session((0, 0), true);
         let labels: Vec<&str> = menu.items_for_test().iter().map(|(_, l)| *l).collect();
@@ -425,14 +493,14 @@ mod tests {
     }
 
     #[test]
-    fn project_group_menu_labels_flip_on_pin_state() {
+    fn project_group_menu_keeps_new_session_and_flips_pin_label() {
         let unpinned = ContextMenuDialog::for_project_group((0, 0), false);
         let labels: Vec<&str> = unpinned.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Pin project"]);
+        assert_eq!(labels, vec!["New Session", "Pin project"]);
 
         let pinned = ContextMenuDialog::for_project_group((0, 0), true);
         let labels: Vec<&str> = pinned.items_for_test().iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels, vec!["Unpin project"]);
+        assert_eq!(labels, vec!["New Session", "Unpin project"]);
     }
 
     #[test]

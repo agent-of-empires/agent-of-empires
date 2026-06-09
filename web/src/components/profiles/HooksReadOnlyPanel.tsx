@@ -27,8 +27,9 @@ const SOURCE_BADGE: Record<HookSource, { label: string; className: string }> = {
  *
  *  Lifecycle hooks run arbitrary shell commands on session create/launch/
  *  destroy, so a hooks section set through the API would be remote code
- *  execution. The server blocks hook writes (ALLOWED_PROFILE_SETTINGS_
- *  SECTIONS in src/server/api/mod.rs) and this panel deliberately renders
+ *  execution. The `hooks` section is absent from the settings schema, so the
+ *  server rejects hook writes (validate_patch in
+ *  src/session/settings_schema/policy.rs) and this panel deliberately renders
  *  display-only: it takes no onChange/save props and exposes no inputs, so
  *  there is no path from here to a profile PATCH. */
 export function HooksReadOnlyPanel({ groups }: Props) {

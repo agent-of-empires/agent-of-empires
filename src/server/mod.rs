@@ -225,6 +225,20 @@ impl CleanupDefaultsCache {
     }
 }
 
+/// A cached branch-diff scan (`compute_changed_files`) with its refresh
+/// timestamp. The scan is the heavy part of every diff request, and both the
+/// file-list endpoint and the per-file endpoint need the identical result, so
+/// rapidly clicking through the sidebar would otherwise re-scan the whole tree
+/// per file. The TTL is short because the working tree changes as the agent
+/// edits; it only dedupes bursts of requests, and `compute_file_contents`
+/// always reads the live working tree, so file contents are never served stale.
+struct ChangedFilesEntry {
+    refreshed_at: std::time::Instant,
+    files: Vec<crate::git::diff::DiffFile>,
+}
+
+pub const CHANGED_FILES_TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Per-profile entry tracking a live `FileWatchService` subscription and the
 /// `tokio::spawn`ed forwarder that drains its receiver into
 /// `AppState::disk_changed`. Stored under `AppState::disk_watch_handles`.
@@ -296,6 +310,11 @@ pub struct AppState {
     /// Cached remote owner per repo path. Remote owners don't change, so
     /// entries live for the lifetime of the process.
     pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
+    /// base_branch)`, shared by the file-list and per-file diff endpoints so a
+    /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
+    changed_files_cache:
+        std::sync::RwLock<std::collections::HashMap<(String, String), ChangedFilesEntry>>,
     /// Broadcasts session status transitions to consumers (currently the
     /// push-notification module). Emitted from `status_poll_loop` after
     /// each tmux scrape when `old != new`. Keep the Sender around even
@@ -411,6 +430,42 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Read-through cache over `compute_changed_files`. Returns a fresh scan
+    /// when the cached entry is missing or older than `CHANGED_FILES_TTL`;
+    /// errors are never cached. Safe to call from `spawn_blocking` (the lock is
+    /// a `std::sync::RwLock`, held only across the map lookup/insert).
+    pub fn changed_files_cached(
+        &self,
+        repo_path: &std::path::Path,
+        base_branch: &str,
+    ) -> crate::git::error::Result<Vec<crate::git::diff::DiffFile>> {
+        let key = (
+            repo_path.to_string_lossy().into_owned(),
+            base_branch.to_string(),
+        );
+        if let Ok(cache) = self.changed_files_cache.read() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.refreshed_at.elapsed() < CHANGED_FILES_TTL {
+                    return Ok(entry.files.clone());
+                }
+            }
+        }
+        let files = crate::git::diff::compute_changed_files(repo_path, base_branch)?;
+        if let Ok(mut cache) = self.changed_files_cache.write() {
+            // Drop expired entries while we hold the write lock so the map can't
+            // grow without bound across stale (repo, base) combinations.
+            cache.retain(|_, e| e.refreshed_at.elapsed() < CHANGED_FILES_TTL);
+            cache.insert(
+                key,
+                ChangedFilesEntry {
+                    refreshed_at: std::time::Instant::now(),
+                    files: files.clone(),
+                },
+            );
+        }
+        Ok(files)
+    }
+
     /// Get or create the per-instance serialization mutex. The outer
     /// `RwLock` is only held long enough to insert/lookup the `Arc<Mutex>`;
     /// the caller awaits the inner mutex without holding the map lock.
@@ -900,6 +955,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             entries: std::collections::HashMap::new(),
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
         session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
@@ -3533,6 +3589,7 @@ pub mod test_support {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),
             }),
+            changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             remote_owner_cache: RwLock::new(HashMap::new()),
             session_primaries: Arc::new(RwLock::new(HashMap::new())),
             session_pause_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

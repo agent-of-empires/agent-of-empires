@@ -134,11 +134,28 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
+// The schema is static for the server's run, and the profile-settings write
+// guard (`updateProfileSettings`) derives its section allowlist from it, so we
+// cache the first successful fetch and reuse it instead of refetching on every
+// save. A failed fetch is not cached, so the next call retries.
+let schemaPromise: Promise<SettingsFieldDescriptor[] | null> | null = null;
+
 /** Fetch the settings schema (single source of truth, #1692). The generic
  *  settings renderer builds form rows from these descriptors instead of
  *  hand-written per-field JSX. */
 export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
-  return fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema");
+  if (!schemaPromise) {
+    schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema").then((s) => {
+      if (!s) schemaPromise = null;
+      return s;
+    });
+  }
+  return schemaPromise;
+}
+
+/** Test-only seam: drop the cached schema so each test starts cold. */
+export function resetSettingsSchemaCache(): void {
+  schemaPromise = null;
 }
 
 export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
@@ -247,38 +264,40 @@ export function getProfileSettings(name: string): Promise<ProfileSettingsRespons
   return fetchJson<ProfileSettingsResponse>(`/api/profiles/${encodeURIComponent(name)}/settings`);
 }
 
-/** Profile-settings sections the dashboard is allowed to PATCH. Mirror of
- *  the server's `ALLOWED_PROFILE_SETTINGS_SECTIONS` (src/server/api/mod.rs).
- *  Sections NOT listed here, notably `hooks` plus the agent-command and
- *  env fields, are remote-code-execution surfaces blocked server-side with
- *  a pinned regression test (mod.rs tests module). We reject them client
- *  side too as defense in depth. Keep this in sync with the Rust constant
- *  by hand: there is no automated cross-language pin. */
-export const PROFILE_WRITABLE_SECTIONS = [
-  "theme",
-  "session",
-  "tmux",
-  "updates",
-  "sound",
-  "sandbox",
-  "worktree",
-  "web",
-  "logging",
-  "acp",
-  "description",
-] as const;
+/** Profile-settings sections the dashboard is allowed to PATCH, derived from
+ *  the live settings schema (single source of truth, #1692) so the client
+ *  guard cannot drift from the server. Every schema section is profile-
+ *  writable; `description` is the profile-only top-level field that carries no
+ *  schema descriptor. Sections absent from the schema, notably `hooks` plus the
+ *  agent-command and env fields, are remote-code-execution surfaces the server
+ *  rejects (`validate_patch` in src/session/settings_schema/policy.rs); we
+ *  reject them client side too as defense in depth. Because both sides read the
+ *  same schema, there is no hand-kept list to keep in sync. */
+export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<string> {
+  const sections = new Set(schema.map((d) => d.section));
+  sections.add("description");
+  return sections;
+}
 
-const PROFILE_WRITABLE_SECTION_SET: ReadonlySet<string> = new Set(PROFILE_WRITABLE_SECTIONS);
-
+/** PATCH a profile's settings, refusing any section the schema does not list as
+ *  writable (see {@link profileWritableSections}) before sending. Returns
+ *  whether the server accepted the write. */
 export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
-  for (const key of Object.keys(updates)) {
-    if (!PROFILE_WRITABLE_SECTION_SET.has(key)) {
-      // Refuse loudly rather than silently dropping the key. A blocked
-      // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
-      // server would 400 it anyway. Failing here keeps a buggy caller
-      // from reporting a partial save as success.
-      console.error(`updateProfileSettings: refusing to send blocked profile section "${key}"`);
-      return false;
+  const schema = await getSettingsSchema();
+  // With the schema in hand, refuse a blocked section before sending. If the
+  // schema fetch failed, defer to the server's authoritative guard rather than
+  // blocking a legitimate save on a transient network error.
+  if (schema) {
+    const writable = profileWritableSections(schema);
+    for (const key of Object.keys(updates)) {
+      if (!writable.has(key)) {
+        // Refuse loudly rather than silently dropping the key. A blocked
+        // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
+        // server would 400 it anyway. Failing here keeps a buggy caller
+        // from reporting a partial save as success.
+        console.error(`updateProfileSettings: refusing to send blocked profile section "${key}"`);
+        return false;
+      }
     }
   }
   try {

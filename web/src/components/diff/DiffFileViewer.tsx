@@ -434,7 +434,15 @@ export function DiffFileViewer({
       )}
 
       {/* Diff content */}
-      <div ref={measureRef} className="flex-1 overflow-hidden flex flex-col">
+      <div ref={measureRef} className="relative flex-1 overflow-hidden flex flex-col">
+        {/* While switching to an uncached file we keep the previous diff
+            painted and lay a light scrim over it (the full loading screen is
+            only used on the very first load, handled above). */}
+        {loading && (
+          <div className="animate-fade-in absolute inset-0 z-10 flex items-center justify-center bg-surface-900/25 pointer-events-none">
+            <span className="text-xs text-text-dim bg-surface-900/80 rounded px-2 py-1">Loading diff...</span>
+          </div>
+        )}
         {contents.is_binary ? (
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <span className="text-sm">Binary file changed</span>
