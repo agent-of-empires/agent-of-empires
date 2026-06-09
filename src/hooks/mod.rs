@@ -113,6 +113,24 @@ pub(crate) fn agent_settings_path_for_host_environment(
         .join(hook_cfg.settings_rel_path))
 }
 
+/// Display variant of [`agent_settings_path_for_host_environment`] for UI
+/// consent dialogs. Returns the absolute override path when a config-dir env
+/// var is set, otherwise the `~/`-relative default so the displayed path
+/// matches where hooks are actually written.
+pub(crate) fn agent_settings_path_display_for_host_environment(
+    hook_cfg: &crate::agents::AgentHookConfig,
+    host_env: &[String],
+) -> String {
+    if let Some(var) = hook_cfg.config_dir_env_var {
+        if let Some(dir) = resolve_config_dir_override(var, host_env) {
+            if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
+                return PathBuf::from(dir).join(file).display().to_string();
+            }
+        }
+    }
+    format!("~/{}", hook_cfg.settings_rel_path)
+}
+
 /// Resolve a config-dir override env var, preferring an explicit value in the
 /// session's host environment list and falling back to AoE's own env so a var
 /// exported in the shell that launched `aoe` (and thus inherited by the agent)
@@ -1501,6 +1519,25 @@ mod tests {
         let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/claude-proc");
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_display_matches_resolution() {
+        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+
+        // Default: tilde-relative, matching how the path is shown elsewhere.
+        assert_eq!(
+            agent_settings_path_display_for_host_environment(claude_hook_config(), &[]),
+            "~/.claude/settings.json"
+        );
+
+        // Override: absolute path the user will actually see hooks land in.
+        let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
+        assert_eq!(
+            agent_settings_path_display_for_host_environment(claude_hook_config(), &host_env),
+            "/home/me/.claude-work/settings.json"
+        );
     }
 
     #[test]
