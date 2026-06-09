@@ -3634,6 +3634,73 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
     env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.group_value(), "work");
+    // The group has a member at "/tmp/work", so the path is borrowed from it
+    // instead of being left on the default cwd (issue #2023).
+    assert_eq!(dialog.path_value(), "/tmp/work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor to the "work" group row, as a right-click would.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    // The group right-click menu's "New Session" routes here.
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
+    use crate::session::config::GroupByMode;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // In project mode the group label is the repo basename ("work" from
+    // "/tmp/work"), not the stored group_path.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { name, .. } if name == "work"))
+        .expect("work project group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(
+        dialog.path_value(),
+        "/tmp/work",
+        "project-mode prefill should borrow the member repo path"
+    );
 }
 
 #[test]

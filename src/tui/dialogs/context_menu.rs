@@ -17,6 +17,10 @@ pub enum ContextMenuAction {
     ToggleArchive,
     /// Open the new-session dialog (mirrors the `'n'` hotkey).
     NewSession,
+    /// Open the new-session dialog prefilled from the right-clicked
+    /// project/group (mirrors `'N'` "new from selection" on a group),
+    /// so the mouse path matches the web sidebar's per-project "+".
+    NewFromGroup,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
@@ -77,6 +81,7 @@ impl ContextMenuDialog {
         Self::new(
             anchor,
             vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
                 (ContextMenuAction::Rename, "Rename Group"),
                 (ContextMenuAction::Delete, "Delete Group"),
             ],
@@ -205,7 +210,21 @@ impl ContextMenuDialog {
                     'r' | 'R' => Some(ContextMenuAction::Rename),
                     'd' | 'D' => Some(ContextMenuAction::Delete),
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
-                    'n' | 'N' => Some(ContextMenuAction::NewSession),
+                    // `n` opens a new session from whichever new-session entry
+                    // the current menu carries: the group/project menu prefills
+                    // from the row (NewFromGroup), the empty-sidebar menu opens
+                    // a blank one (NewSession).
+                    'n' | 'N' => {
+                        if self
+                            .items
+                            .iter()
+                            .any(|(item, _)| *item == ContextMenuAction::NewFromGroup)
+                        {
+                            Some(ContextMenuAction::NewFromGroup)
+                        } else {
+                            Some(ContextMenuAction::NewSession)
+                        }
+                    }
                     'o' | 'O' => Some(ContextMenuAction::OpenSortPicker),
                     'g' | 'G' => Some(ContextMenuAction::OpenGroupPicker),
                     _ => None,
@@ -322,6 +341,48 @@ mod tests {
         assert!(matches!(
             result,
             DialogResult::Submit(ContextMenuAction::Delete)
+        ));
+    }
+
+    #[test]
+    fn group_menu_offers_new_session_first() {
+        let menu = ContextMenuDialog::for_group((0, 0));
+        let items: Vec<(ContextMenuAction, &str)> = menu
+            .items_for_test()
+            .iter()
+            .map(|(a, l)| (*a, *l))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                (ContextMenuAction::NewFromGroup, "New Session"),
+                (ContextMenuAction::Rename, "Rename Group"),
+                (ContextMenuAction::Delete, "Delete Group"),
+            ]
+        );
+    }
+
+    #[test]
+    fn n_hotkey_in_group_menu_submits_new_from_group() {
+        let mut menu = ContextMenuDialog::for_group((0, 0));
+        // Pre-select Delete to prove the hotkey wins over the cursor.
+        menu.handle_key(key(KeyCode::Up));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewFromGroup)
+        ));
+    }
+
+    #[test]
+    fn n_hotkey_in_empty_sidebar_menu_submits_new_session() {
+        // The empty-sidebar menu carries the blank NewSession entry, so `n`
+        // must resolve there and never to the group-scoped NewFromGroup.
+        let mut menu = ContextMenuDialog::for_empty_sidebar((0, 0));
+        let result = menu.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::NewSession)
         ));
     }
 

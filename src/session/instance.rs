@@ -1288,6 +1288,18 @@ impl Instance {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
     }
 
+    /// The repo this session groups under: the worktree's main repo when
+    /// present (so all branches of a repo group together), else the project
+    /// path. Shared by sidebar project grouping and new-session prefill so
+    /// the "which directory does this session belong to" rule lives in one
+    /// place.
+    pub fn repo_path(&self) -> &str {
+        self.worktree_info
+            .as_ref()
+            .map(|w| w.main_repo_path.as_str())
+            .unwrap_or(&self.project_path)
+    }
+
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
     }
@@ -4918,6 +4930,24 @@ mod tests {
         let wt = deserialized.worktree_info.unwrap();
         assert_eq!(wt.branch, "feature/abc");
         assert!(wt.managed_by_aoe);
+    }
+
+    #[test]
+    fn test_repo_path_prefers_worktree_main_repo() {
+        let mut inst = Instance::new("Test", "/tmp/worktrees/feature");
+        assert_eq!(inst.repo_path(), "/tmp/worktrees/feature");
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature".to_string(),
+            main_repo_path: "/tmp/main-repo".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        assert_eq!(
+            inst.repo_path(),
+            "/tmp/main-repo",
+            "worktree sessions group under the main repo, not the worktree dir"
+        );
     }
 
     // Test generate_id function properties

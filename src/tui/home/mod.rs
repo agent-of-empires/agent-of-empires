@@ -57,11 +57,7 @@ fn project_group_name(inst: &Instance) -> String {
         return "scratch".to_string();
     }
 
-    let base_path = inst
-        .worktree_info
-        .as_ref()
-        .map(|wt| wt.main_repo_path.as_str())
-        .unwrap_or(&inst.project_path);
+    let base_path = inst.repo_path();
 
     let path = std::path::Path::new(base_path);
     path.file_name()

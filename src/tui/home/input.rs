@@ -2198,11 +2198,15 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| {
-                inst.worktree_info
+            .map(|inst| inst.repo_path().to_string())
+            .or_else(|| {
+                // No session selected (the project/group right-click menu, or
+                // `'N'` on a group header): borrow a member's repo path so the
+                // new session lands in the same project, matching the web
+                // sidebar's per-project "+".
+                self.selected_group
                     .as_ref()
-                    .map(|wt| wt.main_repo_path.clone())
-                    .unwrap_or_else(|| inst.project_path.clone())
+                    .and_then(|g| self.group_repo_path(g))
             });
         let prefill_group = self
             .selected_session
@@ -2237,14 +2241,35 @@ impl HomeView {
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
             }
-            // Only skip to the title when the path was inherited from a
-            // session. In the group-only fallback the path is still the
-            // default cwd, so leaving focus there lets the user confirm it.
+            // Skip to the title whenever the path is genuinely prefilled,
+            // whether inherited from a session or borrowed from a project/group
+            // member, so the user lands directly on naming. Only an empty group
+            // (no member to borrow a path from) leaves focus on the default cwd
+            // so the user can confirm it.
             if has_prefilled_path {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
         }
+    }
+
+    /// Pick a representative repo path for a selected group so "New Session"
+    /// from a project/group can prefill the working directory. In project mode
+    /// the group label is a derived basename, so match members by
+    /// `project_group_name`; in manual mode match by the stored `group_path`,
+    /// including nested subgroups. Returns `None` for an empty group (no member
+    /// to borrow a path from), leaving the dialog on the default cwd.
+    fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|inst| match self.group_by {
+                GroupByMode::Project => super::project_group_name(inst) == group_path,
+                _ => {
+                    inst.group_path == group_path
+                        || inst.group_path.starts_with(&format!("{group_path}/"))
+                }
+            })
+            .map(|inst| inst.repo_path().to_string())
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
@@ -3171,6 +3196,11 @@ impl HomeView {
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
+            // The right-click already moved the cursor onto the group row, so
+            // reuse the "new from selection" path: with a group selected it
+            // prefills the project's repo path (and group) the same way `'N'`
+            // does on a session.
+            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
         }
