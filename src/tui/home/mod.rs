@@ -961,33 +961,6 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
 /// once per failure burst, not once per tick. The dialog body aggregates
 /// every currently-failing source (storage and config) into a single
 /// message.
-/// Distinguishes create vs delete in `rewire_after_profile_mutation`.
-/// The two methods produce the structured-log label
-/// (`op_label`, used in tracing) and the user-facing past-tense word
-/// (`past_tense`, used in dialog text) so call sites cannot drift in
-/// a parallel-string convention.
-#[derive(Debug)]
-pub(super) enum ProfileMutation {
-    Create,
-    Delete,
-}
-
-impl ProfileMutation {
-    fn op_label(&self) -> &'static str {
-        match self {
-            Self::Create => "create_profile",
-            Self::Delete => "delete_profile",
-        }
-    }
-
-    fn past_tense(&self) -> &'static str {
-        match self {
-            Self::Create => "created",
-            Self::Delete => "deleted",
-        }
-    }
-}
-
 #[derive(Default)]
 pub(super) struct ReloadFailureState {
     storage_failed: bool,
@@ -2078,34 +2051,29 @@ impl HomeView {
     }
 
     /// Rewire disk + config subscriptions after a successful profile
-    /// create or delete. The mutation enum produces both the structured-
-    /// log label and the user-facing past-tense word so call sites
-    /// cannot drift in a parallel-string convention.
-    pub(super) fn rewire_after_profile_mutation(
-        &mut self,
-        profile_name: &str,
-        mutation: ProfileMutation,
-    ) {
-        let op_label = mutation.op_label();
-        let past_tense = mutation.past_tense();
+    /// delete. Surfaces a `Watcher Warning` dialog when
+    /// `list_profiles()` cannot enumerate profiles, since the dialog
+    /// is the only user-facing signal the delete path has; the next
+    /// successful reload repairs watcher state.
+    pub(super) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
         match crate::session::list_profiles() {
             Ok(profiles) => {
                 if let Err(e) = self.rewire_disk_subscriptions(&profiles) {
                     tracing::warn!(
                         target: "tui.file_watch",
                         profile = %profile_name,
-                        op = %op_label,
+                        op = "delete_profile",
                         error = %e,
-                        "rewire_disk_subscriptions after profile mutation failed"
+                        "rewire_disk_subscriptions after profile delete failed"
                     );
                 }
                 if let Err(e) = self.rewire_config_subscriptions(&profiles) {
                     tracing::warn!(
                         target: "tui.file_watch",
                         profile = %profile_name,
-                        op = %op_label,
+                        op = "delete_profile",
                         error = %e,
-                        "rewire_config_subscriptions after profile mutation failed"
+                        "rewire_config_subscriptions after profile delete failed"
                     );
                 }
             }
@@ -2113,21 +2081,51 @@ impl HomeView {
                 tracing::warn!(
                     target: "tui.file_watch",
                     profile = %profile_name,
-                    op = %op_label,
+                    op = "delete_profile",
                     error = %e,
-                    "list_profiles failed during rewire after profile mutation; watcher state will repair on next reload"
+                    "list_profiles failed during rewire after profile delete; watcher state will repair on next reload"
                 );
                 if self.info_dialog.is_none() {
                     self.info_dialog = Some(InfoDialog::new(
                         "Watcher Warning",
                         &format!(
-                            "Profile '{}' was {} but the watcher rewire could not enumerate profiles: {}\n\nThe next successful reload will repair watcher state.",
-                            profile_name, past_tense, e
+                            "Profile '{}' was deleted but the watcher rewire could not enumerate profiles: {}\n\nThe next successful reload will repair watcher state.",
+                            profile_name, e
                         ),
                     ));
                 }
             }
         }
+    }
+
+    /// Open or refresh the `Reload Failed` dialog from the current
+    /// `reload_failure_state`. Returns `true` when the dialog was
+    /// opened or refreshed in place so the caller can request a redraw.
+    ///
+    /// When a `Reload Failed` dialog is already on screen, the body is
+    /// rebuilt so a failure source recorded after the last presentation
+    /// becomes visible without waiting for the user to dismiss and
+    /// re-open. When an unrelated dialog occupies the slot (a
+    /// `Watcher Warning` from `rewire_after_profile_mutation`, or a
+    /// profile create/delete `Error`), presentation is skipped without
+    /// acknowledging, so the next tick re-tries once the foreign
+    /// dialog is dismissed.
+    pub(super) fn try_present_reload_failure_dialog(&mut self) -> bool {
+        if !self.reload_failure_state.has_unacknowledged_failure() {
+            return false;
+        }
+        let title = "Reload Failed";
+        let occupied_by_other = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.title() != title);
+        if occupied_by_other {
+            return false;
+        }
+        let body = self.reload_failure_state.build_dialog_body();
+        self.info_dialog = Some(InfoDialog::new(title, &body));
+        self.reload_failure_state.acknowledge_dialog();
+        true
     }
 
     /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog

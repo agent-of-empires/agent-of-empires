@@ -1937,10 +1937,6 @@ impl HomeView {
                         self.profile_picker_dialog = None;
                         match crate::session::create_profile(&name) {
                             Ok(()) => {
-                                self.rewire_after_profile_mutation(
-                                    &name,
-                                    crate::tui::home::ProfileMutation::Create,
-                                );
                                 if let Err(e) = self.switch_profile(Some(name)) {
                                     tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
                                 }
@@ -1956,10 +1952,7 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
-                                self.rewire_after_profile_mutation(
-                                    &name,
-                                    crate::tui::home::ProfileMutation::Delete,
-                                );
+                                self.rewire_after_profile_delete(&name);
                                 self.show_profile_picker();
                             }
                             Err(e) => {

@@ -1290,13 +1290,7 @@ impl App {
                 DiskRefreshDecision::None => {}
             }
 
-            if self.home.reload_failure_state.has_unacknowledged_failure()
-                && self.home.info_dialog.is_none()
-            {
-                let body = self.home.reload_failure_state.build_dialog_body();
-                self.home.info_dialog =
-                    Some(crate::tui::dialogs::InfoDialog::new("Reload Failed", &body));
-                self.home.reload_failure_state.acknowledge_dialog();
+            if self.home.try_present_reload_failure_dialog() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }

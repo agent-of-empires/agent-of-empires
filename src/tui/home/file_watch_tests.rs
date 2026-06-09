@@ -288,13 +288,13 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
 }
 
 /// When `list_profiles()` fails after a successful create or delete,
-/// `rewire_after_profile_mutation` must surface a Watcher Warning to
+/// `rewire_after_profile_delete` must surface a Watcher Warning to
 /// the user via `info_dialog` (in addition to logging a structured
 /// warn). The test seam in `crate::session` injects the failure
 /// without requiring a platform-fragile permission denial.
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_mutation_surfaces_dialog_when_list_profiles_fails() {
+async fn rewire_after_profile_delete_surfaces_dialog_when_list_profiles_fails() {
     let temp = TempDir::new().expect("tempdir");
     isolate_home(temp.path());
 
@@ -314,7 +314,7 @@ async fn rewire_after_profile_mutation_surfaces_dialog_when_list_profiles_fails(
     );
 
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_mutation("seam-test", super::ProfileMutation::Create);
+    view.rewire_after_profile_delete("seam-test");
 
     assert!(
         view.info_dialog.is_some(),
@@ -370,7 +370,7 @@ async fn reload_storage_only_survives_list_profiles_failure() {
 
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
+async fn rewire_after_profile_delete_preserves_existing_info_dialog() {
     let temp = TempDir::new().expect("tempdir");
     isolate_home(temp.path());
 
@@ -390,7 +390,7 @@ async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
     ));
 
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_mutation("dialog-guard", super::ProfileMutation::Delete);
+    view.rewire_after_profile_delete("dialog-guard");
 
     assert!(
         crate::session::list_profiles().is_ok(),
@@ -412,14 +412,14 @@ async fn rewire_after_profile_mutation_preserves_existing_info_dialog() {
     );
 }
 
-/// The Watcher Warning dialog raised by `rewire_after_profile_mutation`
+/// The Watcher Warning dialog raised by `rewire_after_profile_delete`
 /// is intentionally outside `reload_failure_state`, so `has_any_failure()`
 /// stays false. The recovery-edge cleanup keys off both the failure
 /// state and the dialog title, and must not match `Watcher Warning`;
 /// the dialog stays visible until the user dismisses it.
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_mutation_watcher_warning_survives_recovery_edge() {
+async fn rewire_after_profile_delete_watcher_warning_survives_recovery_edge() {
     let temp = TempDir::new().expect("tempdir");
     isolate_home(temp.path());
 
@@ -434,7 +434,7 @@ async fn rewire_after_profile_mutation_watcher_warning_survives_recovery_edge() 
     .expect("HomeView::new");
 
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_mutation("watcher-warning-edge", super::ProfileMutation::Create);
+    view.rewire_after_profile_delete("watcher-warning-edge");
 
     let dialog = view.info_dialog.as_ref().expect("watcher warning raised");
     assert_eq!(
@@ -444,7 +444,7 @@ async fn rewire_after_profile_mutation_watcher_warning_survives_recovery_edge() 
     );
     assert!(
         !view.reload_failure_state.has_any_failure(),
-        "rewire_after_profile_mutation does not record into reload_failure_state; \
+        "rewire_after_profile_delete does not record into reload_failure_state; \
          the recovery-edge cleanup keys off has_any_failure() to protect tracked \
          failures, and the Watcher Warning relies on its title to stay visible"
     );
@@ -647,5 +647,116 @@ fn reload_failure_state_watcher_init_failure_lifecycle_is_per_source() {
     assert!(
         !state.has_unacknowledged_failure(),
         "clearing the last failing source resets the ack latch"
+    );
+}
+
+/// Locks the body-refresh invariant: a `Reload Failed` dialog already
+/// on screen must rebuild its body when a new failure source is
+/// recorded, so the user sees every failed source without dismissing
+/// and reopening the dialog.
+#[tokio::test]
+#[serial]
+async fn try_present_reload_failure_dialog_refreshes_body_for_new_source() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("body-refresh").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("body-refresh".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("first source"));
+    view.reload_failure_state.record_storage(&storage_err);
+
+    assert!(
+        view.try_present_reload_failure_dialog(),
+        "first call presents the dialog"
+    );
+    let dialog = view.info_dialog.as_ref().expect("dialog presented");
+    assert_eq!(dialog.title(), "Reload Failed");
+
+    let config_err: anyhow::Result<()> = Err(anyhow::anyhow!("second source"));
+    view.reload_failure_state.record_config(&config_err);
+    assert!(
+        view.reload_failure_state.has_unacknowledged_failure(),
+        "recording a new source while a dialog is acked re-arms the latch"
+    );
+
+    assert!(
+        view.try_present_reload_failure_dialog(),
+        "second call refreshes the body and re-acknowledges"
+    );
+
+    let body = view.reload_failure_state.build_dialog_body();
+    assert!(
+        body.contains("first source"),
+        "refreshed body must keep the original failure source: {body}"
+    );
+    assert!(
+        body.contains("second source"),
+        "refreshed body must include the newly recorded source: {body}"
+    );
+}
+
+/// Locks the foreign-dialog skip invariant: when an unrelated dialog
+/// (a `Watcher Warning` from `rewire_after_profile_delete`, or an
+/// `Error` from a profile create/delete failure) occupies the slot,
+/// `try_present_reload_failure_dialog` returns `false` and leaves the
+/// ack latch untouched, so the next tick can present once the
+/// foreign dialog is dismissed.
+#[tokio::test]
+#[serial]
+async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_slot() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("foreign-skip").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("foreign-skip".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
+    view.reload_failure_state.record_storage(&storage_err);
+    view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+        "Watcher Warning",
+        "unrelated message",
+    ));
+
+    assert!(
+        !view.try_present_reload_failure_dialog(),
+        "presentation must skip while a foreign dialog occupies the slot"
+    );
+    assert_eq!(
+        view.info_dialog
+            .as_ref()
+            .expect("foreign dialog still up")
+            .title(),
+        "Watcher Warning",
+        "the foreign dialog stays in place untouched"
+    );
+    assert!(
+        view.reload_failure_state.has_unacknowledged_failure(),
+        "the ack latch stays armed so the next tick re-tries presentation \
+         after the foreign dialog is dismissed"
+    );
+
+    view.info_dialog = None;
+    assert!(
+        view.try_present_reload_failure_dialog(),
+        "after the foreign dialog is dismissed the next call presents"
+    );
+    assert_eq!(
+        view.info_dialog.as_ref().expect("dialog presented").title(),
+        "Reload Failed"
     );
 }
