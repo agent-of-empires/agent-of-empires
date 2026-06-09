@@ -7,10 +7,7 @@ import {
   persistRepoAppearances,
   type RepoAppearanceUpdate,
 } from "../lib/repoAppearance";
-import {
-  loadRepoGroupOrder,
-  persistRepoGroupOrder,
-} from "../lib/repoGroupOrder";
+import { loadRepoGroupOrder, persistRepoGroupOrder } from "../lib/repoGroupOrder";
 import {
   compareWorkspacesByAttention,
   compareWorkspacesByLastActivityDesc,
@@ -163,8 +160,7 @@ export function useRepoGroups(
     if (multiRepo.length > 0) {
       const sorted = sortWorkspaces(multiRepo);
       const hasActive = sorted.some((ws) => ws.status === "active");
-      const collapsed =
-        collapsedMap[MULTI_REPO_GROUP_ID] ?? loadCollapsed(MULTI_REPO_GROUP_ID);
+      const collapsed = collapsedMap[MULTI_REPO_GROUP_ID] ?? loadCollapsed(MULTI_REPO_GROUP_ID);
       const appearance = appearanceMap[MULTI_REPO_GROUP_ID];
       const defaultDisplayName = "Multi-repo";
       repoGroups.push({
@@ -184,8 +180,7 @@ export function useRepoGroups(
     if (scratch.length > 0) {
       const sorted = sortWorkspaces(scratch);
       const hasActive = sorted.some((ws) => ws.status === "active");
-      const collapsed =
-        collapsedMap[SCRATCH_GROUP_ID] ?? loadCollapsed(SCRATCH_GROUP_ID);
+      const collapsed = collapsedMap[SCRATCH_GROUP_ID] ?? loadCollapsed(SCRATCH_GROUP_ID);
       const appearance = appearanceMap[SCRATCH_GROUP_ID];
       const defaultDisplayName = "Scratch";
       repoGroups.push({
@@ -202,8 +197,7 @@ export function useRepoGroups(
       });
     }
 
-    const isSyntheticGroup = (id: string) =>
-      id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
+    const isSyntheticGroup = (id: string) => id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
 
     repoGroups.sort((a, b) => {
       if (sortMode === "attention") {
@@ -275,14 +269,7 @@ export function useRepoGroups(
     });
 
     return repoGroups;
-  }, [
-    workspaces,
-    workspaceOrdering,
-    sortMode,
-    collapsedMap,
-    appearanceMap,
-    groupOrder,
-  ]);
+  }, [workspaces, workspaceOrdering, sortMode, collapsedMap, appearanceMap, groupOrder]);
 
   const toggleRepoCollapsed = useCallback((repoId: string) => {
     setCollapsedMap((prev) => {
@@ -297,16 +284,13 @@ export function useRepoGroups(
     });
   }, []);
 
-  const updateRepoAppearance = useCallback(
-    (repoId: string, update: RepoAppearanceUpdate) => {
-      setAppearanceMap((prev) => {
-        const next = applyRepoAppearanceUpdate(prev, repoId, update);
-        persistRepoAppearances(next);
-        return next;
-      });
-    },
-    [],
-  );
+  const updateRepoAppearance = useCallback((repoId: string, update: RepoAppearanceUpdate) => {
+    setAppearanceMap((prev) => {
+      const next = applyRepoAppearanceUpdate(prev, repoId, update);
+      persistRepoAppearances(next);
+      return next;
+    });
+  }, []);
 
   // Persist the full ordered list of real repo-group ids handed up by the
   // sidebar drag. Synthetic ids are pinned to the bottom and never

@@ -1,16 +1,7 @@
 import type { RepoColor } from "./repoAppearance";
-import type {
-  RepoGroup,
-  SessionResponse,
-  Workspace,
-  WorkspaceStatus,
-} from "./types";
+import type { RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
-import {
-  compareWorkspacesForComputedSortMode,
-  type SidebarSortMode,
-  workspaceIsSunk,
-} from "./sidebarSort";
+import { compareWorkspacesForComputedSortMode, type SidebarSortMode, workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Synthetic id for the bucket that collects sessions with no user-assigned
@@ -148,9 +139,7 @@ export function buildSessionGroups(
       const sliced: Workspace = {
         ...ws,
         sessions,
-        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs))
-          ? "active"
-          : "idle",
+        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs)) ? "active" : "idle",
       };
       const view: SidebarWorkspaceView = {
         key: `${gp}::${ws.id}`,
@@ -238,8 +227,7 @@ export function buildNestedSidebarGroups(
     const subgroups = buildSessionGroups(repoGroup.workspaces, {
       idleDecayWindowMs: opts.idleDecayWindowMs,
       sortMode: opts.sortMode,
-      isCollapsed: (_groupId, groupPath) =>
-        opts.isSubgroupCollapsed(repo.id, groupPath),
+      isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
     return {
       repo: {
@@ -254,8 +242,6 @@ export function buildNestedSidebarGroups(
 // Nested-axis equivalent of `sidebarGroupHasLiveWorkspace`: true while any
 // subgroup still has a live row, so an all-sunk repository block is not
 // rendered as an empty header.
-export function nestedSidebarGroupHasLiveWorkspace(
-  group: NestedSidebarGroup,
-): boolean {
+export function nestedSidebarGroupHasLiveWorkspace(group: NestedSidebarGroup): boolean {
   return group.subgroups.some(sidebarGroupHasLiveWorkspace);
 }

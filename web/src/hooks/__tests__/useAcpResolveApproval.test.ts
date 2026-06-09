@@ -7,11 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  classifyApprovalResolveResponse,
-  reducer,
-  type Action,
-} from "../useAcpSession";
+import { classifyApprovalResolveResponse, reducer, type Action } from "../useAcpSession";
 import { emptyAcpState, type Approval } from "../../lib/acpTypes";
 
 function approval(nonce: string): Approval {
@@ -37,35 +33,20 @@ describe("classifyApprovalResolveResponse", () => {
   });
 
   it("treats a 404 naming this nonce as resolved", () => {
-    expect(
-      classifyApprovalResolveResponse(
-        false,
-        404,
-        "no pending approval with nonce n-1",
-        "n-1",
-      ),
-    ).toEqual({ kind: "resolved" });
+    expect(classifyApprovalResolveResponse(false, 404, "no pending approval with nonce n-1", "n-1")).toEqual({
+      kind: "resolved",
+    });
   });
 
   it("treats a 404 naming a different nonce as an error", () => {
     // Guards the #1821 contract: a generic / wrong-nonce 404 must not
     // silently clear the clicked card.
-    const out = classifyApprovalResolveResponse(
-      false,
-      404,
-      "no pending approval with nonce other-99",
-      "n-1",
-    );
+    const out = classifyApprovalResolveResponse(false, 404, "no pending approval with nonce other-99", "n-1");
     expect(out.kind).toBe("error");
   });
 
   it("treats a session-gone 404 as an error", () => {
-    const out = classifyApprovalResolveResponse(
-      false,
-      404,
-      "session has no running agent",
-      "n-1",
-    );
+    const out = classifyApprovalResolveResponse(false, 404, "session has no running agent", "n-1");
     expect(out.kind).toBe("error");
     expect(out.kind === "error" && out.message).toContain("404");
   });

@@ -9,16 +9,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-  attachServeDiagnostics,
-} from "../../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { waitForStructuredView, enableStructuredViewAndWait, attachServeDiagnostics } from "../../helpers/acp";
 
 const SCRIPT = {
   turns: [
@@ -59,9 +51,7 @@ base("edit a queued follow-up before it fires", async ({ page }, testInfo) => {
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", {
@@ -74,9 +64,7 @@ base("edit a queued follow-up before it fires", async ({ page }, testInfo) => {
       timeout: 10_000,
     });
     await composer.fill("original queued text");
-    await page
-      .getByRole("button", { name: /Queue follow-up message/i })
-      .click();
+    await page.getByRole("button", { name: /Queue follow-up message/i }).click();
 
     const queuedRow = page.getByRole("button", {
       name: /^original queued text$/,
@@ -92,12 +80,8 @@ base("edit a queued follow-up before it fires", async ({ page }, testInfo) => {
     await editor.fill("edited queued text");
     await editor.press("Enter");
 
-    await expect(
-      page.getByRole("button", { name: /^edited queued text$/ }),
-    ).toBeVisible({ timeout: 5_000 });
-    await expect(
-      page.getByRole("button", { name: /^original queued text$/ }),
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /^edited queued text$/ })).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("button", { name: /^original queued text$/ })).toHaveCount(0);
   } finally {
     try {
       if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);

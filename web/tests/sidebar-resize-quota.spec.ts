@@ -20,26 +20,17 @@ const RIGHT_PANEL_KEY = "aoe-right-collapsed";
 async function stubQuotaForKey(page: Page, key: string) {
   await page.addInitScript(
     ({ key: _key }) => {
-      (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor =
-        new Set();
+      (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor = new Set();
       const original = Storage.prototype.setItem;
       Storage.prototype.setItem = function (k: string, v: string) {
-        const throwSet = (
-          window as unknown as { __throwQuotaFor?: Set<string> }
-        ).__throwQuotaFor;
+        const throwSet = (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor;
         if (throwSet && throwSet.has(k)) {
-          throw new DOMException(
-            "The quota has been exceeded.",
-            "QuotaExceededError",
-          );
+          throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
         }
         return original.call(this, k, v);
       };
-      (
-        window as unknown as { __enableQuotaThrow: (k: string) => void }
-      ).__enableQuotaThrow = (k: string) => {
-        const set = (window as unknown as { __throwQuotaFor?: Set<string> })
-          .__throwQuotaFor;
+      (window as unknown as { __enableQuotaThrow: (k: string) => void }).__enableQuotaThrow = (k: string) => {
+        const set = (window as unknown as { __throwQuotaFor?: Set<string> }).__throwQuotaFor;
         if (set) set.add(k);
       };
     },
@@ -49,39 +40,20 @@ async function stubQuotaForKey(page: Page, key: string) {
 
 async function enableThrow(page: Page, key: string) {
   await page.evaluate((k) => {
-    (
-      window as unknown as { __enableQuotaThrow: (k: string) => void }
-    ).__enableQuotaThrow(k);
+    (window as unknown as { __enableQuotaThrow: (k: string) => void }).__enableQuotaThrow(k);
   }, key);
 }
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  await page.route("**/api/sessions", (r) =>
-    r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
 test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
-  test("sidebar resize bar click does not crash when setItem throws QuotaExceeded", async ({
-    page,
-  }) => {
+  test("sidebar resize bar click does not crash when setItem throws QuotaExceeded", async ({ page }) => {
     await stubQuotaForKey(page, SIDEBAR_WIDTH_KEY);
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -108,9 +80,7 @@ test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
     await expect(page.locator("header")).toBeVisible();
   });
 
-  test("content split resize handle click does not crash when setItem throws QuotaExceeded", async ({
-    page,
-  }) => {
+  test("content split resize handle click does not crash when setItem throws QuotaExceeded", async ({ page }) => {
     await stubQuotaForKey(page, SPLIT_STORAGE_KEY);
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -136,9 +106,7 @@ test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
     await expect(page.locator("header")).toBeVisible();
   });
 
-  test("right-panel collapse toggle does not crash when setItem throws QuotaExceeded", async ({
-    page,
-  }) => {
+  test("right-panel collapse toggle does not crash when setItem throws QuotaExceeded", async ({ page }) => {
     await stubQuotaForKey(page, RIGHT_PANEL_KEY);
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 720 });

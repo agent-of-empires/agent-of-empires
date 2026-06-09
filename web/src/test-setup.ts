@@ -26,9 +26,7 @@ afterEach(() => {
 // own Storage, which no longer exists once we replace it.
 function storageWorks(name: "localStorage" | "sessionStorage"): boolean {
   try {
-    const s = (globalThis as Record<string, unknown>)[name] as
-      | Storage
-      | undefined;
+    const s = (globalThis as Record<string, unknown>)[name] as Storage | undefined;
     if (!s || typeof s.setItem !== "function") return false;
     s.setItem("__aoe_probe__", "1");
     s.removeItem("__aoe_probe__");

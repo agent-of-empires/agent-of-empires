@@ -16,9 +16,7 @@ base("s key opens the Settings view", async ({ page }, testInfo) => {
 
   try {
     await page.goto(serve.baseUrl);
-    await expect(
-      page.getByRole("button", { name: "Go to dashboard" }),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
     await page.locator("body").click();
 
     await page.keyboard.press("s");

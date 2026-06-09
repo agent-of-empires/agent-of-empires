@@ -6,11 +6,7 @@
 // handle's presence is the simplest visual signal.
 
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 
 // FIXME: this spec is intermittently flaky on CI — both the
 // `toBeHidden` and `toBeVisible` assertions on the resize handle
@@ -34,9 +30,7 @@ base.fixme("D key toggles the diff panel", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'story-diff-toggle' missing");
     const sessionId = seeded.id;
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     const handle = page.locator('[data-testid="content-split-resize-handle"]');
     await expect(handle).toBeVisible({ timeout: 10_000 });
     // Click outside the terminal so focus moves to body and the
@@ -61,10 +55,7 @@ base.fixme("D key toggles the diff panel", async ({ page }, testInfo) => {
       document.body.focus?.();
     });
     await expect
-      .poll(
-        () => page.evaluate(() => document.activeElement?.tagName ?? null),
-        { timeout: 5_000 },
-      )
+      .poll(() => page.evaluate(() => document.activeElement?.tagName ?? null), { timeout: 5_000 })
       .toBe("BODY");
 
     await page.keyboard.press("Shift+D");

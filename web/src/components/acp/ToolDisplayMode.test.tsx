@@ -12,14 +12,7 @@
 //     never hidden (#1467).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 vi.mock("../../lib/highlighter", () => ({
@@ -48,20 +41,10 @@ import { fixtures, makeError } from "./__fixtures__/toolCalls";
 
 const STORAGE_KEY = "aoe.acp.toolDensity.v1";
 
-function Wrap({
-  density,
-  toolKey,
-  children,
-}: {
-  density: ToolDensity;
-  toolKey?: string;
-  children: ReactNode;
-}) {
+function Wrap({ density, toolKey, children }: { density: ToolDensity; toolKey?: string; children: ReactNode }) {
   return (
     <AgentProfileProvider toolKey={toolKey ?? null}>
-      <ToolDisplayModeProvider density={density}>
-        {children}
-      </ToolDisplayModeProvider>
+      <ToolDisplayModeProvider density={density}>{children}</ToolDisplayModeProvider>
     </AgentProfileProvider>
   );
 }
@@ -82,11 +65,7 @@ describe("useToolDisplayMode", () => {
 
   it("reads the provided density inside a provider", () => {
     const { result } = renderHook(() => useToolDisplayMode(), {
-      wrapper: ({ children }) => (
-        <ToolDisplayModeProvider density="compact">
-          {children}
-        </ToolDisplayModeProvider>
-      ),
+      wrapper: ({ children }) => <ToolDisplayModeProvider density="compact">{children}</ToolDisplayModeProvider>,
     });
     expect(result.current).toBe("compact");
   });
@@ -114,19 +93,13 @@ describe("useToolDensityPref", () => {
 describe("ToolDensityToggle", () => {
   it("reflects density via aria-pressed and fires onToggle", () => {
     const onToggle = vi.fn();
-    const { rerender } = render(
-      <ToolDensityToggle density="detailed" onToggle={onToggle} />,
-    );
+    const { rerender } = render(<ToolDensityToggle density="detailed" onToggle={onToggle} />);
     const btn = screen.getByRole("button", { name: /compact tools/i });
     expect(btn.getAttribute("aria-pressed")).toBe("false");
     fireEvent.click(btn);
     expect(onToggle).toHaveBeenCalledTimes(1);
     rerender(<ToolDensityToggle density="compact" onToggle={onToggle} />);
-    expect(
-      screen
-        .getByRole("button", { name: /compact tools/i })
-        .getAttribute("aria-pressed"),
-    ).toBe("true");
+    expect(screen.getByRole("button", { name: /compact tools/i }).getAttribute("aria-pressed")).toBe("true");
   });
 });
 
@@ -175,10 +148,7 @@ describe("tool-card density", () => {
   it("keeps an errored card open even in compact mode", () => {
     const { container } = render(
       <Wrap density="compact">
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ toolCallId: "bash-1", text: "boom" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ toolCallId: "bash-1", text: "boom" })} />
       </Wrap>,
     );
     expect(container.textContent).toContain("boom");

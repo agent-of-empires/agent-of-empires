@@ -10,11 +10,7 @@
 
 /** The closed set of classes the daemon accepts; anything else is rejected
  *  server-side and never stored. Mirrors `telemetry::form_factor` in Rust. */
-export type ClientFormFactor =
-  | "desktop"
-  | "desktop_pwa"
-  | "mobile"
-  | "mobile_pwa";
+export type ClientFormFactor = "desktop" | "desktop_pwa" | "mobile" | "mobile_pwa";
 
 const matchesMedia = (query: string): boolean =>
   typeof window !== "undefined" && Boolean(window.matchMedia?.(query).matches);
@@ -23,9 +19,7 @@ const matchesMedia = (query: string): boolean =>
  *  platform reports `(display-mode: standalone)`. Either counts. */
 const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
-  const ios =
-    (window.navigator as unknown as { standalone?: boolean }).standalone ===
-    true;
+  const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
   return ios || matchesMedia("(display-mode: standalone)");
 };
 
@@ -38,8 +32,7 @@ const isStandalone = (): boolean => {
  *  - `desktop` otherwise. */
 export function clientFormFactor(): ClientFormFactor {
   const pwa = isStandalone();
-  const mobile =
-    matchesMedia("(pointer: coarse)") && !matchesMedia("(min-width: 768px)");
+  const mobile = matchesMedia("(pointer: coarse)") && !matchesMedia("(min-width: 768px)");
   const base = mobile ? "mobile" : "desktop";
   return pwa ? `${base}_pwa` : base;
 }

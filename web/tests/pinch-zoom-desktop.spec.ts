@@ -1,12 +1,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
-import {
-  mockTerminalApis,
-  installTerminalSpies,
-  readFontSize,
-  seedSettings,
-} from "./helpers/terminal-mocks";
+import { mockTerminalApis, installTerminalSpies, readFontSize, seedSettings } from "./helpers/terminal-mocks";
 
 // Desktop viewport: covers the Ctrl+wheel / trackpad pinch code path that
 // only runs when window.innerWidth >= MOBILE_BREAKPOINT_PX. Also proves the
@@ -45,16 +40,11 @@ function wheelCoords(messages: Buffer[]) {
 test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
   async function openSession(page: Page) {
     await clickSidebarSession(page, "pinch-test");
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
   }
 
   async function wsCount(page: Page) {
-    return page.evaluate(
-      () => (window as unknown as { __WS_COUNT__: number }).__WS_COUNT__,
-    );
+    return page.evaluate(() => (window as unknown as { __WS_COUNT__: number }).__WS_COUNT__);
   }
 
   // Dispatch wheel events on .xterm with configurable ctrlKey/deltaY.
@@ -70,9 +60,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
   ) {
     if (!opts.ctrlKey) {
       const point = await page.evaluate(({ xRatio, yRatio }) => {
-        const target = Array.from(
-          document.querySelectorAll<HTMLElement>(".xterm"),
-        ).find((el) => {
+        const target = Array.from(document.querySelectorAll<HTMLElement>(".xterm")).find((el) => {
           const rect = el.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0;
         });
@@ -91,9 +79,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
     }
 
     await page.evaluate(({ deltaY, ctrlKey, times, xRatio, yRatio }) => {
-      const target = Array.from(
-        document.querySelectorAll<HTMLElement>(".xterm"),
-      ).find((el) => {
+      const target = Array.from(document.querySelectorAll<HTMLElement>(".xterm")).find((el) => {
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       });
@@ -116,9 +102,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
     }, opts);
   }
 
-  test("Ctrl+wheel up increases desktopFontSize after debounce", async ({
-    page,
-  }) => {
+  test("Ctrl+wheel up increases desktopFontSize after debounce", async ({ page }) => {
     await installTerminalSpies(page);
     await mockTerminalApis(page);
     await page.goto("/");
@@ -134,9 +118,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
     // doubt.
     await fireWheel(page, { deltaY: -60, ctrlKey: true, times: 2 });
 
-    await expect
-      .poll(() => readFontSize(page, "desktop"), { timeout: 2_000 })
-      .toBeGreaterThan(14);
+    await expect.poll(() => readFontSize(page, "desktop"), { timeout: 2_000 }).toBeGreaterThan(14);
     expect(await wsCount(page)).toBe(wsBefore);
   });
 
@@ -150,14 +132,10 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
 
     await fireWheel(page, { deltaY: 60, ctrlKey: true, times: 2 });
 
-    await expect
-      .poll(() => readFontSize(page, "desktop"), { timeout: 2_000 })
-      .toBeLessThan(14);
+    await expect.poll(() => readFontSize(page, "desktop"), { timeout: 2_000 }).toBeLessThan(14);
   });
 
-  test("wheel without ctrlKey does not change font size (scrolls terminal instead)", async ({
-    page,
-  }) => {
+  test("wheel without ctrlKey does not change font size (scrolls terminal instead)", async ({ page }) => {
     await installTerminalSpies(page);
     const terminal = await mockTerminalApis(page);
     await page.goto("/");
@@ -182,9 +160,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
     // writes through without ctrlKey, they would have landed by now.
     await page.waitForTimeout(500);
     const writes = await page.evaluate(() =>
-      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.filter(
-        (w) => w.includes("desktopFontSize"),
-      ),
+      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.filter((w) => w.includes("desktopFontSize")),
     );
     expect(writes).toEqual([]);
     expect(await readFontSize(page, "desktop")).toBe(14);
@@ -203,9 +179,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
     expect(wheelCoords.some(({ col, row }) => col > 1 && row > 1)).toBe(true);
   });
 
-  test("wheel coordinates stay inside tmux's last applied grid during scrollback resize", async ({
-    page,
-  }) => {
+  test("wheel coordinates stay inside tmux's last applied grid during scrollback resize", async ({ page }) => {
     await page.setViewportSize({ width: 900, height: 600 });
     await installTerminalSpies(page);
     const terminal = await mockTerminalApis(page);
@@ -234,11 +208,7 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
       yRatio: 0.83,
     });
     await expect
-      .poll(() =>
-        terminal.wsMessages.some((m) =>
-          m.toString("utf8").includes('"type":"pause_output"'),
-        ),
-      )
+      .poll(() => terminal.wsMessages.some((m) => m.toString("utf8").includes('"type":"pause_output"')))
       .toBe(true);
 
     terminal.wsMessages.length = 0;
@@ -254,18 +224,14 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
       yRatio: 0.95,
     });
 
-    await expect
-      .poll(() => wheelCoords(terminal.wsMessages).length, { timeout: 2000 })
-      .toBeGreaterThan(0);
+    await expect.poll(() => wheelCoords(terminal.wsMessages).length, { timeout: 2000 }).toBeGreaterThan(0);
     const coords = wheelCoords(terminal.wsMessages);
     expect(coords.some(({ col, row }) => col > 1 && row > 1)).toBe(true);
     expect(coords.every(({ col }) => col <= appliedGrid.cols)).toBe(true);
     expect(coords.every(({ row }) => row <= appliedGrid.rows)).toBe(true);
   });
 
-  test("Ctrl+wheel zoom does NOT re-mount the terminal (live-sync regression guard)", async ({
-    page,
-  }) => {
+  test("Ctrl+wheel zoom does NOT re-mount the terminal (live-sync regression guard)", async ({ page }) => {
     // Regression guard for the load-bearing change in this PR: the main
     // terminal useEffect no longer depends on the font-size setting, so
     // persisting a new font size (via pinch/wheel → update()) must NOT
@@ -289,15 +255,10 @@ test.describe("Terminal Ctrl+wheel zoom (desktop)", () => {
 
     await fireWheel(page, { deltaY: -60, ctrlKey: true, times: 2 });
 
-    await expect
-      .poll(() => readFontSize(page, "desktop"), { timeout: 2_000 })
-      .toBeGreaterThan(14);
+    await expect.poll(() => readFontSize(page, "desktop"), { timeout: 2_000 }).toBeGreaterThan(14);
     // If the main effect had re-run on settings change, the tagged
     // element would have been wiped by `container.innerHTML = ""`.
-    const stillThere = await page.evaluate(
-      (id) => !!document.querySelector(`[data-test-id="${id}"]`),
-      tag,
-    );
+    const stillThere = await page.evaluate((id) => !!document.querySelector(`[data-test-id="${id}"]`), tag);
     expect(stillThere).toBe(true);
   });
 });

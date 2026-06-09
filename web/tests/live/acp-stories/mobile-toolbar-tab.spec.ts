@@ -2,11 +2,7 @@
 // sends "\t" to the PTY.
 
 import { test as base, expect, devices } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 
 base.use({ ...devices["iPhone 13"] });
 
@@ -33,9 +29,7 @@ base("mobile toolbar Tab sends \\t", async ({ page }, testInfo) => {
           if (data instanceof ArrayBuffer) {
             w.__WS_SENT__.push(new TextDecoder().decode(new Uint8Array(data)));
           } else if (ArrayBuffer.isView(data)) {
-            w.__WS_SENT__.push(
-              new TextDecoder().decode(data as unknown as Uint8Array),
-            );
+            w.__WS_SENT__.push(new TextDecoder().decode(data as unknown as Uint8Array));
           } else if (typeof data === "string") {
             w.__WS_SENT__.push(data);
           }
@@ -46,22 +40,16 @@ base("mobile toolbar Tab sends \\t", async ({ page }, testInfo) => {
       };
     });
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
 
     const tab = page.getByRole("button", { name: "Tab" });
     await expect(tab).toBeVisible({ timeout: 15_000 });
     await tab.click();
 
     await expect
-      .poll(
-        async () =>
-          await page.evaluate(
-            () => (window as unknown as { __WS_SENT__: string[] }).__WS_SENT__,
-          ),
-        { timeout: 5_000 },
-      )
+      .poll(async () => await page.evaluate(() => (window as unknown as { __WS_SENT__: string[] }).__WS_SENT__), {
+        timeout: 5_000,
+      })
       .toContain("\t");
   } finally {
     await serve.stop();

@@ -63,9 +63,7 @@ async function mockApis(
   getOrdering: () => string[],
   onPut?: (order: string[]) => void,
 ) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -82,32 +80,15 @@ async function mockApis(
     if (body.order) onPut?.(body.order);
     return r.fulfill({ json: { order: body.order ?? [] } });
   });
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
 async function readWorkspaceTitles(page: Page): Promise<string[]> {
   return page.evaluate(() => {
-    const rows = Array.from(
-      document.querySelectorAll<HTMLAnchorElement>(
-        "[data-testid='sidebar-session-row']",
-      ),
-    );
-    return rows
-      .map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "")
-      .filter(Boolean);
+    const rows = Array.from(document.querySelectorAll<HTMLAnchorElement>("[data-testid='sidebar-session-row']"));
+    return rows.map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "").filter(Boolean);
   });
 }
 
@@ -122,9 +103,7 @@ async function selectSortMode(page: Page, mode: string): Promise<void> {
 }
 
 test.describe("Sidebar sort picker (#1418, #1640)", () => {
-  test("default is manual; rows follow server workspace_ordering", async ({
-    page,
-  }) => {
+  test("default is manual; rows follow server workspace_ordering", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -152,19 +131,11 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "manual",
-    );
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
-      .toEqual(["old-ws", "new-ws"]);
+    await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "manual");
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
   });
 
-  test("selecting last-activity reorders desc and persists", async ({
-    page,
-    context,
-  }) => {
+  test("selecting last-activity reorders desc and persists", async ({ page, context }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -190,43 +161,28 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
-      .toEqual(["old-ws", "new-ws"]);
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
 
     await selectSortMode(page, "lastActivity");
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
-      .toEqual(["new-ws", "old-ws"]);
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["new-ws", "old-ws"]);
 
-    const stored = await page.evaluate(() =>
-      window.localStorage.getItem("aoe-sidebar-sort-mode"),
-    );
+    const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
     expect(stored).toBe("lastActivity");
 
     // Reload: mode and order persist on first paint without another
     // selection. Use the same browser context so localStorage carries.
     await page.reload();
-    await expect(page.locator(TOGGLE)).toHaveAttribute(
-      "data-sort-mode",
-      "lastActivity",
-    );
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 8000 })
-      .toEqual(["new-ws", "old-ws"]);
+    await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "lastActivity");
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["new-ws", "old-ws"]);
 
     // Selecting manual restores the server order.
     await selectSortMode(page, "manual");
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
-      .toEqual(["old-ws", "new-ws"]);
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["old-ws", "new-ws"]);
     // suppress unused-binding lint without changing the signature
     void context;
   });
 
-  test("drag affordances are absent in last-activity mode", async ({
-    page,
-  }) => {
+  test("drag affordances are absent in last-activity mode", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s1",
@@ -254,25 +210,18 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await page.goto("/");
 
     // Sanity: drag wrappers are present in manual mode.
-    await expect(
-      page.locator("[aria-roledescription='Press and hold to reorder']"),
-    ).toHaveCount(2, { timeout: 8000 });
+    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2, { timeout: 8000 });
 
     await selectSortMode(page, "lastActivity");
 
     // Drag wrappers gone in last-activity mode.
-    await expect(
-      page.locator("[aria-roledescription='Press and hold to reorder']"),
-    ).toHaveCount(0);
+    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(0);
 
     // No PUT to workspace-ordering fires from a press-and-hold attempt.
     const rows = page.locator("[data-testid='sidebar-session-row']");
     const sourceBox = await rows.nth(1).boundingBox();
     if (!sourceBox) throw new Error("row missing");
-    await page.mouse.move(
-      sourceBox.x + sourceBox.width - 4,
-      sourceBox.y + sourceBox.height / 2,
-    );
+    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
     await page.mouse.down();
     await page.waitForTimeout(300);
     await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
@@ -280,16 +229,12 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
 
     // Selecting manual: drag affordances return.
     await selectSortMode(page, "manual");
-    await expect(
-      page.locator("[aria-roledescription='Press and hold to reorder']"),
-    ).toHaveCount(2);
+    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2);
 
     expect(puts.length).toBe(0);
   });
 
-  test("multi-repo group stays pinned at the bottom in last-activity mode", async ({
-    page,
-  }) => {
+  test("multi-repo group stays pinned at the bottom in last-activity mode", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-multi",
@@ -327,22 +272,16 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await page.goto("/");
 
     // Wait for the sidebar to render both rows before flipping the mode.
-    await expect(
-      page.locator("[data-testid='sidebar-session-row']"),
-    ).toHaveCount(2, { timeout: 8000 });
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(2, { timeout: 8000 });
 
     await selectSortMode(page, "lastActivity");
 
     // Multi-repo group's row stays last even though its workspace has
     // the freshest activity. Single-repo row renders first.
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
-      .toEqual(["single-old", "multi-recent"]);
+    await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["single-old", "multi-recent"]);
   });
 
-  test("attention sort floats waiting and urgent rows to the top (#1640)", async ({
-    page,
-  }) => {
+  test("attention sort floats waiting and urgent rows to the top (#1640)", async ({ page }) => {
     // Same repo so all four sessions sit in one group; manual order is
     // newest-first by created_at. last_accessed_at is identical so the
     // within-tier tie-break does not interfere with the status ordering.
@@ -400,9 +339,7 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await expect(
-      page.locator("[data-testid='sidebar-session-row']"),
-    ).toHaveCount(4, { timeout: 8000 });
+    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(4, { timeout: 8000 });
 
     await selectSortMode(page, "attention");
 
@@ -412,9 +349,7 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
       .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
       .toEqual(["urgent-ws", "waiting-ws", "error-ws", "running-ws"]);
 
-    const stored = await page.evaluate(() =>
-      window.localStorage.getItem("aoe-sidebar-sort-mode"),
-    );
+    const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
     expect(stored).toBe("attention");
   });
 
@@ -422,9 +357,7 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
   // looked different from the grouping and filter controls (which wrap their
   // buttons in the shared styled Tooltip). It now uses that same component,
   // and the sidebar gained separator borders.
-  test("sort tooltip matches the styled group/filter tooltip; sidebar has separators (#1836)", async ({
-    page,
-  }) => {
+  test("sort tooltip matches the styled group/filter tooltip; sidebar has separators (#1836)", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s1",

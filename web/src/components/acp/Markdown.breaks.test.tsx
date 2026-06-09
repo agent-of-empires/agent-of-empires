@@ -20,11 +20,7 @@ import ReactMarkdown from "react-markdown";
 import { remarkPluginsFor } from "./Markdown";
 
 function renderMd(text: string, breaks: boolean) {
-  return render(
-    <ReactMarkdown remarkPlugins={remarkPluginsFor(breaks)}>
-      {text}
-    </ReactMarkdown>,
-  );
+  return render(<ReactMarkdown remarkPlugins={remarkPluginsFor(breaks)}>{text}</ReactMarkdown>);
 }
 
 describe("remarkPluginsFor rendering (#1472)", () => {
@@ -52,10 +48,7 @@ describe("remarkPluginsFor rendering (#1472)", () => {
   });
 
   it("leaves fenced code blocks intact when breaks is enabled", () => {
-    const { container } = renderMd(
-      "```ts\nconst a = 1;\nconst b = 2;\n```",
-      true,
-    );
+    const { container } = renderMd("```ts\nconst a = 1;\nconst b = 2;\n```", true);
     const pre = container.querySelector("pre");
     expect(pre).not.toBeNull();
     expect(pre?.textContent).toContain("const a = 1;");

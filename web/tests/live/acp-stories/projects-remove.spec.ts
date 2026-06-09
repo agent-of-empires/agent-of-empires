@@ -24,38 +24,26 @@ base("remove a project from the Projects view", async ({ page }, testInfo) => {
         env,
       });
       if (initRes.status !== 0) {
-        throw new Error(
-          `git init failed: status=${initRes.status} stderr=${initRes.stderr?.toString() ?? "<none>"}`,
-        );
+        throw new Error(`git init failed: status=${initRes.status} stderr=${initRes.stderr?.toString() ?? "<none>"}`);
       }
-      const commitRes = spawnSync(
-        "git",
-        ["commit", "--allow-empty", "-q", "-m", "init"],
-        {
-          cwd: projectPath,
-          env: {
-            ...env,
-            GIT_AUTHOR_NAME: "t",
-            GIT_AUTHOR_EMAIL: "t@t",
-            GIT_COMMITTER_NAME: "t",
-            GIT_COMMITTER_EMAIL: "t@t",
-          },
+      const commitRes = spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], {
+        cwd: projectPath,
+        env: {
+          ...env,
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@t",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@t",
         },
-      );
+      });
       if (commitRes.status !== 0) {
         throw new Error(
           `git commit failed: status=${commitRes.status} stderr=${commitRes.stderr?.toString() ?? "<none>"}`,
         );
       }
-      const res = spawnSync(
-        resolveAoeBinary(),
-        ["project", "add", projectPath],
-        { env },
-      );
+      const res = spawnSync(resolveAoeBinary(), ["project", "add", projectPath], { env });
       if (res.status !== 0) {
-        throw new Error(
-          `aoe project add failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-        );
+        throw new Error(`aoe project add failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
       }
     },
   });

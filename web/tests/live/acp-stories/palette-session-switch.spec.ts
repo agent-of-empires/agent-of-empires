@@ -8,19 +8,11 @@ import { mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  resolveAoeBinary,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, resolveAoeBinary } from "../../helpers/aoeServe";
 
 const MOD = process.platform === "darwin" ? "Meta" : "Control";
 
-function seedTwoSessions(): (seedEnv: {
-  home: string;
-  shimBin: string;
-  env: NodeJS.ProcessEnv;
-}) => void {
+function seedTwoSessions(): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
     for (const [title, subdir] of [
       ["palette-source", "project-a"],
@@ -39,15 +31,9 @@ function seedTwoSessions(): (seedEnv: {
           GIT_COMMITTER_EMAIL: "t@t",
         },
       });
-      const res = spawnSync(
-        resolveAoeBinary(),
-        ["add", projectDir, "-t", title, "-c", "claude"],
-        { env },
-      );
+      const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });
       if (res.status !== 0) {
-        throw new Error(
-          `aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-        );
+        throw new Error(`aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
       }
     }
   };
@@ -66,9 +52,7 @@ base("command palette switches sessions", async ({ page }, testInfo) => {
     const source = sessions.find((s) => s.title === "palette-source")!;
     const target = sessions.find((s) => s.title === "palette-target")!;
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(source.id)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(source.id)}`);
     await expect(page).toHaveURL(new RegExp(`/session/${source.id}`), {
       timeout: 10_000,
     });
@@ -76,9 +60,7 @@ base("command palette switches sessions", async ({ page }, testInfo) => {
     await page.keyboard.press(`${MOD}+K`);
     const palette = page.getByRole("dialog", { name: "Command palette" });
     await expect(palette).toBeVisible({ timeout: 5_000 });
-    await palette
-      .getByPlaceholder("Search actions, sessions, settings…")
-      .fill("palette-target");
+    await palette.getByPlaceholder("Search actions, sessions, settings…").fill("palette-target");
 
     await palette.getByText("palette-target").first().click();
     await expect(page).toHaveURL(new RegExp(`/session/${target.id}`), {

@@ -41,10 +41,7 @@ describe("ToolErrorBody", () => {
 
   it("renders the error chrome and the unwrapped body on status 'err'", () => {
     const { getByText, container } = render(
-      <ToolErrorBody
-        status="err"
-        errorText="<tool_use_error>File does not exist.</tool_use_error>"
-      >
+      <ToolErrorBody status="err" errorText="<tool_use_error>File does not exist.</tool_use_error>">
         <div>attempted body</div>
       </ToolErrorBody>,
     );
@@ -104,10 +101,7 @@ describe("ToolErrorBody", () => {
 
   it("passes through arbitrary single-pair wrapper tags as the chip label", () => {
     const { getByText, container } = render(
-      <ToolErrorBody
-        status="err"
-        errorText="<custom_wrapper>weird failure</custom_wrapper>"
-      >
+      <ToolErrorBody status="err" errorText="<custom_wrapper>weird failure</custom_wrapper>">
         <div>attempted body</div>
       </ToolErrorBody>,
     );
@@ -126,12 +120,7 @@ describe("ToolErrorBody", () => {
 
   it("preserves linebreaks in the error body", () => {
     const { container } = render(
-      <ToolErrorBody
-        status="err"
-        errorText={
-          "<tool_use_error>line one\nline two\nline three</tool_use_error>"
-        }
-      >
+      <ToolErrorBody status="err" errorText={"<tool_use_error>line one\nline two\nline three</tool_use_error>"}>
         <div>attempted body</div>
       </ToolErrorBody>,
     );

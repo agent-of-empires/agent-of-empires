@@ -46,12 +46,7 @@ export default defineConfig({
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
-  reporter: process.env.CI
-    ? [
-        ["html", { open: "never", outputFolder: "playwright-live-report" }],
-        ["github"],
-      ]
-    : "list",
+  reporter: process.env.CI ? [["html", { open: "never", outputFolder: "playwright-live-report" }], ["github"]] : "list",
   projects: [
     {
       name: "chromium",

@@ -62,9 +62,7 @@ self.addEventListener("push", (event) => {
         type: "window",
         includeUncontrolled: true,
       });
-      const focused = clientList.find(
-        (c) => c.visibilityState === "visible" && c.focused,
-      );
+      const focused = clientList.find((c) => c.visibilityState === "visible" && c.focused);
       if (focused) {
         // User is already in the app, forward the payload for an in-app
         // toast, skip the OS notification. If the client has no handler,
@@ -85,27 +83,24 @@ self.addEventListener("push", (event) => {
 // (and navigate if needed) rather than opening a second instance.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const target =
-    (event.notification.data && event.notification.data.url) || "/";
+  const target = (event.notification.data && event.notification.data.url) || "/";
   event.waitUntil(
-    self.clients
-      .matchAll({ type: "window", includeUncontrolled: true })
-      .then(async (clientList) => {
-        for (const client of clientList) {
-          if ("focus" in client) {
-            if (client.url !== target && "navigate" in client) {
-              try {
-                await client.navigate(target);
-              } catch {
-                /* SW may not be able to navigate across origins etc; ignore */
-              }
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (clientList) => {
+      for (const client of clientList) {
+        if ("focus" in client) {
+          if (client.url !== target && "navigate" in client) {
+            try {
+              await client.navigate(target);
+            } catch {
+              /* SW may not be able to navigate across origins etc; ignore */
             }
-            return client.focus();
           }
+          return client.focus();
         }
-        if (self.clients.openWindow) {
-          return self.clients.openWindow(target);
-        }
-      }),
+      }
+      if (self.clients.openWindow) {
+        return self.clients.openWindow(target);
+      }
+    }),
   );
 });

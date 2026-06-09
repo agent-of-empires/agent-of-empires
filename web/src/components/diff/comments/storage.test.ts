@@ -1,12 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  clearStoredComments,
-  EMPTY_STORAGE,
-  isEmptyState,
-  loadComments,
-  saveComments,
-  storageKey,
-} from "./storage";
+import { clearStoredComments, EMPTY_STORAGE, isEmptyState, loadComments, saveComments, storageKey } from "./storage";
 import type { DiffComment, DiffCommentsStorageV1 } from "./types";
 
 // Vitest default env is node; install a minimal in-memory localStorage
@@ -166,9 +159,7 @@ describe("storage", () => {
     });
     // Non-empty state still routes through setItem; should not throw despite
     // the failing write.
-    expect(() =>
-      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] }),
-    ).not.toThrow();
+    expect(() => saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] })).not.toThrow();
     expect(spy).toHaveBeenCalled();
   });
 
@@ -182,15 +173,11 @@ describe("storage", () => {
     });
 
     it("ignores a non-default clearAfterSend toggle", () => {
-      expect(isEmptyState({ ...EMPTY_STORAGE, clearAfterSend: false })).toBe(
-        true,
-      );
+      expect(isEmptyState({ ...EMPTY_STORAGE, clearAfterSend: false })).toBe(true);
     });
 
     it("is false with a comment", () => {
-      expect(
-        isEmptyState({ ...EMPTY_STORAGE, comments: [mkComment({})] }),
-      ).toBe(false);
+      expect(isEmptyState({ ...EMPTY_STORAGE, comments: [mkComment({})] })).toBe(false);
     });
 
     it("is false with draft text", () => {

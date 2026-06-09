@@ -16,12 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  isQuotaExceededError,
-  safeGetItem,
-  safeRemoveItem,
-  safeSetItem,
-} from "./safeStorage";
+import { isQuotaExceededError, safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 
 const KEY = "test:safe-storage";
 

@@ -8,32 +8,15 @@ import { Page } from "@playwright/test";
 // - Submitting the wizard sends `base_branch` in the POST body.
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "profiles",
-    "groups",
-    "devices",
-    "about",
-    "system/update-status",
-  ]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json:
-          path === "settings" ||
-          path === "about" ||
-          path === "system/update-status"
-            ? {}
-            : [],
+        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
       }),
     );
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: false, runtime: null } }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   // The wizard's Project step shows a "Recent projects" list driven by
   // /api/sessions. Seed one entry so the test can click it to advance
   // to the Session step (where the Advanced base-branch UI lives).
@@ -85,15 +68,10 @@ async function mockApis(page: Page) {
 async function openWizardOnSessionStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   // Wait for the seeded recent project to populate (driven by
   // /api/sessions which the test mocks).
-  const recentBtn = page
-    .getByRole("button")
-    .filter({ hasText: "/tmp/example" })
-    .first();
+  const recentBtn = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
   await recentBtn.waitFor({ state: "visible", timeout: 5000 });
   await recentBtn.click();
   // Next is gated on `data.path` being set; wait for it to enable
@@ -111,9 +89,7 @@ async function expandAdvanced(page: Page) {
 }
 
 test.describe("Wizard base branch (#948)", () => {
-  test("Base branch section is collapsed by default on the session step", async ({
-    page,
-  }) => {
+  test("Base branch section is collapsed by default on the session step", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -130,15 +106,11 @@ test.describe("Wizard base branch (#948)", () => {
     if ((await toggle.getAttribute("aria-checked")) !== "true") {
       await toggle.click();
     }
-    await expect(
-      page.getByRole("button", { name: "Base branch" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
     await expect(page.getByLabel("Base branch")).toHaveCount(0);
   });
 
-  test("expanding Base branch fetches branches with include_remote=true", async ({
-    page,
-  }) => {
+  test("expanding Base branch fetches branches with include_remote=true", async ({ page }) => {
     await mockApis(page);
 
     let capturedUrl: URL | null = null;
@@ -159,14 +131,10 @@ test.describe("Wizard base branch (#948)", () => {
     await expandAdvanced(page);
     await page.getByRole("button", { name: "Base branch" }).click();
     await expect(page.getByLabel("Base branch")).toBeVisible();
-    await expect
-      .poll(() => capturedUrl?.searchParams.get("include_remote"))
-      .toBe("true");
+    await expect.poll(() => capturedUrl?.searchParams.get("include_remote")).toBe("true");
   });
 
-  test("selecting a remote-only branch populates the base-branch input", async ({
-    page,
-  }) => {
+  test("selecting a remote-only branch populates the base-branch input", async ({ page }) => {
     await mockApis(page);
     await page.route("**/api/git/branches**", (r) =>
       r.fulfill({

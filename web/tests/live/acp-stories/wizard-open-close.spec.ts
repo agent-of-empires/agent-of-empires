@@ -8,36 +8,26 @@
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe } from "../../helpers/aoeServe";
 
-base(
-  "sidebar New session opens wizard and X closes it",
-  async ({ page }, testInfo) => {
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-    });
+base("sidebar New session opens wizard and X closes it", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+  });
 
-    try {
-      await page.goto(serve.baseUrl);
+  try {
+    await page.goto(serve.baseUrl);
 
-      // The empty-state sidebar exposes a single "New session" trigger
-      // before any groups exist; once groups exist, every group header
-      // also has its own. Click the topbar/sidebar primary one.
-      await page
-        .getByRole("button", { name: "New session", exact: true })
-        .first()
-        .click();
+    // The empty-state sidebar exposes a single "New session" trigger
+    // before any groups exist; once groups exist, every group header
+    // also has its own. Click the topbar/sidebar primary one.
+    await page.getByRole("button", { name: "New session", exact: true }).first().click();
 
-      await expect(
-        page.getByRole("heading", { name: "New session", exact: true }),
-      ).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("heading", { name: "New session", exact: true })).toBeVisible({ timeout: 5_000 });
 
-      await page.getByRole("button", { name: "Close" }).click();
-      await expect(
-        page.getByRole("heading", { name: "New session", exact: true }),
-      ).toBeHidden({ timeout: 5_000 });
-    } finally {
-      await serve.stop();
-    }
-  },
-);
+    await page.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("heading", { name: "New session", exact: true })).toBeHidden({ timeout: 5_000 });
+  } finally {
+    await serve.stop();
+  }
+});

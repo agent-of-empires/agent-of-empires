@@ -9,9 +9,7 @@ import { clickSidebarSession } from "./helpers/sidebar";
 // isolation.
 
 async function setupMultiRepoSession(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -43,25 +41,10 @@ async function setupMultiRepoSession(page: Page) {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, () => {});
   await page.route("**/api/sessions/*/diff/files", (r) =>
@@ -119,31 +102,21 @@ test.describe("Diff multi-repo subfolder folding", () => {
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
     await clickSidebarSession(page, "multi-repo");
-    await expect(
-      page.getByText("2 repos", { exact: true }).first(),
-    ).toBeVisible({
+    await expect(page.getByText("2 repos", { exact: true }).first()).toBeVisible({
       timeout: 10000,
     });
     // Toggle title flips based on the current mode. Match either so the
     // assertion stays robust against the desktop default.
     await expect(
-      page
-        .locator(
-          'button[title="Switch to tree view"], button[title="Switch to flat list"]',
-        )
-        .first(),
+      page.locator('button[title="Switch to tree view"], button[title="Switch to flat list"]').first(),
     ).toBeVisible();
   });
 
-  test("tree mode renders foldable dir rows inside each repo group", async ({
-    page,
-  }) => {
+  test("tree mode renders foldable dir rows inside each repo group", async ({ page }) => {
     await setupMultiRepoSession(page);
     await page.goto("/");
     await clickSidebarSession(page, "multi-repo");
-    await expect(
-      page.getByText("2 repos", { exact: true }).first(),
-    ).toBeVisible({
+    await expect(page.getByText("2 repos", { exact: true }).first()).toBeVisible({
       timeout: 10000,
     });
     // Force tree mode regardless of viewport default: if the toggle

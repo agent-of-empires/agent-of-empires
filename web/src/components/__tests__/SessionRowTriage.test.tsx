@@ -15,10 +15,7 @@ import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
-import {
-  OPEN_SWITCH_AGENT_EVENT,
-  consumePendingSwitchAgent,
-} from "../../lib/switchAgentTrigger";
+import { OPEN_SWITCH_AGENT_EVENT, consumePendingSwitchAgent } from "../../lib/switchAgentTrigger";
 
 function session(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -70,11 +67,7 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
 
 function Wrap({ children }: { children: ReactNode }) {
   const ref = useRef(0);
-  return (
-    <DragSuppressContext.Provider value={ref}>
-      {children}
-    </DragSuppressContext.Provider>
-  );
+  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
 }
 
 // Mounts a SessionRow wired to the real `useSidebarTriage` controller, the
@@ -125,9 +118,7 @@ afterEach(() => {
 
 describe("SessionRow chips", () => {
   it("renders the Pin glyph when any session is pinned", () => {
-    const ws = workspace("w-pinned", [
-      session({ pinned_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -139,9 +130,7 @@ describe("SessionRow chips", () => {
   });
 
   it("renders the Archived chip when any session is archived", () => {
-    const ws = workspace("w-archived", [
-      session({ archived_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-archived", [session({ archived_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -191,9 +180,7 @@ describe("SessionRow chips", () => {
 
 describe("SessionRow context menu", () => {
   it("shows only the Unpin toggle when pinned", () => {
-    const ws = workspace("w-pinned", [
-      session({ pinned_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -208,9 +195,7 @@ describe("SessionRow context menu", () => {
   });
 
   it("shows only the Unarchive toggle when archived", () => {
-    const ws = workspace("w-archived", [
-      session({ archived_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-archived", [session({ archived_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -253,18 +238,14 @@ describe("SessionRow context menu", () => {
   });
 
   it("shows Switch agent for a structured view row", () => {
-    const ws = workspace("w-structured view", [
-      session({ id: "sess-structured view", view: "structured" }),
-    ]);
+    const ws = workspace("w-structured view", [session({ id: "sess-structured view", view: "structured" })]);
     render(
       <Wrap>
         <Row ws={ws} />
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-switch-agent"),
-    ).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).not.toBeNull();
   });
 
   it("hides Switch agent for a non-structured view (tmux) row", () => {
@@ -275,9 +256,7 @@ describe("SessionRow context menu", () => {
       </Wrap>,
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-switch-agent"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
   });
 
   it("hides the triage section in read-only mode", () => {
@@ -295,9 +274,7 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).not.toContain("Archive");
     expect(menu.textContent).not.toContain("Snooze");
     expect(menu.textContent).not.toContain("Delete");
-    expect(
-      screen.queryByTestId("sidebar-context-menu-switch-agent"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
   });
 });
 
@@ -354,9 +331,7 @@ describe("SessionRow triage actions", () => {
     // The chip should appear synchronously from the optimistic
     // state flip, before the PATCH response would have time to
     // round-trip.
-    await vi.waitFor(() =>
-      expect(screen.queryByLabelText("Archived")).not.toBeNull(),
-    );
+    await vi.waitFor(() => expect(screen.queryByLabelText("Archived")).not.toBeNull());
   });
 
   it("Snooze… opens the modal (does NOT POST until a preset is picked)", () => {
@@ -373,9 +348,7 @@ describe("SessionRow triage actions", () => {
   });
 
   it("Unpin click fires PATCH /api/sessions/:id/pin with { pinned: false }", async () => {
-    const ws = workspace("w-pinned", [
-      session({ id: "sess-unpin", pinned_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-pinned", [session({ id: "sess-unpin", pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -390,9 +363,7 @@ describe("SessionRow triage actions", () => {
   });
 
   it("Unarchive click fires PATCH /api/sessions/:id/archive with { archived: false }", async () => {
-    const ws = workspace("w-archived", [
-      session({ id: "sess-unarc", archived_at: "2026-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w-archived", [session({ id: "sess-unarc", archived_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -411,9 +382,7 @@ describe("SessionRow triage actions", () => {
 
   it("reverts optimistic pin override on PATCH failure", async () => {
     // Branch coverage: the wake-call-failed path through togglePin.
-    fetchSpy.mockImplementation(
-      async () => new Response("nope", { status: 500 }),
-    );
+    fetchSpy.mockImplementation(async () => new Response("nope", { status: 500 }));
     const ws = workspace("w-live", [session({ id: "sess-pin-fail" })]);
     render(
       <Wrap>
@@ -425,15 +394,11 @@ describe("SessionRow triage actions", () => {
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     // The optimistic pin flipped on, then reverted off. The glyph
     // should not be visible after the failure settles.
-    await vi.waitFor(() =>
-      expect(screen.queryByLabelText("Pinned")).toBeNull(),
-    );
+    await vi.waitFor(() => expect(screen.queryByLabelText("Pinned")).toBeNull());
   });
 
   it("reverts optimistic archive override on PATCH failure", async () => {
-    fetchSpy.mockImplementation(
-      async () => new Response("nope", { status: 500 }),
-    );
+    fetchSpy.mockImplementation(async () => new Response("nope", { status: 500 }));
     const ws = workspace("w-live", [session({ id: "sess-arch-fail" })]);
     render(
       <Wrap>
@@ -443,16 +408,12 @@ describe("SessionRow triage actions", () => {
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     fireEvent.click(screen.getByTestId("sidebar-context-menu-archive"));
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    await vi.waitFor(() =>
-      expect(screen.queryByLabelText("Archived")).toBeNull(),
-    );
+    await vi.waitFor(() => expect(screen.queryByLabelText("Archived")).toBeNull());
   });
 
   it("Unsnooze click fires PATCH /api/sessions/:id/snooze with { minutes: null }", async () => {
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const ws = workspace("w-snoozed", [
-      session({ id: "sess-unsnooze-it", snoozed_until: future }),
-    ]);
+    const ws = workspace("w-snoozed", [session({ id: "sess-unsnooze-it", snoozed_until: future })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -467,15 +428,11 @@ describe("SessionRow triage actions", () => {
   });
 
   it("Switch agent click navigates to the session and requests the dialog", () => {
-    const ws = workspace("w-structured view", [
-      session({ id: "sess-switch-it", view: "structured" }),
-    ]);
+    const ws = workspace("w-structured view", [session({ id: "sess-switch-it", view: "structured" })]);
     const opened: string[] = [];
     const switched: string[] = [];
-    const onOpen = (e: Event) =>
-      opened.push((e as CustomEvent).detail.sessionId);
-    const onSwitch = (e: Event) =>
-      switched.push((e as CustomEvent).detail.sessionId);
+    const onOpen = (e: Event) => opened.push((e as CustomEvent).detail.sessionId);
+    const onSwitch = (e: Event) => switched.push((e as CustomEvent).detail.sessionId);
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
     try {

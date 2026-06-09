@@ -4,11 +4,7 @@ import type { RefObject } from "react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { toastBus } from "../lib/toastBus";
 
-const CLIPBOARD_TEXT_TYPES = [
-  "text/plain",
-  "text/uri-list",
-  "text/html",
-] as const;
+const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
 
 // Normalize clipboard payloads to plain text. Necessary because GitHub's
 // "Copy link" buttons (and many Mac copy-link UIs) write text/uri-list
@@ -109,8 +105,7 @@ export function MobileTerminalToolbar({
   const btnBase =
     "flex-1 flex items-center justify-center h-11 rounded-md transition-colors duration-75 text-text-secondary select-none touch-manipulation relative active:bg-surface-700/50 active:scale-95";
 
-  const strip =
-    "shrink-0 flex items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
+  const strip = "shrink-0 flex items-center gap-1 px-2 py-1.5 bg-surface-850 border-t border-surface-700/20";
 
   // Parent (TerminalView) pads its layout by the live keyboard occlusion, so
   // the strip already sits above the keyboard and must not add its own inset.
@@ -118,9 +113,7 @@ export function MobileTerminalToolbar({
   // the flag and the strip falls back to env(keyboard-inset-height) to lift
   // itself above the keyboard.
   const stripStyle = {
-    paddingBottom: parentHandlesKeyboardInset
-      ? "0"
-      : "env(keyboard-inset-height, 0px)",
+    paddingBottom: parentHandlesKeyboardInset ? "0" : "env(keyboard-inset-height, 0px)",
   };
 
   const arrowHint = (axis: DragAxis) =>
@@ -142,49 +135,25 @@ export function MobileTerminalToolbar({
       // soft keyboard. onClick handlers still fire normally.
       onMouseDown={(e) => e.preventDefault()}
     >
-      <button
-        type="button"
-        aria-label="Arrow up"
-        className={btnBase}
-        {...upHandlers}
-      >
+      <button type="button" aria-label="Arrow up" className={btnBase} {...upHandlers}>
         <span className="font-mono text-sm">{"\u2191"}</span>
         {arrowHint(upAxis)}
       </button>
-      <button
-        type="button"
-        aria-label="Arrow down"
-        className={btnBase}
-        {...downHandlers}
-      >
+      <button type="button" aria-label="Arrow down" className={btnBase} {...downHandlers}>
         <span className="font-mono text-sm">{"\u2193"}</span>
         {arrowHint(downAxis)}
       </button>
-      <button
-        type="button"
-        aria-label="Tab"
-        className={btnBase}
-        onClick={() => send("\t")}
-      >
+      <button type="button" aria-label="Tab" className={btnBase} onClick={() => send("\t")}>
         <span className="font-mono text-sm">Tab</span>
       </button>
-      <button
-        type="button"
-        aria-label="Escape"
-        className={btnBase}
-        onClick={() => send("\x1b")}
-      >
+      <button type="button" aria-label="Escape" className={btnBase} onClick={() => send("\x1b")}>
         <span className="font-mono text-sm">Esc</span>
       </button>
       <button
         type="button"
         aria-label="Ctrl"
         aria-pressed={ctrlActive}
-        className={
-          ctrlActive
-            ? `${btnBase.replace("text-text-secondary", "text-brand-400")} bg-brand-600/20`
-            : btnBase
-        }
+        className={ctrlActive ? `${btnBase.replace("text-text-secondary", "text-brand-400")} bg-brand-600/20` : btnBase}
         onClick={() => {
           haptic();
           onCtrlToggle();
@@ -257,16 +226,12 @@ export function MobileTerminalToolbar({
           // readonly first so iOS doesn't pop the keyboard, then blur
           // afterward so the next FAB tap is a real focus transition.
           const activeEl = document.activeElement;
-          const activeIsEditable =
-            activeEl instanceof HTMLTextAreaElement ||
-            activeEl instanceof HTMLInputElement;
+          const activeIsEditable = activeEl instanceof HTMLTextAreaElement || activeEl instanceof HTMLInputElement;
 
           if (keyboardOpen && activeIsEditable) {
             let recovered = "";
             const onPaste: EventListener = (e: Event) => {
-              recovered = extractClipboardText(
-                (e as ClipboardEvent).clipboardData,
-              );
+              recovered = extractClipboardText((e as ClipboardEvent).clipboardData);
             };
             activeEl.addEventListener("paste", onPaste, { once: true });
             try {
@@ -280,9 +245,7 @@ export function MobileTerminalToolbar({
               return;
             }
           } else {
-            const ta = termRef.current?.element?.querySelector(
-              "textarea",
-            ) as HTMLTextAreaElement | null;
+            const ta = termRef.current?.element?.querySelector("textarea") as HTMLTextAreaElement | null;
             if (ta) {
               let recovered = "";
               const onPaste = (e: ClipboardEvent) => {
@@ -309,13 +272,9 @@ export function MobileTerminalToolbar({
 
           // All paths failed. Tell the user what to try next.
           if (!window.isSecureContext) {
-            t?.error(
-              "Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.",
-            );
+            t?.error("Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.");
           } else {
-            t?.error(
-              "Couldn't read clipboard. Try copying again, or open this dashboard in Safari.",
-            );
+            t?.error("Couldn't read clipboard. Try copying again, or open this dashboard in Safari.");
           }
         }}
       >

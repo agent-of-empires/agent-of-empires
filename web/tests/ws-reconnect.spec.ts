@@ -13,9 +13,7 @@ import { clickSidebarSession } from "./helpers/sidebar";
 // connection attempts in the route handler (Node side) and assert on that.
 
 async function mockApisExceptWs(page: Page, sessionTitle: string) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -44,28 +42,13 @@ async function mockApisExceptWs(page: Page, sessionTitle: string) {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
 }
 
@@ -73,10 +56,7 @@ async function openSession(page: Page, title: string) {
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
   await clickSidebarSession(page, title);
-  await page
-    .locator(".xterm")
-    .first()
-    .waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
 }
 
 test.describe("Terminal WebSocket reconnection", () => {
@@ -86,12 +66,9 @@ test.describe("Terminal WebSocket reconnection", () => {
 
     // Side-channel WS (shell host terminal, container ws): keep them open
     // and mute so they don't affect our main-terminal reconnect observations.
-    await page.routeWebSocket(
-      /\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/,
-      (ws) => {
-        ws.onMessage(() => {});
-      },
-    );
+    await page.routeWebSocket(/\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/, (ws) => {
+      ws.onMessage(() => {});
+    });
 
     let attempts = 0;
     let firstClosedAt = 0;
@@ -126,9 +103,7 @@ test.describe("Terminal WebSocket reconnection", () => {
     // Wait for the reconnect to fire. First retry is scheduled at 200ms
     // under the fast-start ladder; 5s upper bound still fails fast if we
     // regressed to a slow exponential delay.
-    await expect
-      .poll(() => attempts, { timeout: 5_000 })
-      .toBeGreaterThanOrEqual(2);
+    await expect.poll(() => attempts, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
 
     // Guard: both timestamps must have been set. Without this check, a 0
     // firstClosedAt would make elapsed comically large and the < 1500
@@ -150,9 +125,7 @@ test.describe("Terminal WebSocket reconnection", () => {
     expect(attempts).toBe(2);
   });
 
-  test("'online' event short-circuits the backoff and dials immediately", async ({
-    page,
-  }) => {
+  test("'online' event short-circuits the backoff and dials immediately", async ({ page }) => {
     // Drop attempts 1-4 so the next scheduled backoff is the longer 3s
     // delay (200+400+800+1500 = 2.9s of total wait under the fast-start
     // schedule). Dispatch a window 'online' event during that 3s window.
@@ -162,12 +135,9 @@ test.describe("Terminal WebSocket reconnection", () => {
     const title = "online-test";
     await mockApisExceptWs(page, title);
 
-    await page.routeWebSocket(
-      /\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/,
-      (ws) => {
-        ws.onMessage(() => {});
-      },
-    );
+    await page.routeWebSocket(/\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/, (ws) => {
+      ws.onMessage(() => {});
+    });
 
     let attempts = 0;
     const closeTimes: number[] = [];
@@ -203,9 +173,7 @@ test.describe("Terminal WebSocket reconnection", () => {
 
     // Attempt 5 should arrive well under the 3s backoff that would
     // otherwise gate it.
-    await expect
-      .poll(() => attempts, { timeout: 2_000 })
-      .toBeGreaterThanOrEqual(5);
+    await expect.poll(() => attempts, { timeout: 2_000 }).toBeGreaterThanOrEqual(5);
     const fifthOpenedAt = openTimes[4];
     expect(fifthOpenedAt).toBeDefined();
     expect(fifthOpenedAt! - beforeOnline).toBeLessThan(1_500);
@@ -220,12 +188,9 @@ test.describe("Terminal WebSocket reconnection", () => {
     const title = "retry-test";
     await mockApisExceptWs(page, title);
 
-    await page.routeWebSocket(
-      /\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/,
-      (ws) => {
-        ws.onMessage(() => {});
-      },
-    );
+    await page.routeWebSocket(/\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/, (ws) => {
+      ws.onMessage(() => {});
+    });
 
     let attempts = 0;
     await page.routeWebSocket(/\/sessions\/[^/]+\/ws$/, (ws) => {
@@ -242,14 +207,10 @@ test.describe("Terminal WebSocket reconnection", () => {
 
     await openSession(page, title);
 
-    await expect
-      .poll(() => attempts, { timeout: 5_000, intervals: [100, 250] })
-      .toBeGreaterThanOrEqual(4);
+    await expect.poll(() => attempts, { timeout: 5_000, intervals: [100, 250] }).toBeGreaterThanOrEqual(4);
   });
 
-  test("switching sessions mid-retry does not resurrect the old session's socket", async ({
-    page,
-  }) => {
+  test("switching sessions mid-retry does not resurrect the old session's socket", async ({ page }) => {
     // Regression for #1455. User story: a session drops its WS and the
     // client schedules a retry. Before the retry fires, the user clicks
     // a different session in the sidebar. The old session's onclose
@@ -257,9 +218,7 @@ test.describe("Terminal WebSocket reconnection", () => {
     // OLD sessionId after the effect cleanup has run.
     const oldTitle = "old-session";
     const newTitle = "new-session";
-    await page.route("**/api/login/status", (r) =>
-      r.fulfill({ json: { required: false, authenticated: true } }),
-    );
+    await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
@@ -286,36 +245,18 @@ test.describe("Terminal WebSocket reconnection", () => {
         },
       });
     });
-    await page.route("**/api/sessions/*/ensure", (r) =>
-      r.fulfill({ json: { ok: true } }),
-    );
-    await page.route("**/api/sessions/*/terminal", (r) =>
-      r.fulfill({ status: 200, body: "" }),
-    );
+    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+    await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
     await page.route("**/api/sessions/*/diff/files", (r) =>
       r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
     );
-    for (const path of [
-      "settings",
-      "themes",
-      "agents",
-      "profiles",
-      "groups",
-      "devices",
-      "docker/status",
-      "about",
-    ]) {
-      await page.route(`**/api/${path}`, (r) =>
-        r.fulfill({ json: path === "docker/status" ? {} : [] }),
-      );
+    for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+      await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
     }
 
-    await page.routeWebSocket(
-      /\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/,
-      (ws) => {
-        ws.onMessage(() => {});
-      },
-    );
+    await page.routeWebSocket(/\/sessions\/[^/]+\/(terminal\/ws|container-ws)$/, (ws) => {
+      ws.onMessage(() => {});
+    });
 
     // Tuple of (sessionId, dialedAtMs) per attempt so we can assert
     // "no NEW old-session attempts after the switch moment", independent
@@ -355,10 +296,7 @@ test.describe("Terminal WebSocket reconnection", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await clickSidebarSession(page, oldTitle);
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
 
     // Wait for at least one old-session attempt to land.
     await expect
@@ -372,9 +310,7 @@ test.describe("Terminal WebSocket reconnection", () => {
     // synchronously inside commit), so any subsequent old-session dial
     // is unambiguously a ghost.
     await clickSidebarSession(page, newTitle);
-    await expect
-      .poll(() => dials.some((d) => d.id === newTitle), { timeout: 5_000 })
-      .toBe(true);
+    await expect.poll(() => dials.some((d) => d.id === newTitle), { timeout: 5_000 }).toBe(true);
 
     const oldCountAtSwitch = dials.filter((d) => d.id === oldTitle).length;
 

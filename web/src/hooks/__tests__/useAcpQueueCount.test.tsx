@@ -4,11 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
 import { useQueuedCountForSessions } from "../useAcpQueueCount";
-import {
-  STORAGE_KEY_PREFIX,
-  clearQueueCount,
-  setQueueCount,
-} from "../../lib/acpStateStorage";
+import { STORAGE_KEY_PREFIX, clearQueueCount, setQueueCount } from "../../lib/acpStateStorage";
 
 function entryKey(id: string): string {
   return `${STORAGE_KEY_PREFIX}${id}`;
@@ -142,9 +138,7 @@ describe("useQueuedCountForSessions", () => {
   });
 
   it("removes its storage listener on unmount", () => {
-    const { unmount, result } = renderHook(() =>
-      useQueuedCountForSessions(["a"]),
-    );
+    const { unmount, result } = renderHook(() => useQueuedCountForSessions(["a"]));
     unmount();
     // After unmount the listener is gone, so a cross-tab event must not
     // throw or leave a dangling subscriber. The hook value is frozen at

@@ -1,10 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  fetchAcpAgents,
-  fetchContextPrimer,
-  switchAcpAgent,
-  type AcpAgentInfo,
-} from "../../lib/api";
+import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent, type AcpAgentInfo } from "../../lib/api";
 
 /**
  * Agent-switch dialog. Lists the structured view ACP registry, preselects a
@@ -45,14 +40,7 @@ interface Props {
 
 const PREFERRED_FALLBACK = "codex";
 
-export function SwitchAgentModal({
-  open,
-  sessionId,
-  currentAgent,
-  onClose,
-  onPrefill,
-  trigger = "manual",
-}: Props) {
+export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPrefill, trigger = "manual" }: Props) {
   const [agents, setAgents] = useState<AcpAgentInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -67,9 +55,7 @@ export function SwitchAgentModal({
   // Reset loading/error when deps change (render-time to avoid effect-based setState).
   // Track the key even while closed so reopening with the same agent/trigger still
   // re-triggers the reset (the key flips on the close, then again on the reopen).
-  const [depKey, setDepKey] = useState(
-    () => `${open}-${currentAgent}-${rateLimited}`,
-  );
+  const [depKey, setDepKey] = useState(() => `${open}-${currentAgent}-${rateLimited}`);
   const currentKey = `${open}-${currentAgent}-${rateLimited}`;
   if (currentKey !== depKey) {
     setDepKey(currentKey);
@@ -90,18 +76,12 @@ export function SwitchAgentModal({
         // On the rate-limit path, prefer codex when installed. On a
         // manual switch we have no preferred direction, so just pick the
         // first remaining entry. The user can change the pick either way.
-        const preferred = rateLimited
-          ? filtered.find((a) => a.name === PREFERRED_FALLBACK)
-          : undefined;
+        const preferred = rateLimited ? filtered.find((a) => a.name === PREFERRED_FALLBACK) : undefined;
         setSelected(preferred?.name ?? filtered[0]?.name ?? null);
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(
-          e instanceof Error
-            ? e.message
-            : "Failed to load structured view agents.",
-        );
+        setError(e instanceof Error ? e.message : "Failed to load structured view agents.");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -146,23 +126,14 @@ export function SwitchAgentModal({
     setSubmitting(true);
     setError(null);
     try {
-      const result = await switchAcpAgent(
-        sessionId,
-        selected,
-        null,
-        rateLimited ? "rate_limited" : "manual",
-      );
+      const result = await switchAcpAgent(sessionId, selected, null, rateLimited ? "rate_limited" : "manual");
       if (!result) {
         setError("Switch failed: server returned no response.");
         return;
       }
       const controller = new AbortController();
       abortRef.current = controller;
-      const primer = await fetchContextPrimer(
-        sessionId,
-        result.before_seq,
-        controller.signal,
-      );
+      const primer = await fetchContextPrimer(sessionId, result.before_seq, controller.signal);
       if (controller.signal.aborted) return;
       const recap = primer?.primer?.trim() ?? "";
       const unprocessed = primer?.unprocessed_prompt?.trim() ?? "";
@@ -201,17 +172,15 @@ export function SwitchAgentModal({
         <p className="mt-1 text-xs text-text-muted">
           {rateLimited ? (
             <>
-              The current agent ({currentAgent ?? "unknown"}) is rate-limited.
-              Hand the session off to a different installed ACP backend; we will
-              pre-fill the composer with a recap of the recent turns for you to
-              review before sending.
+              The current agent ({currentAgent ?? "unknown"}) is rate-limited. Hand the session off to a different
+              installed ACP backend; we will pre-fill the composer with a recap of the recent turns for you to review
+              before sending.
             </>
           ) : (
             <>
-              Hand this session off from {currentAgent ?? "the current agent"}{" "}
-              to a different installed ACP backend, keeping the transcript. We
-              will pre-fill the composer with a recap of the recent turns for
-              you to review before sending.
+              Hand this session off from {currentAgent ?? "the current agent"} to a different installed ACP backend,
+              keeping the transcript. We will pre-fill the composer with a recap of the recent turns for you to review
+              before sending.
             </>
           )}
         </p>
@@ -220,8 +189,8 @@ export function SwitchAgentModal({
           <div className="mt-4 text-xs text-text-muted">Loading agents...</div>
         ) : agents.length === 0 ? (
           <div className="mt-4 text-xs text-status-error">
-            No alternative structured view agents are registered. Install one
-            (e.g. `npm i -g @zed-industries/codex-acp`) and try again.
+            No alternative structured view agents are registered. Install one (e.g. `npm i -g
+            @zed-industries/codex-acp`) and try again.
           </div>
         ) : (
           <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">
@@ -229,9 +198,7 @@ export function SwitchAgentModal({
               <li key={a.name}>
                 <label
                   className={`flex cursor-pointer items-start gap-3 rounded border px-3 py-2 transition-colors ${
-                    selected === a.name
-                      ? "border-brand-500 bg-brand-900/30"
-                      : "border-surface-700 hover:bg-surface-800"
+                    selected === a.name ? "border-brand-500 bg-brand-900/30" : "border-surface-700 hover:bg-surface-800"
                   }`}
                 >
                   <input
@@ -245,9 +212,7 @@ export function SwitchAgentModal({
                   />
                   <span className="flex-1">
                     <span className="block text-sm font-mono">{a.name}</span>
-                    <span className="block text-xs text-text-muted">
-                      {a.description}
-                    </span>
+                    <span className="block text-xs text-text-muted">{a.description}</span>
                   </span>
                 </label>
               </li>
@@ -279,9 +244,7 @@ export function SwitchAgentModal({
             disabled={!selected || submitting || agents.length === 0}
             className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {submitting
-              ? "Switching..."
-              : `${rateLimited ? "Continue in" : "Switch to"} ${selected ?? ""}`}
+            {submitting ? "Switching..." : `${rateLimited ? "Continue in" : "Switch to"} ${selected ?? ""}`}
           </button>
         </div>
       </div>
@@ -297,13 +260,7 @@ interface PrefillInputs {
   rateLimited: boolean;
 }
 
-function buildHandoffPrefill({
-  from,
-  to,
-  recap,
-  unprocessed,
-  rateLimited,
-}: PrefillInputs): string {
+function buildHandoffPrefill({ from, to, recap, unprocessed, rateLimited }: PrefillInputs): string {
   const parts: string[] = [];
   parts.push(
     rateLimited

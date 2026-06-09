@@ -48,8 +48,7 @@ function PairedTerminal({
     clearCtrlRef,
     maxRetries,
   } = useTerminal(ready ? sessionId : null, wsPath, false);
-  const { isMobile, keyboardOpen, keyboardHeight, keyboardOcclusion } =
-    useMobileKeyboard();
+  const { isMobile, keyboardOpen, keyboardHeight, keyboardOcclusion } = useMobileKeyboard();
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
   const [bootError, setBootError] = useState(false);
@@ -153,9 +152,7 @@ function PairedTerminal({
   if (bootError) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-2 bg-surface-950 text-text-dim">
-        <span className="text-xs text-status-error">
-          Couldn't start the terminal.
-        </span>
+        <span className="text-xs text-status-error">Couldn't start the terminal.</span>
         <button
           onClick={() => setBootAttempt((n) => n + 1)}
           className="text-xs text-brand-500 cursor-pointer underline"
@@ -174,19 +171,13 @@ function PairedTerminal({
     );
   }
 
-  const appliedKeyboardPadding = fullViewport
-    ? keyboardOcclusion
-    : keyboardHeight;
+  const appliedKeyboardPadding = fullViewport ? keyboardOcclusion : keyboardHeight;
   const rootStyle = {
-    paddingBottom:
-      appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
+    paddingBottom: appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
   } as const;
 
   return (
-    <div
-      className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800"
-      style={rootStyle}
-    >
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden md:bg-surface-800" style={rootStyle}>
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-3 py-1 shrink-0">
           <span className="text-xs text-status-waiting">
@@ -194,38 +185,25 @@ function PairedTerminal({
           </span>
         </div>
       )}
-      {!state.connected &&
-        !state.reconnecting &&
-        state.retryCount >= maxRetries && (
-          <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
-            <span className="text-xs text-status-error">Disconnected</span>
-            <button
-              onClick={manualReconnect}
-              className="text-xs text-brand-500 cursor-pointer underline"
-            >
-              Retry
-            </button>
-          </div>
-        )}
+      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
+        <div className="bg-status-error/10 border-b border-status-error/30 px-3 py-1 flex items-center gap-2 shrink-0">
+          <span className="text-xs text-status-error">Disconnected</span>
+          <button onClick={manualReconnect} className="text-xs text-brand-500 cursor-pointer underline">
+            Retry
+          </button>
+        </div>
+      )}
       <div
         data-term="paired"
         className={`flex-1 overflow-hidden bg-surface-950 relative md:rounded-lg term-panel${termFocused ? " term-focused" : ""}`}
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >
-        <div
-          ref={containerRef}
-          className="absolute inset-0"
-          onPointerDown={activate}
-        />
+        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
 
-        {isMobile && state.isInScrollback && (
-          <BackToLiveButton onClick={exitScrollback} topOffset="top-2" />
-        )}
+        {isMobile && state.isInScrollback && <BackToLiveButton onClick={exitScrollback} topOffset="top-2" />}
 
-        {isMobile && state.connected && (
-          <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />
-        )}
+        {isMobile && state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
       </div>
       {isMobile && state.connected && (
         <MobileTerminalToolbar
@@ -262,9 +240,7 @@ export function PairedShellPane({
         <button
           onClick={() => setShellMode("host")}
           className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-            shellMode === "host"
-              ? "text-brand-500 bg-brand-600/10"
-              : "text-text-dim hover:text-text-muted"
+            shellMode === "host" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
           }`}
         >
           Host
@@ -273,9 +249,7 @@ export function PairedShellPane({
           <button
             onClick={() => setShellMode("container")}
             className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-              shellMode === "container"
-                ? "text-brand-500 bg-brand-600/10"
-                : "text-text-dim hover:text-text-muted"
+              shellMode === "container" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
             }`}
           >
             Container

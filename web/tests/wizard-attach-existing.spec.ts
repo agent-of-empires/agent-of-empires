@@ -7,32 +7,15 @@ import { Page } from "@playwright/test";
 // section hides since it's only honored for new-branch creates).
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "profiles",
-    "groups",
-    "devices",
-    "about",
-    "system/update-status",
-  ]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json:
-          path === "settings" ||
-          path === "about" ||
-          path === "system/update-status"
-            ? {}
-            : [],
+        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
       }),
     );
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: false, runtime: null } }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
@@ -81,13 +64,8 @@ async function mockApis(page: Page) {
 async function openSessionStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
-  const recent = page
-    .getByRole("button")
-    .filter({ hasText: "/tmp/example" })
-    .first();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   const next = page.getByRole("button", { name: "Next" });
@@ -104,24 +82,18 @@ async function expandAdvanced(page: Page) {
 }
 
 test.describe("Wizard attach-existing toggle (#969)", () => {
-  test("toggle is off by default; Base branch section visible", async ({
-    page,
-  }) => {
+  test("toggle is off by default; Base branch section visible", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
     await expandAdvanced(page);
-    const attachToggle = page
-      .locator("label", { hasText: "Attach to existing branch" })
-      .locator("role=switch");
+    const attachToggle = page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch");
     await expect(attachToggle).toBeVisible();
     await expect(attachToggle).toHaveAttribute("aria-checked", "false");
     // The base-branch picker (only meaningful for new-branch creates) is
     // its own "Base branch" disclosure inside Advanced.
-    await expect(
-      page.getByRole("button", { name: "Base branch" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
   });
 
   test("turning attach on hides the Base branch section", async ({ page }) => {
@@ -130,22 +102,15 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.goto("/");
     await openSessionStep(page);
     await expandAdvanced(page);
-    const attachToggle = page
-      .locator("label", { hasText: "Attach to existing branch" })
-      .locator("role=switch");
+    const attachToggle = page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch");
     await attachToggle.click();
     await expect(attachToggle).toHaveAttribute("aria-checked", "true");
-    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(
-      0,
-    );
+    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
-  test("submit with attach off sends create_new_branch=true", async ({
-    page,
-  }) => {
+  test("submit with attach off sends create_new_branch=true", async ({ page }) => {
     await mockApis(page);
-    let captured: { create_new_branch?: boolean; base_branch?: string } | null =
-      null;
+    let captured: { create_new_branch?: boolean; base_branch?: string } | null = null;
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") {
         captured = JSON.parse(r.request().postData() || "{}");
@@ -190,12 +155,9 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await expect.poll(() => captured?.create_new_branch).toBe(true);
   });
 
-  test("submit with attach on sends create_new_branch=false and no base_branch", async ({
-    page,
-  }) => {
+  test("submit with attach on sends create_new_branch=false and no base_branch", async ({ page }) => {
     await mockApis(page);
-    let captured: { create_new_branch?: boolean; base_branch?: string } | null =
-      null;
+    let captured: { create_new_branch?: boolean; base_branch?: string } | null = null;
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") {
         captured = JSON.parse(r.request().postData() || "{}");
@@ -231,13 +193,8 @@ test.describe("Wizard attach-existing toggle (#969)", () => {
     await page.goto("/");
     await openSessionStep(page);
     await expandAdvanced(page);
-    await page
-      .getByPlaceholder("Uses session title if empty")
-      .fill("feat/existing");
-    await page
-      .locator("label", { hasText: "Attach to existing branch" })
-      .locator("role=switch")
-      .click();
+    await page.getByPlaceholder("Uses session title if empty").fill("feat/existing");
+    await page.locator("label", { hasText: "Attach to existing branch" }).locator("role=switch").click();
     await page.getByRole("button", { name: /Next/ }).click();
     await page.getByRole("button", { name: /Next/ }).click();
     await page.getByRole("button", { name: /Launch session/ }).click();

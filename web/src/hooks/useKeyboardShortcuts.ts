@@ -18,10 +18,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const isInput =
-        !!target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable);
+        !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 
       const matched = matchShortcut(e, { mac: IS_MAC, isInput });
       if (!matched) return;

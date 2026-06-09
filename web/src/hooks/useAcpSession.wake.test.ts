@@ -88,16 +88,10 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
         }
         calls.push({ url, method, body });
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.endsWith("/archive") && method === "PATCH") {
-          return new Response(
-            JSON.stringify({ id: "sess-wake-PLACEHOLDER", archived_at: null }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ id: "sess-wake-PLACEHOLDER", archived_at: null }), { status: 200 });
         }
         if (url.endsWith("/snooze") && method === "PATCH") {
           return new Response(
@@ -122,10 +116,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("clears the archived flag via PATCH before enqueueing the prompt", async () => {
     const sessionId = "sess-wake-archive";
-    const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -133,9 +124,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     });
     await flushAsync();
 
-    const archiveCalls = calls.filter(
-      (c) => c.url.endsWith("/archive") && c.method === "PATCH",
-    );
+    const archiveCalls = calls.filter((c) => c.url.endsWith("/archive") && c.method === "PATCH");
     expect(archiveCalls).toHaveLength(1);
     expect(archiveCalls[0]!.body).toEqual({
       archived: false,
@@ -148,10 +137,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("clears the snoozed flag via PATCH before enqueueing the prompt", async () => {
     const sessionId = "sess-wake-snooze";
-    const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -159,9 +145,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     });
     await flushAsync();
 
-    const snoozeCalls = calls.filter(
-      (c) => c.url.endsWith("/snooze") && c.method === "PATCH",
-    );
+    const snoozeCalls = calls.filter((c) => c.url.endsWith("/snooze") && c.method === "PATCH");
     expect(snoozeCalls).toHaveLength(1);
     expect(snoozeCalls[0]!.body).toEqual({ minutes: null });
     expect(result.current.state.queuedPrompts).toHaveLength(1);
@@ -169,10 +153,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("does not call wake endpoints when the session is live", async () => {
     const sessionId = "sess-wake-live";
-    const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", null, null),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, null), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -181,9 +162,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     await flushAsync();
 
     const wakeCalls = calls.filter(
-      (c) =>
-        c.method === "PATCH" &&
-        (c.url.endsWith("/archive") || c.url.endsWith("/snooze")),
+      (c) => c.method === "PATCH" && (c.url.endsWith("/archive") || c.url.endsWith("/snooze")),
     );
     expect(wakeCalls).toHaveLength(0);
     expect(result.current.state.queuedPrompts).toHaveLength(1);
@@ -212,10 +191,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
         }
         calls.push({ url, method, body });
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.endsWith("/archive") && method === "PATCH") {
           return new Response("simulated failure", { status: 500 });
@@ -224,10 +200,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
       }),
     );
 
-    const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -256,10 +229,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
         }
         calls.push({ url, method, body });
         if (url.includes("/acp/replay")) {
-          return new Response(
-            JSON.stringify({ frames: [], lost: false, highest_seq: 0 }),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
         if (url.endsWith("/snooze") && method === "PATCH") {
           return new Response("simulated failure", { status: 500 });
@@ -268,10 +238,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
       }),
     );
 
-    const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -292,13 +259,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     // merge_user_action_diff on the server side.
     const sessionId = "sess-wake-both";
     const { result } = renderHook(
-      () =>
-        useAcpSession(
-          sessionId,
-          "absent",
-          "2026-01-01T00:00:00Z",
-          "2099-01-01T00:00:00Z",
-        ),
+      () => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
       { wrapper },
     );
     await flushAsync();
@@ -308,12 +269,8 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     });
     await flushAsync();
 
-    const archiveCalls = calls.filter(
-      (c) => c.url.endsWith("/archive") && c.method === "PATCH",
-    );
-    const snoozeCalls = calls.filter(
-      (c) => c.url.endsWith("/snooze") && c.method === "PATCH",
-    );
+    const archiveCalls = calls.filter((c) => c.url.endsWith("/archive") && c.method === "PATCH");
+    const snoozeCalls = calls.filter((c) => c.url.endsWith("/snooze") && c.method === "PATCH");
     expect(archiveCalls).toHaveLength(1);
     expect(snoozeCalls).toHaveLength(0);
   });

@@ -11,11 +11,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 test("structured view/files lists workspace files and honors the skip rules", async ({}, testInfo) => {
   const serve = await spawnAoeServe({
@@ -35,10 +31,7 @@ test("structured view/files lists workspace files and honors the skip rules", as
       writeFileSync(join(projectDir, "src", "nested", "deep.rs"), "// deep\n");
       // SKIP_DIRS entry: must NOT appear in the response.
       mkdirSync(join(projectDir, "node_modules", "junk"), { recursive: true });
-      writeFileSync(
-        join(projectDir, "node_modules", "junk", "ignore.js"),
-        "// ignore\n",
-      );
+      writeFileSync(join(projectDir, "node_modules", "junk", "ignore.js"), "// ignore\n");
       // Dot-file at top level: must NOT appear.
       writeFileSync(join(projectDir, ".secret"), "should be hidden\n");
     },
@@ -49,9 +42,7 @@ test("structured view/files lists workspace files and honors the skip rules", as
     expect(sessions.length).toBeGreaterThan(0);
     const sessionId = sessions[0]!.id;
 
-    const res = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/files`,
-    );
+    const res = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/files`);
     expect(res.ok).toBeTruthy();
     const body = (await res.json()) as { files: string[]; truncated: boolean };
     expect(Array.isArray(body.files)).toBe(true);
@@ -67,9 +58,7 @@ test("structured view/files lists workspace files and honors the skip rules", as
     expect(body.files).not.toContain(".secret");
 
     // Unknown session id returns 404.
-    const notFound = await fetch(
-      `${serve.baseUrl}/api/sessions/does-not-exist/acp/files`,
-    );
+    const notFound = await fetch(`${serve.baseUrl}/api/sessions/does-not-exist/acp/files`);
     expect(notFound.status).toBe(404);
   } finally {
     await serve.stop();

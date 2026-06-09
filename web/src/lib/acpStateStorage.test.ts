@@ -71,19 +71,14 @@ describe("getQueuedCount", () => {
   });
 
   it("treats an entry without a queuedPrompts array as 0", () => {
-    localStorage.setItem(
-      entryKey("a"),
-      JSON.stringify({ savedAt: Date.now(), state: { lastSeq: 0 } }),
-    );
+    localStorage.setItem(entryKey("a"), JSON.stringify({ savedAt: Date.now(), state: { lastSeq: 0 } }));
     expect(getQueuedCount("a")).toBe(0);
   });
 
   it("returns 0 when localStorage access throws", () => {
-    const spy = vi
-      .spyOn(Storage.prototype, "getItem")
-      .mockImplementation(() => {
-        throw new Error("blocked");
-      });
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
     expect(getQueuedCount("a")).toBe(0);
     spy.mockRestore();
   });
@@ -190,9 +185,7 @@ describe("subscribeAcpState storage events", () => {
     setQueueCount("a", 2);
     const cb = vi.fn();
     const unsub = subscribeAcpState(cb, new Set(["a"]));
-    window.dispatchEvent(
-      new StorageEvent("storage", { key: null, storageArea: localStorage }),
-    );
+    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
     expect(cb).toHaveBeenCalledTimes(1);
     expect(getQueuedCount("a")).toBe(0);
     unsub();

@@ -7,13 +7,8 @@ test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
 async function openSession(page: Page, handle: MockHandle) {
   await clickSidebarSession(page, "pinch-test");
-  await page
-    .locator(".xterm")
-    .first()
-    .waitFor({ state: "visible", timeout: 10_000 });
-  await expect
-    .poll(() => handle.wsMessages.length, { timeout: 5_000 })
-    .toBeGreaterThan(0);
+  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+  await expect.poll(() => handle.wsMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 }
 
 function sentText(handle: MockHandle, start: number) {
@@ -30,14 +25,10 @@ test.describe("Terminal IME input", () => {
     await page.locator(".xterm").first().locator("textarea").focus();
     await page.keyboard.type("a");
 
-    await expect
-      .poll(() => sentText(handle, start), { timeout: 5_000 })
-      .toContain("a");
+    await expect.poll(() => sentText(handle, start), { timeout: 5_000 }).toContain("a");
   });
 
-  test("macOS Chinese composition sends only the committed text", async ({
-    page,
-  }) => {
+  test("macOS Chinese composition sends only the committed text", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
@@ -92,15 +83,11 @@ test.describe("Terminal IME input", () => {
       );
     });
 
-    await expect
-      .poll(() => sentText(handle, start), { timeout: 5_000 })
-      .toContain("你好");
+    await expect.poll(() => sentText(handle, start), { timeout: 5_000 }).toContain("你好");
     expect(sentText(handle, start)).not.toContain("n");
   });
 
-  test("Shift+Enter sends bracketed paste with newline instead of bare CR", async ({
-    page,
-  }) => {
+  test("Shift+Enter sends bracketed paste with newline instead of bare CR", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
@@ -111,9 +98,7 @@ test.describe("Terminal IME input", () => {
     await page.keyboard.press("Enter");
     await page.keyboard.up("Shift");
 
-    await expect
-      .poll(() => sentText(handle, start), { timeout: 5_000 })
-      .toContain("\x1b[200~\n\x1b[201~");
+    await expect.poll(() => sentText(handle, start), { timeout: 5_000 }).toContain("\x1b[200~\n\x1b[201~");
     // xterm.js fires both keydown and keypress for Enter; the handler must
     // suppress both, otherwise a stray bare CR leaks through and submits.
     expect(sentText(handle, start)).not.toContain("\r");

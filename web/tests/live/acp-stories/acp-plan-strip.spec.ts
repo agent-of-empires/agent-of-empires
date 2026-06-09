@@ -10,15 +10,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-} from "../../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { waitForStructuredView, enableStructuredViewAndWait } from "../../helpers/acp";
 
 const PLAN_SCRIPT = {
   turns: [
@@ -67,9 +60,7 @@ base("plan session update renders in PlanStrip", async ({ page }, testInfo) => {
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });

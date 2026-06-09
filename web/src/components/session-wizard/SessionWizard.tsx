@@ -19,11 +19,7 @@ import { AgentStep } from "./steps/AgentStep";
 import { ReviewStep } from "./steps/ReviewStep";
 import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
-import {
-  commandMapsFromSettings,
-  EMPTY_COMMAND_MAPS,
-  type CommandMaps,
-} from "./commandMaps";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 
 /** localStorage key persisting the last tool the user picked in the
  *  wizard. Per-browser, scoped by tool registry key. Validated against
@@ -52,10 +48,7 @@ function buildInitialData(): WizardData {
   return { ...initialData, tool: loadLastUsedTool() };
 }
 
-function acpDefaultsFor(
-  session: Record<string, unknown> | undefined,
-  tool: string,
-): { model: string; effort: string } {
+function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
   const defaults = session?.acp_defaults as Record<string, unknown> | undefined;
   const entry = defaults?.[tool] as Record<string, unknown> | undefined;
   return {
@@ -140,8 +133,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // preview. Sourced from the settings the wizard already fetches on open
   // and on a profile switch, so the preview adds no extra request. See
   // #1911.
-  const [commandMaps, setCommandMaps] =
-    useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+  const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
 
   const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
@@ -152,9 +144,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    fetchDockerStatus().then((d) =>
-      dispatch({ type: "SET_DOCKER", available: d.available }),
-    );
+    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
 
     // Seed the wizard with the resolved (global + active profile) defaults so
     // single-profile users get yolo_mode_default and friends without ever
@@ -168,41 +158,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       // Prefer an explicit prefill profile; otherwise use the server's active
       // profile (`is_default: true`). If neither resolves, pass undefined so
       // `fetchSettings` loads the unresolved global config.
-      const effectiveProfile =
-        prefill?.profile || p.find((x) => x.is_default)?.name || "";
+      const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
       fetchSettings(effectiveProfile || undefined).then((s) => {
         if (!s) return;
         setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
         const session = s.session as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
-        if (img)
-          dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
+        if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const env = Array.isArray(sandbox?.environment)
-          ? (sandbox?.environment as unknown[]).filter(
-              (v): v is string => typeof v === "string",
-            )
+          ? (sandbox?.environment as unknown[]).filter((v): v is string => typeof v === "string")
           : [];
-        const defaultTool =
-          prefill?.tool || (session?.default_tool as string) || "";
-        const acpDefaults = acpDefaultsFor(
-          session,
-          defaultTool || state.data.tool,
-        );
+        const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
+        const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
         // sandboxEnabled/tool isn't silently overridden by profile defaults.
         // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
         // by going through the user-driven onChange path.
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
-          yoloMode:
-            prefill?.yoloMode ??
-            (session?.yolo_mode_default as boolean) ??
-            false,
-          sandboxEnabled:
-            prefill?.sandboxEnabled ??
-            (sandbox?.enabled_by_default as boolean) ??
-            false,
+          yoloMode: prefill?.yoloMode ?? (session?.yolo_mode_default as boolean) ?? false,
+          sandboxEnabled: prefill?.sandboxEnabled ?? (sandbox?.enabled_by_default as boolean) ?? false,
           tool: defaultTool,
           extraEnv: env,
           agentModel: acpDefaults.model,
@@ -239,12 +215,10 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   );
 
   const goNext = () => {
-    if (state.currentStep < steps.length - 1)
-      dispatch({ type: "SET_STEP", step: state.currentStep + 1 });
+    if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 });
   };
   const goBack = () => {
-    if (state.currentStep > 0)
-      dispatch({ type: "SET_STEP", step: state.currentStep - 1 });
+    if (state.currentStep > 0) dispatch({ type: "SET_STEP", step: state.currentStep - 1 });
   };
   const jumpTo = (stepId: StepId) => {
     const idx = steps.findIndex((s) => s.id === stepId);
@@ -254,10 +228,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
-    const selectedAgentAcpCapable = isAcpCapable(
-      d.tool,
-      state.agents.find((a) => a.name === d.tool)?.acp_capable,
-    );
+    const selectedAgentAcpCapable = isAcpCapable(d.tool, state.agents.find((a) => a.name === d.tool)?.acp_capable);
     // Scratch sessions: server provisions the working directory and
     // ignores `path`. Force-omit every worktree-related field so a
     // stale reducer state cannot make the server return 400 on the
@@ -268,25 +239,14 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       title: d.title || undefined,
       group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch:
-        !d.scratch && d.useWorktree
-          ? getSubmittedBranch(d.title, d.worktreeBranch)
-          : undefined,
+      worktree_branch: !d.scratch && d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
       create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
-        !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim()
-          ? d.baseBranch.trim()
-          : undefined,
+        !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,
       sandbox: d.sandboxEnabled,
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
-      extra_env:
-        d.sandboxEnabled && d.extraEnv.length > 0
-          ? d.extraEnv.filter(Boolean)
-          : undefined,
-      extra_repo_paths:
-        !d.scratch && d.extraRepoPaths.length > 0
-          ? d.extraRepoPaths
-          : undefined,
+      extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
+      extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
@@ -299,18 +259,9 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       // server re-resolves capability (see src/server/api/sessions.rs),
       // so a tampered request can't escalate structured view on for a
       // non-capable agent.
-      view:
-        selectedAgentAcpCapable && d.useStructuredView
-          ? "structured"
-          : "terminal",
-      agent_model:
-        selectedAgentAcpCapable && d.useStructuredView && d.agentModel
-          ? d.agentModel
-          : undefined,
-      agent_effort:
-        selectedAgentAcpCapable && d.useStructuredView && d.agentEffort
-          ? d.agentEffort
-          : undefined,
+      view: selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
+      agent_model: selectedAgentAcpCapable && d.useStructuredView && d.agentModel ? d.agentModel : undefined,
+      agent_effort: selectedAgentAcpCapable && d.useStructuredView && d.agentEffort ? d.agentEffort : undefined,
       scratch: d.scratch || undefined,
     };
     const result = await createSession(body);
@@ -330,20 +281,13 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   };
 
   useEffect(() => {
-    if (state.currentStep >= steps.length)
-      dispatch({ type: "SET_STEP", step: steps.length - 1 });
+    if (state.currentStep >= steps.length) dispatch({ type: "SET_STEP", step: steps.length - 1 });
   }, [steps.length, state.currentStep]);
 
   const renderStep = () => {
     switch (currentStepDef?.id) {
       case "project":
-        return (
-          <ProjectStep
-            data={state.data}
-            onChange={handleChange}
-            initialTab={prefill?.initialTab}
-          />
-        );
+        return <ProjectStep data={state.data} onChange={handleChange} initialTab={prefill?.initialTab} />;
       case "session":
         return <SessionStep data={state.data} onChange={handleChange} />;
       case "agent":
@@ -380,17 +324,14 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // Scratch selection satisfies the project-step "need a project" gate
   // without a path: the server provisions the working directory on
   // submit. Otherwise require a path as before.
-  const nextDisabled =
-    currentStepDef?.id === "project" && !state.data.scratch && !state.data.path;
+  const nextDisabled = currentStepDef?.id === "project" && !state.data.scratch && !state.data.path;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-xl flex flex-col max-h-[min(720px,90vh)]">
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700/20">
-          <h1 className="text-sm font-medium text-text-secondary">
-            New session
-          </h1>
+          <h1 className="text-sm font-medium text-text-secondary">New session</h1>
           <button
             onClick={onClose}
             className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"

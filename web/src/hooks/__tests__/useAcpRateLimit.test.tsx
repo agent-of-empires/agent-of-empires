@@ -4,11 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
 import { useRateLimitedForSessions } from "../useAcpRateLimit";
-import {
-  STORAGE_KEY_PREFIX,
-  clearQueueCount,
-  setRateLimit,
-} from "../../lib/acpStateStorage";
+import { STORAGE_KEY_PREFIX, clearQueueCount, setRateLimit } from "../../lib/acpStateStorage";
 import type { RateLimitInfo } from "../../lib/acpTypes";
 
 function entryKey(id: string): string {
@@ -21,11 +17,7 @@ function rl(resetsAt: string): RateLimitInfo {
 
 // Write a persisted acp-state entry shaped like useAcpSession's
 // persistState output, with the given rateLimit (or null).
-function writeEntry(
-  id: string,
-  rateLimit: RateLimitInfo | null,
-  savedAt = Date.now(),
-): void {
+function writeEntry(id: string, rateLimit: RateLimitInfo | null, savedAt = Date.now()): void {
   localStorage.setItem(
     entryKey(id),
     JSON.stringify({
@@ -65,9 +57,7 @@ describe("useRateLimitedForSessions", () => {
     writeEntry("a", rl("2026-06-01T13:00:00Z"));
     writeEntry("b", null);
     writeEntry("c", rl("2026-06-01T12:30:00Z"));
-    const { result } = renderHook(() =>
-      useRateLimitedForSessions(["a", "b", "c"]),
-    );
+    const { result } = renderHook(() => useRateLimitedForSessions(["a", "b", "c"]));
     expect(result.current).toEqual({
       count: 2,
       resetsAt: "2026-06-01T12:30:00Z",
@@ -156,9 +146,7 @@ describe("useRateLimitedForSessions", () => {
   });
 
   it("removes its storage listener on unmount", () => {
-    const { unmount, result } = renderHook(() =>
-      useRateLimitedForSessions(["a"]),
-    );
+    const { unmount, result } = renderHook(() => useRateLimitedForSessions(["a"]));
     unmount();
     act(() => {
       window.dispatchEvent(

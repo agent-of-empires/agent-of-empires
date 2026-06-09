@@ -4,10 +4,7 @@
 // flies. Locks the 8px threshold from drifting (#1419).
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("4px movement does not start a drag", async ({ page }) => {
   const handle = await installSidebarMocks(page, {
@@ -17,17 +14,12 @@ test("4px movement does not start a drag", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
 
-  const wrappers = page.locator(
-    "[aria-roledescription='Press and hold to reorder']",
-  );
+  const wrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
   await expect(wrappers).toHaveCount(3);
 
   // Snapshot the visible order via the inner link text.
   const beforeOrder = await wrappers.evaluateAll((els) =>
-    els.map(
-      (el) =>
-        el.querySelector("span.truncate[title]")?.getAttribute("title") ?? "",
-    ),
+    els.map((el) => el.querySelector("span.truncate[title]")?.getAttribute("title") ?? ""),
   );
   expect(beforeOrder).toEqual(["alpha", "beta", "gamma"]);
 
@@ -44,10 +36,7 @@ test("4px movement does not start a drag", async ({ page }) => {
   await page.waitForTimeout(200);
 
   const afterOrder = await wrappers.evaluateAll((els) =>
-    els.map(
-      (el) =>
-        el.querySelector("span.truncate[title]")?.getAttribute("title") ?? "",
-    ),
+    els.map((el) => el.querySelector("span.truncate[title]")?.getAttribute("title") ?? ""),
   );
   expect(afterOrder).toEqual(beforeOrder);
   expect(handle.puts).toEqual([]);

@@ -12,11 +12,7 @@
 // going through the prompt path.
 
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 test("view switch round-trips between tmux and structured view", async ({}, testInfo) => {
   const serve = await spawnAoeServe({
@@ -34,10 +30,7 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     expect(sessionsBefore[0]!.view === "structured").toBeFalsy();
 
     // tmux -> structured view
-    const enableRes = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-      { method: "POST" },
-    );
+    const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
     expect(enableRes.ok).toBeTruthy();
     const enableBody = (await enableRes.json()) as {
       session_id: string;
@@ -47,17 +40,11 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     expect(enableBody.view === "structured").toBe(true);
 
     const sessionsAfterEnable = await listSessions(serve.baseUrl);
-    expect(
-      sessionsAfterEnable.find((s) => s.id === sessionId)!.view ===
-        "structured",
-    ).toBe(true);
+    expect(sessionsAfterEnable.find((s) => s.id === sessionId)!.view === "structured").toBe(true);
 
     // Idempotent: a second enable returns the same shape without an
     // error and without re-spawning anything destructive.
-    const enableAgain = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-      { method: "POST" },
-    );
+    const enableAgain = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
     expect(enableAgain.ok).toBeTruthy();
     const enableAgainBody = (await enableAgain.json()) as {
       view?: "structured" | "terminal";
@@ -65,10 +52,7 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     expect(enableAgainBody.view === "structured").toBe(true);
 
     // structured view -> tmux
-    const disableRes = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`,
-      { method: "POST" },
-    );
+    const disableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`, { method: "POST" });
     expect(disableRes.ok).toBeTruthy();
     const disableBody = (await disableRes.json()) as {
       session_id: string;
@@ -77,16 +61,10 @@ test("view switch round-trips between tmux and structured view", async ({}, test
     expect(disableBody.view === "structured").toBe(false);
 
     const sessionsAfterDisable = await listSessions(serve.baseUrl);
-    expect(
-      sessionsAfterDisable.find((s) => s.id === sessionId)!.view ===
-        "structured",
-    ).toBe(false);
+    expect(sessionsAfterDisable.find((s) => s.id === sessionId)!.view === "structured").toBe(false);
 
     // Idempotent in the other direction too.
-    const disableAgain = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`,
-      { method: "POST" },
-    );
+    const disableAgain = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/disable`, { method: "POST" });
     expect(disableAgain.ok).toBeTruthy();
     const disableAgainBody = (await disableAgain.json()) as {
       view?: "structured" | "terminal";

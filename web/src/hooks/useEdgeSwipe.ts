@@ -18,12 +18,7 @@ const MOBILE_BREAKPOINT = 768;
  * viewport and moves horizontally past a threshold. Used to open the sidebar
  * (left edge) and the diff/right panel (right edge) on mobile.
  */
-export function useEdgeSwipe({
-  edge,
-  enabled,
-  onSwipe,
-  blurOnSwipe = false,
-}: EdgeSwipeOptions) {
+export function useEdgeSwipe({ edge, enabled, onSwipe, blurOnSwipe = false }: EdgeSwipeOptions) {
   useEffect(() => {
     if (!enabled) return;
 
@@ -32,14 +27,10 @@ export function useEdgeSwipe({
     let tracking = false;
 
     const onTouchStart = (e: TouchEvent) => {
-      if (window.innerWidth >= MOBILE_BREAKPOINT || e.touches.length !== 1)
-        return;
+      if (window.innerWidth >= MOBILE_BREAKPOINT || e.touches.length !== 1) return;
       const t = e.touches[0];
       if (!t) return;
-      const inEdge =
-        edge === "left"
-          ? t.clientX <= EDGE_PX
-          : t.clientX >= window.innerWidth - EDGE_PX;
+      const inEdge = edge === "left" ? t.clientX <= EDGE_PX : t.clientX >= window.innerWidth - EDGE_PX;
       if (!inEdge) return;
       tracking = true;
       startX = t.clientX;
@@ -58,10 +49,7 @@ export function useEdgeSwipe({
           document.activeElement.blur();
         }
         onSwipe();
-      } else if (
-        Math.abs(dy) > Math.abs(dx) &&
-        Math.abs(dy) > VERTICAL_CANCEL_PX
-      ) {
+      } else if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > VERTICAL_CANCEL_PX) {
         tracking = false;
       }
     };

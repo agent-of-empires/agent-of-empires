@@ -40,9 +40,7 @@ describe("TelemetrySettings contract", () => {
       expect(fetchTelemetryStatus).toHaveBeenCalled();
     });
 
-    const toggle = container.querySelector(
-      "button[role=switch]",
-    ) as HTMLButtonElement;
+    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
     fireEvent.click(toggle);
     expect(setTelemetryConsent).toHaveBeenCalledWith(true);
   });
@@ -51,29 +49,21 @@ describe("TelemetrySettings contract", () => {
     fetchTelemetryStatus.mockResolvedValue(status({ enabled: true }));
     const { container } = render(<TelemetrySettings />);
     await waitFor(() => {
-      const t = container.querySelector(
-        "button[role=switch]",
-      ) as HTMLButtonElement | null;
+      const t = container.querySelector("button[role=switch]") as HTMLButtonElement | null;
       expect(t?.getAttribute("aria-checked")).toBe("true");
     });
 
-    const toggle = container.querySelector(
-      "button[role=switch]",
-    ) as HTMLButtonElement;
+    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
     fireEvent.click(toggle);
     expect(setTelemetryConsent).toHaveBeenCalledWith(false);
   });
 
   it("DO_NOT_TRACK forces the toggle off and shows a note; clicking is a no-op", async () => {
-    fetchTelemetryStatus.mockResolvedValue(
-      status({ enabled: true, do_not_track: true }),
-    );
+    fetchTelemetryStatus.mockResolvedValue(status({ enabled: true, do_not_track: true }));
     const { container, findByText } = render(<TelemetrySettings />);
     await findByText(/DO_NOT_TRACK is set/i);
 
-    const toggle = container.querySelector(
-      "button[role=switch]",
-    ) as HTMLButtonElement;
+    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
     // Forced off despite enabled=true in config.
     expect(toggle.getAttribute("aria-checked")).toBe("false");
     fireEvent.click(toggle);

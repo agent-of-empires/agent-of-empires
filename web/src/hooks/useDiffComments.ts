@@ -1,14 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  DiffComment,
-  DiffCommentDraft,
-  DiffCommentsStorageV1,
-} from "../components/diff/comments/types";
-import {
-  EMPTY_STORAGE,
-  loadComments,
-  saveComments,
-} from "../components/diff/comments/storage";
+import type { DiffComment, DiffCommentDraft, DiffCommentsStorageV1 } from "../components/diff/comments/types";
+import { EMPTY_STORAGE, loadComments, saveComments } from "../components/diff/comments/storage";
 
 export interface UseDiffCommentsResult {
   comments: DiffComment[];
@@ -31,9 +23,7 @@ export interface UseDiffCommentsResult {
  *  (when `clearAfterSend` is true). State only switches when the
  *  session id changes; if the active session changes we reload from
  *  storage so each session sees its own list. See #928. */
-export function useDiffComments(
-  sessionId: string | null,
-): UseDiffCommentsResult {
+export function useDiffComments(sessionId: string | null): UseDiffCommentsResult {
   const [state, setState] = useState<DiffCommentsStorageV1>(() =>
     sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE },
   );
@@ -100,9 +90,7 @@ export function useDiffComments(
       const ts = new Date().toISOString();
       setState((s) => ({
         ...s,
-        comments: s.comments.map((c) =>
-          c.id === id ? { ...c, body, updatedAt: ts } : c,
-        ),
+        comments: s.comments.map((c) => (c.id === id ? { ...c, body, updatedAt: ts } : c)),
       }));
       bumpSave();
     },
@@ -164,16 +152,7 @@ export function useDiffComments(
       deleteComment,
       clearComments,
     }),
-    [
-      state,
-      addComment,
-      updateComment,
-      deleteComment,
-      clearComments,
-      setClearAfterSend,
-      setIntroDraft,
-      setOutroDraft,
-    ],
+    [state, addComment, updateComment, deleteComment, clearComments, setClearAfterSend, setIntroDraft, setOutroDraft],
   );
 }
 
@@ -181,7 +160,5 @@ function cryptoRandomId(): string {
   const c = globalThis.crypto;
   if (c && typeof c.randomUUID === "function") return c.randomUUID();
   // Fallback for environments without crypto.randomUUID (older Safari, jsdom).
-  return `dc_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
+  return `dc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }

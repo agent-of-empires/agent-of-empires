@@ -33,13 +33,9 @@ describe("SnoozeModal preset buttons", () => {
 
   it("clicks fire onPick with the preset minutes", () => {
     const onPick = vi.fn();
-    render(
-      <SnoozeModal title="my session" onCancel={() => {}} onPick={onPick} />,
-    );
+    render(<SnoozeModal title="my session" onCancel={() => {}} onPick={onPick} />);
     for (const preset of SNOOZE_PRESETS) {
-      fireEvent.click(
-        screen.getByTestId(`snooze-modal-preset-${preset.minutes}`),
-      );
+      fireEvent.click(screen.getByTestId(`snooze-modal-preset-${preset.minutes}`));
     }
     expect(onPick).toHaveBeenCalledTimes(SNOOZE_PRESETS.length);
     for (let i = 0; i < SNOOZE_PRESETS.length; i++) {
@@ -62,9 +58,7 @@ describe("SnoozeModal dismissal", () => {
     // Modal's useEffect attaches keydown to document, so the event
     // needs to bubble there. document.body is the typical bubble
     // source under jsdom.
-    document.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-    );
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
@@ -238,9 +232,7 @@ describe("makeOptimisticSnoozedUntil", () => {
 
   it("returns now + minutes as an RFC3339 string", () => {
     expect(makeOptimisticSnoozedUntil(60)).toBe("2026-06-01T13:00:00.000Z");
-    expect(makeOptimisticSnoozedUntil(24 * 60)).toBe(
-      "2026-06-02T12:00:00.000Z",
-    );
+    expect(makeOptimisticSnoozedUntil(24 * 60)).toBe("2026-06-02T12:00:00.000Z");
   });
 });
 

@@ -37,30 +37,16 @@ export function LoginPage({ onSuccess }: Props) {
   return (
     <div className="h-dvh flex items-center justify-center bg-surface-900 p-4 safe-area-inset">
       <div className="w-full max-w-sm animate-slide-up">
-        <form
-          onSubmit={handleSubmit}
-          className="bg-surface-800 border border-surface-700/40 rounded-xl p-8"
-        >
+        <form onSubmit={handleSubmit} className="bg-surface-800 border border-surface-700/40 rounded-xl p-8">
           {/* Logo */}
           <div className="flex items-center justify-center gap-2 mb-8">
-            <img
-              src="/icon-192.png"
-              alt=""
-              width="28"
-              height="28"
-              className="rounded-sm"
-            />
-            <span className="font-mono text-lg text-text-primary tracking-tight">
-              aoe
-            </span>
+            <img src="/icon-192.png" alt="" width="28" height="28" className="rounded-sm" />
+            <span className="font-mono text-lg text-text-primary tracking-tight">aoe</span>
           </div>
 
           {/* Passphrase input */}
           <div className="mb-4">
-            <label
-              htmlFor="passphrase"
-              className="block text-xs text-text-muted mb-2 font-medium"
-            >
+            <label htmlFor="passphrase" className="block text-xs text-text-muted mb-2 font-medium">
               Passphrase
             </label>
             <div className="relative">
@@ -80,9 +66,7 @@ export function LoginPage({ onSuccess }: Props) {
                 onClick={() => setShowPassphrase((s) => !s)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center text-text-dim hover:text-text-secondary transition-colors cursor-pointer rounded"
                 tabIndex={-1}
-                aria-label={
-                  showPassphrase ? "Hide passphrase" : "Show passphrase"
-                }
+                aria-label={showPassphrase ? "Hide passphrase" : "Show passphrase"}
               >
                 {showPassphrase ? (
                   <svg
@@ -130,19 +114,8 @@ export function LoginPage({ onSuccess }: Props) {
           >
             {loading ? (
               <>
-                <svg
-                  className="animate-spin h-4 w-4"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
+                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path
                     className="opacity-75"
                     fill="currentColor"

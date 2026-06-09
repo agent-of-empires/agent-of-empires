@@ -134,10 +134,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.worktreeBranch = slugifyBranch(String(action.value));
       }
       if (action.field === "worktreeBranch") {
-        const override = applyBranchOverride(
-          String(newData.title),
-          String(action.value),
-        );
+        const override = applyBranchOverride(String(newData.title), String(action.value));
         newData.worktreeBranch = override.worktreeBranch;
         newData.worktreeBranchDirty = override.worktreeBranchDirty;
       }
@@ -151,12 +148,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.useWorktree = false;
       }
       if (
-        (action.field === "path" &&
-          typeof action.value === "string" &&
-          action.value.length > 0) ||
-        (action.field === "extraRepoPaths" &&
-          Array.isArray(action.value) &&
-          action.value.length > 0)
+        (action.field === "path" && typeof action.value === "string" && action.value.length > 0) ||
+        (action.field === "extraRepoPaths" && Array.isArray(action.value) && action.value.length > 0)
       ) {
         newData.scratch = false;
       }
@@ -169,16 +162,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (
-        [
-          "yoloMode",
-          "sandboxEnabled",
-          "tool",
-          "extraEnv",
-          "agentModel",
-          "agentEffort",
-        ].includes(action.field)
-      ) {
+      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "agentModel", "agentEffort"].includes(action.field)) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };

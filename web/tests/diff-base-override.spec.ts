@@ -25,9 +25,7 @@ const DIFF_FILES_RESPONSE = {
 
 async function setupSession(page: Page) {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions/*/diff/files", (r) =>
-    r.fulfill({ json: DIFF_FILES_RESPONSE }),
-  );
+  await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
   await page.route("**/api/git/branches**", (r) =>
     r.fulfill({
       json: [
@@ -42,9 +40,7 @@ async function setupSession(page: Page) {
 test.use({ viewport: { width: 1280, height: 720 } });
 
 test.describe("Diff base override (#970)", () => {
-  test("clicking the chip opens a typeahead populated from /api/git/branches", async ({
-    page,
-  }) => {
+  test("clicking the chip opens a typeahead populated from /api/git/branches", async ({ page }) => {
     await setupSession(page);
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
@@ -56,14 +52,10 @@ test.describe("Diff base override (#970)", () => {
     await chip.click();
     await expect(page.getByPlaceholder("Search branches...")).toBeVisible();
     await expect(page.getByRole("option", { name: /^main/ })).toBeVisible();
-    await expect(
-      page.getByRole("option", { name: /upstream\/main/ }),
-    ).toBeVisible();
+    await expect(page.getByRole("option", { name: /upstream\/main/ })).toBeVisible();
   });
 
-  test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({
-    page,
-  }) => {
+  test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({ page }) => {
     await setupSession(page);
     let patched: { base_branch?: string | null } | null = null;
     let getCount = 0;

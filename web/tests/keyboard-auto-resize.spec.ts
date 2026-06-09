@@ -48,21 +48,13 @@ function lastResize(handle: MockHandle): ResizeMsg | undefined {
 
 // Override visualViewport.height (and optionally innerHeight) to simulate
 // a keyboard event. Matches the helper in mobile-keyboard.spec.ts.
-async function setKeyboard(
-  page: Page,
-  opts: { open: boolean; px?: number; pwa?: boolean },
-) {
+async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?: boolean }) {
   await page.evaluate(
     ({ open, px, pwa }) => {
       const vv = window.visualViewport;
       if (!vv) return;
-      const fullH =
-        (window as unknown as { __fullH?: number }).__fullH ??
-        window.innerHeight;
-      (window as unknown as { __fullH?: number }).__fullH = Math.max(
-        fullH,
-        window.innerHeight,
-      );
+      const fullH = (window as unknown as { __fullH?: number }).__fullH ?? window.innerHeight;
+      (window as unknown as { __fullH?: number }).__fullH = Math.max(fullH, window.innerHeight);
 
       if (open) {
         const newVvH = fullH - px!;
@@ -80,10 +72,7 @@ async function setKeyboard(
         const proto = Object.getPrototypeOf(vv);
         const orig = Object.getOwnPropertyDescriptor(proto, "height");
         if (orig) Object.defineProperty(vv, "height", orig);
-        const origInner = Object.getOwnPropertyDescriptor(
-          Window.prototype,
-          "innerHeight",
-        );
+        const origInner = Object.getOwnPropertyDescriptor(Window.prototype, "innerHeight");
         if (origInner) Object.defineProperty(window, "innerHeight", origInner);
       }
       vv.dispatchEvent(new Event("resize"));
@@ -95,18 +84,12 @@ async function setKeyboard(
 async function openSession(page: Page, handle: MockHandle) {
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page
-    .locator('[data-term="agent"] .xterm')
-    .waitFor({ state: "visible", timeout: 10_000 });
-  await expect
-    .poll(() => handle.wsMessages.length, { timeout: 5_000 })
-    .toBeGreaterThan(0);
+  await page.locator('[data-term="agent"] .xterm').waitFor({ state: "visible", timeout: 10_000 });
+  await expect.poll(() => handle.wsMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 }
 
 test.describe("Keyboard auto-resize (#1432)", () => {
-  test("Safari mode: opening the keyboard shrinks the terminal, closing grows it back", async ({
-    page,
-  }) => {
+  test("Safari mode: opening the keyboard shrinks the terminal, closing grows it back", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
@@ -130,10 +113,9 @@ test.describe("Keyboard auto-resize (#1432)", () => {
       `opening the keyboard should emit 1 resize (<=2 tolerated), got ${openDelta}`,
     ).toBeGreaterThanOrEqual(1);
     expect(openDelta).toBeLessThanOrEqual(2);
-    expect(
-      afterOpenRows,
-      "terminal should have fewer rows while the keyboard occludes the viewport",
-    ).toBeLessThan(baselineRows);
+    expect(afterOpenRows, "terminal should have fewer rows while the keyboard occludes the viewport").toBeLessThan(
+      baselineRows,
+    );
 
     // Close keyboard: occlusion releases to 0, the terminal grows back.
     await setKeyboard(page, { open: false, pwa: false });
@@ -147,10 +129,9 @@ test.describe("Keyboard auto-resize (#1432)", () => {
       `closing the keyboard should emit 1 resize (<=2 tolerated), got ${closeDelta}`,
     ).toBeGreaterThanOrEqual(1);
     expect(closeDelta).toBeLessThanOrEqual(2);
-    expect(
-      afterCloseRows,
-      "terminal should grow back to roughly the no-keyboard row count",
-    ).toBeGreaterThan(afterOpenRows);
+    expect(afterCloseRows, "terminal should grow back to roughly the no-keyboard row count").toBeGreaterThan(
+      afterOpenRows,
+    );
   });
 
   test("PWA mode: innerHeight shrinks with the keyboard but occlusion padding still resizes the terminal", async ({
@@ -183,18 +164,14 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(afterOpenRows).toBeLessThan(baselineRows);
   });
 
-  test("App root is pinned to stableViewportHeight on mobile", async ({
-    page,
-  }) => {
+  test("App root is pinned to stableViewportHeight on mobile", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
     await page.waitForTimeout(1000);
 
     const before = await page.evaluate(() => {
-      const root = document.querySelector<HTMLElement>(
-        "div.h-dvh.flex.flex-col",
-      );
+      const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
       return {
         innerHeight: window.innerHeight,
         rootInlineHeight: root?.style?.height ?? "",
@@ -205,14 +182,10 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     // and App.tsx applies it as inline pixel height. Without this, 100dvh
     // shrinks on iOS PWA and the terminal pane shrinks with it.
     expect(before.rootInlineHeight).toMatch(/^\d+px$/);
-    expect(parseInt(before.rootInlineHeight)).toBeGreaterThanOrEqual(
-      before.innerHeight - 5,
-    );
+    expect(parseInt(before.rootInlineHeight)).toBeGreaterThanOrEqual(before.innerHeight - 5);
   });
 
-  test("no persisted reservation: a closed keyboard on load starts full-size", async ({
-    page,
-  }) => {
+  test("no persisted reservation: a closed keyboard on load starts full-size", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     // Seed the now-removed reservation key. It must be ignored: the pane
     // should not start shrunk just because a prior session latched a value.

@@ -20,10 +20,7 @@ import {
  * Mirrors the inline wiring TerminalView uses for the "agent" target; the
  * structured view Composer uses it for "composer".
  */
-export function useFocusTerminalTarget(
-  target: TerminalFocusTarget,
-  ref: React.RefObject<HTMLElement | null>,
-): void {
+export function useFocusTerminalTarget(target: TerminalFocusTarget, ref: React.RefObject<HTMLElement | null>): void {
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;

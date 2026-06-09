@@ -78,8 +78,7 @@ function FlatList({
         const parts = file.path.split("/");
         const fileName = parts.pop() || file.path;
         const dirPath = parts.length > 0 ? parts.join("/") + "/" : "";
-        const isSelected =
-          file.path === selectedPath && file.repo_name === selectedRepoName;
+        const isSelected = file.path === selectedPath && file.repo_name === selectedRepoName;
         const isFocused = i === focusedIndex;
 
         return (
@@ -90,9 +89,7 @@ function FlatList({
             onClick={() => onSelectFile(file.path, file.repo_name)}
             onMouseEnter={() => onFocusIndex(i)}
             className={`w-full text-left px-3 py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${
-              isSelected
-                ? "bg-surface-850 text-text-primary"
-                : "text-text-secondary hover:bg-surface-800/50"
+              isSelected ? "bg-surface-850 text-text-primary" : "text-text-secondary hover:bg-surface-800/50"
             } ${isFocused ? "outline outline-1 outline-brand-600/60 -outline-offset-1" : ""}`}
           >
             <span
@@ -101,20 +98,12 @@ function FlatList({
               {STATUS_LETTERS[file.status] ?? "?"}
             </span>
             <span className="truncate min-w-0 flex-1">
-              {dirPath && (
-                <span className="font-mono text-[11px] text-text-dim">
-                  {dirPath}
-                </span>
-              )}
+              {dirPath && <span className="font-mono text-[11px] text-text-dim">{dirPath}</span>}
               <span className="font-mono text-[12px]">{fileName}</span>
             </span>
             <span className="shrink-0 font-mono text-[11px] flex items-center gap-1">
-              {file.additions > 0 && (
-                <span className="text-status-running">+{file.additions}</span>
-              )}
-              {file.deletions > 0 && (
-                <span className="text-status-error">-{file.deletions}</span>
-              )}
+              {file.additions > 0 && <span className="text-status-running">+{file.additions}</span>}
+              {file.deletions > 0 && <span className="text-status-error">-{file.deletions}</span>}
             </span>
           </button>
         );
@@ -154,9 +143,7 @@ function TreeView({
     <>
       {nodes.map((node, i) => {
         const isFocused = i === focusedIndex;
-        const focusRing = isFocused
-          ? "outline outline-1 outline-brand-600/60 -outline-offset-1"
-          : "";
+        const focusRing = isFocused ? "outline outline-1 outline-brand-600/60 -outline-offset-1" : "";
 
         if (node.kind === "dir") {
           return (
@@ -182,19 +169,11 @@ function TreeView({
               >
                 <path d="M4 6l4 4 4-4" />
               </svg>
-              <span className="font-mono text-[12px] truncate flex-1">
-                {node.name}
-              </span>
-              <span className="shrink-0 font-mono text-[10px] text-text-dim">
-                {node.fileCount}
-              </span>
+              <span className="font-mono text-[12px] truncate flex-1">{node.name}</span>
+              <span className="shrink-0 font-mono text-[10px] text-text-dim">{node.fileCount}</span>
               <span className="shrink-0 font-mono text-[11px] flex items-center gap-1">
-                {node.additions > 0 && (
-                  <span className="text-status-running">+{node.additions}</span>
-                )}
-                {node.deletions > 0 && (
-                  <span className="text-status-error">-{node.deletions}</span>
-                )}
+                {node.additions > 0 && <span className="text-status-running">+{node.additions}</span>}
+                {node.deletions > 0 && <span className="text-status-error">-{node.deletions}</span>}
               </span>
             </button>
           );
@@ -202,22 +181,17 @@ function TreeView({
 
         const file = node.file;
         const fileName = file.path.split("/").pop() || file.path;
-        const isSelected =
-          file.path === selectedPath && file.repo_name === selectedRepoName;
+        const isSelected = file.path === selectedPath && file.repo_name === selectedRepoName;
 
         return (
           <button
             key={`${file.repo_name ?? ""}::${file.path}`}
             data-index={i}
             data-path={file.path}
-            onClick={() =>
-              onSelectFile(file.path, repoNameForSelect ?? file.repo_name)
-            }
+            onClick={() => onSelectFile(file.path, repoNameForSelect ?? file.repo_name)}
             onMouseEnter={() => onFocusIndex(i)}
             className={`w-full text-left py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${
-              isSelected
-                ? "bg-surface-850 text-text-primary"
-                : "text-text-secondary hover:bg-surface-800/50"
+              isSelected ? "bg-surface-850 text-text-primary" : "text-text-secondary hover:bg-surface-800/50"
             } ${focusRing}`}
             style={{
               paddingLeft: `${node.depth * 16 + 12 + indentOffset}px`,
@@ -229,16 +203,10 @@ function TreeView({
             >
               {STATUS_LETTERS[file.status] ?? "?"}
             </span>
-            <span className="font-mono text-[12px] truncate flex-1">
-              {fileName}
-            </span>
+            <span className="font-mono text-[12px] truncate flex-1">{fileName}</span>
             <span className="shrink-0 font-mono text-[11px] flex items-center gap-1">
-              {file.additions > 0 && (
-                <span className="text-status-running">+{file.additions}</span>
-              )}
-              {file.deletions > 0 && (
-                <span className="text-status-error">-{file.deletions}</span>
-              )}
+              {file.additions > 0 && <span className="text-status-running">+{file.additions}</span>}
+              {file.deletions > 0 && <span className="text-status-error">-{file.deletions}</span>}
             </span>
           </button>
         );
@@ -248,9 +216,7 @@ function TreeView({
 }
 
 function scrollToIndex(container: HTMLDivElement | null, index: number) {
-  container
-    ?.querySelector(`[data-index="${index}"]`)
-    ?.scrollIntoView({ block: "nearest" });
+  container?.querySelector(`[data-index="${index}"]`)?.scrollIntoView({ block: "nearest" });
 }
 
 export function DiffFileList({
@@ -271,9 +237,7 @@ export function DiffFileList({
   // single-repo sessions get one entry and we don't show a per-repo
   // header at all. See #1047.
   const singleBaseBranch = perRepoBases[0]?.base_branch ?? "main";
-  const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(
-    () => new Set(),
-  );
+  const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(() => new Set());
   const toggleRepo = useCallback((name: string) => {
     setCollapsedRepos((prev) => {
       const next = new Set(prev);
@@ -294,19 +258,14 @@ export function DiffFileList({
   }, [files]);
   const { settings, update } = useWebSettings();
   const viewMode = settings.diffViewMode;
-  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(
-    () => new Set(settings.collapsedDiffDirs),
-  );
+  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(() => new Set(settings.collapsedDiffDirs));
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const listRef = useRef<HTMLDivElement>(null);
 
   const totalAdditions = files.reduce((sum, f) => sum + f.additions, 0);
   const totalDeletions = files.reduce((sum, f) => sum + f.deletions, 0);
 
-  const treeNodes = useMemo(
-    () => buildDiffTree(files, collapsedDirs),
-    [files, collapsedDirs],
-  );
+  const treeNodes = useMemo(() => buildDiffTree(files, collapsedDirs), [files, collapsedDirs]);
 
   // Persist collapsed dirs to settings whenever they change
   useEffect(() => {
@@ -362,8 +321,7 @@ export function DiffFileList({
           break;
         }
         case "ArrowRight": {
-          const rNode =
-            viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
+          const rNode = viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
           if (rNode?.kind === "dir" && rNode.collapsed) {
             e.preventDefault();
             toggleDir(rNode.path);
@@ -371,8 +329,7 @@ export function DiffFileList({
           break;
         }
         case "ArrowLeft": {
-          const lNode =
-            viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
+          const lNode = viewMode === "tree" ? treeNodes[clampedFocusedIndex] : undefined;
           if (lNode?.kind === "dir" && !lNode.collapsed) {
             e.preventDefault();
             toggleDir(lNode.path);
@@ -398,15 +355,7 @@ export function DiffFileList({
         }
       }
     },
-    [
-      itemCount,
-      clampedFocusedIndex,
-      viewMode,
-      treeNodes,
-      files,
-      toggleDir,
-      onSelectFile,
-    ],
+    [itemCount, clampedFocusedIndex, viewMode, treeNodes, files, toggleDir, onSelectFile],
   );
 
   const [pathMenu, setPathMenu] = useState<PathMenuState | null>(null);
@@ -420,17 +369,12 @@ export function DiffFileList({
   const closePathMenu = useCallback(() => setPathMenu(null), []);
 
   return (
-    <div
-      className="flex flex-col h-full bg-surface-900 overflow-hidden"
-      onContextMenu={handleContextMenu}
-    >
+    <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
       <CopyPathContextMenu menu={pathMenu} onClose={closePathMenu} />
       {/* Header */}
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">
-            Changes
-          </span>
+          <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
           {isMultiRepo ? (
             <span className="font-mono text-[10px] px-1.5 py-px rounded bg-surface-800 text-text-muted">
               {perRepoBases.length} repos
@@ -466,50 +410,27 @@ export function DiffFileList({
             <button
               onClick={toggleViewMode}
               className="ml-auto shrink-0 p-1 rounded text-text-dim hover:text-text-muted hover:bg-surface-800/50 transition-colors cursor-pointer"
-              title={
-                viewMode === "flat"
-                  ? "Switch to tree view"
-                  : "Switch to flat list"
-              }
+              title={viewMode === "flat" ? "Switch to tree view" : "Switch to flat list"}
             >
               {viewMode === "flat" ? (
                 // Tree icon
-                <svg
-                  className="w-3.5 h-3.5"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                   <path d="M2 3h12M5 7h9M5 11h9M2 7l1.5 1L2 9M2 11l1.5 1L2 13" />
                 </svg>
               ) : (
                 // List icon
-                <svg
-                  className="w-3.5 h-3.5"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                   <path d="M2 3h12M2 7h12M2 11h12" />
                 </svg>
               )}
             </button>
           )}
         </div>
-        {warning && (
-          <p className="text-[11px] text-status-waiting mt-1">{warning}</p>
-        )}
+        {warning && <p className="text-[11px] text-status-waiting mt-1">{warning}</p>}
       </div>
 
       {/* File list */}
-      <div
-        ref={listRef}
-        className="flex-1 overflow-y-auto"
-        tabIndex={0}
-        onKeyDown={handleKeyDown}
-      >
+      <div ref={listRef} className="flex-1 overflow-y-auto" tabIndex={0} onKeyDown={handleKeyDown}>
         {loading && files.length === 0 ? (
           <div className="flex items-center justify-center h-full text-text-dim">
             <span className="text-xs">Loading files...</span>
@@ -596,10 +517,7 @@ function MultiRepoGroups({
         const adds = repoFiles.reduce((s, f) => s + f.additions, 0);
         const dels = repoFiles.reduce((s, f) => s + f.deletions, 0);
         return (
-          <div
-            key={name || "_default"}
-            className="border-b border-surface-700/20 last:border-b-0"
-          >
+          <div key={name || "_default"} className="border-b border-surface-700/20 last:border-b-0">
             <button
               type="button"
               onClick={() => onToggleRepo(name)}
@@ -615,26 +533,16 @@ function MultiRepoGroups({
               >
                 <path d="M4 6l4 4 4-4" />
               </svg>
-              <span className="font-mono text-[12px] truncate flex-1">
-                {repo.repo_name ?? "(default)"}
-              </span>
-              <span className="font-mono text-[10px] text-text-dim">
-                vs {repo.base_branch}
-              </span>
-              <span className="font-mono text-[11px] text-text-muted">
-                {repoFiles.length}
-              </span>
+              <span className="font-mono text-[12px] truncate flex-1">{repo.repo_name ?? "(default)"}</span>
+              <span className="font-mono text-[10px] text-text-dim">vs {repo.base_branch}</span>
+              <span className="font-mono text-[11px] text-text-muted">{repoFiles.length}</span>
               <span className="font-mono text-[11px] flex items-center gap-1">
-                {adds > 0 && (
-                  <span className="text-status-running">+{adds}</span>
-                )}
+                {adds > 0 && <span className="text-status-running">+{adds}</span>}
                 {dels > 0 && <span className="text-status-error">-{dels}</span>}
               </span>
             </button>
             {!collapsed && repoFiles.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-dim italic">
-                No changes in this repo.
-              </div>
+              <div className="px-3 py-2 text-[11px] text-text-dim italic">No changes in this repo.</div>
             )}
             {!collapsed && repoFiles.length > 0 && (
               <RepoBody
@@ -685,10 +593,7 @@ function RepoBody({
     }
     return out;
   }, [collapsedDirs, ns]);
-  const localToggle = useCallback(
-    (p: string) => onToggleDir(`${ns}${p}`),
-    [onToggleDir, ns],
-  );
+  const localToggle = useCallback((p: string) => onToggleDir(`${ns}${p}`), [onToggleDir, ns]);
   const treeNodes = useMemo(
     () => (viewMode === "tree" ? buildDiffTree(files, localCollapsed) : []),
     [viewMode, files, localCollapsed],
@@ -715,8 +620,7 @@ function RepoBody({
         const parts = file.path.split("/");
         const fileName = parts.pop() || file.path;
         const dirPath = parts.length > 0 ? parts.join("/") + "/" : "";
-        const isSelected =
-          file.path === selectedPath && file.repo_name === selectedRepoName;
+        const isSelected = file.path === selectedPath && file.repo_name === selectedRepoName;
         return (
           <button
             key={`${file.repo_name ?? ""}::${file.path}`}
@@ -724,9 +628,7 @@ function RepoBody({
             data-path={file.path}
             onClick={() => onSelectFile(file.path, file.repo_name)}
             className={`w-full text-left px-6 py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${
-              isSelected
-                ? "bg-surface-850 text-text-primary"
-                : "text-text-secondary hover:bg-surface-800/50"
+              isSelected ? "bg-surface-850 text-text-primary" : "text-text-secondary hover:bg-surface-800/50"
             }`}
           >
             <span
@@ -735,20 +637,12 @@ function RepoBody({
               {STATUS_LETTERS[file.status] ?? "?"}
             </span>
             <span className="truncate min-w-0 flex-1">
-              {dirPath && (
-                <span className="font-mono text-[11px] text-text-dim">
-                  {dirPath}
-                </span>
-              )}
+              {dirPath && <span className="font-mono text-[11px] text-text-dim">{dirPath}</span>}
               <span className="font-mono text-[12px]">{fileName}</span>
             </span>
             <span className="shrink-0 font-mono text-[11px] flex items-center gap-1">
-              {file.additions > 0 && (
-                <span className="text-status-running">+{file.additions}</span>
-              )}
-              {file.deletions > 0 && (
-                <span className="text-status-error">-{file.deletions}</span>
-              )}
+              {file.additions > 0 && <span className="text-status-running">+{file.additions}</span>}
+              {file.deletions > 0 && <span className="text-status-error">-{file.deletions}</span>}
             </span>
           </button>
         );
@@ -768,13 +662,7 @@ interface BasePickerProps {
 /// Clickable chip + typeahead popover for the per-session diff base.
 /// Persists via `PATCH /api/sessions/{id}/diff-base`; the parent
 /// triggers a diff refetch on success. See #970.
-function BasePicker({
-  sessionId,
-  repoPath,
-  currentBase,
-  hasOverride,
-  onChanged,
-}: BasePickerProps) {
+function BasePicker({ sessionId, repoPath, currentBase, hasOverride, onChanged }: BasePickerProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
@@ -797,10 +685,7 @@ function BasePicker({
   useEffect(() => {
     if (!open) return;
     const onDocPointer = (e: PointerEvent) => {
-      if (
-        containerRef.current &&
-        !containerRef.current.contains(e.target as Node)
-      ) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false);
       }
     };
@@ -809,9 +694,7 @@ function BasePicker({
   }, [open]);
 
   const q = query.trim().toLowerCase();
-  const suggestions = (branches ?? [])
-    .filter((b) => !q || b.name.toLowerCase().includes(q))
-    .slice(0, 8);
+  const suggestions = (branches ?? []).filter((b) => !q || b.name.toLowerCase().includes(q)).slice(0, 8);
 
   const apply = async (value: string | null) => {
     setBusy(true);
@@ -880,11 +763,7 @@ function BasePicker({
               ↺ Reset to auto-detected
             </button>
           )}
-          <ul
-            role="listbox"
-            aria-label="Branch suggestions"
-            className="mt-1 max-h-56 overflow-y-auto"
-          >
+          <ul role="listbox" aria-label="Branch suggestions" className="mt-1 max-h-56 overflow-y-auto">
             {suggestions.length === 0 && (
               <li className="px-2 py-1 text-[11px] text-text-dim italic">
                 {branches === null ? "Loading branches..." : "No matches."}
@@ -901,18 +780,12 @@ function BasePicker({
                   void apply(b.name);
                 }}
                 className={`flex items-center justify-between gap-2 px-2 py-1 text-xs font-mono cursor-pointer rounded ${
-                  i === highlightIdx
-                    ? "bg-surface-800 text-text-primary"
-                    : "text-text-secondary"
+                  i === highlightIdx ? "bg-surface-800 text-text-primary" : "text-text-secondary"
                 }`}
               >
                 <span className="truncate">{b.name}</span>
                 <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
-                  {b.is_current
-                    ? "current"
-                    : b.remote_only
-                      ? "remote"
-                      : "local"}
+                  {b.is_current ? "current" : b.remote_only ? "remote" : "local"}
                 </span>
               </li>
             ))}

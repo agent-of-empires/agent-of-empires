@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  SUBAGENT_TASK_NAME,
-  TODO_GROUP_NAME,
-  TOOL_GROUP_NAME,
-  activityToThreadMessages,
-} from "./AcpRuntime";
+import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, activityToThreadMessages } from "./AcpRuntime";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 
 function userRow(text: string, id = "u1"): ActivityRow {
@@ -34,10 +29,7 @@ function toolStart(id: string, kind = "read"): ActivityRow {
   };
 }
 
-function todoStart(
-  id: string,
-  todos: Array<{ content: string; status: string }>,
-): ActivityRow {
+function todoStart(id: string, todos: Array<{ content: string; status: string }>): ActivityRow {
   const tool: ToolCall = {
     id,
     name: `Update TODOs: ${todos.map((t) => t.content).join(", ")}`,
@@ -67,13 +59,7 @@ function messageRow(text: string, id = "m1"): ActivityRow {
 describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
   it("folds a run of ≥3 consecutive tool calls into one group", () => {
     const messages = activityToThreadMessages(
-      [
-        userRow("go"),
-        toolStart("t1"),
-        toolStart("t2"),
-        toolStart("t3"),
-        toolStart("t4"),
-      ],
+      [userRow("go"), toolStart("t1"), toolStart("t2"), toolStart("t3"), toolStart("t4")],
       false,
     );
     const assistant = messages.find((m) => m.role === "assistant");
@@ -88,10 +74,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
   });
 
   it("does not group runs of 1 or 2 tool calls", () => {
-    const messages = activityToThreadMessages(
-      [userRow("go"), toolStart("t1"), toolStart("t2")],
-      false,
-    );
+    const messages = activityToThreadMessages([userRow("go"), toolStart("t1"), toolStart("t2")], false);
     const assistant = messages.find((m) => m.role === "assistant")!;
     const parts = assistant.content as Array<{
       type: string;
@@ -121,9 +104,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       type: string;
       toolName?: string;
     }>;
-    const groups = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME,
-    );
+    const groups = parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME);
     expect(groups).toHaveLength(2);
   });
 
@@ -157,9 +138,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       type: string;
       toolName?: string;
     }>;
-    const groups = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME,
-    );
+    const groups = parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME);
     expect(groups).toHaveLength(0);
     const toolParts = parts.filter((p) => p.type === "tool-call");
     expect(toolParts).toHaveLength(4);
@@ -185,12 +164,8 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(toolParts[0]!.toolName).toBe(TODO_GROUP_NAME);
     // The folded payload preserves each snapshot in original order so
     // the expand-history view can replay the plan's evolution.
-    const payload = JSON.parse(
-      (toolParts[0] as { argsText?: string }).argsText!,
-    );
-    expect(
-      payload.children.map((c: { toolCallId: string }) => c.toolCallId),
-    ).toEqual(["td1", "td2", "td3"]);
+    const payload = JSON.parse((toolParts[0] as { argsText?: string }).argsText!);
+    expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
   });
 
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
@@ -278,9 +253,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       type: string;
       toolName?: string;
     }>;
-    const groups = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === TODO_GROUP_NAME,
-    );
+    const groups = parts.filter((p) => p.type === "tool-call" && p.toolName === TODO_GROUP_NAME);
     // Each side of the text is a run of 2, below the fold threshold.
     expect(groups).toHaveLength(0);
   });
@@ -348,28 +321,21 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       tool: child,
       at: "2026-05-12T00:00:01Z",
     };
-    const messages = activityToThreadMessages(
-      [userRow("go"), parentRow, childRow],
-      false,
-    );
+    const messages = activityToThreadMessages([userRow("go"), parentRow, childRow], false);
     const assistant = messages.find((m) => m.role === "assistant")!;
     const parts = assistant.content as Array<{
       type: string;
       toolName?: string;
       argsText?: string;
     }>;
-    const subagentParts = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
-    );
+    const subagentParts = parts.filter((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
     expect(subagentParts).toHaveLength(1);
     const payload = JSON.parse(subagentParts[0]!.argsText!);
     expect(payload.parent.toolCallId).toBe("task-1");
     expect(payload.children).toHaveLength(1);
     expect(payload.children[0].toolCallId).toBe("ch-1");
     // The original child part should not appear as a top-level tool-call.
-    const directChild = parts.find(
-      (p) => p.type === "tool-call" && p.toolName !== SUBAGENT_TASK_NAME,
-    );
+    const directChild = parts.find((p) => p.type === "tool-call" && p.toolName !== SUBAGENT_TASK_NAME);
     expect(directChild).toBeUndefined();
   });
 
@@ -396,9 +362,7 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       type: string;
       toolName?: string;
     }>;
-    const subagentParts = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
-    );
+    const subagentParts = parts.filter((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
     expect(subagentParts).toHaveLength(0);
     const toolParts = parts.filter((p) => p.type === "tool-call");
     expect(toolParts).toHaveLength(1);
@@ -445,25 +409,15 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
       type: string;
       toolName?: string;
     }>;
-    const groups = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME,
-    );
+    const groups = parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME);
     expect(groups).toHaveLength(0);
-    const subagents = parts.filter(
-      (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
-    );
+    const subagents = parts.filter((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
     expect(subagents).toHaveLength(1);
   });
 
   it("does not group across user-prompt boundaries (separate messages)", () => {
     const messages = activityToThreadMessages(
-      [
-        userRow("first", "u1"),
-        toolStart("t1"),
-        toolStart("t2"),
-        userRow("second", "u2"),
-        toolStart("t3"),
-      ],
+      [userRow("first", "u1"), toolStart("t1"), toolStart("t2"), userRow("second", "u2"), toolStart("t3")],
       false,
     );
     // Each user_prompt starts a fresh assistant message; neither run is
@@ -514,11 +468,7 @@ describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
     expect(parts[0]!.text).toContain("## Diff comments");
     // The structured payload rides on metadata.custom.diffComments for
     // UserText to render the rich card without parsing any sentinel.
-    const custom = (
-      user.metadata as
-        | { custom?: { diffComments?: { comments?: unknown[] } } }
-        | undefined
-    )?.custom;
+    const custom = (user.metadata as { custom?: { diffComments?: { comments?: unknown[] } } } | undefined)?.custom;
     expect(custom?.diffComments?.comments).toHaveLength(1);
   });
 
@@ -547,10 +497,7 @@ function toolStopped(id: string, text = ""): ActivityRow {
 
 describe("activityToThreadMessages; stopped status threading (#1646)", () => {
   it("carries stopped onto a top-level tool-call part's result", () => {
-    const messages = activityToThreadMessages(
-      [userRow("go"), toolStart("t1"), toolStopped("t1")],
-      false,
-    );
+    const messages = activityToThreadMessages([userRow("go"), toolStart("t1"), toolStopped("t1")], false);
     const assistant = messages.find((m) => m.role === "assistant")!;
     const parts = assistant.content as Array<{
       type: string;
@@ -595,19 +542,14 @@ describe("activityToThreadMessages; stopped status threading (#1646)", () => {
       tool: child,
       at: "2026-05-12T00:00:01Z",
     };
-    const messages = activityToThreadMessages(
-      [userRow("go"), parentRow, childRow, toolStopped("ch-1")],
-      false,
-    );
+    const messages = activityToThreadMessages([userRow("go"), parentRow, childRow, toolStopped("ch-1")], false);
     const assistant = messages.find((m) => m.role === "assistant")!;
     const parts = assistant.content as Array<{
       type: string;
       toolName?: string;
       argsText?: string;
     }>;
-    const subagent = parts.find(
-      (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
-    )!;
+    const subagent = parts.find((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME)!;
     const payload = JSON.parse(subagent.argsText!);
     expect(payload.children[0].result.stopped).toBe(true);
   });

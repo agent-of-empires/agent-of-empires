@@ -1,10 +1,5 @@
 import { useEffect, useState } from "react";
-import {
-  fetchDevices,
-  revokeDevice,
-  signOutAllDevices,
-  type DeviceSession,
-} from "../lib/api";
+import { fetchDevices, revokeDevice, signOutAllDevices, type DeviceSession } from "../lib/api";
 
 /** Parse a raw user-agent string into a short "Browser + OS" label. */
 function parseUserAgent(ua: string): string {
@@ -51,9 +46,7 @@ function isInactive(iso: string): boolean {
 }
 
 const Heading = () => (
-  <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">
-    Connected Devices
-  </h3>
+  <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Connected Devices</h3>
 );
 
 export function ConnectedDevices() {
@@ -100,11 +93,7 @@ export function ConnectedDevices() {
   };
 
   const onSignOutAll = async () => {
-    if (
-      !window.confirm(
-        "Sign out every device, including this one? You will need the passphrase to sign back in.",
-      )
-    ) {
+    if (!window.confirm("Sign out every device, including this one? You will need the passphrase to sign back in.")) {
       return;
     }
     setBusy("__all__");
@@ -117,9 +106,7 @@ export function ConnectedDevices() {
     return (
       <div>
         <Heading />
-        <p className="font-body text-[13px] text-status-error">
-          Could not load devices
-        </p>
+        <p className="font-body text-[13px] text-status-error">Could not load devices</p>
       </div>
     );
   }
@@ -151,9 +138,7 @@ export function ConnectedDevices() {
               d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"
             />
           </svg>
-          <p className="font-body text-[16px] text-text-muted">
-            No signed-in devices
-          </p>
+          <p className="font-body text-[16px] text-text-muted">No signed-in devices</p>
           <p className="font-body text-[13px] text-text-muted mt-1">
             Devices appear here after they sign in with the passphrase
           </p>
@@ -193,9 +178,7 @@ export function ConnectedDevices() {
                   </span>
                 )}
               </div>
-              <p className="font-body text-[11px] text-text-secondary ml-3.5">
-                {device.created_ip}
-              </p>
+              <p className="font-body text-[11px] text-text-secondary ml-3.5">{device.created_ip}</p>
               <p className="font-body text-[11px] text-text-muted ml-3.5">
                 last seen: {relativeTime(device.last_seen)}
               </p>

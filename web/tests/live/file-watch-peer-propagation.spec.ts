@@ -15,19 +15,12 @@
 
 import { test, expect } from "@playwright/test";
 import { spawnSync } from "node:child_process";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-  resolveAoeBinary,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd, resolveAoeBinary } from "../helpers/aoeServe";
 
 const aoeBinary = resolveAoeBinary();
 
 test.describe.serial("file-watch peer propagation", () => {
-  test("peer rename surfaces within the watcher budget", async ({
-    page,
-  }, ti) => {
+  test("peer rename surfaces within the watcher budget", async ({ page }, ti) => {
     const serve = await spawnAoeServe({
       authMode: "none",
       workerIndex: ti.workerIndex,
@@ -40,26 +33,18 @@ test.describe.serial("file-watch peer propagation", () => {
         timeout: 10_000,
       });
 
-      const rename = spawnSync(
-        aoeBinary,
-        ["session", "rename", "peer-source", "-t", "peer-target"],
-        {
-          env: serve.env,
-          stdio: "pipe",
-        },
-      );
+      const rename = spawnSync(aoeBinary, ["session", "rename", "peer-source", "-t", "peer-target"], {
+        env: serve.env,
+        stdio: "pipe",
+      });
       expect(rename.status, rename.stderr.toString()).toBe(0);
 
       // Prove the daemon state flips through the watcher path before the 2s
       // poll fallback could refresh it.
       await expect
-        .poll(
-          async () =>
-            (await listSessions(serve.baseUrl)).some(
-              (session) => session.title === "peer-target",
-            ),
-          { timeout: 1_500 },
-        )
+        .poll(async () => (await listSessions(serve.baseUrl)).some((session) => session.title === "peer-target"), {
+          timeout: 1_500,
+        })
         .toBe(true);
 
       // Once the watcher has updated daemon state, the dashboard can take a

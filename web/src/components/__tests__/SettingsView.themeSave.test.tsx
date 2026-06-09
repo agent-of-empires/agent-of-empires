@@ -9,13 +9,7 @@
 // web/tests/live/settings-persistence-theme.spec.ts.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 
 const PROFILES = [{ name: "main", is_default: true }];
@@ -70,16 +64,13 @@ const updateProfileSettings = vi.fn(() => Promise.resolve(true));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
-  fetchSettings: vi.fn(() =>
-    Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } }),
-  ),
+  fetchSettings: vi.fn(() => Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } })),
   getSettingsSchema: vi.fn(() => Promise.resolve(THEME_SCHEMA)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
-  updateProfileSettings: (name: string, updates: Record<string, unknown>) =>
-    updateProfileSettings(name, updates),
+  updateProfileSettings: (name: string, updates: Record<string, unknown>) => updateProfileSettings(name, updates),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
   fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
 }));
@@ -95,23 +86,16 @@ afterEach(() => {
 });
 
 function renderThemeTab() {
-  return render(
-    <SettingsView
-      onClose={() => {}}
-      tab="theme"
-      onSelectTab={vi.fn()}
-      onServerAboutRefresh={() => {}}
-    />,
-  );
+  return render(<SettingsView onClose={() => {}} tab="theme" onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
 }
 
 /** A <select> that carries an <option> with this value. Labels in FormFields
  *  are not wired to their controls, so we locate by option value rather than
  *  accessible name (and dodge the duplicated mobile/desktop tab strips). */
 function selectWithOption(value: string): HTMLSelectElement {
-  const found = Array.from(
-    document.querySelectorAll<HTMLSelectElement>("select"),
-  ).find((s) => Array.from(s.options).some((o) => o.value === value));
+  const found = Array.from(document.querySelectorAll<HTMLSelectElement>("select")).find((s) =>
+    Array.from(s.options).some((o) => o.value === value),
+  );
   if (!found) throw new Error(`no <select> has an option "${value}"`);
   return found;
 }
@@ -131,9 +115,7 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.change(selectWithOption("dracula"), {
       target: { value: "dracula" },
     });
-    await waitFor(() =>
-      expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }),
-    );
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
@@ -143,9 +125,7 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.change(selectWithOption("palette"), {
       target: { value: "palette" },
     });
-    await waitFor(() =>
-      expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }),
-    );
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 

@@ -13,13 +13,7 @@
 // web/tests/live/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -259,9 +253,7 @@ const MOCK_SCHEMA = RAW_SCHEMA.map((d) => ({
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
-  fetchSettings: vi.fn(() =>
-    Promise.resolve({ acp: {}, sandbox: {}, worktree: {} }),
-  ),
+  fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -273,20 +265,13 @@ vi.mock("../../lib/api", () => ({
 function renderView(tab: string) {
   const onSelectTab = vi.fn();
   const utils = render(
-    <SettingsView
-      onClose={() => {}}
-      tab={tab}
-      onSelectTab={onSelectTab}
-      onServerAboutRefresh={() => {}}
-    />,
+    <SettingsView onClose={() => {}} tab={tab} onSelectTab={onSelectTab} onServerAboutRefresh={() => {}} />,
   );
   return { ...utils, onSelectTab };
 }
 
 function expandAdvanced(container: HTMLElement) {
-  const trigger = container.querySelector(
-    "button[aria-expanded]",
-  ) as HTMLButtonElement;
+  const trigger = container.querySelector("button[aria-expanded]") as HTMLButtonElement;
   expect(trigger).toBeTruthy();
   fireEvent.click(trigger);
 }
@@ -298,17 +283,13 @@ function fieldInputByLabel(
 ): HTMLInputElement | HTMLTextAreaElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
-  const selector =
-    type === "text" ? 'input[type="text"], textarea' : `input[type="${type}"]`;
+  const selector = type === "text" ? 'input[type="text"], textarea' : `input[type="${type}"]`;
   const input = match?.parentElement?.querySelector(selector);
   expect(input).toBeTruthy();
   return input as HTMLInputElement | HTMLTextAreaElement;
 }
 
-function selectByLabel(
-  container: HTMLElement,
-  label: string,
-): HTMLSelectElement {
+function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
   const labels = Array.from(container.querySelectorAll("label"));
   const match = labels.find((l) => l.textContent === label);
   const select = match?.parentElement?.querySelector("select");
@@ -337,9 +318,7 @@ function clickToggle(container: HTMLElement, label: string) {
 // ListField: open its add input, type a value, submit with Enter. Scoped to
 // the ListField whose header carries `label`.
 function addListItem(container: HTMLElement, label: string, value: string) {
-  const labelEl = Array.from(container.querySelectorAll("label")).find(
-    (l) => l.textContent === label,
-  );
+  const labelEl = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
   const root = labelEl?.parentElement?.parentElement as HTMLElement;
   const addBtn = labelEl?.parentElement?.querySelector("button");
   if (addBtn) fireEvent.click(addBtn);
@@ -391,26 +370,12 @@ describe("Settings Advanced fold", () => {
 
     // Switch to worktree: its Advanced fold starts collapsed (no leaked
     // open-state from the sandbox tab sharing the same root element).
-    rerender(
-      <SettingsView
-        onClose={() => {}}
-        tab="worktree"
-        onSelectTab={() => {}}
-        onServerAboutRefresh={() => {}}
-      />,
-    );
+    rerender(<SettingsView onClose={() => {}} tab="worktree" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
     await screen.findByText("Enabled by Default");
     expect(screen.queryByText("Bare Repo Template")).toBeNull();
 
     // Back to sandbox: the fold reset to collapsed.
-    rerender(
-      <SettingsView
-        onClose={() => {}}
-        tab="sandbox"
-        onSelectTab={() => {}}
-        onServerAboutRefresh={() => {}}
-      />,
-    );
+    rerender(<SettingsView onClose={() => {}} tab="sandbox" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
     await screen.findByText("Sandbox enabled by default");
     expect(screen.queryByText("CPU limit")).toBeNull();
   });
@@ -420,30 +385,15 @@ describe("Settings Advanced fold", () => {
     await screen.findByText("Queue drain mode");
 
     expandAdvanced(container);
-    commit(
-      fieldInputByLabel(container, "Replay buffer bytes", "number"),
-      "4096",
-    );
-    commit(
-      fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"),
-      "30",
-    );
-    commit(
-      fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"),
-      "28800",
-    );
-    commit(
-      fieldInputByLabel(container, "Auto-resume grace (s)", "number"),
-      "20",
-    );
+    commit(fieldInputByLabel(container, "Replay buffer bytes", "number"), "4096");
+    commit(fieldInputByLabel(container, "Silent-orphan fast grace (s)", "number"), "30");
+    commit(fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"), "28800");
+    commit(fieldInputByLabel(container, "Auto-resume grace (s)", "number"), "20");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
-        "main",
-        {
-          acp: { replay_bytes: 4096 },
-        },
-      ),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        acp: { replay_bytes: 4096 },
+      }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { silent_orphan_fast_grace_secs: 30 },
@@ -466,12 +416,9 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
-        "main",
-        {
-          acp: { queue_drain_mode: "serial" },
-        },
-      ),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        acp: { queue_drain_mode: "serial" },
+      }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { rate_limit_auto_resume: true },
@@ -486,24 +433,15 @@ describe("Settings Advanced fold", () => {
     expandAdvanced(container);
     expect(screen.getByText("Workspace Path Template")).toBeTruthy();
 
-    commit(
-      fieldInputByLabel(container, "Bare Repo Template", "text"),
-      "./{branch}",
-    );
-    commit(
-      fieldInputByLabel(container, "Workspace Path Template", "text"),
-      "../wt-{branch}",
-    );
+    commit(fieldInputByLabel(container, "Bare Repo Template", "text"), "./{branch}");
+    commit(fieldInputByLabel(container, "Workspace Path Template", "text"), "../wt-{branch}");
     clickToggle(container, "Delete Branch on Cleanup");
     clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
-        "main",
-        {
-          worktree: { workspace_path_template: "../wt-{branch}" },
-        },
-      ),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        worktree: { workspace_path_template: "../wt-{branch}" },
+      }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       worktree: { delete_branch_on_cleanup: true },
@@ -517,10 +455,7 @@ describe("Settings Advanced fold", () => {
     expandAdvanced(container);
     commit(fieldInputByLabel(container, "CPU limit", "text"), "4");
     commit(fieldInputByLabel(container, "Memory limit", "text"), "8g");
-    commit(
-      fieldInputByLabel(container, "Custom instruction", "text"),
-      "be terse",
-    );
+    commit(fieldInputByLabel(container, "Custom instruction", "text"), "be terse");
 
     // Lists exercise both the add (onChange) and validate paths: an invalid
     // entry trips the schema-derived validator, then a valid one commits.
@@ -533,12 +468,9 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith(
-        "main",
-        {
-          sandbox: { cpu_limit: "4" },
-        },
-      ),
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        sandbox: { cpu_limit: "4" },
+      }),
     );
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       sandbox: { environment: ["FOO=bar"] },
@@ -574,9 +506,7 @@ describe("Settings Advanced fold", () => {
       resolveProfiles(PROFILES);
     });
 
-    await waitFor(() =>
-      expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"),
-    );
+    await waitFor(() => expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"));
     expect(screen.getByText("Replay buffer bytes")).toBeTruthy();
   });
 
@@ -589,8 +519,6 @@ describe("Settings Advanced fold", () => {
 
     selectProfile(container, "work");
 
-    await waitFor(() =>
-      expect(screen.queryByText("Replay buffer bytes")).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByText("Replay buffer bytes")).toBeNull());
   });
 });

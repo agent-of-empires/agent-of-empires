@@ -18,9 +18,7 @@ base("Escape closes an open command palette", async ({ page }, testInfo) => {
 
   try {
     await page.goto(serve.baseUrl);
-    await expect(
-      page.getByRole("button", { name: "Go to dashboard" }),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
 
     await page.keyboard.press(`${MOD}+K`);
     const palette = page.getByRole("dialog", { name: "Command palette" });

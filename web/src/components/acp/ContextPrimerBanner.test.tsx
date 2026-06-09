@@ -20,9 +20,7 @@ const mockFetch = vi.mocked(fetchContextPrimer);
 
 const AVAILABLE = { resetSeq: 7, reason: "session/load" };
 
-function mount(
-  props?: Partial<React.ComponentProps<typeof ContextPrimerBanner>>,
-) {
+function mount(props?: Partial<React.ComponentProps<typeof ContextPrimerBanner>>) {
   const onInsertPrimer = vi.fn();
   const onDismiss = vi.fn();
   const utils = render(
@@ -95,9 +93,7 @@ describe("ContextPrimerBanner", () => {
     });
     const { getByText, onInsertPrimer, onDismiss } = mount();
     fireEvent.click(getByText(/Resume with prior context/i));
-    await waitFor(() =>
-      expect(onInsertPrimer).toHaveBeenCalledWith("recap text"),
-    );
+    await waitFor(() => expect(onInsertPrimer).toHaveBeenCalledWith("recap text"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
@@ -145,21 +141,14 @@ describe("ContextPrimerBanner", () => {
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
     // No alert role surfaces from an AbortError.
     await Promise.resolve();
-    expect(queryByRole("alert")?.textContent ?? "").not.toMatch(
-      /Network error/i,
-    );
+    expect(queryByRole("alert")?.textContent ?? "").not.toMatch(/Network error/i);
     expect(onInsertPrimer).not.toHaveBeenCalled();
   });
 
   it("clears prior error state when resetSeq changes", async () => {
     mockFetch.mockResolvedValueOnce(null);
     const { getByText, findByRole, rerender, queryByRole } = render(
-      <ContextPrimerBanner
-        sessionId="s-1"
-        available={AVAILABLE}
-        onInsertPrimer={vi.fn()}
-        onDismiss={vi.fn()}
-      />,
+      <ContextPrimerBanner sessionId="s-1" available={AVAILABLE} onInsertPrimer={vi.fn()} onDismiss={vi.fn()} />,
     );
     fireEvent.click(getByText(/Resume with prior context/i));
     await findByRole("alert");

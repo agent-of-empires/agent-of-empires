@@ -55,9 +55,7 @@ export function TokenEntryPage({ onSuccess }: Props) {
       // The interceptor already cleared localStorage on 401. Reset the
       // dedup flags so the next submission attempt can be detected too.
       resetTokenExpired();
-      setError(
-        "Invalid token. Copy the token from your `aoe serve` output and try again.",
-      );
+      setError("Invalid token. Copy the token from your `aoe serve` output and try again.");
       setLoading(false);
       inputRef.current?.focus();
     }
@@ -66,38 +64,22 @@ export function TokenEntryPage({ onSuccess }: Props) {
   return (
     <div className="h-dvh flex items-center justify-center bg-surface-900 p-4 safe-area-inset">
       <div className="w-full max-w-sm animate-slide-up">
-        <form
-          onSubmit={handleSubmit}
-          className="bg-surface-800 border border-surface-700/40 rounded-xl p-8"
-        >
+        <form onSubmit={handleSubmit} className="bg-surface-800 border border-surface-700/40 rounded-xl p-8">
           {/* Logo */}
           <div className="flex items-center justify-center gap-2 mb-6">
-            <img
-              src="/icon-192.png"
-              alt=""
-              width="28"
-              height="28"
-              className="rounded-sm"
-            />
-            <span className="font-mono text-lg text-text-primary tracking-tight">
-              aoe
-            </span>
+            <img src="/icon-192.png" alt="" width="28" height="28" className="rounded-sm" />
+            <span className="font-mono text-lg text-text-primary tracking-tight">aoe</span>
           </div>
 
           {/* Explanation */}
           <p className="text-xs text-text-muted mb-6 text-center leading-relaxed">
-            Your session token has expired or is missing. Paste the dashboard
-            URL or token from{" "}
-            <code className="text-brand-500 font-mono">aoe serve</code> to
-            reconnect.
+            Your session token has expired or is missing. Paste the dashboard URL or token from{" "}
+            <code className="text-brand-500 font-mono">aoe serve</code> to reconnect.
           </p>
 
           {/* Token input */}
           <div className="mb-4">
-            <label
-              htmlFor="token"
-              className="block text-xs text-text-muted mb-2 font-medium"
-            >
+            <label htmlFor="token" className="block text-xs text-text-muted mb-2 font-medium">
               Token or URL
             </label>
             <input
@@ -125,19 +107,8 @@ export function TokenEntryPage({ onSuccess }: Props) {
           >
             {loading ? (
               <>
-                <svg
-                  className="animate-spin h-4 w-4"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
+                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path
                     className="opacity-75"
                     fill="currentColor"

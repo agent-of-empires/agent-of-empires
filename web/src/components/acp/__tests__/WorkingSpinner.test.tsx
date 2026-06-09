@@ -61,33 +61,25 @@ function renderSpinner(opts: {
 describe("WorkingSpinner force-end-turn gate (#1176)", () => {
   it("hides the button while a tool is in flight, even past the stall threshold", () => {
     renderSpinner({ stalledSecs: 60, tool: "Write" });
-    expect(
-      screen.queryByRole("button", { name: /force end turn/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
     expect(screen.getByText(/waiting on tool…/i)).toBeTruthy();
   });
 
   it("shows the button when no tool is in flight past the stall threshold", () => {
     renderSpinner({ stalledSecs: 60, tool: null });
-    expect(
-      screen.getByRole("button", { name: /force end turn/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /force end turn/i })).toBeTruthy();
     expect(screen.getByText(/waiting on model…/i)).toBeTruthy();
   });
 
   it("hides the button below threshold regardless of tool state", () => {
     renderSpinner({ stalledSecs: 5, tool: null });
-    expect(
-      screen.queryByRole("button", { name: /force end turn/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
     expect(screen.queryByText(/waiting on (model|tool)…/i)).toBeNull();
   });
 
   it("hides the button for a long-running Task subagent (original report)", () => {
     renderSpinner({ stalledSecs: 180, tool: "Task" });
-    expect(
-      screen.queryByRole("button", { name: /force end turn/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
     expect(screen.getByText(/waiting on tool… 3m \d{2}s/i)).toBeTruthy();
   });
 });
@@ -110,9 +102,7 @@ describe("WorkingSpinner cancelling / force-stop (#1727)", () => {
     expect(screen.getByRole("button", { name: /force stop/i })).toBeTruthy();
     expect(screen.getByText(/stopping…/i)).toBeTruthy();
     // The legacy "Force end turn" must not also render while cancelling.
-    expect(
-      screen.queryByRole("button", { name: /force end turn/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
   });
 
   it("renders an escalation countdown when a deadline is provided", () => {
@@ -139,8 +129,6 @@ describe("WorkingSpinner cancelling / force-stop (#1727)", () => {
   it("does not show force controls for a slow tool that is NOT being cancelled (#1176 preserved)", () => {
     renderSpinner({ stalledSecs: 180, tool: "Task", cancelling: false });
     expect(screen.queryByRole("button", { name: /force stop/i })).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: /force end turn/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
   });
 });

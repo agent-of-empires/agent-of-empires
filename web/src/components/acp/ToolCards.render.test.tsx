@@ -32,26 +32,10 @@ vi.mock("../../hooks/useShikiTheme", () => ({
 
 import { ToolCard, TodoGroupCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
-import {
-  fixtures,
-  makeCompletion,
-  makeError,
-  makeStopped,
-  makeToolCall,
-} from "./__fixtures__/toolCalls";
+import { fixtures, makeCompletion, makeError, makeStopped, makeToolCall } from "./__fixtures__/toolCalls";
 
-function Wrap({
-  toolKey,
-  children,
-}: {
-  toolKey?: string;
-  children: ReactNode;
-}) {
-  return (
-    <AgentProfileProvider toolKey={toolKey ?? null}>
-      {children}
-    </AgentProfileProvider>
-  );
+function Wrap({ toolKey, children }: { toolKey?: string; children: ReactNode }) {
+  return <AgentProfileProvider toolKey={toolKey ?? null}>{children}</AgentProfileProvider>;
 }
 
 afterEach(() => {
@@ -111,9 +95,7 @@ describe("ToolCards dispatch", () => {
     expect(container.textContent).not.toContain("(unknown file)");
     // Expand to reveal the diff body.
     fireEvent.click(container.querySelector("button")!);
-    expect(
-      container.querySelector('[data-testid="string-diff"]'),
-    ).not.toBeNull();
+    expect(container.querySelector('[data-testid="string-diff"]')).not.toBeNull();
   });
 
   it("renders every touched file path for a multi-file Codex patch", () => {
@@ -127,9 +109,7 @@ describe("ToolCards dispatch", () => {
     // The second file's path lives in the expanded body.
     fireEvent.click(container.querySelector("button")!);
     expect(container.textContent).toContain("src/beta.rs");
-    expect(
-      container.querySelectorAll('[data-testid="string-diff"]').length,
-    ).toBe(2);
+    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(2);
   });
 
   it("renders delete kind with a 'delete' label", () => {
@@ -174,10 +154,7 @@ describe("ToolCards dispatch", () => {
   it("flips the status pill to 'failed' on tool_error results", () => {
     const { container } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "command not found" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "command not found" })} />
       </Wrap>,
     );
     expect(container.textContent?.toLowerCase()).toContain("failed");
@@ -186,10 +163,7 @@ describe("ToolCards dispatch", () => {
   it("renders the 'done' badge on tool_complete results", () => {
     const { container } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeCompletion({ text: "hello\n" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeCompletion({ text: "hello\n" })} />
       </Wrap>,
     );
     expect(container.textContent).toContain("done");
@@ -466,9 +440,7 @@ describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
     expect(container.textContent).toContain("Synthesised memory");
     fireEvent.click(getByRole("button"));
     const body = getByTestId("memory-recall-synthesized");
-    expect(body.textContent).toContain(
-      "User is a senior engineer working on agent-of-empires.",
-    );
+    expect(body.textContent).toContain("User is a senior engineer working on agent-of-empires.");
   });
 });
 
@@ -492,10 +464,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
   it("renders the error body on first paint for a failed card", () => {
     const { container } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "boom: command failed" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "boom: command failed" })} />
       </Wrap>,
     );
     expect(container.textContent).toContain("tool failed");
@@ -505,10 +474,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
   it("folds the error body when the chevron is clicked", () => {
     const { container, getByRole } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "boom: command failed" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "boom: command failed" })} />
       </Wrap>,
     );
     expect(container.textContent).toContain("tool failed");
@@ -523,10 +489,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
   it("keeps a successful card collapsed by default", () => {
     const { container } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeCompletion({ text: "hello world\n" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeCompletion({ text: "hello world\n" })} />
       </Wrap>,
     );
     // Header is present, body output is hidden until the user expands.
@@ -544,10 +507,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
     expect(container.textContent).not.toContain("tool failed");
     rerender(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "boom: command failed" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "boom: command failed" })} />
       </Wrap>,
     );
     // The error row arrives and the card opens with no user click.
@@ -558,10 +518,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
   it("respects the user's fold once set, even if the card re-enters err", () => {
     const { container, getByRole, rerender } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "boom: command failed" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "boom: command failed" })} />
       </Wrap>,
     );
     // User folds the failed card.
@@ -570,10 +527,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
     // A later render still reports err: the card stays folded.
     rerender(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeError({ text: "boom again" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeError({ text: "boom again" })} />
       </Wrap>,
     );
     expect(container.textContent).not.toContain("tool failed");
@@ -589,24 +543,18 @@ describe("ToolCards failed-card folding (#1467)", () => {
     ["scheduleWakeup", () => fixtures.scheduleWakeup],
   ];
 
-  it.each(errToggleKinds)(
-    "auto-opens and folds a failed %s card",
-    (_label, getTool) => {
-      const { container, getAllByRole } = render(
-        <Wrap toolKey="claude">
-          <ToolCard
-            tool={getTool() as never}
-            result={makeError({ text: "kind-specific boom" })}
-          />
-        </Wrap>,
-      );
-      // Auto-open on failure: the rose error block is visible with no click.
-      expect(container.textContent).toContain("tool failed");
-      // The header is the card's first button; clicking it folds the body.
-      fireEvent.click(getAllByRole("button")[0]);
-      expect(container.textContent).not.toContain("tool failed");
-    },
-  );
+  it.each(errToggleKinds)("auto-opens and folds a failed %s card", (_label, getTool) => {
+    const { container, getAllByRole } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={getTool() as never} result={makeError({ text: "kind-specific boom" })} />
+      </Wrap>,
+    );
+    // Auto-open on failure: the rose error block is visible with no click.
+    expect(container.textContent).toContain("tool failed");
+    // The header is the card's first button; clicking it folds the body.
+    fireEvent.click(getAllByRole("button")[0]);
+    expect(container.textContent).not.toContain("tool failed");
+  });
 
   it("auto-opens and folds a failed memory-file card", () => {
     // A Read on a path under Claude's per-project memory dir dispatches
@@ -616,16 +564,12 @@ describe("ToolCards failed-card folding (#1467)", () => {
       name: "Read",
       kind: "read",
       args_preview: JSON.stringify({
-        file_path:
-          "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
+        file_path: "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
       }),
     });
     const { container, getAllByRole } = render(
       <Wrap toolKey="claude">
-        <ToolCard
-          tool={tool}
-          result={makeError({ text: "memory read boom" })}
-        />
+        <ToolCard tool={tool} result={makeError({ text: "memory read boom" })} />
       </Wrap>,
     );
     expect(container.textContent).toContain("tool failed");
@@ -641,9 +585,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
         <ToolCard
           tool={fixtures.generic}
           result={makeCompletion({
-            output: [
-              { kind: "image", mime_type: "image/png", data: "BASE64IMG" },
-            ],
+            output: [{ kind: "image", mime_type: "image/png", data: "BASE64IMG" }],
           })}
         />
       </Wrap>,
@@ -673,9 +615,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
     );
     const audio = container.querySelector("audio");
     expect(audio).not.toBeNull();
-    expect(audio!.getAttribute("src")).toBe(
-      "data:audio/wav;base64,BASE64AUDIO",
-    );
+    expect(audio!.getAttribute("src")).toBe("data:audio/wav;base64,BASE64AUDIO");
     const link = container.querySelector('a[href="file:///report.pdf"]');
     expect(link).not.toBeNull();
     expect(container.textContent).toContain("report.pdf");
@@ -741,9 +681,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
     );
     const link = container.querySelector("a[download]");
     expect(link).not.toBeNull();
-    expect(link!.getAttribute("href")).toBe(
-      "data:application/octet-stream;base64,QkxPQg==",
-    );
+    expect(link!.getAttribute("href")).toBe("data:application/octet-stream;base64,QkxPQg==");
     expect(link!.getAttribute("download")).toBe("out.bin");
   });
 
@@ -752,10 +690,7 @@ describe("ToolCards failed-card folding (#1467)", () => {
     // the user opens the card, not just the error path.
     const { container, getByRole } = render(
       <Wrap>
-        <ToolCard
-          tool={fixtures.bash}
-          result={makeCompletion({ text: "hello world\n" })}
-        />
+        <ToolCard tool={fixtures.bash} result={makeCompletion({ text: "hello world\n" })} />
       </Wrap>,
     );
     expect(container.textContent).not.toContain("hello world");

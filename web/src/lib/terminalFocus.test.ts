@@ -1,8 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import {
-  consumePendingTerminalFocus,
-  setPendingTerminalFocus,
-} from "./terminalFocus";
+import { consumePendingTerminalFocus, setPendingTerminalFocus } from "./terminalFocus";
 
 describe("terminalFocus pending intent", () => {
   beforeEach(() => {

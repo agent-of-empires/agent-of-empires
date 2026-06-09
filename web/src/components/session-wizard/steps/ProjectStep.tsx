@@ -61,9 +61,7 @@ interface RecentProject {
   sessionCount: number;
 }
 
-export function collectRecentProjects(
-  sessions: SessionResponse[],
-): RecentProject[] {
+export function collectRecentProjects(sessions: SessionResponse[]): RecentProject[] {
   const map = new Map<string, RecentProject>();
   for (const s of sessions) {
     // Scratch sessions live in transient `<app_dir>/scratch/<id>/`
@@ -103,9 +101,7 @@ export function collectRecentProjects(
       });
     }
   }
-  return Array.from(map.values()).sort((a, b) =>
-    (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""),
-  );
+  return Array.from(map.values()).sort((a, b) => (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""));
 }
 
 function timeAgo(ts: string | null): string {
@@ -149,11 +145,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
   const filteredRecent = useMemo(() => {
     if (!data.path) return recent;
     const q = data.path.toLowerCase();
-    return recent.filter(
-      (r) =>
-        r.path.toLowerCase().includes(q) ||
-        r.displayName.toLowerCase().includes(q),
-    );
+    return recent.filter((r) => r.path.toLowerCase().includes(q) || r.displayName.toLowerCase().includes(q));
   }, [recent, data.path]);
 
   const hasRecents = recent.length > 0;
@@ -192,12 +184,8 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">
-        Project folder
-      </h2>
-      <p className="text-sm text-text-muted mb-4">
-        Pick a recent project, browse for one, or clone from a URL.
-      </p>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">Project folder</h2>
+      <p className="text-sm text-text-muted mb-4">Pick a recent project, browse for one, or clone from a URL.</p>
 
       {/* Scratch-session toggle. Sits above the project-source tabs
           because it is a mode (skip the path picker entirely) rather
@@ -209,35 +197,25 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
         onClick={(e) => {
           // Avoid double-toggle when the user clicks the switch itself:
           // both the label and the inner button fire onChange otherwise.
-          if ((e.target as HTMLElement).closest('button[role="switch"]'))
-            return;
+          if ((e.target as HTMLElement).closest('button[role="switch"]')) return;
           onChange("scratch", !data.scratch);
         }}
       >
         <div className="flex-1">
-          <div className="text-sm font-medium text-text-primary">
-            Skip project folder
-          </div>
+          <div className="text-sm font-medium text-text-primary">Skip project folder</div>
           <div className="text-xs text-text-dim mt-0.5 leading-snug">
-            Run the agent in a fresh scratch directory under your AoE app data
-            folder. The folder is removed when you delete the session.
+            Run the agent in a fresh scratch directory under your AoE app data folder. The folder is removed when you
+            delete the session.
           </div>
         </div>
-        <Toggle
-          checked={data.scratch}
-          onChange={(v) => onChange("scratch", v)}
-          ariaLabel="Skip project folder"
-        />
+        <Toggle checked={data.scratch} onChange={(v) => onChange("scratch", v)} ariaLabel="Skip project folder" />
       </label>
 
       {data.scratch && (
         <div className="px-3 py-2.5 bg-surface-900 border border-brand-600/30 rounded-md">
-          <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim mb-1">
-            Scratch session
-          </p>
+          <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim mb-1">Scratch session</p>
           <p className="text-sm text-text-primary">
-            A fresh scratch directory under your AoE app data folder is created
-            when you launch this session.
+            A fresh scratch directory under your AoE app data folder is created when you launch this session.
           </p>
         </div>
       )}
@@ -268,10 +246,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
           {loading && (
             <div className="animate-pulse space-y-2">
               {[...Array(3)].map((_, i) => (
-                <div
-                  key={i}
-                  className="h-[60px] bg-surface-900 border border-surface-700/40 rounded-md"
-                />
+                <div key={i} className="h-[60px] bg-surface-900 border border-surface-700/40 rounded-md" />
               ))}
             </div>
           )}
@@ -292,23 +267,15 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
                 >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-text-primary truncate">
-                        {r.displayName}
-                      </span>
-                      <span className="text-[10px] font-mono text-text-dim shrink-0">
-                        {r.tool}
-                      </span>
+                      <span className="text-sm font-medium text-text-primary truncate">{r.displayName}</span>
+                      <span className="text-[10px] font-mono text-text-dim shrink-0">{r.tool}</span>
                     </div>
                     <div className="flex items-center gap-2 mt-0.5">
-                      <span className="font-mono text-[11px] text-text-dim truncate">
-                        {r.path}
-                      </span>
+                      <span className="font-mono text-[11px] text-text-dim truncate">{r.path}</span>
                     </div>
                   </div>
                   <div className="flex flex-col items-end shrink-0 gap-0.5">
-                    <span className="text-[10px] text-text-dim">
-                      {timeAgo(r.lastAccessedAt)}
-                    </span>
+                    <span className="text-[10px] text-text-dim">{timeAgo(r.lastAccessedAt)}</span>
                     <span className="text-[10px] text-text-dim">
                       {r.sessionCount} session{r.sessionCount !== 1 ? "s" : ""}
                     </span>
@@ -319,18 +286,13 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
           )}
 
           {/* Browse tab */}
-          {!loading && activeTab === "browse" && (
-            <DirectoryBrowser onSelect={handleBrowseSelect} />
-          )}
+          {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={handleBrowseSelect} />}
 
           {/* Clone from URL tab */}
           {!loading && activeTab === "clone" && (
             <div className="space-y-3">
               <div>
-                <label
-                  htmlFor="clone-url"
-                  className="block text-sm text-text-secondary mb-1.5"
-                >
+                <label htmlFor="clone-url" className="block text-sm text-text-secondary mb-1.5">
                   Repository URL
                 </label>
                 <input
@@ -342,8 +304,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
                     setCloneError(null);
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && cloneUrl.trim() && !cloning)
-                      handleClone();
+                    if (e.key === "Enter" && cloneUrl.trim() && !cloning) handleClone();
                   }}
                   placeholder="https://github.com/user/repo.git"
                   className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
@@ -375,10 +336,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
               {showAdvanced && (
                 <div className="space-y-3 pl-1 border-l-2 border-surface-700/30 ml-1">
                   <div>
-                    <label
-                      htmlFor="clone-dest"
-                      className="block text-[12px] text-text-dim mb-1"
-                    >
+                    <label htmlFor="clone-dest" className="block text-[12px] text-text-dim mb-1">
                       Destination path (optional)
                     </label>
                     <input
@@ -402,12 +360,8 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
                       className="accent-brand-600"
                       disabled={cloning}
                     />
-                    <span className="text-sm text-text-secondary">
-                      Shallow clone (--depth 1)
-                    </span>
-                    <span className="text-[10px] text-text-dim">
-                      faster for large repos
-                    </span>
+                    <span className="text-sm text-text-secondary">Shallow clone (--depth 1)</span>
+                    <span className="text-[10px] text-text-dim">faster for large repos</span>
                   </label>
                 </div>
               )}
@@ -430,19 +384,8 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
               >
                 {cloning ? (
                   <span className="flex items-center justify-center gap-2">
-                    <svg
-                      className="animate-spin h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                    >
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                      />
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                       <path
                         className="opacity-75"
                         fill="currentColor"
@@ -457,9 +400,7 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
               </button>
 
               <div className="flex items-start gap-1.5 text-[11px] text-text-dim">
-                <span>
-                  The repository will be cloned into your home directory.
-                </span>
+                <span>The repository will be cloned into your home directory.</span>
                 <span className="relative group/info inline-flex shrink-0 mt-px">
                   <svg
                     className="w-3.5 h-3.5 text-text-dim cursor-help"
@@ -475,10 +416,8 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
                     <path d="M12 8h.01" />
                   </svg>
                   <span className="pointer-events-none absolute right-0 bottom-full mb-1.5 w-56 px-2.5 py-2 rounded bg-surface-950 border border-surface-700 text-[11px] leading-relaxed text-text-secondary opacity-0 scale-95 transition-all duration-100 group-hover/info:opacity-100 group-hover/info:scale-100 z-50">
-                    Uses the git credentials from the environment where the
-                    server is running (SSH keys, credential helpers, GH_TOKEN,
-                    etc). Private repos work if your git is already
-                    authenticated.
+                    Uses the git credentials from the environment where the server is running (SSH keys, credential
+                    helpers, GH_TOKEN, etc). Private repos work if your git is already authenticated.
                   </span>
                 </span>
               </div>
@@ -488,12 +427,8 @@ export function ProjectStep({ data, onChange, initialTab }: Props) {
           {/* Selected path display */}
           {data.path && activeTab !== "browse" && (
             <div className="mt-4 px-3 py-2 bg-surface-900 border border-brand-600/30 rounded-md">
-              <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim mb-1">
-                Selected project
-              </p>
-              <p className="text-sm font-mono text-text-primary truncate">
-                {data.path}
-              </p>
+              <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim mb-1">Selected project</p>
+              <p className="text-sm font-mono text-text-primary truncate">{data.path}</p>
             </div>
           )}
 

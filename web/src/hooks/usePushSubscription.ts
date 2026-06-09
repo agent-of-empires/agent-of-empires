@@ -26,26 +26,19 @@ export type PushState =
   | { kind: "disabled-by-server" }
   | { kind: "error"; message: string };
 
-const isIOS = () =>
-  typeof navigator !== "undefined" &&
-  /iPad|iPhone|iPod/.test(navigator.userAgent);
+const isIOS = () => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
 
 const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
   // iOS uses navigator.standalone; other platforms use the display-mode
   // media query. Both are worth checking.
-  const ios =
-    (window.navigator as unknown as { standalone?: boolean }).standalone ===
-    true;
+  const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
   const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
 
 const supportsPush = (): boolean =>
-  typeof window !== "undefined" &&
-  "serviceWorker" in navigator &&
-  "PushManager" in window &&
-  "Notification" in window;
+  typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
 /** Web Push requires a secure context. Localhost and 127.0.0.1 are
  *  allowed over http for dev, but any LAN IP or hostname must be

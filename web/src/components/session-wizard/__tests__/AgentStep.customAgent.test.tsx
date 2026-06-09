@@ -100,9 +100,7 @@ describe("AgentStep custom-agent selection (#1252)", () => {
 
     expect(getByRole("button", { name: /claude/ })).toBeTruthy();
     expect(getByRole("button", { name: /remote-helper/ })).toBeTruthy();
-    expect(
-      queryByRole("button", { name: "uninstalled-builtin", exact: true }),
-    ).toBeNull();
+    expect(queryByRole("button", { name: "uninstalled-builtin", exact: true })).toBeNull();
     expect(queryAllByText("Custom").length).toBeGreaterThan(0);
   });
 
@@ -119,11 +117,7 @@ describe("AgentStep custom-agent selection (#1252)", () => {
       tool: "remote-helper",
       agents: [builtin, custom],
     });
-    expect(
-      getByText(
-        /Custom agents run in the terminal unless they define agent_acp_cmd/,
-      ),
-    ).toBeTruthy();
+    expect(getByText(/Custom agents run in the terminal unless they define agent_acp_cmd/)).toBeTruthy();
   });
 
   it("renders the structured view card for a custom agent that is acp_capable", () => {
@@ -134,9 +128,7 @@ describe("AgentStep custom-agent selection (#1252)", () => {
       agents: [builtin, acpCustom],
     });
     expect(getByRole("switch", { name: "Use structured view" })).toBeTruthy();
-    expect(
-      getByText(/Renders the agent's plan, tool calls, and diffs/),
-    ).toBeTruthy();
+    expect(getByText(/Renders the agent's plan, tool calls, and diffs/)).toBeTruthy();
     expect(queryByText(/Custom agents run in the terminal/)).toBeNull();
   });
 
@@ -162,10 +154,7 @@ describe("AgentStep custom-agent selection (#1252)", () => {
 });
 
 describe("AgentStep profile description (#949)", () => {
-  function renderWithProfiles(
-    profiles: ProfileInfo[],
-    dataOverrides: Partial<typeof initialData> = {},
-  ) {
+  function renderWithProfiles(profiles: ProfileInfo[], dataOverrides: Partial<typeof initialData> = {}) {
     const onChange = vi.fn();
     const onApplyProfileDefaults = vi.fn();
     const utils = render(
@@ -266,9 +255,7 @@ describe("AgentStep profile description (#949)", () => {
       ],
       { profile: "work", profileDirty: true },
     );
-    expect(
-      getByText(/\(Custom\) Settings differ from preset defaults/),
-    ).toBeTruthy();
+    expect(getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
   });
 
   it("confirms before switching profiles when settings are dirty (canceled)", () => {
@@ -293,9 +280,7 @@ describe("AgentStep profile description (#949)", () => {
   it("hides the profile picker when only a single profile exists", () => {
     // Guard the showProfilePicker branch: list of length <= 1 hides the
     // picker entirely so the Workflow preset section is not rendered.
-    const { queryByText } = renderWithProfiles([
-      { name: "default", is_default: true, description: "Stock setup" },
-    ]);
+    const { queryByText } = renderWithProfiles([{ name: "default", is_default: true, description: "Stock setup" }]);
     expect(queryByText("Workflow preset")).toBeNull();
   });
 });
@@ -316,11 +301,7 @@ describe("ReviewStep agent row (#1252)", () => {
         error={null}
         onSubmit={() => {}}
         onJumpTo={() => {}}
-        steps={
-          [{ id: "agent", label: "Agent" }] as Parameters<
-            typeof ReviewStep
-          >[0]["steps"]
-        }
+        steps={[{ id: "agent", label: "Agent" }] as Parameters<typeof ReviewStep>[0]["steps"]}
       />,
     );
   }

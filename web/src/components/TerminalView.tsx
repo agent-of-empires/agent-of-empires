@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -35,9 +29,7 @@ const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
 export function TerminalView({ session, active = true }: Props) {
-  const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
-    "pending",
-  );
+  const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const {
     containerRef,
@@ -50,13 +42,7 @@ export function TerminalView({ session, active = true }: Props) {
     ctrlActiveRef,
     clearCtrlRef,
     maxRetries,
-  } = useTerminal(
-    ensureState === "ready" ? session.id : null,
-    "ws",
-    active,
-    session.claude_fullscreen,
-    active,
-  );
+  } = useTerminal(ensureState === "ready" ? session.id : null, "ws", active, session.claude_fullscreen, active);
   const { isMobile, keyboardOpen, keyboardOcclusion } = useMobileKeyboard();
   const [trackedSessionId, setTrackedSessionId] = useState(session.id);
   if (session.id !== trackedSessionId) {
@@ -226,10 +212,7 @@ export function TerminalView({ session, active = true }: Props) {
         <span className="text-xs text-status-error max-w-md break-words">
           {ensureError ?? "Could not start session."}
         </span>
-        <button
-          onClick={retryEnsure}
-          className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-        >
+        <button onClick={retryEnsure} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
           Retry
         </button>
       </div>
@@ -241,14 +224,10 @@ export function TerminalView({ session, active = true }: Props) {
   // closes. The hook debounces the occlusion so one open/close is one PTY
   // resize, not a storm during the keyboard animation.
   const rootStyle = {
-    paddingBottom:
-      appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
+    paddingBottom: appliedKeyboardPadding > 0 ? appliedKeyboardPadding : undefined,
   } as const;
   return (
-    <div
-      className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5"
-      style={rootStyle}
-    >
+    <div className="flex-1 flex flex-col overflow-hidden relative md:bg-surface-800 md:pb-1.5" style={rootStyle}>
       {/* Top-right view switch, a discreet pill that lets the
           user flip this session into structured view mode. Only enabled
           for tools whose ACP adapter we ship. */}
@@ -265,24 +244,21 @@ export function TerminalView({ session, active = true }: Props) {
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">
-            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/
-            {maxRetries})
+            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/{maxRetries})
           </span>
         </div>
       )}
-      {!state.connected &&
-        !state.reconnecting &&
-        state.retryCount >= maxRetries && (
-          <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-            <span className="text-xs text-status-error">Connection lost</span>
-            <button
-              onClick={manualReconnect}
-              className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-            >
-              Retry
-            </button>
-          </div>
-        )}
+      {!state.connected && !state.reconnecting && state.retryCount >= maxRetries && (
+        <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+          <span className="text-xs text-status-error">Connection lost</span>
+          <button
+            onClick={manualReconnect}
+            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <div
         data-term="agent"
@@ -290,11 +266,7 @@ export function TerminalView({ session, active = true }: Props) {
         onFocus={() => setTermFocused(true)}
         onBlur={() => setTermFocused(false)}
       >
-        <div
-          ref={containerRef}
-          className="absolute inset-0"
-          onPointerDown={activate}
-        />
+        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
 
         {state.connected && !state.isPrimary && (
           <div
@@ -321,13 +293,9 @@ export function TerminalView({ session, active = true }: Props) {
           </div>
         )}
 
-        {isMobile && state.isInScrollback && (
-          <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />
-        )}
+        {isMobile && state.isInScrollback && <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />}
 
-        {isMobile && state.connected && (
-          <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />
-        )}
+        {isMobile && state.connected && <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />}
       </div>
 
       {isMobile && state.connected && (

@@ -59,11 +59,7 @@ function session(over: Partial<SessionResponse> = {}): SessionResponse {
   };
 }
 
-function workspace(
-  id: string,
-  sessions: SessionResponse[],
-  over: Partial<Workspace> = {},
-): Workspace {
+function workspace(id: string, sessions: SessionResponse[], over: Partial<Workspace> = {}): Workspace {
   return {
     id,
     branch: null,
@@ -92,25 +88,15 @@ describe("buildSessionGroups", () => {
   it("orders within-group rows by attention when sortMode is attention (#1640)", () => {
     const groups = build(
       [
-        workspace("w-running", [
-          session({ id: "r", group_path: "feature", status: "Running" }),
-        ]),
-        workspace("w-waiting", [
-          session({ id: "w", group_path: "feature", status: "Waiting" }),
-        ]),
-        workspace("w-idle", [
-          session({ id: "i", group_path: "feature", status: "Idle" }),
-        ]),
+        workspace("w-running", [session({ id: "r", group_path: "feature", status: "Running" })]),
+        workspace("w-waiting", [session({ id: "w", group_path: "feature", status: "Waiting" })]),
+        workspace("w-idle", [session({ id: "i", group_path: "feature", status: "Idle" })]),
       ],
       () => false,
       "attention",
     );
     const feature = groups.find((g) => g.id === "feature")!;
-    expect(feature.workspaces.map((v) => v.workspace.id)).toEqual([
-      "w-waiting",
-      "w-idle",
-      "w-running",
-    ]);
+    expect(feature.workspaces.map((v) => v.workspace.id)).toEqual(["w-waiting", "w-idle", "w-running"]);
   });
 
   it("buckets workspaces by group_path, named groups alphabetical", () => {
@@ -136,10 +122,7 @@ describe("buildSessionGroups", () => {
 
   it("splits a workspace whose sessions span groups, slicing sessions", () => {
     const groups = build([
-      workspace("w1", [
-        session({ id: "a", group_path: "feature" }),
-        session({ id: "b", group_path: "fix" }),
-      ]),
+      workspace("w1", [session({ id: "a", group_path: "feature" }), session({ id: "b", group_path: "fix" })]),
     ]);
     expect(groups.map((g) => g.id)).toEqual(["feature", "fix"]);
 
@@ -154,18 +137,12 @@ describe("buildSessionGroups", () => {
     expect(feature.workspaces[0]!.key).not.toBe(fix.workspaces[0]!.key);
 
     // Each view carries only its group's sessions.
-    expect(feature.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual([
-      "a",
-    ]);
-    expect(fix.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual([
-      "b",
-    ]);
+    expect(feature.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
+    expect(fix.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
   });
 
   it("trims and normalizes whitespace-only group_path into Ungrouped", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "   " })]),
-    ]);
+    const groups = build([workspace("w1", [session({ id: "s1", group_path: "   " })])]);
     expect(groups.map((g) => g.id)).toEqual([UNGROUPED_GROUP_ID]);
   });
 
@@ -176,33 +153,22 @@ describe("buildSessionGroups", () => {
       workspace("w3", [session({ id: "c", group_path: "/feature" })]),
     ]);
     expect(groups.map((g) => g.id)).toEqual(["feature"]);
-    expect(groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual([
-      "w1",
-      "w2",
-      "w3",
-    ]);
+    expect(groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["w1", "w2", "w3"]);
   });
 
   it("uses the leaf segment of a nested path as the display name", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "feature/auth" })]),
-    ]);
+    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature/auth" })])]);
     expect(groups[0]!.id).toBe("feature/auth");
     expect(groups[0]!.displayName).toBe("auth");
   });
 
   it("reflects collapse state from the isCollapsed lookup", () => {
-    const groups = build(
-      [workspace("w1", [session({ id: "s1", group_path: "feature" })])],
-      (id) => id === "feature",
-    );
+    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])], (id) => id === "feature");
     expect(groups[0]!.collapsed).toBe(true);
   });
 
   it("session groups expose no repo-only affordances", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "feature" })]),
-    ]);
+    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])]);
     expect(groups[0]!.capabilities).toEqual({
       appearance: false,
       reorder: false,
@@ -242,9 +208,7 @@ describe("repoGroupToSidebarGroup", () => {
   });
 
   it("gives synthetic repo buckets a generic create action", () => {
-    const sg = repoGroupToSidebarGroup(
-      repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID }),
-    );
+    const sg = repoGroupToSidebarGroup(repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID }));
     expect(sg.capabilities.create).toBe("generic");
     expect(sg.capabilities.appearance).toBe(true);
   });
@@ -269,8 +233,7 @@ describe("buildNestedSidebarGroups", () => {
 
   const buildNested = (
     repoGroups: RepoGroup[],
-    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () =>
-      false,
+    isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean = () => false,
     sortMode: SidebarSortMode = "lastActivity",
   ) =>
     buildNestedSidebarGroups(repoGroups, {
@@ -292,9 +255,7 @@ describe("buildNestedSidebarGroups", () => {
     expect(nested[0]!.repo.kind).toBe("repo");
     expect(nested[0]!.repo.repoPath).toBe("/repo-a");
     expect(nested[0]!.subgroups.map((sg) => sg.id)).toEqual(["feature", "fix"]);
-    expect(nested[0]!.subgroups.every((sg) => sg.kind === "sessionGroup")).toBe(
-      true,
-    );
+    expect(nested[0]!.subgroups.every((sg) => sg.kind === "sessionGroup")).toBe(true);
   });
 
   it("drops manual reorder on the repo header (nested axis has no order)", () => {
@@ -320,9 +281,7 @@ describe("buildNestedSidebarGroups", () => {
     ]);
     const ids = nested[0]!.subgroups.map((sg) => sg.id);
     expect(ids).toEqual(["feature", UNGROUPED_GROUP_ID]);
-    const ungrouped = nested[0]!.subgroups.find(
-      (sg) => sg.id === UNGROUPED_GROUP_ID,
-    )!;
+    const ungrouped = nested[0]!.subgroups.find((sg) => sg.id === UNGROUPED_GROUP_ID)!;
     expect(ungrouped.groupPath).toBe("");
   });
 
@@ -330,10 +289,7 @@ describe("buildNestedSidebarGroups", () => {
     const nested = buildNested([
       repoGroup({
         workspaces: [
-          workspace("w1", [
-            session({ id: "a", group_path: "feature" }),
-            session({ id: "b", group_path: "fix" }),
-          ]),
+          workspace("w1", [session({ id: "a", group_path: "feature" }), session({ id: "b", group_path: "fix" })]),
         ],
       }),
     ]);
@@ -341,12 +297,8 @@ describe("buildNestedSidebarGroups", () => {
     expect(feature!.workspaces[0]!.workspace.id).toBe("w1");
     expect(fix!.workspaces[0]!.workspace.id).toBe("w1");
     expect(feature!.workspaces[0]!.key).not.toBe(fix!.workspaces[0]!.key);
-    expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(
-      ["a"],
-    );
-    expect(fix!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual([
-      "b",
-    ]);
+    expect(feature!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
+    expect(fix!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
   });
 
   it("keys subgroup collapse on (repoId, groupPath), not group id alone", () => {
@@ -355,9 +307,7 @@ describe("buildNestedSidebarGroups", () => {
         repoGroup({
           id: "/repo-a",
           repoPath: "/repo-a",
-          workspaces: [
-            workspace("w1", [session({ id: "a", group_path: "feature" })]),
-          ],
+          workspaces: [workspace("w1", [session({ id: "a", group_path: "feature" })])],
         }),
         repoGroup({
           id: "/repo-b",
@@ -394,9 +344,7 @@ describe("buildNestedSidebarGroups", () => {
 
     const live = buildNested([
       repoGroup({
-        workspaces: [
-          workspace("w1", [session({ id: "a", group_path: "feature" })]),
-        ],
+        workspaces: [workspace("w1", [session({ id: "a", group_path: "feature" })])],
       }),
     ]);
     expect(nestedSidebarGroupHasLiveWorkspace(live[0]!)).toBe(true);
@@ -418,9 +366,7 @@ describe("sidebarGroupHasLiveWorkspace", () => {
   });
 
   it("is true when at least one workspace is live", () => {
-    const groups = build([
-      workspace("w1", [session({ id: "s1", group_path: "feature" })]),
-    ]);
+    const groups = build([workspace("w1", [session({ id: "s1", group_path: "feature" })])]);
     expect(sidebarGroupHasLiveWorkspace(groups[0]!)).toBe(true);
   });
 });

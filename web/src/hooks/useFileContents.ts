@@ -22,9 +22,7 @@ export function useFileContents(
   /** Triggers a re-fetch when bumped (e.g. from useDiffFiles.revision). */
   externalRevision?: number,
 ): UseFileContentsResult {
-  const [contents, setContents] = useState<RichFileContentsResponse | null>(
-    null,
-  );
+  const [contents, setContents] = useState<RichFileContentsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestIdRef = useRef(0);
@@ -40,11 +38,7 @@ export function useFileContents(
     const capturedRepoName = repoName;
     setLoading(true);
     setError(null);
-    const resp = await getSessionFileContents(
-      capturedSessionId,
-      capturedFilePath,
-      capturedRepoName,
-    );
+    const resp = await getSessionFileContents(capturedSessionId, capturedFilePath, capturedRepoName);
     // Drop stale responses from rapid file/session switches.
     if (
       reqId !== requestIdRef.current ||
