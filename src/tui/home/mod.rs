@@ -1892,7 +1892,11 @@ impl HomeView {
         // inode, and notify NonRecursive watches do not auto-reattach.
         // Compare each prior entry's stored canonical_dir against the
         // current canonical resolution; mismatch forces a rewire even
-        // when the name set is unchanged.
+        // when the name set is unchanged. Resolution goes through the
+        // non-creating `get_profile_dir_path`; `get_profile_dir` calls
+        // `fs::create_dir_all`, which recreates a profile directory
+        // the user just deleted and re-surfaces it in `list_profiles()`
+        // on the next heartbeat.
         let inode_invalidated: Vec<String> = prior_profiles
             .iter()
             .filter(|name| {
@@ -1903,7 +1907,7 @@ impl HomeView {
                     Some(e) => e,
                     None => return false,
                 };
-                let current_canonical = crate::session::get_profile_dir(name)
+                let current_canonical = crate::session::get_profile_dir_path(name)
                     .ok()
                     .and_then(|p| std::fs::canonicalize(&p).ok());
                 match current_canonical {

@@ -189,6 +189,52 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
     );
 }
 
+/// Locks the resurrection-prevention invariant for
+/// `rewire_config_subscriptions`: the inode-invalidation pre-pass
+/// resolves profile paths through the non-creating
+/// `get_profile_dir_path`, so a deleted profile directory stays
+/// deleted when a subsequent rewire iterates it in `prior_profiles`.
+#[tokio::test]
+#[serial]
+async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
+    use super::ConfigWatchKey;
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let profile_dir = crate::session::get_profile_dir("ghost").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("ghost".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    view.rewire_config_subscriptions(&["ghost".to_string()])
+        .expect("install profile sub");
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("ghost")),
+        "precondition: profile config sub installed"
+    );
+
+    std::fs::remove_dir_all(&profile_dir).expect("delete profile dir");
+    assert!(
+        !profile_dir.exists(),
+        "precondition: profile dir is gone before the rewire pre-pass runs"
+    );
+
+    view.rewire_config_subscriptions(&[])
+        .expect("rewire after delete");
+
+    assert!(
+        !profile_dir.exists(),
+        "the inode-invalidation pre-pass must use a non-creating resolver; \
+         a deleted profile directory stays deleted across rewire"
+    );
+}
+
 /// In single-profile mode, `reload_storage_only` keeps disk
 /// subscriptions scoped to `self.storages.keys()` (just the active
 /// profile) while config subscriptions cover the full on-disk
