@@ -133,13 +133,17 @@ fn watch_paths_resolve_in_a_normal_checkout() {
 }
 
 #[test]
-fn git_watch_paths_empty_outside_a_repo() {
+fn git_watch_paths_empty_when_git_cannot_resolve() {
     if !git_available() {
         eprintln!("skipping: git not available");
         return;
     }
+    // Point at a path with no repository so `git -C` fails: resolution yields
+    // nothing and the build version stays pinned to CARGO_PKG_VERSION with no
+    // rerun trigger (the source-tarball / no-VCS fallback). Using a
+    // nonexistent directory keeps this deterministic regardless of whether the
+    // system temp dir happens to sit inside a git repository.
     let tmp = tempfile::tempdir().expect("tempdir");
-    // A bare directory with no git repository: resolution yields nothing, so
-    // the build version stays pinned to CARGO_PKG_VERSION with no rerun trigger.
-    assert!(build_git_watch::git_watch_paths(tmp.path()).is_empty());
+    let no_repo = tmp.path().join("nonexistent");
+    assert!(build_git_watch::git_watch_paths(&no_repo).is_empty());
 }
