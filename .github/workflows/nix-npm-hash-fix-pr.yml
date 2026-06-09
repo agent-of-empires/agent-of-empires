@@ -22,7 +22,7 @@ permissions:
 jobs:
   auto-fix:
     name: Compute and apply hash
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: github.event.pull_request.state == 'open'
 
     steps:
