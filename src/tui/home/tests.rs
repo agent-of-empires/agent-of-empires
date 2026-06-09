@@ -6712,8 +6712,8 @@ mod click_to_select {
         // live-sending must leave live mode (otherwise keystrokes stay aimed at
         // the old session while the cursor/preview walk away). The click still
         // emits no action and still moves the cursor.
-        use super::live_send::{LiveSendState, LiveSendTarget};
         use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;
@@ -6747,8 +6747,8 @@ mod click_to_select {
     fn select_only_click_on_live_row_stays_live() {
         // Clicking the row that's already live-sending is not a "leave" gesture:
         // the cursor is already there, so SelectOnly must not tear down live mode.
-        use super::live_send::{LiveSendState, LiveSendTarget};
         use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         // Row 3 resolves to index 2, so make index 2 the live row.
