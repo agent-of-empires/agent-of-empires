@@ -57,23 +57,18 @@ fn project_group_name(inst: &Instance) -> String {
         return "scratch".to_string();
     }
 
-    let base_path = inst
-        .worktree_info
+    crate::session::projects::repo_label(project_repo_path(inst))
+}
+
+/// The repo path a session groups under in project view: its worktree's main
+/// repo when present, else its launch path. Shared by the group label and the
+/// pin action so a pinned project registers the same path the header derives
+/// from.
+fn project_repo_path(inst: &Instance) -> &str {
+    inst.worktree_info
         .as_ref()
         .map(|wt| wt.main_repo_path.as_str())
-        .unwrap_or(&inst.project_path);
-
-    let path = std::path::Path::new(base_path);
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            // For root paths like "/", use a readable fallback
-            if base_path == "/" || base_path.is_empty() {
-                "(root)".to_string()
-            } else {
-                base_path.to_string()
-            }
-        })
+        .unwrap_or(&inst.project_path)
 }
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
@@ -394,6 +389,9 @@ pub(super) const ICON_STOPPED: &str = "⠒";
 pub(super) const ICON_DELETING: &str = "✕";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
+/// Marks a pinned project header in project view. Geometric per DESIGN.md
+/// (clean readable glyphs, not emoji).
+pub(super) const ICON_PINNED: &str = "◆";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -454,6 +452,12 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
+    /// Merged project registry (global + active profile), refreshed on reload
+    /// and after a pin/unpin. Project view injects the registered projects
+    /// with no live sessions as empty "pinned" headers, and the renderer reads
+    /// it to mark pinned headers. Mirrors the WebUI, where an empty project is
+    /// just a registry entry decoupled from any session.
+    pub(super) registered_projects: Vec<crate::session::Project>,
 
     // Dialogs
     pub(super) show_help: bool,
@@ -1086,6 +1090,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: HashMap::new(),
+            registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
             new_dialog: None,
@@ -1316,6 +1321,7 @@ impl HomeView {
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
 
+        view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
         let initial_profiles: Vec<String> = view.storages.keys().cloned().collect();
@@ -1416,6 +1422,10 @@ impl HomeView {
             .iter()
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
+        // Refresh the project registry so project view's empty pinned headers
+        // and pin indicators reflect the current on-disk registry.
+        self.refresh_registered_projects();
+
         // Remember what the cursor was pointing at so we can follow it
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
@@ -3085,7 +3095,27 @@ impl HomeView {
             .filter(|i| !i.is_archived())
             .cloned()
             .collect();
-        let mut tree = GroupTree::new_with_groups(&tree_seed, &[]);
+
+        // Surface registered projects with no live session as empty "pinned"
+        // headers, so a project can persist in the view without any sessions,
+        // matching the WebUI where an empty project is just a registry entry.
+        // Seed them as empty groups; their headers render even with zero
+        // members (the phantom-header guard above only excludes archived-only
+        // session groups, not deliberately pinned ones).
+        let populated_labels: std::collections::HashSet<String> = tree_seed
+            .iter()
+            .map(|i| i.group_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let empty_pinned: Vec<crate::session::Group> =
+            crate::session::projects::unpopulated_projects(
+                &populated_labels,
+                &self.registered_projects,
+            )
+            .into_iter()
+            .map(|p| crate::session::Group::new(&p.label, &p.label))
+            .collect();
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &empty_pinned);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -4266,6 +4296,42 @@ impl HomeView {
         self.active_profile
             .clone()
             .unwrap_or_else(crate::session::config::resolve_default_profile)
+    }
+
+    /// Reload the merged project registry into `registered_projects`. Called on
+    /// every storage reload and after a pin/unpin so the project view's empty
+    /// headers and pin indicators track the on-disk registry.
+    pub(super) fn refresh_registered_projects(&mut self) {
+        let profile = self.config_profile();
+        self.registered_projects =
+            crate::session::projects::load_merged(&profile).unwrap_or_default();
+    }
+
+    /// Whether a project-view header `label` is backed by a registered
+    /// (pinned) project. Used for the pin indicator and to decide whether the
+    /// pin toggle adds or removes the registry entry.
+    pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
+        self.registered_projects
+            .iter()
+            .any(|p| crate::session::projects::repo_label(&p.path) == label)
+    }
+
+    /// The project-view header label under the cursor when it is a real,
+    /// pinnable project: project grouping is active, the cursor is on a group
+    /// header, and that header is neither the synthetic Archived section nor
+    /// the `scratch` bucket (scratch sessions have no backing repo to pin).
+    pub(super) fn project_group_at_cursor(&self) -> Option<String> {
+        if self.group_by != GroupByMode::Project {
+            return None;
+        }
+        match self.flat_items.get(self.cursor) {
+            Some(Item::Group { path, name, .. })
+                if !crate::session::is_within_archived_section(path) && name != "scratch" =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Resolve the effective `SessionConfig` for an existing session

@@ -9,7 +9,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_STOPPED, ICON_UNKNOWN,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
 };
 use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
@@ -918,7 +918,18 @@ impl HomeView {
                 } else {
                     ICON_EXPANDED
                 };
-                let text = Cow::Owned(format!("{} ({})", name, session_count));
+                // Mark pinned project headers with a trailing pin glyph so an
+                // empty (sessionless) pinned project still reads as deliberate
+                // rather than stale. Project view only; the registry lookup is
+                // keyed by the header label.
+                let pinned = self.group_by == GroupByMode::Project
+                    && !crate::session::is_within_archived_section(path)
+                    && self.is_project_label_pinned(name);
+                let text = if pinned {
+                    Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
+                } else {
+                    Cow::Owned(format!("{} ({})", name, session_count))
+                };
                 let mut style = Style::default().fg(theme.group).bold();
                 if crate::session::is_within_archived_section(path) {
                     // Synthetic Archived section header (and any

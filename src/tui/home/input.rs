@@ -1998,6 +1998,7 @@ impl HomeView {
             view_mode: self.view_mode.clone(),
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
         };
         if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
             return self.run_action(id, update_info);
@@ -2181,6 +2182,7 @@ impl HomeView {
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
+            ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
         }
         None
@@ -3092,7 +3094,13 @@ impl HomeView {
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
-            self.context_menu = Some(if is_group {
+            // A real project header in project view gets the pin menu; the
+            // cursor was just moved onto this row, so `project_group_at_cursor`
+            // reflects it. Manual/synthetic group rows keep Rename/Delete.
+            let project_label = self.project_group_at_cursor();
+            self.context_menu = Some(if let Some(label) = project_label {
+                ContextMenuDialog::for_project_group(anchor, self.is_project_label_pinned(&label))
+            } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
                 let is_archived = match &self.flat_items[idx] {
@@ -3173,6 +3181,12 @@ impl HomeView {
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
+            ContextMenuAction::TogglePin => {
+                // The right-click already moved the cursor onto the project
+                // header, so the toggle acts on the same project the menu was
+                // opened for.
+                self.toggle_project_pin_at_cursor();
+            }
         }
     }
 

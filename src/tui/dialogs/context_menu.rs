@@ -21,6 +21,9 @@ pub enum ContextMenuAction {
     OpenSortPicker,
     /// Open the group-by mode picker (mirrors `'g'`).
     OpenGroupPicker,
+    /// Pin or unpin the project header (project view only; mirrors `'p'`). The
+    /// menu label flips to "Unpin project" when the project is already pinned.
+    TogglePin,
 }
 
 pub struct ContextMenuDialog {
@@ -81,6 +84,20 @@ impl ContextMenuDialog {
                 (ContextMenuAction::Delete, "Delete Group"),
             ],
         )
+    }
+
+    /// Menu for a project header in project view. Project groups are
+    /// automatic, so Rename/Delete don't apply (they'd only show the
+    /// "Project groups are automatic" info dialog). The one meaningful action
+    /// is pinning the project so it persists without any sessions. The label
+    /// flips based on the current pinned state.
+    pub fn for_project_group(anchor: (u16, u16), is_pinned: bool) -> Self {
+        let pin_label = if is_pinned {
+            "Unpin project"
+        } else {
+            "Pin project"
+        };
+        Self::new(anchor, vec![(ContextMenuAction::TogglePin, pin_label)])
     }
 
     /// Menu shown when the user right-clicks the empty area of the
@@ -208,6 +225,7 @@ impl ContextMenuDialog {
                     'n' | 'N' => Some(ContextMenuAction::NewSession),
                     'o' | 'O' => Some(ContextMenuAction::OpenSortPicker),
                     'g' | 'G' => Some(ContextMenuAction::OpenGroupPicker),
+                    'p' | 'P' => Some(ContextMenuAction::TogglePin),
                     _ => None,
                 };
                 match action {
@@ -404,6 +422,35 @@ mod tests {
             result,
             DialogResult::Submit(ContextMenuAction::Delete)
         ));
+    }
+
+    #[test]
+    fn project_group_menu_labels_flip_on_pin_state() {
+        let unpinned = ContextMenuDialog::for_project_group((0, 0), false);
+        let labels: Vec<&str> = unpinned.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["Pin project"]);
+
+        let pinned = ContextMenuDialog::for_project_group((0, 0), true);
+        let labels: Vec<&str> = pinned.items_for_test().iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["Unpin project"]);
+    }
+
+    #[test]
+    fn p_hotkey_submits_toggle_pin() {
+        let mut menu = ContextMenuDialog::for_project_group((0, 0), false);
+        let result = menu.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(
+            result,
+            DialogResult::Submit(ContextMenuAction::TogglePin)
+        ));
+    }
+
+    #[test]
+    fn p_hotkey_inert_on_session_menu() {
+        // The session menu has no pin entry, so `p` must not fire it.
+        let mut menu = ContextMenuDialog::for_session((0, 0), false);
+        let result = menu.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(result, DialogResult::Continue));
     }
 
     #[test]

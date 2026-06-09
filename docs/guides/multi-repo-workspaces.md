@@ -76,6 +76,10 @@ aoe project add /repo/foo                              # global
 aoe -p other project add /repo/foo --allow-override    # profile shadows global
 ```
 
+### Pinning a project from the TUI
+
+In the TUI's project view (press `g` and pick Project grouping), a project header normally disappears once its last session is gone. Press `p` on a project header, or pick "Pin project" from its right-click menu, to register that repo in the global registry. A pinned project keeps its header (marked with a `◆`) even with zero sessions, so you can launch new work under it later, mirroring the web dashboard, where a project is a registry entry independent of any session. Press `p` again to unpin; an unpinned project drops from the view once it has no sessions.
+
 ## CLI Reference
 
 ```bash

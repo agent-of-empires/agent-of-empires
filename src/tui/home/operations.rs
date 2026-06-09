@@ -22,6 +22,92 @@ fn humanize_minutes(m: u32) -> String {
 }
 
 impl HomeView {
+    /// Pin or unpin the project header under the cursor (project view only).
+    ///
+    /// Pinning registers the repo in the global project registry (the same
+    /// store the WebUI writes), so the project keeps its header in project
+    /// view even after its last session is deleted. Unpinning removes the
+    /// registry entry; a project with no remaining sessions then disappears.
+    ///
+    /// The registry is the shared persistence layer: this goes through the
+    /// same `projects::add` / `projects::remove` the web API and the projects
+    /// dialog use, so canonicalization and conflict rules stay in one place.
+    pub(super) fn toggle_project_pin_at_cursor(&mut self) {
+        use crate::session::{projects, Project, ProjectScope};
+        use crate::tui::dialogs::InfoDialog;
+
+        let Some(label) = self.project_group_at_cursor() else {
+            return;
+        };
+        let profile = self.config_profile();
+
+        if self.is_project_label_pinned(&label) {
+            // Unpin: remove the matching registry entry in its own scope. The
+            // merged registry holds one entry per canonical path, so the first
+            // label match is the one backing this header.
+            let Some(existing) = self
+                .registered_projects
+                .iter()
+                .find(|p| projects::repo_label(&p.path) == label)
+                .cloned()
+            else {
+                return;
+            };
+            match projects::remove(&profile, existing.scope, &existing.path) {
+                Ok(_) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Project Unpinned",
+                        &format!(
+                            "'{}' is no longer pinned. It will drop from project view once it has no sessions.",
+                            label
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Unpin Failed",
+                        &format!("Could not unpin: {}", e),
+                    ));
+                }
+            }
+        } else {
+            // Pin: register the repo backing this header. The repo path comes
+            // from a live session in the group (an unpinned header always has
+            // at least one), using the same path the header label derives from.
+            let Some(repo_path) = self
+                .instances
+                .iter()
+                .filter(|i| super::project_group_name(i) == label)
+                .map(|i| super::project_repo_path(i).to_string())
+                .next()
+            else {
+                return;
+            };
+            let project = Project::new(label.clone(), repo_path, ProjectScope::Global);
+            match projects::add(&profile, ProjectScope::Global, project, false) {
+                Ok(_) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Project Pinned",
+                        &format!(
+                            "'{}' is pinned. It will stay in project view even with no sessions.",
+                            label
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Pin Failed",
+                        &format!("Could not pin: {}", e),
+                    ));
+                }
+            }
+        }
+
+        self.refresh_registered_projects();
+        self.flat_items = self.build_flat_items();
+        self.update_selected();
+    }
+
     pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
         let target_profile = data.profile.clone();
 
