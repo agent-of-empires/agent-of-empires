@@ -22,10 +22,7 @@ export function VolumeIgnoresGlobDialog({ globs, onConfirm, onCancel }: Props) {
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  const matchCount = useMemo(
-    () => globs.reduce((sum, g) => sum + g.matched_paths.length, 0),
-    [globs],
-  );
+  const matchCount = useMemo(() => globs.reduce((sum, g) => sum + g.matched_paths.length, 0), [globs]);
 
   const handleConfirm = useCallback(async () => {
     setConfirming(true);
@@ -89,26 +86,24 @@ export function VolumeIgnoresGlobDialog({ globs, onConfirm, onCancel }: Props) {
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            This session's <span className="font-mono text-text-primary">volume_ignores</span> include glob
-            patterns. They are expanded against the workspace now, matching{" "}
-            <span className="text-text-primary">{matchCount}</span> director{matchCount === 1 ? "y" : "ies"}, and
-            one ignore mount is created per match.
+            This session's <span className="font-mono text-text-primary">volume_ignores</span> include glob patterns.
+            They are expanded against the workspace now, matching{" "}
+            <span className="text-text-primary">{matchCount}</span> director{matchCount === 1 ? "y" : "ies"}, and one
+            ignore mount is created per match.
           </p>
 
           <ul className="space-y-1 max-h-40 overflow-y-auto" data-testid="volume-ignores-glob-list">
             {globs.map((g) => (
               <li key={g.pattern} className="text-[13px] text-text-secondary flex items-baseline justify-between gap-3">
                 <span className="font-mono text-text-primary truncate">{g.pattern}</span>
-                <span className="text-text-dim whitespace-nowrap">
-                  {g.matched_paths.length} matched
-                </span>
+                <span className="text-text-dim whitespace-nowrap">{g.matched_paths.length} matched</span>
               </li>
             ))}
           </ul>
 
           <p className="text-[12px] text-text-dim">
-            This is a point-in-time snapshot. Directories a build creates later inside the container are not
-            hidden; re-create the session to pick up new matches.
+            This is a point-in-time snapshot. Directories a build creates later inside the container are not hidden;
+            re-create the session to pick up new matches.
           </p>
 
           <Checkbox
@@ -137,7 +132,15 @@ export function VolumeIgnoresGlobDialog({ globs, onConfirm, onCancel }: Props) {
           >
             {confirming && (
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  fill="none"
+                />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}

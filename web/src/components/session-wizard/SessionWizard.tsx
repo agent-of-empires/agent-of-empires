@@ -408,11 +408,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         )}
       </div>
       {globConfirm && (
-        <VolumeIgnoresGlobDialog
-          globs={globConfirm.globs}
-          onConfirm={handleGlobConfirm}
-          onCancel={handleGlobCancel}
-        />
+        <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={handleGlobCancel} />
       )}
     </div>
   );

@@ -375,13 +375,21 @@
       "id": "wizard.volume-ignores-globs",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": [
-        "tests/wizard-volume-ignores-globs.spec.ts"
-      ],
+      "specs": ["tests/wizard-volume-ignores-globs.spec.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/VolumeIgnoresGlobDialog.tsx"
       ]
+    },
+    {
+      "id": "wizard.volume-ignores-globs.unit",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/session-wizard/__tests__/VolumeIgnoresGlobDialog.test.tsx",
+        "src/lib/__tests__/volumeIgnoresApi.test.ts"
+      ],
+      "components": ["web/src/components/session-wizard/VolumeIgnoresGlobDialog.tsx"]
     },
     {
       "id": "wizard.acp-opt-out",
