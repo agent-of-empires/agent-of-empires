@@ -1459,6 +1459,13 @@ impl App {
             self.update_status = None;
         }
         let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Only hand the renderer the image banner when it's actually the active
+        // one; while a pull is in flight `image_banner_active` is false, so the
+        // banner can't re-render under the "pulling…" toast and clobber itself
+        // (#2072).
+        let image_update = self
+            .image_banner_active()
+            .then_some(self.image_update.as_ref());
         // Reset before the render so a frame that skips the preview path
         // (dialog open, non-home view) reads as zero capture/parse rather
         // than leaking the previous frame's durations.
@@ -1469,7 +1476,7 @@ impl App {
             &self.theme,
             self.update_info.as_ref(),
             status_text,
-            self.image_update.as_ref(),
+            image_update.flatten(),
         );
         // Sampled trace for frame-budget diagnostics. A full-frame trace on
         // every paint would dominate the log at `default_level = trace`, so
@@ -1600,9 +1607,16 @@ impl App {
 
     /// Is the sandbox-image banner the one currently shown? It sits below the
     /// app-update banner and transient toast, so it only owns the `u`/Ctrl+x
-    /// keys when neither of those is up.
+    /// keys when neither of those is up, and it must stay hidden while a pull it
+    /// already started is still running (otherwise it re-arms `u` into the "pull
+    /// already in progress" no-op, #2072).
     fn image_banner_active(&self) -> bool {
-        self.image_update.is_some() && self.update_info.is_none() && self.update_status.is_none()
+        should_show_image_banner(
+            self.image_update.is_some(),
+            self.update_info.is_some(),
+            self.update_status.is_some(),
+            self.image_pull_rx.is_some(),
+        )
     }
 
     /// Spawn the background sandbox-image staleness check. Mirrors
@@ -1657,7 +1671,14 @@ impl App {
         if self.image_pull_rx.is_some() {
             return;
         }
-        self.update_status = Some(UpdateStatus::transient(format!("pulling {image}…")));
+        // Persistent, not transient: a `docker pull` routinely runs longer than
+        // the 10s transient window, and if the toast expired mid-pull the status
+        // line went blank and the (still-`Some`) image banner re-rendered under
+        // it, clobbering itself; pressing `u` again then hit the "pull already in
+        // progress" guard (#2072). `poll_image_pull_status` replaces this with a
+        // transient success/failure toast once the pull resolves. Mirrors the
+        // app-update flow, which is also persistent while the install runs.
+        self.update_status = Some(UpdateStatus::persistent(format!("pulling {image}…")));
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_pull_rx = Some(rx);
         std::thread::spawn(move || {
@@ -1982,6 +2003,22 @@ fn decide_disk_refresh(live_idle: bool, heartbeat_due: bool, dirty: bool) -> Dis
     } else {
         DiskRefreshDecision::None
     }
+}
+
+/// Whether the sandbox-image banner should own the bottom row right now. It is
+/// the lowest-priority banner, so it yields to the app-update banner and any
+/// transient toast, and it stays hidden while a pull it kicked off is still
+/// running. That last clause is the #2072 fix: without it the banner reappeared
+/// the moment the "pulling…" toast cleared, redrawing itself on top of an
+/// in-flight pull and re-arming `u` into the "pull already in progress" no-op.
+/// Factored out of `App::image_banner_active` so the policy is unit-testable.
+fn should_show_image_banner(
+    has_image_update: bool,
+    has_app_update: bool,
+    has_status: bool,
+    pull_in_flight: bool,
+) -> bool {
+    has_image_update && !has_app_update && !has_status && !pull_in_flight
 }
 
 /// Catches reload errors so the tick loop never propagates them. A
@@ -2826,6 +2863,28 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_banner_shows_only_when_it_owns_the_row() {
+        // The plain case: an image update is pending and nothing outranks it.
+        assert!(should_show_image_banner(true, false, false, false));
+        // No pending update: nothing to show.
+        assert!(!should_show_image_banner(false, false, false, false));
+        // The app-update banner and any transient toast both outrank it.
+        assert!(!should_show_image_banner(true, true, false, false));
+        assert!(!should_show_image_banner(true, false, true, false));
+    }
+
+    #[test]
+    fn image_banner_stays_hidden_while_its_own_pull_runs() {
+        // #2072: once the user accepts the pull, the banner must stay down for
+        // the whole `docker pull`. Even after the "pulling…" toast clears
+        // (has_status = false) the in-flight pull keeps the banner hidden, so it
+        // can't redraw under the pull and re-arm `u` into "pull already in
+        // progress".
+        assert!(!should_show_image_banner(true, false, false, true));
+        assert!(!should_show_image_banner(true, false, true, true));
+    }
 
     #[test]
     fn ctrl_q_never_quits() {
