@@ -234,6 +234,10 @@ pub async fn reconcile_acp_workers(
     // block legitimate spawns until the next tick. Do not reorder.
     sweep_orphan_workers(state, &live).await;
 
+    // Re-adopt live orphan runners (#1890) before the work-list loop, which
+    // skips every `attempted` id. See `readopt_orphan_runners`.
+    readopt_orphan_runners(state, attempted).await;
+
     // Build the work list. Skip ids already in `attempted` (a
     // permanently-failing spawn shouldn't loop every tick) and ids the
     // supervisor already knows about (REST-triggered spawn or
@@ -703,6 +707,20 @@ enum AdoptDecision {
     /// Live worker on an older binary mid-turn: adopt to keep the turn
     /// streaming, then respawn at the next idle boundary.
     AdoptStaleForDrain,
+}
+
+/// Decide whether a session currently pinned in the reconciler's
+/// `attempted` set should be dropped so the resume pass can re-adopt its
+/// live on-disk runner. `running` folds the in-memory worker AND any
+/// in-flight resume reservation (`Supervisor::is_running`); `has_live_runner`
+/// is a live registry record (PID alive + socket present). A session with a
+/// live runner but no in-memory presence is the orphan-after-failed-handshake
+/// state (#1890): the runner is serving on its socket but the daemon never
+/// reattached, so every prompt 404s. A running session (healthy or mid-spawn)
+/// is left alone. Pure so the policy is unit-testable without a daemon,
+/// mirroring `adopt_decision`.
+fn should_readopt_orphan_runner(running: bool, has_live_runner: bool) -> bool {
+    !running && has_live_runner
 }
 
 fn adopt_decision(live: bool, build_current: bool, in_flight_turn: bool) -> AdoptDecision {
@@ -1287,6 +1305,46 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
+/// Re-adopt live orphan runners. A fresh spawn whose in-memory handshake
+/// fails or times out can leave its DETACHED runner alive and registered on
+/// disk: the runner binds its socket and writes its registry entry BEFORE the
+/// handshake completes, and `connect_via_socket`'s error/timeout path does not
+/// kill it (the runner owns the agent and survives daemon death by design).
+/// Such a session is left in `attempted` with no in-memory worker, so the
+/// reconciler's work-list loop skips it forever and the live runner is never
+/// reattached, so every prompt 404s even though `aoe acp ps` shows the worker
+/// alive.
+///
+/// This is the live-session mirror of `sweep_orphan_workers`, which only reaps
+/// runners whose session is GONE; here the session IS live, so clear it from
+/// `attempted` and let the same tick's resume pass adopt the runner over its
+/// socket. The respawn budget still bounds a genuinely-wedged runner: a record
+/// that can't be reattached burns a budget slot per tick and parks after the
+/// cap rather than looping. A worker that is in-memory or mid-spawn reports
+/// `is_running`, so the healthy and in-flight cases are left untouched. See
+/// #1890.
+async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
+    let mut readopt: Vec<String> = Vec::new();
+    for id in attempted.iter() {
+        let running = state.acp_supervisor.is_running(id).await;
+        // Skip the registry disk read on the hot path: only a non-running
+        // session can possibly be a readopt candidate.
+        if running {
+            continue;
+        }
+        let has_live_runner = matches!(
+            crate::acp::worker_registry::load(id),
+            Ok(Some(record)) if crate::acp::worker_registry::is_record_live(&record)
+        );
+        if should_readopt_orphan_runner(running, has_live_runner) {
+            readopt.push(id.clone());
+        }
+    }
+    for id in readopt {
+        attempted.remove(&id);
+    }
+}
+
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     // Sweep registry entries whose session no longer exists (deleted
     // while serve was down) and SIGTERM the orphan runner so the user
@@ -1330,8 +1388,8 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, rate_limit_resume_at, should_auto_stop, AdoptDecision,
-        RATE_LIMIT_MIN_PARK_SECS,
+        adopt_decision, rate_limit_resume_at, should_auto_stop, should_readopt_orphan_runner,
+        AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
 
@@ -1385,6 +1443,26 @@ mod tests {
             "other-sess",
             now
         ));
+    }
+
+    // --- live orphan runner re-adoption (#1890) ---
+
+    /// The only state that should drop a session from `attempted` for
+    /// re-adoption is "no in-memory worker / reservation, but a live runner
+    /// on disk": a fresh spawn whose handshake failed while the detached
+    /// runner stayed up. A running session (healthy or mid-spawn) is never
+    /// disturbed, and a session with no live runner stays parked under the
+    /// respawn budget instead of being poked every tick.
+    #[test]
+    fn readopt_only_when_runner_live_and_not_running() {
+        // Orphan: live runner, nothing in memory -> re-adopt.
+        assert!(should_readopt_orphan_runner(false, true));
+        // Healthy / mid-spawn: an in-memory worker or reservation wins, even
+        // if a registry record exists.
+        assert!(!should_readopt_orphan_runner(true, true));
+        // No live runner: leave the respawn budget to govern; do not clear.
+        assert!(!should_readopt_orphan_runner(false, false));
+        assert!(!should_readopt_orphan_runner(true, false));
     }
 
     // --- build-version respawn policy (#1754) ---

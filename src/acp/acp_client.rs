@@ -963,6 +963,35 @@ fn runner_socket_deadline() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+/// Test-only fault injection for the #1890 regression e2e. When
+/// `AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES=N` is set, the first N *fresh*-spawn
+/// ACP handshakes fail right after the runner has come up, before the daemon
+/// records an in-memory worker. The runner keeps its agent alive and its
+/// on-disk registry entry, so the daemon is left with a live, registered
+/// runner it never adopted: the exact orphan state #1890 got permanently
+/// stuck in, reproduced deterministically without depending on host timing.
+/// Each call consumes one budgeted failure; `0` (the default, var unset) is a
+/// no-op. Debug builds only, so release can never trip it. Mirrors the
+/// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` debug knob above.
+#[cfg(debug_assertions)]
+fn take_injected_fresh_handshake_failure() -> bool {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::OnceLock;
+    static REMAINING: OnceLock<AtomicI64> = OnceLock::new();
+    let remaining = REMAINING.get_or_init(|| {
+        let n = std::env::var("AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        AtomicI64::new(n)
+    });
+    remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n > 0).then_some(n - 1)
+        })
+        .is_ok()
+}
+
 /// Read the silent-orphan watchdog grace for the given source profile.
 /// In debug builds, honors `AOE_SILENT_ORPHAN_GRACE_MS` so the
 /// integration test can drive a sub-second cadence without making
@@ -1440,6 +1469,20 @@ impl AcpClient {
         // few ms) but bound the wait so a wedged runner returns a typed
         // error instead of parking the supervisor.
         let stream = wait_for_socket(&socket_path, runner_socket_deadline()).await?;
+        // #1890 regression hook (debug-only): simulate a fresh-spawn whose
+        // daemon-side handshake fails after the runner is already up and
+        // registered. Dropping the socket closes the daemon's end cleanly; the
+        // runner keeps its agent alive and its registry entry, leaving the
+        // orphaned-but-live-runner state the readopt pass must recover from.
+        // Gated on `Fresh` so the recovery reattach/respawn is never failed,
+        // and budgeted by the env var so only the first spawn trips.
+        #[cfg(debug_assertions)]
+        if matches!(mode, ConnectMode::Fresh { .. }) && take_injected_fresh_handshake_failure() {
+            drop(stream);
+            return Err(AcpError::Spawn(
+                "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
+            ));
+        }
         let (read_half, write_half) = stream.into_split();
         let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
 
