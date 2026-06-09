@@ -138,7 +138,12 @@ test.describe("Wizard scratch sessions (#1324)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
 
-    await page.locator("body").click();
+    // Wait for the dashboard to be interactive before firing global
+    // shortcuts: the sidebar's "New session" button doubles as a proxy
+    // for "the document-level keydown handler is registered". Pressing
+    // earlier races React's effect registration on a cold CI runner
+    // (the live original used the same guard).
+    await expect(page.getByRole("button", { name: "New session", exact: true }).first()).toBeVisible();
     await page.keyboard.press("ControlOrMeta+Shift+KeyN");
 
     await expect(page.getByRole("heading", { name: "Review & Launch" })).toBeVisible();

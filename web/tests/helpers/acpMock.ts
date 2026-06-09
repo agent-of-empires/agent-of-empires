@@ -12,7 +12,6 @@
 // drops the duplicates.
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
-import { clickSidebarSession } from "./sidebar";
 
 export interface AcpSessionMockOptions {
   sessionId?: string;
@@ -163,11 +162,13 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   return handle;
 }
 
-/** Load the dashboard and click into the mocked structured-view session. */
+/** Open the mocked structured-view session via its deep link. Direct
+ *  navigation rather than a sidebar click: several consumers run at
+ *  mobile widths where the sidebar is collapsed and the session link is
+ *  outside the viewport (sidebar-row navigation has its own spec). */
 export async function openStructuredSession(page: Page, mock: AcpSessionMock) {
-  await page.goto("/");
+  await page.goto(`/session/${mock.sessionId}`);
   await expect(page.locator("header")).toBeVisible();
-  await clickSidebarSession(page, mock.title);
 }
 
 /** Wait until the composer reflects an open structured view WS. The Send
