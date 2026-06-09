@@ -2194,6 +2194,14 @@ impl HomeView {
             ));
             return;
         }
+        // Same gate as `open_new_session_dialog`: with no agent available the
+        // dialog has nothing to create, so point the user at setup instead of
+        // opening an unusable form. Keeps `'N'` and the group menu's New
+        // Session in step with `'n'` and the empty-sidebar menu.
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
         let prefill_path = self
             .selected_session
             .as_ref()

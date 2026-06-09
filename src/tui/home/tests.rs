@@ -3670,6 +3670,35 @@ fn test_group_context_menu_new_session_prefills_path() {
 
 #[test]
 #[serial]
+fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.available_tools = AvailableTools::with_tools(&[]);
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no agents means the new-session form must not open"
+    );
+    assert!(
+        env.view.no_agents_dialog.is_some(),
+        "should point the user at agent setup instead, like 'n'"
+    );
+}
+
+#[test]
+#[serial]
 fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
     use crate::session::config::GroupByMode;
     use crate::tui::dialogs::ContextMenuAction;
