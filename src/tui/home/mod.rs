@@ -475,6 +475,13 @@ pub struct HomeView {
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
+    /// One-time confirm shown before a sandbox session whose resolved config
+    /// has glob `volume_ignores` (e.g. `**/bin`), explaining the create-time
+    /// snapshot expansion (#2045). Reuses [`ConfirmDialog`] with a
+    /// "don't warn me again" checkbox persisted to app_state.
+    pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
+    /// Session data pending the volume_ignores glob expansion acknowledgment.
+    pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,
     /// Theme name queued by a click on the intro dialog (live preview or
     /// final pick). Drained by the `App` mouse handler after
@@ -1101,6 +1108,8 @@ impl HomeView {
             pending_repo_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
+            volume_ignores_glob_dialog: None,
+            pending_volume_ignores_glob_data: None,
             intro_dialog: None,
             pending_intro_theme: None,
             no_agents_dialog: None,
@@ -2764,6 +2773,7 @@ impl HomeView {
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -2801,6 +2811,7 @@ impl HomeView {
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()

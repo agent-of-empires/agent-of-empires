@@ -266,3 +266,16 @@ describe("SessionWizard reducer / useStructuredView (#1580)", () => {
     expect(next.data.useStructuredView).toBe(false);
   });
 });
+
+describe("SessionWizard reducer / SUBMIT_CANCEL (#2045)", () => {
+  it("re-enables submit without an error when a pre-create confirm is cancelled", () => {
+    // SUBMIT_START disables the button; backing out of the glob volume_ignores
+    // confirm modal must restore the interactive state and leave no error.
+    const submitting = reducer(makeState(), { type: "SUBMIT_START" });
+    expect(submitting.isSubmitting).toBe(true);
+
+    const cancelled = reducer(submitting, { type: "SUBMIT_CANCEL" });
+    expect(cancelled.isSubmitting).toBe(false);
+    expect(cancelled.error).toBeNull();
+  });
+});

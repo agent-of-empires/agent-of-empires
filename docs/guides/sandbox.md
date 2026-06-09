@@ -71,7 +71,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | `cpu_limit` | (none) | CPU limit (e.g., "4") |
 | `memory_limit` | (none) | Memory limit (e.g., "8g") |
 | `environment` | `[]` | Env vars for containers (bare KEY or KEY=VALUE, see below) |
-| `volume_ignores` | `[]` | Literal directory paths to exclude from the project mount via anonymous volumes (no glob expansion, see below) |
+| `volume_ignores` | `[]` | Directory paths to exclude from the project mount via anonymous volumes. Literal paths or glob patterns expanded at create time (see below) |
 | `volume_ignores_strategy` | `"anonymous"` | How `volume_ignores` are mounted: `"anonymous"` (default) or `"named"` (required on macOS/VirtioFS, see below) |
 | `extra_volumes` | `[]` | Additional volume mounts |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
@@ -79,20 +79,19 @@ environment = ["ANTHROPIC_API_KEY"]
 
 ## Volume Mounts
 
-### Volume Ignores Are Literal Paths
+### Volume Ignores: Literal Paths and Glob Patterns
 
-`volume_ignores` entries are literal directory paths, each resolved relative to the mounted workspace roots. Glob patterns are **not** expanded: Docker needs concrete mount paths at container-create time. An entry like `**/bin` or `target/*` is skipped with a warning rather than mounted, since concatenating it literally would create a real `**` directory inside the bind-mounted repo and leak it back onto the host.
+`volume_ignores` entries can be literal directory paths or glob patterns:
 
-List each generated directory explicitly:
+- A **literal path** (e.g. `node_modules`, `target`, `src/MyApp/bin`) is resolved relative to each mounted workspace root and mounted unconditionally. It need not exist yet; the anonymous volume shadows it once the directory is created.
+- A **glob pattern** (containing `*`, `?`, `[`, or `]`, e.g. `**/bin`, `**/obj`) is expanded against the workspace filesystem when the session is created, and one ignore mount is created per matching directory.
 
 ```toml
 [sandbox]
-# Good: literal paths
-volume_ignores = ["node_modules", "target", "src/MyApp/bin", "src/MyApp/obj"]
-
-# Skipped with a warning: glob metacharacters (* ? [ ])
-# volume_ignores = ["**/bin", "**/obj"]
+volume_ignores = ["node_modules", "target", "**/bin", "**/obj"]
 ```
+
+> **Glob expansion is a point-in-time snapshot.** Docker needs concrete mount paths when the container starts, so a glob is expanded only against the directories that exist at create time. A `bin/` that a build creates *later*, inside the container, is **not** shadowed. Re-create the session to pick up new matches, or list the path literally if you know it ahead of time. The native TUI and the web dashboard show a one-time confirmation explaining this before creating a sandbox session whose config has a glob entry.
 
 ### Volume Ignores Strategy (macOS/VirtioFS)
 

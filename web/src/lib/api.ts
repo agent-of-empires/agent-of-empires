@@ -191,6 +191,59 @@ export async function markWebTourSeen(): Promise<boolean> {
   }
 }
 
+// --- Sandbox volume_ignores glob expansion (#2045) ---
+
+export interface VolumeIgnoresGlobPreview {
+  pattern: string;
+  /** Container-side paths the pattern matches in the workspace right now. */
+  matched_paths: string[];
+}
+
+export interface VolumeIgnoresPreviewResponse {
+  /** True once the snapshot-expansion behavior has been acknowledged. */
+  acknowledged: boolean;
+  /** One entry per configured glob pattern; empty when none are configured. */
+  globs: VolumeIgnoresGlobPreview[];
+}
+
+/**
+ * Dry-run how glob `volume_ignores` entries (recursive `**` patterns) expand for a
+ * sandbox session rooted at `path`. The wizard calls this before creating to
+ * decide whether to show the one-time snapshot-expansion confirm modal (#2045).
+ * Returns null on failure; callers treat that as "nothing to confirm".
+ */
+export async function fetchVolumeIgnoresPreview(
+  path: string,
+  profile?: string,
+): Promise<VolumeIgnoresPreviewResponse | null> {
+  try {
+    const params = new URLSearchParams({ path });
+    if (profile) params.set("profile", profile);
+    const res = await fetch(`/api/sandbox/volume-ignores-preview?${params.toString()}`);
+    if (!res.ok) return null;
+    return (await res.json()) as VolumeIgnoresPreviewResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Records that the user acknowledged glob `volume_ignores` snapshot expansion,
+ * so the confirm modal shows once and never again. Single-purpose endpoint
+ * (not PATCH /api/settings) so the flag stays off the passphrase/elevation
+ * wall. Returns false on read-only servers (403) or network failure.
+ */
+export async function markVolumeIgnoresGlobsAcknowledged(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/volume-ignores-globs-acknowledged", {
+      method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // --- Profile management ---
 
 export async function createProfile(name: string): Promise<boolean> {

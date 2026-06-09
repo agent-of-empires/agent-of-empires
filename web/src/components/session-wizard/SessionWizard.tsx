@@ -7,7 +7,11 @@ import {
   fetchProfiles,
   fetchSettings,
   createSession,
+  fetchVolumeIgnoresPreview,
+  markVolumeIgnoresGlobsAcknowledged,
+  type VolumeIgnoresGlobPreview,
 } from "../../lib/api";
+import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
@@ -134,6 +138,13 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
   // and on a profile switch, so the preview adds no extra request. See
   // #1911.
   const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+  // Pending sandbox create paused on the glob volume_ignores confirm modal
+  // (#2045). Holds the matched patterns to explain and the request to replay
+  // once the user proceeds.
+  const [globConfirm, setGlobConfirm] = useState<{
+    globs: VolumeIgnoresGlobPreview[];
+    body: CreateSessionRequest;
+  } | null>(null);
 
   const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
@@ -264,10 +275,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       agent_effort: selectedAgentAcpCapable && d.useStructuredView && d.agentEffort ? d.agentEffort : undefined,
       scratch: d.scratch || undefined,
     };
+
+    // Sandbox sessions whose resolved config has glob volume_ignores get a
+    // one-time snapshot-expansion confirmation before we create (#2045). Skip
+    // for scratch (no project path to expand against) and treat any preview
+    // failure as "nothing to confirm" so it never blocks creation.
+    if (d.sandboxEnabled && !d.scratch && d.path) {
+      const preview = await fetchVolumeIgnoresPreview(d.path, d.profile || undefined);
+      if (preview && !preview.acknowledged && preview.globs.length > 0) {
+        setGlobConfirm({ globs: preview.globs, body });
+        return;
+      }
+    }
+
+    await runCreate(body, d.tool);
+  };
+
+  const runCreate = async (body: CreateSessionRequest, tool: string) => {
     const result = await createSession(body);
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
-      saveLastUsedTool(d.tool);
+      saveLastUsedTool(tool);
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);
@@ -278,6 +306,19 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         type: "SUBMIT_ERROR",
         error: result.error || "Unknown error",
       });
+  };
+
+  const handleGlobConfirm = async (dontShowAgain: boolean) => {
+    const pending = globConfirm;
+    if (!pending) return;
+    if (dontShowAgain) await markVolumeIgnoresGlobsAcknowledged();
+    setGlobConfirm(null);
+    await runCreate(pending.body, state.data.tool);
+  };
+
+  const handleGlobCancel = () => {
+    setGlobConfirm(null);
+    dispatch({ type: "SUBMIT_CANCEL" });
   };
 
   useEffect(() => {
@@ -366,6 +407,13 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           </div>
         )}
       </div>
+      {globConfirm && (
+        <VolumeIgnoresGlobDialog
+          globs={globConfirm.globs}
+          onConfirm={handleGlobConfirm}
+          onCancel={handleGlobCancel}
+        />
+      )}
     </div>
   );
 }

@@ -1109,6 +1109,29 @@ impl HomeView {
                             }
                         }
                         if let Some(data) = self.pending_hooks_install_data.take() {
+                            self.pending_dialog_click_action =
+                                self.maybe_confirm_volume_ignores_globs(data);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &self.volume_ignores_glob_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let dont_ask_again = dialog.dont_ask_again();
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.volume_ignores_glob_dialog = None;
+                        self.pending_volume_ignores_glob_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        self.volume_ignores_glob_dialog = None;
+                        if dont_ask_again {
+                            self.persist_volume_ignores_globs_ack();
+                        }
+                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                             self.pending_dialog_click_action = self.continue_session_creation(data);
                         }
                     }
@@ -1506,6 +1529,27 @@ impl HomeView {
                     }
                     // Resume session creation
                     if let Some(data) = self.pending_hooks_install_data.take() {
+                        return self.maybe_confirm_volume_ignores_globs(data);
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.volume_ignores_glob_dialog = None;
+                    self.pending_volume_ignores_glob_data = None;
+                }
+                DialogResult::Submit(_) => {
+                    let dont_ask_again = dialog.dont_ask_again();
+                    self.volume_ignores_glob_dialog = None;
+                    if dont_ask_again {
+                        self.persist_volume_ignores_globs_ack();
+                    }
+                    if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                         return self.continue_session_creation(data);
                     }
                 }
@@ -1598,7 +1642,7 @@ impl HomeView {
                         }
                     }
 
-                    return self.continue_session_creation(data);
+                    return self.maybe_confirm_volume_ignores_globs(data);
                 }
             }
             return None;
@@ -4273,6 +4317,85 @@ impl HomeView {
         }
     }
 
+    /// Gate sandbox session creation on a one-time confirmation when the resolved
+    /// config has glob `volume_ignores` (e.g. `**/bin`). Those entries are expanded
+    /// against the workspace at create time, a point-in-time snapshot that won't
+    /// shadow directories a build creates later inside the container (#2045). Shows
+    /// the dialog once (unless already acknowledged or no glob is configured),
+    /// otherwise proceeds straight to creation.
+    fn maybe_confirm_volume_ignores_globs(&mut self, data: NewSessionData) -> Option<Action> {
+        if data.sandbox && !Self::volume_ignores_globs_acknowledged() {
+            if let Some(message) = Self::volume_ignores_glob_confirm_message(&data) {
+                self.volume_ignores_glob_dialog = Some(
+                    crate::tui::dialogs::ConfirmDialog::new(
+                        "Glob volume_ignores",
+                        &message,
+                        "volume_ignores_globs",
+                    )
+                    .neutral()
+                    .offering_dont_ask_again(),
+                );
+                self.pending_volume_ignores_glob_data = Some(data);
+                return None;
+            }
+        }
+        self.continue_session_creation(data)
+    }
+
+    fn volume_ignores_globs_acknowledged() -> bool {
+        load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false)
+    }
+
+    fn persist_volume_ignores_globs_ack(&self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.has_acknowledged_volume_ignores_globs = true;
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
+            }
+        }
+    }
+
+    /// Build the confirm message describing how this session's glob volume_ignores
+    /// will expand, or `None` when there is no glob entry (nothing to confirm).
+    fn volume_ignores_glob_confirm_message(data: &NewSessionData) -> Option<String> {
+        let config =
+            repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
+                .ok()?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &data.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )
+        .ok()?;
+        if expansions.is_empty() {
+            return None;
+        }
+        let match_count: usize = expansions
+            .iter()
+            .map(|e| e.matched_container_paths.len())
+            .sum();
+        // Name the patterns (capped) so the user sees what will expand.
+        let mut patterns: Vec<&str> = expansions.iter().map(|e| e.pattern.as_str()).collect();
+        let pattern_list = if patterns.len() > 3 {
+            patterns.truncate(3);
+            format!("{}, ...", patterns.join(", "))
+        } else {
+            patterns.join(", ")
+        };
+        Some(format!(
+            "volume_ignores globs ({}) match {} director{} in the workspace right now. Each \
+             becomes an ignore mount at create time; directories a build creates later inside the \
+             container are not hidden. Proceed?",
+            pattern_list,
+            match_count,
+            if match_count == 1 { "y" } else { "ies" },
+        ))
+    }
+
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
@@ -4604,5 +4727,65 @@ mod tests {
         let cache = build_tool_hotkey_cache(&tools);
         assert_eq!(cache[0].0, "alpha");
         assert_eq!(cache[1].0, "beta");
+    }
+
+    fn glob_session_data(path: &str) -> NewSessionData {
+        NewSessionData {
+            profile: String::new(),
+            title: String::new(),
+            path: path.to_string(),
+            group: String::new(),
+            tool: "claude".to_string(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            extra_repo_paths: Vec::new(),
+            sandbox: true,
+            sandbox_image: "ubuntu:latest".to_string(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            scratch: false,
+        }
+    }
+
+    /// The confirm gate only fires when the resolved config has a glob ignore
+    /// that the message can name; literal-only ignores produce no dialog.
+    #[test]
+    #[serial_test::serial]
+    fn volume_ignores_glob_confirm_message_fires_only_on_globs() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src/App/bin")).unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        let cfg = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let path = project.path().to_str().unwrap();
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"**/bin\", \"target\"]\n",
+        )
+        .unwrap();
+        let msg = HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path))
+            .expect("glob ignore should produce a confirm message");
+        assert!(msg.contains("**/bin"), "message names the pattern: {msg}");
+        assert!(msg.contains("1 directory"), "one match counted: {msg}");
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"target\", \".venv\"]\n",
+        )
+        .unwrap();
+        assert!(
+            HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path)).is_none(),
+            "literal-only ignores must not trigger the gate"
+        );
     }
 }

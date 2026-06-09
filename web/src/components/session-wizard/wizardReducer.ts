@@ -79,6 +79,7 @@ export type Action =
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
   | { type: "SUBMIT_SUCCESS" }
+  | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
   | { type: "SET_GROUPS"; groups: GroupInfo[] }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
@@ -175,6 +176,10 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, isSubmitting: false, error: action.error };
     case "SUBMIT_SUCCESS":
       return { ...state, isSubmitting: false };
+    case "SUBMIT_CANCEL":
+      // User backed out of a pre-create confirmation (e.g. the glob
+      // volume_ignores modal); re-enable the submit button without an error.
+      return { ...state, isSubmitting: false, error: null };
     case "SET_AGENTS":
       return { ...state, agents: action.agents };
     case "SET_GROUPS":

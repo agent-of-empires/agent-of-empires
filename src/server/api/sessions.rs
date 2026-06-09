@@ -3797,6 +3797,91 @@ pub async fn session_diff_file(
     }
 }
 
+#[derive(Deserialize)]
+pub struct VolumeIgnoresPreviewQuery {
+    pub path: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresGlobPreview {
+    pub pattern: String,
+    pub matched_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresPreviewResponse {
+    /// True once the user has acknowledged the snapshot-expansion behavior, so
+    /// the wizard can skip the confirm modal without another round trip.
+    pub acknowledged: bool,
+    /// One entry per glob `volume_ignores` pattern with the directories it
+    /// currently matches (container-side paths). Empty when none are configured.
+    pub globs: Vec<VolumeIgnoresGlobPreview>,
+}
+
+/// Dry-run how glob `volume_ignores` entries would expand for a session rooted at
+/// `path`, without creating anything. The wizard calls this before a sandbox
+/// create to decide whether to show the snapshot-expansion confirm modal (#2045).
+/// Read-only: no `read_only` guard needed.
+pub async fn preview_volume_ignores_globs(
+    axum::extract::Query(query): axum::extract::Query<VolumeIgnoresPreviewQuery>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = query.profile.unwrap_or_default();
+        let config = crate::session::repo_config::resolve_config_with_repo(
+            &profile,
+            std::path::Path::new(&query.path),
+        )?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &query.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )?;
+        let acknowledged = crate::session::Config::load()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false);
+        Ok::<_, anyhow::Error>((acknowledged, expansions))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((acknowledged, expansions))) => {
+            let globs = expansions
+                .into_iter()
+                .map(|e| VolumeIgnoresGlobPreview {
+                    pattern: e.pattern,
+                    matched_paths: e.matched_container_paths,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(VolumeIgnoresPreviewResponse {
+                    acknowledged,
+                    globs,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.sessions", "volume_ignores glob preview failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "preview_failed", "message": "Failed to preview volume_ignores"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "volume_ignores glob preview panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

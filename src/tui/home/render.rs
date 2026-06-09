@@ -630,6 +630,7 @@ impl HomeView {
             worktree_name_dialog,
             restart_dialog,
             hooks_install_dialog,
+            volume_ignores_glob_dialog,
             repo_trust_dialog,
             intro_dialog,
             no_agents_dialog,
@@ -867,6 +868,7 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()

@@ -963,35 +963,121 @@ impl<'a> ContainerAgentSelection<'a> {
     }
 }
 
-/// `volume_ignores` entries are treated as literal directory paths and concatenated
-/// onto each mount base. Glob patterns are not expanded (Docker needs concrete mount
-/// paths at container-create time), so an entry like `**/bin` would materialize a
-/// literal `**` directory inside the bind-mounted repo, leaking onto the host (#2036).
-/// Detect such entries so we can skip and warn instead of creating junk mount targets.
-fn has_glob_metachars(entry: &str) -> bool {
+/// A `volume_ignores` entry containing glob metacharacters is expanded against the
+/// mounted workspace roots at container-create time (#2045); a literal entry is
+/// concatenated onto each mount base unconditionally. This distinguishes the two.
+pub(crate) fn has_glob_metachars(entry: &str) -> bool {
     entry.contains(['*', '?', '[', ']'])
 }
 
-/// Produce user-facing warnings for `volume_ignores` entries that `build_container_config`
-/// will skip because they contain glob metacharacters. Mirrors that skip so session
-/// creation can surface the same information in the TUI warnings dialog (#2036), the way
-/// [`validate_env_entries`](crate::session::validate_env_entries) surfaces unset env vars.
-pub(crate) fn validate_volume_ignores<I, S>(entries: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    entries
+/// Expand one glob `volume_ignores` entry against the host filesystem under each
+/// mounted workspace root, returning the container-side mount paths for every
+/// directory that matches right now.
+///
+/// `roots` is `(host_path, container_path)` for each project mount. Expansion is a
+/// point-in-time snapshot: Docker needs concrete mount paths when the container
+/// starts, so a directory created later by an in-container build is not shadowed.
+/// Only directories are returned; files can't be ignore mounts. The glob's leading
+/// host prefix is escaped so a literal `[` in the real path isn't treated as a
+/// character class.
+fn expand_glob_ignore(entry: &str, roots: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (host_base, container_base) in roots {
+        let host_trimmed = host_base.trim_end_matches('/');
+        let pattern = format!("{}/{}", glob::Pattern::escape(host_trimmed), entry);
+        let matches = match glob::glob(&pattern) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.profile",
+                    "Skipping volume_ignores glob '{}': invalid pattern: {}",
+                    entry, e
+                );
+                continue;
+            }
+        };
+        for matched in matches {
+            let path = match matched {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(target: "session.profile", "glob walk error for '{}': {}", entry, e);
+                    continue;
+                }
+            };
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(host_trimmed) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy();
+            if rel.is_empty() {
+                continue;
+            }
+            out.push(format!("{}/{}", container_base, rel));
+        }
+    }
+    out
+}
+
+/// One glob `volume_ignores` entry paired with the directories it currently
+/// matches, expressed as container-side mount paths. The empty-`matches` case is
+/// kept (rather than dropped) so callers can tell "configured but matched nothing"
+/// from "no glob configured".
+#[derive(Debug, Clone)]
+pub(crate) struct GlobIgnoreExpansion {
+    pub pattern: String,
+    pub matched_container_paths: Vec<String>,
+}
+
+/// Compute how glob `volume_ignores` entries would expand for a session rooted at
+/// `project_path_str`, without creating any container. The TUI confirm gate and the
+/// web preview endpoint both call this so they describe the exact snapshot
+/// [`build_container_config`] will materialize. Literal (non-glob) entries are
+/// excluded; an `Ok(vec![])` means nothing needs confirming.
+pub(crate) fn preview_glob_volume_ignores(
+    project_path_str: &str,
+    workspace_info: Option<&super::WorkspaceInfo>,
+    volume_ignores: &[String],
+) -> Result<Vec<GlobIgnoreExpansion>> {
+    // An empty project path (scratch session) has no workspace to expand
+    // against; globbing it would resolve to filesystem-root patterns. Nothing
+    // to preview.
+    if project_path_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let glob_entries: Vec<&String> = volume_ignores
+        .iter()
+        .filter(|e| has_glob_metachars(e))
+        .collect();
+    if glob_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let project_path = Path::new(project_path_str);
+    let (project_volumes, _workspace_path) = if let Some(ws_info) = workspace_info {
+        compute_workspace_volume_paths(project_path, ws_info)?
+    } else {
+        compute_volume_paths(project_path, project_path_str)?
+    };
+    let roots = glob_roots(&project_volumes);
+
+    Ok(glob_entries
         .into_iter()
-        .filter_map(|e| {
-            let s = e.as_ref();
-            has_glob_metachars(s).then(|| {
-                format!(
-                    "Warning: volume_ignores entry '{}' was skipped; glob patterns are not supported, list literal directory paths instead",
-                    s
-                )
-            })
+        .map(|pattern| GlobIgnoreExpansion {
+            pattern: pattern.clone(),
+            matched_container_paths: expand_glob_ignore(pattern, &roots),
         })
+        .collect())
+}
+
+/// `(host_path, container_path)` pairs for the project mounts, the roots glob
+/// `volume_ignores` are expanded against.
+fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
+    project_volumes
+        .iter()
+        .map(|v| (v.host_path.clone(), v.container_path.clone()))
         .collect()
 }
 
@@ -1070,6 +1156,10 @@ pub(crate) fn build_container_config(
     if !volume_ignore_bases.contains(&workspace_path) {
         volume_ignore_bases.push(workspace_path.clone());
     }
+
+    // (host, container) roots for expanding glob volume_ignores against the live
+    // filesystem. Captured before `project_volumes` is moved into `volumes`.
+    let glob_roots = glob_roots(&project_volumes);
 
     let mut volumes = project_volumes;
 
@@ -1314,36 +1404,30 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Glob patterns are not supported: they would be concatenated literally and create
-    // a real `**`/`*` directory inside the bind-mounted repo, leaking onto the host (#2036).
-    // Skip glob-like entries with a warning rather than mounting a bogus path.
-    let literal_ignores: Vec<&String> = sandbox_config
-        .volume_ignores
-        .iter()
-        .filter(|ignore| {
-            if has_glob_metachars(ignore) {
-                tracing::warn!(
-                    target: "session.profile",
-                    "Ignoring volume_ignores entry '{}': glob patterns are not supported, entries must be literal directory paths",
-                    ignore
-                );
-                false
-            } else {
-                true
+    // Resolve volume_ignores into concrete container mount paths. Literal entries
+    // mount unconditionally at every workspace base (the path need not exist yet,
+    // since the anonymous/named volume shadows it once created). Glob entries are
+    // expanded against the host filesystem now (#2045): a point-in-time snapshot,
+    // since Docker needs concrete mount paths when the container starts.
+    let mut resolved_ignore_paths: Vec<String> = Vec::new();
+    for ignore in &sandbox_config.volume_ignores {
+        if has_glob_metachars(ignore) {
+            resolved_ignore_paths.extend(expand_glob_ignore(ignore, &glob_roots));
+        } else {
+            for base_path in &volume_ignore_bases {
+                resolved_ignore_paths.push(format!("{}/{}", base_path, ignore));
             }
-        })
-        .collect();
+        }
+    }
 
-    // Expand all volume_ignores paths and filter conflicts with extra_volumes.
-    // (extra_volumes take precedence over volume_ignores)
-    // Conflicts: exact match, anonymous is a parent of extra, or inside extra.
-    let expanded_ignore_paths: Vec<String> = volume_ignore_bases
-        .iter()
-        .flat_map(|base_path| {
-            literal_ignores
-                .iter()
-                .map(move |ignore| format!("{}/{}", base_path, ignore))
-        })
+    // Drop duplicates (a glob can match the same dir under overlapping bases) and
+    // filter conflicts with extra_volumes, which take precedence over
+    // volume_ignores. Conflicts: exact match, ignore is a parent of an extra, or
+    // ignore sits inside an extra.
+    let mut seen_ignore = std::collections::HashSet::new();
+    let expanded_ignore_paths: Vec<String> = resolved_ignore_paths
+        .into_iter()
+        .filter(|path| seen_ignore.insert(path.clone()))
         .filter(|path| {
             !extra_volume_container_paths.iter().any(|extra_path| {
                 path == extra_path
@@ -2671,34 +2755,31 @@ extra_volumes = ["/host/data:/container/data:ro"]
         assert!(!has_glob_metachars(".venv"));
     }
 
-    #[test]
-    fn test_validate_volume_ignores_warns_only_on_globs() {
-        let warnings = validate_volume_ignores(["**/bin/", "target", "**/obj/", "node_modules"]);
-        assert_eq!(warnings.len(), 2, "got: {:?}", warnings);
-        assert!(warnings[0].contains("**/bin/"));
-        assert!(warnings[1].contains("**/obj/"));
-        assert!(validate_volume_ignores(["target", ".venv"]).is_empty());
-    }
-
-    /// Regression test for #2036: glob-like volume_ignores entries must be skipped
-    /// rather than concatenated into literal mount targets (which leaked a `**`
-    /// directory onto the host through the bind mount). Literal entries still mount.
+    /// Feature test for #2045: glob volume_ignores entries are expanded against the
+    /// live workspace at build time, emitting one mount per matched directory, while
+    /// literal entries still mount unconditionally and no `*` ever reaches a mount
+    /// path (the #2036 host-littering regression must not return).
     #[test]
     #[serial_test::serial]
-    fn test_volume_ignores_skips_glob_entries() {
+    fn test_volume_ignores_expands_glob_entries() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let project_dir = TempDir::new().unwrap();
+        // Nested generated dirs the .NET-style globs should find.
+        fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
+        fs::create_dir_all(project_dir.path().join("src/App/obj")).unwrap();
+        fs::create_dir_all(project_dir.path().join("tests/Lib/bin")).unwrap();
+
         let config_dir = project_dir.path().join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
             r#"
 [sandbox]
-volume_ignores = ["**/bin/", "**/obj/", "target"]
+volume_ignores = ["**/bin", "**/obj", "target"]
 "#,
         )
         .unwrap();
@@ -2727,9 +2808,18 @@ volume_ignores = ["**/bin/", "**/obj/", "target"]
         .unwrap();
 
         let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
-        let expected_target = format!("/workspace/{}/target", dir_name);
+        let expect = |p: &str| format!("/workspace/{}/{}", dir_name, p);
+
+        for matched in ["src/App/bin", "tests/Lib/bin", "src/App/obj"] {
+            assert!(
+                config.anonymous_volumes.contains(&expect(matched)),
+                "glob should have expanded to {}, got: {:?}",
+                matched,
+                config.anonymous_volumes
+            );
+        }
         assert!(
-            config.anonymous_volumes.contains(&expected_target),
+            config.anonymous_volumes.contains(&expect("target")),
             "literal 'target' entry should still mount, got: {:?}",
             config.anonymous_volumes
         );
@@ -2738,9 +2828,56 @@ volume_ignores = ["**/bin/", "**/obj/", "target"]
                 .anonymous_volumes
                 .iter()
                 .any(|p| p.contains('*') || p.contains('?')),
-            "glob-like entries must not produce literal mount targets, got: {:?}",
+            "no glob metachar may reach a mount path, got: {:?}",
             config.anonymous_volumes
         );
+    }
+
+    /// `preview_glob_volume_ignores` reports the same expansion the build performs,
+    /// keeps a configured-but-unmatched pattern with an empty match list, and ignores
+    /// literal entries entirely.
+    #[test]
+    #[serial_test::serial]
+    fn test_preview_glob_volume_ignores() {
+        let project_dir = TempDir::new().unwrap();
+        fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
+        // A file (not a dir) named like a match must be ignored.
+        fs::write(project_dir.path().join("notes.bin"), "x").unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let project_path_str = project_dir.path().to_str().unwrap();
+
+        let ignores = vec![
+            "**/bin".to_string(),
+            "**/missing".to_string(),
+            "target".to_string(),
+        ];
+        let expansions = preview_glob_volume_ignores(project_path_str, None, &ignores).unwrap();
+
+        // Two glob entries (literal "target" excluded); order preserved.
+        assert_eq!(expansions.len(), 2);
+        assert_eq!(expansions[0].pattern, "**/bin");
+        let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            expansions[0].matched_container_paths,
+            vec![format!("/workspace/{}/src/App/bin", dir_name)],
+            "only the directory should match, not notes.bin"
+        );
+        assert_eq!(expansions[1].pattern, "**/missing");
+        assert!(
+            expansions[1].matched_container_paths.is_empty(),
+            "an unmatched glob is kept with no matches"
+        );
+    }
+
+    #[test]
+    fn test_preview_glob_volume_ignores_empty_without_globs() {
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let ignores = vec!["target".to_string(), ".venv".to_string()];
+        let expansions =
+            preview_glob_volume_ignores(project_dir.path().to_str().unwrap(), None, &ignores)
+                .unwrap();
+        assert!(expansions.is_empty());
     }
 
     /// Regression: when project_path is a sibling worktree, `.agent-of-empires/config.toml`

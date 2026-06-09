@@ -71,6 +71,9 @@ rand = "0.10"
 # Directory utilities
 dirs = "6.0"
 
+# Glob expansion for sandbox volume_ignores patterns (e.g. `**/bin`, `**/obj`)
+glob = "0.3"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

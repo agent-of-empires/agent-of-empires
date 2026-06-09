@@ -1335,6 +1335,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
+        .route(
+            "/api/app-state/volume-ignores-globs-acknowledged",
+            post(api::mark_volume_ignores_globs_acknowledged),
+        )
+        .route(
+            "/api/sandbox/volume-ignores-preview",
+            get(api::preview_volume_ignores_globs),
+        )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))

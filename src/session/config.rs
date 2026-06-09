@@ -659,6 +659,14 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
 
+    /// True once the user has acknowledged that glob `volume_ignores` entries
+    /// (e.g. `**/bin`) are expanded against the workspace at session-create time,
+    /// a point-in-time snapshot that won't shadow directories created later by an
+    /// in-container build (#2045). Gates the one-time confirm dialog shown before a
+    /// sandbox session whose resolved config contains a glob ignore.
+    #[serde(default)]
+    pub has_acknowledged_volume_ignores_globs: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<SortOrder>,
 
