@@ -1723,7 +1723,7 @@ impl HomeView {
         }
 
         for name in &to_add {
-            let dir = match crate::session::get_profile_dir(name) {
+            let dir = match crate::session::get_profile_dir_path(name) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
@@ -1735,6 +1735,14 @@ impl HomeView {
                     continue;
                 }
             };
+            if !dir.exists() {
+                tracing::debug!(
+                    target: "tui.file_watch",
+                    profile = %name,
+                    "skipping disk subscribe; profile dir absent (peer delete raced the list_profiles snapshot)"
+                );
+                continue;
+            }
             let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
             let sessions_path = dir.join("sessions.json");
             let groups_path = dir.join("groups.json");
@@ -1980,7 +1988,7 @@ impl HomeView {
         }
 
         for name in &to_add {
-            let dir = match crate::session::get_profile_dir(name) {
+            let dir = match crate::session::get_profile_dir_path(name) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
@@ -1992,6 +2000,14 @@ impl HomeView {
                     continue;
                 }
             };
+            if !dir.exists() {
+                tracing::debug!(
+                    target: "tui.file_watch",
+                    profile = %name,
+                    "skipping config subscribe; profile dir absent (peer delete raced the list_profiles snapshot)"
+                );
+                continue;
+            }
             let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
             let target_path = dir.join("config.toml");
             let spec = WatchSpec {
@@ -2024,6 +2040,11 @@ impl HomeView {
                             forwarder: join.abort_handle(),
                             canonical_dir,
                         },
+                    );
+                    tracing::debug!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        "profile config.toml subscription installed"
                     );
                 }
                 Err(e) => {
@@ -2100,18 +2121,27 @@ impl HomeView {
 
     /// Open or refresh the `Reload Failed` dialog from the current
     /// `reload_failure_state`. Returns `true` when the dialog was
-    /// opened or refreshed in place so the caller can request a redraw.
+    /// opened or its body refreshed in place so the caller can
+    /// request a redraw.
     ///
-    /// When a `Reload Failed` dialog is already on screen, the body is
-    /// rebuilt so a failure source recorded after the last presentation
-    /// becomes visible without waiting for the user to dismiss and
-    /// re-open. When an unrelated dialog occupies the slot (a
-    /// `Watcher Warning` from `rewire_after_profile_mutation`, or a
-    /// profile create/delete `Error`), presentation is skipped without
-    /// acknowledging, so the next tick re-tries once the foreign
-    /// dialog is dismissed.
+    /// Three update paths converge here:
+    /// * New burst presentation: `has_unacknowledged_failure()` is
+    ///   true. The dialog opens (or re-opens) and the ack latch is
+    ///   consumed.
+    /// * Body refresh: when a `Reload Failed` dialog is on screen
+    ///   and the ack latch is acknowledged, the body is rebuilt if
+    ///   the failing-source set has shifted (partial recovery that
+    ///   leaves at least one source still failing, or a new source
+    ///   recorded for the same acknowledged burst). The ack latch
+    ///   stays in place; the user is not re-notified for the same
+    ///   ongoing burst.
+    /// * No-op: nothing failing, body unchanged, or an unrelated
+    ///   dialog (a `Watcher Warning` from `rewire_after_profile_delete`,
+    ///   or a profile create/delete `Error`) occupies the slot. In
+    ///   the foreign-dialog case the ack latch stays armed so the
+    ///   next tick can present once the foreign dialog is dismissed.
     pub(super) fn try_present_reload_failure_dialog(&mut self) -> bool {
-        if !self.reload_failure_state.has_unacknowledged_failure() {
+        if !self.reload_failure_state.has_any_failure() {
             return false;
         }
         let title = "Reload Failed";
@@ -2122,9 +2152,30 @@ impl HomeView {
         if occupied_by_other {
             return false;
         }
+
+        let needs_ack = self.reload_failure_state.has_unacknowledged_failure();
+        let dialog_open = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.title() == title);
+
+        if !needs_ack && !dialog_open {
+            return false;
+        }
+
         let body = self.reload_failure_state.build_dialog_body();
+        let body_matches = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.message() == body);
+        if !needs_ack && body_matches {
+            return false;
+        }
+
         self.info_dialog = Some(InfoDialog::new(title, &body));
-        self.reload_failure_state.acknowledge_dialog();
+        if needs_ack {
+            self.reload_failure_state.acknowledge_dialog();
+        }
         true
     }
 
@@ -5127,17 +5178,20 @@ impl HomeView {
     }
 
     /// Watcher-path counterpart of `refresh_from_config`. Returns Err on
-    /// TOML parse failure so the tick loop can preserve the previous
-    /// in-memory config rather than silently flipping safety-affecting
-    /// settings (e.g. `confirm_before_quit`) to defaults. The Err is
-    /// consumed by `handle_tick_reload_config` in `App::run` and
-    /// surfaced in the aggregated reload-failure dialog.
+    /// TOML parse failure for the active profile so the tick loop can
+    /// preserve the previous in-memory active config rather than silently
+    /// flipping safety-affecting settings (e.g. `confirm_before_quit`)
+    /// to defaults. The Err is consumed by `handle_tick_reload_config` in
+    /// `App::run` and surfaced in the aggregated reload-failure dialog.
     ///
     /// Peer profile coverage: `apply_config_to_state` calls
     /// `refresh_status_hook_config_cache` which loads status_hook
     /// configs for every storage'd profile, so a peer-process edit to
     /// any `<profile>/config.toml` updates the visible status-hook
-    /// state even in unified mode.
+    /// state even in unified mode. Peer-profile status_hooks load
+    /// through the lenient `resolve_config_or_warn` and fall back to
+    /// `Default::default()` on parse error; the strict-resolve
+    /// guarantee applies to the active profile only.
     pub(super) fn try_refresh_from_config_watcher(&mut self) -> anyhow::Result<()> {
         let profile = self.config_profile();
         let config = crate::session::resolve_config(&profile)?;

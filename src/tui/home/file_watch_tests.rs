@@ -760,3 +760,174 @@ async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_s
         "Reload Failed"
     );
 }
+
+/// Locks the install-loop resurrection-prevention invariant for
+/// `rewire_config_subscriptions`: the install loop resolves each
+/// `to_add` profile through the non-creating `get_profile_dir_path`
+/// and skips when the directory is absent, so a peer-process delete
+/// that races the `list_profiles()` snapshot does not recreate the
+/// profile directory as an empty stub via the install path.
+#[tokio::test]
+#[serial]
+async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
+    use super::ConfigWatchKey;
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("active").expect("seed active");
+
+    let mut view = HomeView::new(
+        Some("active".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let stale_name = "stale-deleted";
+    let stale_path = crate::session::get_profile_dir_path(stale_name).expect("path");
+    assert!(
+        !stale_path.exists(),
+        "precondition: stale profile dir is absent (peer delete raced the snapshot)"
+    );
+
+    view.rewire_config_subscriptions(&["active".to_string(), stale_name.to_string()])
+        .expect("rewire with stale snapshot");
+
+    assert!(
+        !stale_path.exists(),
+        "the install loop must not recreate a deleted profile dir; \
+         a stale snapshot listing a missing profile is skipped, not resurrected"
+    );
+    assert!(
+        !view
+            .config_watch_handles
+            .contains_key(&ConfigWatchKey::profile(stale_name)),
+        "no config-watch handle is installed for a missing profile dir"
+    );
+    assert!(
+        view.config_watch_handles
+            .contains_key(&ConfigWatchKey::profile("active")),
+        "the active profile (which exists) is still subscribed"
+    );
+}
+
+/// Locks the install-loop resurrection-prevention invariant for
+/// `rewire_disk_subscriptions`: same shape as the config-watch
+/// sibling. A stale snapshot that lists a missing profile is
+/// skipped, not resurrected via `fs::create_dir_all`.
+#[tokio::test]
+#[serial]
+async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("disk-active").expect("seed active");
+
+    let mut view = HomeView::new(
+        Some("disk-active".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let stale_name = "disk-stale-deleted";
+    let stale_path = crate::session::get_profile_dir_path(stale_name).expect("path");
+    assert!(
+        !stale_path.exists(),
+        "precondition: stale profile dir is absent"
+    );
+
+    view.rewire_disk_subscriptions(&["disk-active".to_string(), stale_name.to_string()])
+        .expect("rewire with stale snapshot");
+
+    assert!(
+        !stale_path.exists(),
+        "the disk-watch install loop must not recreate a deleted profile dir"
+    );
+    assert!(
+        !view.disk_watch_handles.contains_key(stale_name),
+        "no disk-watch handle is installed for a missing profile dir"
+    );
+    assert!(
+        view.disk_watch_handles.contains_key("disk-active"),
+        "the active profile (which exists) is still subscribed"
+    );
+}
+
+/// Locks the partial-recovery body-refresh invariant: when one
+/// failing source recovers while another stays failed, the
+/// `Reload Failed` dialog body rebuilds in place to drop the
+/// recovered source's line. The ack latch stays in place so the
+/// user is not re-notified for the same ongoing burst.
+#[tokio::test]
+#[serial]
+async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() {
+    let temp = TempDir::new().expect("tempdir");
+    isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    crate::session::get_profile_dir("partial-recovery").expect("seed dir");
+
+    let mut view = HomeView::new(
+        Some("partial-recovery".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+
+    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
+    let config_err: anyhow::Result<()> = Err(anyhow::anyhow!("config broken"));
+    view.reload_failure_state.record_storage(&storage_err);
+    view.reload_failure_state.record_config(&config_err);
+
+    assert!(
+        view.try_present_reload_failure_dialog(),
+        "first call presents the dialog"
+    );
+    let initial_body = view
+        .info_dialog
+        .as_ref()
+        .expect("dialog presented")
+        .message()
+        .to_string();
+    assert!(
+        initial_body.contains("storage broken") && initial_body.contains("config broken"),
+        "initial body lists both failing sources: {initial_body}"
+    );
+    assert!(
+        !view.reload_failure_state.has_unacknowledged_failure(),
+        "presentation consumed the ack latch"
+    );
+
+    let storage_ok: anyhow::Result<()> = Ok(());
+    view.reload_failure_state.record_storage(&storage_ok);
+    assert!(
+        view.reload_failure_state.has_any_failure(),
+        "config still failing keeps has_any_failure true"
+    );
+    assert!(
+        !view.reload_failure_state.has_unacknowledged_failure(),
+        "partial recovery does not re-arm the ack latch"
+    );
+
+    assert!(
+        view.try_present_reload_failure_dialog(),
+        "the body-refresh path must update an on-screen dialog when the failing-source set shifts"
+    );
+
+    let refreshed_body = view
+        .info_dialog
+        .as_ref()
+        .expect("dialog still on screen")
+        .message();
+    assert!(
+        refreshed_body.contains("config broken"),
+        "refreshed body keeps the still-failing source: {refreshed_body}"
+    );
+    assert!(
+        !refreshed_body.contains("storage broken"),
+        "refreshed body drops the recovered source's line: {refreshed_body}"
+    );
+}

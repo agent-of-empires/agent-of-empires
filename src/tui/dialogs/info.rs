@@ -98,6 +98,15 @@ impl InfoDialog {
         &self.title
     }
 
+    /// The dialog body. The tick loop compares this against the
+    /// current `reload_failure_state` body so a `Reload Failed`
+    /// dialog already on screen refreshes only when the failing
+    /// source set changes (partial recovery or a newly recorded
+    /// source).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// A left-click anywhere inside the info dialog dismisses it,
     /// matching the keyboard's "any of Esc/Enter/Space closes" model.
     /// `None` when the click landed outside the dialog area, so the
