@@ -1851,7 +1851,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             setActivatorNodeRef (a ref-setter callback) alongside plain
             attributes/listeners objects; the rule incorrectly taints every
             property access on the whole object as a "ref value read during
-            render". None of these touch .current — it's a false positive. */}
+            render". None of these touch .current, so it's a false positive. */}
         {dragHandle && (
           <button
             ref={dragHandle.setActivatorNodeRef}
