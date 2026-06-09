@@ -14,11 +14,25 @@ permissions:
 
 jobs:
   cargo:
-    name: Cargo Test
+    # Job names use the stable `label`, not the runner, so the branch
+    # ruleset's required checks ("Cargo Test (linux)" / "Cargo Test
+    # (macos)") survive runner swaps. The runner itself comes from a
+    # repo Actions variable so Blacksmith can be dropped without a
+    # commit when the monthly credit pool runs dry: clearing
+    # RUNNER_CARGO_LINUX / RUNNER_CARGO_MACOS in Settings -> Actions ->
+    # Variables falls back to the free GitHub-hosted runners on the
+    # next run. Jobs already queued for Blacksmith sit "queued"
+    # forever (GitHub has no runner fallback primitive), so flip the
+    # variable, then re-run the stuck workflow.
+    name: Cargo Test (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [blacksmith-8vcpu-ubuntu-2404, blacksmith-6vcpu-macos-15]
+        include:
+          - label: linux
+            os: ${{ vars.RUNNER_CARGO_LINUX || 'ubuntu-latest' }}
+          - label: macos
+            os: ${{ vars.RUNNER_CARGO_MACOS || 'macos-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -147,7 +161,9 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Same Blacksmith-with-fallback scheme as the cargo job: clear
+    # RUNNER_PLAYWRIGHT_MOCKED to drop to the free GitHub runner.
+    runs-on: ${{ vars.RUNNER_PLAYWRIGHT_MOCKED || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
