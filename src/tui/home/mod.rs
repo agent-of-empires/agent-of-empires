@@ -4363,15 +4363,23 @@ impl HomeView {
         self.registered_projects = merged;
     }
 
-    /// The canonical repo path of the first live session under project header
-    /// `label`, or `None` when the header has no sessions (an empty pinned
-    /// header). This is the header's stable repo identity, so two repos that
-    /// merely share a basename are judged against their own paths rather than
-    /// the shared display label.
+    /// The canonical repo path of the first live (non-archived) session under
+    /// project header `label`, or `None` when no live session populates the
+    /// header (an empty pinned header). This is the header's stable repo
+    /// identity, so two repos that merely share a basename are judged against
+    /// their own paths rather than the shared display label.
+    ///
+    /// Archived sessions are excluded on purpose: an empty main-flow header is
+    /// injected by LABEL match against the registry, so its pin state and
+    /// unpin toggle must resolve by the same rule. Letting an archived row
+    /// lend the header its path made a registry entry with a different
+    /// recorded path (repo deleted or moved, so `canonical_key` compares raw
+    /// strings) render an unpinnable phantom header: pinned by label, judged
+    /// by path.
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .iter()
-            .find(|i| project_group_name(i) == label)
+            .find(|i| !i.is_archived() && project_group_name(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 

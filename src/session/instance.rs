@@ -4437,7 +4437,13 @@ mod tests {
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
+    // Serialized: this test creates and kills a real tmux session. Unserialized
+    // it can kill the shared server's last session while a `#[serial]` peer's
+    // `new-session` is connecting, which fails that peer with "server exited
+    // unexpectedly" (and its own skip-on-failure fallback silently masks the
+    // same race in the other direction).
     #[test]
+    #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
         if std::process::Command::new("tmux")
             .arg("-V")

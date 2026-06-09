@@ -173,7 +173,10 @@ test.describe("Wizard form UI stories", () => {
     await page.getByRole("button", { name: /Launch session/ }).click();
 
     await expect.poll(() => captured.body?.tool).toBe("codex");
-    expect(await page.evaluate(() => localStorage.getItem("aoe-acp-last-tool"))).toBe("codex");
+    // saveLastUsedTool runs after the create RESPONSE resolves, while the
+    // poll above passes as soon as the REQUEST is captured by the route, so
+    // an immediate read races the response handling. Poll until persisted.
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("aoe-acp-last-tool"))).toBe("codex");
 
     await page.reload();
 

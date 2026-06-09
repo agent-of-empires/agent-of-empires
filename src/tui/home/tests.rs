@@ -5909,6 +5909,112 @@ fn unpin_archived_only_project_leaves_main_flow() {
     );
 }
 
+/// A registry entry whose path differs from an archived session's repo path
+/// sharing the same basename must still read as pinned and be unpinnable.
+/// The empty header is surfaced by LABEL match (`unpopulated_projects`), so
+/// pin state and the unpin toggle must resolve by the same rule. Previously
+/// `project_header_repo_path` let the archived row lend the header its path:
+/// the path comparison failed (repo gone from disk, `canonical_key` compares
+/// raw strings), the header read as unpinned, and `p` routed to the pin
+/// branch and died on the name conflict, leaving a phantom header the user
+/// could not clear.
+#[test]
+#[serial]
+fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnable() {
+    use crate::session::config::GroupByMode;
+    use crate::session::is_within_archived_section;
+    use crate::session::projects::{self, Project, ProjectScope};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // A live session in another project, plus an ARCHIVED session whose repo
+    // basename is "otari" but whose recorded path differs from the registry
+    // entry below (repo deleted/moved, so neither canonicalizes).
+    let mut alpha = Instance::new("alpha-running", "/repos/alpha");
+    alpha.status = Status::Running;
+    let mut orphan = Instance::new("otari-old", "/old/home/otari");
+    orphan.status = Status::Stopped;
+    orphan.archive();
+
+    let instances = vec![alpha, orphan];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // Stale registry entry: same basename, different (nonexistent) path.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    view.group_by = GroupByMode::Project;
+    view.refresh_registered_projects();
+    view.flat_items = view.build_flat_items();
+
+    // 1. The phantom: an empty otari header renders in the main flow.
+    let otari_idx = view.flat_items.iter().position(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        otari_idx.is_some(),
+        "stale registry entry must surface an empty otari header; got {:?}",
+        view.flat_items
+    );
+
+    // 2. With no live session populating the label, pin state resolves by
+    //    label, the same rule that injected the header.
+    assert!(
+        view.is_project_label_pinned("otari"),
+        "registry-backed empty header must read as pinned even when an \
+         archived session recorded a different path for the same basename"
+    );
+
+    // 3. `p` on the header routes to the unpin branch and clears it.
+    view.cursor = otari_idx.unwrap();
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    let still_there = view.flat_items.iter().any(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        !still_there,
+        "unpin must drop the empty header from the main flow; got {:?}",
+        view.flat_items
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "unpin must remove the stale registry entry"
+    );
+    // The archived session itself is untouched; it stays under Archived.
+    assert!(
+        view.flat_items
+            .iter()
+            .any(|i| { matches!(i, Item::Group { path, .. } if is_within_archived_section(path)) }),
+        "archived section still present"
+    );
+}
+
 /// The pin must persist a project across its last session leaving the view:
 /// once pinned, the header remains even when no sessions reference it. This
 /// is the user-visible promise of #2047.

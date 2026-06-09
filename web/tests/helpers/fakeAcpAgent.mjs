@@ -333,7 +333,11 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    version: "0.41.0",
+    // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs;
+    // the gate rejects the fake's handshake otherwise, which fails every
+    // live Playwright acp spec and the acp live-daemon e2e suite (#2077
+    // bumped the floor without this fixture and broke both).
+    version: "0.44.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
