@@ -75,14 +75,16 @@ vi.mock("../../lib/api", () => ({
   fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
 }));
 
+const dispatchThemePickerChanged = vi.fn();
 vi.mock("../../hooks/useResolvedTheme", () => ({
-  dispatchThemePickerChanged: vi.fn(),
+  dispatchThemePickerChanged: (name?: string) => dispatchThemePickerChanged(name),
 }));
 
 afterEach(() => {
   cleanup();
   updateTheme.mockClear();
   updateProfileSettings.mockClear();
+  dispatchThemePickerChanged.mockClear();
 });
 
 function renderThemeTab() {
@@ -127,6 +129,30 @@ describe("SettingsView theme tab save routing", () => {
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
     expect(updateProfileSettings).not.toHaveBeenCalled();
+  });
+
+  // Ported from live settings-theme-color-mode.spec.ts (#1405). Color mode is
+  // a TUI-only palette setting: only the theme-name custom widget dispatches
+  // the dashboard repaint event after its save lands. A refactor that routes
+  // color mode through the same dispatch would re-fetch /api/themes/<name> and
+  // repaint the dashboard on every toggle of a setting the web never renders.
+  it("color-mode change PATCHes but never dispatches the theme repaint event", async () => {
+    renderThemeTab();
+    await waitFor(() => selectWithOption("palette"));
+    fireEvent.change(selectWithOption("palette"), {
+      target: { value: "palette" },
+    });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+
+    // Positive control: a theme-name pick through the same tab does dispatch,
+    // proving the spy is wired and the gating is per-field, not global.
+    fireEvent.change(selectWithOption("dracula"), {
+      target: { value: "dracula" },
+    });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
   });
 
   it("routes a profile-overridable row (idle decay) to the profile, not /api/theme", async () => {

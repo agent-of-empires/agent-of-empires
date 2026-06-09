@@ -5,6 +5,7 @@
 // does not match there), so these exercise it directly: the parent-handles-
 // inset padding switch and the keyboard-open paste fallback branch.
 
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MobileTerminalToolbar } from "../MobileTerminalToolbar";
@@ -78,5 +79,54 @@ describe("MobileTerminalToolbar keyboard inset", () => {
 
     expect(sendData).not.toHaveBeenCalled();
     document.body.removeChild(editable);
+  });
+});
+
+// User story (ported from the live Playwright acp-stories suite): the
+// Ctrl toggle latches the modifier so the next keystroke combines with
+// Ctrl. Tapping Ctrl flips aria-pressed to "true"; tapping again flips
+// it back. The latch state lives in the parent (TerminalView /
+// PairedTerminal hold a useState and pass `onCtrlToggle={() =>
+// setCtrlActive(v => !v)}`); this harness mirrors that wiring so the
+// toolbar's aria-pressed contract is exercised end to end. The
+// modifier-applied keystroke itself is handled by the terminal helper
+// textarea and is out of scope here.
+function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
+  const [ctrlActive, setCtrlActive] = useState(false);
+  return (
+    <MobileTerminalToolbar
+      sendData={sendData}
+      termRef={{ current: null }}
+      keyboardOpen={false}
+      ctrlActive={ctrlActive}
+      onCtrlToggle={() => setCtrlActive((v) => !v)}
+    />
+  );
+}
+
+describe("MobileTerminalToolbar Ctrl latch", () => {
+  it("tapping Ctrl latches (aria-pressed true) and tapping again unlatches", () => {
+    render(<CtrlLatchHarness sendData={vi.fn()} />);
+    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(ctrl);
+    expect(ctrl.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(ctrl);
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("Ctrl+C interrupt clears an active latch", () => {
+    const sendData = vi.fn();
+    render(<CtrlLatchHarness sendData={sendData} />);
+    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+
+    fireEvent.click(ctrl);
+    expect(ctrl.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl+C interrupt" }));
+    expect(sendData).toHaveBeenCalledWith("\x03");
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
   });
 });
