@@ -1873,7 +1873,14 @@ fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<
 fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
-    fresh.last_error = prior.last_error;
+    // Only preserve `last_error` while the session is still in Error. A healthy
+    // `fresh` clears it in `update_status_with_metadata_inner`; carrying the
+    // prior string over unconditionally would re-stick a stale error on a now-green
+    // session every poll tick when a healthy transition happened through a path that
+    // did not explicitly null `last_error` in-memory (issue #1271).
+    if fresh.status == Status::Error {
+        fresh.last_error = prior.last_error;
+    }
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh
@@ -3673,6 +3680,54 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_runtime_fields_preserves_last_error_while_still_in_error() {
+        // Cascade-Err preservation: prior held the error string, fresh re-derived
+        // Error from a still-dead pane without re-attaching the message. Carry it.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Error;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_on_healthy_transition() {
+        // Issue #1271: prior errored in-memory, the session recovered to Idle
+        // through a path that never nulled `last_error`. The fresh poll must not
+        // re-stick the stale string on a now-green session.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_idle_to_idle() {
+        // Both ends healthy but prior still carried a stale string: don't propagate.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Idle;
+        prior.last_error = Some("stale".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
 
     #[tokio::test]
     #[serial_test::serial]
