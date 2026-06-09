@@ -333,7 +333,7 @@ export interface ProfileInfo {
  *  HooksConfigOverride (src/session/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
- *  the dashboard; see HooksReadOnlyPanel and PROFILE_WRITABLE_SECTIONS. */
+ *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
 export interface HooksOverride {
   on_create?: string[];
   on_launch?: string[];
