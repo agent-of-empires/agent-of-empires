@@ -70,6 +70,27 @@
       "components": ["web/src/components/DashboardUpdateBanner.tsx"]
     },
     {
+      "id": "terminal.mobile-dom-renderer",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/mobile-dom-renderer.spec.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
+    },
+    {
+      "id": "terminal.webgl-gate-units",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useTerminal.webgl.test.ts"],
+      "components": ["web/src/hooks/useTerminal.ts"]
+    },
+    {
+      "id": "terminal.mobile-scrollback-touch",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/scrollback-exit.spec.ts"],
+      "components": ["web/src/hooks/useTerminal.ts", "web/src/components/BackToLiveButton.tsx"]
+    },
+    {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",

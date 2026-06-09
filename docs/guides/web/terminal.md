@@ -14,7 +14,7 @@ Scrolling up into history pauses the live tail and surfaces a **Back to live** b
 
 The terminal uses tmux for scrollback and selection, so copy and scroll work with no modifier keys:
 
-- **Scroll** with the mouse wheel (or two-finger swipe on touch) through tmux scrollback.
+- **Scroll** with the mouse wheel (or a one-finger swipe on touch) through tmux scrollback. Touch scrolling follows the finger like any native list: drag down to look back through history, drag up to head back toward the live tail.
 - **Select** by click-dragging across the text. Dragging upward past the top edge scrolls into scrollback and extends the selection. Releasing the drag copies to your system clipboard automatically; no Ctrl/Cmd+C needed.
 
 Copy relies on the browser Clipboard API, which only works in a secure context: HTTPS (the remote-access tunnel modes) or `http://localhost`. On a plain-HTTP LAN/VPN origin the browser blocks clipboard writes, so the selection stays visible but is not copied. Firefox is best-effort (it lacks the async clipboard write); Chromium and Safari copy reliably.

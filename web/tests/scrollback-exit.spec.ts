@@ -41,21 +41,12 @@ async function openSession(page: Page) {
   await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
 }
 
-async function swipeUp(page: Page, travel: number) {
+// Direct-manipulation mapping: content follows the finger. Dragging the
+// finger DOWN reveals older lines above (tmux wheel-UP, enters
+// scrollback); dragging UP heads back toward live (wheel-DOWN, clamped).
+async function swipeDown(page: Page, travel: number) {
   // Single-finger vertical swipe. A ~300px travel over ~15 frames emits
   // well above the per-gesture wheel threshold.
-  const cx = 160;
-  let cy = 500;
-  await fireTouches(page, "touchstart", [{ x: cx, y: cy }]);
-  const steps = 15;
-  for (let i = 1; i <= steps; i++) {
-    cy = 500 - (i * travel) / steps;
-    await fireTouches(page, "touchmove", [{ x: cx, y: cy }]);
-  }
-  await fireTouches(page, "touchend", []);
-}
-
-async function swipeDown(page: Page, travel: number) {
   const cx = 160;
   let cy = 100;
   await fireTouches(page, "touchstart", [{ x: cx, y: cy }]);
@@ -67,13 +58,25 @@ async function swipeDown(page: Page, travel: number) {
   await fireTouches(page, "touchend", []);
 }
 
+async function swipeUp(page: Page, travel: number) {
+  const cx = 160;
+  let cy = 500;
+  await fireTouches(page, "touchstart", [{ x: cx, y: cy }]);
+  const steps = 15;
+  for (let i = 1; i <= steps; i++) {
+    cy = 500 - (i * travel) / steps;
+    await fireTouches(page, "touchmove", [{ x: cx, y: cy }]);
+  }
+  await fireTouches(page, "touchend", []);
+}
+
 function hasText(handle: MockHandle, needle: string): boolean {
   const buf = Buffer.from(needle);
   return handle.wsMessages.some((m) => m.includes(buf));
 }
 
 test.describe("Mobile scrollback exit", () => {
-  test("button appears after swipe-up and sends Escape on tap", async ({ page }) => {
+  test("button appears after swipe-down and sends Escape on tap", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await page.goto("/");
@@ -83,7 +86,7 @@ test.describe("Mobile scrollback exit", () => {
 
     await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
 
-    await swipeUp(page, 300);
+    await swipeDown(page, 300);
     await expect.poll(() => countSeq(handle, WHEEL_UP_SEQ), { timeout: 2_000 }).toBeGreaterThan(0);
 
     const btn = page.getByRole("button", { name: "Back to live" });
@@ -110,7 +113,7 @@ test.describe("Mobile scrollback exit", () => {
     // No pause sent yet.
     expect(hasText(handle, '"type":"pause_output"')).toBe(false);
 
-    await swipeUp(page, 300);
+    await swipeDown(page, 300);
     await expect.poll(() => hasText(handle, '"type":"pause_output"'), { timeout: 2_000 }).toBe(true);
     // Still no resume until the user exits.
     expect(hasText(handle, '"type":"resume_output"')).toBe(false);
@@ -132,17 +135,18 @@ test.describe("Mobile scrollback exit", () => {
     await page.reload();
     await openSession(page);
 
-    // Aggressive swipe: large per-step dy (75px) saturates velocity at
-    // MAX_VELOCITY=2.0 px/ms even when synthetic touchmoves arrive tens
-    // of ms apart (Playwright IPC roundtrip). Without saturation, slow
-    // local environments wouldn't generate enough momentum to repro.
+    // Aggressive downward swipe (into scrollback): large per-step dy
+    // (75px) saturates velocity at MAX_VELOCITY=2.0 px/ms even when
+    // synthetic touchmoves arrive tens of ms apart (Playwright IPC
+    // roundtrip). Without saturation, slow local environments wouldn't
+    // generate enough momentum to repro.
     const cx = 160;
-    let cy = 600;
+    let cy = 100;
     await fireTouches(page, "touchstart", [{ x: cx, y: cy }]);
     const steps = 8;
     const travel = 600;
     for (let i = 1; i <= steps; i++) {
-      cy = 600 - (i * travel) / steps;
+      cy = 100 + (i * travel) / steps;
       await fireTouches(page, "touchmove", [{ x: cx, y: cy }]);
     }
     await fireTouches(page, "touchend", []);
@@ -175,14 +179,14 @@ test.describe("Mobile scrollback exit", () => {
     await page.reload();
     await openSession(page);
 
-    await swipeUp(page, 300);
+    await swipeDown(page, 300);
     await expect.poll(() => countSeq(handle, WHEEL_UP_SEQ), { timeout: 2_000 }).toBeGreaterThan(0);
     const ups = countSeq(handle, WHEEL_UP_SEQ);
 
-    // Now swipe down harder — more travel than the up gesture. The
-    // clamp should cut off wheel-DOWN emissions before depth hits 0,
-    // so the total down count stays strictly less than the up count.
-    await swipeDown(page, 600);
+    // Now swipe up (back toward live) harder, with more travel than
+    // the entry gesture. The clamp should cut off wheel-DOWN emissions
+    // before depth hits 0, so the down count stays below the up count.
+    await swipeUp(page, 600);
     await page.waitForTimeout(200);
     const downs = countSeq(handle, WHEEL_DOWN_SEQ);
 

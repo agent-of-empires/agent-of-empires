@@ -163,6 +163,24 @@ export function readThemeFromCss(): ITheme {
 }
 
 /**
+ * Decide whether the WebGL addon is safe to load. WebKit is excluded:
+ * Safari 26.x garbles xterm's WebGL glyph atlas (xtermjs/xterm.js#5816)
+ * and iOS WebKit (which backs every iOS browser, including CriOS/EdgiOS)
+ * also tears down GL contexts whenever a PWA is backgrounded. iPadOS 13+
+ * masquerades as "MacIntel", so the touch-point probe is needed to catch
+ * iPads. Exported for unit tests.
+ */
+export function shouldUseWebglRenderer(
+  ua: string = navigator.userAgent,
+  platform: string = navigator.platform,
+  maxTouchPoints: number = navigator.maxTouchPoints,
+): boolean {
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (platform === "MacIntel" && maxTouchPoints > 1);
+  const isSafari = /AppleWebKit/.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|Android/.test(ua);
+  return !isIOS && !isSafari;
+}
+
+/**
  * Manages an xterm.js terminal connected to a PTY-relayed WebSocket.
  * Returns a ref to attach to a container div, plus connection state.
  *
@@ -439,18 +457,29 @@ export function useTerminal(
     // GPU renderer. Loaded after .open() per the addon's contract. Falls
     // back to the DOM renderer silently on machines where the context is
     // unavailable (Safari private mode, headless CI, software-render VMs)
-    // so the terminal still works there.
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
+    // so the terminal still works there. Skipped entirely on WebKit
+    // (iOS + Safari): xterm's WebGL output is garbled there
+    // (xtermjs/xterm.js#5816, reproduced on iPhone PWA as giant
+    // mis-scaled glyphs), and iOS additionally drops GL contexts every
+    // time a PWA is backgrounded. The DOM renderer handles phone-sized
+    // grids comfortably; desktop Chromium / Firefox / Android Chrome
+    // keep the GPU path.
+    if (shouldUseWebglRenderer()) {
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          timing?.setRenderer("dom");
+          webgl.dispose();
+        });
+        term.loadAddon(webgl);
+        timing?.setRenderer("webgl");
+      } catch (err) {
         timing?.setRenderer("dom");
-        webgl.dispose();
-      });
-      term.loadAddon(webgl);
-      timing?.setRenderer("webgl");
-    } catch (err) {
+        tdbg("webgl addon unavailable, using DOM renderer", err);
+      }
+    } else {
       timing?.setRenderer("dom");
-      tdbg("webgl addon unavailable, using DOM renderer", err);
+      tdbg("webkit detected, using DOM renderer");
     }
 
     // Resize messaging. FitAddon measures the container and calls
@@ -902,7 +931,9 @@ export function useTerminal(
     }
 
     // Touch swipe emits SGR mouse-wheel escape sequences to the PTY
-    // so tmux mouse-mode enters copy-mode and scrolls.
+    // so tmux mouse-mode enters copy-mode and scrolls. Direction follows
+    // direct manipulation: dragging the finger DOWN reveals older lines
+    // above (wheel-UP), dragging UP heads back toward live (wheel-DOWN).
     //
     // Track net wheel-UP depth so the client knows whether tmux is in
     // copy-mode and can pause/resume the pane's process accordingly.
@@ -913,8 +944,8 @@ export function useTerminal(
     // via the "Back to live" button on mobile).
     //
     // Mobile-only: clamp wheel-DOWN emissions so depth floors at 1,
-    // preventing tmux's `-e` auto-exit. On mobile the down-swipe
-    // overshoots easily and the snap-to-live discards the scroll
+    // preventing tmux's `-e` auto-exit. On mobile the return-to-live
+    // swipe overshoots easily and the snap-to-live discards the scroll
     // position. Desktop keeps the unclamped behavior — scroll-down-past-
     // bottom auto-exits, as users expect there.
     //
@@ -1045,7 +1076,11 @@ export function useTerminal(
     let singleLastTs = 0;
     let suppressNextClick = false;
     const GESTURE_LOCK_PX = 12;
-    const LINES_PER_WHEEL = 2;
+    // tmux's default copy-mode wheel binding scrolls 5 lines per wheel
+    // event, so one wheel must cost 5 lines of finger travel for the
+    // content to track the finger 1:1. The old value of 2 made the
+    // scrollback fly past at 2.5x finger speed.
+    const LINES_PER_WHEEL = 5;
     const MAX_VELOCITY = 2.0;
     const MAX_WHEELS_PER_FRAME = 6;
     const clampV = (v: number) => Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, v));
@@ -1166,7 +1201,11 @@ export function useTerminal(
 
         e.preventDefault();
 
-        const dy = singleY - y;
+        // Direct manipulation: content follows the finger. Dragging DOWN
+        // (positive dy) reveals older lines above, which in tmux terms is
+        // wheel-UP. The previous `singleY - y` mapping was inverted
+        // relative to every native iOS scroll surface.
+        const dy = y - singleY;
         singleY = y;
         singleAccum += dy;
         const step = pxPerWheel();
@@ -1209,7 +1248,9 @@ export function useTerminal(
         return;
       }
 
-      const dy = touchMidY - y;
+      // Same direct-manipulation sign convention as the single-finger
+      // path above: midpoint moving DOWN scrolls into older content.
+      const dy = y - touchMidY;
       touchMidY = y;
       touchAccum += dy;
       const step = pxPerWheel();
