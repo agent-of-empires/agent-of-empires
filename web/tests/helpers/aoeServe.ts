@@ -486,21 +486,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     writeFakeClaudeShim(shimBin);
   }
 
-  // The agent pane command is wrapped in a login shell
-  // (`<shell> -lc 'stty susp undef; exec env <cmd>'`, see
-  // wrap_command_ignore_suspend in src/session/instance.rs). A login shell
-  // sources /etc/profile, and some CI runner images (Blacksmith's ubuntu-2404)
-  // reset PATH there, dropping the shim dir we put on `seedEnv.PATH` below.
-  // Without a ~/.profile to restore it, `env <shim>` fails with "No such file
-  // or directory" (exit 127) and the pane dies before running the fake agent.
-  // Seed a ~/.profile that re-prepends the shim dir, mirroring how a real
-  // user's ~/.profile typically adds ~/bin. (GitHub's runner image preserves
-  // the inherited PATH through the login shell, so this was previously
-  // invisible.)
-  writeFileSync(join(home, ".profile"), `export PATH="${shimBin}:$PATH"\n`, {
-    mode: 0o600,
-  });
-
   const authMode: AuthMode = opts.authMode ?? "none";
 
   const seedEnv: NodeJS.ProcessEnv = {

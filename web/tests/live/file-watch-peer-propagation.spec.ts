@@ -48,13 +48,9 @@ test.describe.serial("file-watch peer propagation", () => {
         .toBe(true);
 
       // Once the watcher has updated daemon state, the dashboard can take a
-      // little longer to repaint. The watcher budget is asserted above against
-      // the daemon API (1.5s); this is only the browser-repaint allowance, so
-      // give it the same headroom as the initial load (a slower CI runner can
-      // push the repaint just past a tight 3s window even though the daemon
-      // already flipped).
+      // little longer to repaint.
       await expect(page.getByText("peer-target")).toBeVisible({
-        timeout: 10_000,
+        timeout: 3_000,
       });
     } finally {
       await serve.stop();
