@@ -210,7 +210,14 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
         let Some((key, value)) = part.split_once('=') else {
             continue;
         };
-        let value = value.trim().trim_matches('"').to_string();
+        // Strip only a single outer pair of quotes, not every quote, so a
+        // value that legitimately contains a `"` survives intact.
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value)
+            .to_string();
         match key.trim() {
             "realm" => realm = Some(value),
             "service" => service = Some(value),
@@ -412,5 +419,18 @@ docker.io/library/ubuntu@sha256:bbb\n";
     #[test]
     fn rejects_non_bearer_challenge() {
         assert!(parse_bearer_challenge("Basic realm=\"x\"").is_none());
+    }
+
+    #[test]
+    fn strips_only_the_outer_quote_pair() {
+        // An unquoted value passes through; only a single surrounding pair is
+        // removed, so an embedded quote is preserved rather than stripped.
+        let c = parse_bearer_challenge(
+            "Bearer realm=https://r.example/token,service=svc,scope=\"a\"b\"",
+        )
+        .unwrap();
+        assert_eq!(c.realm, "https://r.example/token");
+        assert_eq!(c.service.as_deref(), Some("svc"));
+        assert_eq!(c.scope.as_deref(), Some("a\"b"));
     }
 }
