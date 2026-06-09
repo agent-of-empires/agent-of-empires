@@ -35,8 +35,16 @@ export default defineConfig({
   // isolated HOME / TMUX_TMPDIR and (workerIndex,
   // parallelIndex)-derived port, so workers don't collide on port or
   // filesystem.
+  //
+  // The CI `playwright-live` job runs on a Blacksmith 4vcpu runner, which
+  // starves at 3 workers under the same coverage-instrumented load: a
+  // different spec timed out on each run (file-watch repaint, terminal-copy
+  // clipboard round-trip, /ensure restart, chat-bubble layout), the rotating-
+  // failure signature of contention rather than a broken spec. That job sets
+  // PLAYWRIGHT_LIVE_WORKERS=2; local runs and any other host keep the 3-worker
+  // default.
   fullyParallel: true,
-  workers: 3,
+  workers: process.env.PLAYWRIGHT_LIVE_WORKERS ? Number(process.env.PLAYWRIGHT_LIVE_WORKERS) : 3,
   // No retries: a flaky live spec doubles CI wall time on every flake.
   // Better to surface the flake and fix it (or quarantine via test.skip
   // until fixed) than to mask it with a retry budget.

@@ -270,6 +270,9 @@ jobs:
         env:
           AOE_COVERAGE: '1'
           AOE_E2E_BINARY: ${{ github.workspace }}/target/debug/aoe
+          # The Blacksmith 4vcpu runner starves the live suite at the 3-worker
+          # default (rotating spec timeouts); 2 workers clears the contention.
+          PLAYWRIGHT_LIVE_WORKERS: '2'
         run: npx playwright test --config=playwright.live.config.ts
       - name: Build LCOV from collected Playwright coverage
         working-directory: web
