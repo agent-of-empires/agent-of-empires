@@ -3394,6 +3394,22 @@ impl HomeView {
         stale_sid
     }
 
+    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    /// preview output rect when known, else the full terminal. `preview_pane_area`
+    /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
+    /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
+    /// no SIGWINCH race). Falls back to the terminal size for the rare entry
+    /// with no prior preview frame (e.g. attach-on-create), and to `None` if
+    /// neither is available so tmux keeps its default.
+    fn live_send_boot_size(&self) -> Option<(u16, u16)> {
+        let pane = self.preview_pane_area;
+        if pane.width > 0 && pane.height > 0 {
+            Some((pane.width, pane.height))
+        } else {
+            crate::terminal::get_size()
+        }
+    }
+
     /// Stage live-send mode against `session_id`. Mirrors
     /// `execute_send_message`'s revive cascade so a cold-start (Docker
     /// pull, agent splash) is handled before the user starts typing,
@@ -3415,22 +3431,6 @@ impl HomeView {
     /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
     /// if the pane could not be readied (`info_dialog` is set with the
     /// underlying error so the caller only has to clear its toast).
-    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
-    /// preview output rect when known, else the full terminal. `preview_pane_area`
-    /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
-    /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
-    /// no SIGWINCH race). Falls back to the terminal size for the rare entry
-    /// with no prior preview frame (e.g. attach-on-create), and to `None` if
-    /// neither is available so tmux keeps its default.
-    fn live_send_boot_size(&self) -> Option<(u16, u16)> {
-        let pane = self.preview_pane_area;
-        if pane.width > 0 && pane.height > 0 {
-            Some((pane.width, pane.height))
-        } else {
-            crate::terminal::get_size()
-        }
-    }
-
     pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
         let target = self.pending_live_send_target;
         self.pending_live_send_target = live_send::LiveSendTarget::Agent;
