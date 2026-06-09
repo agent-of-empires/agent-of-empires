@@ -303,6 +303,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Ids whose startup-recovery cascade is scheduled but not yet complete.
+    /// Phase A seeds it; each Phase B worker drains its id on completion. The
+    /// background refresher walks it to keep queued candidates' marks in
+    /// `recently_restarted` fresh past `RECENTLY_RESTARTED_TTL`, closing the
+    /// race where a candidate waiting on a `STARTUP_RECOVERY_CONCURRENCY`
+    /// permit ages out of suppression and trips a phantom `Status::Error`.
+    pub recovery_pending: crate::session::recovery::RecoveryPending,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -948,6 +955,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -1039,6 +1047,42 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
+        // Background mark-refresher (#1264). Re-stamps every still-pending
+        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
+        // so a candidate queued past the TTL behind a
+        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
+        // and trip a phantom Status::Error in status_poll_loop. Exits once the
+        // pending set drains (every worker finished) or on shutdown.
+        {
+            let pending = state.recovery_pending.clone();
+            let recently = state.recently_restarted.clone();
+            let shutdown = state.shutdown.clone();
+            crate::task_util::spawn_supervised(
+                "server.startup_recovery_refresher",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    let mut interval =
+                        tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately; skip past it so we don't
+                    // redundantly re-stamp the marks Phase A just wrote.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if !crate::session::recovery::refresh_recovery_pending(
+                                    &pending, &recently,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = shutdown.cancelled() => break,
+                        }
+                    }
+                },
+            );
+        }
+
         let cascade_state = state.clone();
         crate::task_util::spawn_supervised(
             "server.startup_recovery_cascade",
@@ -2969,6 +3013,14 @@ async fn daemon_startup_recovery_mark(
     for inst in &candidates {
         crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
     }
+    // Seed the pending set so the refresher (spawned between Phase A and
+    // Phase B) keeps these marks fresh while candidates wait on a
+    // STARTUP_RECOVERY_CONCURRENCY permit. Each worker drains its own id on
+    // completion.
+    crate::session::recovery::seed_recovery_pending(
+        &state.recovery_pending,
+        candidates.iter().map(|i| i.id.clone()),
+    );
 
     tracing::info!(
         target: "session.startup_recovery",
@@ -3023,7 +3075,8 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "tmux probe failed during recovery re-check; skipping cascade",
                     );
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3046,10 +3099,12 @@ async fn daemon_startup_recovery_cascade(
                     .unwrap_or(false)
             };
             if !still_candidate {
-                // Phase A pre-marked this id; without unmarking, the
-                // status_poll_loop would suppress the real status for
-                // the full TTL even though we are not running a cascade.
-                crate::session::recovery::unmark_recently_restarted(
+                // Phase A pre-marked this id and seeded recovery_pending;
+                // without draining, the refresher would keep re-stamping the
+                // mark and status_poll_loop would suppress the real status
+                // even though we are not running a cascade.
+                crate::session::recovery::drain_recovery_pending(
+                    &inst_state.recovery_pending,
                     &inst_state.recently_restarted,
                     &id,
                 );
@@ -3108,7 +3163,8 @@ async fn daemon_startup_recovery_cascade(
                     // reload; once the cascade has finished the on-disk
                     // status is current and the poll path resolves to the
                     // correct status without help.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3151,7 +3207,8 @@ async fn daemon_startup_recovery_cascade(
                     // Release the suppression so the next poll respects the
                     // Error state instead of forcing Status::Starting for
                     // the rest of the TTL window.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3175,7 +3232,8 @@ async fn daemon_startup_recovery_cascade(
                     // Same suppression release as above: without unmarking,
                     // the next poll forces Status::Starting and wipes the
                     // panic-specific last_error written above.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -3593,6 +3651,7 @@ pub mod test_support {
             serve_mode: "local",
             instance_locks: RwLock::new(HashMap::new()),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
+            recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),
