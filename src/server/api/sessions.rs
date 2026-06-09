@@ -2413,9 +2413,13 @@ fn resolve_create_hook_plan(
         }
     };
 
-    // Non-interactive: a surface that needs approval is only granted when the
-    // caller opted in. Otherwise refuse so the caller can prompt and retry.
-    if trust.needs_prompt() && !trust_hooks_requested {
+    // Refuse only when HOOKS need approval and the caller did not opt in.
+    // Project MCP is deliberately not a gate here: the supervisor skips an
+    // untrusted `.mcp.json` at spawn (it's the real MCP gate), so blocking
+    // creation on it would be more aggressive than the CLI, which still
+    // creates the session when MCP is declined. A passed `trust_hooks` still
+    // records MCP trust below, bundling approval the way the CLI does.
+    if trust.hooks.needs_trust() && !trust_hooks_requested {
         let repo_hooks = match &trust.hooks {
             TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
                 Some(h.clone())
@@ -5328,6 +5332,31 @@ mod tests {
             "no global hooks, so scratch resolves to nothing"
         );
         assert!(plan.trust_write.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
+        // A repo with an untrusted `.mcp.json` but no hooks must NOT be refused:
+        // the supervisor gates MCP at spawn, so blocking creation here would be
+        // stricter than the CLI. The session is created with MCP left untrusted.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers": {"foo": {"command": "echo"}}}"#,
+        )
+        .unwrap();
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("untrusted MCP without hooks must not block creation");
+        assert!(plan.on_create.is_empty());
+        assert!(
+            plan.trust_write.is_none(),
+            "MCP is left untrusted when the caller did not opt in"
+        );
     }
 
     #[test]
