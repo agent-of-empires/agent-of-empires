@@ -512,6 +512,64 @@ mod tests {
         );
     }
 
+    /// The two tests above are sequential, so they would still pass even if
+    /// [`refresh_recovery_pending`] snapshotted the ids and *released* the
+    /// `pending` read lock before stamping. That ordering is the whole point
+    /// of the fix, so prove it under a real lock overlap: hold the `pending`
+    /// read lock (standing in for a refresher mid-tick), start a concurrent
+    /// drain that blocks on the write lock, stamp the mark at the last
+    /// possible moment while still holding the read lock, then release and
+    /// let the drain finish. The drain's unmark must win.
+    ///
+    /// This fails if [`drain_recovery_pending`] is reordered to unmark before
+    /// taking `W(pending)`: the premature unmark would race ahead of the
+    /// stamp and the id would be resurrected.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn refresher_mark_loses_to_concurrent_drain_under_lock_overlap() {
+        use std::thread;
+        use std::time::Duration;
+
+        let recently = new_recently_restarted();
+        let pending = new_recovery_pending();
+        seed_recovery_pending(&pending, ["x".to_string()]);
+        mark_recently_restarted(&recently, "x");
+
+        // Stand in for a refresher tick that is *inside* its `pending`
+        // read-lock scope and has not yet stamped.
+        let read_guard = pending.read().unwrap();
+
+        // A worker completes concurrently. `drain_recovery_pending` takes
+        // `W(pending)` first, which blocks behind our read lock, so its
+        // unmark is forced to serialize after we release.
+        let drain_pending = pending.clone();
+        let drain_recently = recently.clone();
+        let drainer = thread::spawn(move || {
+            drain_recovery_pending(&drain_pending, &drain_recently, "x");
+        });
+
+        // Give the drainer time to reach (and block on) the write lock, or,
+        // if drain were buggily reordered to unmark first, to perform that
+        // premature unmark. Then stamp at the latest possible moment, exactly
+        // as the refresher would just before releasing its read lock.
+        thread::sleep(Duration::from_millis(100));
+        mark_recently_restarted(&recently, "x");
+
+        // Release: the blocked drain now removes the id and unmarks.
+        drop(read_guard);
+        drainer.join().unwrap();
+
+        assert!(
+            !pending.read().unwrap().contains("x"),
+            "drain must remove the id from the pending set",
+        );
+        assert!(
+            !recently.read().unwrap().contains_key("x"),
+            "the worker's unmark must win over the refresher's last mark; \
+             no mark-after-unmark resurrection",
+        );
+    }
+
     /// Regression: archiving a session kills its tmux pane, so the next
     /// startup observes a dead pane on a resume-capable agent. Without an
     /// archive guard on `is_recovery_candidate`, the cascade respawns the
