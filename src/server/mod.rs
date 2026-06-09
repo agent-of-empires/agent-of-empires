@@ -3040,6 +3040,9 @@ async fn daemon_startup_recovery_cascade(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         crate::session::recovery::STARTUP_RECOVERY_CONCURRENCY,
     ));
+    // Captured up front for the completion sweep below; the worker loop
+    // consumes `candidates`.
+    let all_ids: Vec<String> = candidates.iter().map(|i| i.id.clone()).collect();
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for inst in candidates {
@@ -3243,6 +3246,21 @@ async fn daemon_startup_recovery_cascade(
     }
 
     while tasks.join_next().await.is_some() {}
+
+    // Completion sweep: every worker drains its own id on each exit arm
+    // (including the spawn_blocking panic arm), but a panic in a worker's
+    // async body *outside* that match would skip its drain and leave the id
+    // pending, so the refresher would re-stamp it until daemon shutdown. By
+    // the time the JoinSet is fully drained every worker has terminated, so
+    // sweeping all ids guarantees `recovery_pending` is empty and the
+    // refresher exits on its next tick. Idempotent for ids already drained.
+    for id in &all_ids {
+        crate::session::recovery::drain_recovery_pending(
+            &state.recovery_pending,
+            &state.recently_restarted,
+            id,
+        );
+    }
     drop(lock);
 }
 
