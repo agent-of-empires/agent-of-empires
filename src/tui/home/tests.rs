@@ -5470,6 +5470,119 @@ fn pinned_project_survives_losing_last_session() {
     );
 }
 
+/// Two repos that share a basename are judged independently for pinning: a
+/// header whose own repo is not registered must read as unpinned even when a
+/// different same-basename repo is in the registry. Guards the path-keyed pin
+/// identity (CodeRabbit #2055).
+#[test]
+#[serial]
+fn same_basename_repos_pin_independently() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Register `/work/api`, but the visible header's repo is `/other/api`.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("api", "/work/api", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    let mut sess = Instance::new("api-sess", "/other/api");
+    sess.source_profile = "test".to_string();
+    env.view.instances.push(sess);
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let api_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
+        .expect("api header present");
+    // The header's repo (/other/api) is not registered, so it is NOT pinned,
+    // even though a same-basename repo (/work/api) is. The old basename match
+    // would have reported pinned here.
+    assert!(!env.view.is_project_label_pinned("api"));
+
+    // Pinning this header would register under the basename "api", which the
+    // registry already holds for /work/api, so the registry's name-uniqueness
+    // surfaces a conflict rather than silently toggling the unrelated entry.
+    env.view.cursor = api_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(
+        !env.view.is_project_label_pinned("api"),
+        "the unrelated /work/api entry must not make this header read as pinned"
+    );
+    // The conflicting pin did not register the header's repo.
+    let paths: Vec<String> = projects::load_global()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert_eq!(paths, vec!["/work/api".to_string()]);
+}
+
+/// In all-profiles mode the pin registry must include every loaded profile's
+/// projects, not just the default profile's, so a profile-scoped pin keeps its
+/// empty header (CodeRabbit #2055).
+#[test]
+#[serial]
+fn all_profiles_view_includes_profile_scoped_pins() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` with no sessions of its own.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let names: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lonely"),
+        "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
+    );
+    assert!(view.is_project_label_pinned("lonely"));
+}
+
 /// Pressing `g` to flip `group_by` keeps the cursor on the previously
 /// selected session, even when the list reshapes (Manual flat list →
 /// Project grouped list). Previously `apply_group_by` clamped by index,

@@ -40,17 +40,29 @@ impl HomeView {
             return;
         };
         let profile = self.config_profile();
+        // The header's own repo path (canonical), or None for an empty pinned
+        // header. Keying on the path keeps two repos that share a basename
+        // independent, so the toggle acts on the repo the user is looking at.
+        let header_path = self.project_header_repo_path(&label);
 
         if self.is_project_label_pinned(&label) {
-            // Unpin: remove the matching registry entry in its own scope. The
-            // merged registry holds one entry per canonical path, so the first
-            // label match is the one backing this header.
-            let Some(existing) = self
-                .registered_projects
-                .iter()
-                .find(|p| projects::repo_label(&p.path) == label)
-                .cloned()
-            else {
+            // Unpin. Prefer the registry entry whose canonical path matches the
+            // header's own repo. An empty header has no session path, so fall
+            // back to the basename match (it exists only because a registered
+            // project carries that basename; two such empties share one header
+            // and clear one per press).
+            let existing = match &header_path {
+                Some(path) => self
+                    .registered_projects
+                    .iter()
+                    .find(|p| projects::canonical_key(&p.path) == *path),
+                None => self
+                    .registered_projects
+                    .iter()
+                    .find(|p| projects::repo_label(&p.path) == label),
+            }
+            .cloned();
+            let Some(existing) = existing else {
                 return;
             };
             match projects::remove(&profile, existing.scope, &existing.path) {
@@ -71,16 +83,10 @@ impl HomeView {
                 }
             }
         } else {
-            // Pin: register the repo backing this header. The repo path comes
-            // from a live session in the group (an unpinned header always has
-            // at least one), using the same path the header label derives from.
-            let Some(repo_path) = self
-                .instances
-                .iter()
-                .filter(|i| super::project_group_name(i) == label)
-                .map(|i| super::project_repo_path(i).to_string())
-                .next()
-            else {
+            // Pin the repo backing this header. An unpinned header always has at
+            // least one live session (an empty header is pinned by
+            // construction), so its repo path is known.
+            let Some(repo_path) = header_path else {
                 return;
             };
             let project = Project::new(label.clone(), repo_path, ProjectScope::Global);

@@ -209,10 +209,11 @@ pub struct UnpopulatedProject {
 
 /// Given the set of project-header labels that already have at least one live
 /// session and the registered projects, return the registered projects whose
-/// header would otherwise be invisible. Deduped by label; the first registered
-/// entry for a label wins. A registered project whose label collides with a
-/// populated header is omitted, the populated header already carries it (and
-/// the pin indicator is derived separately from the registry).
+/// header would otherwise be invisible. Deduped by canonical path (the stable
+/// repo identity), so two repos that merely share a basename are not folded
+/// into one entry. A registered project whose label collides with a populated
+/// header is omitted, the populated header already carries it (and the pin
+/// indicator is derived separately, against the header's own repo path).
 ///
 /// Pure and side-effect free so it can be unit-tested directly and reused by
 /// any surface that wants to show pinned-but-empty projects.
@@ -224,7 +225,7 @@ pub fn unpopulated_projects(
     let mut seen: HashSet<String> = HashSet::new();
     for p in registered {
         let label = repo_label(&p.path);
-        if populated_labels.contains(&label) || !seen.insert(label.clone()) {
+        if populated_labels.contains(&label) || !seen.insert(canonical_key(&p.path)) {
             continue;
         }
         out.push(UnpopulatedProject {
@@ -436,21 +437,36 @@ mod tests {
     }
 
     #[test]
-    fn unpopulated_projects_skips_populated_and_dedupes_by_label() {
+    fn unpopulated_projects_skips_populated_and_keys_on_path() {
         let registered = vec![
             Project::new("alpha", "/work/alpha", ProjectScope::Global),
             Project::new("beta", "/work/beta", ProjectScope::Global),
-            // Same basename as the first beta entry: a second registration
-            // under a different parent must not double up the empty header.
-            Project::new("beta-dup", "/other/beta", ProjectScope::Profile),
+            // Same basename as the first beta entry but a distinct repo: it
+            // must NOT be folded away by the shared basename, the identity is
+            // the path.
+            Project::new("beta-other", "/other/beta", ProjectScope::Profile),
         ];
-        // `alpha` has a live session keeping its header alive; only the
-        // beta projects should surface as empty headers, deduped to one.
+        // `alpha` has a live session keeping its header alive, so only the
+        // two distinct beta repos surface as empty headers.
         let populated: HashSet<String> = ["alpha".to_string()].into_iter().collect();
 
         let empties = unpopulated_projects(&populated, &registered);
+        let paths: Vec<&str> = empties.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec!["/work/beta", "/other/beta"]);
+        assert!(empties.iter().all(|p| p.label == "beta"));
+    }
+
+    #[test]
+    fn unpopulated_projects_dedupes_same_path() {
+        let registered = vec![
+            Project::new("beta", "/work/beta", ProjectScope::Global),
+            // Same canonical path registered again (e.g. global + profile
+            // shadow): collapse to a single header.
+            Project::new("beta", "/work/beta", ProjectScope::Profile),
+        ];
+        let populated: HashSet<String> = HashSet::new();
+        let empties = unpopulated_projects(&populated, &registered);
         assert_eq!(empties.len(), 1);
-        assert_eq!(empties[0].label, "beta");
         assert_eq!(empties[0].path, "/work/beta");
     }
 

@@ -4301,19 +4301,60 @@ impl HomeView {
     /// Reload the merged project registry into `registered_projects`. Called on
     /// every storage reload and after a pin/unpin so the project view's empty
     /// headers and pin indicators track the on-disk registry.
+    ///
+    /// In all-profiles mode `build_flat_items_by_project` merges sessions from
+    /// every loaded profile, so the registry must too: a profile-scoped pin
+    /// would otherwise lose its header (and glyph) the moment its sessions are
+    /// gone. Dedupe across profiles by canonical path since each
+    /// `load_merged` repeats the global entries.
     pub(super) fn refresh_registered_projects(&mut self) {
-        let profile = self.config_profile();
-        self.registered_projects =
-            crate::session::projects::load_merged(&profile).unwrap_or_default();
+        use crate::session::projects::{canonical_key, load_merged};
+        if self.active_profile.is_some() {
+            self.registered_projects = load_merged(&self.config_profile()).unwrap_or_default();
+            return;
+        }
+        let profiles: Vec<String> = self.storages.keys().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for profile in &profiles {
+            for p in load_merged(profile).unwrap_or_default() {
+                if seen.insert(canonical_key(&p.path)) {
+                    merged.push(p);
+                }
+            }
+        }
+        self.registered_projects = merged;
     }
 
-    /// Whether a project-view header `label` is backed by a registered
-    /// (pinned) project. Used for the pin indicator and to decide whether the
-    /// pin toggle adds or removes the registry entry.
-    pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
-        self.registered_projects
+    /// The canonical repo path of the first live session under project header
+    /// `label`, or `None` when the header has no sessions (an empty pinned
+    /// header). This is the header's stable repo identity, so two repos that
+    /// merely share a basename are judged against their own paths rather than
+    /// the shared display label.
+    pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
+        self.instances
             .iter()
-            .any(|p| crate::session::projects::repo_label(&p.path) == label)
+            .find(|i| project_group_name(i) == label)
+            .map(|i| crate::session::projects::canonical_key(project_repo_path(i)))
+    }
+
+    /// Whether the project-view header `label` is backed by a registered
+    /// (pinned) project. A header with live sessions is pinned iff its own repo
+    /// path is in the registry, so two repos sharing a basename are judged
+    /// independently. An empty header exists only because a registered project
+    /// carries that basename, so it is pinned by construction (matched by
+    /// label). Used for the pin indicator and the pin toggle.
+    pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
+        match self.project_header_repo_path(label) {
+            Some(path) => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+            None => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+        }
     }
 
     /// The project-view header label under the cursor when it is a real,
