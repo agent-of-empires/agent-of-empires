@@ -218,11 +218,14 @@ jobs:
 
   playwright-live:
     name: Playwright (live)
-    # Keep on ubuntu-latest: ensure-session-restart, file-watch-peer-propagation,
-    # and terminal-copy-select reproduce as red on Blacksmith microVMs (different
-    # tmux PTY / inotify / clipboard timing), even after reducing Playwright
-    # workers from 3 to 2.
-    runs-on: ubuntu-latest
+    # On Blacksmith with 2 workers (see PLAYWRIGHT_LIVE_WORKERS below). The
+    # earlier red on ensure-session-restart, file-watch-peer-propagation, and
+    # terminal-copy-select was not microVM PTY/inotify/clipboard flakiness: the
+    # agent pane launches through a login shell that resets PATH from
+    # /etc/profile on this runner image, dropping the test shim dir. The harness
+    # now seeds a ~/.profile to restore it (see aoeServe.ts), so the fake agent
+    # execs and the panes stay alive.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -274,6 +277,9 @@ jobs:
         env:
           AOE_COVERAGE: '1'
           AOE_E2E_BINARY: ${{ github.workspace }}/target/debug/aoe
+          # The Blacksmith 4vcpu runner starves the live suite at the 3-worker
+          # default (rotating spec timeouts); 2 workers clears the contention.
+          PLAYWRIGHT_LIVE_WORKERS: '2'
         run: npx playwright test --config=playwright.live.config.ts
       - name: Build LCOV from collected Playwright coverage
         working-directory: web
