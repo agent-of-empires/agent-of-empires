@@ -33,9 +33,7 @@ function stubToasts() {
 // dispatching events that should close the menu.
 async function flushFrame() {
   await act(async () => {
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => resolve()),
-    );
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   });
 }
 
@@ -49,12 +47,7 @@ async function flushMicrotasks() {
 }
 
 function openMenu(onClose: () => void) {
-  return render(
-    <CopyPathContextMenu
-      menu={{ x: 12, y: 34, path: "src/app/foo.rs" }}
-      onClose={onClose}
-    />,
-  );
+  return render(<CopyPathContextMenu menu={{ x: 12, y: 34, path: "src/app/foo.rs" }} onClose={onClose} />);
 }
 
 afterEach(() => {
@@ -64,9 +57,7 @@ afterEach(() => {
 
 describe("CopyPathContextMenu", () => {
   it("renders nothing when there is no open menu", () => {
-    const { container } = render(
-      <CopyPathContextMenu menu={null} onClose={() => {}} />,
-    );
+    const { container } = render(<CopyPathContextMenu menu={null} onClose={() => {}} />);
     expect(container.querySelector("button")).toBeNull();
     expect(screen.queryByText("Copy relative path")).toBeNull();
   });
@@ -103,8 +94,7 @@ describe("CopyPathContextMenu", () => {
     });
     const execCommand = vi.fn().mockReturnValue(true);
     // jsdom has no execCommand by default; install a stub.
-    (document as unknown as { execCommand: typeof execCommand }).execCommand =
-      execCommand;
+    (document as unknown as { execCommand: typeof execCommand }).execCommand = execCommand;
     const { info, error } = stubToasts();
     openMenu(vi.fn());
 
@@ -122,9 +112,7 @@ describe("CopyPathContextMenu", () => {
       value: undefined,
       configurable: true,
     });
-    (document as unknown as { execCommand: () => boolean }).execCommand = vi
-      .fn()
-      .mockReturnValue(false);
+    (document as unknown as { execCommand: () => boolean }).execCommand = vi.fn().mockReturnValue(false);
     const { info, error } = stubToasts();
     openMenu(vi.fn());
 

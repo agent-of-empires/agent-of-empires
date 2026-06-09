@@ -43,14 +43,7 @@ vi.mock("../../lib/api", () => ({
 }));
 
 function renderView(tab: string) {
-  return render(
-    <SettingsView
-      onClose={() => {}}
-      tab={tab}
-      onSelectTab={vi.fn()}
-      onServerAboutRefresh={() => {}}
-    />,
-  );
+  return render(<SettingsView onClose={() => {}} tab={tab} onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
 }
 
 describe("SettingsView schema load", () => {
@@ -58,9 +51,7 @@ describe("SettingsView schema load", () => {
     renderView("worktree");
 
     // First fetch returned null -> error surfaced, not a blank tab.
-    await waitFor(() =>
-      expect(screen.getByText("Failed to load settings schema.")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
     const retry = screen.getByRole("button", { name: "Retry" });
 
     // Retry refetches; the second call returns the schema and fields render.
@@ -77,9 +68,7 @@ describe("SettingsView schema load", () => {
     vi.mocked(api.getSettingsSchema).mockResolvedValue(null);
     renderView("session");
 
-    await waitFor(() =>
-      expect(screen.getByText("Failed to load settings schema.")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
     // The non-schema selector is still there alongside the schema-slot error.
     expect(screen.getByText("Default profile")).toBeTruthy();
   });

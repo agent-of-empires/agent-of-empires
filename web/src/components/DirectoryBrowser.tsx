@@ -39,11 +39,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
   }, []);
 
   const loadPath = useCallback(
-    async (
-      path: string,
-      limit: number,
-      options: { filter?: string; resetFilter?: boolean } = {},
-    ): Promise<boolean> => {
+    async (path: string, limit: number, options: { filter?: string; resetFilter?: boolean } = {}): Promise<boolean> => {
       const seq = loadSeq.current + 1;
       loadSeq.current = seq;
       setLoading(true);
@@ -57,9 +53,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
         const resp = await browseFilesystem(path, limit, options.filter);
         if (seq !== loadSeq.current) return false;
         if (!resp.ok) {
-          setError(
-            "Can't access this folder. It may not exist or is outside the home directory.",
-          );
+          setError("Can't access this folder. It may not exist or is outside the home directory.");
           return false;
         }
         // Success: update state even if empty (empty dir is valid)
@@ -71,9 +65,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
         return true;
       } catch {
         if (seq === loadSeq.current) {
-          setError(
-            "Can't access this folder. It may not exist or is outside the home directory.",
-          );
+          setError("Can't access this folder. It may not exist or is outside the home directory.");
         }
         return false;
       } finally {
@@ -84,8 +76,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
   );
 
   const navigate = useCallback(
-    async (path: string): Promise<boolean> =>
-      loadPath(path, BROWSE_PAGE_SIZE, { resetFilter: true }),
+    async (path: string): Promise<boolean> => loadPath(path, BROWSE_PAGE_SIZE, { resetFilter: true }),
     [loadPath],
   );
 
@@ -194,14 +185,9 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
   return (
     <div>
       {/* Breadcrumbs */}
-      <nav
-        aria-label="Directory path"
-        className="flex items-center flex-wrap gap-0.5 mb-3 min-h-[28px]"
-      >
+      <nav aria-label="Directory path" className="flex items-center flex-wrap gap-0.5 mb-3 min-h-[28px]">
         <button
-          onClick={() =>
-            navigate(currentPath.split("/").slice(0, 2).join("/") || "/")
-          }
+          onClick={() => navigate(currentPath.split("/").slice(0, 2).join("/") || "/")}
           className="text-text-dim hover:text-text-secondary cursor-pointer text-sm"
           title="Go to home"
         >
@@ -231,10 +217,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
           // Skeleton loading rows
           <div className="animate-pulse">
             {[...Array(5)].map((_, i) => (
-              <div
-                key={i}
-                className="flex items-center px-3 h-[44px] border-b border-surface-800 last:border-0"
-              >
+              <div key={i} className="flex items-center px-3 h-[44px] border-b border-surface-800 last:border-0">
                 <div className="w-5 h-5 bg-surface-700 rounded mr-3" />
                 <div className="h-4 bg-surface-700 rounded w-1/2" />
               </div>
@@ -268,14 +251,10 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
             {entries.length === 0 && (
               <div className="px-4 py-6 text-center">
                 <p className="text-sm text-text-dim">
-                  {filter
-                    ? "No folders match your filter"
-                    : "No visible subfolders here"}
+                  {filter ? "No folders match your filter" : "No visible subfolders here"}
                 </p>
                 {!filter && (
-                  <p className="text-xs text-text-dim mt-1">
-                    Hidden folders (starting with .) are not shown
-                  </p>
+                  <p className="text-xs text-text-dim mt-1">Hidden folders (starting with .) are not shown</p>
                 )}
               </div>
             )}
@@ -290,19 +269,11 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
               >
                 <span className="w-5 mr-3 text-center text-text-dim">
                   {entry.is_git_repo ? (
-                    <svg
-                      className="w-4 h-4 inline text-accent-600"
-                      viewBox="0 0 16 16"
-                      fill="currentColor"
-                    >
+                    <svg className="w-4 h-4 inline text-accent-600" viewBox="0 0 16 16" fill="currentColor">
                       <path d="M15.698 7.287 8.712.302a1.03 1.03 0 0 0-1.457 0l-1.45 1.45 1.84 1.84a1.223 1.223 0 0 1 1.55 1.56l1.773 1.774a1.224 1.224 0 1 1-.733.693L8.535 5.918v4.27a1.229 1.229 0 1 1-1.008-.036V5.847a1.224 1.224 0 0 1-.664-1.608L5.045 2.422l-4.743 4.743a1.03 1.03 0 0 0 0 1.457l6.986 6.986a1.03 1.03 0 0 0 1.457 0l6.953-6.953a1.031 1.031 0 0 0 0-1.457" />
                     </svg>
                   ) : (
-                    <svg
-                      className="w-4 h-4 inline text-text-dim"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
+                    <svg className="w-4 h-4 inline text-text-dim" viewBox="0 0 20 20" fill="currentColor">
                       <path d="M2 6a2 2 0 0 1 2-2h5l2 2h5a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6z" />
                     </svg>
                   )}
@@ -322,9 +293,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
 
             {hasMore && (
               <div className="px-3 py-3 text-center border-t border-surface-800">
-                <p className="text-xs text-text-dim mb-2">
-                  Showing first {entries.length} entries.
-                </p>
+                <p className="text-xs text-text-dim mb-2">Showing first {entries.length} entries.</p>
                 <button
                   type="button"
                   onClick={loadMore}

@@ -31,8 +31,7 @@ export function extractSnippetFromHunks(
     const hunk = hunks[hunkIdx];
     if (!hunk) continue;
     const hunkStart = side === "new" ? hunk.new_start : hunk.old_start;
-    const hunkEnd =
-      hunkStart + (side === "new" ? hunk.new_lines : hunk.old_lines) - 1;
+    const hunkEnd = hunkStart + (side === "new" ? hunk.new_lines : hunk.old_lines) - 1;
     if (hunkEnd < rangeLo || hunkStart > rangeHi) continue;
     if (hunkStart > rangeLo || hunkEnd < rangeHi) {
       // Range straddles the hunk's boundary; reject to keep extraction

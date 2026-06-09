@@ -21,38 +21,24 @@ describe("applyRepoAppearanceUpdate", () => {
   });
 
   it("clears the alias when null is passed and prunes the entry if color is also absent", () => {
-    const next = applyRepoAppearanceUpdate(
-      { "/repo/a": { alias: "Alpha" } },
-      "/repo/a",
-      { alias: null },
-    );
+    const next = applyRepoAppearanceUpdate({ "/repo/a": { alias: "Alpha" } }, "/repo/a", { alias: null });
     expect(next).toEqual({});
   });
 
   it("treats whitespace-only alias as a clear", () => {
-    const next = applyRepoAppearanceUpdate(
-      { "/repo/a": { alias: "Alpha", color: "amber" } },
-      "/repo/a",
-      { alias: "   " },
-    );
+    const next = applyRepoAppearanceUpdate({ "/repo/a": { alias: "Alpha", color: "amber" } }, "/repo/a", {
+      alias: "   ",
+    });
     expect(next).toEqual({ "/repo/a": { color: "amber" } });
   });
 
   it("sets a valid color and keeps an existing alias", () => {
-    const next = applyRepoAppearanceUpdate(
-      { "/repo/a": { alias: "Alpha" } },
-      "/repo/a",
-      { color: "teal" },
-    );
+    const next = applyRepoAppearanceUpdate({ "/repo/a": { alias: "Alpha" } }, "/repo/a", { color: "teal" });
     expect(next).toEqual({ "/repo/a": { alias: "Alpha", color: "teal" } });
   });
 
   it("clears the color when null is passed and prunes the entry if alias is also absent", () => {
-    const next = applyRepoAppearanceUpdate(
-      { "/repo/a": { color: "rose" } },
-      "/repo/a",
-      { color: null },
-    );
+    const next = applyRepoAppearanceUpdate({ "/repo/a": { color: "rose" } }, "/repo/a", { color: null });
     expect(next).toEqual({});
   });
 

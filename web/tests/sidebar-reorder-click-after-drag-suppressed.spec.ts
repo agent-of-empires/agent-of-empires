@@ -8,14 +8,9 @@
 // click would have landed there.
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
-test("click-after-drag suppression keeps the URL on the source row", async ({
-  page,
-}) => {
+test("click-after-drag suppression keeps the URL on the source row", async ({ page }) => {
   const handle = await installSidebarMocks(page, {
     sessions: threeSessionsInOneRepo(),
   });
@@ -27,26 +22,17 @@ test("click-after-drag suppression keeps the URL on the source row", async ({
   // The contract is "URL stays at /".
   await page.goto("/");
 
-  const wrappers = page.locator(
-    "[aria-roledescription='Press and hold to reorder']",
-  );
+  const wrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
   await expect(wrappers).toHaveCount(3);
 
   const sourceBox = await wrappers.nth(2).boundingBox();
   const targetBox = await wrappers.nth(0).boundingBox();
   if (!sourceBox || !targetBox) throw new Error("row box missing");
 
-  await page.mouse.move(
-    sourceBox.x + sourceBox.width - 4,
-    sourceBox.y + sourceBox.height / 2,
-  );
+  await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
   await page.mouse.down();
   await page.waitForTimeout(250);
-  await page.mouse.move(
-    targetBox.x + targetBox.width / 2,
-    targetBox.y + targetBox.height / 2,
-    { steps: 12 },
-  );
+  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
   await page.mouse.up();
 
   // The drag fires one PUT. After release, the synthetic click would

@@ -14,14 +14,9 @@ function flip(current: TmuxMode | undefined): TmuxMode {
   return current === "enabled" ? "disabled" : "enabled";
 }
 
-test("tmux settings persist through PATCH + reload", async ({
-  serve,
-  page,
-}) => {
+test("tmux settings persist through PATCH + reload", async ({ serve, page }) => {
   // Read baseline.
-  const before = await fetch(`${serve.baseUrl}/api/settings`).then((r) =>
-    r.json(),
-  );
+  const before = await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
   const baselineTmux = (before?.tmux ?? {}) as Record<string, unknown>;
   const newStatusBar = flip(baselineTmux.status_bar as TmuxMode | undefined);
   const newMouse = flip(baselineTmux.mouse as TmuxMode | undefined);
@@ -37,9 +32,7 @@ test("tmux settings persist through PATCH + reload", async ({
   expect(patchRes.ok).toBeTruthy();
 
   // Server-side persistence: GET returns the new values immediately.
-  const after = await fetch(`${serve.baseUrl}/api/settings`).then((r) =>
-    r.json(),
-  );
+  const after = await fetch(`${serve.baseUrl}/api/settings`).then((r) => r.json());
   expect(after?.tmux?.status_bar).toBe(newStatusBar);
   expect(after?.tmux?.mouse).toBe(newMouse);
 

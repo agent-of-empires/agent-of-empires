@@ -12,14 +12,7 @@
 
 /** Card categories the renderer dispatches to. Keep aligned with the
  *  switch in `ToolCards.renderToolCard`. */
-export type CardKind =
-  | "execute"
-  | "read"
-  | "edit"
-  | "delete"
-  | "search"
-  | "fetch"
-  | "think";
+export type CardKind = "execute" | "read" | "edit" | "delete" | "search" | "fetch" | "think";
 
 export interface AgentProfile {
   /** Registry key, matches `AgentRegistry` on the server side
@@ -238,9 +231,7 @@ const PROFILES: Record<string, AgentProfile> = {
 
 /** Resolve a profile by the session's `tool` key. Unknown keys (and
  *  `null` / `undefined`) fall back to `DEFAULT_AGENT_PROFILE`. */
-export function resolveAgentProfile(
-  toolKey: string | null | undefined,
-): AgentProfile {
+export function resolveAgentProfile(toolKey: string | null | undefined): AgentProfile {
   if (!toolKey) return DEFAULT_AGENT_PROFILE;
   return PROFILES[toolKey] ?? DEFAULT_AGENT_PROFILE;
 }
@@ -251,10 +242,7 @@ export function resolveAgentProfile(
  *  `src/acp/agent_profiles.rs` so the structured view's combined-mode drain
  *  splits at exactly the same boundary the server detects as a session
  *  clear (#1356). */
-export function isClearAlias(
-  text: string,
-  aliases: ReadonlyArray<string>,
-): boolean {
+export function isClearAlias(text: string, aliases: ReadonlyArray<string>): boolean {
   const trimmed = text.trim();
   if (trimmed.length === 0) return false;
   for (const alias of aliases) {

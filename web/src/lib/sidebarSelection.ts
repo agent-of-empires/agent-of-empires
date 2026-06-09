@@ -23,11 +23,7 @@ export const EMPTY_SELECTION: SidebarSelectionState = {
  *  use Ctrl; both map to the additive toggle. */
 export type ClickIntent = "navigate" | "toggle" | "range" | "additive-range";
 
-export function classifyClick(modifiers: {
-  metaKey: boolean;
-  ctrlKey: boolean;
-  shiftKey: boolean;
-}): ClickIntent {
+export function classifyClick(modifiers: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }): ClickIntent {
   const mod = modifiers.metaKey || modifiers.ctrlKey;
   if (modifiers.shiftKey) return mod ? "additive-range" : "range";
   if (mod) return "toggle";
@@ -39,11 +35,7 @@ export function classifyClick(modifiers: {
  *  either endpoint is missing from `orderedIds` (e.g. it scrolled into a
  *  collapsed group since the anchor was set) the range collapses to just the
  *  target, which is the least surprising fallback. */
-export function rangeBetween(
-  orderedIds: readonly string[],
-  anchorId: string,
-  targetId: string,
-): string[] {
+export function rangeBetween(orderedIds: readonly string[], anchorId: string, targetId: string): string[] {
   const a = orderedIds.indexOf(anchorId);
   const b = orderedIds.indexOf(targetId);
   if (a === -1 || b === -1) return [targetId];
@@ -64,10 +56,7 @@ export type SidebarSelectionAction =
   | { type: "clear" }
   | { type: "prune"; validIds: ReadonlySet<string> };
 
-export function selectionReducer(
-  state: SidebarSelectionState,
-  action: SidebarSelectionAction,
-): SidebarSelectionState {
+export function selectionReducer(state: SidebarSelectionState, action: SidebarSelectionAction): SidebarSelectionState {
   switch (action.type) {
     case "toggle": {
       const next = new Set(state.selectedIds);
@@ -83,13 +72,9 @@ export function selectionReducer(
       // clicked row so the next Shift+click forms a range from here instead
       // of repeatedly collapsing to a single row.
       const anchor =
-        state.anchorId != null && action.orderedIds.includes(state.anchorId)
-          ? state.anchorId
-          : action.targetId;
+        state.anchorId != null && action.orderedIds.includes(state.anchorId) ? state.anchorId : action.targetId;
       const range = rangeBetween(action.orderedIds, anchor, action.targetId);
-      const next = action.additive
-        ? new Set([...state.selectedIds, ...range])
-        : new Set(range);
+      const next = action.additive ? new Set([...state.selectedIds, ...range]) : new Set(range);
       // Anchor stays put so repeated Shift+clicks re-pivot from the same
       // origin, matching Finder / file-manager behavior.
       return { selectedIds: next, anchorId: anchor };
@@ -103,8 +88,7 @@ export function selectionReducer(
         if (action.validIds.has(id)) next.add(id);
         else changed = true;
       }
-      const anchorValid =
-        state.anchorId != null && action.validIds.has(state.anchorId);
+      const anchorValid = state.anchorId != null && action.validIds.has(state.anchorId);
       if (!anchorValid && state.anchorId != null) changed = true;
       if (!changed) return state;
       return {

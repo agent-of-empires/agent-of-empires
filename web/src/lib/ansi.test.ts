@@ -41,15 +41,11 @@ describe("collapseCarriageReturns", () => {
   it("preserves CRLF line endings", () => {
     // Windows-style CRLF — the trailing \r is part of the line ending,
     // not a redraw marker. Stripping it would corrupt the text.
-    expect(collapseCarriageReturns("line1\r\nline2\r\n")).toBe(
-      "line1\r\nline2\r\n",
-    );
+    expect(collapseCarriageReturns("line1\r\nline2\r\n")).toBe("line1\r\nline2\r\n");
   });
   it("collapses redraws within a CRLF-terminated line", () => {
     // Mixed: redraws in the middle of a line, CRLF at the end.
-    expect(collapseCarriageReturns("p:1/3\rp:2/3\rp:3/3\r\nnext")).toBe(
-      "p:3/3\r\nnext",
-    );
+    expect(collapseCarriageReturns("p:1/3\rp:2/3\rp:3/3\r\nnext")).toBe("p:3/3\r\nnext");
   });
 });
 

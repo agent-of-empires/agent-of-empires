@@ -20,10 +20,5 @@ export function CommentMarkdown({ text }: Props) {
   const html = useMemo(() => {
     return marked.parse(text, { async: false, breaks: true }) as string;
   }, [text]);
-  return (
-    <div
-      className="diff-comment-md text-[13px] leading-relaxed"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  );
+  return <div className="diff-comment-md text-[13px] leading-relaxed" dangerouslySetInnerHTML={{ __html: html }} />;
 }

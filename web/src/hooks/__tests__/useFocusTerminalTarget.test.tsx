@@ -12,21 +12,14 @@ import { renderHook } from "@testing-library/react";
 import { useRef } from "react";
 
 import { useFocusTerminalTarget } from "../useFocusTerminalTarget";
-import {
-  consumePendingTerminalFocus,
-  dispatchFocusTerminal,
-  setPendingTerminalFocus,
-} from "../../lib/terminalFocus";
+import { consumePendingTerminalFocus, dispatchFocusTerminal, setPendingTerminalFocus } from "../../lib/terminalFocus";
 
 afterEach(() => {
   consumePendingTerminalFocus("composer");
   consumePendingTerminalFocus("agent");
 });
 
-function renderWithElement(
-  target: "composer" | "agent",
-  el: HTMLElement | null,
-) {
+function renderWithElement(target: "composer" | "agent", el: HTMLElement | null) {
   return renderHook(() => {
     const ref = useRef<HTMLElement | null>(el);
     useFocusTerminalTarget(target, ref);

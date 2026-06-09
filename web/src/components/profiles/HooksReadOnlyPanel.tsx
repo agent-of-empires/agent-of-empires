@@ -34,13 +34,10 @@ const SOURCE_BADGE: Record<HookSource, { label: string; className: string }> = {
 export function HooksReadOnlyPanel({ groups }: Props) {
   return (
     <section className="rounded-lg border border-surface-700 bg-surface-900 p-4">
-      <h3 className="text-sm font-semibold text-text-primary">
-        Lifecycle hooks
-      </h3>
+      <h3 className="text-sm font-semibold text-text-primary">Lifecycle hooks</h3>
       <p className="mt-1 text-xs text-text-dim">
-        Lifecycle hooks run shell commands when sessions are created, launched,
-        and destroyed. To prevent remote code execution, the dashboard shows
-        them read-only; edit hooks in your config file or the TUI settings.
+        Lifecycle hooks run shell commands when sessions are created, launched, and destroyed. To prevent remote code
+        execution, the dashboard shows them read-only; edit hooks in your config file or the TUI settings.
       </p>
       <ul className="mt-3 flex flex-col gap-3">
         {groups.map((group) => {
@@ -48,12 +45,8 @@ export function HooksReadOnlyPanel({ groups }: Props) {
           return (
             <li key={group.key}>
               <div className="flex items-center gap-2">
-                <span className="text-xs font-medium text-text-secondary">
-                  {group.label}
-                </span>
-                <span
-                  className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${badge.className}`}
-                >
+                <span className="text-xs font-medium text-text-secondary">{group.label}</span>
+                <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${badge.className}`}>
                   {badge.label}
                 </span>
               </div>
@@ -69,9 +62,7 @@ export function HooksReadOnlyPanel({ groups }: Props) {
                   ))}
                 </ul>
               ) : (
-                <p className="mt-1 text-xs text-text-dim italic">
-                  No commands.
-                </p>
+                <p className="mt-1 text-xs text-text-dim italic">No commands.</p>
               )}
             </li>
           );

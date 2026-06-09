@@ -6,11 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  DICTATION_BURST_TIMEOUT_MS,
-  decideDictationAction,
-  type DictationBurstState,
-} from "./Composer";
+import { DICTATION_BURST_TIMEOUT_MS, decideDictationAction, type DictationBurstState } from "./Composer";
 
 const inactive: DictationBurstState = { active: false };
 

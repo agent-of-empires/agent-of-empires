@@ -8,19 +8,10 @@
 // and the focus latch deterministically with a mocked useTerminal.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
-import {
-  FOCUS_TERMINAL_EVENT,
-  setPendingTerminalFocus,
-} from "../../lib/terminalFocus";
+import { FOCUS_TERMINAL_EVENT, setPendingTerminalFocus } from "../../lib/terminalFocus";
 
 const ensureTerminal = vi.fn();
 const manualReconnect = vi.fn();
@@ -47,8 +38,7 @@ const termEl = vi.hoisted(() => ({ current: null as HTMLElement | null }));
 
 vi.mock("../../lib/api", () => ({
   ensureSession: vi.fn(),
-  ensureTerminal: (id: string, container: boolean) =>
-    ensureTerminal(id, container),
+  ensureTerminal: (id: string, container: boolean) => ensureTerminal(id, container),
 }));
 
 vi.mock("../../hooks/useTerminal", () => ({
@@ -129,13 +119,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function renderReady(
-  props: Partial<Parameters<typeof PairedShellPane>[0]> = {},
-) {
+async function renderReady(props: Partial<Parameters<typeof PairedShellPane>[0]> = {}) {
   render(<PairedShellPane session={session()} sessionId="sess-1" {...props} />);
-  await waitFor(() =>
-    expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-  );
+  await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
 }
 
 describe("PairedShellPane", () => {
@@ -162,9 +148,7 @@ describe("PairedShellPane", () => {
     // Retry re-runs ensureTerminal (now succeeding) and the terminal mounts.
     ensureTerminal.mockResolvedValue(true);
     fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
-    await waitFor(() =>
-      expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
   });
 
   it("shows the error state when ensureTerminal rejects", async () => {
@@ -205,9 +189,7 @@ describe("PairedShellPane", () => {
     const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
     const focusSpy = vi.spyOn(ta, "focus");
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "agent" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "agent" } }));
     });
     expect(focusSpy).not.toHaveBeenCalled();
   });
@@ -227,9 +209,7 @@ describe("PairedShellPane", () => {
     termEl.current = document.createElement("div");
     await renderReady();
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }));
     });
     expect(document.querySelector('[data-term="paired"]')).not.toBeNull();
   });
@@ -239,9 +219,7 @@ describe("PairedShellPane", () => {
     const ta = termEl.current!.querySelector("textarea") as HTMLTextAreaElement;
     const focusSpy = vi.spyOn(ta, "focus");
     act(() => {
-      window.dispatchEvent(
-        new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }),
-      );
+      window.dispatchEvent(new CustomEvent(FOCUS_TERMINAL_EVENT, { detail: { target: "paired" } }));
     });
     expect(focusSpy).toHaveBeenCalled();
   });
@@ -289,26 +267,16 @@ describe("PairedShellPane", () => {
   });
 
   it("offers the Container switch for sandboxed sessions and re-ensures on switch", async () => {
-    render(
-      <PairedShellPane
-        session={session({ is_sandboxed: true })}
-        sessionId="sess-1"
-      />,
-    );
-    await waitFor(() =>
-      expect(document.querySelector('[data-term="paired"]')).not.toBeNull(),
-    );
+    render(<PairedShellPane session={session({ is_sandboxed: true })} sessionId="sess-1" />);
+    await waitFor(() => expect(document.querySelector('[data-term="paired"]')).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: /^Container$/ }));
-    await waitFor(() =>
-      expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true),
-    );
+    await waitFor(() => expect(ensureTerminal).toHaveBeenCalledWith("sess-1", true));
   });
 
   it("reserves keyboard padding in fullViewport mode", async () => {
     mockKeyboard.current.keyboardOcclusion = 320;
     await renderReady({ fullViewport: true });
-    const root = document.querySelector('[data-term="paired"]')
-      ?.parentElement as HTMLElement;
+    const root = document.querySelector('[data-term="paired"]')?.parentElement as HTMLElement;
     expect(root.style.paddingBottom).toBe("320px");
   });
 });

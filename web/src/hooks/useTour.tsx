@@ -8,20 +8,8 @@
 // TourRunner, which is only mounted (and only downloaded) while a tour runs, so
 // returning users never pay for the engine. App is the single consumer, so this
 // is a plain hook returning the element to render rather than a context.
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
-import {
-  resolveTourSteps,
-  type TourScope,
-  type TourStep,
-} from "../lib/tourSteps";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { resolveTourSteps, type TourScope, type TourStep } from "../lib/tourSteps";
 import { isAutomatedSession } from "../lib/onboarding";
 
 const TourRunner = lazy(() => import("../components/tour/TourRunner"));

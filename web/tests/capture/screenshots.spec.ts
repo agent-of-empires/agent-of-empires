@@ -18,17 +18,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test as base, type Page } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  resolveAoeBinary,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-} from "../helpers/acp";
+import { waitForStructuredView, enableStructuredViewAndWait } from "../helpers/acp";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -54,15 +46,9 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     parallelIndex: testInfo.parallelIndex,
     seedFn: ({ home, env }) => {
       const add = (dir: string, title: string) => {
-        const res = spawnSync(
-          resolveAoeBinary(),
-          ["add", dir, "-t", title, "-c", "claude"],
-          { env },
-        );
+        const res = spawnSync(resolveAoeBinary(), ["add", dir, "-t", title, "-c", "claude"], { env });
         if (res.status !== 0) {
-          throw new Error(
-            `aoe add ${title} failed: ${res.stderr?.toString() ?? "<none>"}`,
-          );
+          throw new Error(`aoe add ${title} failed: ${res.stderr?.toString() ?? "<none>"}`);
         }
       };
       // Plain sessions for a populated sidebar.
@@ -86,10 +72,8 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
       });
       commitAll(apiDir, "baseline");
       writeFiles(apiDir, {
-        "src/routes.ts":
-          "export const routes = [\n  { path: '/health', handler: health },\n];\n",
-        "src/auth.ts":
-          "export function login(user: string) {\n  return issueToken(user);\n}\n",
+        "src/routes.ts": "export const routes = [\n  { path: '/health', handler: health },\n];\n",
+        "src/auth.ts": "export function login(user: string) {\n  return issueToken(user);\n}\n",
         "README.md": "# api-server\n\nNow with auth and health routes.\n",
       });
       add(apiDir, "api-server");
@@ -102,11 +86,7 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
 
     // Dashboard home.
     await page.goto(`${serve.baseUrl}/`);
-    await page
-      .getByRole("link")
-      .filter({ hasText: "api-server" })
-      .first()
-      .waitFor({ timeout: 15_000 });
+    await page.getByRole("link").filter({ hasText: "api-server" }).first().waitFor({ timeout: 15_000 });
     await shot(page, "web/dashboard.png");
 
     const sessions = await listSessions(serve.baseUrl);
@@ -196,8 +176,7 @@ const ACP_SCRIPT = {
           rawInput: {
             file_path: "src/auth.ts",
             old_string: "export function login() {}",
-            new_string:
-              "export function login(user: string) {\n  return issueToken(user);\n}",
+            new_string: "export function login(user: string) {\n  return issueToken(user);\n}",
           },
         },
         {
@@ -244,9 +223,7 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'wire-auth' missing");
     await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", {
@@ -266,18 +243,14 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     // Reload at the phone width so the layout mounts in mobile mode with
     // the sidebar collapsed, rather than mid-switch with the drawer open.
     await page.setViewportSize(MOBILE);
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
     // The mobile drawer mounts open; tap the content area to the right of
     // it (the backdrop) so it slides away and the structured view is clear.
     const projects = page.getByText("Projects", { exact: true });
     if (await projects.isVisible().catch(() => false)) {
       await page.mouse.click(340, 450);
-      await projects
-        .waitFor({ state: "hidden", timeout: 5_000 })
-        .catch(() => {});
+      await projects.waitFor({ state: "hidden", timeout: 5_000 }).catch(() => {});
     }
     await page.waitForTimeout(600);
     await shot(page, "structured view/interface.png");
@@ -341,9 +314,7 @@ base("structured view approval card", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'approve-push' missing");
     await enableStructuredViewAndWait(serve.baseUrl, seeded.id);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", {

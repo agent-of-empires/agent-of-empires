@@ -25,13 +25,7 @@ interface Props {
   variant?: "icon" | "button";
 }
 
-export function SwitchViewAction({
-  sessionId,
-  structuredView,
-  acpCapable = true,
-  className,
-  variant = "icon",
-}: Props) {
+export function SwitchViewAction({ sessionId, structuredView, acpCapable = true, className, variant = "icon" }: Props) {
   const offline = useServerDown();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -81,9 +75,7 @@ export function SwitchViewAction({
     }
   };
 
-  const triggerLabel = structuredView
-    ? "Switch to terminal view"
-    : "Switch to structured view";
+  const triggerLabel = structuredView ? "Switch to terminal view" : "Switch to structured view";
   const triggerDisabled = (!structuredView && !acpCapable) || offline;
 
   return (
@@ -124,29 +116,21 @@ export function SwitchViewAction({
             ref={dialogRef}
             className="w-[26rem] max-w-[92vw] rounded-xl border border-surface-700 bg-surface-900 p-4 shadow-xl"
           >
-            <h2 className="text-sm font-semibold text-text-primary">
-              Switch to {target}?
-            </h2>
+            <h2 className="text-sm font-semibold text-text-primary">Switch to {target}?</h2>
             <p className="mt-2 text-xs leading-relaxed text-text-muted">
               {structuredView ? (
                 <>
-                  The structured view conversation history will be discarded and
-                  the agent will restart in a fresh terminal pane. Open files
-                  and worktree state are preserved.
+                  The structured view conversation history will be discarded and the agent will restart in a fresh
+                  terminal pane. Open files and worktree state are preserved.
                 </>
               ) : (
                 <>
-                  The current tmux scrollback will be lost and the agent will
-                  restart as an ACP server. Open files and worktree state are
-                  preserved.
+                  The current tmux scrollback will be lost and the agent will restart as an ACP server. Open files and
+                  worktree state are preserved.
                 </>
               )}
             </p>
-            {error && (
-              <p className="mt-2 rounded bg-rose-950/40 px-2 py-1 text-xs text-rose-300">
-                {error}
-              </p>
-            )}
+            {error && <p className="mt-2 rounded bg-rose-950/40 px-2 py-1 text-xs text-rose-300">{error}</p>}
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"

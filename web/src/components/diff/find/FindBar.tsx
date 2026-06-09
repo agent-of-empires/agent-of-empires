@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  findMatches,
-  type FindMatch,
-  type SearchableLine,
-} from "./findMatches";
+import { findMatches, type FindMatch, type SearchableLine } from "./findMatches";
 
 interface Props {
   /** Lines that find may match against: the diff's changed lines. */
@@ -51,8 +47,7 @@ export function FindBar({ lines, onJump, onClose }: Props) {
 
   // Displayed index is derived at render; jumps fire from the event handlers
   // below (not an effect), per the no-set-state-in-effect lint posture.
-  const activeIdx =
-    matches.length === 0 ? 0 : Math.min(active, matches.length - 1);
+  const activeIdx = matches.length === 0 ? 0 : Math.min(active, matches.length - 1);
 
   /** Re-run the search with new inputs and jump to its first match. */
   const retarget = (q: string, cs: boolean, rx: boolean) => {
@@ -90,16 +85,8 @@ export function FindBar({ lines, onJump, onClose }: Props) {
         aria-label="Find in diff"
         className="flex-1 min-w-0 bg-surface-900 border border-surface-700/40 rounded px-2 py-0.5 text-[12px] font-mono text-text-primary outline-none focus:border-brand-600"
       />
-      <span
-        className={`font-mono text-[11px] tabular-nums ${error ? "text-status-error" : "text-text-dim"}`}
-      >
-        {error
-          ? error
-          : matches.length === 0
-            ? query
-              ? "0/0"
-              : ""
-            : `${activeIdx + 1}/${matches.length}`}
+      <span className={`font-mono text-[11px] tabular-nums ${error ? "text-status-error" : "text-text-dim"}`}>
+        {error ? error : matches.length === 0 ? (query ? "0/0" : "") : `${activeIdx + 1}/${matches.length}`}
       </span>
       <ToggleButton
         active={caseSensitive}
@@ -125,12 +112,7 @@ export function FindBar({ lines, onJump, onClose }: Props) {
         disabled={matches.length === 0}
         label="↑"
       />
-      <IconButton
-        onClick={() => step(1)}
-        title="Next match (Enter)"
-        disabled={matches.length === 0}
-        label="↓"
-      />
+      <IconButton onClick={() => step(1)} title="Next match (Enter)" disabled={matches.length === 0} label="↓" />
       <IconButton onClick={onClose} title="Close (Esc)" label="✕" />
     </div>
   );
@@ -155,9 +137,7 @@ function ToggleButton({
       aria-label={title}
       title={title}
       className={`px-1.5 py-0.5 rounded text-[11px] font-mono cursor-pointer transition-colors ${
-        active
-          ? "bg-brand-600 text-white"
-          : "text-text-dim hover:text-text-secondary"
+        active ? "bg-brand-600 text-white" : "text-text-dim hover:text-text-secondary"
       }`}
     >
       {label}

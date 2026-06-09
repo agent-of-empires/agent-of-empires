@@ -41,9 +41,7 @@ interface Props {
   commandMaps?: CommandMaps;
 }
 
-const isMac =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad/.test(navigator.userAgent);
+const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
 function Row({
   label,
@@ -65,15 +63,11 @@ function Row({
       onClick={() => interactive && onJumpTo(stepId)}
       disabled={!interactive}
       className={`flex justify-between items-center w-full py-3 border-b border-surface-800 last:border-0 text-left ${
-        interactive
-          ? "cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md"
-          : "-mx-2 px-2"
+        interactive ? "cursor-pointer hover:bg-surface-800/50 -mx-2 px-2 rounded-md" : "-mx-2 px-2"
       }`}
     >
       <span className="text-sm text-text-dim">{label}</span>
-      <span
-        className={`text-sm font-mono truncate ml-4 ${accent ? "text-accent-600" : "text-text-primary"}`}
-      >
+      <span className={`text-sm font-mono truncate ml-4 ${accent ? "text-accent-600" : "text-text-primary"}`}>
         {value}
       </span>
     </button>
@@ -208,9 +202,7 @@ function EditableCommandRow({
     if (normalized !== prefix) onChangePrefix(normalized);
   };
 
-  const suffixSpan = suffix ? (
-    <span className="text-text-dim"> {suffix}</span>
-  ) : null;
+  const suffixSpan = suffix ? <span className="text-text-dim"> {suffix}</span> : null;
 
   if (editing) {
     return (
@@ -274,17 +266,14 @@ export function ReviewStep({
   // Scratch sessions intentionally carry no path until the server
   // provisions one on submit; treat that as satisfying the "need a
   // project" gate so the user can launch.
-  const canSubmit =
-    !isSubmitting && !offline && (data.scratch || !!data.path) && !!data.tool;
+  const canSubmit = !isSubmitting && !offline && (data.scratch || !!data.path) && !!data.tool;
   const summary = getReviewSummary(data.title, data.worktreeBranch);
   const selectedAgent = agents.find((agent) => agent.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
   // Mirror the submit-path computation in SessionWizard.handleSubmit so
   // the review reflects the view the session will actually launch
   // with, including the per-session opt-out (#1580).
-  const willUseStructuredView =
-    isAcpCapable(data.tool, selectedAgent?.acp_capable) &&
-    data.useStructuredView;
+  const willUseStructuredView = isAcpCapable(data.tool, selectedAgent?.acp_capable) && data.useStructuredView;
 
   // Resolve the exact launch command the session will run, so the user
   // can confirm (and edit) it before starting. Mirrors the backend
@@ -315,20 +304,12 @@ export function ReviewStep({
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-text-primary mb-1">
-        Review & Launch
-      </h2>
-      <p className="text-sm text-text-muted mb-5">
-        Here's what will be created. Make sure everything looks right.
-      </p>
+      <h2 className="text-lg font-semibold text-text-primary mb-1">Review & Launch</h2>
+      <p className="text-sm text-text-muted mb-5">Here's what will be created. Make sure everything looks right.</p>
       <div className="bg-surface-900 border border-surface-700 rounded-lg p-4 mb-5">
         <Row
           label="Project"
-          value={
-            data.scratch
-              ? "Scratch directory (provisioned on create)"
-              : data.path || "(not set)"
-          }
+          value={data.scratch ? "Scratch directory (provisioned on create)" : data.path || "(not set)"}
           stepId="project"
           onJumpTo={onJumpTo}
         />
@@ -349,14 +330,7 @@ export function ReviewStep({
               onChange={(v) => onChange("worktreeBranch", v)}
               accent
             />
-            <Row
-              label="Mode"
-              value={
-                data.attachExisting
-                  ? "Attach to existing branch"
-                  : "Create new branch"
-              }
-            />
+            <Row label="Mode" value={data.attachExisting ? "Attach to existing branch" : "Create new branch"} />
             {!data.attachExisting && data.baseBranch.trim() && (
               <Row label="Base branch" value={data.baseBranch.trim()} />
             )}
@@ -368,12 +342,7 @@ export function ReviewStep({
         )}
         <Row
           label="Agent"
-          value={
-            <AgentReviewValue
-              name={data.tool || "(not set)"}
-              custom={selectedCustomAgent}
-            />
-          }
+          value={<AgentReviewValue name={data.tool || "(not set)"} custom={selectedCustomAgent} />}
           stepId="agent"
           onJumpTo={onJumpTo}
         />
@@ -388,9 +357,7 @@ export function ReviewStep({
         {data.profile && (
           <Row
             label="Profile"
-            value={
-              data.profileDirty ? `${data.profile} (Custom)` : data.profile
-            }
+            value={data.profileDirty ? `${data.profile} (Custom)` : data.profile}
             stepId="agent"
             onJumpTo={onJumpTo}
             accent
@@ -404,12 +371,7 @@ export function ReviewStep({
             onJumpTo={onJumpTo}
           />
         )}
-        <Row
-          label="Auto-approve"
-          value={data.yoloMode ? "On" : "Off"}
-          stepId="agent"
-          onJumpTo={onJumpTo}
-        />
+        <Row label="Auto-approve" value={data.yoloMode ? "On" : "Off"} stepId="agent" onJumpTo={onJumpTo} />
         {data.group && <Row label="Group" value={data.group} />}
         {data.customInstruction && <Row label="Instructions" value="(set)" />}
         {data.tool && (
@@ -421,23 +383,14 @@ export function ReviewStep({
           />
         )}
         {willUseStructuredView && data.extraArgs.trim() && (
-          <p
-            className="pt-2 text-xs text-status-warning"
-            data-testid="extra-args-ignored-review"
-          >
+          <p className="pt-2 text-xs text-status-warning" data-testid="extra-args-ignored-review">
             Extra args are ignored for structured view sessions.
           </p>
         )}
       </div>
-      {error && (
-        <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">
-          {error}
-        </div>
-      )}
+      {error && <div className="text-sm text-red-400 bg-red-400/10 rounded-lg p-3 mb-4">{error}</div>}
       {offline && (
-        <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">
-          {OFFLINE_TITLE}
-        </div>
+        <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
       )}
       <button
         onClick={onSubmit}
@@ -451,29 +404,14 @@ export function ReviewStep({
         {isSubmitting ? (
           <span className="flex items-center justify-center gap-2">
             <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="4"
-                fill="none"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-              />
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             Creating session...
           </span>
         ) : (
           <span>
-            Launch session{" "}
-            <span className="opacity-60">
-              ({isMac ? "\u2318" : "Ctrl"}+Enter)
-            </span>
+            Launch session <span className="opacity-60">({isMac ? "\u2318" : "Ctrl"}+Enter)</span>
           </span>
         )}
       </button>

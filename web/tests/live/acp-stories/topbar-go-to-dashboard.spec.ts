@@ -5,11 +5,7 @@
 // asserts the URL returns to "/".
 
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
 
 base("topbar Go to dashboard returns to /", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -25,10 +21,7 @@ base("topbar Go to dashboard returns to /", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'story-go-dashboard' missing");
     const sessionId = seeded.id;
 
-    const sessionUrl = new URL(
-      `/session/${encodeURIComponent(sessionId)}`,
-      serve.baseUrl,
-    ).toString();
+    const sessionUrl = new URL(`/session/${encodeURIComponent(sessionId)}`, serve.baseUrl).toString();
     await page.goto(sessionUrl);
     await expect(page).toHaveURL(sessionUrl, { timeout: 10_000 });
 

@@ -42,10 +42,7 @@ export function useSessions() {
       // settling. Without this guard, a poll that fires between our
       // optimistic setState and the PUT landing can read the file in
       // its pre-drag state and revert the row to its old slot.
-      if (
-        Date.now() - lastLocalOrderingAtRef.current >
-        LOCAL_ORDERING_WINDOW_MS
-      ) {
+      if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
         setWorkspaceOrdering(data.workspace_ordering);
       }
       setError(false);
@@ -63,23 +60,15 @@ export function useSessions() {
 
   useEffect(() => {
     void fetchSessions().then(applyResult);
-    intervalRef.current = setInterval(
-      () => void fetchSessions().then(applyResult),
-      POLL_INTERVAL,
-    );
+    intervalRef.current = setInterval(() => void fetchSessions().then(applyResult), POLL_INTERVAL);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [applyResult]);
 
-  const setSessionStatus = useCallback(
-    (id: string, status: SessionResponse["status"]) => {
-      setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, status } : s)),
-      );
-    },
-    [],
-  );
+  const setSessionStatus = useCallback((id: string, status: SessionResponse["status"]) => {
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
+  }, []);
 
   return {
     sessions,

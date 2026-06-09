@@ -40,9 +40,7 @@ export const STATUS_TEXT_CLASS: Record<SessionStatus, string> = {
  *  Returns null for non-Idle sessions, sessions without an
  *  `idle_entered_at` timestamp (legacy state), or timestamps in the future
  *  (clock skew). */
-export function idleAgeMs(
-  session: Pick<SessionResponse, "status" | "idle_entered_at">,
-): number | null {
+export function idleAgeMs(session: Pick<SessionResponse, "status" | "idle_entered_at">): number | null {
   if (session.status !== "Idle") return null;
   if (!session.idle_entered_at) return null;
   const since = Date.parse(session.idle_entered_at);
@@ -99,9 +97,7 @@ export function isSessionActive(
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): boolean {
   if (typeof session === "string") {
-    return (
-      session === "Running" || session === "Waiting" || session === "Starting"
-    );
+    return session === "Running" || session === "Waiting" || session === "Starting";
   }
   return (
     session.status === "Running" ||

@@ -31,10 +31,7 @@ const HOOK_EVENTS: ReadonlyArray<readonly [HookEventKey, string]> = [
  *  tri-state `Some`), else `undefined` (the tri-state `None` = inherit).
  *  Non-array values are treated as absent so a malformed payload degrades
  *  to "inherited" rather than throwing. */
-function hookArray(
-  src: HooksOverride | undefined,
-  key: HookEventKey,
-): string[] | undefined {
+function hookArray(src: HooksOverride | undefined, key: HookEventKey): string[] | undefined {
   const value = src?.[key];
   return Array.isArray(value) ? value : undefined;
 }

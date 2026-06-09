@@ -18,12 +18,7 @@ function mk(id: string, text: string): QueuedPrompt {
 function renderWithProfile(toolKey: string, queued: QueuedPrompt[]) {
   return render(
     <AgentProfileProvider toolKey={toolKey}>
-      <QueuedPromptsStrip
-        queued={queued}
-        onRemove={() => {}}
-        onEdit={() => {}}
-        onClear={() => {}}
-      />
+      <QueuedPromptsStrip queued={queued} onRemove={() => {}} onEdit={() => {}} onClear={() => {}} />
     </AgentProfileProvider>,
   );
 }
@@ -36,26 +31,17 @@ describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
   it("renders a divider above a queued /clear under the claude profile", () => {
     // Two-entry queue stays under the desktop visibleDefault=2 collapse
     // threshold so both rows render without an expand click.
-    const { queryAllByTestId } = renderWithProfile("claude", [
-      mk("a", "first"),
-      mk("c", "/clear"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("c", "/clear")]);
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
   });
 
   it("renders a divider below a queued /clear when it leads the visible queue", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [
-      mk("c", "/clear"),
-      mk("b", "second"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("claude", [mk("c", "/clear"), mk("b", "second")]);
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
   });
 
   it("renders no divider when the queue contains no clear-command aliases", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [
-      mk("a", "first"),
-      mk("b", "second"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("b", "second")]);
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(0);
   });
 
@@ -65,10 +51,7 @@ describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
   });
 
   it("does not render a divider for an agent profile without clear aliases (gemini)", () => {
-    const { queryAllByTestId } = renderWithProfile("gemini", [
-      mk("a", "first"),
-      mk("c", "/clear"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("gemini", [mk("a", "first"), mk("c", "/clear")]);
     // gemini's clearAliases are empty; even with `/clear` text in the
     // queue, the strip should not show a boundary because the agent
     // does not honour `/clear`.
@@ -76,26 +59,17 @@ describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
   });
 
   it("treats `/new` as a boundary under the codex profile", () => {
-    const { queryAllByTestId } = renderWithProfile("codex", [
-      mk("a", "first"),
-      mk("n", "/new"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("codex", [mk("a", "first"), mk("n", "/new")]);
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
   });
 
   it("treats a `/clear` invocation with trailing args as a boundary", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [
-      mk("a", "first"),
-      mk("c", "/clear --hard"),
-    ]);
+    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("c", "/clear --hard")]);
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
   });
 
   it("renders the Clear all button when the queue has more than one entry", () => {
-    const { getByRole } = renderWithProfile("claude", [
-      mk("a", "first"),
-      mk("b", "second"),
-    ]);
+    const { getByRole } = renderWithProfile("claude", [mk("a", "first"), mk("b", "second")]);
     expect(getByRole("button", { name: /clear all/i })).toBeTruthy();
   });
 
@@ -125,18 +99,14 @@ describe("QueuedPromptRow attachment indicator (#1833)", () => {
   };
 
   it("renders a thumbnail for an image attachment on a queued row", () => {
-    const { getByTestId, getByAltText } = renderWithProfile("claude", [
-      withImage,
-    ]);
+    const { getByTestId, getByAltText } = renderWithProfile("claude", [withImage]);
     expect(getByTestId("queued-attachments")).toBeTruthy();
     const img = getByAltText("shot.png") as HTMLImageElement;
     expect(img.src).toContain("data:image/png;base64,aA==");
   });
 
   it("renders no attachment strip for a text-only queued row", () => {
-    const { queryByTestId } = renderWithProfile("claude", [
-      mk("a", "plain text"),
-    ]);
+    const { queryByTestId } = renderWithProfile("claude", [mk("a", "plain text")]);
     expect(queryByTestId("queued-attachments")).toBeNull();
   });
 });
@@ -151,9 +121,7 @@ describe("QueuedPromptRow expanded-state bounds (#1642)", () => {
   const hugePaste = "lorem ipsum ".repeat(500);
 
   it("clamps a long collapsed prompt and offers the expand affordance", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [
-      mk("a", hugePaste),
-    ]);
+    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
     const textButton = getByTitle("Click to edit");
     expect(textButton.className).toContain("line-clamp-3");
     // `block` must NOT co-exist with `line-clamp-3`: its `display:block`
@@ -161,15 +129,11 @@ describe("QueuedPromptRow expanded-state bounds (#1642)", () => {
     // the clamp, rendering the whole paste. See #1642.
     expect(textButton.className.split(/\s+/)).not.toContain("block");
     // Collapsed affordance is the "…" toggle.
-    expect(
-      getByRole("button", { name: "Show full queued prompt" }),
-    ).toBeTruthy();
+    expect(getByRole("button", { name: "Show full queued prompt" })).toBeTruthy();
   });
 
   it("bounds the expanded prompt to a scrollable box so it cannot grow the strip", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [
-      mk("a", hugePaste),
-    ]);
+    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
     fireEvent.click(getByRole("button", { name: "Show full queued prompt" }));
 
     // Clamp is gone once expanded.
@@ -184,9 +148,7 @@ describe("QueuedPromptRow expanded-state bounds (#1642)", () => {
   });
 
   it("keeps the Show less toggle outside the scrollable region so it stays reachable", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [
-      mk("a", hugePaste),
-    ]);
+    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
     fireEvent.click(getByRole("button", { name: "Show full queued prompt" }));
 
     const collapseToggle = getByRole("button", {

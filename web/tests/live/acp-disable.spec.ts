@@ -10,11 +10,7 @@
 // `POST /acp/spawn` can re-attach without re-enabling.
 
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) => {
   const serve = await spawnAoeServe({
@@ -34,10 +30,7 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
     // legitimately land on either an absent worker (404) or a
     // marked-for-cancel pending spawn (204). The load-bearing assertions
     // are the post-enable 204 and the structured_view-still-true contract.
-    const preDelete = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp`,
-      { method: "DELETE" },
-    );
+    const preDelete = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp`, { method: "DELETE" });
     expect([204, 404]).toContain(preDelete.status);
 
     // Bring the worker up. The supervisor's spawn is `tokio::spawn`'d
@@ -49,10 +42,7 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
 
     let postDeleteStatus = 0;
     for (let attempt = 0; attempt < 25; attempt++) {
-      const res = await fetch(
-        `${serve.baseUrl}/api/sessions/${sessionId}/acp`,
-        { method: "DELETE" },
-      );
+      const res = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp`, { method: "DELETE" });
       postDeleteStatus = res.status;
       if (res.status === 204) break;
       await new Promise((r) => setTimeout(r, 200));
@@ -63,19 +53,14 @@ test("DELETE /acp shuts the worker down with 204 / 404", async ({}, testInfo) =>
     // still true on the session record. That's the contract that
     // distinguishes shutdown from disable.
     const after = await listSessions(serve.baseUrl);
-    expect(after.find((s) => s.id === sessionId)!.view === "structured").toBe(
-      true,
-    );
+    expect(after.find((s) => s.id === sessionId)!.view === "structured").toBe(true);
 
     // The reconciler may re-spawn the worker for a session whose
     // structured_view is still true, so a second DELETE can land on either
     // an absent worker (404) or a freshly-respawned one (204). Either
     // outcome satisfies the lifecycle contract; the load-bearing
     // assertion is the initial 404 -> 204 transition above.
-    const repeat = await fetch(
-      `${serve.baseUrl}/api/sessions/${sessionId}/acp`,
-      { method: "DELETE" },
-    );
+    const repeat = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp`, { method: "DELETE" });
     expect([204, 404]).toContain(repeat.status);
   } finally {
     await serve.stop();

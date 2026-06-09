@@ -19,8 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState } from "../lib/acpTypes";
 import { __test } from "./useAcpSession";
 
-const { persistState, evictOldestPersistedAcpState, STORAGE_KEY_PREFIX } =
-  __test;
+const { persistState, evictOldestPersistedAcpState, STORAGE_KEY_PREFIX } = __test;
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
 
@@ -51,27 +50,19 @@ describe("structured view cache eviction (#1345)", () => {
 
     // First setItem call (the persistState write) throws; subsequent calls
     // succeed so the retry after eviction lands.
-    const setItem = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementationOnce(() => {
-        throw quotaError();
-      });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => {
+      throw quotaError();
+    });
 
     persistState("sess-current", emptyAcpState());
 
     expect(setItem).toHaveBeenCalled();
     // Oldest entry was evicted.
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`),
-    ).toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`)).toBeNull();
     // Newer entry survives.
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-new`),
-    ).not.toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-new`)).not.toBeNull();
     // Retried write landed.
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-current`),
-    ).not.toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-current`)).not.toBeNull();
   });
 
   it("never evicts acp:draft:* entries even when older than acp-state entries", () => {
@@ -84,17 +75,11 @@ describe("structured view cache eviction (#1345)", () => {
       JSON.stringify({ savedAt: now - 86_400_000, state: emptyAcpState() }),
     );
 
-    const removed = evictOldestPersistedAcpState(
-      `${STORAGE_KEY_PREFIX}sess-current`,
-    );
+    const removed = evictOldestPersistedAcpState(`${STORAGE_KEY_PREFIX}sess-current`);
     expect(removed).toBe(true);
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`),
-    ).toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`)).toBeNull();
     // Draft stays put.
-    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-old`)).toBe(
-      "draft body",
-    );
+    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-old`)).toBe("draft body");
   });
 
   it("never evicts unrelated keys (e.g. theme cache, settings)", () => {
@@ -110,9 +95,7 @@ describe("structured view cache eviction (#1345)", () => {
 
     expect(window.localStorage.getItem("aoe-resolved-theme")).toBe("themedata");
     expect(window.localStorage.getItem("aoe-web-settings")).toBe("{}");
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`),
-    ).toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-old`)).toBeNull();
   });
 
   it("prefers corrupt acp-state entries over older valid ones", () => {
@@ -123,20 +106,13 @@ describe("structured view cache eviction (#1345)", () => {
       JSON.stringify({ savedAt: now - 86_400_000, state: emptyAcpState() }),
     );
     // Corrupt entry with newer-looking key (not even valid JSON).
-    window.localStorage.setItem(
-      `${STORAGE_KEY_PREFIX}sess-corrupt`,
-      "not valid json{{{",
-    );
+    window.localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-corrupt`, "not valid json{{{");
 
     evictOldestPersistedAcpState(`${STORAGE_KEY_PREFIX}sess-current`);
 
     // Corrupt entry evicted first.
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-corrupt`),
-    ).toBeNull();
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-valid-old`),
-    ).not.toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-corrupt`)).toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-valid-old`)).not.toBeNull();
   });
 
   it("does not evict the current session's key (the one being written)", () => {
@@ -148,13 +124,9 @@ describe("structured view cache eviction (#1345)", () => {
       JSON.stringify({ savedAt: now - 86_400_000, state: emptyAcpState() }),
     );
 
-    const removed = evictOldestPersistedAcpState(
-      `${STORAGE_KEY_PREFIX}sess-current`,
-    );
+    const removed = evictOldestPersistedAcpState(`${STORAGE_KEY_PREFIX}sess-current`);
     expect(removed).toBe(false);
-    expect(
-      window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-current`),
-    ).not.toBeNull();
+    expect(window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-current`)).not.toBeNull();
   });
 
   it("retry depth is exactly 1: second failure stays silent and does not loop", () => {
@@ -167,11 +139,9 @@ describe("structured view cache eviction (#1345)", () => {
     // Every setItem call throws. The eviction's removeItem still works,
     // but the retried write fails again. persistState must return silently
     // without throwing or looping.
-    const setItem = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementation(() => {
-        throw quotaError();
-      });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw quotaError();
+    });
 
     expect(() => persistState("sess-current", emptyAcpState())).not.toThrow();
     // Original + retry = exactly two calls; no infinite loop.
@@ -183,13 +153,9 @@ describe("structured view cache eviction (#1345)", () => {
     window.localStorage.setItem(`${DRAFT_KEY_PREFIX}sess-a`, "draft");
     window.localStorage.setItem("aoe-resolved-theme", "{}");
 
-    const removed = evictOldestPersistedAcpState(
-      `${STORAGE_KEY_PREFIX}sess-current`,
-    );
+    const removed = evictOldestPersistedAcpState(`${STORAGE_KEY_PREFIX}sess-current`);
     expect(removed).toBe(false);
-    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-a`)).toBe(
-      "draft",
-    );
+    expect(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}sess-a`)).toBe("draft");
   });
 });
 
@@ -234,14 +200,10 @@ describe("persistState strips attachment-bearing queued rows (#1833)", () => {
   it("leaves a fully text-only queue untouched (no needless clone)", () => {
     const state = {
       ...emptyAcpState(),
-      queuedPrompts: [
-        { id: "q1", text: "a", queuedAt: "2026-01-01T00:00:00.000Z" },
-      ],
+      queuedPrompts: [{ id: "q1", text: "a", queuedAt: "2026-01-01T00:00:00.000Z" }],
     };
     persistState("sess-textonly", state);
-    const raw = window.localStorage.getItem(
-      `${STORAGE_KEY_PREFIX}sess-textonly`,
-    );
+    const raw = window.localStorage.getItem(`${STORAGE_KEY_PREFIX}sess-textonly`);
     const parsed = JSON.parse(raw!) as {
       state: { queuedPrompts: Array<{ id: string }> };
     };

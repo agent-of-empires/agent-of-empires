@@ -7,10 +7,7 @@ import { useShikiTheme } from "../../../hooks/useShikiTheme";
  * `@pierre/diffs/worker/worker.js` when referenced via `new URL(..., import.meta.url)`.
  */
 function workerFactory(): Worker {
-  return new Worker(
-    new URL("@pierre/diffs/worker/worker.js", import.meta.url),
-    { type: "module" },
-  );
+  return new Worker(new URL("@pierre/diffs/worker/worker.js", import.meta.url), { type: "module" });
 }
 
 /**
@@ -30,11 +27,7 @@ export function DiffWorkerPoolProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <WorkerPoolContextProvider
-      key={theme}
-      poolOptions={{ workerFactory, poolSize: 4 }}
-      highlighterOptions={{ theme }}
-    >
+    <WorkerPoolContextProvider key={theme} poolOptions={{ workerFactory, poolSize: 4 }} highlighterOptions={{ theme }}>
       {children}
     </WorkerPoolContextProvider>
   );

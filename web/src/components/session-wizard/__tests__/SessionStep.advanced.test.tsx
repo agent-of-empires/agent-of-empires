@@ -35,8 +35,7 @@ function renderStep(overrides: Partial<WizardData> = {}) {
       onChange={onChange}
     />,
   );
-  const expandAdvanced = () =>
-    fireEvent.click(utils.getByRole("button", { name: "Advanced" }));
+  const expandAdvanced = () => fireEvent.click(utils.getByRole("button", { name: "Advanced" }));
   return { onChange, expandAdvanced, ...utils };
 }
 
@@ -46,16 +45,13 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
   });
 
   it("hides every non-title control until Advanced is expanded", () => {
-    const { queryByRole, queryByPlaceholderText, getByPlaceholderText } =
-      renderStep();
+    const { queryByRole, queryByPlaceholderText, getByPlaceholderText } = renderStep();
     // Title input is always visible.
     expect(getByPlaceholderText("Auto-generated if empty")).toBeTruthy();
     // Folded controls are absent before expanding.
     expect(queryByRole("switch")).toBeNull();
     expect(queryByPlaceholderText("Uses session title if empty")).toBeNull();
-    expect(
-      queryByPlaceholderText("Optional, for organizing related sessions"),
-    ).toBeNull();
+    expect(queryByPlaceholderText("Optional, for organizing related sessions")).toBeNull();
   });
 
   it("reveals the worktree toggle, branch input, attach toggle, and group when expanded", () => {
@@ -63,15 +59,11 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
     expandAdvanced();
     expect(getByRole("switch", { name: /Create a worktree/ })).toBeTruthy();
     expect(getByPlaceholderText("Uses session title if empty")).toBeTruthy();
-    expect(
-      getByRole("switch", { name: /Attach to existing branch/ }),
-    ).toBeTruthy();
+    expect(getByRole("switch", { name: /Attach to existing branch/ })).toBeTruthy();
     // The base-branch picker's disclosure button (its input shares the
     // same accessible name but is not a button).
     expect(getByRole("button", { name: "Base branch" })).toBeTruthy();
-    expect(
-      getByPlaceholderText("Optional, for organizing related sessions"),
-    ).toBeTruthy();
+    expect(getByPlaceholderText("Optional, for organizing related sessions")).toBeTruthy();
   });
 
   it("editing the branch input emits a worktreeBranch change", () => {
@@ -108,10 +100,9 @@ describe("SessionStep Advanced disclosure (#1514)", () => {
   it("editing the group input emits a group change", () => {
     const { expandAdvanced, onChange, getByPlaceholderText } = renderStep();
     expandAdvanced();
-    fireEvent.change(
-      getByPlaceholderText("Optional, for organizing related sessions"),
-      { target: { value: "backend" } },
-    );
+    fireEvent.change(getByPlaceholderText("Optional, for organizing related sessions"), {
+      target: { value: "backend" },
+    });
     expect(onChange).toHaveBeenCalledWith("group", "backend");
   });
 });

@@ -40,8 +40,7 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node))
-        setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     const onKeydown = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -69,9 +68,7 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
           data-testid="sidebar-sort-toggle"
           data-sort-mode={sortMode}
           className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-            sortMode !== "manual"
-              ? "text-brand-500"
-              : "text-text-dim hover:text-text-secondary"
+            sortMode !== "manual" ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
           }`}
         >
           <ActiveIcon className="h-3.5 w-3.5" />
@@ -97,9 +94,7 @@ export function SidebarSortPicker({ sortMode, onSortModeChange }: Props) {
                   if (mode !== sortMode) onSortModeChange(mode);
                 }}
                 className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-surface-700/60 ${
-                  selected
-                    ? "text-brand-500"
-                    : "text-text-secondary hover:text-text-primary"
+                  selected ? "text-brand-500" : "text-text-secondary hover:text-text-primary"
                 }`}
               >
                 <Icon className="h-3.5 w-3.5 shrink-0" />

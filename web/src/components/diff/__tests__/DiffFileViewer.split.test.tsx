@@ -48,23 +48,13 @@ vi.mock("../../../hooks/useFileContents", () => ({
 // Stand in for the Pierre renderer: surface the diffStyle on a data attribute
 // and render the file name so the header assertions still resolve.
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({
-    options,
-    fileDiff,
-  }: {
-    options: { diffStyle: string };
-    fileDiff: { name: string };
-  }) => (
+  FileDiff: ({ options, fileDiff }: { options: { diffStyle: string }; fileDiff: { name: string } }) => (
     <div data-testid="pierre-diff" data-diff-style={options.diffStyle}>
       {fileDiff.name}
     </div>
   ),
-  Virtualizer: ({ children }: { children: React.ReactNode }) => (
-    <div data-testid="virtualizer">{children}</div>
-  ),
-  WorkerPoolContextProvider: ({ children }: { children: React.ReactNode }) => (
-    <>{children}</>
-  ),
+  Virtualizer: ({ children }: { children: React.ReactNode }) => <div data-testid="virtualizer">{children}</div>,
+  WorkerPoolContextProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
 beforeEach(() => {
@@ -78,10 +68,7 @@ beforeEach(() => {
     }
     observe(el: Element) {
       mock.observe(el);
-      this.cb(
-        [{ contentRect: { width: 1000 } } as ResizeObserverEntry],
-        this as unknown as ResizeObserver,
-      );
+      this.cb([{ contentRect: { width: 1000 } } as ResizeObserverEntry], this as unknown as ResizeObserver);
     }
     unobserve() {}
     disconnect() {}
@@ -98,14 +85,8 @@ describe("DiffFileViewer split layout", () => {
   it("defaults to unified (Split toggle not pressed)", async () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
-    expect(
-      screen
-        .getByRole("button", { name: "Split" })
-        .getAttribute("aria-pressed"),
-    ).toBe("false");
-    expect(
-      screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
-    ).toBe("unified");
+    expect(screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.getByTestId("pierre-diff").getAttribute("data-diff-style")).toBe("unified");
   });
 
   it("switches to split, forwards diffStyle, and persists the preference", async () => {
@@ -115,26 +96,15 @@ describe("DiffFileViewer split layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Split" }));
 
     await waitFor(() => {
-      expect(
-        screen
-          .getByRole("button", { name: "Split" })
-          .getAttribute("aria-pressed"),
-      ).toBe("true");
+      expect(screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed")).toBe("true");
     });
-    expect(
-      screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
-    ).toBe("split");
-    expect(
-      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}")
-        .diffViewLayout,
-    ).toBe("split");
+    expect(screen.getByTestId("pierre-diff").getAttribute("data-diff-style")).toBe("split");
+    expect(JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}").diffViewLayout).toBe("split");
   });
 
   it("attaches the width observer when the diff container mounts after loading", async () => {
     mock.contents = undefined;
-    const { rerender } = render(
-      <DiffFileViewer sessionId="s1" filePath="a.ts" />,
-    );
+    const { rerender } = render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     expect(mock.observe).not.toHaveBeenCalled();
 
     mock.contents = contents;

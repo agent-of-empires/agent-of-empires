@@ -15,11 +15,7 @@ import {
   type Step,
   type Styles,
 } from "react-joyride";
-import {
-  type TourShortcutHint,
-  type TourStep,
-  tourSelector,
-} from "../../lib/tourSteps";
+import { type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 
 export interface TourRunnerProps {
@@ -77,13 +73,7 @@ function hintLine(hint: TourShortcutHint): string {
   return `${formatTourShortcut(SHORTCUTS_BY_ID[hint.id].chord)} ${hint.verb}`;
 }
 
-function StepBody({
-  body,
-  shortcutHints,
-}: {
-  body: string;
-  shortcutHints?: readonly TourShortcutHint[];
-}) {
+function StepBody({ body, shortcutHints }: { body: string; shortcutHints?: readonly TourShortcutHint[] }) {
   return (
     <div>
       <p>{body}</p>
@@ -121,8 +111,7 @@ export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
       // status and may carry `action: null`, which an action allowlist would
       // misread as a user finish and silently opt the user out. Only an
       // actual finish or skip marks the tour seen.
-      const markSeen =
-        data.status === STATUS.FINISHED || data.status === STATUS.SKIPPED;
+      const markSeen = data.status === STATUS.FINISHED || data.status === STATUS.SKIPPED;
       onFinish(markSeen);
     },
     [onFinish],

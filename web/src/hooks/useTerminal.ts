@@ -136,8 +136,7 @@ export interface TerminalState {
 export function readThemeFromCss(): ITheme {
   const root = document.documentElement;
   const cs = getComputedStyle(root);
-  const v = (name: string, fallback: string) =>
-    cs.getPropertyValue(name).trim() || fallback;
+  const v = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback;
   return {
     background: v("--term-bg", "#1c1c1f"),
     foreground: v("--term-fg", "#e4e4e7"),
@@ -248,24 +247,18 @@ export function useTerminal(
       listeners: new Set(),
     };
   }
-  const terminalSetState = useCallback(
-    (fn: (prev: TerminalState) => TerminalState) => {
-      const store = terminalStoreRef.current!;
-      store.snapshot = fn(store.snapshot);
-      store.listeners.forEach((l) => l());
-    },
-    [],
-  );
+  const terminalSetState = useCallback((fn: (prev: TerminalState) => TerminalState) => {
+    const store = terminalStoreRef.current!;
+    store.snapshot = fn(store.snapshot);
+    store.listeners.forEach((l) => l());
+  }, []);
   const terminalSubscribe = useCallback((listener: () => void) => {
     terminalStoreRef.current!.listeners.add(listener);
     return () => {
       terminalStoreRef.current!.listeners.delete(listener);
     };
   }, []);
-  const terminalGetSnapshot = useCallback(
-    () => terminalStoreRef.current!.snapshot,
-    [],
-  );
+  const terminalGetSnapshot = useCallback(() => terminalStoreRef.current!.snapshot, []);
   const state = useSyncExternalStore(terminalSubscribe, terminalGetSnapshot);
 
   const settingsRef = useRef(settings);
@@ -302,15 +295,12 @@ export function useTerminal(
     let timingPingTimer: ReturnType<typeof setInterval> | null = null;
     let timingSummaryTimer: ReturnType<typeof setInterval> | null = null;
     if (timing) {
-      (window as Window & { __aoeTiming?: TerminalTiming }).__aoeTiming =
-        timing;
+      (window as Window & { __aoeTiming?: TerminalTiming }).__aoeTiming = timing;
     }
 
     const isMobileViewport = () => window.innerWidth < MOBILE_BREAKPOINT_PX;
     const readFontSize = () =>
-      isMobileViewport()
-        ? settingsRef.current.mobileFontSize
-        : settingsRef.current.desktopFontSize;
+      isMobileViewport() ? settingsRef.current.mobileFontSize : settingsRef.current.desktopFontSize;
     const persistFontSize = (size: number) => {
       if (isMobileViewport()) updateRef.current({ mobileFontSize: size });
       else updateRef.current({ desktopFontSize: size });
@@ -434,13 +424,7 @@ export function useTerminal(
     // requiring extended-keys negotiation. Gated on bare Shift+Enter so
     // Ctrl/Alt/Cmd+Shift+Enter still reach the app as distinct combos.
     term.attachCustomKeyEventHandler((ev) => {
-      if (
-        ev.key === "Enter" &&
-        ev.shiftKey &&
-        !ev.ctrlKey &&
-        !ev.metaKey &&
-        !ev.altKey
-      ) {
+      if (ev.key === "Enter" && ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
         if (ev.type === "keydown") {
           const ws = wsRef.current;
           if (ws?.readyState === WebSocket.OPEN) {
@@ -525,9 +509,7 @@ export function useTerminal(
     term.onResize(({ cols, rows }) => {
       lastMeasuredRef.current = { cols, rows };
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
-      const delay = hasSentInitialResize
-        ? RESIZE_DEBOUNCE_MS
-        : INITIAL_SETTLE_MS;
+      const delay = hasSentInitialResize ? RESIZE_DEBOUNCE_MS : INITIAL_SETTLE_MS;
       resizeDebounceTimer = setTimeout(() => {
         resizeDebounceTimer = null;
         hasSentInitialResize = true;
@@ -577,10 +559,7 @@ export function useTerminal(
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
         if (w <= 0 || h <= 0) continue;
-        if (
-          Math.abs(w - lastObservedWidth) < 1 &&
-          Math.abs(h - lastObservedHeight) < 1
-        ) {
+        if (Math.abs(w - lastObservedWidth) < 1 && Math.abs(h - lastObservedHeight) < 1) {
           continue;
         }
         lastObservedWidth = w;
@@ -606,9 +585,7 @@ export function useTerminal(
     // fit may have used fallback-font metrics on a cold cache; once
     // Geist Mono loads, the cell width changes and the grid needs to
     // be recomputed.
-    const fontsApi = (
-      document as Document & { fonts?: { ready: Promise<unknown> } }
-    ).fonts;
+    const fontsApi = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts;
     if (fontsApi?.ready) {
       fontsApi.ready
         .then(() => {
@@ -769,12 +746,7 @@ export function useTerminal(
             const msg = JSON.parse(event.data) as { type?: string };
             if (msg.type === "timing_pong") {
               const pong = msg as TimingPongMessage;
-              timing?.onPong(
-                pong.seq,
-                pong.client_t,
-                pong.server_busy_us,
-                performance.now(),
-              );
+              timing?.onPong(pong.seq, pong.client_t, pong.server_busy_us, performance.now());
               return;
             }
             if (msg.type === "primary_status") {
@@ -951,10 +923,7 @@ export function useTerminal(
     const wheelSeq = (dir: "up" | "down", cell: { col: number; row: number }) =>
       `\x1b[<${dir === "up" ? 64 : 65};${cell.col};${cell.row}M`;
     const wheelGrid = () => {
-      const sentGrid =
-        lastSentCols > 0 && lastSentRows > 0
-          ? { cols: lastSentCols, rows: lastSentRows }
-          : null;
+      const sentGrid = lastSentCols > 0 && lastSentRows > 0 ? { cols: lastSentCols, rows: lastSentRows } : null;
       // While reading tmux scrollback, resize messages are deferred to
       // avoid SIGWINCH redraws. xterm may still refit to a new monitor
       // size, so mouse coordinates must stay in the pane size tmux
@@ -965,26 +934,17 @@ export function useTerminal(
         rows: Math.max(1, term.rows),
       };
     };
-    const cellFromClientPoint = (
-      clientX: number,
-      clientY: number,
-      eventTarget?: EventTarget | null,
-    ) => {
+    const cellFromClientPoint = (clientX: number, clientY: number, eventTarget?: EventTarget | null) => {
       const targetEl = eventTarget instanceof HTMLElement ? eventTarget : null;
       const targetRect = targetEl?.getBoundingClientRect();
-      const el =
-        targetRect && targetRect.width > 0 && targetRect.height > 0
-          ? targetEl
-          : term.element;
+      const el = targetRect && targetRect.width > 0 && targetRect.height > 0 ? targetEl : term.element;
       if (!el) return { col: 1, row: 1 };
       const rect = el.getBoundingClientRect();
       const grid = wheelGrid();
       const cellWidth = rect.width > 0 ? rect.width / grid.cols : 0;
       const cellHeight = rect.height > 0 ? rect.height / grid.rows : 0;
-      const rawCol =
-        cellWidth > 0 ? Math.floor((clientX - rect.left) / cellWidth) + 1 : 1;
-      const rawRow =
-        cellHeight > 0 ? Math.floor((clientY - rect.top) / cellHeight) + 1 : 1;
+      const rawCol = cellWidth > 0 ? Math.floor((clientX - rect.left) / cellWidth) + 1 : 1;
+      const rawRow = cellHeight > 0 ? Math.floor((clientY - rect.top) / cellHeight) + 1 : 1;
       return {
         col: Math.max(1, Math.min(grid.cols, rawCol)),
         row: Math.max(1, Math.min(grid.rows, rawRow)),
@@ -998,11 +958,7 @@ export function useTerminal(
       };
     };
     let scrollbackDepth = 0;
-    const sendWheel = (
-      dir: "up" | "down",
-      count: number,
-      cell = centerCell(),
-    ) => {
+    const sendWheel = (dir: "up" | "down", count: number, cell = centerCell()) => {
       const ws = wsRef.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
 
@@ -1043,9 +999,7 @@ export function useTerminal(
         terminalSetState((prev) => {
           if (prev.isInScrollback) return prev;
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({ type: "pause_output" } as PauseOutputMessage),
-            );
+            ws.send(JSON.stringify({ type: "pause_output" } as PauseOutputMessage));
           }
           return { ...prev, isInScrollback: true };
         });
@@ -1094,15 +1048,11 @@ export function useTerminal(
     const LINES_PER_WHEEL = 2;
     const MAX_VELOCITY = 2.0;
     const MAX_WHEELS_PER_FRAME = 6;
-    const clampV = (v: number) =>
-      Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, v));
+    const clampV = (v: number) => Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, v));
     const currentFontSize = (): number =>
-      typeof term.options.fontSize === "number"
-        ? term.options.fontSize
-        : DEFAULT_FONT_SIZE;
+      typeof term.options.fontSize === "number" ? term.options.fontSize : DEFAULT_FONT_SIZE;
     const pxPerWheel = () => currentFontSize() * 1.2 * LINES_PER_WHEEL;
-    const prefersReducedMotion = () =>
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    const prefersReducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
     const midpointY = (e: TouchEvent) => {
       const a = e.touches[0];
@@ -1118,8 +1068,7 @@ export function useTerminal(
       return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
     };
 
-    const clampFont = (n: number) =>
-      Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, n));
+    const clampFont = (n: number) => Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, n));
 
     // Font size updates. Coalesce to one per frame, refit after change
     // so the cell grid recomputes against the new metrics.
@@ -1200,10 +1149,7 @@ export function useTerminal(
 
     const onTouchMove = (e: TouchEvent) => {
       // Single-finger scroll
-      if (
-        e.touches.length === 1 &&
-        (gestureMode === null || gestureMode === "single-scroll")
-      ) {
+      if (e.touches.length === 1 && (gestureMode === null || gestureMode === "single-scroll")) {
         const t = e.touches[0]!;
         const y = t.clientY;
         const now = performance.now();
@@ -1225,16 +1171,9 @@ export function useTerminal(
         singleAccum += dy;
         const step = pxPerWheel();
         const rawWheels = Math.trunc(singleAccum / step);
-        const wheels = Math.max(
-          -MAX_WHEELS_PER_FRAME,
-          Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
-        );
+        const wheels = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawWheels));
         if (wheels !== 0) {
-          sendWheel(
-            wheels > 0 ? "up" : "down",
-            Math.abs(wheels),
-            cellFromClientPoint(singleX, y, e.currentTarget),
-          );
+          sendWheel(wheels > 0 ? "up" : "down", Math.abs(wheels), cellFromClientPoint(singleX, y, e.currentTarget));
           singleAccum -= wheels * step;
           const dt = Math.max(1, now - singleLastTs);
           velocity = clampV(dy / dt);
@@ -1275,16 +1214,9 @@ export function useTerminal(
       touchAccum += dy;
       const step = pxPerWheel();
       const rawWheels = Math.trunc(touchAccum / step);
-      const wheels = Math.max(
-        -MAX_WHEELS_PER_FRAME,
-        Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
-      );
+      const wheels = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawWheels));
       if (wheels !== 0) {
-        sendWheel(
-          wheels > 0 ? "up" : "down",
-          Math.abs(wheels),
-          cellFromClientPoint(touchMidX, y, e.currentTarget),
-        );
+        sendWheel(wheels > 0 ? "up" : "down", Math.abs(wheels), cellFromClientPoint(touchMidX, y, e.currentTarget));
         touchAccum -= wheels * step;
         const dt = Math.max(1, now - lastMoveTs);
         velocity = clampV(dy / dt);
@@ -1301,8 +1233,7 @@ export function useTerminal(
         velocity = 0;
         return;
       }
-      const wasScrolling =
-        gestureMode === "single-scroll" || gestureMode === "scroll";
+      const wasScrolling = gestureMode === "single-scroll" || gestureMode === "scroll";
       gestureMode = null;
       if (wasScrolling) suppressNextClick = true;
       if (prefersReducedMotion() || Math.abs(velocity) < 0.05) {
@@ -1320,10 +1251,7 @@ export function useTerminal(
         carry += v * dt;
         const step = pxPerWheel();
         const rawW = Math.trunc(carry / step);
-        const w = Math.max(
-          -MAX_WHEELS_PER_FRAME,
-          Math.min(MAX_WHEELS_PER_FRAME, rawW),
-        );
+        const w = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawW));
         if (w !== 0) {
           sendWheel(w > 0 ? "up" : "down", Math.abs(w), centerCell());
           carry -= w * step;
@@ -1376,10 +1304,7 @@ export function useTerminal(
         if (osc52ArmSeq === armSeq) osc52Resolve = null;
       };
       try {
-        if (
-          typeof ClipboardItem !== "undefined" &&
-          navigator.clipboard?.write
-        ) {
+        if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
           const pending = new Promise<Blob>((resolve, reject) => {
             osc52Resolve = (text) => {
               if (settled || osc52ArmSeq !== armSeq) return;
@@ -1396,13 +1321,11 @@ export function useTerminal(
           // unhandled rejection if the clipboard implementation drops the
           // promise (the write() consumer below also sees it; both fire).
           pending.catch(() => {});
-          navigator.clipboard
-            .write([new ClipboardItem({ "text/plain": pending })])
-            .catch(() => {
-              // Rejected when no OSC 52 arrived within the timeout (drag
-              // selected nothing) or the engine declined the async write.
-              // Harmless.
-            });
+          navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {
+            // Rejected when no OSC 52 arrived within the timeout (drag
+            // selected nothing) or the engine declined the async write.
+            // Harmless.
+          });
           return;
         }
       } catch {
@@ -1428,10 +1351,7 @@ export function useTerminal(
       if (e.button !== 0 || !start) return;
       // Threshold filters plain focus clicks; only a real drag (which tmux
       // turns into a copy-mode selection) should arm a clipboard write.
-      if (
-        Math.hypot(e.clientX - start.x, e.clientY - start.y) <
-        DRAG_COPY_THRESHOLD_PX
-      ) {
+      if (Math.hypot(e.clientX - start.x, e.clientY - start.y) < DRAG_COPY_THRESHOLD_PX) {
         return;
       }
       armClipboardCopy();
@@ -1456,11 +1376,7 @@ export function useTerminal(
     let wheelPersistTimer: ReturnType<typeof setTimeout> | null = null;
     let lastCapturedWheelCell: { col: number; row: number } | null = null;
     const onWheelCapture = (e: WheelEvent) => {
-      lastCapturedWheelCell = cellFromClientPoint(
-        e.clientX,
-        e.clientY,
-        e.currentTarget ?? e.target,
-      );
+      lastCapturedWheelCell = cellFromClientPoint(e.clientX, e.clientY, e.currentTarget ?? e.target);
     };
     viewport.addEventListener("wheel", onWheelCapture, {
       capture: true,
@@ -1492,20 +1408,11 @@ export function useTerminal(
       scrollWheelAccum += e.deltaY;
       const step = pxPerWheel();
       const rawWheels = Math.trunc(scrollWheelAccum / step);
-      const wheels = Math.max(
-        -MAX_WHEELS_PER_FRAME,
-        Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
-      );
+      const wheels = Math.max(-MAX_WHEELS_PER_FRAME, Math.min(MAX_WHEELS_PER_FRAME, rawWheels));
       if (wheels !== 0) {
-        const eventCell = cellFromClientPoint(
-          e.clientX,
-          e.clientY,
-          e.currentTarget ?? e.target,
-        );
+        const eventCell = cellFromClientPoint(e.clientX, e.clientY, e.currentTarget ?? e.target);
         const cell =
-          eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell
-            ? lastCapturedWheelCell
-            : eventCell;
+          eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell ? lastCapturedWheelCell : eventCell;
         sendWheel(wheels > 0 ? "down" : "up", Math.abs(wheels), cell);
         scrollWheelAccum -= wheels * step;
       }
@@ -1533,10 +1440,7 @@ export function useTerminal(
     const tryAutoReconnect = (label: string) => {
       const ws = wsRef.current;
       const readyState = ws?.readyState;
-      if (
-        readyState === WebSocket.OPEN ||
-        readyState === WebSocket.CONNECTING
-      ) {
+      if (readyState === WebSocket.OPEN || readyState === WebSocket.CONNECTING) {
         return;
       }
       tdbg("auto-reconnect", { trigger: label, readyState });
@@ -1643,10 +1547,7 @@ export function useTerminal(
     const term = termRef.current;
     const fit = fitRef.current;
     if (!term) return;
-    const size =
-      window.innerWidth < MOBILE_BREAKPOINT_PX
-        ? settings.mobileFontSize
-        : settings.desktopFontSize;
+    const size = window.innerWidth < MOBILE_BREAKPOINT_PX ? settings.mobileFontSize : settings.desktopFontSize;
     if (term.options.fontSize !== size) {
       term.options.fontSize = size;
       try {
@@ -1720,9 +1621,7 @@ export function useTerminal(
 
   const activate = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({ type: "activate" } as ActivateMessage),
-      );
+      wsRef.current.send(JSON.stringify({ type: "activate" } as ActivateMessage));
     }
   }, []);
 
@@ -1746,9 +1645,7 @@ export function useTerminal(
       ws.send(new TextEncoder().encode("\x1b"));
     }
     resetScrollbackDepthRef.current?.();
-    terminalSetState((prev) =>
-      prev.isInScrollback ? { ...prev, isInScrollback: false } : prev,
-    );
+    terminalSetState((prev) => (prev.isInScrollback ? { ...prev, isInScrollback: false } : prev));
   }, [terminalSetState]);
 
   return {

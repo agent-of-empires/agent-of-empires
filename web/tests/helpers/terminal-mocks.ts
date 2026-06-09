@@ -11,9 +11,7 @@ export interface MockHandle {
 
 export async function mockTerminalApis(page: Page): Promise<MockHandle> {
   const handle: MockHandle = { wsMessages: [] };
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
@@ -42,28 +40,13 @@ export async function mockTerminalApis(page: Page): Promise<MockHandle> {
       },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, (ws) => {
     ws.onMessage((msg) => {
@@ -101,9 +84,7 @@ export async function installTerminalSpies(page: Page) {
     (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__ = [];
     const origSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key: string, value: string) {
-      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(
-        `${key}=${value}`,
-      );
+      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(`${key}=${value}`);
       return origSetItem.call(this, key, value);
     };
   });
@@ -118,10 +99,7 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
   }, which);
 }
 
-export async function seedSettings(
-  page: Page,
-  settings: { mobileFontSize?: number; desktopFontSize?: number },
-) {
+export async function seedSettings(page: Page, settings: { mobileFontSize?: number; desktopFontSize?: number }) {
   await page.evaluate((settings) => {
     localStorage.setItem(
       "aoe-web-settings",

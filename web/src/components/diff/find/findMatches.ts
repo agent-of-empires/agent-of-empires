@@ -48,11 +48,7 @@ export interface FindOptions {
  * is set and `query` is not a valid regular expression, so the caller can
  * surface an "invalid pattern" state.
  */
-export function findMatches(
-  lines: SearchableLine[],
-  query: string,
-  opts: FindOptions = {},
-): FindMatch[] {
+export function findMatches(lines: SearchableLine[], query: string, opts: FindOptions = {}): FindMatch[] {
   if (query.length === 0) return [];
 
   const matcher = opts.regex

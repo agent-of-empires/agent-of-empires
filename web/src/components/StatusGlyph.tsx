@@ -11,25 +11,7 @@ const RATTLES: Record<string, { frames: string[]; interval: number }> = {
   },
   orbit: { frames: ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"], interval: 400 },
   breathe: {
-    frames: [
-      "⠀",
-      "⠂",
-      "⠌",
-      "⡑",
-      "⢕",
-      "⢝",
-      "⣫",
-      "⣟",
-      "⣿",
-      "⣟",
-      "⣫",
-      "⢝",
-      "⢕",
-      "⡑",
-      "⠌",
-      "⠂",
-      "⠀",
-    ],
+    frames: ["⠀", "⠂", "⠌", "⡑", "⢕", "⢝", "⣫", "⣟", "⣿", "⣟", "⣫", "⢝", "⢕", "⡑", "⠌", "⠂", "⠀"],
     interval: 180,
   },
 };
@@ -84,31 +66,20 @@ export function StatusGlyph({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isFresh =
-    status === "Idle" &&
-    isFreshIdle(
-      { status, idle_entered_at: idleEnteredAt ?? null },
-      idleDecayWindowMs,
-    );
+    status === "Idle" && isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs);
   const rattleKey = STATUS_RATTLE[status];
-  const rattle = isFresh
-    ? FRESH_IDLE_RATTLE
-    : rattleKey
-      ? RATTLES[rattleKey]
-      : undefined;
+  const rattle = isFresh ? FRESH_IDLE_RATTLE : rattleKey ? RATTLES[rattleKey] : undefined;
   const parsed = createdAt ? Date.parse(createdAt) : 0;
   const epoch = Number.isNaN(parsed) ? 0 : parsed;
   const [frame, setFrame] = useState(() => {
     if (!rattle) return 0;
-    return (
-      Math.floor((Date.now() - epoch) / rattle.interval) % rattle.frames.length
-    );
+    return Math.floor((Date.now() - epoch) / rattle.interval) % rattle.frames.length;
   });
 
   useEffect(() => {
     if (!rattle) return;
     const r = rattle;
-    const computeFrame = () =>
-      Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
+    const computeFrame = () => Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
     const initial = setTimeout(() => setFrame(computeFrame()), 0);
     const id = setInterval(() => setFrame(computeFrame()), r.interval);
     return () => {

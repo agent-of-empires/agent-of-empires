@@ -1,12 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FileDiff, Virtualizer } from "@pierre/diffs/react";
 import { processFile } from "@pierre/diffs";
-import type {
-  DiffLineAnnotation,
-  FileContents,
-  FileDiffOptions,
-  SelectedLineRange,
-} from "@pierre/diffs";
+import type { DiffLineAnnotation, FileContents, FileDiffOptions, SelectedLineRange } from "@pierre/diffs";
 import { useFileContents } from "../../hooks/useFileContents";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
@@ -69,14 +64,10 @@ interface DraftRange {
 
 /** Metadata carried on each Pierre line annotation so `renderAnnotation`
  *  knows whether to draw a saved card or the active draft form. */
-type AnnotationMeta =
-  | { kind: "card"; anchored: AnchoredComment }
-  | { kind: "form"; draft: DraftRange };
+type AnnotationMeta = { kind: "card"; anchored: AnchoredComment } | { kind: "form"; draft: DraftRange };
 
-const sideToAnnotation = (side: DiffSide) =>
-  side === "old" ? ("deletions" as const) : ("additions" as const);
-const annotationToSide = (side: "deletions" | "additions"): DiffSide =>
-  side === "deletions" ? "old" : "new";
+const sideToAnnotation = (side: DiffSide) => (side === "old" ? ("deletions" as const) : ("additions" as const));
+const annotationToSide = (side: "deletions" | "additions"): DiffSide => (side === "deletions" ? "old" : "new");
 
 export function DiffFileViewer({
   sessionId,
@@ -87,12 +78,7 @@ export function DiffFileViewer({
   commentsEnabled = false,
   commentsStore,
 }: Props) {
-  const { contents, loading, error } = useFileContents(
-    sessionId,
-    filePath,
-    repoName,
-    revision,
-  );
+  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision);
   const { theme } = useShikiTheme();
   const { settings, update } = useWebSettings();
 
@@ -119,12 +105,7 @@ export function DiffFileViewer({
 
   // Reset transient state when the viewer switches files / repos / sessions.
   // Synced at render time (not in an effect) to avoid set-state-in-effect.
-  const syncKey = JSON.stringify([
-    sessionId,
-    repoName ?? null,
-    filePath,
-    revision,
-  ]);
+  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision]);
   const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
   if (syncKey !== handledSyncKey) {
     setHandledSyncKey(syncKey);
@@ -140,31 +121,15 @@ export function DiffFileViewer({
   const oldPath = contents?.file.old_path ?? resolvedPath;
 
   const commentsActive = commentsEnabled && !!commentsStore;
-  const comments = useMemo(
-    () => commentsStore?.comments ?? [],
-    [commentsStore],
-  );
+  const comments = useMemo(() => commentsStore?.comments ?? [], [commentsStore]);
 
   const anchored = useMemo(
-    () =>
-      anchorCommentsToContents(
-        comments,
-        filePath,
-        repoName,
-        oldContent,
-        newContent,
-      ),
+    () => anchorCommentsToContents(comments, filePath, repoName, oldContent, newContent),
     [comments, filePath, repoName, oldContent, newContent],
   );
-  const staleComments = useMemo(
-    () => anchored.filter((a) => a.status === "stale"),
-    [anchored],
-  );
+  const staleComments = useMemo(() => anchored.filter((a) => a.status === "stale"), [anchored]);
 
-  const oldFile = useMemo<FileContents>(
-    () => ({ name: oldPath, contents: oldContent }),
-    [oldPath, oldContent],
-  );
+  const oldFile = useMemo<FileContents>(() => ({ name: oldPath, contents: oldContent }), [oldPath, oldContent]);
   const newFile = useMemo<FileContents>(
     () => ({ name: resolvedPath, contents: newContent }),
     [resolvedPath, newContent],
@@ -210,14 +175,8 @@ export function DiffFileViewer({
     return out;
   }, [anchored, draft]);
 
-  const handleSave = useCallback(
-    (id: string, body: string) => commentsStore?.updateComment(id, body),
-    [commentsStore],
-  );
-  const handleDelete = useCallback(
-    (id: string) => commentsStore?.deleteComment(id),
-    [commentsStore],
-  );
+  const handleSave = useCallback((id: string, body: string) => commentsStore?.updateComment(id, body), [commentsStore]);
+  const handleDelete = useCallback((id: string) => commentsStore?.deleteComment(id), [commentsStore]);
   const handleDraftSave = useCallback(
     (body: string) => {
       if (!draft || !commentsStore) return;
@@ -255,13 +214,7 @@ export function DiffFileViewer({
           />
         );
       }
-      return (
-        <CommentCard
-          anchored={meta.anchored}
-          onSave={handleSave}
-          onDelete={handleDelete}
-        />
-      );
+      return <CommentCard anchored={meta.anchored} onSave={handleSave} onDelete={handleDelete} />;
     },
     [handleDraftSave, handleDraftCancel, handleSave, handleDelete],
   );
@@ -273,13 +226,7 @@ export function DiffFileViewer({
       const side = annotationToSide(range.side ?? "additions");
       const startLine = Math.min(range.start, range.end);
       const endLine = Math.max(range.start, range.end);
-      const snippet = extractSnippetFromContents(
-        oldContent,
-        newContent,
-        side,
-        startLine,
-        endLine,
-      );
+      const snippet = extractSnippetFromContents(oldContent, newContent, side, startLine, endLine);
       if (snippet == null) return;
       setDraft({ side, startLine, endLine, snippet });
     },
@@ -303,10 +250,7 @@ export function DiffFileViewer({
 
   // Searchable line set for find: the diff's changed lines, read straight off
   // the already-parsed patch metadata (no extra work beyond walking hunks).
-  const findLines = useMemo(
-    () => (findOpen && fileDiff ? changedLines(fileDiff) : []),
-    [findOpen, fileDiff],
-  );
+  const findLines = useMemo(() => (findOpen && fileDiff ? changedLines(fileDiff) : []), [findOpen, fileDiff]);
 
   const handleFindJump = useCallback(
     (match: FindMatch | null) => {
@@ -327,13 +271,9 @@ export function DiffFileViewer({
       if (scroller) {
         const text = match.side === "old" ? oldContent : newContent;
         const lineCount = text.split("\n").length;
-        const frac = Math.min(
-          1,
-          Math.max(0, (match.lineNumber - 1) / lineCount),
-        );
+        const frac = Math.min(1, Math.max(0, (match.lineNumber - 1) / lineCount));
         userScrolledRef.current = true;
-        scroller.scrollTop =
-          frac * (scroller.scrollHeight - scroller.clientHeight);
+        scroller.scrollTop = frac * (scroller.scrollHeight - scroller.clientHeight);
       }
     },
     [oldContent, newContent],
@@ -402,15 +342,11 @@ export function DiffFileViewer({
   }
 
   const statusColor = STATUS_COLORS[contents.file.status] ?? "text-text-muted";
-  const statusLabel =
-    STATUS_LABELS[contents.file.status] ?? contents.file.status;
+  const statusLabel = STATUS_LABELS[contents.file.status] ?? contents.file.status;
   const noChanges = oldContent === newContent;
 
   return (
-    <div
-      className="flex-1 flex flex-col bg-surface-900 overflow-hidden"
-      onKeyDown={onKeyDown}
-    >
+    <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden" onKeyDown={onKeyDown}>
       {/* File header */}
       <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0 flex-wrap">
         {onClose && (
@@ -435,25 +371,13 @@ export function DiffFileViewer({
             <span className="hidden sm:inline">Terminal</span>
           </button>
         )}
-        <span className={`font-mono text-[11px] font-semibold ${statusColor}`}>
-          {statusLabel}
-        </span>
+        <span className={`font-mono text-[11px] font-semibold ${statusColor}`}>{statusLabel}</span>
         <span className="font-mono text-[12px] text-text-primary truncate">
-          {contents.file.old_path
-            ? `${contents.file.old_path} → ${contents.file.path}`
-            : contents.file.path}
+          {contents.file.old_path ? `${contents.file.old_path} → ${contents.file.path}` : contents.file.path}
         </span>
         <span className="font-mono text-[11px] flex items-center gap-1">
-          {contents.file.additions > 0 && (
-            <span className="text-status-running">
-              +{contents.file.additions}
-            </span>
-          )}
-          {contents.file.deletions > 0 && (
-            <span className="text-status-error">
-              -{contents.file.deletions}
-            </span>
-          )}
+          {contents.file.additions > 0 && <span className="text-status-running">+{contents.file.additions}</span>}
+          {contents.file.deletions > 0 && <span className="text-status-error">-{contents.file.deletions}</span>}
         </span>
         <div className="ml-auto flex items-center gap-2">
           <button
@@ -463,9 +387,7 @@ export function DiffFileViewer({
             title="Find in diff (Cmd/Ctrl+F)"
             aria-label="Find in diff"
             className={`px-2 py-0.5 text-[11px] font-mono rounded cursor-pointer transition-colors ${
-              findOpen
-                ? "bg-brand-600 text-white"
-                : "text-text-dim hover:text-text-secondary"
+              findOpen ? "bg-brand-600 text-white" : "text-text-dim hover:text-text-secondary"
             }`}
           >
             Find
@@ -508,11 +430,7 @@ export function DiffFileViewer({
       </div>
 
       {findOpen && !contents.is_binary && !contents.truncated && (
-        <FindBar
-          lines={findLines}
-          onJump={handleFindJump}
-          onClose={() => setFindOpen(false)}
-        />
+        <FindBar lines={findLines} onJump={handleFindJump} onClose={() => setFindOpen(false)} />
       )}
 
       {/* Diff content */}
@@ -525,9 +443,7 @@ export function DiffFileViewer({
           <div className="flex-1 flex items-center justify-center text-text-dim">
             <div className="text-center px-4">
               <p className="text-sm mb-1">File too large to diff inline</p>
-              <p className="text-xs">
-                Open it in your editor to review the changes.
-              </p>
+              <p className="text-xs">Open it in your editor to review the changes.</p>
             </div>
           </div>
         ) : noChanges && staleComments.length === 0 ? (
@@ -540,16 +456,10 @@ export function DiffFileViewer({
               <div className="px-3 py-2 bg-status-error/5 border-b border-status-error/30 shrink-0 overflow-auto max-h-48">
                 <div className="text-[11px] font-mono text-status-error mb-2">
                   {staleComments.length} stale comment
-                  {staleComments.length === 1 ? "" : "s"} (line range no longer
-                  in current diff)
+                  {staleComments.length === 1 ? "" : "s"} (line range no longer in current diff)
                 </div>
                 {staleComments.map((a) => (
-                  <CommentCard
-                    key={`stale-${a.comment.id}`}
-                    anchored={a}
-                    onSave={handleSave}
-                    onDelete={handleDelete}
-                  />
+                  <CommentCard key={`stale-${a.comment.id}`} anchored={a} onSave={handleSave} onDelete={handleDelete} />
                 ))}
               </div>
             )}

@@ -10,15 +10,11 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("sandbox advanced knob edits persist after expanding the fold", async ({
-  serve,
-  page,
-}) => {
-  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(
-    `${serve.baseUrl}/api/profiles`,
-  ).then((r) => r.json());
-  const defaultProfile =
-    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
+test("sandbox advanced knob edits persist after expanding the fold", async ({ serve, page }) => {
+  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(`${serve.baseUrl}/api/profiles`).then(
+    (r) => r.json(),
+  );
+  const defaultProfile = profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
   const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
 
   const before = await fetch(profileUrl).then((r) => r.json());
@@ -32,9 +28,7 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
   await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
-    0,
-  );
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(0);
 
   // Expand the Advanced fold.
   await page
@@ -64,9 +58,7 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
   await expect(page.getByText("Enabled by Default")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(
-    0,
-  );
+  await expect(page.locator("label", { hasText: /^CPU Limit$/ })).toHaveCount(0);
 
   await page
     .getByRole("button", { name: /Advanced/ })
@@ -79,10 +71,7 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({
 // advanced fields only once the fold is expanded. Drive each one in the
 // browser so the relocated field markup is exercised end to end (the unit
 // suite asserts the same hide/expand behavior; this is the real-DOM pass).
-test("worktree, structured-view, and logging advanced folds expand in the browser", async ({
-  serve,
-  page,
-}) => {
+test("worktree, structured-view, and logging advanced folds expand in the browser", async ({ serve, page }) => {
   const cases: Array<{ tab: string; anchor: string; field: RegExp }> = [
     // Worktree is schema-driven (#1692): labels + the advanced fold come from
     // the settings schema, so they match the TUI ("Enabled by Default",

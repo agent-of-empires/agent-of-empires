@@ -1,10 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  ensureThemeLoaded,
-  getHighlighter,
-  langImportForPath,
-  type ThemedToken,
-} from "../lib/highlighter";
+import { ensureThemeLoaded, getHighlighter, langImportForPath, type ThemedToken } from "../lib/highlighter";
 import type { RichDiffHunk } from "../lib/types";
 import { useShikiTheme } from "./useShikiTheme";
 
@@ -43,10 +38,7 @@ export interface HighlightResult {
  * since any failure in the async load would otherwise hide content
  * permanently.
  */
-export function useHighlightedLines(
-  hunks: RichDiffHunk[],
-  filePath: string,
-): HighlightResult {
+export function useHighlightedLines(hunks: RichDiffHunk[], filePath: string): HighlightResult {
   const [state, setState] = useState<GridState | null>(null);
   const requestRef = useRef(0);
   // Tracks whether the host component is still mounted. The async IIFE
@@ -73,24 +65,17 @@ export function useHighlightedLines(
 
     (async () => {
       try {
-        const resolvedTheme = await ensureThemeLoaded(
-          shiki.theme,
-          shiki.appearance,
-        );
+        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
         const hl = await getHighlighter();
 
         // Load the grammar if not already registered.
         const mod = await langImport();
         const registration = (mod as Record<string, unknown>).default ?? mod;
-        const langs = Array.isArray(registration)
-          ? registration
-          : [registration];
+        const langs = Array.isArray(registration) ? registration : [registration];
         for (const lang of langs) {
           const id = (lang as { name?: string }).name;
           if (id && !hl.getLoadedLanguages().includes(id)) {
-            await hl.loadLanguage(
-              lang as Parameters<typeof hl.loadLanguage>[0],
-            );
+            await hl.loadLanguage(lang as Parameters<typeof hl.loadLanguage>[0]);
           }
         }
 
@@ -118,11 +103,10 @@ export function useHighlightedLines(
                 lang: langId,
                 theme: resolvedTheme,
               });
-              const mapped: SyntaxToken[] = (
-                tokens[0] as ThemedToken[] | undefined
-              )?.map((t) => ({ content: t.content, color: t.color })) ?? [
-                { content: raw },
-              ];
+              const mapped: SyntaxToken[] = (tokens[0] as ThemedToken[] | undefined)?.map((t) => ({
+                content: t.content,
+                color: t.color,
+              })) ?? [{ content: raw }];
               hunkTokens.push(mapped);
             } catch {
               hunkTokens.push([{ content: raw }]);

@@ -19,9 +19,7 @@ test.describe("Terminal pinch zoom (mobile)", () => {
   }
 
   async function wsCount(page: Page) {
-    return page.evaluate(
-      () => (window as unknown as { __WS_COUNT__: number }).__WS_COUNT__,
-    );
+    return page.evaluate(() => (window as unknown as { __WS_COUNT__: number }).__WS_COUNT__);
   }
 
   async function fontSizeWrites(page: Page) {
@@ -32,9 +30,7 @@ test.describe("Terminal pinch zoom (mobile)", () => {
     );
   }
 
-  test("two-finger spread zooms in and clamps at MAX_FONT_SIZE", async ({
-    page,
-  }) => {
+  test("two-finger spread zooms in and clamps at MAX_FONT_SIZE", async ({ page }) => {
     await installTerminalSpies(page);
     await mockTerminalApis(page);
     await page.goto("/");
@@ -61,9 +57,7 @@ test.describe("Terminal pinch zoom (mobile)", () => {
     }
     await fireTouches(page, "touchend", []);
 
-    await expect
-      .poll(() => readFontSize(page, "mobile"), { timeout: 2_000 })
-      .toBe(28);
+    await expect.poll(() => readFontSize(page, "mobile"), { timeout: 2_000 }).toBe(28);
     // Same session, no reconnect.
     expect(await wsCount(page)).toBe(wsBefore);
   });
@@ -95,15 +89,11 @@ test.describe("Terminal pinch zoom (mobile)", () => {
     }
     await fireTouches(page, "touchend", []);
 
-    await expect
-      .poll(() => readFontSize(page, "mobile"), { timeout: 2_000 })
-      .toBe(6);
+    await expect.poll(() => readFontSize(page, "mobile"), { timeout: 2_000 }).toBe(6);
     expect(await wsCount(page)).toBe(wsBefore);
   });
 
-  test("two-finger vertical pan does NOT write to localStorage (scroll lock)", async ({
-    page,
-  }) => {
+  test("two-finger vertical pan does NOT write to localStorage (scroll lock)", async ({ page }) => {
     await installTerminalSpies(page);
     await mockTerminalApis(page);
     await page.goto("/");
@@ -136,9 +126,7 @@ test.describe("Terminal pinch zoom (mobile)", () => {
     expect(await readFontSize(page, "mobile")).toBe(10);
   });
 
-  test("touchcancel mid-pinch still persists the latest size", async ({
-    page,
-  }) => {
+  test("touchcancel mid-pinch still persists the latest size", async ({ page }) => {
     await installTerminalSpies(page);
     await mockTerminalApis(page);
     await page.goto("/");
@@ -162,8 +150,6 @@ test.describe("Terminal pinch zoom (mobile)", () => {
     // A system gesture / incoming call cancels the touch instead of lifting it.
     await fireTouches(page, "touchcancel", []);
 
-    await expect
-      .poll(() => readFontSize(page, "mobile"), { timeout: 2_000 })
-      .toBeGreaterThan(10);
+    await expect.poll(() => readFontSize(page, "mobile"), { timeout: 2_000 }).toBeGreaterThan(10);
   });
 });

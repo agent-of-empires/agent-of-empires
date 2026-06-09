@@ -8,11 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  fetchAcpAgents,
-  switchAcpAgent,
-  type SwitchAgentResponse,
-} from "./api";
+import { fetchAcpAgents, switchAcpAgent, type SwitchAgentResponse } from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -21,9 +17,7 @@ beforeEach(() => {
   // null from fetchJson rather than a hung test.
   globalThis.fetch = vi
     .fn()
-    .mockResolvedValue(
-      new Response("not found", { status: 404 }),
-    ) as unknown as typeof globalThis.fetch;
+    .mockResolvedValue(new Response("not found", { status: 404 })) as unknown as typeof globalThis.fetch;
 });
 
 afterEach(() => {
@@ -43,21 +37,16 @@ describe("fetchAcpAgents", () => {
       { name: "claude", description: "Claude", command: "claude-agent-acp" },
       { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     ];
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      ok(agents),
-    );
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok(agents));
     const result = await fetchAcpAgents();
     expect(result).toEqual(agents);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(String(url)).toContain("/api/acp/agents");
   });
 
   it("coalesces a null fetchJson result to []", async () => {
     // 4xx -> fetchJson returns null -> helper returns [].
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response("nope", { status: 404 }),
-    );
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("nope", { status: 404 }));
     const result = await fetchAcpAgents();
     expect(result).toEqual([]);
   });
@@ -72,13 +61,10 @@ describe("switchAcpAgent", () => {
       switch_seq: 42,
       status: "switched",
     };
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      ok(response),
-    );
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(ok(response));
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toEqual(response);
-    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
-      .calls[0];
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(url)).toContain("/api/sessions/s-1/acp/switch-agent");
     const req = init as RequestInit;
     expect(req.method).toBe("POST");
@@ -96,8 +82,7 @@ describe("switchAcpAgent", () => {
       }),
     );
     await switchAcpAgent("weird/id", "codex");
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(String(url)).toContain("weird%2Fid");
   });
 
@@ -112,8 +97,7 @@ describe("switchAcpAgent", () => {
       }),
     );
     await switchAcpAgent("s-1", "codex", "opus-4.7");
-    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
-      .calls[0];
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body).toEqual({ target: "codex", model: "opus-4.7" });
   });
@@ -129,16 +113,13 @@ describe("switchAcpAgent", () => {
       }),
     );
     await switchAcpAgent("s-1", "claude", null, "manual");
-    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
-      .calls[0];
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body).toEqual({ target: "claude", reason: "manual" });
   });
 
   it("returns null when fetchJson reports a non-2xx", async () => {
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response("conflict", { status: 409 }),
-    );
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("conflict", { status: 409 }));
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toBeNull();
   });

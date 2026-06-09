@@ -10,10 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-import {
-  DICTATION_BURST_TIMEOUT_MS,
-  useDictationBurstGuard,
-} from "./useDictationBurstGuard";
+import { DICTATION_BURST_TIMEOUT_MS, useDictationBurstGuard } from "./useDictationBurstGuard";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -26,9 +23,7 @@ afterEach(() => {
 
 function renderGuard() {
   const setText = vi.fn<(s: string) => void>();
-  const { result, unmount, rerender } = renderHook(() =>
-    useDictationBurstGuard(setText),
-  );
+  const { result, unmount, rerender } = renderHook(() => useDictationBurstGuard(setText));
   return { setText, result, unmount, rerender };
 }
 
@@ -64,9 +59,7 @@ describe("useDictationBurstGuard (#1431)", () => {
     act(() => {
       result.current.observeInputType("insertReplacementText", 1300);
     });
-    expect(result.current.shouldSuppressUpstream("open the diff viewer")).toBe(
-      true,
-    );
+    expect(result.current.shouldSuppressUpstream("open the diff viewer")).toBe(true);
     expect(setText).not.toHaveBeenCalled();
   });
 
@@ -182,9 +175,7 @@ describe("useDictationBurstGuard (#1431)", () => {
     const setText = vi.fn<(s: string) => void>(() => {
       calls += 1;
     });
-    const { result, rerender } = renderHook(() =>
-      useDictationBurstGuard(setText),
-    );
+    const { result, rerender } = renderHook(() => useDictationBurstGuard(setText));
     act(() => {
       result.current.observeInputType("insertReplacementText", 1000);
     });

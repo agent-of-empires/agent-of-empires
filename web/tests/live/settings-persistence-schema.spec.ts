@@ -10,15 +10,11 @@
 
 import { test, expect } from "../helpers/liveTest";
 
-test("a schema-driven select persists through the UI and a reload", async ({
-  serve,
-  page,
-}) => {
-  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(
-    `${serve.baseUrl}/api/profiles`,
-  ).then((r) => r.json());
-  const defaultProfile =
-    profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
+test("a schema-driven select persists through the UI and a reload", async ({ serve, page }) => {
+  const profiles: Array<{ name: string; is_default?: boolean }> = await fetch(`${serve.baseUrl}/api/profiles`).then(
+    (r) => r.json(),
+  );
+  const defaultProfile = profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
   const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(defaultProfile)}/settings`;
 
   const before = await fetch(profileUrl).then((r) => r.json());

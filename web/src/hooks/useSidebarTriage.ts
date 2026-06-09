@@ -26,29 +26,23 @@ export interface TriageResult {
  *  row components. Triage always targets the workspace's primary session
  *  (`sessions[0]`), matching the prior row-level behavior. See #1724. */
 export function useSidebarTriage(workspaces: readonly Workspace[]) {
-  const [overlay, setOverlay] = useState<Map<string, OptimisticTriage>>(
-    () => new Map(),
-  );
+  const [overlay, setOverlay] = useState<Map<string, OptimisticTriage>>(() => new Map());
   const [trackedWorkspaces, setTrackedWorkspaces] = useState(workspaces);
   if (workspaces !== trackedWorkspaces) {
     setTrackedWorkspaces(workspaces);
     setOverlay((prev) => reconcileOptimistic(prev, workspaces));
   }
 
-  const setOverride = useCallback(
-    (workspaceId: string, patch: Partial<OptimisticTriage>) => {
-      setOverlay((prev) => {
-        const next = new Map(prev);
-        next.set(workspaceId, withOverride(prev.get(workspaceId), patch));
-        return next;
-      });
-    },
-    [],
-  );
+  const setOverride = useCallback((workspaceId: string, patch: Partial<OptimisticTriage>) => {
+    setOverlay((prev) => {
+      const next = new Map(prev);
+      next.set(workspaceId, withOverride(prev.get(workspaceId), patch));
+      return next;
+    });
+  }, []);
 
   const optimisticFor = useCallback(
-    (workspaceId: string): OptimisticTriage =>
-      overlay.get(workspaceId) ?? EMPTY_OPTIMISTIC,
+    (workspaceId: string): OptimisticTriage => overlay.get(workspaceId) ?? EMPTY_OPTIMISTIC,
     [overlay],
   );
 
@@ -86,8 +80,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     async (ws: Workspace, minutes: number | null): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
-      const optimisticUntil =
-        minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
+      const optimisticUntil = minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
       setOverride(ws.id, { snoozedUntil: optimisticUntil });
       const result = await setSessionSnooze(sessionId, minutes);
       if (!result) {
@@ -105,9 +98,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     (ws: Workspace, pinned: boolean) => {
       void pin(ws, pinned).then((r) => {
         if (!r.ok && !r.skipped) {
-          reportError(
-            pinned ? "Failed to pin session" : "Failed to unpin session",
-          );
+          reportError(pinned ? "Failed to pin session" : "Failed to unpin session");
         }
       });
     },
@@ -118,11 +109,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     (ws: Workspace, archived: boolean) => {
       void archive(ws, archived).then((r) => {
         if (!r.ok && !r.skipped) {
-          reportError(
-            archived
-              ? "Failed to archive session"
-              : "Failed to unarchive session",
-          );
+          reportError(archived ? "Failed to archive session" : "Failed to unarchive session");
         }
       });
     },
@@ -133,11 +120,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     (ws: Workspace, minutes: number | null) => {
       void snooze(ws, minutes).then((r) => {
         if (!r.ok && !r.skipped) {
-          reportError(
-            minutes == null
-              ? "Failed to unsnooze session"
-              : "Failed to snooze session",
-          );
+          reportError(minutes == null ? "Failed to unsnooze session" : "Failed to snooze session");
         }
       });
     },
@@ -167,18 +150,15 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
   );
 
   const bulkPin = useCallback(
-    (wss: readonly Workspace[], pinned: boolean) =>
-      runBulk(wss, (ws) => pin(ws, pinned)),
+    (wss: readonly Workspace[], pinned: boolean) => runBulk(wss, (ws) => pin(ws, pinned)),
     [runBulk, pin],
   );
   const bulkArchive = useCallback(
-    (wss: readonly Workspace[], archived: boolean) =>
-      runBulk(wss, (ws) => archive(ws, archived)),
+    (wss: readonly Workspace[], archived: boolean) => runBulk(wss, (ws) => archive(ws, archived)),
     [runBulk, archive],
   );
   const bulkSnooze = useCallback(
-    (wss: readonly Workspace[], minutes: number | null) =>
-      runBulk(wss, (ws) => snooze(ws, minutes)),
+    (wss: readonly Workspace[], minutes: number | null) => runBulk(wss, (ws) => snooze(ws, minutes)),
     [runBulk, snooze],
   );
 

@@ -7,32 +7,15 @@ import { Page } from "@playwright/test";
 // conditional Mode / Base branch / Worktree rows.
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "profiles",
-    "groups",
-    "devices",
-    "about",
-    "system/update-status",
-  ]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json:
-          path === "settings" ||
-          path === "about" ||
-          path === "system/update-status"
-            ? {}
-            : [],
+        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
       }),
     );
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: false, runtime: null } }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
@@ -81,22 +64,15 @@ async function mockApis(page: Page) {
 async function openReviewStep(page: Page, title = "feat/initial") {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
-  const recent = page
-    .getByRole("button")
-    .filter({ hasText: "/tmp/example" })
-    .first();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByPlaceholder("Auto-generated if empty").fill(title);
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByRole("button", { name: "Next" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Review & Launch" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Review & Launch" })).toBeVisible();
 }
 
 // Match a review-card row by its exact label span. The row markup is
@@ -109,9 +85,7 @@ function reviewRow(page: import("@playwright/test").Page, label: string) {
 }
 
 test.describe("Wizard review step (#1219)", () => {
-  test("Title row shows current value and Mode/Branch rows render when worktree is on", async ({
-    page,
-  }) => {
+  test("Title row shows current value and Mode/Branch rows render when worktree is on", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -121,9 +95,7 @@ test.describe("Wizard review step (#1219)", () => {
     await expect(reviewRow(page, "Branch / worktree")).toBeVisible();
   });
 
-  test("clicking the Title row enters edit mode; Enter commits the new value", async ({
-    page,
-  }) => {
+  test("clicking the Title row enters edit mode; Enter commits the new value", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -136,9 +108,7 @@ test.describe("Wizard review step (#1219)", () => {
     await expect(reviewRow(page, "Title")).toContainText("renamed");
   });
 
-  test("blur on the inline title input commits the draft value", async ({
-    page,
-  }) => {
+  test("blur on the inline title input commits the draft value", async ({ page }) => {
     // EditableRow.onBlur calls commit(), so clicking outside the input
     // while it's in edit mode applies the typed draft. The Escape key
     // case currently bubbles up to the dashboard's global Escape
@@ -159,22 +129,16 @@ test.describe("Wizard review step (#1219)", () => {
     await expect(reviewRow(page, "Title")).toContainText("after");
   });
 
-  test("clicking the Project row jumps back to the Project step", async ({
-    page,
-  }) => {
+  test("clicking the Project row jumps back to the Project step", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openReviewStep(page);
     await reviewRow(page, "Project").click();
-    await expect(
-      page.getByRole("heading", { name: "Project folder" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Project folder" })).toBeVisible();
   });
 
-  test("Launch session button is disabled while submitting, then back to enabled on success", async ({
-    page,
-  }) => {
+  test("Launch session button is disabled while submitting, then back to enabled on success", async ({ page }) => {
     await mockApis(page);
     let resolveCreate: (() => void) | null = null;
     const createPromise = new Promise<void>((res) => {

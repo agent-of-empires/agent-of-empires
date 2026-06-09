@@ -10,9 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  fetchProfiles: vi
-    .fn()
-    .mockResolvedValue([{ name: "default", is_default: true }]),
+  fetchProfiles: vi.fn().mockResolvedValue([{ name: "default", is_default: true }]),
   createProfile: vi.fn(),
   renameProfile: vi.fn(),
   deleteProfile: vi.fn(),
@@ -55,9 +53,7 @@ describe("SettingsHeader", () => {
   });
 
   it("renders saveError message when saveError is set", () => {
-    render(
-      <SettingsHeader {...baseProps} saveError="Save failed: network error" />,
-    );
+    render(<SettingsHeader {...baseProps} saveError="Save failed: network error" />);
     const errorSpan = screen.getByTestId("settings-header-save-error");
     expect(errorSpan.textContent).toBe("Save failed: network error");
   });
@@ -65,13 +61,7 @@ describe("SettingsHeader", () => {
   it("renders both Saving... and saveError together when both are set", () => {
     // The header allows saveError to surface while a subsequent save is in
     // flight; both branches should render side by side.
-    render(
-      <SettingsHeader
-        {...baseProps}
-        saving={true}
-        saveError="Save failed: network error"
-      />,
-    );
+    render(<SettingsHeader {...baseProps} saving={true} saveError="Save failed: network error" />);
     expect(screen.getByText("Saving...")).toBeTruthy();
     expect(screen.getByText("Save failed: network error")).toBeTruthy();
   });

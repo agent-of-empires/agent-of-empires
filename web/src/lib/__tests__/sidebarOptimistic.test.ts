@@ -41,18 +41,11 @@ describe("effective resolvers", () => {
   });
 
   it("snooze override: undefined falls through, null and string win", () => {
-    expect(
-      effectiveSnoozedUntilOf(EMPTY_OPTIMISTIC, "2099-01-01T00:00:00Z"),
-    ).toBe("2099-01-01T00:00:00Z");
-    expect(
-      effectiveSnoozedUntilOf(override({ snoozedUntil: null }), "x"),
-    ).toBeNull();
-    expect(
-      effectiveSnoozedUntilOf(
-        override({ snoozedUntil: "2099-01-01T00:00:00Z" }),
-        null,
-      ),
-    ).toBe("2099-01-01T00:00:00Z");
+    expect(effectiveSnoozedUntilOf(EMPTY_OPTIMISTIC, "2099-01-01T00:00:00Z")).toBe("2099-01-01T00:00:00Z");
+    expect(effectiveSnoozedUntilOf(override({ snoozedUntil: null }), "x")).toBeNull();
+    expect(effectiveSnoozedUntilOf(override({ snoozedUntil: "2099-01-01T00:00:00Z" }), null)).toBe(
+      "2099-01-01T00:00:00Z",
+    );
   });
 });
 
@@ -90,9 +83,7 @@ describe("withOverride", () => {
       snoozedUntil: "2099-01-01T00:00:00Z",
     });
     expect(withOverride(base, { pinned: null }).pinned).toBeNull();
-    expect(
-      withOverride(base, { snoozedUntil: undefined }).snoozedUntil,
-    ).toBeUndefined();
+    expect(withOverride(base, { snoozedUntil: undefined }).snoozedUntil).toBeUndefined();
   });
 });
 
@@ -140,9 +131,7 @@ describe("reconcileOptimistic", () => {
     const map = new Map([["w", override({ pinned: true, archived: false })]]);
     // Server caught up to the archived=false override (no archive), but not
     // the pin. The pin override survives; the archived override is dropped.
-    const next = reconcileOptimistic(map, [
-      ws("w", [{ pinned_at: null, archived_at: null }]),
-    ]);
+    const next = reconcileOptimistic(map, [ws("w", [{ pinned_at: null, archived_at: null }])]);
     expect(next.get("w")).toEqual({
       pinned: true,
       archived: null,

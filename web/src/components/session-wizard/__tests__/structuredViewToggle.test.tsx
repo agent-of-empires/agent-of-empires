@@ -65,11 +65,7 @@ const custom: AgentInfo = {
   install_hint: "Configured custom agent",
 };
 
-function renderAgentStep(overrides: {
-  tool?: string;
-  agents?: AgentInfo[];
-  useStructuredView?: boolean;
-}) {
+function renderAgentStep(overrides: { tool?: string; agents?: AgentInfo[]; useStructuredView?: boolean }) {
   const onChange = vi.fn();
   const utils = render(
     <AgentStep
@@ -110,11 +106,7 @@ describe("AgentStep structured-view view card", () => {
       tool: "claude",
       useStructuredView: false,
     });
-    expect(
-      getByRole("switch", { name: "Use structured view" }).getAttribute(
-        "aria-checked",
-      ),
-    ).toBe("false");
+    expect(getByRole("switch", { name: "Use structured view" }).getAttribute("aria-checked")).toBe("false");
   });
 
   it("shows no switch for a non-ACP built-in, only the terminal fallback notice", () => {
@@ -129,9 +121,7 @@ describe("AgentStep structured-view view card", () => {
     });
     expect(queryByRole("switch", { name: "Use structured view" })).toBeNull();
     expect(
-      getByText(
-        "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings.",
-      ),
+      getByText("Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."),
     ).toBeTruthy();
   });
 });
@@ -154,11 +144,7 @@ describe("SessionWizard structured_view payload", () => {
 
   function renderWizardWithoutToolPrefill() {
     return render(
-      <SessionWizard
-        onClose={() => {}}
-        onCreated={() => {}}
-        prefill={{ skipToReview: true, path: "/tmp/proj" }}
-      />,
+      <SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ skipToReview: true, path: "/tmp/proj" }} />,
     );
   }
 
@@ -166,9 +152,7 @@ describe("SessionWizard structured_view payload", () => {
     const { getByText } = renderWizard();
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
-    expect(createSession).toHaveBeenCalledWith(
-      expect.objectContaining({ tool: "claude", view: "structured" }),
-    );
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "structured" }));
   });
 
   it("sends the terminal view when the user opts out via the toggle", async () => {
@@ -180,9 +164,7 @@ describe("SessionWizard structured_view payload", () => {
     fireEvent.click(getByText("Next"));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
-    expect(createSession).toHaveBeenCalledWith(
-      expect.objectContaining({ tool: "claude", view: "terminal" }),
-    );
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ tool: "claude", view: "terminal" }));
   });
 
   it("sends profile-resolved agent model and effort defaults", async () => {
@@ -198,9 +180,7 @@ describe("SessionWizard structured_view payload", () => {
     const { getAllByText, getByText } = renderWizardWithoutToolPrefill();
     // "opencode" now renders in both the Agent row and the resolved
     // Launch command row (#1911), so match either occurrence.
-    await waitFor(() =>
-      expect(getAllByText(/opencode/).length).toBeGreaterThan(0),
-    );
+    await waitFor(() => expect(getAllByText(/opencode/).length).toBeGreaterThan(0));
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(

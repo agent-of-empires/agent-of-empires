@@ -19,11 +19,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { enableStructuredViewAndWait } from "../helpers/acp";
 
 const FLOOD_UPDATES = Array.from({ length: 300 }, (_, i) => ({
@@ -40,44 +36,41 @@ const FLOOD_SCRIPT = {
   ],
 };
 
-base.skip(
-  "lagged WS receiver gets a kind:lagged frame from the server",
-  async ({}, testInfo) => {
-    const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-lagged-"));
-    const scriptPath = join(scriptDir, "script.json");
-    writeFileSync(scriptPath, JSON.stringify(FLOOD_SCRIPT));
+base.skip("lagged WS receiver gets a kind:lagged frame from the server", async ({}, testInfo) => {
+  const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-lagged-"));
+  const scriptPath = join(scriptDir, "script.json");
+  writeFileSync(scriptPath, JSON.stringify(FLOOD_SCRIPT));
 
-    const serve = await spawnAoeServe({
-      authMode: "none",
-      acp: true,
-      fakeAcpScript: scriptPath,
-      workerIndex: testInfo.workerIndex,
-      parallelIndex: testInfo.parallelIndex,
-      seedFn: seedSessionViaAoeAdd({ title: "acp-lagged" }),
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    acp: true,
+    fakeAcpScript: scriptPath,
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedSessionViaAoeAdd({ title: "acp-lagged" }),
+  });
+
+  try {
+    const sessions = await listSessions(serve.baseUrl);
+    const sessionId = sessions[0]!.id;
+
+    await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+
+    // Sketch only. The full version would: (1) open a WebSocket to
+    // /sessions/:id/acp/ws and stop reading its frames so the
+    // per-client receiver lags, (2) POST /acp/prompt to trigger the
+    // 300-update flood, (3) resume reading and assert a
+    // `{ kind: "lagged", skipped: N }` frame appears before normal
+    // delivery resumes. The above is unreachable today because the
+    // flood never starts; the supervisor publishes AgentStartupError
+    // before the scripted updates emit.
+    await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "trigger flood" }),
     });
-
-    try {
-      const sessions = await listSessions(serve.baseUrl);
-      const sessionId = sessions[0]!.id;
-
-      await enableStructuredViewAndWait(serve.baseUrl, sessionId);
-
-      // Sketch only. The full version would: (1) open a WebSocket to
-      // /sessions/:id/acp/ws and stop reading its frames so the
-      // per-client receiver lags, (2) POST /acp/prompt to trigger the
-      // 300-update flood, (3) resume reading and assert a
-      // `{ kind: "lagged", skipped: N }` frame appears before normal
-      // delivery resumes. The above is unreachable today because the
-      // flood never starts; the supervisor publishes AgentStartupError
-      // before the scripted updates emit.
-      await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: "trigger flood" }),
-      });
-      expect(true).toBe(true);
-    } finally {
-      await serve.stop();
-    }
-  },
-);
+    expect(true).toBe(true);
+  } finally {
+    await serve.stop();
+  }
+});

@@ -13,16 +13,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-  attachServeDiagnostics,
-} from "../../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { waitForStructuredView, enableStructuredViewAndWait, attachServeDiagnostics } from "../../helpers/acp";
 
 const SCRIPT = {
   turns: [
@@ -47,14 +39,10 @@ const SCRIPT = {
 // "Operating Slow tool…" are not exact matches), then walked up to the
 // card root so badge text reads only inside this card.
 function cardFor(page: import("@playwright/test").Page) {
-  return page
-    .getByText("Slow tool", { exact: true })
-    .locator("xpath=ancestor::div[contains(@class,'rounded-md')][1]");
+  return page.getByText("Slow tool", { exact: true }).locator("xpath=ancestor::div[contains(@class,'rounded-md')][1]");
 }
 
-test("stopping mid-tool settles the card and survives reload", async ({
-  page,
-}, testInfo) => {
+test("stopping mid-tool settles the card and survives reload", async ({ page }, testInfo) => {
   let serveHandle: { home: string } | undefined;
   let serve: Awaited<ReturnType<typeof spawnAoeServe>> | undefined;
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-stuck-tool-"));
@@ -78,9 +66,7 @@ test("stopping mid-tool settles the card and survives reload", async ({
     const sessionId = seeded.id;
     await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     await waitForStructuredView(page);
 
     const composer = page.getByRole("textbox", { name: /Send a message/i });

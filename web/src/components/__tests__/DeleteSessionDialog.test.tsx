@@ -25,8 +25,7 @@ function setup(overrides?: {
   isSandboxed?: boolean;
   isScratch?: boolean;
 }) {
-  const onConfirm =
-    overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
+  const onConfirm = overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
   const onCancel = overrides?.onCancel ?? vi.fn();
   const utils = render(
     <DeleteSessionDialog
@@ -51,9 +50,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
   it("focuses the Delete button on mount so Enter activates it natively", () => {
     const { container } = setup();
     const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) =>
-        b.textContent?.includes("Delete") &&
-        !b.textContent.includes("Deleting"),
+      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
     );
     expect(deleteBtn).toBeTruthy();
     expect(document.activeElement).toBe(deleteBtn);
@@ -104,9 +101,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm });
     const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) =>
-        b.textContent?.includes("Delete") &&
-        !b.textContent.includes("Deleting"),
+      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
     )!;
     expect(document.activeElement).toBe(deleteBtn);
     // Dispatch keydown from the focused button (bubbles up to document)
@@ -120,9 +115,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const onCancel = vi.fn();
     const { container } = setup({ onConfirm, onCancel });
-    const cancelBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Cancel",
-    );
+    const cancelBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel");
     expect(cancelBtn).toBeTruthy();
     cancelBtn!.focus();
     // The keydown handler should skip Enter when focus is on a non-confirm
@@ -149,21 +142,15 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm });
 
-    const worktreeBox = container.querySelector<HTMLLabelElement>(
-      '[data-testid="delete-session-checkbox-worktree"]',
-    );
+    const worktreeBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-worktree"]');
     expect(worktreeBox).toBeTruthy();
     expect(worktreeBox!.dataset.checked).toBe("true");
     // The force-delete checkbox is only rendered while delete-worktree is on.
-    expect(
-      container.querySelector('[data-testid="delete-session-checkbox-force"]'),
-    ).toBeTruthy();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeTruthy();
 
     fireEvent.click(worktreeBox!.querySelector("span")!);
     expect(worktreeBox!.dataset.checked).toBe("false");
-    expect(
-      container.querySelector('[data-testid="delete-session-checkbox-force"]'),
-    ).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeNull();
 
     fireEvent.keyDown(document, { key: "Enter" });
     expect(onConfirm).toHaveBeenCalledWith({
@@ -178,9 +165,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm });
 
-    const forceBox = container.querySelector<HTMLLabelElement>(
-      '[data-testid="delete-session-checkbox-force"]',
-    );
+    const forceBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-force"]');
     expect(forceBox).toBeTruthy();
     expect(forceBox!.dataset.checked).toBe("false");
 
@@ -200,9 +185,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);
     const { container } = setup({ onConfirm });
 
-    const branchBox = container.querySelector<HTMLLabelElement>(
-      '[data-testid="delete-session-checkbox-branch"]',
-    );
+    const branchBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-branch"]');
     expect(branchBox).toBeTruthy();
     expect(branchBox!.dataset.checked).toBe("false");
 
@@ -226,21 +209,11 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       isSandboxed: true,
     });
 
-    expect(
-      container.querySelector(
-        '[data-testid="delete-session-checkbox-worktree"]',
-      ),
-    ).toBeNull();
-    expect(
-      container.querySelector('[data-testid="delete-session-checkbox-branch"]'),
-    ).toBeNull();
-    expect(
-      container.querySelector('[data-testid="delete-session-checkbox-force"]'),
-    ).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-branch"]')).toBeNull();
+    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeNull();
 
-    const sandboxBox = container.querySelector<HTMLLabelElement>(
-      '[data-testid="delete-session-checkbox-sandbox"]',
-    );
+    const sandboxBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-sandbox"]');
     expect(sandboxBox).toBeTruthy();
     // Sandbox default flips on automatically because cleanupDefaults.delete_sandbox
     // is false but the dialog re-derives off isSandboxed. Here cleanupDefaults
@@ -265,9 +238,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       isSandboxed: false,
     });
 
-    expect(
-      container.querySelectorAll('[data-testid^="delete-session-checkbox-"]'),
-    ).toHaveLength(0);
+    expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
 
     fireEvent.keyDown(document, { key: "Enter" });
     expect(onConfirm).toHaveBeenCalledWith({
@@ -289,9 +260,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       isScratch: true,
     });
 
-    const keepCheckbox = document.querySelector(
-      '[data-testid="delete-session-checkbox-keep-scratch"]',
-    );
+    const keepCheckbox = document.querySelector('[data-testid="delete-session-checkbox-keep-scratch"]');
     expect(keepCheckbox).toBeTruthy();
     expect(keepCheckbox?.getAttribute("data-checked")).toBe("false");
 

@@ -5,25 +5,17 @@ test.describe("Mobile terminal toolbar", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     // Toolbar should never appear on desktop
-    await expect(
-      page.getByRole("button", { name: "Arrow up" }),
-    ).not.toBeVisible();
+    await expect(page.getByRole("button", { name: "Arrow up" })).not.toBeVisible();
   });
 
-  test("toolbar hidden on mobile when no session selected", async ({
-    page,
-  }) => {
+  test("toolbar hidden on mobile when no session selected", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     // No session = dashboard view, no toolbar
-    await expect(
-      page.getByRole("button", { name: "Arrow up" }),
-    ).not.toBeVisible();
+    await expect(page.getByRole("button", { name: "Arrow up" })).not.toBeVisible();
   });
 
-  test("toolbar buttons have correct aria-labels for accessibility", async ({
-    page,
-  }) => {
+  test("toolbar buttons have correct aria-labels for accessibility", async ({ page }) => {
     // Verify the component defines the expected labels (render test)
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
@@ -34,9 +26,7 @@ test.describe("Mobile terminal toolbar", () => {
 
   test("dark color-scheme meta tag present", async ({ page }) => {
     await page.goto("/");
-    const colorScheme = await page
-      .locator('meta[name="color-scheme"]')
-      .getAttribute("content");
+    const colorScheme = await page.locator('meta[name="color-scheme"]').getAttribute("content");
     expect(colorScheme).toBe("dark");
   });
 });

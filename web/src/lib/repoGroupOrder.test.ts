@@ -17,9 +17,7 @@ describe("repoGroupOrder", () => {
 
   it("round-trips a persisted order through localStorage", () => {
     persistRepoGroupOrder(["/repo-b", "/repo-a"]);
-    expect(window.localStorage.getItem(ORDER_KEY)).toBe(
-      JSON.stringify(["/repo-b", "/repo-a"]),
-    );
+    expect(window.localStorage.getItem(ORDER_KEY)).toBe(JSON.stringify(["/repo-b", "/repo-a"]));
     expect(loadRepoGroupOrder()).toEqual(["/repo-b", "/repo-a"]);
   });
 
@@ -41,10 +39,7 @@ describe("repoGroupOrder", () => {
   });
 
   it("drops non-string entries from the stored array", () => {
-    window.localStorage.setItem(
-      ORDER_KEY,
-      JSON.stringify(["/repo-a", 42, null, "/repo-b"]),
-    );
+    window.localStorage.setItem(ORDER_KEY, JSON.stringify(["/repo-a", 42, null, "/repo-b"]));
     expect(loadRepoGroupOrder()).toEqual(["/repo-a", "/repo-b"]);
   });
 });

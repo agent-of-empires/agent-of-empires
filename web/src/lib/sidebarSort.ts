@@ -5,11 +5,7 @@ export type SidebarSortMode = "manual" | "lastActivity" | "attention";
 
 export const SIDEBAR_SORT_MODE_KEY = "aoe-sidebar-sort-mode";
 
-const VALID_MODES: readonly SidebarSortMode[] = [
-  "manual",
-  "lastActivity",
-  "attention",
-];
+const VALID_MODES: readonly SidebarSortMode[] = ["manual", "lastActivity", "attention"];
 
 export function loadSidebarSortMode(): SidebarSortMode {
   const raw = safeGetItem(SIDEBAR_SORT_MODE_KEY);
@@ -36,20 +32,14 @@ function epochOr(ts: string | null | undefined): number {
 export function workspaceLastActivityMs(ws: Workspace): number {
   let best = Number.NEGATIVE_INFINITY;
   for (const s of ws.sessions) {
-    const m = Math.max(
-      epochOr(s.last_accessed_at),
-      epochOr(s.idle_entered_at),
-      epochOr(s.created_at),
-    );
+    const m = Math.max(epochOr(s.last_accessed_at), epochOr(s.idle_entered_at), epochOr(s.created_at));
     if (m > best) best = m;
   }
   return best;
 }
 
 /** Group-level activity key: max across the group's workspaces. */
-export function repoGroupLastActivityMs(
-  workspaces: readonly Workspace[],
-): number {
+export function repoGroupLastActivityMs(workspaces: readonly Workspace[]): number {
   let best = Number.NEGATIVE_INFINITY;
   for (const ws of workspaces) {
     const m = workspaceLastActivityMs(ws);
@@ -72,9 +62,7 @@ export function workspaceIsPinned(ws: Workspace): boolean {
  *  a sibling session was archived. See #1581. */
 export function workspaceIsSunk(ws: Workspace): boolean {
   if (ws.sessions.length === 0) return false;
-  return ws.sessions.every(
-    (s) => s.archived_at != null || s.snoozed_until != null,
-  );
+  return ws.sessions.every((s) => s.archived_at != null || s.snoozed_until != null);
 }
 
 /** True when a repo group still has at least one workspace that is
@@ -108,10 +96,7 @@ export function workspaceTriageTier(ws: Workspace): 0 | 1 | 2 {
  *  small clock drift without letting a brand-new snooze get swapped
  *  back to a stale one. Unparseable strings fall back to literal
  *  equality so the helper is defensive. See #1581. */
-export function snoozeTimestampCloseEnough(
-  aIso: string,
-  bIso: string,
-): boolean {
+export function snoozeTimestampCloseEnough(aIso: string, bIso: string): boolean {
   const a = Date.parse(aIso);
   const b = Date.parse(bIso);
   if (!Number.isFinite(a) || !Number.isFinite(b)) return aIso === bIso;
@@ -159,11 +144,7 @@ export interface TriageMenuShape {
   showUnsnooze: boolean;
 }
 
-export function triageStateOf(input: {
-  isPinned: boolean;
-  isArchived: boolean;
-  isSnoozed: boolean;
-}): TriageState {
+export function triageStateOf(input: { isPinned: boolean; isArchived: boolean; isSnoozed: boolean }): TriageState {
   if (input.isPinned) return "pinned";
   if (input.isArchived) return "archived";
   if (input.isSnoozed) return "snoozed";
@@ -221,10 +202,7 @@ export function triageMenuShape(state: TriageState): TriageMenuShape {
  *  `NaN`, which `Array.prototype.sort` treats like `0` (equal) and
  *  would silently skip the id tie-break, leaving ordering at the mercy
  *  of input order. */
-export function compareWorkspacesByLastActivityDesc(
-  a: Workspace,
-  b: Workspace,
-): number {
+export function compareWorkspacesByLastActivityDesc(a: Workspace, b: Workspace): number {
   const aTier = workspaceTriageTier(a);
   const bTier = workspaceTriageTier(b);
   if (aTier !== bTier) return aTier - bTier;
@@ -317,10 +295,7 @@ export function workspaceIsUrgent(ws: Workspace): boolean {
  *  `workspaceLastActivityMs` can return `Number.NEGATIVE_INFINITY`, and
  *  `-Infinity - -Infinity` is `NaN`, which `Array.prototype.sort` treats as
  *  equal and would silently skip the id tie-break. */
-export function compareWorkspacesByAttention(
-  a: Workspace,
-  b: Workspace,
-): number {
+export function compareWorkspacesByAttention(a: Workspace, b: Workspace): number {
   const aTier = workspaceTriageTier(a);
   const bTier = workspaceTriageTier(b);
   if (aTier !== bTier) return aTier - bTier;
@@ -350,9 +325,7 @@ export function compareWorkspacesByAttention(
  *  where those axes always sorted by last activity; `lastActivity` and
  *  `attention` are honored when selected. The repo axis does NOT use this
  *  (it special-cases `manual` with the persisted workspace rank). */
-export function compareWorkspacesForComputedSortMode(
-  mode: SidebarSortMode,
-): (a: Workspace, b: Workspace) => number {
+export function compareWorkspacesForComputedSortMode(mode: SidebarSortMode): (a: Workspace, b: Workspace) => number {
   if (mode === "attention") return compareWorkspacesByAttention;
   return compareWorkspacesByLastActivityDesc;
 }
@@ -360,9 +333,7 @@ export function compareWorkspacesForComputedSortMode(
 /** Best (lowest) attention rank across a repo group's workspaces, so a
  *  group holding a Waiting session floats above one whose best session is
  *  merely Running. */
-export function repoGroupAttentionRank(
-  workspaces: readonly Workspace[],
-): number {
+export function repoGroupAttentionRank(workspaces: readonly Workspace[]): number {
   let best = ATTENTION_SINK_RANK;
   for (const ws of workspaces) {
     const rank = workspaceAttentionRank(ws);
@@ -377,8 +348,6 @@ export function repoGroupIsUrgent(workspaces: readonly Workspace[]): boolean {
 }
 
 /** True when any workspace in the group is favorited. */
-export function repoGroupIsFavorited(
-  workspaces: readonly Workspace[],
-): boolean {
+export function repoGroupIsFavorited(workspaces: readonly Workspace[]): boolean {
   return workspaces.some(workspaceIsFavorited);
 }

@@ -16,26 +16,14 @@ function state(ids: string[], anchorId: string | null): SidebarSelectionState {
 
 describe("classifyClick", () => {
   it("maps modifier combinations to intents", () => {
-    expect(
-      classifyClick({ metaKey: false, ctrlKey: false, shiftKey: false }),
-    ).toBe("navigate");
-    expect(
-      classifyClick({ metaKey: true, ctrlKey: false, shiftKey: false }),
-    ).toBe("toggle");
-    expect(
-      classifyClick({ metaKey: false, ctrlKey: true, shiftKey: false }),
-    ).toBe("toggle");
-    expect(
-      classifyClick({ metaKey: false, ctrlKey: false, shiftKey: true }),
-    ).toBe("range");
-    expect(
-      classifyClick({ metaKey: true, ctrlKey: false, shiftKey: true }),
-    ).toBe("additive-range");
+    expect(classifyClick({ metaKey: false, ctrlKey: false, shiftKey: false })).toBe("navigate");
+    expect(classifyClick({ metaKey: true, ctrlKey: false, shiftKey: false })).toBe("toggle");
+    expect(classifyClick({ metaKey: false, ctrlKey: true, shiftKey: false })).toBe("toggle");
+    expect(classifyClick({ metaKey: false, ctrlKey: false, shiftKey: true })).toBe("range");
+    expect(classifyClick({ metaKey: true, ctrlKey: false, shiftKey: true })).toBe("additive-range");
     // Ctrl+Shift on Windows/Linux is the same additive-range gesture as
     // Cmd+Shift on macOS.
-    expect(
-      classifyClick({ metaKey: false, ctrlKey: true, shiftKey: true }),
-    ).toBe("additive-range");
+    expect(classifyClick({ metaKey: false, ctrlKey: true, shiftKey: true })).toBe("additive-range");
   });
 });
 
@@ -134,9 +122,7 @@ describe("selectionReducer", () => {
   });
 
   it("clear empties the selection and anchor", () => {
-    expect(selectionReducer(state(["a", "b"], "b"), { type: "clear" })).toEqual(
-      EMPTY_SELECTION,
-    );
+    expect(selectionReducer(state(["a", "b"], "b"), { type: "clear" })).toEqual(EMPTY_SELECTION);
   });
 
   it("prune drops ids and the anchor that no longer exist", () => {

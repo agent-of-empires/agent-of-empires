@@ -9,11 +9,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  resolveAoeBinary,
-} from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, resolveAoeBinary } from "../../helpers/aoeServe";
 
 base("diff panel renders the changed file row", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -36,15 +32,9 @@ base("diff panel renders the changed file row", async ({ page }, testInfo) => {
       });
       // Untracked file: shows up in the diff against HEAD.
       writeFileSync(join(projectDir, "story.txt"), "hello story\n");
-      const res = spawnSync(
-        resolveAoeBinary(),
-        ["add", projectDir, "-t", "story-diff-files", "-c", "claude"],
-        { env },
-      );
+      const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "story-diff-files", "-c", "claude"], { env });
       if (res.status !== 0) {
-        throw new Error(
-          `aoe add failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
-        );
+        throw new Error(`aoe add failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
       }
     },
   });
@@ -55,9 +45,7 @@ base("diff panel renders the changed file row", async ({ page }, testInfo) => {
     if (!seeded) throw new Error("seeded session 'story-diff-files' missing");
     const sessionId = seeded.id;
 
-    await page.goto(
-      `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-    );
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
     await expect(page).toHaveURL(new RegExp(`/session/${sessionId}`), {
       timeout: 10_000,
     });

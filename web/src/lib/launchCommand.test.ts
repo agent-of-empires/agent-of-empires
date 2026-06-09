@@ -90,9 +90,11 @@ describe("resolveLaunchCommand (structured view)", () => {
   });
 
   it("falls back to the tool name when no command is known", () => {
-    expect(
-      resolveLaunchCommand({ tool: "opencode", useStructuredView: true }),
-    ).toEqual({ prefix: "opencode", suffix: "", full: "opencode" });
+    expect(resolveLaunchCommand({ tool: "opencode", useStructuredView: true })).toEqual({
+      prefix: "opencode",
+      suffix: "",
+      full: "opencode",
+    });
   });
 
   it("ignores a whitespace-only manual override", () => {

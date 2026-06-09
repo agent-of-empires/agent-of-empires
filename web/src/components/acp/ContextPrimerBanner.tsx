@@ -19,12 +19,7 @@ interface Props {
   onDismiss: () => void;
 }
 
-export function ContextPrimerBanner({
-  sessionId,
-  available,
-  onInsertPrimer,
-  onDismiss,
-}: Props) {
+export function ContextPrimerBanner({ sessionId, available, onInsertPrimer, onDismiss }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -54,18 +49,10 @@ export function ContextPrimerBanner({
     setLoading(true);
     setError(null);
     try {
-      const resp = await fetchContextPrimer(
-        sessionId,
-        available.resetSeq,
-        controller.signal,
-      );
+      const resp = await fetchContextPrimer(sessionId, available.resetSeq, controller.signal);
       if (controller.signal.aborted) return;
       if (!resp || !resp.primer) {
-        setError(
-          resp
-            ? "No prior transcript available to recap."
-            : "Failed to fetch primer.",
-        );
+        setError(resp ? "No prior transcript available to recap." : "Failed to fetch primer.");
         return;
       }
       onInsertPrimer(resp.primer);
@@ -89,9 +76,7 @@ export function ContextPrimerBanner({
       </span>
       <span className="flex-1 leading-snug">
         Agent lost its prior model context.{" "}
-        <span className="text-amber-100/70">
-          You can pre-fill the composer with a recap of the recent turns.
-        </span>
+        <span className="text-amber-100/70">You can pre-fill the composer with a recap of the recent turns.</span>
       </span>
       {error && (
         <span className="text-status-error text-[11px] shrink-0" role="alert">

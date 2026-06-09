@@ -62,17 +62,14 @@ describe("SessionWizard reducer / APPLY_PROFILE_DEFAULTS (#1142)", () => {
     // `(session?.default_tool as string) || ""` resolves empty when the
     // profile doesn't set a tool; the reducer must keep whatever the
     // wizard already had (the prefill or "claude" default).
-    const next = reducer(
-      makeState({ data: { ...initialData, tool: "opencode" } }),
-      {
-        type: "APPLY_PROFILE_DEFAULTS",
-        yoloMode: false,
-        sandboxEnabled: false,
-        tool: "",
-        extraEnv: [],
-        skipIfDirty: true,
-      },
-    );
+    const next = reducer(makeState({ data: { ...initialData, tool: "opencode" } }), {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      tool: "",
+      extraEnv: [],
+      skipIfDirty: true,
+    });
     expect(next.data.tool).toBe("opencode");
   });
 

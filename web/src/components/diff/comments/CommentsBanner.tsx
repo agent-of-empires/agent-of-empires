@@ -10,31 +10,19 @@ interface Props {
  *  whenever the active session has at least one comment and supports
  *  the feature (acp-only). The send button is disabled while the
  *  structured view worker is not running so the prompt doesn't sink. */
-export function CommentsBanner({
-  count,
-  sendEnabled,
-  sendDisabledReason,
-  onSend,
-  onDiscardAll,
-}: Props) {
+export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (
     <div className="flex items-center gap-2 px-3 py-1.5 bg-brand-600/10 border-b border-brand-600/30 text-[11px] font-mono">
       <span className="text-brand-500 font-semibold">
         {count} comment{count === 1 ? "" : "s"}
       </span>
-      <span className="text-text-dim hidden sm:inline">
-        Cmd/Ctrl+Shift+S to send
-      </span>
+      <span className="text-text-dim hidden sm:inline">Cmd/Ctrl+Shift+S to send</span>
       <div className="ml-auto flex items-center gap-1.5">
         <button
           type="button"
           onClick={() => {
-            if (
-              window.confirm(
-                `Discard all ${count} diff comment${count === 1 ? "" : "s"}? This can't be undone.`,
-              )
-            ) {
+            if (window.confirm(`Discard all ${count} diff comment${count === 1 ? "" : "s"}? This can't be undone.`)) {
               onDiscardAll();
             }
           }}

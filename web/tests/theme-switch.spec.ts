@@ -103,10 +103,7 @@ async function stubTheme(
   });
 }
 
-async function readCssVar(
-  page: import("@playwright/test").Page,
-  name: string,
-): Promise<string> {
+async function readCssVar(page: import("@playwright/test").Page, name: string): Promise<string> {
   return await page.evaluate((n) => {
     return document.documentElement.style.getPropertyValue(n).trim();
   }, name);
@@ -117,18 +114,14 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     await stubTheme(page, { dracula: dracula() }, dracula());
     await page.goto("/");
     // Allow the hook's mount-time fetch + apply to land.
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#282a36");
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
     const fg = await readCssVar(page, "--color-text-primary");
     expect(fg).toBe("#f8f8f2");
     const termBg = await readCssVar(page, "--term-bg");
     expect(termBg).toBe("#282a36");
   });
 
-  test("dispatching theme-picker-changed repaints to requested theme", async ({
-    page,
-  }) => {
+  test("dispatching theme-picker-changed repaints to requested theme", async ({ page }) => {
     const empire: ResolvedThemePayload = {
       name: "empire",
       source: "builtin",
@@ -144,9 +137,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     };
     await stubTheme(page, { empire, dracula: dracula() }, empire);
     await page.goto("/");
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#0f172a");
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#0f172a");
 
     // Settings.tsx would normally fire this after the user picks a
     // theme. Exercise the same event the picker dispatches.
@@ -157,35 +148,21 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
         }),
       );
     });
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#282a36");
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
     expect(await readCssVar(page, "--color-text-primary")).toBe("#f8f8f2");
   });
 
   test("light theme sets color-scheme: light on root", async ({ page }) => {
-    await stubTheme(
-      page,
-      { "catppuccin-latte": catppuccinLatte() },
-      catppuccinLatte(),
-    );
+    await stubTheme(page, { "catppuccin-latte": catppuccinLatte() }, catppuccinLatte());
     await page.goto("/");
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#eff1f5");
-    const scheme = await page.evaluate(
-      () => document.documentElement.style.colorScheme,
-    );
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#eff1f5");
+    const scheme = await page.evaluate(() => document.documentElement.style.colorScheme);
     expect(scheme).toBe("light");
-    const dataAppearance = await page.evaluate(
-      () => document.documentElement.dataset.themeAppearance,
-    );
+    const dataAppearance = await page.evaluate(() => document.documentElement.dataset.themeAppearance);
     expect(dataAppearance).toBe("light");
   });
 
-  test("pre-React bootstrap paints cached theme before hydration", async ({
-    page,
-  }) => {
+  test("pre-React bootstrap paints cached theme before hydration", async ({ page }) => {
     // Goal: verify the static /theme-bootstrap.js path executes and
     // applies the cached payload BEFORE useResolvedTheme's fetch
     // lands. To make the assertion specific to the bootstrap (and
@@ -235,9 +212,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
         intervals: [50, 100, 200],
       })
       .toBe("#282a36");
-    const dataTheme = await page.evaluate(
-      () => document.documentElement.dataset.theme,
-    );
+    const dataTheme = await page.evaluate(() => document.documentElement.dataset.theme);
     expect(dataTheme).toBe("dracula");
 
     // CSP regression check: the bootstrap must load successfully.
@@ -246,28 +221,20 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     expect(violations).toEqual([]);
   });
 
-  test("theme repaint persists across the chrome elements", async ({
-    page,
-  }) => {
+  test("theme repaint persists across the chrome elements", async ({ page }) => {
     await stubTheme(page, { dracula: dracula() }, dracula());
     await page.goto("/");
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#282a36");
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
 
     // The body's background-color resolves through Tailwind's
     // `background: var(--color-surface-900)`. After applyResolvedTheme,
     // the body should compute to Dracula's bg (RGB 40, 42, 54).
-    const bg = await page.evaluate(
-      () => getComputedStyle(document.body).backgroundColor,
-    );
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     // rgb(40, 42, 54) -> "rgb(40, 42, 54)" or "rgba(40, 42, 54, 1)"
     expect(bg).toMatch(/40,\s*42,\s*54/);
   });
 
-  test("slow mount fetch does not overwrite a faster picker pick", async ({
-    page,
-  }) => {
+  test("slow mount fetch does not overwrite a faster picker pick", async ({ page }) => {
     // Regression test for the in-flight ordering bug: if the user
     // picks Dracula while the mount-time /api/theme/current is still
     // pending, the eventual mount response (Empire) used to win the
@@ -308,9 +275,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
       );
     });
 
-    await expect
-      .poll(() => readCssVar(page, "--color-surface-900"))
-      .toBe("#282a36");
+    await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
     // Wait past the stalled mount response so we can assert Dracula
     // is sticky after both fetches have settled.
     await page.waitForTimeout(2000);

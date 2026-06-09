@@ -10,13 +10,8 @@ import { render } from "@testing-library/react";
 import { HooksReadOnlyPanel } from "../HooksReadOnlyPanel";
 import { buildEffectiveHooks } from "../../../lib/profileHooks";
 
-function mount(
-  profile: Parameters<typeof buildEffectiveHooks>[0],
-  global: Parameters<typeof buildEffectiveHooks>[1],
-) {
-  return render(
-    <HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />,
-  );
+function mount(profile: Parameters<typeof buildEffectiveHooks>[0], global: Parameters<typeof buildEffectiveHooks>[1]) {
+  return render(<HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />);
 }
 
 describe("HooksReadOnlyPanel", () => {
@@ -26,10 +21,7 @@ describe("HooksReadOnlyPanel", () => {
   });
 
   it("exposes no editable controls (read-only invariant)", () => {
-    const { container } = mount(
-      { on_create: ["echo hi"] },
-      { on_launch: ["echo global"] },
-    );
+    const { container } = mount({ on_create: ["echo hi"] }, { on_launch: ["echo global"] });
     expect(container.querySelectorAll("input").length).toBe(0);
     expect(container.querySelectorAll("textarea").length).toBe(0);
     expect(container.querySelectorAll("button").length).toBe(0);
@@ -49,10 +41,7 @@ describe("HooksReadOnlyPanel", () => {
   });
 
   it("labels an explicit empty override as overridden-to-none", () => {
-    const { getByText } = mount(
-      { on_destroy: [] },
-      { on_destroy: ["docker compose down"] },
-    );
+    const { getByText } = mount({ on_destroy: [] }, { on_destroy: ["docker compose down"] });
     expect(getByText("Overridden: none")).toBeTruthy();
   });
 });

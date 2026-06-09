@@ -10,14 +10,9 @@ import { listSessions } from "../helpers/aoeServe";
 
 const PALETTE_PLACEHOLDER = "Search actions, sessions, settings…";
 
-test("palette 'New scratch session' opens the wizard and launches a scratch session", async ({
-  serve,
-  page,
-}) => {
+test("palette 'New scratch session' opens the wizard and launches a scratch session", async ({ serve, page }) => {
   await page.goto(serve.baseUrl);
-  await expect(
-    page.getByRole("button", { name: "New session", exact: true }).first(),
-  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("button", { name: "New session", exact: true }).first()).toBeVisible({ timeout: 15_000 });
 
   // ControlOrMeta honors the host's actual modifier (Cmd on macOS, Ctrl on
   // CI), matching how useKeyboardShortcuts derives the palette chord.
@@ -27,19 +22,13 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   await page.getByPlaceholder(PALETTE_PLACEHOLDER).fill("scratch");
   await page.getByRole("option", { name: /New scratch session/i }).click();
 
-  const wizard = page.locator(
-    'div.fixed.inset-0.z-50:has(h1:has-text("New session"))',
-  );
+  const wizard = page.locator('div.fixed.inset-0.z-50:has(h1:has-text("New session"))');
   await expect(wizard).toBeVisible({ timeout: 10_000 });
 
   // skipToReview lands the wizard on Review with scratch enabled; the Launch
   // button + scratch project marker prove the prefill plumbing fired.
-  await expect(
-    wizard.getByRole("button", { name: /Launch session/ }),
-  ).toBeVisible({ timeout: 10_000 });
-  await expect(
-    wizard.getByText(/Scratch directory \(provisioned on create\)/),
-  ).toBeVisible();
+  await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeVisible({ timeout: 10_000 });
+  await expect(wizard.getByText(/Scratch directory \(provisioned on create\)/)).toBeVisible();
 
   await page.keyboard.press("ControlOrMeta+Enter");
 
@@ -57,16 +46,12 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
   expect(basename(dirname(projectPath))).toBe("scratch");
 });
 
-test("palette hides creation commands in read-only mode", async ({
-  serveReadOnly,
-  page,
-}) => {
+test("palette hides creation commands in read-only mode", async ({ serveReadOnly, page }) => {
   // Wait for /api/about so the React state carries read_only before the
   // palette renders; otherwise serverAbout is null and the guard is bypassed.
-  const aboutPromise = page.waitForResponse(
-    (r) => r.url().endsWith("/api/about") && r.status() === 200,
-    { timeout: 10_000 },
-  );
+  const aboutPromise = page.waitForResponse((r) => r.url().endsWith("/api/about") && r.status() === 200, {
+    timeout: 10_000,
+  });
   await page.goto(serveReadOnly.baseUrl);
   await aboutPromise;
   await page.waitForTimeout(200);
@@ -75,10 +60,6 @@ test("palette hides creation commands in read-only mode", async ({
   await page.keyboard.press("ControlOrMeta+KeyK");
   await expect(page.getByPlaceholder(PALETTE_PLACEHOLDER)).toBeVisible();
 
-  await expect(
-    page.getByRole("option", { name: /New scratch session/i }),
-  ).toHaveCount(0);
-  await expect(page.getByRole("option", { name: /New session/i })).toHaveCount(
-    0,
-  );
+  await expect(page.getByRole("option", { name: /New scratch session/i })).toHaveCount(0);
+  await expect(page.getByRole("option", { name: /New session/i })).toHaveCount(0);
 });

@@ -66,9 +66,7 @@ async function mount(page: Page, adds: number, dels: number) {
 }
 
 test.describe("Large diff handling", () => {
-  test("a +10k/-13k lockfile churn renders without crashing", async ({
-    page,
-  }) => {
+  test("a +10k/-13k lockfile churn renders without crashing", async ({ page }) => {
     await mount(page, 10000, 13000); // ~23k changed lines
     const t0 = Date.now();
     await page.getByText("pnpm-lock.yaml").first().click();
@@ -76,9 +74,7 @@ test.describe("Large diff handling", () => {
       timeout: 30000,
     });
     // Content from the top of the diff is on screen.
-    await expect(
-      page.getByText("pkg-old-0@", { exact: false }).first(),
-    ).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText("pkg-old-0@", { exact: false }).first()).toBeVisible({ timeout: 15000 });
     const elapsed = Date.now() - t0;
     console.log(`large lockfile render: ${elapsed}ms`);
     // Text-parse + virtualized render; the old contents-diffing path took ~8s

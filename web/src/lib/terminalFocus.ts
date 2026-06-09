@@ -26,9 +26,7 @@ export function setPendingTerminalFocus(target: TerminalFocusTarget) {
   pendingFocus = target;
 }
 
-export function consumePendingTerminalFocus(
-  target: TerminalFocusTarget,
-): boolean {
+export function consumePendingTerminalFocus(target: TerminalFocusTarget): boolean {
   if (pendingFocus === target) {
     pendingFocus = null;
     return true;
@@ -47,8 +45,7 @@ export function requestSessionInputFocus(
   isCoarse: boolean,
 ): void {
   if (!session || isCoarse) return;
-  const target: TerminalFocusTarget =
-    session.view === "structured" ? "composer" : "agent";
+  const target: TerminalFocusTarget = session.view === "structured" ? "composer" : "agent";
   setPendingTerminalFocus(target);
   dispatchFocusTerminal(target);
 }

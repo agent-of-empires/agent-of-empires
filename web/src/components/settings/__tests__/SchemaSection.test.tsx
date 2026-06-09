@@ -16,8 +16,7 @@ const ALLOW = { policy: "allow" } as const;
 const NONE = { rule: "none" } as const;
 
 function descriptor(
-  over: Partial<SettingsFieldDescriptor> &
-    Pick<SettingsFieldDescriptor, "field" | "label" | "widget">,
+  over: Partial<SettingsFieldDescriptor> & Pick<SettingsFieldDescriptor, "field" | "label" | "widget">,
 ): SettingsFieldDescriptor {
   return {
     section: "sandbox",
@@ -74,12 +73,7 @@ const SCHEMA: SettingsFieldDescriptor[] = [
 function mount(values: Record<string, unknown> = {}) {
   const onSaveField = vi.fn();
   const { container } = render(
-    <SchemaSection
-      section="sandbox"
-      schema={SCHEMA}
-      values={values}
-      onSaveField={onSaveField}
-    />,
+    <SchemaSection section="sandbox" schema={SCHEMA} values={values} onSaveField={onSaveField} />,
   );
   return { onSaveField, container };
 }
@@ -96,15 +90,9 @@ describe("SchemaSection contract", () => {
 
   it("toggle emits (section, field, value)", () => {
     const { onSaveField, container } = mount({ enabled_by_default: false });
-    const toggle = container.querySelector(
-      "button[role=switch]",
-    ) as HTMLButtonElement;
+    const toggle = container.querySelector("button[role=switch]") as HTMLButtonElement;
     fireEvent.click(toggle);
-    expect(onSaveField).toHaveBeenCalledWith(
-      "sandbox",
-      "enabled_by_default",
-      true,
-    );
+    expect(onSaveField).toHaveBeenCalledWith("sandbox", "enabled_by_default", true);
   });
 
   it("select emits the chosen option value", () => {
@@ -113,11 +101,7 @@ describe("SchemaSection contract", () => {
     });
     const select = container.querySelector("select") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "container" } });
-    expect(onSaveField).toHaveBeenCalledWith(
-      "sandbox",
-      "default_terminal_mode",
-      "container",
-    );
+    expect(onSaveField).toHaveBeenCalledWith("sandbox", "default_terminal_mode", "container");
   });
 
   it("advanced fields live under an Advanced fold", () => {
@@ -148,9 +132,7 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
       />,
     );
     // SoundModeWidget renders a select with the Random/Specific options.
-    const select = screen
-      .getByText("Mode")
-      .parentElement?.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByText("Mode").parentElement?.querySelector("select") as HTMLSelectElement;
     expect(select).toBeTruthy();
     expect(select.value).toBe("random");
   });
@@ -243,8 +225,7 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
         onSaveField={onSaveField}
       />,
     );
-    const root = screen.getByText("Environment variables").parentElement
-      ?.parentElement as HTMLElement;
+    const root = screen.getByText("Environment variables").parentElement?.parentElement as HTMLElement;
     const addBtn = screen
       .getByText("Environment variables")
       .parentElement?.querySelector("button") as HTMLButtonElement;
@@ -259,8 +240,6 @@ describe("SchemaSection custom widgets, hooks, and validators (#1792)", () => {
     // Valid KEY=VALUE commits.
     fireEvent.change(input, { target: { value: "FOO=bar" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(onSaveField).toHaveBeenCalledWith("sandbox", "environment", [
-      "FOO=bar",
-    ]);
+    expect(onSaveField).toHaveBeenCalledWith("sandbox", "environment", ["FOO=bar"]);
   });
 });

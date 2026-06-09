@@ -80,17 +80,8 @@ export async function openMobileSidebar(page: Page) {
  */
 export async function readVisibleSessionTitles(page: Page): Promise<string[]> {
   return page.evaluate(() => {
-    const rows = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        "[data-testid='sidebar-session-row']",
-      ),
-    );
-    return rows
-      .map(
-        (r) =>
-          r.querySelector("span.truncate[title]")?.getAttribute("title") ?? "",
-      )
-      .filter(Boolean);
+    const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-testid='sidebar-session-row']"));
+    return rows.map((r) => r.querySelector("span.truncate[title]")?.getAttribute("title") ?? "").filter(Boolean);
   });
 }
 
@@ -109,11 +100,7 @@ export function seedSessionsInRepo(opts: {
   titles: string[];
   subdir?: string;
   tool?: string;
-}): (seedEnv: {
-  home: string;
-  shimBin: string;
-  env: NodeJS.ProcessEnv;
-}) => void {
+}): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   return ({ home, env }) => {
     const binary = resolveAoeBinary();
     const projectDir = join(home, opts.subdir ?? "repo");
@@ -130,11 +117,7 @@ export function seedSessionsInRepo(opts: {
       },
     });
     for (const title of opts.titles) {
-      const res = spawnSync(
-        binary,
-        ["add", projectDir, "-t", title, "-c", opts.tool ?? "claude"],
-        { env },
-      );
+      const res = spawnSync(binary, ["add", projectDir, "-t", title, "-c", opts.tool ?? "claude"], { env });
       if (res.status !== 0) {
         throw new Error(
           `aoe add failed for ${title}: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
@@ -152,11 +135,7 @@ export function seedSessionsInRepo(opts: {
  */
 export function seedRepos(
   repos: Array<{ titles: string[]; subdir: string; tool?: string }>,
-): (seedEnv: {
-  home: string;
-  shimBin: string;
-  env: NodeJS.ProcessEnv;
-}) => void {
+): (seedEnv: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => void {
   const fns = repos.map((r) => seedSessionsInRepo(r));
   return (seedEnv) => {
     for (const fn of fns) fn(seedEnv);

@@ -15,16 +15,8 @@
 // it; no coarse-pointer emulation is needed.
 
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  seedSessionViaAoeAdd,
-} from "../../helpers/aoeServe";
-import {
-  waitForStructuredView,
-  enableStructuredViewAndWait,
-  attachServeDiagnostics,
-} from "../../helpers/acp";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { waitForStructuredView, enableStructuredViewAndWait, attachServeDiagnostics } from "../../helpers/acp";
 
 base(
   "mobile composer footer keeps the Send action reachable when config controls are present",
@@ -45,15 +37,12 @@ base(
 
       const sessions = await listSessions(serve.baseUrl);
       const seeded = sessions.find((s) => s.title === "story-footer-actions");
-      if (!seeded)
-        throw new Error("seeded session 'story-footer-actions' missing");
+      if (!seeded) throw new Error("seeded session 'story-footer-actions' missing");
       const sessionId = seeded.id;
 
       await enableStructuredViewAndWait(serve.baseUrl, sessionId);
 
-      await page.goto(
-        `${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-      );
+      await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
       await waitForStructuredView(page);
 
       // The model chip rendering confirms the left cluster carries the
@@ -67,12 +56,7 @@ base(
       const footer = page.getByTestId("composer-footer");
       await expect(footer).toBeVisible();
       await expect
-        .poll(async () =>
-          footer.evaluate(
-            (el) =>
-              (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth,
-          ),
-        )
+        .poll(async () => footer.evaluate((el) => (el as HTMLElement).scrollWidth - (el as HTMLElement).clientWidth))
         .toBeLessThanOrEqual(0);
 
       // The Send button sits entirely within the viewport (pre-fix its

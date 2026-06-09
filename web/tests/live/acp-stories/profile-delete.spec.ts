@@ -31,9 +31,7 @@ base("delete a profile via ProfileSelector", async ({ page }, testInfo) => {
     await page.getByRole("button", { name: "+ New" }).click();
     await page.getByPlaceholder("Profile name").fill("zz-delete-me");
     await page.getByRole("button", { name: "Create", exact: true }).click();
-    await expect(
-      select.locator("option", { hasText: "zz-delete-me" }),
-    ).toHaveCount(1, { timeout: 5_000 });
+    await expect(select.locator("option", { hasText: "zz-delete-me" })).toHaveCount(1, { timeout: 5_000 });
 
     await select.selectOption("zz-delete-me");
     await expect(select).toHaveValue("zz-delete-me");
@@ -45,9 +43,7 @@ base("delete a profile via ProfileSelector", async ({ page }, testInfo) => {
     await expect(deleteBtn).toBeVisible({ timeout: 5_000 });
     await deleteBtn.click();
 
-    await expect(
-      select.locator("option", { hasText: "zz-delete-me" }),
-    ).toHaveCount(0, { timeout: 5_000 });
+    await expect(select.locator("option", { hasText: "zz-delete-me" })).toHaveCount(0, { timeout: 5_000 });
   } finally {
     await serve.stop();
   }

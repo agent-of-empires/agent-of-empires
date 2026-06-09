@@ -11,9 +11,7 @@ import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { FileRef } from "../lib/fileRef";
 
-const StructuredView = lazy(() =>
-  import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })),
-);
+const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
   view: RightPanelView;
@@ -117,9 +115,7 @@ export function MobileMainPane({
           ) : (
             <TerminalSessionStack
               activeSessionId={activeSessionId!}
-              sessions={sessions.filter(
-                (session) => session.view !== "structured",
-              )}
+              sessions={sessions.filter((session) => session.view !== "structured")}
               persistent={webSettings.persistentTerminals}
               maxPersistentTerminals={webSettings.maxPersistentTerminals}
             />
@@ -127,15 +123,8 @@ export function MobileMainPane({
         </div>
 
         {pairedMounted && (
-          <div
-            className={layerClass(view === "paired")}
-            inert={view !== "paired"}
-          >
-            <PairedShellPane
-              session={activeSession}
-              sessionId={activeSessionId}
-              fullViewport
-            />
+          <div className={layerClass(view === "paired")} inert={view !== "paired"}>
+            <PairedShellPane session={activeSession} sessionId={activeSessionId} fullViewport />
           </div>
         )}
 
@@ -171,14 +160,8 @@ export function MobileMainPane({
                   loading={diffFilesLoading}
                   onSelectFile={onSelectFile}
                   sessionId={activeSessionId}
-                  repoPath={
-                    activeSession?.main_repo_path ??
-                    activeSession?.project_path ??
-                    null
-                  }
-                  baseBranchOverride={
-                    activeSession?.base_branch_override ?? null
-                  }
+                  repoPath={activeSession?.main_repo_path ?? activeSession?.project_path ?? null}
+                  baseBranchOverride={activeSession?.base_branch_override ?? null}
                   onBaseBranchChanged={onDiffRefresh}
                 />
               </div>

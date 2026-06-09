@@ -48,54 +48,32 @@ afterEach(() => {
 describe("SwitchViewAction trigger", () => {
   it("labels the icon as 'Switch to structured view' when current view is terminal", () => {
     render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
-    const btns = document.querySelectorAll(
-      "button[aria-label='Switch to structured view']",
-    );
+    const btns = document.querySelectorAll("button[aria-label='Switch to structured view']");
     expect(btns.length).toBeGreaterThan(0);
   });
 
   it("labels the icon as 'Switch to terminal view' when current view is structured view", () => {
     render(<SwitchViewAction sessionId="s-1" structuredView={true} />);
-    const btns = document.querySelectorAll(
-      "button[aria-label='Switch to terminal view']",
-    );
+    const btns = document.querySelectorAll("button[aria-label='Switch to terminal view']");
     expect(btns.length).toBeGreaterThan(0);
   });
 
   it("renders 'Switch to terminal' text in button variant when structuredView is true", () => {
-    const { getByText } = render(
-      <SwitchViewAction
-        sessionId="s-1"
-        structuredView={true}
-        variant="button"
-      />,
-    );
+    const { getByText } = render(<SwitchViewAction sessionId="s-1" structuredView={true} variant="button" />);
     expect(getByText("Switch to terminal view")).toBeTruthy();
   });
 
   it("is disabled when the target is structured view and the agent is not ACP-capable", () => {
-    const { getByLabelText } = render(
-      <SwitchViewAction
-        sessionId="s-1"
-        structuredView={false}
-        acpCapable={false}
-      />,
-    );
-    const btn = getByLabelText(
-      "Switch to structured view",
-    ) as HTMLButtonElement;
+    const { getByLabelText } = render(<SwitchViewAction sessionId="s-1" structuredView={false} acpCapable={false} />);
+    const btn = getByLabelText("Switch to structured view") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.title).toMatch(/no ACP adapter/i);
   });
 
   it("is disabled when the server is offline", () => {
     mockOffline = true;
-    const { getByLabelText } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={false} />,
-    );
-    const btn = getByLabelText(
-      "Switch to structured view",
-    ) as HTMLButtonElement;
+    const { getByLabelText } = render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
+    const btn = getByLabelText("Switch to structured view") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     expect(btn.title).toMatch(/Disconnected/i);
   });
@@ -104,9 +82,7 @@ describe("SwitchViewAction trigger", () => {
 describe("SwitchViewAction confirm dialog", () => {
   it("opens the confirm dialog on trigger click", () => {
     mockOkFetch();
-    const { getByLabelText, getByRole } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={false} />,
-    );
+    const { getByLabelText, getByRole } = render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
     fireEvent.click(getByLabelText("Switch to structured view"));
     expect(getByRole("dialog")).toBeTruthy();
   });
@@ -124,9 +100,7 @@ describe("SwitchViewAction confirm dialog", () => {
 
   it("escape closes the dialog", () => {
     mockOkFetch();
-    const { getByLabelText, queryByRole } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={false} />,
-    );
+    const { getByLabelText, queryByRole } = render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
     fireEvent.click(getByLabelText("Switch to structured view"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(queryByRole("dialog")).toBeNull();
@@ -134,9 +108,7 @@ describe("SwitchViewAction confirm dialog", () => {
 
   it("POSTs to /acp/enable when switching FROM terminal TO structured view", async () => {
     const fetchFn = mockOkFetch();
-    const { getByLabelText, getByText } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={false} />,
-    );
+    const { getByLabelText, getByText } = render(<SwitchViewAction sessionId="s-1" structuredView={false} />);
     fireEvent.click(getByLabelText("Switch to structured view"));
     fireEvent.click(getByText("Switch"));
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
@@ -146,9 +118,7 @@ describe("SwitchViewAction confirm dialog", () => {
 
   it("POSTs to /acp/disable when switching FROM structured view TO terminal", async () => {
     const fetchFn = mockOkFetch();
-    const { getByLabelText, getByText } = render(
-      <SwitchViewAction sessionId="s-1" structuredView={true} />,
-    );
+    const { getByLabelText, getByText } = render(<SwitchViewAction sessionId="s-1" structuredView={true} />);
     fireEvent.click(getByLabelText("Switch to terminal view"));
     fireEvent.click(getByText("Switch"));
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
@@ -157,15 +127,11 @@ describe("SwitchViewAction confirm dialog", () => {
 
   it("URL-encodes the session id in the endpoint", async () => {
     const fetchFn = mockOkFetch();
-    const { getByLabelText, getByText } = render(
-      <SwitchViewAction sessionId="weird/id" structuredView={false} />,
-    );
+    const { getByLabelText, getByText } = render(<SwitchViewAction sessionId="weird/id" structuredView={false} />);
     fireEvent.click(getByLabelText("Switch to structured view"));
     fireEvent.click(getByText("Switch"));
     await waitFor(() => expect(fetchFn).toHaveBeenCalled());
-    expect(fetchFn.mock.calls[0]?.[0]).toBe(
-      "/api/sessions/weird%2Fid/acp/enable",
-    );
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/sessions/weird%2Fid/acp/enable");
   });
 
   it("surfaces a server error response in the dialog", async () => {

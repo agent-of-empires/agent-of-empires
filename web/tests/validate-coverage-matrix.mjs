@@ -71,9 +71,7 @@ async function main() {
 
   for (const e of exempt.exempt) {
     if (!e.reason || typeof e.reason !== "string") {
-      errors.push(
-        `coverage-matrix.exempt.json: entry '${e.path}' is missing 'reason'`,
-      );
+      errors.push(`coverage-matrix.exempt.json: entry '${e.path}' is missing 'reason'`);
     }
   }
 
@@ -87,15 +85,11 @@ async function main() {
     const tag = surface.id;
     if (surface.kind === "deferred") {
       if (!surface.issue) {
-        errors.push(
-          `coverage-matrix.json: deferred surface '${tag}' is missing 'issue' link`,
-        );
+        errors.push(`coverage-matrix.json: deferred surface '${tag}' is missing 'issue' link`);
       }
     } else if (surface.kind === "out-of-scope") {
       if (!surface.reason) {
-        errors.push(
-          `coverage-matrix.json: out-of-scope surface '${tag}' is missing 'reason'`,
-        );
+        errors.push(`coverage-matrix.json: out-of-scope surface '${tag}' is missing 'reason'`);
       }
     } else if (
       surface.kind === "live-playwright" ||
@@ -103,23 +97,17 @@ async function main() {
       surface.kind === "mocked-playwright"
     ) {
       if (!Array.isArray(surface.specs) || surface.specs.length === 0) {
-        errors.push(
-          `coverage-matrix.json: surface '${tag}' (${surface.kind}) has no specs`,
-        );
+        errors.push(`coverage-matrix.json: surface '${tag}' (${surface.kind}) has no specs`);
       } else {
         for (const spec of surface.specs) {
           const specPath = resolve(webDir, spec);
           if (!(await pathExists(specPath))) {
-            errors.push(
-              `coverage-matrix.json: surface '${tag}' references missing spec '${spec}'`,
-            );
+            errors.push(`coverage-matrix.json: surface '${tag}' references missing spec '${spec}'`);
           }
         }
       }
     } else {
-      errors.push(
-        `coverage-matrix.json: surface '${tag}' has unknown kind '${surface.kind}'`,
-      );
+      errors.push(`coverage-matrix.json: surface '${tag}' has unknown kind '${surface.kind}'`);
     }
     for (const c of surface.components ?? []) {
       seenComponents.add(c);

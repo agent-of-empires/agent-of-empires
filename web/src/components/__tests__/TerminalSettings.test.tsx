@@ -24,23 +24,13 @@ describe("TerminalSettings localStorage contract", () => {
   it("labels font-size controls as applying to web tmux sessions", () => {
     const { getByText } = render(<TerminalSettings />);
 
-    expect(
-      getByText(
-        /web terminal sessions on mobile devices, including tmux-backed sessions/i,
-      ),
-    ).toBeTruthy();
-    expect(
-      getByText(
-        /web terminal sessions on desktop, including tmux-backed sessions/i,
-      ),
-    ).toBeTruthy();
+    expect(getByText(/web terminal sessions on mobile devices, including tmux-backed sessions/i)).toBeTruthy();
+    expect(getByText(/web terminal sessions on desktop, including tmux-backed sessions/i)).toBeTruthy();
   });
 
   it("mobile font slider writes mobileFontSize into aoe-web-settings", () => {
     const { container } = render(<TerminalSettings />);
-    const slider = container.querySelectorAll(
-      "input[type=range]",
-    )[0] as HTMLInputElement;
+    const slider = container.querySelectorAll("input[type=range]")[0] as HTMLInputElement;
     fireEvent.change(slider, { target: { value: "10" } });
     expect(readStored().mobileFontSize).toBe(10);
   });
@@ -54,9 +44,7 @@ describe("TerminalSettings localStorage contract", () => {
 
   it("desktop font slider writes desktopFontSize", () => {
     const { container } = render(<TerminalSettings />);
-    const slider = container.querySelectorAll(
-      "input[type=range]",
-    )[1] as HTMLInputElement;
+    const slider = container.querySelectorAll("input[type=range]")[1] as HTMLInputElement;
     fireEvent.change(slider, { target: { value: "18" } });
     expect(readStored().desktopFontSize).toBe(18);
   });
@@ -70,31 +58,22 @@ describe("TerminalSettings localStorage contract", () => {
 
   it("autoOpenKeyboard checkbox writes the boolean flag", () => {
     const { container } = render(<TerminalSettings />);
-    const checkbox = container.querySelectorAll(
-      "input[type=checkbox]",
-    )[0] as HTMLInputElement;
+    const checkbox = container.querySelectorAll("input[type=checkbox]")[0] as HTMLInputElement;
     fireEvent.click(checkbox);
     expect(readStored().autoOpenKeyboard).toBe(false);
   });
 
   it("persistent terminals checkbox writes the beta flag", () => {
     const { container } = render(<TerminalSettings />);
-    const checkbox = container.querySelectorAll(
-      "input[type=checkbox]",
-    )[1] as HTMLInputElement;
+    const checkbox = container.querySelectorAll("input[type=checkbox]")[1] as HTMLInputElement;
     fireEvent.click(checkbox);
     expect(readStored().persistentTerminals).toBe(true);
   });
 
   it("persistent terminal limit input writes a clamped number", () => {
-    window.localStorage.setItem(
-      KEY,
-      JSON.stringify({ persistentTerminals: true }),
-    );
+    window.localStorage.setItem(KEY, JSON.stringify({ persistentTerminals: true }));
     const { container } = render(<TerminalSettings />);
-    const input = container.querySelector(
-      "input[type=number]",
-    ) as HTMLInputElement;
+    const input = container.querySelector("input[type=number]") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "50" } });
     expect(readStored().maxPersistentTerminals).toBe(50);
 
@@ -116,9 +95,7 @@ describe("TerminalSettings localStorage contract", () => {
       }),
     );
     const { container } = render(<TerminalSettings />);
-    const slider = container.querySelectorAll(
-      "input[type=range]",
-    )[0] as HTMLInputElement;
+    const slider = container.querySelectorAll("input[type=range]")[0] as HTMLInputElement;
     fireEvent.change(slider, { target: { value: "12" } });
     const stored = readStored();
     expect(stored).toMatchObject({
@@ -144,18 +121,12 @@ describe("TerminalSettings localStorage contract", () => {
       }),
     );
     const { container } = render(<TerminalSettings />);
-    const mobileSelect = container.querySelectorAll(
-      "select",
-    )[0] as HTMLSelectElement;
-    const desktopSelect = container.querySelectorAll(
-      "select",
-    )[1] as HTMLSelectElement;
+    const mobileSelect = container.querySelectorAll("select")[0] as HTMLSelectElement;
+    const desktopSelect = container.querySelectorAll("select")[1] as HTMLSelectElement;
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
     const checkbox = checkboxes[0] as HTMLInputElement;
     const persistentCheckbox = checkboxes[1] as HTMLInputElement;
-    const persistentLimit = container.querySelector(
-      "input[type=number]",
-    ) as HTMLInputElement;
+    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement;
     expect(mobileSelect.value).toBe("22");
     expect(desktopSelect.value).toBe("16");
     expect(checkbox.checked).toBe(false);
@@ -174,9 +145,7 @@ describe("TerminalSettings localStorage contract", () => {
     const { container } = render(<TerminalSettings />);
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
     const persistentCheckbox = checkboxes[1] as HTMLInputElement;
-    const persistentLimit = container.querySelector(
-      "input[type=number]",
-    ) as HTMLInputElement | null;
+    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement | null;
 
     expect(persistentCheckbox.checked).toBe(false);
     expect(persistentLimit).toBeNull();
@@ -191,9 +160,7 @@ describe("TerminalSettings localStorage contract", () => {
       }),
     );
     const { container } = render(<TerminalSettings />);
-    const persistentLimit = container.querySelector(
-      "input[type=number]",
-    ) as HTMLInputElement;
+    const persistentLimit = container.querySelector("input[type=number]") as HTMLInputElement;
 
     expect(persistentLimit.value).toBe("50");
   });

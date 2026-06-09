@@ -38,10 +38,7 @@ function nameOf(tool: ToolCall): string {
  *  separator-prefixed naming convention. Server names can contain
  *  underscores (e.g. `claude_ai_HubSpot`, `db-toolbox-preprod`), but
  *  the separators are always the double-underscore `__`. */
-function parseMcpName(
-  name: string,
-  prefix: string,
-): { server: string; verb: string } | null {
+function parseMcpName(name: string, prefix: string): { server: string; verb: string } | null {
   if (!name.startsWith(prefix)) return null;
   const parts = name.split("__");
   if (parts.length < 3) return null;
@@ -54,10 +51,7 @@ function parseMcpName(
   return { server, verb };
 }
 
-export function classifyMcp(
-  tool: ToolCall,
-  profile?: AgentProfile | null,
-): McpHit | NotMcp {
+export function classifyMcp(tool: ToolCall, profile?: AgentProfile | null): McpHit | NotMcp {
   const name = nameOf(tool);
   const prefixes = profile?.mcpPrefixes ?? DEFAULT_MCP_PREFIXES;
   for (const prefix of prefixes) {

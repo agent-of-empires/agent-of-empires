@@ -210,8 +210,7 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
         next[target] = palette256(params[i + 2] ?? 0);
         i += 3;
       } else if (mode === 2) {
-        next[target] =
-          `rgb(${params[i + 2] ?? 0}, ${params[i + 3] ?? 0}, ${params[i + 4] ?? 0})`;
+        next[target] = `rgb(${params[i + 2] ?? 0}, ${params[i + 3] ?? 0}, ${params[i + 4] ?? 0})`;
         i += 5;
       } else {
         i++;

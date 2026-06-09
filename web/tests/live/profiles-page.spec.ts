@@ -25,10 +25,7 @@ async function seedProfile(serve: ServeHandle, name: string): Promise<void> {
   expect(res.ok).toBeTruthy();
 }
 
-test("create profile via + New round-trips through POST /api/profiles", async ({
-  serve,
-  page,
-}) => {
+test("create profile via + New round-trips through POST /api/profiles", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/profiles`);
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 
@@ -43,10 +40,7 @@ test("create profile via + New round-trips through POST /api/profiles", async ({
   }).toPass({ timeout: 5_000 });
 });
 
-test("set as default round-trips through PATCH /api/default-profile", async ({
-  serve,
-  page,
-}) => {
+test("set as default round-trips through PATCH /api/default-profile", async ({ serve, page }) => {
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
@@ -75,22 +69,15 @@ test("description edit persists across reload", async ({ serve, page }) => {
 
   await expect(async () => {
     const profiles = await fetchProfiles(serve);
-    expect(profiles.find((p) => p.name === "work")?.description).toBe(
-      "client repos",
-    );
+    expect(profiles.find((p) => p.name === "work")?.description).toBe("client repos");
   }).toPass({ timeout: 5_000 });
 
   await page.reload();
   await page.getByRole("button", { name: "work", exact: true }).click();
-  await expect(page.getByPlaceholder("What this profile is for")).toHaveValue(
-    "client repos",
-  );
+  await expect(page.getByPlaceholder("What this profile is for")).toHaveValue("client repos");
 });
 
-test("Edit configuration deep-links into Settings scoped to the profile", async ({
-  serve,
-  page,
-}) => {
+test("Edit configuration deep-links into Settings scoped to the profile", async ({ serve, page }) => {
   await seedProfile(serve, "work");
 
   await page.goto(`${serve.baseUrl}/profiles`);
@@ -105,10 +92,7 @@ test("Edit configuration deep-links into Settings scoped to the profile", async 
   await expect(profileSelect).toHaveValue("work");
 });
 
-test("opens from the sidebar footer and closes back to the dashboard", async ({
-  serve,
-  page,
-}) => {
+test("opens from the sidebar footer and closes back to the dashboard", async ({ serve, page }) => {
   await page.goto(serve.baseUrl);
   await page.getByRole("button", { name: "Profiles", exact: true }).click();
   await expect(page).toHaveURL(/\/profiles$/);
@@ -118,10 +102,7 @@ test("opens from the sidebar footer and closes back to the dashboard", async ({
   await expect(page).not.toHaveURL(/\/profiles/);
 });
 
-test("lifecycle hooks render read-only with the explain-why note", async ({
-  serve,
-  page,
-}) => {
+test("lifecycle hooks render read-only with the explain-why note", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/profiles`);
   await page.getByRole("button", { name: "main" }).click();
 

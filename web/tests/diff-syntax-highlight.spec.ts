@@ -32,8 +32,7 @@ const DIFF_FILE_RESPONSE = {
     additions: 3,
     deletions: 1,
   },
-  old_content:
-    'import { useState } from "react";\nconst x = 42;\nexport default x;\n',
+  old_content: 'import { useState } from "react";\nconst x = 42;\nexport default x;\n',
   new_content:
     'import { useState } from "react";\n' +
     "const x: number = 42;\n" +
@@ -51,12 +50,8 @@ const DIFF_FILE_RESPONSE = {
 
 async function setupDiffMocks(page: Page) {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions/*/diff/files", (r) =>
-    r.fulfill({ json: DIFF_FILES_RESPONSE }),
-  );
-  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) =>
-    r.fulfill({ json: DIFF_FILE_RESPONSE }),
-  );
+  await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
+  await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) => r.fulfill({ json: DIFF_FILE_RESPONSE }));
 }
 
 async function openSessionAndWaitForDiffList(page: Page) {
@@ -130,8 +125,6 @@ test.describe("Diff rendering (@pierre/diffs)", () => {
     });
     await page.getByText("data.xyz").first().click();
 
-    await expect(
-      page.getByText("some unknown format content").first(),
-    ).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText("some unknown format content").first()).toBeVisible({ timeout: 10000 });
   });
 });

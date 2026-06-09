@@ -90,21 +90,17 @@ describe("getDraft / setDraft", () => {
   });
 
   it("returns empty string when localStorage.getItem throws", () => {
-    const spy = vi
-      .spyOn(Storage.prototype, "getItem")
-      .mockImplementation(() => {
-        throw new Error("blocked");
-      });
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
     expect(getDraft("s-1")).toBe("");
     spy.mockRestore();
   });
 
   it("setDraft swallows localStorage write errors", () => {
-    const spy = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementation(() => {
-        throw new Error("quota");
-      });
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
     expect(() => setDraft("s-1", "x")).not.toThrow();
     spy.mockRestore();
   });
@@ -127,11 +123,9 @@ describe("hasDraft", () => {
   });
 
   it("returns false when localStorage throws", () => {
-    const spy = vi
-      .spyOn(Storage.prototype, "getItem")
-      .mockImplementation(() => {
-        throw new Error("blocked");
-      });
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
     expect(hasDraft("s-1")).toBe(false);
     spy.mockRestore();
   });
@@ -215,9 +209,7 @@ describe("subscribeDrafts pub/sub", () => {
     const cbWildcard = vi.fn();
     const unsub1 = subscribeDrafts(cbFiltered, new Set(["s-1"]));
     const unsub2 = subscribeDrafts(cbWildcard, null);
-    window.dispatchEvent(
-      new StorageEvent("storage", { key: null, newValue: null }),
-    );
+    window.dispatchEvent(new StorageEvent("storage", { key: null, newValue: null }));
     expect(cbFiltered).toHaveBeenCalledTimes(1);
     expect(cbWildcard).toHaveBeenCalledTimes(1);
     unsub1();

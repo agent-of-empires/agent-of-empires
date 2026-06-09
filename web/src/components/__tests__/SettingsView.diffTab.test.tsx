@@ -7,9 +7,7 @@ const PROFILES = [{ name: "main", is_default: true }];
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
-  fetchSettings: vi.fn(() =>
-    Promise.resolve({ acp: {}, sandbox: {}, worktree: {} }),
-  ),
+  fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
@@ -23,14 +21,7 @@ afterEach(() => {
 
 describe("SettingsView diff tab", () => {
   it("renders the Diff section (split + tree toggles)", async () => {
-    render(
-      <SettingsView
-        onClose={() => {}}
-        tab="diff"
-        onSelectTab={vi.fn()}
-        onServerAboutRefresh={() => {}}
-      />,
-    );
+    render(<SettingsView onClose={() => {}} tab="diff" onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
 
     expect(await screen.findByText("Side-by-side diff")).toBeTruthy();
     expect(screen.getByText("Tree file list")).toBeTruthy();

@@ -7,10 +7,7 @@
 // and no PUT (#1419).
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  installSidebarMocks,
-  threeSessionsInOneRepo,
-} from "./helpers/sidebarMocks";
+import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 
 test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
   const handle = await installSidebarMocks(page, {
@@ -24,9 +21,7 @@ test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
   // The drag-enabled wrapper carries
   // `aria-roledescription="Press and hold to reorder"`. In read-only
   // mode the attribute is omitted; the row should not match at all.
-  const dragWrappers = page.locator(
-    "[aria-roledescription='Press and hold to reorder']",
-  );
+  const dragWrappers = page.locator("[aria-roledescription='Press and hold to reorder']");
   await expect.poll(() => dragWrappers.count(), { timeout: 5_000 }).toBe(0);
 
   // Locate the row a different way and attempt a drag anyway. If a
@@ -38,17 +33,10 @@ test("read-only viewer cannot drag sidebar rows", async ({ page }) => {
   const targetBox = await rows.nth(0).boundingBox();
   if (!sourceBox || !targetBox) throw new Error("row box missing");
 
-  await page.mouse.move(
-    sourceBox.x + sourceBox.width - 4,
-    sourceBox.y + sourceBox.height / 2,
-  );
+  await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
   await page.mouse.down();
   await page.waitForTimeout(250);
-  await page.mouse.move(
-    targetBox.x + targetBox.width / 2,
-    targetBox.y + targetBox.height / 2,
-    { steps: 12 },
-  );
+  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
 
   // Visual feedback contract: no row gains the active-drag ring class.
   // The check runs mid-gesture so a regression that wires listeners

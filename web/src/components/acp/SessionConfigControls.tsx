@@ -47,11 +47,7 @@ function findByCategory(
   return options.find((o) => o.category === category);
 }
 
-export function SessionConfigControls({
-  configOptions,
-  pendingConfigOption,
-  onSetConfigOption,
-}: Props) {
+export function SessionConfigControls({ configOptions, pendingConfigOption, onSetConfigOption }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
 
@@ -60,29 +56,18 @@ export function SessionConfigControls({
   if (!model && !effort) return null;
 
   return (
-    <div
-      data-testid="session-config-controls"
-      className="flex flex-wrap items-center gap-1.5"
-    >
+    <div data-testid="session-config-controls" className="flex flex-wrap items-center gap-1.5">
       {model && (
         <ModelDropdown
           option={model}
-          pending={
-            pendingConfigOption?.configId === model.id
-              ? pendingConfigOption.value
-              : null
-          }
+          pending={pendingConfigOption?.configId === model.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(model.id, value)}
         />
       )}
       {effort && (
         <EffortControl
           option={effort}
-          pending={
-            pendingConfigOption?.configId === effort.id
-              ? pendingConfigOption.value
-              : null
-          }
+          pending={pendingConfigOption?.configId === effort.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(effort.id, value)}
         />
       )}
@@ -102,9 +87,7 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
-  const current =
-    option.options.find((o) => o.value === option.current_value) ??
-    option.options[0];
+  const current = option.options.find((o) => o.value === option.current_value) ?? option.options[0];
   const label = current?.name ?? option.current_value;
 
   useEffect(() => {
@@ -180,20 +163,10 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
               >
                 <span className="flex-1">
                   <span className="block font-medium">{opt.name}</span>
-                  {opt.description && (
-                    <span className="block text-[11px] text-text-dim">
-                      {opt.description}
-                    </span>
-                  )}
+                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
                 </span>
-                {isCurrent && !isPending && (
-                  <span className="text-[10px] uppercase text-brand-500">
-                    Active
-                  </span>
-                )}
-                {isPending && (
-                  <span className="text-[10px] uppercase text-text-dim">…</span>
-                )}
+                {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
+                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
               </button>
             );
           })}
@@ -205,19 +178,12 @@ function ModelDropdown({ option, pending, onSelect }: SubProps) {
 
 function EffortControl(props: SubProps) {
   const { option } = props;
-  const totalLabelLen = option.options.reduce(
-    (acc, o) => acc + o.name.length,
-    0,
-  );
+  const totalLabelLen = option.options.reduce((acc, o) => acc + o.name.length, 0);
   const useSegmented =
     option.options.length > 0 &&
     option.options.length <= EFFORT_SEGMENTED_MAX_COUNT &&
     totalLabelLen <= EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN;
-  return useSegmented ? (
-    <EffortSegmented {...props} />
-  ) : (
-    <ModelDropdown {...props} />
-  );
+  return useSegmented ? <EffortSegmented {...props} /> : <ModelDropdown {...props} />;
 }
 
 function EffortSegmented({ option, pending, onSelect }: SubProps) {
@@ -246,9 +212,7 @@ function EffortSegmented({ option, pending, onSelect }: SubProps) {
             data-testid={`config-option-${option.id}-value-${opt.value}`}
             className={[
               "rounded px-2 py-0.5 text-[11px] font-medium transition-colors",
-              isCurrent
-                ? "bg-surface-700 text-text-primary"
-                : "text-text-secondary hover:text-text-primary",
+              isCurrent ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:text-text-primary",
               isPending ? "cursor-not-allowed opacity-50" : "",
             ].join(" ")}
           >
@@ -270,16 +234,10 @@ interface NoticeProps {
  *  rejects a `session/set_config_option`. Auto-dismisses via the
  *  reducer when a later snapshot confirms the requested value; the
  *  manual dismiss button is the user-visible escape hatch. */
-export function ConfigOptionSwitchFailedNotice({
-  failure,
-  configOptions,
-  onDismiss,
-}: NoticeProps) {
+export function ConfigOptionSwitchFailedNotice({ failure, configOptions, onDismiss }: NoticeProps) {
   if (!failure) return null;
   const config = configOptions.find((c) => c.id === failure.configId);
-  const optionLabel =
-    config?.options.find((o) => o.value === failure.value)?.name ??
-    failure.value;
+  const optionLabel = config?.options.find((o) => o.value === failure.value)?.name ?? failure.value;
   const configLabel = config?.name ?? failure.configId;
   return (
     <div

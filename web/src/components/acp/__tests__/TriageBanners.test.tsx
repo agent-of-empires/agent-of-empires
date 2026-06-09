@@ -10,10 +10,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import {
-  ArchivedWorkerStoppedBanner,
-  SnoozedWorkerStoppedBanner,
-} from "../StructuredView";
+import { ArchivedWorkerStoppedBanner, SnoozedWorkerStoppedBanner } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
@@ -38,12 +35,7 @@ describe("ArchivedWorkerStoppedBanner", () => {
 
 describe("SnoozedWorkerStoppedBanner", () => {
   it("renders the snoozed copy with a localized wake-time", () => {
-    render(
-      <SnoozedWorkerStoppedBanner
-        sessionId="abc-123"
-        snoozedUntil="2099-01-01T00:00:00Z"
-      />,
-    );
+    render(<SnoozedWorkerStoppedBanner sessionId="abc-123" snoozedUntil="2099-01-01T00:00:00Z" />);
     const banner = screen.getByTestId("acp-snoozed-banner-abc-123");
     expect(banner).not.toBeNull();
     expect(banner.textContent).toContain("Session snoozed");
@@ -56,12 +48,7 @@ describe("SnoozedWorkerStoppedBanner", () => {
   });
 
   it("mentions the Unsnooze affordance", () => {
-    render(
-      <SnoozedWorkerStoppedBanner
-        sessionId="abc-123"
-        snoozedUntil="2099-01-01T00:00:00Z"
-      />,
-    );
+    render(<SnoozedWorkerStoppedBanner sessionId="abc-123" snoozedUntil="2099-01-01T00:00:00Z" />);
     const banner = screen.getByTestId("acp-snoozed-banner-abc-123");
     expect(banner.textContent).toContain("Unsnooze");
   });
@@ -70,12 +57,7 @@ describe("SnoozedWorkerStoppedBanner", () => {
     // Defensive: the server gates snoozed_until on `is_snoozed()`,
     // but an unparseable string would otherwise crash
     // `Date.toLocaleString`. We render the raw value instead.
-    render(
-      <SnoozedWorkerStoppedBanner
-        sessionId="abc-123"
-        snoozedUntil="not-a-date"
-      />,
-    );
+    render(<SnoozedWorkerStoppedBanner sessionId="abc-123" snoozedUntil="not-a-date" />);
     const banner = screen.getByTestId("acp-snoozed-banner-abc-123");
     expect(banner.textContent).toContain("not-a-date");
   });

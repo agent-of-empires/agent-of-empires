@@ -39,19 +39,12 @@ function extractResizes(handle: MockHandle): ResizeMsg[] {
 
 async function openSession(page: Page, handle: MockHandle) {
   await clickSidebarSession(page, "pinch-test");
-  await page
-    .locator(".xterm")
-    .first()
-    .waitFor({ state: "visible", timeout: 10_000 });
-  await expect
-    .poll(() => handle.wsMessages.length, { timeout: 5_000 })
-    .toBeGreaterThan(0);
+  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
+  await expect.poll(() => handle.wsMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 }
 
 test.describe("Init resize storm regression (#807)", () => {
-  test("never sends xterm.js's 80x24 default at session open", async ({
-    page,
-  }) => {
+  test("never sends xterm.js's 80x24 default at session open", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
@@ -75,9 +68,7 @@ test.describe("Init resize storm regression (#807)", () => {
     ).toHaveLength(0);
   });
 
-  test("init storm is bounded: small msg count, no duplicate sizes", async ({
-    page,
-  }) => {
+  test("init storm is bounded: small msg count, no duplicate sizes", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);

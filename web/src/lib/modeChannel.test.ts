@@ -85,12 +85,7 @@ describe("resolveModeChannel", () => {
   it("uses the claude hardcoded taxonomy only when the profile opts in", () => {
     const channel = resolveModeChannel({ ...BASE, allowLegacyFallback: true });
     expect(channel!.kind).toBe("legacy");
-    expect(channel!.modes.map((m) => m.id)).toEqual([
-      "default",
-      "plan",
-      "accept_edits",
-      "bypass_permissions",
-    ]);
+    expect(channel!.modes.map((m) => m.id)).toEqual(["default", "plan", "accept_edits", "bypass_permissions"]);
     expect(channel!.activeId).toBe("default");
   });
 

@@ -47,9 +47,7 @@ export interface ResolvedLaunchCommand {
   full: string;
 }
 
-export function resolveLaunchCommand(
-  input: ResolveLaunchCommandInput,
-): ResolvedLaunchCommand {
+export function resolveLaunchCommand(input: ResolveLaunchCommandInput): ResolvedLaunchCommand {
   const manual = input.manualOverride?.trim();
   const configOverride = input.agentCommandOverride?.[input.tool]?.trim();
   const custom = input.customAgents?.[input.tool]?.trim();
@@ -59,23 +57,13 @@ export function resolveLaunchCommand(
 
   if (input.useStructuredView) {
     prefix =
-      manual ||
-      configOverride ||
-      custom ||
-      input.acpCommand?.trim() ||
-      input.binary?.trim() ||
-      input.tool.trim();
+      manual || configOverride || custom || input.acpCommand?.trim() || input.binary?.trim() || input.tool.trim();
     // Registry args are always appended for built-in structured view agents and
     // are retained even when a command override is set. Custom agents
     // carry no registry args, so the suffix is empty for them.
     suffix = (input.acpArgs ?? []).join(" ").trim();
   } else {
-    prefix =
-      manual ||
-      configOverride ||
-      custom ||
-      input.binary?.trim() ||
-      input.tool.trim();
+    prefix = manual || configOverride || custom || input.binary?.trim() || input.tool.trim();
     suffix = input.extraArgs?.trim() ?? "";
   }
 

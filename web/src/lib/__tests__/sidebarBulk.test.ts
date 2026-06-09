@@ -40,13 +40,8 @@ describe("bucketSelectionForBulk", () => {
     // Server says live, but a pending optimistic pin makes it eligible only
     // for Unpin, not Pin.
     const workspaces = [ws("w", {})];
-    const overlay = new Map([
-      ["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })],
-    ]);
-    const b = bucketSelectionForBulk(
-      workspaces,
-      (id) => overlay.get(id) ?? EMPTY_OPTIMISTIC,
-    );
+    const overlay = new Map([["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })]]);
+    const b = bucketSelectionForBulk(workspaces, (id) => overlay.get(id) ?? EMPTY_OPTIMISTIC);
     expect(b.pinnable).toHaveLength(0);
     expect(b.unpinnable.map((w) => w.id)).toEqual(["w"]);
   });
@@ -55,18 +50,11 @@ describe("bucketSelectionForBulk", () => {
 describe("summarizeBulkResults", () => {
   it("reports successes, failures, and skips", () => {
     expect(
-      summarizeBulkResults("Archived", [
-        { ok: true },
-        { ok: true },
-        { ok: false },
-        { ok: false, skipped: true },
-      ]),
+      summarizeBulkResults("Archived", [{ ok: true }, { ok: true }, { ok: false }, { ok: false, skipped: true }]),
     ).toBe("Archived 2 sessions. 1 failed. 1 skipped.");
   });
 
   it("uses the singular noun and omits zero counts", () => {
-    expect(summarizeBulkResults("Pinned", [{ ok: true }])).toBe(
-      "Pinned 1 session.",
-    );
+    expect(summarizeBulkResults("Pinned", [{ ok: true }])).toBe("Pinned 1 session.");
   });
 });

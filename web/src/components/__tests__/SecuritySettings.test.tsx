@@ -90,9 +90,7 @@ describe("SecuritySettings", () => {
     await waitFor(() => {
       // The Read-only Row renders the literal text 'off'.
       const cells = container.querySelectorAll("span");
-      const offCell = Array.from(cells).find(
-        (c) => c.textContent?.trim().toLowerCase() === "off",
-      );
+      const offCell = Array.from(cells).find((c) => c.textContent?.trim().toLowerCase() === "off");
       expect(offCell).toBeDefined();
     });
   });

@@ -9,6 +9,9 @@ mod render;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod file_watch_tests;
+
 // LiveSendState is intentionally NOT re-exported: it's an internal
 // detail of the home module. Tests that need to install it directly
 // go through the `super::live_send::LiveSendState` path.
@@ -830,12 +833,162 @@ pub struct HomeView {
         crossterm::event::KeyModifiers,
     )>,
     pub(super) tool_picker_dialog: Option<super::dialogs::ToolPickerDialog>,
+
+    /// Process-wide file-watch primitive. Threaded into per-profile
+    /// `Storage` instances so writes from this process surface
+    /// immediately via the in-process Local fast path, and used to
+    /// register per-profile subscriptions on `sessions.json` /
+    /// `groups.json` so peer-process writes propagate within the
+    /// primitive's debounce window.
+    pub(super) file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    /// Set by the per-profile forwarder tasks; swapped to `false` by the
+    /// tick loop when it consumes the kick. Cap-1 fan-in across all
+    /// profile forwarders: idempotent `store(true, Release)` collapses
+    /// multiple events between two reloads into one reload regardless of
+    /// source file.
+    pub(super) disk_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-profile subscription pairs; see `rewire_disk_subscriptions`
+    /// for the canonical drop-then-abort removal order.
+    pub(super) disk_watch_handles: HashMap<String, DiskWatchEntry>,
+    /// Tracks tick-driven reload failures so a malformed `sessions.json`
+    /// or `groups.json` does not crash the TUI. Populated by
+    /// `handle_tick_reload_storage`; consumed once per tick to surface a
+    /// single aggregated `info_dialog` and avoid spamming on every tick
+    /// while a file remains broken.
+    pub(super) reload_failure_state: ReloadFailureState,
+}
+
+/// Per-profile subscription pair, held in `HomeView::disk_watch_handles`.
+///
+/// Two teardown paths exist:
+/// 1. Explicit-remove (rewire / profile delete via `drop_disk_watch_entry`):
+///    drop the `SubscriptionHandle` first to close the source channel; the
+///    forwarder's `rx.recv().await` returns `None` and exits naturally;
+///    `forwarder.abort()` then runs as a fast-path safeguard for any
+///    `recv` future that has not yet observed the close.
+/// 2. HomeView field-drop on shutdown: the same order falls out of struct
+///    field declaration order. `disk_watch_handles` drops, each entry's
+///    handle drops first (channel-close cascade), the forwarder exits
+///    naturally; the AbortHandle drop is a no-op (Tokio's `AbortHandle`
+///    does not abort on drop) but the forwarder is already gone.
+pub(super) struct DiskWatchEntry {
+    handle: crate::file_watch::SubscriptionHandle,
+    forwarder: tokio::task::AbortHandle,
+    /// Canonicalized profile dir at install time. Compared against the
+    /// current canonical dir on rewire to detect peer-driven
+    /// delete-and-recreate (same name, new inode); on mismatch the entry
+    /// is treated as needing rewire even when the profile name set is
+    /// unchanged. notify NonRecursive watches do not auto-reattach to a
+    /// recreated directory on Linux inotify (IN_IGNORED) or macOS
+    /// FSEvents (path-based but inconsistent across platforms).
+    canonical_dir: std::path::PathBuf,
+}
+
+/// Drop the subscription handle FIRST. Closing the source channel
+/// before aborting the forwarder ensures no in-flight event reaches
+/// an aborted task.
+fn drop_disk_watch_entry(entry: DiskWatchEntry) {
+    let DiskWatchEntry {
+        handle,
+        forwarder,
+        canonical_dir: _,
+    } = entry;
+    drop(handle);
+    forwarder.abort();
+}
+
+/// Per-tick reload failure tracking. Tick-driven reload paths in
+/// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`)
+/// route results through `handle_tick_reload_storage`, which records
+/// failures here so the tick loop surfaces a single aggregated
+/// `info_dialog` per failure burst rather than one dialog per tick.
+///
+/// `dialog_acknowledged` latches once the dialog is shown and clears
+/// only after every source returns to healthy, so the user is
+/// notified once per failure burst, not once per tick.
+#[derive(Default)]
+pub(super) struct ReloadFailureState {
+    storage_failed: bool,
+    storage_error: Option<String>,
+    /// Latched description of the most recent watcher-init failure
+    /// (typically `subscribe_channel` returning Err). Surfaced in the
+    /// reload-failure dialog body so the user sees that live propagation
+    /// is degraded for this profile. Cleared on the next successful
+    /// rewire pass for that profile.
+    watcher_init_error: Option<String>,
+    dialog_acknowledged: bool,
+}
+
+impl ReloadFailureState {
+    pub(super) fn record_storage(&mut self, result: &anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                if self.storage_failed {
+                    self.storage_failed = false;
+                    self.storage_error = None;
+                    if !self.has_any_failure() {
+                        self.dialog_acknowledged = false;
+                    }
+                }
+            }
+            Err(e) => {
+                if !self.storage_failed {
+                    self.dialog_acknowledged = false;
+                }
+                self.storage_failed = true;
+                self.storage_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    pub(super) fn record_watcher_init_failure(&mut self, detail: &str) {
+        let was_clear = self.watcher_init_error.is_none();
+        self.watcher_init_error = Some(detail.to_string());
+        if was_clear {
+            self.dialog_acknowledged = false;
+        }
+    }
+
+    pub(super) fn clear_watcher_init_failure(&mut self) {
+        if self.watcher_init_error.is_some() {
+            self.watcher_init_error = None;
+            if !self.has_any_failure() {
+                self.dialog_acknowledged = false;
+            }
+        }
+    }
+
+    pub(super) fn has_any_failure(&self) -> bool {
+        self.storage_failed || self.watcher_init_error.is_some()
+    }
+
+    pub(super) fn has_unacknowledged_failure(&self) -> bool {
+        self.has_any_failure() && !self.dialog_acknowledged
+    }
+
+    pub(super) fn build_dialog_body(&self) -> String {
+        let mut lines: Vec<String> = vec!["The following reload sources are degraded:".to_string()];
+        if let Some(e) = &self.storage_error {
+            lines.push(format!("- Storage: {e}"));
+        }
+        if let Some(e) = &self.watcher_init_error {
+            lines.push(format!("- Watcher init: {e}"));
+        }
+        lines.push(String::new());
+        lines.push("Previous in-memory state preserved; will retry on next tick.".to_string());
+        lines.join("\n")
+    }
+
+    pub(super) fn acknowledge_dialog(&mut self) {
+        self.dialog_acknowledged = true;
+    }
 }
 
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
         available_tools: AvailableTools,
+        file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> anyhow::Result<Self> {
         use crate::session::list_profiles;
 
@@ -849,7 +1002,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new_unwatched(profile_name)?;
+            let storage = Storage::new(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -910,6 +1063,8 @@ impl HomeView {
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
         let view_mode = ViewMode::default();
+
+        let disk_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut view = Self {
             storages,
@@ -1053,6 +1208,10 @@ impl HomeView {
                 .unwrap_or_default(),
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
+            file_watch,
+            disk_dirty,
+            disk_watch_handles: HashMap::new(),
+            reload_failure_state: ReloadFailureState::default(),
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
@@ -1159,26 +1318,42 @@ impl HomeView {
 
         view.flat_items = view.build_flat_items();
         view.update_selected();
+        let initial_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        view.rewire_disk_subscriptions(&initial_profiles)?;
         Ok(view)
     }
 
+    /// Full reload: status-hook config-cache refresh + storage. Used by
+    /// the 5s heartbeat tick and by event-driven sites (attach-return,
+    /// save+reload pairs, profile switch). Watcher-driven ticks call
+    /// `reload_storage_only` because the watcher only fires on
+    /// `sessions.json` / `groups.json`; status-hook config is not
+    /// watched.
     pub fn reload(&mut self) -> anyhow::Result<()> {
+        self.refresh_status_hook_config_cache();
+        self.reload_storage_only()
+    }
+
+    /// Storage-only reload: profile rediscovery + per-profile load + tree
+    /// rebuild + cursor restore. Skips the status-hook config-cache refresh,
+    /// which is driven by the full `reload()` path. Used by the watcher-
+    /// driven tick.
+    pub(super) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
         let mut all_instances = Vec::new();
 
-        // Re-discover profiles in "all" mode
         if self.active_profile.is_none() {
             let current_profiles = list_profiles()?;
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
                     self.storages
-                        .insert(name.clone(), Storage::new_unwatched(name)?);
+                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
                 }
             }
             self.storages.retain(|k, _| current_profiles.contains(k));
+            self.rewire_disk_subscriptions(&current_profiles)?;
         }
-        self.refresh_status_hook_config_cache();
 
         for (profile_name, storage) in &self.storages {
             let (mut instances, groups) = storage.load_with_groups()?;
@@ -1282,6 +1457,155 @@ impl HomeView {
         }
 
         self.update_selected();
+        Ok(())
+    }
+
+    /// Reconcile per-profile file-watch subscriptions against `current`
+    /// via set-diff: drop entries for profiles in `prior - current`,
+    /// keep entries in `prior ∩ current` untouched, install fresh
+    /// entries for profiles in `current - prior`. Same-set rewires are
+    /// a no-op.
+    ///
+    /// Inode-invalidation case (profile dir deleted and recreated under
+    /// the same name): the caller must drop the stale entry first via
+    /// `drop_disk_watch_entry` before invoking this helper, so the name
+    /// is missing from `prior` and the install path runs.
+    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) -> anyhow::Result<()> {
+        use crate::file_watch::{FileMatcher, WatchSpec};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Ok(());
+        }
+
+        let prior: HashSet<String> = self.disk_watch_handles.keys().cloned().collect();
+        let target: HashSet<&String> = current.iter().collect();
+
+        // Detect peer-driven delete-and-recreate of any prior profile dir
+        // by comparing each prior entry's stored canonical_dir against the
+        // current canonical resolution. Mismatch forces a rewire of that
+        // entry even when the name set is unchanged, since notify
+        // NonRecursive watches do not auto-reattach across the inode
+        // change on Linux inotify or macOS FSEvents. Resolve via the
+        // non-creating `get_profile_dir_path`: this is a read-only
+        // existence/canonicalization probe, and `get_profile_dir` would
+        // resurrect a profile dir that a peer just deleted, leaving the
+        // removed profile visible in `list_profiles()` forever.
+        let inode_invalidated: HashSet<String> = prior
+            .iter()
+            .filter(|name| {
+                let entry = match self.disk_watch_handles.get(*name) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let current_canonical = crate::session::get_profile_dir_path(name)
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => canonical != entry.canonical_dir,
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        if prior == current.iter().cloned().collect() && inode_invalidated.is_empty() {
+            return Ok(());
+        }
+
+        // Clear the latch ahead of the install loop. `record_watcher_init_failure`
+        // re-latches it on any `subscribe_channel` Err below, so the latch
+        // reflects the outcome of this rewire pass.
+        self.reload_failure_state.clear_watcher_init_failure();
+
+        let to_remove: Vec<String> = prior
+            .iter()
+            .filter(|n| !target.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+        let to_add: Vec<String> = current
+            .iter()
+            .filter(|n| !prior.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+
+        for name in &to_remove {
+            if let Some(entry) = self.disk_watch_handles.remove(name) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+
+        for name in &to_add {
+            let dir = match crate::session::get_profile_dir(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "skipping subscribe; profile dir resolution failed"
+                    );
+                    continue;
+                }
+            };
+            let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let sessions_path = dir.join("sessions.json");
+            let groups_path = dir.join("groups.json");
+            let spec = WatchSpec {
+                dir: dir.clone(),
+                matcher: FileMatcher::AnyOf(vec![sessions_path, groups_path]),
+                debounce: Some(Duration::from_millis(75)),
+            };
+            match self.file_watch.subscribe_channel(spec, 16) {
+                Ok((mut rx, handle)) => {
+                    use tracing::Instrument;
+                    let dirty = self.disk_dirty.clone();
+                    // Forwarder exits via `rx.recv() = None` when its
+                    // SubscriptionHandle is dropped (rewire / HomeView
+                    // teardown). The TUI has no graceful-drain phase, so
+                    // no `CancellationToken` is plumbed through here.
+                    let span = tracing::debug_span!(
+                        "tui.disk_watch.forwarder",
+                        profile = %name
+                    );
+                    let join = crate::task_util::spawn_supervised(
+                        "tui.disk_watch.forwarder",
+                        crate::task_util::PanicPolicy::Log,
+                        async move {
+                            while rx.recv().await.is_some() {
+                                dirty.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        .instrument(span),
+                    );
+                    self.disk_watch_handles.insert(
+                        name.clone(),
+                        DiskWatchEntry {
+                            handle,
+                            forwarder: join.abort_handle(),
+                            canonical_dir,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "subscribe_channel failed; falling back to 5s heartbeat for this profile"
+                    );
+                    self.reload_failure_state
+                        .record_watcher_init_failure(&format!("{}: {}", name, e));
+                }
+            }
+        }
+        tracing::debug!(
+            target: "tui.file_watch",
+            added = ?to_add,
+            removed = ?to_remove,
+            "reconciled per-profile disk-watch subscriptions"
+        );
         Ok(())
     }
 
@@ -1558,17 +1882,16 @@ impl HomeView {
                 id,
                 session_id,
                 expected_prior.as_deref(),
-                &crate::file_watch::FileWatchService::noop(),
+                &self.file_watch,
             ) {
                 crate::session::SidWrite::Applied => {
                     to_apply.push((id.clone(), session_id.clone()));
                 }
                 crate::session::SidWrite::Skipped => {
                     let mut reloaded = false;
-                    if let Ok(storage) = crate::session::Storage::new(
-                        &profile,
-                        crate::file_watch::FileWatchService::noop(),
-                    ) {
+                    if let Ok(storage) =
+                        crate::session::Storage::new(&profile, self.file_watch.clone())
+                    {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
                                 to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
@@ -2156,7 +2479,7 @@ impl HomeView {
 
                 // Ensure target profile storage exists
                 if !self.storages.contains_key(&target_profile) {
-                    if let Ok(s) = Storage::new_unwatched(&target_profile) {
+                    if let Ok(s) = Storage::new(&target_profile, self.file_watch.clone()) {
                         self.storages.insert(target_profile.clone(), s);
                     }
                 }
@@ -2790,6 +3113,16 @@ impl HomeView {
     /// Pass `None` for all-profiles mode, or `Some(name)` to filter to one profile.
     pub fn switch_profile(&mut self, new_profile: Option<String>) -> anyhow::Result<()> {
         self.active_profile = new_profile;
+        if let Some(profile) = self.active_profile.clone() {
+            if !self.storages.contains_key(&profile) {
+                self.storages.insert(
+                    profile.clone(),
+                    Storage::new(&profile, self.file_watch.clone())?,
+                );
+            }
+            self.storages.retain(|name, _| name == &profile);
+            self.rewire_disk_subscriptions(std::slice::from_ref(&profile))?;
+        }
         // Clear selection before reload so stale session/group refs don't linger
         self.selected_session = None;
         self.selected_group = None;
@@ -2826,7 +3159,7 @@ impl HomeView {
         let mut entries: Vec<ProfileEntry> = profiles
             .iter()
             .map(|name| {
-                let session_count = Storage::new_unwatched(name)
+                let session_count = Storage::new(name, self.file_watch.clone())
                     .and_then(|s| s.load())
                     .map(|instances| instances.len())
                     .unwrap_or(0);
@@ -3602,8 +3935,10 @@ impl HomeView {
         }
 
         if !self.storages.contains_key(target) {
-            self.storages
-                .insert(target.to_string(), Storage::new_unwatched(target)?);
+            self.storages.insert(
+                target.to_string(),
+                Storage::new(target, self.file_watch.clone())?,
+            );
         }
 
         self.pending_deletions

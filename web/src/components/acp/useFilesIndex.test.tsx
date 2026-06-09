@@ -16,12 +16,7 @@ interface Item {
 
 describe("fuzzyFilter", () => {
   it("returns the first cap items unfiltered for an empty query", () => {
-    const items: Item[] = [
-      { label: "a" },
-      { label: "b" },
-      { label: "c" },
-      { label: "d" },
-    ];
+    const items: Item[] = [{ label: "a" }, { label: "b" }, { label: "c" }, { label: "d" }];
     expect(fuzzyFilter(items, "", 2)).toEqual([{ label: "a" }, { label: "b" }]);
   });
 
@@ -41,11 +36,7 @@ describe("fuzzyFilter", () => {
   });
 
   it("breaks score ties by shorter label", () => {
-    const items: Item[] = [
-      { label: "foobarbaz" },
-      { label: "foobar" },
-      { label: "foo" },
-    ];
+    const items: Item[] = [{ label: "foobarbaz" }, { label: "foobar" }, { label: "foo" }];
     const out = fuzzyFilter(items, "foo");
     expect(out.map((i) => i.label)).toEqual(["foo", "foobar", "foobarbaz"]);
   });
@@ -58,11 +49,7 @@ describe("fuzzyFilter", () => {
   });
 
   it("drops items that don't match label or description", () => {
-    const items: Item[] = [
-      { label: "alpha" },
-      { label: "beta", description: "the quick" },
-      { label: "gamma" },
-    ];
+    const items: Item[] = [{ label: "alpha" }, { label: "beta", description: "the quick" }, { label: "gamma" }];
     expect(fuzzyFilter(items, "xyz")).toEqual([]);
   });
 
@@ -104,11 +91,7 @@ describe("useFilesIndex hook", () => {
       json: async () => ({ files: [] }),
     });
     renderHook(() => useFilesIndex("session/with/slash"));
-    await waitFor(() =>
-      expect(fetchSpy).toHaveBeenCalledWith(
-        "/api/sessions/session%2Fwith%2Fslash/acp/files",
-      ),
-    );
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledWith("/api/sessions/session%2Fwith%2Fslash/acp/files"));
   });
 
   it("re-fetches when sessionId changes", async () => {
@@ -121,10 +104,9 @@ describe("useFilesIndex hook", () => {
         ok: true,
         json: async () => ({ files: ["two"] }),
       });
-    const { result, rerender } = renderHook(
-      ({ id }: { id: string }) => useFilesIndex(id),
-      { initialProps: { id: "s-1" } },
-    );
+    const { result, rerender } = renderHook(({ id }: { id: string }) => useFilesIndex(id), {
+      initialProps: { id: "s-1" },
+    });
     await waitFor(() => expect(result.current.files).toEqual(["one"]));
     rerender({ id: "s-2" });
     await waitFor(() => expect(result.current.files).toEqual(["two"]));

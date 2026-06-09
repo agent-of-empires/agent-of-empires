@@ -84,9 +84,7 @@ describe("workspaceLastActivityMs", () => {
         last_accessed_at: "2025-02-01T00:00:00Z",
       }),
     ]);
-    expect(workspaceLastActivityMs(ws)).toBe(
-      Date.parse("2025-03-01T00:00:00Z"),
-    );
+    expect(workspaceLastActivityMs(ws)).toBe(Date.parse("2025-03-01T00:00:00Z"));
   });
 
   it("ignores null timestamps; created_at fallback works", () => {
@@ -97,9 +95,7 @@ describe("workspaceLastActivityMs", () => {
         last_accessed_at: null,
       }),
     ]);
-    expect(workspaceLastActivityMs(ws)).toBe(
-      Date.parse("2025-05-01T00:00:00Z"),
-    );
+    expect(workspaceLastActivityMs(ws)).toBe(Date.parse("2025-05-01T00:00:00Z"));
   });
 
   it("ignores unparseable strings (no NaN poison)", () => {
@@ -110,9 +106,7 @@ describe("workspaceLastActivityMs", () => {
         last_accessed_at: "also-bad",
       }),
     ]);
-    expect(workspaceLastActivityMs(ws)).toBe(
-      Date.parse("2025-04-01T00:00:00Z"),
-    );
+    expect(workspaceLastActivityMs(ws)).toBe(Date.parse("2025-04-01T00:00:00Z"));
   });
 
   it("returns max across every session in a multi-session workspace", () => {
@@ -121,9 +115,7 @@ describe("workspaceLastActivityMs", () => {
       session({ id: "s2", created_at: "2025-06-01T00:00:00Z" }),
       session({ id: "s3", created_at: "2025-03-01T00:00:00Z" }),
     ]);
-    expect(workspaceLastActivityMs(ws)).toBe(
-      Date.parse("2025-06-01T00:00:00Z"),
-    );
+    expect(workspaceLastActivityMs(ws)).toBe(Date.parse("2025-06-01T00:00:00Z"));
   });
 
   it("returns NEGATIVE_INFINITY when no usable timestamp exists", () => {
@@ -140,12 +132,8 @@ describe("workspaceLastActivityMs", () => {
 
 describe("compareWorkspacesByLastActivityDesc", () => {
   it("orders newer activity first", () => {
-    const older = workspace("older", [
-      session({ id: "s1", created_at: "2025-01-01T00:00:00Z" }),
-    ]);
-    const newer = workspace("newer", [
-      session({ id: "s2", created_at: "2025-09-01T00:00:00Z" }),
-    ]);
+    const older = workspace("older", [session({ id: "s1", created_at: "2025-01-01T00:00:00Z" })]);
+    const newer = workspace("newer", [session({ id: "s2", created_at: "2025-09-01T00:00:00Z" })]);
     const list = [older, newer].sort(compareWorkspacesByLastActivityDesc);
     expect(list.map((w) => w.id)).toEqual(["newer", "older"]);
   });
@@ -179,15 +167,9 @@ describe("compareWorkspacesByLastActivityDesc", () => {
 
 describe("repoGroupLastActivityMs", () => {
   it("returns the max across workspaces in the group", () => {
-    const a = workspace("a", [
-      session({ id: "sa", created_at: "2025-01-01T00:00:00Z" }),
-    ]);
-    const b = workspace("b", [
-      session({ id: "sb", created_at: "2025-07-01T00:00:00Z" }),
-    ]);
-    expect(repoGroupLastActivityMs([a, b])).toBe(
-      Date.parse("2025-07-01T00:00:00Z"),
-    );
+    const a = workspace("a", [session({ id: "sa", created_at: "2025-01-01T00:00:00Z" })]);
+    const b = workspace("b", [session({ id: "sb", created_at: "2025-07-01T00:00:00Z" })]);
+    expect(repoGroupLastActivityMs([a, b])).toBe(Date.parse("2025-07-01T00:00:00Z"));
   });
 
   it("returns NEGATIVE_INFINITY on an empty group", () => {
@@ -197,10 +179,7 @@ describe("repoGroupLastActivityMs", () => {
 
 describe("workspaceIsPinned", () => {
   it("returns true when any session has pinned_at set", () => {
-    const ws = workspace("w", [
-      session({ id: "s1" }),
-      session({ id: "s2", pinned_at: "2025-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w", [session({ id: "s1" }), session({ id: "s2", pinned_at: "2025-01-01T00:00:00Z" })]);
     expect(workspaceIsPinned(ws)).toBe(true);
   });
 
@@ -222,10 +201,7 @@ describe("workspaceIsSunk", () => {
   it("returns false when even one session is live", () => {
     // A multi-session workspace with one live session must stay in the
     // active tier rather than sinking the whole group out of sight.
-    const ws = workspace("w", [
-      session({ id: "s1", archived_at: "2025-01-01T00:00:00Z" }),
-      session({ id: "s2" }),
-    ]);
+    const ws = workspace("w", [session({ id: "s1", archived_at: "2025-01-01T00:00:00Z" }), session({ id: "s2" })]);
     expect(workspaceIsSunk(ws)).toBe(false);
   });
 
@@ -283,9 +259,7 @@ describe("workspaceTriageTier", () => {
   });
 
   it("returns 2 (sunk) when every session is archived or snoozed", () => {
-    const ws = workspace("w", [
-      session({ id: "s1", archived_at: "2025-01-01T00:00:00Z" }),
-    ]);
+    const ws = workspace("w", [session({ id: "s1", archived_at: "2025-01-01T00:00:00Z" })]);
     expect(workspaceTriageTier(ws)).toBe(2);
   });
 });
@@ -298,18 +272,14 @@ describe("resolveEffectiveSnoozedUntil", () => {
     // review. `undefined` on the optimistic side means "no override,
     // fall through to the server value."
     expect(resolveEffectiveSnoozedUntil(undefined, null)).toBeNull();
-    expect(
-      resolveEffectiveSnoozedUntil(undefined, "2099-01-01T00:00:00Z"),
-    ).toBe("2099-01-01T00:00:00Z");
+    expect(resolveEffectiveSnoozedUntil(undefined, "2099-01-01T00:00:00Z")).toBe("2099-01-01T00:00:00Z");
   });
 
   it("uses an optimistic string to render the snooze chip pre-PATCH", () => {
     // Regression: clicking a preset must flip the chip immediately,
     // not wait for the round-trip. Optimistic value wins over the
     // (still-null) server prop until the next poll mirrors it.
-    expect(resolveEffectiveSnoozedUntil("2099-01-01T00:00:00Z", null)).toBe(
-      "2099-01-01T00:00:00Z",
-    );
+    expect(resolveEffectiveSnoozedUntil("2099-01-01T00:00:00Z", null)).toBe("2099-01-01T00:00:00Z");
   });
 
   it("uses an explicit null override to hide the chip pre-PATCH on unsnooze", () => {
@@ -317,29 +287,17 @@ describe("resolveEffectiveSnoozedUntil", () => {
     // flight. The optimistic null wins until the server prop also
     // returns null and the clear-on-prop-sync effect drops the
     // override.
-    expect(
-      resolveEffectiveSnoozedUntil(null, "2099-01-01T00:00:00Z"),
-    ).toBeNull();
+    expect(resolveEffectiveSnoozedUntil(null, "2099-01-01T00:00:00Z")).toBeNull();
   });
 });
 
 describe("snoozeTimestampCloseEnough", () => {
   it("treats equal timestamps as a match", () => {
-    expect(
-      snoozeTimestampCloseEnough(
-        "2099-01-01T00:00:00Z",
-        "2099-01-01T00:00:00Z",
-      ),
-    ).toBe(true);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z")).toBe(true);
   });
 
   it("tolerates a 30-second skew", () => {
-    expect(
-      snoozeTimestampCloseEnough(
-        "2099-01-01T00:00:00Z",
-        "2099-01-01T00:00:30Z",
-      ),
-    ).toBe(true);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "2099-01-01T00:00:30Z")).toBe(true);
   });
 
   it("rejects a 5-minute skew (re-snooze case)", () => {
@@ -349,12 +307,7 @@ describe("snoozeTimestampCloseEnough", () => {
     // a 1h re-snooze on a row already sitting on a 1h snooze
     // (where the server hasn't acked the new duration yet) keeps
     // the optimistic chip visible. See #1581 CodeRabbit review.
-    expect(
-      snoozeTimestampCloseEnough(
-        "2099-01-01T00:00:00Z",
-        "2099-01-01T00:05:00Z",
-      ),
-    ).toBe(false);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "2099-01-01T00:05:00Z")).toBe(false);
   });
 
   it("falls back to literal equality for unparseable strings", () => {
@@ -367,29 +320,15 @@ describe("snoozeTimestampCloseEnough", () => {
     // check has 4 outcomes (a/b each parseable or not). The other
     // cases above hit both-finite and both-unparseable; these two
     // exercise the mixed cases so v8 sees every branch leg.
-    expect(
-      snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "not-a-date"),
-    ).toBe(false);
-    expect(
-      snoozeTimestampCloseEnough("not-a-date", "2099-01-01T00:00:00Z"),
-    ).toBe(false);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "not-a-date")).toBe(false);
+    expect(snoozeTimestampCloseEnough("not-a-date", "2099-01-01T00:00:00Z")).toBe(false);
   });
 
   it("rejects exactly at the 2-minute tolerance boundary", () => {
     // Inclusive boundary at 2 minutes (= 120_000 ms). Just-over
     // counts as different snoozes; just-under counts as the same.
-    expect(
-      snoozeTimestampCloseEnough(
-        "2099-01-01T00:00:00Z",
-        "2099-01-01T00:02:00Z",
-      ),
-    ).toBe(true);
-    expect(
-      snoozeTimestampCloseEnough(
-        "2099-01-01T00:00:00Z",
-        "2099-01-01T00:02:00.001Z",
-      ),
-    ).toBe(false);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "2099-01-01T00:02:00Z")).toBe(true);
+    expect(snoozeTimestampCloseEnough("2099-01-01T00:00:00Z", "2099-01-01T00:02:00.001Z")).toBe(false);
   });
 });
 
@@ -431,9 +370,7 @@ describe("compareWorkspacesByLastActivityDesc triage tier", () => {
         archived_at: "2025-09-02T00:00:00Z",
       }),
     ]);
-    const live = workspace("live-older", [
-      session({ id: "sl", created_at: "2025-01-01T00:00:00Z" }),
-    ]);
+    const live = workspace("live-older", [session({ id: "sl", created_at: "2025-01-01T00:00:00Z" })]);
     const list = [archived, live].sort(compareWorkspacesByLastActivityDesc);
     expect(list.map((w) => w.id)).toEqual(["live-older", "archived-newer"]);
   });
@@ -448,20 +385,14 @@ describe("compareWorkspacesByLastActivityDesc triage tier", () => {
         pinned_at: "2025-01-02T00:00:00Z",
       }),
     ]);
-    const live = workspace("live-newer", [
-      session({ id: "sl", created_at: "2025-09-01T00:00:00Z" }),
-    ]);
+    const live = workspace("live-newer", [session({ id: "sl", created_at: "2025-09-01T00:00:00Z" })]);
     const list = [live, pinned].sort(compareWorkspacesByLastActivityDesc);
     expect(list.map((w) => w.id)).toEqual(["pinned-older", "live-newer"]);
   });
 
   it("preserves activity order within the same tier", () => {
-    const livesA = workspace("live-a", [
-      session({ id: "sa", created_at: "2025-09-01T00:00:00Z" }),
-    ]);
-    const livesB = workspace("live-b", [
-      session({ id: "sb", created_at: "2025-01-01T00:00:00Z" }),
-    ]);
+    const livesA = workspace("live-a", [session({ id: "sa", created_at: "2025-09-01T00:00:00Z" })]);
+    const livesB = workspace("live-b", [session({ id: "sb", created_at: "2025-01-01T00:00:00Z" })]);
     const list = [livesB, livesA].sort(compareWorkspacesByLastActivityDesc);
     expect(list.map((w) => w.id)).toEqual(["live-a", "live-b"]);
   });
@@ -469,27 +400,19 @@ describe("compareWorkspacesByLastActivityDesc triage tier", () => {
 
 describe("triageStateOf", () => {
   it("returns 'live' when no flag is set", () => {
-    expect(
-      triageStateOf({ isPinned: false, isArchived: false, isSnoozed: false }),
-    ).toBe("live");
+    expect(triageStateOf({ isPinned: false, isArchived: false, isSnoozed: false })).toBe("live");
   });
 
   it("returns 'pinned' when isPinned is set", () => {
-    expect(
-      triageStateOf({ isPinned: true, isArchived: false, isSnoozed: false }),
-    ).toBe("pinned");
+    expect(triageStateOf({ isPinned: true, isArchived: false, isSnoozed: false })).toBe("pinned");
   });
 
   it("returns 'archived' when only archived is set", () => {
-    expect(
-      triageStateOf({ isPinned: false, isArchived: true, isSnoozed: false }),
-    ).toBe("archived");
+    expect(triageStateOf({ isPinned: false, isArchived: true, isSnoozed: false })).toBe("archived");
   });
 
   it("returns 'snoozed' when only snoozed is set", () => {
-    expect(
-      triageStateOf({ isPinned: false, isArchived: false, isSnoozed: true }),
-    ).toBe("snoozed");
+    expect(triageStateOf({ isPinned: false, isArchived: false, isSnoozed: true })).toBe("snoozed");
   });
 
   it("returns 'archived' when archived + snoozed are both set (no pin)", () => {
@@ -498,9 +421,7 @@ describe("triageStateOf", () => {
     // for a session to be both at once, but workspace aggregators
     // can surface both via different sessions. Archive is the
     // stronger sink so the menu picks it.
-    expect(
-      triageStateOf({ isPinned: false, isArchived: true, isSnoozed: true }),
-    ).toBe("archived");
+    expect(triageStateOf({ isPinned: false, isArchived: true, isSnoozed: true })).toBe("archived");
   });
 
   it("prefers pinned over archived and snoozed (defensive priority)", () => {
@@ -509,12 +430,8 @@ describe("triageStateOf", () => {
     // both via the any-pinned / any-archived aggregators. The state
     // function picks pinned so the menu does not show contradictory
     // toggles.
-    expect(
-      triageStateOf({ isPinned: true, isArchived: true, isSnoozed: false }),
-    ).toBe("pinned");
-    expect(
-      triageStateOf({ isPinned: true, isArchived: false, isSnoozed: true }),
-    ).toBe("pinned");
+    expect(triageStateOf({ isPinned: true, isArchived: true, isSnoozed: false })).toBe("pinned");
+    expect(triageStateOf({ isPinned: true, isArchived: false, isSnoozed: true })).toBe("pinned");
   });
 });
 
@@ -581,9 +498,7 @@ describe("loadSidebarSortMode / saveSidebarSortMode", () => {
 
   it("round-trips 'lastActivity'", () => {
     saveSidebarSortMode("lastActivity");
-    expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe(
-      "lastActivity",
-    );
+    expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe("lastActivity");
     expect(loadSidebarSortMode()).toBe("lastActivity");
   });
 
@@ -613,21 +528,15 @@ describe("repoGroupHasLiveWorkspace", () => {
   it("returns true when at least one workspace is live", () => {
     const g = repoGroup("repo-a", [
       workspace("w-live", [session({})]),
-      workspace("w-archived", [
-        session({ id: "s-arch", archived_at: "2026-01-01T00:00:00Z" }),
-      ]),
+      workspace("w-archived", [session({ id: "s-arch", archived_at: "2026-01-01T00:00:00Z" })]),
     ]);
     expect(repoGroupHasLiveWorkspace(g)).toBe(true);
   });
 
   it("returns false when every workspace is sunk", () => {
     const g = repoGroup("repo-sunk", [
-      workspace("w-archived", [
-        session({ id: "s1", archived_at: "2026-01-01T00:00:00Z" }),
-      ]),
-      workspace("w-snoozed", [
-        session({ id: "s2", snoozed_until: "2099-01-01T00:00:00Z" }),
-      ]),
+      workspace("w-archived", [session({ id: "s1", archived_at: "2026-01-01T00:00:00Z" })]),
+      workspace("w-snoozed", [session({ id: "s2", snoozed_until: "2099-01-01T00:00:00Z" })]),
     ]);
     expect(repoGroupHasLiveWorkspace(g)).toBe(false);
   });
@@ -638,11 +547,7 @@ describe("repoGroupHasLiveWorkspace", () => {
   });
 
   it("flips back to live when a sunk session is unsnoozed/unarchived", () => {
-    const g = repoGroup("repo-flip", [
-      workspace("w", [
-        session({ id: "s", archived_at: "2026-01-01T00:00:00Z" }),
-      ]),
-    ]);
+    const g = repoGroup("repo-flip", [workspace("w", [session({ id: "s", archived_at: "2026-01-01T00:00:00Z" })])]);
     expect(repoGroupHasLiveWorkspace(g)).toBe(false);
     const revived: RepoGroup = {
       ...g,
@@ -653,10 +558,7 @@ describe("repoGroupHasLiveWorkspace", () => {
 
   it("treats a multi-session workspace with one live session as live", () => {
     const g = repoGroup("repo-mixed", [
-      workspace("w-mixed", [
-        session({ id: "s-live" }),
-        session({ id: "s-arch", archived_at: "2026-01-01T00:00:00Z" }),
-      ]),
+      workspace("w-mixed", [session({ id: "s-live" }), session({ id: "s-arch", archived_at: "2026-01-01T00:00:00Z" })]),
     ]);
     expect(repoGroupHasLiveWorkspace(g)).toBe(true);
   });
@@ -664,8 +566,7 @@ describe("repoGroupHasLiveWorkspace", () => {
 
 describe("sessionAttentionRank (#1640)", () => {
   it("ranks live statuses in the TUI attention_tier order", () => {
-    const rank = (status: string) =>
-      sessionAttentionRank(session({ status: status as never }));
+    const rank = (status: string) => sessionAttentionRank(session({ status: status as never }));
     expect(rank("Waiting")).toBe(0);
     expect(rank("Error")).toBe(1);
     expect(rank("Idle")).toBe(2);
@@ -678,16 +579,8 @@ describe("sessionAttentionRank (#1640)", () => {
   });
 
   it("sinks archived and snoozed sessions to rank 99 regardless of status", () => {
-    expect(
-      sessionAttentionRank(
-        session({ status: "Waiting", archived_at: "2026-01-01T00:00:00Z" }),
-      ),
-    ).toBe(99);
-    expect(
-      sessionAttentionRank(
-        session({ status: "Error", snoozed_until: "2999-01-01T00:00:00Z" }),
-      ),
-    ).toBe(99);
+    expect(sessionAttentionRank(session({ status: "Waiting", archived_at: "2026-01-01T00:00:00Z" }))).toBe(99);
+    expect(sessionAttentionRank(session({ status: "Error", snoozed_until: "2999-01-01T00:00:00Z" }))).toBe(99);
   });
 });
 
@@ -717,28 +610,13 @@ describe("workspaceAttentionRank (#1640)", () => {
 
 describe("workspaceIsUrgent / workspaceIsFavorited (#1640)", () => {
   it("is urgent when any session carries the flag", () => {
-    expect(
-      workspaceIsUrgent(
-        workspace("w", [
-          session({ id: "a" }),
-          session({ id: "b", urgent: true }),
-        ]),
-      ),
-    ).toBe(true);
-    expect(workspaceIsUrgent(workspace("w", [session({ id: "a" })]))).toBe(
-      false,
-    );
+    expect(workspaceIsUrgent(workspace("w", [session({ id: "a" }), session({ id: "b", urgent: true })]))).toBe(true);
+    expect(workspaceIsUrgent(workspace("w", [session({ id: "a" })]))).toBe(false);
   });
 
   it("is favorited when any session is favorited", () => {
-    expect(
-      workspaceIsFavorited(
-        workspace("w", [session({ id: "a", favorited: true })]),
-      ),
-    ).toBe(true);
-    expect(workspaceIsFavorited(workspace("w", [session({ id: "a" })]))).toBe(
-      false,
-    );
+    expect(workspaceIsFavorited(workspace("w", [session({ id: "a", favorited: true })]))).toBe(true);
+    expect(workspaceIsFavorited(workspace("w", [session({ id: "a" })]))).toBe(false);
   });
 });
 
@@ -747,9 +625,7 @@ describe("compareWorkspacesByAttention (#1640)", () => {
   // recency key, drives ordering in the pure-rank cases.
   const TS = "2025-06-01T00:00:00Z";
   const wsStatus = (id: string, status: string) =>
-    workspace(id, [
-      session({ id: `${id}-s`, status: status as never, created_at: TS }),
-    ]);
+    workspace(id, [session({ id: `${id}-s`, status: status as never, created_at: TS })]);
 
   function order(list: Workspace[]): string[] {
     return [...list].sort(compareWorkspacesByAttention).map((w) => w.id);
@@ -763,52 +639,30 @@ describe("compareWorkspacesByAttention (#1640)", () => {
       wsStatus("error", "Error"),
       wsStatus("waiting", "Waiting"),
     ];
-    expect(order(list)).toEqual([
-      "waiting",
-      "error",
-      "idle",
-      "running",
-      "stopped",
-    ]);
+    expect(order(list)).toEqual(["waiting", "error", "idle", "running", "stopped"]);
   });
 
   it("promotes an urgent workspace above all non-urgent regardless of status rank", () => {
-    const urgentRunning = workspace("urgent", [
-      session({ id: "u", status: "Running", urgent: true, created_at: TS }),
-    ]);
+    const urgentRunning = workspace("urgent", [session({ id: "u", status: "Running", urgent: true, created_at: TS })]);
     const plainWaiting = wsStatus("waiting", "Waiting");
     expect(order([plainWaiting, urgentRunning])).toEqual(["urgent", "waiting"]);
   });
 
   it("breaks ties within a rank by favorite, then newest activity, then id", () => {
-    const favorited = workspace("fav", [
-      session({ id: "f", status: "Idle", favorited: true, created_at: TS }),
-    ]);
+    const favorited = workspace("fav", [session({ id: "f", status: "Idle", favorited: true, created_at: TS })]);
     const plain = wsStatus("plain", "Idle");
     expect(order([plain, favorited])).toEqual(["fav", "plain"]);
 
-    const newer = workspace("newer", [
-      session({ id: "n", status: "Idle", created_at: "2025-07-01T00:00:00Z" }),
-    ]);
-    const older = workspace("older", [
-      session({ id: "o", status: "Idle", created_at: "2025-01-01T00:00:00Z" }),
-    ]);
+    const newer = workspace("newer", [session({ id: "n", status: "Idle", created_at: "2025-07-01T00:00:00Z" })]);
+    const older = workspace("older", [session({ id: "o", status: "Idle", created_at: "2025-01-01T00:00:00Z" })]);
     expect(order([older, newer])).toEqual(["newer", "older"]);
   });
 
   it("keeps pinned at the top tier and sunk at the bottom tier", () => {
-    const pinned = workspace("pinned", [
-      session({ id: "p", status: "Stopped", pinned_at: TS, created_at: TS }),
-    ]);
+    const pinned = workspace("pinned", [session({ id: "p", status: "Stopped", pinned_at: TS, created_at: TS })]);
     const liveWaiting = wsStatus("waiting", "Waiting");
-    const sunk = workspace("sunk", [
-      session({ id: "s", status: "Waiting", archived_at: TS, created_at: TS }),
-    ]);
-    expect(order([liveWaiting, sunk, pinned])).toEqual([
-      "pinned",
-      "waiting",
-      "sunk",
-    ]);
+    const sunk = workspace("sunk", [session({ id: "s", status: "Waiting", archived_at: TS, created_at: TS })]);
+    expect(order([liveWaiting, sunk, pinned])).toEqual(["pinned", "waiting", "sunk"]);
   });
 
   it("is deterministic when both workspaces have no usable timestamp", () => {
@@ -838,17 +692,11 @@ describe("compareWorkspacesByAttention (#1640)", () => {
 
 describe("compareWorkspacesForComputedSortMode (#1640)", () => {
   it("returns the attention comparator only for attention mode", () => {
-    expect(compareWorkspacesForComputedSortMode("attention")).toBe(
-      compareWorkspacesByAttention,
-    );
-    expect(compareWorkspacesForComputedSortMode("lastActivity")).toBe(
-      compareWorkspacesByLastActivityDesc,
-    );
+    expect(compareWorkspacesForComputedSortMode("attention")).toBe(compareWorkspacesByAttention);
+    expect(compareWorkspacesForComputedSortMode("lastActivity")).toBe(compareWorkspacesByLastActivityDesc);
     // The group/nested axes have no manual order, so manual falls back to
     // last-activity there.
-    expect(compareWorkspacesForComputedSortMode("manual")).toBe(
-      compareWorkspacesByLastActivityDesc,
-    );
+    expect(compareWorkspacesForComputedSortMode("manual")).toBe(compareWorkspacesByLastActivityDesc);
   });
 });
 
@@ -868,9 +716,7 @@ describe("repoGroup attention helpers (#1640)", () => {
         workspace("w2", [session({ id: "b", urgent: true })]),
       ]),
     ).toBe(true);
-    expect(repoGroupIsUrgent([workspace("w1", [session({ id: "a" })])])).toBe(
-      false,
-    );
+    expect(repoGroupIsUrgent([workspace("w1", [session({ id: "a" })])])).toBe(false);
   });
 });
 

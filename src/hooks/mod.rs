@@ -88,6 +88,98 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
         .unwrap_or_else(codex_config_path_display)
 }
 
+/// Resolve the host settings-file path for an agent whose config directory may
+/// be overridden by an environment variable (e.g. Claude's `CLAUDE_CONFIG_DIR`).
+///
+/// When the agent declares a `config_dir_env_var` and that variable is set in
+/// the session's host environment (or, failing that, in AoE's own process env),
+/// the settings file lives directly under that directory using the basename of
+/// `settings_rel_path` (the env var replaces the whole `~/.claude`-style dir,
+/// matching how the agents themselves interpret it). Otherwise it falls back to
+/// the home-relative `settings_rel_path`.
+pub(crate) fn agent_settings_path_for_host_environment(
+    hook_cfg: &crate::agents::AgentHookConfig,
+    host_env: &[String],
+) -> Result<PathBuf> {
+    if let Some(var) = hook_cfg.config_dir_env_var {
+        if let Some(dir) = resolve_config_dir_override(var, host_env) {
+            if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
+                return Ok(PathBuf::from(dir).join(file));
+            }
+        }
+    }
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .join(hook_cfg.settings_rel_path))
+}
+
+/// Display variant of [`agent_settings_path_for_host_environment`] for UI
+/// consent dialogs. Returns the absolute override path when a config-dir env
+/// var is set, otherwise the `~/`-relative default so the displayed path
+/// matches where hooks are actually written.
+pub(crate) fn agent_settings_path_display_for_host_environment(
+    hook_cfg: &crate::agents::AgentHookConfig,
+    host_env: &[String],
+) -> String {
+    if let Some(var) = hook_cfg.config_dir_env_var {
+        if let Some(dir) = resolve_config_dir_override(var, host_env) {
+            if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
+                return PathBuf::from(dir).join(file).display().to_string();
+            }
+        }
+    }
+    format!("~/{}", hook_cfg.settings_rel_path)
+}
+
+/// Resolve a config-dir override env var, preferring an explicit value in the
+/// session's host environment list and falling back to AoE's own env so a var
+/// exported in the shell that launched `aoe` (and thus inherited by the agent)
+/// is honored too. Empty values are treated as unset.
+fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String> {
+    crate::session::environment::resolve_host_environment_value(host_env, var)
+        .or_else(|| std::env::var(var).ok())
+        .filter(|v| !v.is_empty())
+}
+
+/// Enumerate every settings path AoE might have written hooks to for an agent
+/// whose config dir is env-overridable, so uninstall cleans up all of them:
+/// the home-relative default plus the resolution under the global config env
+/// and each profile's env. Mirrors `codex_config_paths_for_uninstall`.
+fn agent_settings_paths_for_uninstall(hook_cfg: &crate::agents::AgentHookConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        push_unique_path(&mut paths, Ok(home.join(hook_cfg.settings_rel_path)));
+    }
+
+    if hook_cfg.config_dir_env_var.is_some() {
+        if let Ok(config) = crate::session::config::Config::load() {
+            push_unique_path(
+                &mut paths,
+                agent_settings_path_for_host_environment(hook_cfg, &config.environment),
+            );
+        }
+        match crate::session::list_profiles() {
+            Ok(profiles) => {
+                for profile in profiles {
+                    let environment =
+                        crate::session::profile_config::resolve_config_or_warn(&profile)
+                            .environment;
+                    push_unique_path(
+                        &mut paths,
+                        agent_settings_path_for_host_environment(hook_cfg, &environment),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "hooks.uninstall", "Failed to list profiles for {} hook cleanup: {}", hook_cfg.settings_rel_path, e)
+            }
+        }
+    }
+
+    paths
+}
+
 /// Build the shell command for a hook that writes a status value.
 ///
 /// The command must never exit non-zero, otherwise the agent treats the hook
@@ -1248,16 +1340,7 @@ pub fn uninstall_all_hooks() {
             let resolved_paths = if agent.name == "codex" {
                 codex_config_paths_for_uninstall()
             } else {
-                match &home {
-                    Some(home) => vec![home.join(hook_cfg.settings_rel_path)],
-                    None => {
-                        tracing::warn!(target: "hooks.uninstall",
-                            "Failed to resolve hooks path for {}: Cannot determine home directory",
-                            agent.name
-                        );
-                        Vec::new()
-                    }
-                }
+                agent_settings_paths_for_uninstall(hook_cfg)
             };
             for settings_path in resolved_paths {
                 let result = if agent.name == "codex" {
@@ -1371,6 +1454,112 @@ mod tests {
                 None => std::env::remove_var("CODEX_HOME"),
             }
         }
+    }
+
+    fn claude_hook_config() -> &'static crate::agents::AgentHookConfig {
+        crate::agents::get_agent("claude")
+            .unwrap()
+            .hook_config
+            .as_ref()
+            .unwrap()
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_defaults_to_home_relative() {
+        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
+        let expected = dirs::home_dir().unwrap().join(".claude/settings.json");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_honors_host_env_override() {
+        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
+        let path =
+            agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
+        // The env var replaces the whole ~/.claude dir; only the basename of
+        // settings_rel_path is appended.
+        assert_eq!(path, PathBuf::from("/home/me/.claude-work/settings.json"));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_host_env_takes_precedence_over_process_env() {
+        // When both are set, the session's profile env wins over AoE's own env.
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/from/process/env");
+        let host_env = vec!["CLAUDE_CONFIG_DIR=/from/host/env".to_string()];
+        let path =
+            agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
+        assert_eq!(path, PathBuf::from("/from/host/env/settings.json"));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_falls_back_to_process_env() {
+        // Not present in the host env list at all, but set in AoE's own env:
+        // the launched agent inherits it, so hooks must follow.
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/claude-proc");
+        let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_display_matches_resolution() {
+        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+
+        // Default: tilde-relative, matching how the path is shown elsewhere.
+        assert_eq!(
+            agent_settings_path_display_for_host_environment(claude_hook_config(), &[]),
+            "~/.claude/settings.json"
+        );
+
+        // Override: absolute path the user will actually see hooks land in.
+        let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
+        assert_eq!(
+            agent_settings_path_display_for_host_environment(claude_hook_config(), &host_env),
+            "/home/me/.claude-work/settings.json"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_agent_settings_path_empty_override_is_ignored() {
+        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let host_env = vec!["CLAUDE_CONFIG_DIR=".to_string()];
+        let path =
+            agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
+        let expected = dirs::home_dir().unwrap().join(".claude/settings.json");
+        assert_eq!(path, expected);
     }
 
     #[test]

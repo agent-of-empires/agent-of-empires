@@ -8,10 +8,7 @@
 
 import { test, expect } from "../../helpers/liveTest";
 
-test("topbar overflow menu signs the user out and returns to LoginPage", async ({
-  servePassphrase,
-  page,
-}) => {
+test("topbar overflow menu signs the user out and returns to LoginPage", async ({ servePassphrase, page }) => {
   if (!servePassphrase.passphrase) {
     throw new Error("servePassphrase fixture must expose passphrase");
   }
@@ -20,9 +17,7 @@ test("topbar overflow menu signs the user out and returns to LoginPage", async (
   await page.locator("input#passphrase").fill(servePassphrase.passphrase);
   await page.locator("button[type=submit]").click();
 
-  await expect(
-    page.getByRole("button", { name: "Go to dashboard" }),
-  ).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("button", { name: "More options" }).click();
   await page.getByRole("menuitem", { name: "Sign out" }).click();

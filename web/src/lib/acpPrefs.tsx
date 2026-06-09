@@ -47,18 +47,8 @@ const DEFAULT_PREFS: AcpPrefs = {
 
 const AcpPrefsContext = createContext<AcpPrefs>(DEFAULT_PREFS);
 
-export function AcpPrefsProvider({
-  value,
-  children,
-}: {
-  value: AcpPrefs;
-  children: ReactNode;
-}) {
-  return (
-    <AcpPrefsContext.Provider value={value}>
-      {children}
-    </AcpPrefsContext.Provider>
-  );
+export function AcpPrefsProvider({ value, children }: { value: AcpPrefs; children: ReactNode }) {
+  return <AcpPrefsContext.Provider value={value}>{children}</AcpPrefsContext.Provider>;
 }
 
 export function useAcpPrefs(): AcpPrefs {

@@ -14,21 +14,13 @@
 // useStreamReveal hook). The primitive replaces both.
 
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import type {
-  CodeHeaderProps,
-  SyntaxHighlighterProps,
-} from "@assistant-ui/react-markdown";
+import type { CodeHeaderProps, SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
 import * as React from "react";
 import { useEffect, useMemo, useState } from "react";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
-import {
-  ensureThemeLoaded,
-  getHighlighter,
-  langKeyForExt,
-  loadLanguage,
-} from "../../lib/highlighter";
+import { ensureThemeLoaded, getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseFileRef } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
@@ -105,11 +97,7 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
  * non-intercepted link (or a middle-click / "open in new tab") still
  * behaves as before.
  */
-function TranscriptLink({
-  href,
-  onClick,
-  ...rest
-}: React.ComponentPropsWithoutRef<"a">) {
+function TranscriptLink({ href, onClick, ...rest }: React.ComponentPropsWithoutRef<"a">) {
   const { onOpenFileRef } = useAcpFileRef();
 
   function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {
@@ -124,15 +112,7 @@ function TranscriptLink({
     onClick?.(e);
   }
 
-  return (
-    <a
-      {...rest}
-      href={href}
-      onClick={handleClick}
-      target="_blank"
-      rel="noopener noreferrer"
-    />
-  );
+  return <a {...rest} href={href} onClick={handleClick} target="_blank" rel="noopener noreferrer" />;
 }
 
 /**
@@ -142,10 +122,7 @@ function TranscriptLink({
  * variant so the notice stands out from the surrounding transcript.
  * Plain agent-emitted blockquotes keep the default muted style.
  */
-function Blockquote({
-  children,
-  ...rest
-}: React.ComponentPropsWithoutRef<"blockquote">) {
+function Blockquote({ children, ...rest }: React.ComponentPropsWithoutRef<"blockquote">) {
   const text = childrenText(children);
   const warn = text.trimStart().startsWith("⚠️");
   return (
@@ -173,10 +150,7 @@ function childrenText(children: React.ReactNode): string {
  * when content is long). Doing this on the bare <table> via
  * `display: block` breaks column sizing.
  */
-function TableWithScroll({
-  children,
-  ...rest
-}: React.ComponentPropsWithoutRef<"table">) {
+function TableWithScroll({ children, ...rest }: React.ComponentPropsWithoutRef<"table">) {
   return (
     <div className="acp-table-wrap">
       <table {...rest}>{children}</table>
@@ -200,10 +174,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
       try {
         const langKey = langKeyForExt(language) ?? language;
         await loadLanguage(langKey);
-        const resolvedTheme = await ensureThemeLoaded(
-          shiki.theme,
-          shiki.appearance,
-        );
+        const resolvedTheme = await ensureThemeLoaded(shiki.theme, shiki.appearance);
         const hl = await getHighlighter();
         if (cancelled) return;
         setHtml(hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }));
@@ -224,11 +195,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
       />
     );
   }
-  return (
-    <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary">
-      {code}
-    </pre>
-  );
+  return <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary">{code}</pre>;
 }
 
 /** Header strip above each code block: language label + copy button. */

@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { RepoGroup } from "../lib/types";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
-import {
-  buildNestedSidebarGroups,
-  type NestedSidebarGroup,
-} from "../lib/sidebarGroups";
+import { buildNestedSidebarGroups, type NestedSidebarGroup } from "../lib/sidebarGroups";
 import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
@@ -51,16 +48,13 @@ export function useNestedSidebarGroups(
 
   // The updater stays pure and persistence runs in an effect, for the same
   // StrictMode double-invoke reason documented in `useSessionGroups`.
-  const toggleSubgroupCollapsed = useCallback(
-    (repoId: string, groupPath: string) => {
-      const key = subgroupKey(repoId, groupPath);
-      setCollapsedMap((prev) => {
-        const current = prev[key] ?? loadCollapsed(key);
-        return { ...prev, [key]: !current };
-      });
-    },
-    [],
-  );
+  const toggleSubgroupCollapsed = useCallback((repoId: string, groupPath: string) => {
+    const key = subgroupKey(repoId, groupPath);
+    setCollapsedMap((prev) => {
+      const current = prev[key] ?? loadCollapsed(key);
+      return { ...prev, [key]: !current };
+    });
+  }, []);
 
   useEffect(() => {
     for (const [key, collapsed] of Object.entries(collapsedMap)) {

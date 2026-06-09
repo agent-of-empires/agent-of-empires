@@ -40,10 +40,7 @@ async function setupAndOpenSession(page: Page) {
   await page.reload();
   await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page
-    .locator(".xterm")
-    .first()
-    .waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function openPicker(page: Page) {
@@ -55,9 +52,7 @@ async function openPicker(page: Page) {
 }
 
 test.describe("Mobile right panel picker (#1452)", () => {
-  test("picker promotes the paired terminal and it survives the keyboard", async ({
-    page,
-  }) => {
+  test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
     await setupAndOpenSession(page);
     await openPicker(page);
 
@@ -79,9 +74,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
       .toBeGreaterThan(150);
   });
 
-  test("picker promotes the diff view, opens a file, and the back chip returns to the agent", async ({
-    page,
-  }) => {
+  test("picker promotes the diff view, opens a file, and the back chip returns to the agent", async ({ page }) => {
     await mockTerminalApis(page);
     // Seed one changed file so the diff list has a row to tap; tapping it
     // promotes the full-screen file viewer into the same pane.
@@ -105,10 +98,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await page.goto("/");
     await openMobileSidebar(page);
     await clickSidebarSession(page, "pinch-test");
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
 
     await openPicker(page);
     await page.getByTestId("mobile-right-panel-pick-diff").click();
@@ -130,9 +120,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await expect(page.locator(".xterm").first()).toBeVisible();
   });
 
-  test("agent and paired terminals stay mounted across view switches", async ({
-    page,
-  }) => {
+  test("agent and paired terminals stay mounted across view switches", async ({ page }) => {
     await setupAndOpenSession(page);
 
     await openPicker(page);
@@ -153,16 +141,11 @@ test.describe("Mobile right panel picker (#1452)", () => {
 test.describe("Desktop right panel split is unchanged (#1452)", () => {
   test.use({ viewport: { width: 1400, height: 900 }, hasTouch: false });
 
-  test("renders the side-by-side split, not the mobile picker", async ({
-    page,
-  }) => {
+  test("renders the side-by-side split, not the mobile picker", async ({ page }) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
-    await page
-      .locator(".xterm")
-      .first()
-      .waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".xterm").first().waitFor({ state: "visible", timeout: 10_000 });
 
     // The desktop split renders the resize handle and never the picker.
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
@@ -212,15 +195,11 @@ async function setupAcpSession(page: Page) {
   await clickSidebarSession(page, "acp-mobile");
   // Structured view sessions render no xterm in the structured view; wait for the
   // right-panel toggle, which only appears once a session is active.
-  await page
-    .getByRole("button", { name: "Toggle diff panel" })
-    .waitFor({ state: "visible", timeout: 10_000 });
+  await page.getByRole("button", { name: "Toggle diff panel" }).waitFor({ state: "visible", timeout: 10_000 });
 }
 
 test.describe("Mobile picker on a structured view session (#1452)", () => {
-  test("promotes the paired shell over a structured view session and survives the keyboard", async ({
-    page,
-  }) => {
+  test("promotes the paired shell over a structured view session and survives the keyboard", async ({ page }) => {
     await setupAcpSession(page);
     await openPicker(page);
 

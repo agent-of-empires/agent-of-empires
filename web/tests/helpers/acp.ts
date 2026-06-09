@@ -1,9 +1,4 @@
-import {
-  expect,
-  type Locator,
-  type Page,
-  type TestInfo,
-} from "@playwright/test";
+import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -13,10 +8,7 @@ import { join } from "node:path";
  *  supervisor + runner logs in test failure messages, since the
  *  structured view/enable endpoint returns 200 even when the background spawn
  *  task wedges or fails. */
-function readDebugLogTail(
-  home: string | undefined,
-  tailBytes = 8_000,
-): string | null {
+function readDebugLogTail(home: string | undefined, tailBytes = 8_000): string | null {
   if (!home) return null;
   // Linux: debug.log lives under $XDG_CONFIG_HOME (the harness sets
   // this to `${home}/config`). macOS/Windows: under
@@ -31,8 +23,7 @@ function readDebugLogTail(
   try {
     const content = readFileSync(path, "utf8");
     return content.length > tailBytes
-      ? `... (${content.length - tailBytes} bytes elided)\n` +
-          content.slice(-tailBytes)
+      ? `... (${content.length - tailBytes} bytes elided)\n` + content.slice(-tailBytes)
       : content;
   } catch {
     return null;
@@ -70,13 +61,8 @@ function readDebugLogTail(
  * Default timeout is 15s; the local happy-path completes in well under
  * 1s, so 15s only kicks in on contended CI runners.
  */
-async function fetchReplayFrames(
-  baseUrl: string,
-  sessionId: string,
-): Promise<unknown[]> {
-  const replay = await fetch(
-    `${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
-  ).then((r) => r.json());
+async function fetchReplayFrames(baseUrl: string, sessionId: string): Promise<unknown[]> {
+  const replay = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`).then((r) => r.json());
   if (Array.isArray(replay)) return replay;
   return (replay?.frames as unknown[]) ?? [];
 }
@@ -94,8 +80,7 @@ function findStartupError(frames: unknown[]): string | null {
     if (typeof f !== "object" || f == null) continue;
     const event = (f as { event?: unknown }).event;
     if (event && typeof event === "object" && "AgentStartupError" in event) {
-      const err = (event as { AgentStartupError?: { message?: string } })
-        .AgentStartupError;
+      const err = (event as { AgentStartupError?: { message?: string } }).AgentStartupError;
       return err?.message ?? "AgentStartupError (no message)";
     }
   }
@@ -115,10 +100,7 @@ export async function waitForAcpReady(
           const frames = await fetchReplayFrames(baseUrl, sessionId);
           const startupErr = findStartupError(frames);
           if (startupErr) {
-            throw new Error(
-              `acp_enable spawn failed: ${startupErr} ` +
-                `(frames=${frames.length})`,
-            );
+            throw new Error(`acp_enable spawn failed: ${startupErr} ` + `(frames=${frames.length})`);
           }
           return frames.length;
         },
@@ -146,18 +128,16 @@ export async function waitForAcpReady(
           const res = await fetch(`${baseUrl}/api/sessions`);
           if (!res.ok) return "fetch-failed";
           const body = await res.json();
-          const sessions: Array<{ id: string; acp_worker_state?: string }> =
-            Array.isArray(body) ? body : (body.sessions ?? []);
+          const sessions: Array<{ id: string; acp_worker_state?: string }> = Array.isArray(body)
+            ? body
+            : (body.sessions ?? []);
           const me = sessions.find((s) => s.id === sessionId);
           const state = me?.acp_worker_state ?? "absent";
           if (state === "absent") {
             const frames = await fetchReplayFrames(baseUrl, sessionId);
             const startupErr = findStartupError(frames);
             if (startupErr) {
-              throw new Error(
-                `acp_enable spawn failed: ${startupErr} ` +
-                  `(frames=${frames.length})`,
-              );
+              throw new Error(`acp_enable spawn failed: ${startupErr} ` + `(frames=${frames.length})`);
             }
           }
           return state;
@@ -171,12 +151,8 @@ export async function waitForAcpReady(
     // value, which makes a "stuck absent" indistinguishable from a
     // misrouted poll. Surface what the server actually said.
     const frames = await fetchReplayFrames(baseUrl, sessionId).catch(() => []);
-    const sessionsRes = await fetch(`${baseUrl}/api/sessions`).catch(
-      () => null,
-    );
-    const sessionsBody = sessionsRes
-      ? await sessionsRes.json().catch(() => null)
-      : null;
+    const sessionsRes = await fetch(`${baseUrl}/api/sessions`).catch(() => null);
+    const sessionsBody = sessionsRes ? await sessionsRes.json().catch(() => null) : null;
     const summary = JSON.stringify(
       {
         sessionId,
@@ -223,16 +199,10 @@ export async function waitForReplayContains(
   await expect
     .poll(
       async () => {
-        const replay = await fetch(
-          `${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`,
-        ).then((r) => r.json());
-        const frames: unknown[] = Array.isArray(replay)
-          ? replay
-          : (replay?.frames ?? []);
+        const replay = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/replay?since=0`).then((r) => r.json());
+        const frames: unknown[] = Array.isArray(replay) ? replay : (replay?.frames ?? []);
         const json = JSON.stringify(frames);
-        return mode === "all"
-          ? list.every((n) => json.includes(n))
-          : list.some((n) => json.includes(n));
+        return mode === "all" ? list.every((n) => json.includes(n)) : list.some((n) => json.includes(n));
       },
       { timeout, intervals: [100, 200, 500, 1000] },
     )
@@ -255,9 +225,7 @@ export async function enableStructuredViewAndWait(
     method: "POST",
   });
   if (!res.ok) {
-    throw new Error(
-      `structured view enable failed: status=${res.status} body=${await res.text()}`,
-    );
+    throw new Error(`structured view enable failed: status=${res.status} body=${await res.text()}`);
   }
   await waitForAcpReady(baseUrl, sessionId, timeoutMs, home);
 }
@@ -277,10 +245,7 @@ export async function enableStructuredViewAndWait(
  * structured view chunks (`App.tsx` dynamic `import("./components/acp/StructuredView")`)
  * may add a short delay on first navigation.
  */
-export async function waitForStructuredView(
-  page: Page,
-  timeoutMs = 15_000,
-): Promise<void> {
+export async function waitForStructuredView(page: Page, timeoutMs = 15_000): Promise<void> {
   await expect(
     page.getByRole("textbox", {
       name: /Send a message|Queue a follow-up/i,
@@ -295,12 +260,7 @@ export async function waitForStructuredView(
  * unambiguous selector walks from the label up to that wrapper.
  */
 export function settingsSelectByLabel(page: Page, labelText: string): Locator {
-  return page
-    .locator("label")
-    .filter({ hasText: labelText })
-    .locator("xpath=..")
-    .locator("select")
-    .first();
+  return page.locator("label").filter({ hasText: labelText }).locator("xpath=..").locator("select").first();
 }
 
 /**
@@ -308,10 +268,7 @@ export function settingsSelectByLabel(page: Page, labelText: string): Locator {
  * label text matches the given string. Same structure as
  * settingsSelectByLabel.
  */
-export function settingsNumberInputByLabel(
-  page: Page,
-  labelText: string,
-): Locator {
+export function settingsNumberInputByLabel(page: Page, labelText: string): Locator {
   return page
     .locator("label")
     .filter({ hasText: labelText })
@@ -321,10 +278,7 @@ export function settingsNumberInputByLabel(
 }
 
 /** Click a top-level SettingsView tab by its visible label. */
-export async function openSettingsTab(
-  page: Page,
-  label: string,
-): Promise<void> {
+export async function openSettingsTab(page: Page, label: string): Promise<void> {
   await page.getByRole("button", { name: label, exact: true }).click();
 }
 
@@ -369,10 +323,7 @@ export async function waitForSettingsLoaded(page: Page): Promise<void> {
  * cause (fake-ACP EPIPE, runner SIGTERM, daemon reap, etc.) shows
  * up in those two logs but vanishes with the home dir.
  */
-export async function attachServeDiagnostics(
-  testInfo: TestInfo,
-  serve: { home: string },
-): Promise<void> {
+export async function attachServeDiagnostics(testInfo: TestInfo, serve: { home: string }): Promise<void> {
   // Always attach. Both `testInfo.status` and `testInfo.errors` are
   // populated only AFTER the test function returns and all hooks run;
   // they are empty/undefined when called from the test body's
@@ -395,10 +346,7 @@ export async function attachServeDiagnostics(
     try {
       const content = readFileSync(debugLog, "utf8");
       const tail =
-        content.length > 64_000
-          ? `... (${content.length - 64_000} bytes elided)\n` +
-            content.slice(-64_000)
-          : content;
+        content.length > 64_000 ? `... (${content.length - 64_000} bytes elided)\n` + content.slice(-64_000) : content;
       await testInfo.attach("debug.log", {
         body: tail,
         contentType: "text/plain",
@@ -453,10 +401,5 @@ export function wizardScope(page: Page): Locator {
  * SessionStep field layout and FormFields TextField.
  */
 export function inputByLabel(page: Page, labelText: string): Locator {
-  return page
-    .locator("label")
-    .filter({ hasText: labelText })
-    .locator("xpath=..")
-    .locator('input[type="text"]')
-    .first();
+  return page.locator("label").filter({ hasText: labelText }).locator("xpath=..").locator('input[type="text"]').first();
 }

@@ -8,32 +8,15 @@ import { Page } from "@playwright/test";
 // wizard-base-branch.spec.ts (#948). Don't duplicate those here.
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "profiles",
-    "groups",
-    "devices",
-    "about",
-    "system/update-status",
-  ]) {
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  for (const path of ["settings", "themes", "profiles", "groups", "devices", "about", "system/update-status"]) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
-        json:
-          path === "settings" ||
-          path === "about" ||
-          path === "system/update-status"
-            ? {}
-            : [],
+        json: path === "settings" || path === "about" || path === "system/update-status" ? {} : [],
       }),
     );
   }
-  await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: false, runtime: null } }),
-  );
+  await page.route("**/api/docker/status", (r) => r.fulfill({ json: { available: false, runtime: null } }));
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [
@@ -82,13 +65,8 @@ async function mockApis(page: Page) {
 async function openSessionStep(page: Page) {
   await page.locator("body").click();
   await page.keyboard.press("n");
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
-  const recent = page
-    .getByRole("button")
-    .filter({ hasText: "/tmp/example" })
-    .first();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+  const recent = page.getByRole("button").filter({ hasText: "/tmp/example" }).first();
   await recent.waitFor({ state: "visible", timeout: 5000 });
   await recent.click();
   const next = page.getByRole("button", { name: "Next" });
@@ -106,9 +84,7 @@ async function expandAdvanced(page: Page) {
 }
 
 test.describe("Wizard session step (#1219)", () => {
-  test("title input is empty by default and updates as the user types", async ({
-    page,
-  }) => {
+  test("title input is empty by default and updates as the user types", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -119,9 +95,7 @@ test.describe("Wizard session step (#1219)", () => {
     await expect(titleInput).toHaveValue("my-feature");
   });
 
-  test("worktree toggle is on by default and gates the branch input + Base branch section", async ({
-    page,
-  }) => {
+  test("worktree toggle is on by default and gates the branch input + Base branch section", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -132,43 +106,29 @@ test.describe("Wizard session step (#1219)", () => {
     });
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "true");
     // Branch input visible while worktree is on.
-    await expect(
-      page.getByPlaceholder("Uses session title if empty"),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Base branch" }),
-    ).toBeVisible();
+    await expect(page.getByPlaceholder("Uses session title if empty")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
     // Flip off: branch input + Base branch picker disappear. The outer
     // Advanced disclosure stays open.
     await worktreeToggle.click();
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "false");
-    await expect(
-      page.getByPlaceholder("Uses session title if empty"),
-    ).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(
-      0,
-    );
+    await expect(page.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
-  test("branch input mirrors the slugified title while not manually edited", async ({
-    page,
-  }) => {
+  test("branch input mirrors the slugified title while not manually edited", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
-    await page
-      .getByPlaceholder("Auto-generated if empty")
-      .fill("My Cool Feature");
+    await page.getByPlaceholder("Auto-generated if empty").fill("My Cool Feature");
     await expandAdvanced(page);
     const branchInput = page.getByPlaceholder("Uses session title if empty");
     // SET_FIELD on title cascades into worktreeBranch via slugifyBranch().
     await expect(branchInput).toHaveValue("my-cool-feature");
   });
 
-  test("submit sends worktree_branch + create_new_branch with Advanced left closed (#1514)", async ({
-    page,
-  }) => {
+  test("submit sends worktree_branch + create_new_branch with Advanced left closed (#1514)", async ({ page }) => {
     await mockApis(page);
     let captured: {
       worktree_branch?: string;
@@ -219,9 +179,7 @@ test.describe("Wizard session step (#1219)", () => {
     expect(captured?.create_new_branch).toBe(true);
   });
 
-  test("group input propagates to the create-session POST body", async ({
-    page,
-  }) => {
+  test("group input propagates to the create-session POST body", async ({ page }) => {
     await mockApis(page);
     let captured: { group?: string } | null = null;
     await page.route("**/api/sessions", (r) => {
@@ -259,65 +217,41 @@ test.describe("Wizard session step (#1219)", () => {
     await page.goto("/");
     await openSessionStep(page);
     await expandAdvanced(page);
-    await page
-      .getByPlaceholder("Optional, for organizing related sessions")
-      .fill("backend");
+    await page.getByPlaceholder("Optional, for organizing related sessions").fill("backend");
     await page.getByRole("button", { name: /Next/ }).click();
     await page.getByRole("button", { name: /Next/ }).click();
     await page.getByRole("button", { name: /Launch session/ }).click();
     await expect.poll(() => captured?.group).toBe("backend");
   });
 
-  test("only the title input and Advanced toggle are visible by default (#1514)", async ({
-    page,
-  }) => {
+  test("only the title input and Advanced toggle are visible by default (#1514)", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
     // Title input + Advanced disclosure are the only controls on screen.
-    await expect(
-      page.getByPlaceholder("Auto-generated if empty"),
-    ).toBeVisible();
+    await expect(page.getByPlaceholder("Auto-generated if empty")).toBeVisible();
     await expect(page.getByRole("button", { name: "Advanced" })).toBeVisible();
     // Everything else is folded away.
     await expect(page.getByRole("switch")).toHaveCount(0);
-    await expect(
-      page.getByPlaceholder("Uses session title if empty"),
-    ).toHaveCount(0);
-    await expect(
-      page.getByPlaceholder("Optional, for organizing related sessions"),
-    ).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(
-      0,
-    );
+    await expect(page.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
+    await expect(page.getByPlaceholder("Optional, for organizing related sessions")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
   });
 
-  test("expanding Advanced reveals the worktree toggle, branch, attach toggle, and group (#1514)", async ({
-    page,
-  }) => {
+  test("expanding Advanced reveals the worktree toggle, branch, attach toggle, and group (#1514)", async ({ page }) => {
     await mockApis(page);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openSessionStep(page);
     await expandAdvanced(page);
     // Worktree toggle defaults on even though it was hidden.
-    await expect(
-      page.getByRole("switch", { name: /Create a worktree/ }),
-    ).toHaveAttribute("aria-checked", "true");
-    await expect(
-      page.getByPlaceholder("Uses session title if empty"),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("switch", { name: /Attach to existing branch/ }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Base branch" }),
-    ).toBeVisible();
+    await expect(page.getByRole("switch", { name: /Create a worktree/ })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByPlaceholder("Uses session title if empty")).toBeVisible();
+    await expect(page.getByRole("switch", { name: /Attach to existing branch/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Base branch" })).toBeVisible();
     // Group input is visible and editable.
-    const groupInput = page.getByPlaceholder(
-      "Optional, for organizing related sessions",
-    );
+    const groupInput = page.getByPlaceholder("Optional, for organizing related sessions");
     await expect(groupInput).toBeVisible();
     await groupInput.fill("backend");
     await expect(groupInput).toHaveValue("backend");

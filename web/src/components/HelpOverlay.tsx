@@ -1,9 +1,4 @@
-import {
-  IS_MAC,
-  SHORTCUTS,
-  SHORTCUTS_BY_ID,
-  formatHelpShortcut,
-} from "../lib/shortcuts";
+import { IS_MAC, SHORTCUTS, SHORTCUTS_BY_ID, formatHelpShortcut } from "../lib/shortcuts";
 
 interface Props {
   onClose: () => void;
@@ -33,29 +28,21 @@ export function HelpOverlay({ onClose }: Props) {
   }));
 
   return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
-      onClick={onClose}
-    >
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in" onClick={onClose}>
       <div
         className="bg-surface-800 border border-surface-700/50 rounded-lg w-[480px] max-w-[90vw] shadow-2xl animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700">
           <h2 className="text-sm font-semibold text-text-bright">Help</h2>
-          <button
-            onClick={onClose}
-            className="text-text-muted hover:text-text-secondary cursor-pointer"
-          >
+          <button onClick={onClose} className="text-text-muted hover:text-text-secondary cursor-pointer">
             &times;
           </button>
         </div>
 
         <div className="p-5">
           <div className="mb-5">
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">
-              Dashboard
-            </h3>
+            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Dashboard</h3>
             <div className="space-y-1">
               {shortcuts.map((s) => (
                 <div key={s.key} className="flex items-center gap-3">
@@ -69,9 +56,7 @@ export function HelpOverlay({ onClose }: Props) {
           </div>
 
           <div className="mb-5">
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">
-              Terminal
-            </h3>
+            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Terminal</h3>
             <div className="space-y-1">
               {TERMINAL_SHORTCUTS.map((s) => (
                 <div key={s.key} className="flex items-center gap-3">
@@ -85,9 +70,7 @@ export function HelpOverlay({ onClose }: Props) {
           </div>
 
           <div>
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">
-              Mobile gestures
-            </h3>
+            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Mobile gestures</h3>
             <div className="space-y-1">
               {MOBILE_GESTURES.map((g) => (
                 <div key={g.key} className="flex items-center gap-3">
@@ -104,8 +87,7 @@ export function HelpOverlay({ onClose }: Props) {
         <div className="px-5 py-3 border-t border-surface-700">
           <p className="text-sm text-text-dim">
             Single-key shortcuts are disabled when typing in inputs.{" "}
-            {formatHelpShortcut(SHORTCUTS_BY_ID.palette.chord, IS_MAC)} works
-            everywhere.
+            {formatHelpShortcut(SHORTCUTS_BY_ID.palette.chord, IS_MAC)} works everywhere.
           </p>
         </div>
       </div>

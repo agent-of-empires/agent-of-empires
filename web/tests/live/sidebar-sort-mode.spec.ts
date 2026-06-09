@@ -27,11 +27,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  spawnAoeServe,
-  listSessions,
-  resolveAoeBinary,
-} from "../helpers/aoeServe";
+import { spawnAoeServe, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 
 interface SeededSession {
   dir: string;
@@ -39,14 +35,7 @@ interface SeededSession {
 }
 
 function seedSequentialSessions(sessions: SeededSession[]) {
-  return async ({
-    home,
-    env,
-  }: {
-    home: string;
-    shimBin: string;
-    env: NodeJS.ProcessEnv;
-  }) => {
+  return async ({ home, env }: { home: string; shimBin: string; env: NodeJS.ProcessEnv }) => {
     const binary = resolveAoeBinary();
     for (let i = 0; i < sessions.length; i++) {
       const { dir, title } = sessions[i]!;
@@ -63,11 +52,7 @@ function seedSequentialSessions(sessions: SeededSession[]) {
           GIT_COMMITTER_EMAIL: "t@t",
         },
       });
-      const res = spawnSync(
-        binary,
-        ["add", projectDir, "-t", title, "-c", "claude"],
-        { env },
-      );
+      const res = spawnSync(binary, ["add", projectDir, "-t", title, "-c", "claude"], { env });
       if (res.status !== 0) {
         throw new Error(
           `aoe add failed for ${title}: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`,
@@ -82,24 +67,15 @@ function seedSequentialSessions(sessions: SeededSession[]) {
 
 async function readWorkspaceTitles(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
-    const rows = Array.from(
-      document.querySelectorAll<HTMLAnchorElement>(
-        "[data-testid='sidebar-session-row']",
-      ),
-    );
-    return rows
-      .map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "")
-      .filter(Boolean);
+    const rows = Array.from(document.querySelectorAll<HTMLAnchorElement>("[data-testid='sidebar-session-row']"));
+    return rows.map((a) => a.querySelector("[title]")?.getAttribute("title") ?? "").filter(Boolean);
   });
 }
 
 const TOGGLE = "[data-testid='sidebar-sort-toggle']";
 
 // The control is a dropdown picker: open it, then click the labeled option.
-async function selectSortMode(
-  page: import("@playwright/test").Page,
-  mode: string,
-) {
+async function selectSortMode(page: import("@playwright/test").Page, mode: string) {
   await page.locator(TOGGLE).click();
   await page.locator(`[data-testid='sidebar-sort-option-${mode}']`).click();
   await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", mode);
@@ -130,10 +106,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
         // bump the first paint waits, matching sidebar-groups.spec.ts.
         const rows = page.locator("[data-testid='sidebar-session-row']");
         await expect(rows).toHaveCount(3, { timeout: 10_000 });
-        await expect(page.locator(TOGGLE)).toHaveAttribute(
-          "data-sort-mode",
-          "manual",
-        );
+        await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "manual");
 
         // Capture the manual-mode order. With three brand-new sessions
         // and no prior drag, the workspace_ordering file is prepended
@@ -142,11 +115,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
         // last-activity outcome. We assert against the toggle's effect,
         // not against a specific manual ordering, by capturing it.
         const manualOrder = await readWorkspaceTitles(page);
-        expect(manualOrder.sort()).toEqual([
-          "middle-session",
-          "newest-session",
-          "oldest-session",
-        ]);
+        expect(manualOrder.sort()).toEqual(["middle-session", "newest-session", "oldest-session"]);
 
         await selectSortMode(page, "lastActivity");
 
@@ -158,10 +127,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
         // even against the live server.
         await page.reload();
         await expect(rows).toHaveCount(3, { timeout: 10_000 });
-        await expect(page.locator(TOGGLE)).toHaveAttribute(
-          "data-sort-mode",
-          "lastActivity",
-        );
+        await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "lastActivity");
         await expect
           .poll(() => readWorkspaceTitles(page), { timeout: 5000 })
           .toEqual(["newest-session", "middle-session", "oldest-session"]);
@@ -172,9 +138,7 @@ base.describe("sidebar sort picker live (#1418, #1640)", () => {
         // this proves the third mode boots against the real server.
         await selectSortMode(page, "attention");
         await expect(rows).toHaveCount(3, { timeout: 5000 });
-        const storedAttention = await page.evaluate(() =>
-          window.localStorage.getItem("aoe-sidebar-sort-mode"),
-        );
+        const storedAttention = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
         expect(storedAttention).toBe("attention");
 
         // Back to manual: returns to whatever the server has as manual

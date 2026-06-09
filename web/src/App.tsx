@@ -1,12 +1,4 @@
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
@@ -26,10 +18,7 @@ import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
-import {
-  clearStoredComments,
-  sweepOrphanComments,
-} from "./components/diff/comments/storage";
+import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -51,19 +40,11 @@ import {
   updateWorkspaceOrdering,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
-import {
-  IdleDecayWindowContext,
-  parseIdleDecayWindowMs,
-  useIdleDecayWindowMs,
-} from "./lib/idleDecay";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
-import {
-  dispatchFocusTerminal,
-  requestSessionInputFocus,
-  setPendingTerminalFocus,
-} from "./lib/terminalFocus";
+import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { TopBar } from "./components/TopBar";
@@ -97,11 +78,7 @@ import type { SessionResponse } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
-import {
-  LOGIN_REQUIRED_EVENT,
-  TOKEN_EXPIRED_EVENT,
-  resetTokenExpired,
-} from "./lib/fetchInterceptor";
+import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
 import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
@@ -124,14 +101,12 @@ export default function App() {
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
-  const [idleDecayWindowMs, setIdleDecayWindowMs] =
-    useState(IDLE_DECAY_WINDOW_MS);
+  const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
     window.addEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
-    return () =>
-      window.removeEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
+    return () => window.removeEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
   }, []);
 
   // Clearing tokenExpired here matters: the render order below shows
@@ -144,8 +119,7 @@ export default function App() {
       setLoginAuthenticated(false);
     };
     window.addEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
-    return () =>
-      window.removeEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
+    return () => window.removeEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
   }, []);
 
   useEffect(() => {
@@ -218,13 +192,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
-function AppContent({
-  loginRequired,
-  onLogout,
-}: {
-  loginRequired: boolean;
-  onLogout: () => void;
-}) {
+function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
@@ -289,30 +257,22 @@ function AppContent({
     updateRepoAppearance,
     reorderRepoGroups,
   } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
-    workspaces,
-    sidebarSortMode,
-  );
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode);
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
-  const { groups: nestedGroups, toggleSubgroupCollapsed } =
-    useNestedSidebarGroups(repoGroups, sidebarSortMode);
+  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(repoGroups, sidebarSortMode);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
   // that shape. Collapse routing follows the active axis so the two
   // axes keep independent collapse state. See #1234.
   const sidebarGroups = useMemo(
-    () =>
-      sidebarAxis === "group"
-        ? sessionGroups
-        : repoGroups.map(repoGroupToSidebarGroup),
+    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
     [sidebarAxis, sessionGroups, repoGroups],
   );
-  const toggleSidebarGroup =
-    sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -367,20 +327,14 @@ function AppContent({
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(
-    () => window.innerWidth >= 768,
-  );
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
 
   const activeWorkspace = useMemo(() => {
     if (!activeSessionId) return undefined;
-    return workspaces.find((w) =>
-      w.sessions.some((s) => s.id === activeSessionId),
-    );
+    return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
-  const activeSession = activeWorkspace?.sessions.find(
-    (s) => s.id === activeSessionId,
-  );
+  const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
@@ -399,8 +353,7 @@ function AppContent({
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
-  const commentSendEnabled =
-    commentsEnabled && activeSession?.acp_worker_state === "running";
+  const commentSendEnabled = commentsEnabled && activeSession?.acp_worker_state === "running";
   const commentSendDisabledReason = !commentsEnabled
     ? "Diff comments require an acp session"
     : "Acp worker is not running";
@@ -410,9 +363,7 @@ function AppContent({
   useEffect(() => {
     if (!commentSendEnabled) return;
     const onKey = (e: KeyboardEvent) => {
-      if (
-        !((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")
-      ) {
+      if (!((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")) {
         return;
       }
       if (isInsideEditable(e.target)) return;
@@ -439,12 +390,7 @@ function AppContent({
 
   // Inline derivation for diffFiles validation: if the selected file is no
   // longer in the diff, clear the selection.
-  if (
-    activeSessionId &&
-    selectedFilePath &&
-    !diffFilesLoading &&
-    !diffFiles.some((f) => f.path === selectedFilePath)
-  ) {
+  if (activeSessionId && selectedFilePath && !diffFilesLoading && !diffFiles.some((f) => f.path === selectedFilePath)) {
     setSelectedFile(null);
   }
 
@@ -458,9 +404,7 @@ function AppContent({
   // but a resize nudge re-runs the xterm fit so the grid matches exactly.
   useEffect(() => {
     if (!singlePane) return;
-    const id = requestAnimationFrame(() =>
-      window.dispatchEvent(new Event("resize")),
-    );
+    const id = requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
     return () => cancelAnimationFrame(id);
   }, [singlePane, rightPanelView]);
 
@@ -476,16 +420,13 @@ function AppContent({
   // requestSessionInputFocus for the dispatch/latch and coarse-pointer rules.
   const isCoarse = useIsCoarsePointer();
   const focusAgentInput = useCallback(
-    (session: SessionResponse | undefined) =>
-      requestSessionInputFocus(session, isCoarse),
+    (session: SessionResponse | undefined) => requestSessionInputFocus(session, isCoarse),
     [isCoarse],
   );
 
   const handleSelectSession = useCallback(
     (sessionId: string) => {
-      const ws = workspaces.find((w) =>
-        w.sessions.some((s) => s.id === sessionId),
-      );
+      const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         navigate(`/session/${encodeURIComponent(sessionId)}`);
         // The proxy is a real textarea; focusing it inside the click gesture
@@ -502,9 +443,7 @@ function AppContent({
   const handleSelectWorkspace = (workspaceId: string) => {
     const ws = workspaces.find((w) => w.id === workspaceId);
     if (ws) {
-      const running = ws.sessions.find((s) =>
-        isSessionActive(s, idleDecayWindowMs),
-      );
+      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
         navigate(`/session/${encodeURIComponent(picked.id)}`);
@@ -523,9 +462,7 @@ function AppContent({
   // the user taps it; navigate to the session that triggered the push.
   useEffect(() => {
     const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent).detail as
-        | { sessionId?: string }
-        | undefined;
+      const detail = (e as CustomEvent).detail as { sessionId?: string } | undefined;
       if (detail?.sessionId) {
         handleSelectSession(detail.sessionId);
       }
@@ -534,12 +471,8 @@ function AppContent({
     return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   }, [handleSelectSession]);
 
-  const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(
-    undefined,
-  );
-  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(
-    null,
-  );
+  const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -596,9 +529,7 @@ function AppContent({
     void setTelemetryConsent(enabled);
   }, []);
 
-  const deletingWorkspace = deletingWorkspaceId
-    ? workspaces.find((w) => w.id === deletingWorkspaceId)
-    : null;
+  const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
 
   const handleDeleteSession = useCallback((workspaceId: string) => {
@@ -652,9 +583,7 @@ function AppContent({
     (repoPath: string) => {
       const projectSessions = sessions
         .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
-        .sort((a, b) =>
-          (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""),
-        );
+        .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
       const latest = projectSessions[0];
 
       setWizardPrefill({
@@ -702,9 +631,7 @@ function AppContent({
       if (!activeSession) return;
       const resolved = resolveToRepoRelative(ref.path, activeSession);
       if (!resolved) {
-        toastBus.handler?.error(
-          `Could not open ${ref.path}: not inside this session's repo`,
-        );
+        toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
         return;
       }
       handleSelectFile(resolved.relativePath, resolved.repoName);
@@ -822,9 +749,7 @@ function AppContent({
     // user is NOT in the paired terminal, send them there; only flip back
     // to agent when they're already in paired.
     const active = document.activeElement;
-    const pairedPanels = document.querySelectorAll<HTMLElement>(
-      '[data-term="paired"]',
-    );
+    const pairedPanels = document.querySelectorAll<HTMLElement>('[data-term="paired"]');
     let inPaired = false;
     if (active) {
       for (const p of pairedPanels) {
@@ -896,8 +821,7 @@ function AppContent({
           setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
-        onSettings: () =>
-          showSettings ? handleCloseSettings() : navigate("/settings"),
+        onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
         onPalette: () => setShowPalette((p) => !p),
         onToggleSidebar: () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleDiff(),
@@ -943,9 +867,7 @@ function AppContent({
           onClose={handleCloseSettings}
           onSelectTab={(t) => {
             const p = searchParams.get("profile");
-            navigate(
-              `/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`,
-            );
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
           }}
           onServerAboutRefresh={refreshServerAbout}
           profile={searchParams.get("profile")}
@@ -959,21 +881,11 @@ function AppContent({
     }
 
     if (showProjects) {
-      return (
-        <ProjectsView
-          onClose={handleCloseProjects}
-          readOnly={serverAbout?.read_only}
-        />
-      );
+      return <ProjectsView onClose={handleCloseProjects} readOnly={serverAbout?.read_only} />;
     }
 
     if (showProfiles) {
-      return (
-        <ProfilesPage
-          onClose={handleCloseProfiles}
-          readOnly={serverAbout?.read_only}
-        />
-      );
+      return <ProfilesPage onClose={handleCloseProfiles} readOnly={serverAbout?.read_only} />;
     }
 
     // Refresh on `/session/<id>` paints once with `sessions === []` before
@@ -1048,21 +960,13 @@ function AppContent({
           onToggleCollapse={toggleDiff}
           left={
             <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-              <div
-                className={
-                  selectedFilePath
-                    ? "hidden"
-                    : "flex-1 flex flex-col min-h-0 overflow-hidden"
-                }
-              >
+              <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                 {activeSession?.view === "structured" ? (
                   <Suspense fallback={<AcpLoadingFallback />}>
                     <StructuredView
                       key={activeSessionId}
                       sessionId={activeSessionId!}
-                      acpWorkerState={
-                        activeSession.acp_worker_state ?? "absent"
-                      }
+                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                       tool={activeSession.tool}
                       archivedAt={activeSession.archived_at ?? null}
                       snoozedUntil={activeSession.snoozed_until ?? null}
@@ -1072,9 +976,7 @@ function AppContent({
                 ) : (
                   <TerminalSessionStack
                     activeSessionId={activeSessionId!}
-                    sessions={sessions.filter(
-                      (session) => session.view !== "structured",
-                    )}
+                    sessions={sessions.filter((session) => session.view !== "structured")}
                     persistent={webSettings.persistentTerminals}
                     maxPersistentTerminals={webSettings.maxPersistentTerminals}
                   />
@@ -1171,19 +1073,14 @@ function AppContent({
   const { isMobile, stableViewportHeight } = useMobileKeyboard();
   const pairedFullViewport = singlePane && rightPanelView === "paired";
   const pinRootHeight =
-    isMobile &&
-    stableViewportHeight > 0 &&
-    (activeSession?.view !== "structured" || pairedFullViewport);
-  const rootStyle = pinRootHeight
-    ? { height: `${stableViewportHeight}px` }
-    : undefined;
+    isMobile && stableViewportHeight > 0 && (activeSession?.view !== "structured" || pairedFullViewport);
+  const rootStyle = pinRootHeight ? { height: `${stableViewportHeight}px` } : undefined;
 
   const acpPrefs = useMemo(
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
       queueDrainMode: serverAbout?.acp_queue_drain_mode ?? "combined",
-      forceEndTurnThresholdSecs:
-        serverAbout?.acp_force_end_turn_threshold_secs ?? 30,
+      forceEndTurnThresholdSecs: serverAbout?.acp_force_end_turn_threshold_secs ?? 30,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
     }),
     [
@@ -1327,9 +1224,7 @@ function AppContent({
             />
           )}
 
-          <div className="flex-1 flex flex-col min-h-0 min-w-0">
-            {renderContent()}
-          </div>
+          <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
         </div>
 
         {showSessionWizard && (
@@ -1358,9 +1253,7 @@ function AppContent({
         {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
         {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
-        {telemetryConsentNeeded && (
-          <TelemetryConsentModal onChoose={handleTelemetryConsent} />
-        )}
+        {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
         {deletingSession && (
           <DeleteSessionDialog
@@ -1375,11 +1268,7 @@ function AppContent({
           />
         )}
 
-        <CommandPalette
-          open={showPalette}
-          onClose={() => setShowPalette(false)}
-          actions={commandActions}
-        />
+        <CommandPalette open={showPalette} onClose={() => setShowPalette(false)} actions={commandActions} />
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker
@@ -1405,9 +1294,7 @@ function AppContent({
 function AcpLoadingFallback() {
   return (
     <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">
-        Loading acp…
-      </div>
+      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
     </div>
   );
 }

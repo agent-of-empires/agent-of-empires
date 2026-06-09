@@ -76,24 +76,12 @@ export function AboutModal({ onClose }: Props) {
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700">
           <div className="flex items-center gap-2 min-w-0">
-            <img
-              src="/icon-192.png"
-              alt=""
-              width="24"
-              height="24"
-              className="rounded-sm shrink-0"
-            />
-            <h2
-              id="about-modal-title"
-              className="text-sm font-semibold text-text-bright truncate"
-            >
+            <img src="/icon-192.png" alt="" width="24" height="24" className="rounded-sm shrink-0" />
+            <h2 id="about-modal-title" className="text-sm font-semibold text-text-bright truncate">
               Agent of Empires
             </h2>
             {version && (
-              <span
-                className="font-mono text-[11px] text-text-muted shrink-0"
-                aria-label={`Version ${version}`}
-              >
+              <span className="font-mono text-[11px] text-text-muted shrink-0" aria-label={`Version ${version}`}>
                 v{version}
               </span>
             )}
@@ -110,8 +98,7 @@ export function AboutModal({ onClose }: Props) {
 
         <div className="p-5 space-y-4">
           <p className="text-sm text-text-secondary">
-            Terminal session manager for parallel AI coding agents. Open source,
-            cross-platform, sandboxed.
+            Terminal session manager for parallel AI coding agents. Open source, cross-platform, sandboxed.
           </p>
 
           <div className="space-y-2">
@@ -123,9 +110,7 @@ export function AboutModal({ onClose }: Props) {
                 rel="noopener noreferrer"
                 className="flex items-center justify-between gap-3 px-3 py-2 rounded-md bg-surface-900 border border-surface-700/50 hover:border-surface-700 hover:bg-surface-850 transition-colors group"
               >
-                <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">
-                  {link.label}
-                </span>
+                <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">{link.label}</span>
                 <span className="text-sm text-brand-500 group-hover:text-brand-400 font-mono truncate">
                   {link.display}
                 </span>
@@ -144,9 +129,7 @@ export function AboutModal({ onClose }: Props) {
         </div>
 
         <div className="px-5 py-3 border-t border-surface-700">
-          <p className="font-mono text-[11px] text-text-dim">
-            Built for developers running many agents at once.
-          </p>
+          <p className="font-mono text-[11px] text-text-dim">Built for developers running many agents at once.</p>
         </div>
       </div>
     </div>

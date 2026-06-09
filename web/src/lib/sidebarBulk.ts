@@ -69,10 +69,7 @@ export function bucketSelectionForBulk(
 /** One-line summary toast for a completed bulk action, e.g.
  *  "Archived 12 workspaces. 2 failed." Skipped rows (no session) are folded
  *  in only when present. */
-export function summarizeBulkResults(
-  verb: string,
-  results: readonly { ok: boolean; skipped?: boolean }[],
-): string {
+export function summarizeBulkResults(verb: string, results: readonly { ok: boolean; skipped?: boolean }[]): string {
   const ok = results.filter((r) => r.ok).length;
   const skipped = results.filter((r) => r.skipped).length;
   const failed = results.filter((r) => !r.ok && !r.skipped).length;

@@ -19,10 +19,7 @@ interface Props {
 }
 
 export function StringDiff({ oldText, newText, filePath }: Props) {
-  const hunk: RichDiffHunk = useMemo(
-    () => diffPair(oldText, newText).hunk,
-    [oldText, newText],
-  );
+  const hunk: RichDiffHunk = useMemo(() => diffPair(oldText, newText).hunk, [oldText, newText]);
   const hunks = useMemo(() => [hunk], [hunk]);
   const { tokens } = useHighlightedLines(hunks, filePath);
 

@@ -34,11 +34,7 @@ async function focusedKind(page: Page): Promise<"agent" | "paired" | null> {
 async function focusKind(page: Page, kind: "agent" | "paired") {
   const target = kind === "paired" ? "paired-visible" : "agent";
   if (target === "agent") {
-    await page
-      .locator('[data-term="agent"]')
-      .first()
-      .locator("textarea")
-      .focus();
+    await page.locator('[data-term="agent"]').first().locator("textarea").focus();
     return;
   }
   // The paired panel renders once (the inline desktop split copy); on
@@ -63,9 +59,7 @@ async function blurAll(page: Page) {
 test.describe("Cmd/Ctrl+` desktop", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
-  test("toggles between agent and paired with the right panel open", async ({
-    page,
-  }, _testInfo) => {
+  test("toggles between agent and paired with the right panel open", async ({ page }, _testInfo) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
@@ -84,9 +78,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await shot(page, "03-back-to-agent.png");
   });
 
-  test("first press from outside any terminal lands in paired (VSCode-like)", async ({
-    page,
-  }) => {
+  test("first press from outside any terminal lands in paired (VSCode-like)", async ({ page }) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
@@ -99,9 +91,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
-  test("expands collapsed right panel and focuses paired (latch)", async ({
-    page,
-  }, _testInfo) => {
+  test("expands collapsed right panel and focuses paired (latch)", async ({ page }, _testInfo) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
@@ -117,9 +107,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await shot(page, "05-expanded-paired-focused.png");
   });
 
-  test("paired latch fires once ensureTerminal resolves (slow paired)", async ({
-    page,
-  }) => {
+  test("paired latch fires once ensureTerminal resolves (slow paired)", async ({ page }) => {
     await mockTerminalApis(page);
     // Override the host-shell ensure with a 1500ms delay BEFORE goto.
     // Routes are matched in reverse registration order, so this wins over
@@ -141,14 +129,10 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // Within 3s the ensureTerminal mock returns, ready flips true,
     // the consume-on-ready effect fires, focus lands in paired.
-    await expect
-      .poll(() => focusedKind(page), { timeout: 3000 })
-      .toBe("paired");
+    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("paired");
   });
 
-  test("agent latch fires once ensureSession resolves (slow agent)", async ({
-    page,
-  }) => {
+  test("agent latch fires once ensureSession resolves (slow agent)", async ({ page }) => {
     await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", async (r) => {
       await new Promise((res) => setTimeout(res, 1500));
@@ -175,9 +159,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("agent");
   });
 
-  test("with diff viewer open, Cmd+` to agent closes the diff", async ({
-    page,
-  }, _testInfo) => {
+  test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }, _testInfo) => {
     await mockTerminalApis(page);
     // Provide one file in the diff list. Don't mock the file content
     // endpoint — DiffFileViewer can render an error state and the test
@@ -238,15 +220,11 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await openSession(page);
 
     await focusKind(page, "agent");
-    await expect(page.locator('[data-term="agent"]').first()).toHaveClass(
-      /term-focused/,
-    );
+    await expect(page.locator('[data-term="agent"]').first()).toHaveClass(/term-focused/);
 
     await page.keyboard.press("ControlOrMeta+`");
     // The visible paired panel should pick up term-focused.
-    await expect(
-      page.locator('[data-term="paired"]:visible').first(),
-    ).toHaveClass(/term-focused/);
+    await expect(page.locator('[data-term="paired"]:visible').first()).toHaveClass(/term-focused/);
   });
 });
 

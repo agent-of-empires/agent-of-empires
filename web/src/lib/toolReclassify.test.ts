@@ -15,9 +15,7 @@ function bash(command: string, kind = "execute"): ToolCall {
 describe("reclassifyBash", () => {
   it("reclassifies plain grep/rg/find/fd shellouts as search", () => {
     expect(reclassifyBash(bash("grep -rn foo .")).kind).toBe("search");
-    expect(reclassifyBash(bash("rg --hidden pattern src/")).kind).toBe(
-      "search",
-    );
+    expect(reclassifyBash(bash("rg --hidden pattern src/")).kind).toBe("search");
     expect(reclassifyBash(bash("find . -name '*.tsx'")).kind).toBe("search");
     expect(reclassifyBash(bash("fd '\\.rs$' src")).kind).toBe("search");
     expect(reclassifyBash(bash("ripgrep pattern src/")).kind).toBe("search");
@@ -45,9 +43,7 @@ describe("reclassifyBash", () => {
   });
 
   it("rejects destructive find flags", () => {
-    expect(reclassifyBash(bash("find . -name '*.tmp' -delete")).kind).toBe(
-      "execute",
-    );
+    expect(reclassifyBash(bash("find . -name '*.tmp' -delete")).kind).toBe("execute");
     expect(reclassifyBash(bash("find . -exec rm {} +")).kind).toBe("execute");
   });
 

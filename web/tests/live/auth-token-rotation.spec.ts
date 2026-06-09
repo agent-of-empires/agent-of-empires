@@ -34,11 +34,7 @@ async function probeToken(baseUrl: string, token: string): Promise<number> {
  * Poll the daemon's `serve.token` file until its content differs from
  * `previous`. Returns the new token. Times out after `deadlineMs`.
  */
-async function waitForRotation(
-  tokenFile: string,
-  previous: string,
-  deadlineMs: number,
-): Promise<string> {
+async function waitForRotation(tokenFile: string, previous: string, deadlineMs: number): Promise<string> {
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
     try {
@@ -73,11 +69,7 @@ test("rotated token: old accepted in grace, new accepted, old rejected past grac
 
     // Wait for the daemon to rotate; lifetime is LIFETIME_SECS, so allow
     // an extra grace+slack to avoid a flake on slow CI.
-    const tokenB = await waitForRotation(
-      handle.tokenFile!,
-      tokenA,
-      (LIFETIME_SECS + GRACE_SECS + 5) * 1000,
-    );
+    const tokenB = await waitForRotation(handle.tokenFile!, tokenA, (LIFETIME_SECS + GRACE_SECS + 5) * 1000);
     expect(tokenB).toMatch(/^[0-9a-f]{64}$/);
     expect(tokenB).not.toBe(tokenA);
 

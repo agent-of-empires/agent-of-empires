@@ -18,24 +18,12 @@ export function anchorComments(
   hunks: RichDiffHunk[],
 ): AnchoredComment[] {
   return comments
-    .filter(
-      (c) =>
-        c.filePath === filePath &&
-        (c.repoName ?? undefined) === (repoName ?? undefined),
-    )
+    .filter((c) => c.filePath === filePath && (c.repoName ?? undefined) === (repoName ?? undefined))
     .map((c) => anchorOne(c, hunks));
 }
 
-function anchorOne(
-  comment: DiffComment,
-  hunks: RichDiffHunk[],
-): AnchoredComment {
-  const found = extractSnippetFromHunks(
-    hunks,
-    comment.side,
-    comment.startLine,
-    comment.endLine,
-  );
+function anchorOne(comment: DiffComment, hunks: RichDiffHunk[]): AnchoredComment {
+  const found = extractSnippetFromHunks(hunks, comment.side, comment.startLine, comment.endLine);
   if (!found) {
     return { comment, status: "stale", contentChanged: false };
   }

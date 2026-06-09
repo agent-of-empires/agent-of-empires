@@ -6,9 +6,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { installSidebarMocks } from "./helpers/sidebarMocks";
 
-test("empty sidebar shows a hint and opens the wizard from its button", async ({
-  page,
-}) => {
+test("empty sidebar shows a hint and opens the wizard from its button", async ({ page }) => {
   await installSidebarMocks(page, { sessions: [] });
 
   await page.setViewportSize({ width: 1280, height: 720 });
@@ -24,9 +22,7 @@ test("empty sidebar shows a hint and opens the wizard from its button", async ({
   // The CTA opens the session wizard (heading is distinct from the
   // button's own "New session" label).
   await empty.getByRole("button", { name: "New session" }).click();
-  await expect(
-    page.getByRole("heading", { name: "New session" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
 });
 
 test("empty-state hint is hidden once a session exists", async ({ page }) => {

@@ -6,7 +6,9 @@ mod split;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::file_watch::FileWatchService;
 use crate::git::diff::{
     check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
     list_branches, DiffFile, FileDiff,
@@ -95,6 +97,11 @@ pub struct DiffView {
     /// Lets a click on a file row select it and a hover highlight it
     /// the same way `j`/`k` would.
     pub(crate) file_list_inner: ratatui::layout::Rect,
+
+    /// Process-wide file-watch primitive, threaded through to per-session
+    /// `Storage` writes so the local in-process Local fast path fires when
+    /// the diff view persists a `base_branch_override`.
+    pub(crate) file_watch: Arc<FileWatchService>,
 }
 
 impl DiffView {
@@ -102,8 +109,8 @@ impl DiffView {
     /// branch through the picker only mutates in-memory state. Callers
     /// that have a session id should use `new_for_session` so the
     /// override persists.
-    pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None, None)
+    pub fn new(repo_path: PathBuf, file_watch: Arc<FileWatchService>) -> anyhow::Result<Self> {
+        Self::new_for_session(repo_path, None, String::new(), None, None, file_watch)
     }
 
     /// Create a diff view bound to a session. `base_override` (the
@@ -118,6 +125,7 @@ impl DiffView {
         profile: String,
         base_override: Option<String>,
         worktree_base: Option<String>,
+        file_watch: Arc<FileWatchService>,
     ) -> anyhow::Result<Self> {
         // Use the profile-merged config so a per-profile Diff override (e.g.
         // split_view) is honored on open. The session-agnostic path (empty
@@ -171,6 +179,7 @@ impl DiffView {
             warning_dialog,
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
+            file_watch,
         };
 
         view.refresh_files()?;
@@ -271,10 +280,7 @@ impl DiffView {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(());
         };
-        let storage = crate::session::Storage::new(
-            &self.profile,
-            crate::file_watch::FileWatchService::noop(),
-        )?;
+        let storage = crate::session::Storage::new(&self.profile, self.file_watch.clone())?;
         let new_override = Some(self.base_branch.clone());
         let id_for_closure = session_id.clone();
         let new_override_for_closure = new_override.clone();
@@ -425,6 +431,7 @@ impl DiffView {
             warning_dialog: None,
             pending_override: None,
             file_list_inner: ratatui::layout::Rect::default(),
+            file_watch: FileWatchService::noop(),
         }
     }
 }

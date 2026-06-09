@@ -13,14 +13,7 @@ interface Props {
 /** Inline composer rendered beneath the last row of the selected range.
  *  Cmd/Ctrl+Enter saves; Esc cancels. Empty bodies are rejected (the
  *  Save button stays disabled). */
-export function CommentForm({
-  startLine,
-  endLine,
-  side,
-  initialBody = "",
-  onSave,
-  onCancel,
-}: Props) {
+export function CommentForm({ startLine, endLine, side, initialBody = "", onSave, onCancel }: Props) {
   const [body, setBody] = useState(initialBody);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -31,10 +24,7 @@ export function CommentForm({
   const trimmed = body.trim();
   const canSave = trimmed.length > 0;
 
-  const range =
-    startLine === endLine
-      ? `line ${startLine}`
-      : `lines ${startLine}-${endLine}`;
+  const range = startLine === endLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`;
 
   return (
     <div className="border-y border-brand-600/30 bg-surface-850 px-3 py-2">

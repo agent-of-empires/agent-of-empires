@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  applyBranchOverride,
-  getReviewSummary,
-  getSubmittedBranch,
-  slugifyBranch,
-} from "./sessionNames";
+import { applyBranchOverride, getReviewSummary, getSubmittedBranch, slugifyBranch } from "./sessionNames";
 
 describe("applyBranchOverride", () => {
   it("marks a non-empty branch as a manual override", () => {
@@ -31,9 +26,7 @@ describe("applyBranchOverride", () => {
 
 describe("getSubmittedBranch", () => {
   it("prefers the explicit branch override", () => {
-    expect(getSubmittedBranch("session-title", "feature/custom")).toBe(
-      "feature/custom",
-    );
+    expect(getSubmittedBranch("session-title", "feature/custom")).toBe("feature/custom");
   });
 
   it("falls back to the title when the branch field is cleared", () => {
@@ -47,15 +40,11 @@ describe("getSubmittedBranch", () => {
 
 describe("slugifyBranch", () => {
   it("kebab-cases titles with spaces", () => {
-    expect(slugifyBranch("Exploration and issues v2")).toBe(
-      "exploration-and-issues-v2",
-    );
+    expect(slugifyBranch("Exploration and issues v2")).toBe("exploration-and-issues-v2");
   });
 
   it("collapses runs of punctuation into a single dash", () => {
-    expect(slugifyBranch("Fix: login @ mobile #42")).toBe(
-      "fix-login-mobile-42",
-    );
+    expect(slugifyBranch("Fix: login @ mobile #42")).toBe("fix-login-mobile-42");
   });
 
   it("replaces forward slashes; git allows them but the slug stays kebab", () => {

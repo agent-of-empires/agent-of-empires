@@ -27,10 +27,9 @@ afterEach(() => {
 
 describe("useDiffComments storage hygiene (#1842)", () => {
   it("writes no key when switching across never-commented sessions", () => {
-    const { rerender } = renderHook(
-      ({ id }: { id: string }) => useDiffComments(id),
-      { initialProps: { id: "sess-A" } },
-    );
+    const { rerender } = renderHook(({ id }: { id: string }) => useDiffComments(id), {
+      initialProps: { id: "sess-A" },
+    });
 
     act(() => {
       rerender({ id: "sess-B" });

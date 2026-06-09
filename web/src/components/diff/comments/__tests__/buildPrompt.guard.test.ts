@@ -40,9 +40,7 @@ describe("isDiffCommentsCardPayload", () => {
   });
 
   it("rejects payloads missing required string fields", () => {
-    expect(
-      isDiffCommentsCardPayload({ isMultiRepo: false, comments: [] }),
-    ).toBe(false);
+    expect(isDiffCommentsCardPayload({ isMultiRepo: false, comments: [] })).toBe(false);
     expect(
       isDiffCommentsCardPayload({
         intro: "intro",
