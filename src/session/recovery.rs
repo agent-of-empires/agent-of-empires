@@ -244,6 +244,80 @@ pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     }
 }
 
+/// Set of instance ids whose startup-recovery cascade has been scheduled
+/// but not yet completed. Populated by Phase A (`daemon_startup_recovery_mark`)
+/// for every candidate; each Phase B worker drains its own id when its
+/// cascade terminates (success, skip, error, or panic). The background
+/// refresher walks this set every `RECENTLY_RESTARTED_TTL / 2` and re-stamps
+/// each member in `recently_restarted`, so a candidate that sits in the
+/// `STARTUP_RECOVERY_CONCURRENCY` semaphore queue past the TTL does not age
+/// out of suppression and trip a phantom `Status::Error` before its worker
+/// even begins.
+#[cfg(feature = "serve")]
+pub type RecoveryPending = Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
+
+/// Construct an empty `recovery_pending` set.
+#[cfg(feature = "serve")]
+pub fn new_recovery_pending() -> RecoveryPending {
+    Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Seed the pending set with every scheduled candidate id. Called by Phase A
+/// alongside the initial `mark_recently_restarted` so the refresher has the
+/// full work set before the cascade (and the refresher) start.
+#[cfg(feature = "serve")]
+pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<Item = String>) {
+    if let Ok(mut guard) = pending.write() {
+        guard.extend(ids);
+    }
+}
+
+/// One refresher tick: re-stamp every still-pending id in `recently_restarted`.
+/// Returns `false` once the pending set is empty so the caller can stop
+/// ticking (the cascade is done).
+///
+/// Lock order is `R(pending)` → `W(recently_restarted)`, with the marking
+/// performed *inside* the `pending` read-lock scope. That is the load-bearing
+/// detail: a concurrent [`drain_recovery_pending`] takes `W(pending)` first,
+/// so it cannot interleave between this function observing an id and stamping
+/// it. Either the drain wins the write lock before this read (the id is gone,
+/// never re-stamped) or it blocks until this read releases (its later unmark
+/// strictly succeeds this stamp). No mark-after-unmark resurrection is
+/// possible. See [`drain_recovery_pending`].
+#[cfg(feature = "serve")]
+pub fn refresh_recovery_pending(
+    pending: &RecoveryPending,
+    recently_restarted: &RecentlyRestarted,
+) -> bool {
+    let guard = match pending.read() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if guard.is_empty() {
+        return false;
+    }
+    for id in guard.iter() {
+        mark_recently_restarted(recently_restarted, id);
+    }
+    true
+}
+
+/// Worker-completion drain: remove `id` from the pending set so the refresher
+/// stops re-stamping it, *then* clear its suppression mark. The ordering
+/// (`W(pending)` before unmarking `recently_restarted`) is what makes the
+/// unmark stick against a racing refresher; see [`refresh_recovery_pending`].
+#[cfg(feature = "serve")]
+pub fn drain_recovery_pending(
+    pending: &RecoveryPending,
+    recently_restarted: &RecentlyRestarted,
+    id: &str,
+) {
+    if let Ok(mut guard) = pending.write() {
+        guard.remove(id);
+    }
+    unmark_recently_restarted(recently_restarted, id);
+}
+
 /// Run the recovery cascade for one instance. Wraps
 /// `restart_with_size_opts(None, false)` in a [`HookTimeoutScope`] so a
 /// hung `on_launch` hook cannot pin the recovery lock (#1265).
@@ -364,6 +438,136 @@ mod tests {
         let g = map.read().unwrap();
         assert!(!g.contains_key("stale"));
         assert!(g.contains_key("fresh"));
+    }
+
+    /// Regression for the queued-candidate TTL race (#1264): the background
+    /// refresher must not resurrect a mark that a completed worker has just
+    /// cleared. The worker drains its id from `recovery_pending` *before*
+    /// unmarking; a subsequent refresher tick sees an empty (for that id)
+    /// pending set and leaves `recently_restarted` clear. Without the drain,
+    /// the refresher would re-stamp the id forever and suppress its real
+    /// status for the rest of the cascade.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn refresher_does_not_resurrect_drained_worker_mark() {
+        let recently = new_recently_restarted();
+        let pending = new_recovery_pending();
+
+        // Phase A: schedule the candidate and stamp its initial mark.
+        seed_recovery_pending(&pending, ["abc".to_string()]);
+        mark_recently_restarted(&recently, "abc");
+
+        // A refresher tick while the worker is still queued keeps it fresh.
+        assert!(
+            refresh_recovery_pending(&pending, &recently),
+            "non-empty pending set should keep ticking",
+        );
+        assert!(
+            recently.read().unwrap().contains_key("abc"),
+            "refresher must keep a queued candidate's mark fresh",
+        );
+
+        // Worker completes: drain from pending, then unmark.
+        drain_recovery_pending(&pending, &recently, "abc");
+        assert!(
+            !recently.read().unwrap().contains_key("abc"),
+            "drain must clear the suppression mark",
+        );
+
+        // A later refresher tick must not bring the mark back, and reports
+        // the set as drained so the loop can exit.
+        assert!(
+            !refresh_recovery_pending(&pending, &recently),
+            "empty pending set signals the refresher to stop",
+        );
+        assert!(
+            !recently.read().unwrap().contains_key("abc"),
+            "refresher must not resurrect a drained worker's mark",
+        );
+    }
+
+    /// The refresher keeps a still-queued candidate marked while a *different*
+    /// candidate finishes. Draining one id must not stop refreshing the rest.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn refresher_keeps_remaining_candidates_after_partial_drain() {
+        let recently = new_recently_restarted();
+        let pending = new_recovery_pending();
+        seed_recovery_pending(&pending, ["done".to_string(), "queued".to_string()]);
+
+        // First worker finishes; the second is still waiting on a permit.
+        drain_recovery_pending(&pending, &recently, "done");
+
+        assert!(
+            refresh_recovery_pending(&pending, &recently),
+            "the queued candidate keeps the refresher alive",
+        );
+        assert!(
+            recently.read().unwrap().contains_key("queued"),
+            "still-queued candidate must stay suppressed",
+        );
+        assert!(
+            !recently.read().unwrap().contains_key("done"),
+            "drained candidate must not be re-stamped",
+        );
+    }
+
+    /// The two tests above are sequential, so they would still pass even if
+    /// [`refresh_recovery_pending`] snapshotted the ids and *released* the
+    /// `pending` read lock before stamping. That ordering is the whole point
+    /// of the fix, so prove it under a real lock overlap: hold the `pending`
+    /// read lock (standing in for a refresher mid-tick), start a concurrent
+    /// drain that blocks on the write lock, stamp the mark at the last
+    /// possible moment while still holding the read lock, then release and
+    /// let the drain finish. The drain's unmark must win.
+    ///
+    /// This fails if [`drain_recovery_pending`] is reordered to unmark before
+    /// taking `W(pending)`: the premature unmark would race ahead of the
+    /// stamp and the id would be resurrected.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn refresher_mark_loses_to_concurrent_drain_under_lock_overlap() {
+        use std::thread;
+        use std::time::Duration;
+
+        let recently = new_recently_restarted();
+        let pending = new_recovery_pending();
+        seed_recovery_pending(&pending, ["x".to_string()]);
+        mark_recently_restarted(&recently, "x");
+
+        // Stand in for a refresher tick that is *inside* its `pending`
+        // read-lock scope and has not yet stamped.
+        let read_guard = pending.read().unwrap();
+
+        // A worker completes concurrently. `drain_recovery_pending` takes
+        // `W(pending)` first, which blocks behind our read lock, so its
+        // unmark is forced to serialize after we release.
+        let drain_pending = pending.clone();
+        let drain_recently = recently.clone();
+        let drainer = thread::spawn(move || {
+            drain_recovery_pending(&drain_pending, &drain_recently, "x");
+        });
+
+        // Give the drainer time to reach (and block on) the write lock, or,
+        // if drain were buggily reordered to unmark first, to perform that
+        // premature unmark. Then stamp at the latest possible moment, exactly
+        // as the refresher would just before releasing its read lock.
+        thread::sleep(Duration::from_millis(100));
+        mark_recently_restarted(&recently, "x");
+
+        // Release: the blocked drain now removes the id and unmarks.
+        drop(read_guard);
+        drainer.join().unwrap();
+
+        assert!(
+            !pending.read().unwrap().contains("x"),
+            "drain must remove the id from the pending set",
+        );
+        assert!(
+            !recently.read().unwrap().contains_key("x"),
+            "the worker's unmark must win over the refresher's last mark; \
+             no mark-after-unmark resurrection",
+        );
     }
 
     /// Regression: archiving a session kills its tmux pane, so the next
