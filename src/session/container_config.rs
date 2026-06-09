@@ -972,6 +972,29 @@ fn has_glob_metachars(entry: &str) -> bool {
     entry.contains(['*', '?', '[', ']'])
 }
 
+/// Produce user-facing warnings for `volume_ignores` entries that `build_container_config`
+/// will skip because they contain glob metacharacters. Mirrors that skip so session
+/// creation can surface the same information in the TUI warnings dialog (#2036), the way
+/// [`validate_env_entries`](crate::session::validate_env_entries) surfaces unset env vars.
+pub(crate) fn validate_volume_ignores<I, S>(entries: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let s = e.as_ref();
+            has_glob_metachars(s).then(|| {
+                format!(
+                    "Warning: volume_ignores entry '{}' was skipped; glob patterns are not supported, list literal directory paths instead",
+                    s
+                )
+            })
+        })
+        .collect()
+}
+
 /// Produce a deterministic Docker volume name for a named volume_ignores mount.
 ///
 /// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
@@ -2646,6 +2669,15 @@ extra_volumes = ["/host/data:/container/data:ro"]
         assert!(!has_glob_metachars("node_modules"));
         assert!(!has_glob_metachars("src/bin"));
         assert!(!has_glob_metachars(".venv"));
+    }
+
+    #[test]
+    fn test_validate_volume_ignores_warns_only_on_globs() {
+        let warnings = validate_volume_ignores(["**/bin/", "target", "**/obj/", "node_modules"]);
+        assert_eq!(warnings.len(), 2, "got: {:?}", warnings);
+        assert!(warnings[0].contains("**/bin/"));
+        assert!(warnings[1].contains("**/obj/"));
+        assert!(validate_volume_ignores(["target", ".venv"]).is_empty());
     }
 
     /// Regression test for #2036: glob-like volume_ignores entries must be skipped

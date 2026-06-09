@@ -2193,11 +2193,10 @@ impl HomeView {
                 if !warnings.is_empty() {
                     let body = warnings.join("\n\n");
                     let message = format!(
-                        "Session was created, but the following warnings were emitted during worktree setup:\n\n{}",
+                        "Session was created, but the following warnings were emitted during setup:\n\n{}",
                         body
                     );
-                    self.info_dialog =
-                        Some(InfoDialog::sized_to_fit("Worktree warnings", &message));
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Session warnings", &message));
                 }
 
                 Some(session_id)
