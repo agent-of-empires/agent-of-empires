@@ -419,6 +419,19 @@ const LAST_ACTIVITY_SLOT: usize = 6;
 /// horizontal budget on narrow panes.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
 
+const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
+
+fn selected_row_style(style: Style, theme: &Theme) -> Style {
+    let Some(fg) = style.fg else {
+        return style.fg(theme.text).bold();
+    };
+    if has_min_contrast(fg, theme.session_selection, SELECTED_ROW_CONTRAST_RATIO) {
+        style.bold()
+    } else {
+        style.fg(theme.text).bold()
+    }
+}
+
 /// Decide where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed (indent,
@@ -1166,22 +1179,7 @@ impl HomeView {
         line_spans.push(Span::styled(
             text.into_owned(),
             if is_selected {
-                // Selected-row contrast gate. The previous unconditional
-                // override stripped per-status color from every selected
-                // row (running-green, error-red, etc.); the contrast check
-                // only swaps in theme.text when the status fg actually
-                // clashes with session_selection. 3:1 is WCAG AA Large /
-                // bold-UI, which matches the row styling. Non-Rgb fg
-                // (palette mode after downsample) falls through to the
-                // override branch for safety. Italic/dim modifiers on
-                // `style` survive both branches so archive/snooze visual
-                // language reads either way.
-                let fg = style.fg.unwrap_or(theme.text);
-                if has_min_contrast(fg, theme.session_selection, 3.0) {
-                    style.bold()
-                } else {
-                    style.fg(theme.text).bold()
-                }
+                selected_row_style(style, theme)
             } else {
                 style
             },
@@ -1190,15 +1188,25 @@ impl HomeView {
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
+                    let branch_style = Style::default().fg(theme.branch);
                     line_spans.push(Span::styled(
                         format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
-                        Style::default().fg(theme.branch),
+                        if is_selected {
+                            selected_row_style(branch_style, theme)
+                        } else {
+                            branch_style
+                        },
                     ));
                 } else if let Some(wt_info) = &inst.worktree_info {
                     if wt_info.branch != inst.title {
+                        let branch_style = Style::default().fg(theme.branch);
                         line_spans.push(Span::styled(
                             format!("  {}", wt_info.branch),
-                            Style::default().fg(theme.branch),
+                            if is_selected {
+                                selected_row_style(branch_style, theme)
+                            } else {
+                                branch_style
+                            },
                         ));
                     }
                 }
@@ -1213,9 +1221,14 @@ impl HomeView {
                 if let Some(tag) =
                     compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
                 {
+                    let tag_style = Style::default().fg(theme.dimmed);
                     line_spans.push(Span::styled(
                         format!("  {}", tag.rendered()),
-                        Style::default().fg(theme.dimmed),
+                        if is_selected {
+                            selected_row_style(tag_style, theme)
+                        } else {
+                            tag_style
+                        },
                     ));
                 }
 
@@ -1294,11 +1307,27 @@ impl HomeView {
                         format_relative_age(age_ts)
                     };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    line_spans.push(Span::styled(padded, Style::default().fg(theme.dimmed)));
+                    let activity_style = Style::default().fg(theme.dimmed);
+                    line_spans.push(Span::styled(
+                        padded,
+                        if is_selected {
+                            selected_row_style(activity_style, theme)
+                        } else {
+                            activity_style
+                        },
+                    ));
                 }
 
                 if let Some(badge) = badge_text {
-                    line_spans.push(Span::styled(badge, Style::default().fg(theme.sandbox)));
+                    let badge_style = Style::default().fg(theme.sandbox);
+                    line_spans.push(Span::styled(
+                        badge,
+                        if is_selected {
+                            selected_row_style(badge_style, theme)
+                        } else {
+                            badge_style
+                        },
+                    ));
                 }
                 if column_fits {
                     let trailing_margin: String =
@@ -2919,6 +2948,31 @@ mod tests {
         // char + ellipsis (2 + 1 = 3) — but we reserve 1 for ellipsis
         // so budget for content is 2, fitting exactly one wide char.
         assert_eq!(truncate_to_width("你好世界", 3), "你\u{2026}");
+    }
+
+    #[test]
+    fn selected_row_style_preserves_readable_status_color() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default().fg(theme.running);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.running));
+    }
+
+    #[test]
+    fn selected_row_style_sets_text_for_default_foreground() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default();
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn selected_row_style_falls_back_when_color_clashes() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.dimmed = theme.session_selection;
+        let style = Style::default().fg(theme.dimmed);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
     }
 
     #[test]

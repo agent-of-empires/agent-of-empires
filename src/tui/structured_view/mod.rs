@@ -34,6 +34,7 @@ use crate::acp::client::{
     WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
 /// Per-keystroke redraw interval. The animations are minimal (just the
@@ -76,9 +77,9 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut event_stream = EventStream::new();
-    // Standalone attach uses a default theme; the user's theme
-    // pref lives in the home view state, which we don't load here.
-    let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+    let theme_name = resolve_theme_name();
+    let palette_mode = resolve_theme_palette_mode();
+    let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
     let result = run(&mut terminal, &mut event_stream, &theme, session_id).await;
 

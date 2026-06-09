@@ -98,7 +98,9 @@
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SchemaSection.tsx",
-        "web/src/lib/api.ts"
+        "web/src/lib/api.ts",
+        "web/src/index.css",
+        "src/tui/styles/resolved.rs"
       ]
     },
     {

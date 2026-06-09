@@ -246,7 +246,7 @@ The web dashboard (`web/`) is a utility that sits between a developer and a term
 - **All color** comes from the user's chosen theme via the resolved theme projection (see [Theme system](#theme-system)). The dashboard does not pin its own palette; the build-time defaults in `web/src/index.css` exist only as a cold-load fallback before `useResolvedTheme` fetches and applies the user's selection, and are kept in sync with the `default` builtin so the cold-load paint matches the post-fetch paint.
 - **Default and Empire are two distinct builtins.** `default` is neutral-zinc surfaces + amber chrome (the prior 2026-04-15 dashboard look, promoted to a real theme as of 2026-05-18). `empire` is warm-navy surfaces + copper chrome (the 2026-03-22 design-system palette). Empty `theme.name` resolves to `default`; the picker exposes both. Tailwind utilities like `bg-surface-900`, `text-text-primary`, `text-status-running` resolve to whichever theme the user has selected.
 - **Light theme support.** Catppuccin Latte is a first-class theme on both TUI and web. The projection inverts the surface ramp direction for light backgrounds and sets `color-scheme: light` on the root so native form controls render correctly.
-- **Status colors** (running, waiting, fresh-idle, idle, error, starting, stopped) come from the matching TUI semantic fields. `starting` and `stopped` have no TUI equivalent; the projection derives them by darkening `waiting` and `dimmed` respectively.
+- **Status colors** (running, waiting, warning, fresh-idle, idle, error, starting, stopped) come from the matching TUI semantic fields. `warning` aliases `waiting`; `starting` and `stopped` have no TUI equivalent, so the projection derives them by darkening `waiting` and `dimmed` respectively.
 - **Text contrast.** Every text token in the ramp (`text-primary` through `text-dim`) must clear WCAG AA body contrast (4.5:1) against the surfaces body copy lives on. Builtins are tuned for AA; custom themes are the user's responsibility.
 
 ### Density and motion
@@ -264,6 +264,7 @@ The web dashboard (`web/`) is a utility that sits between a developer and a term
 ### What to avoid
 
 - **No hardcoded chrome colors.** Use semantic tokens (`bg-surface-900`, `text-status-running`, `border-surface-700`). Hardcoded hex / rgb / `bg-[#...]` arbitrary classes don't repaint under theme changes. The few existing exceptions are: brand-mark SVGs in `Dashboard.tsx` (these stay brand amber regardless of theme), `lib/ansi.ts` (renders user-produced ANSI escape content, not chrome).
+- **Fixed Tailwind palette exceptions stay narrow.** Palette utilities like green, amber, rose, and sky may remain for status, severity, syntax, user-authored content, or third-party visualizations where the hue is the payload. Non-status dashboard chrome should use semantic tokens or add a `ResolvedTheme` token first.
 - **No new build-time `@theme [data-theme=...]` blocks.** The runtime palette swap goes through CSS variables on `documentElement`; build-time scoped themes can't support user-defined TOML themes without rebuilds.
 
 If a change to `web/` would require deviating from any of the above, update this section first.

@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::acp::client::discovery::DaemonEndpoint;
 use crate::acp::client::HttpClient;
+use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
 /// Subset of `/api/sessions`'s `SessionResponse` we need. `serde` skips
@@ -106,7 +107,9 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut event_stream = EventStream::new();
-    let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+    let theme_name = resolve_theme_name();
+    let palette_mode = resolve_theme_palette_mode();
+    let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
     let result = run(&mut terminal, &mut event_stream, &theme, endpoint).await;
 
