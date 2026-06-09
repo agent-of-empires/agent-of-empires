@@ -447,6 +447,12 @@ export interface ServerAbout {
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
   acp_replay_events: number;
   build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
+  /** Content-hashed entry bundle name (`index-<hash>.js`) of the
+   *  embedded dashboard build. Compared against this page's own entry
+   *  script by DashboardUpdateBanner to detect a stale client (an
+   *  installed PWA has no refresh affordance, so it keeps running old
+   *  code after the binary updates until prompted to reload). */
+  web_build_id?: string | null;
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {

@@ -63,6 +63,13 @@
       "components": ["web/src/hooks/useTerminal.ts"]
     },
     {
+      "id": "app-shell.dashboard-update-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
+      "components": ["web/src/components/DashboardUpdateBanner.tsx"]
+    },
+    {
       "id": "auth.no-auth",
       "kind": "live-playwright",
       "risk": "high",

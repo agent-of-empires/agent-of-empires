@@ -831,6 +831,12 @@ pub struct ServerAbout {
     /// a glance, including PWA installs where the port disappears
     /// from the window chrome. See #1055.
     pub build_flavor: &'static str,
+    /// Content-hashed entry bundle name (`index-<hash>.js`) of the
+    /// embedded dashboard build. The client compares this against its
+    /// own entry script tag and offers a reload when they differ, so
+    /// installed PWAs (which have no refresh affordance) pick up new
+    /// dashboard code after the binary updates.
+    pub web_build_id: Option<&'static str>,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -862,6 +868,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         } else {
             "release"
         },
+        web_build_id: crate::server::web_build_id(),
     })
 }
 

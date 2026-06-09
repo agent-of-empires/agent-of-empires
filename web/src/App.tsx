@@ -85,6 +85,7 @@ import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
@@ -1192,6 +1193,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         <DisconnectBanner />
         <UpdateBanner />
+        <DashboardUpdateBanner />
 
         <div className="flex flex-1 min-h-0">
           {!showSettings && !showProjects && (
