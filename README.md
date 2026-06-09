@@ -70,6 +70,7 @@
 | ideogram/ideogram-v3 | Image |
 | recraft/recraft-v3 | Image |
 | minimax/hailuo-i2v-01-live | Video |
+
 </details>
 
 ---
