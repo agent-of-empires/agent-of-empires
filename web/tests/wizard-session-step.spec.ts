@@ -114,6 +114,11 @@ test.describe("Wizard session step (#1219)", () => {
     await expect(worktreeToggle).toHaveAttribute("aria-checked", "false");
     await expect(page.getByPlaceholder("Uses session title if empty")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Base branch" })).toHaveCount(0);
+    // Flip back on: the branch input re-mounts (ported from the live
+    // wizard-worktree-toggle story).
+    await worktreeToggle.click();
+    await expect(worktreeToggle).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByPlaceholder("Uses session title if empty")).toBeVisible();
   });
 
   test("branch input mirrors the slugified title while not manually edited", async ({ page }) => {

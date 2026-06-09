@@ -39,6 +39,20 @@ test.describe("Sidebar", () => {
     await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
   });
 
+  test("sidebar Projects button opens the Projects view", async ({ page }) => {
+    // Ported from the live projects-open story: the sidebar footer's
+    // Projects button navigates to /projects and ProjectsView mounts.
+    await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "Projects", exact: true }).click();
+
+    await expect(page).toHaveURL(/\/projects/);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.getByText(/Saved repositories you can multi-select/i)).toBeVisible();
+  });
+
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -89,6 +103,21 @@ test.describe("Create session from home screen", () => {
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.keyboard.press("Escape");
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
+  });
+
+  test("sidebar New session opens wizard and the header X closes it", async ({ page }) => {
+    // Ported from the live wizard-open-close story. Stub /api/sessions
+    // so useSessions reports the server reachable; otherwise the
+    // offline-state UI disables the sidebar "New session" trigger.
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByLabel("New session").first().click();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Close" }).click();
     await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 

@@ -3,7 +3,9 @@
 // profile, and leaves the global settings under `PATCH /api/settings`
 // untouched. Proves per-profile state isolation on the server.
 //
-// Pairs with profile-lifecycle.spec.ts.
+// Pairs with the mocked profile-lifecycle.spec.ts (web/tests/), which
+// covers the CRUD form UI; this spec keeps the server-side isolation
+// contract live.
 
 import { test, expect } from "../helpers/liveTest";
 

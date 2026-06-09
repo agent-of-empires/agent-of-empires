@@ -5,8 +5,8 @@
 // selection would otherwise be silently reverted by the unconditional
 // `setSelectedProfile(active.name)` the helper replaced.
 //
-// The full end-to-end behavior is asserted by
-// `web/tests/live/profile-lifecycle.spec.ts`. This test focuses on the
+// The full end-to-end behavior is asserted by the mocked Playwright spec
+// `web/tests/profile-lifecycle.spec.ts`. This test focuses on the
 // branch logic.
 
 import { describe, expect, it } from "vitest";

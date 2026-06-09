@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
-// Contract test for the first-run theme welcome modal. Live behavior (auto
-// show, persistence across reload, handoff to the tour) is covered by
-// tests/live/theme-onboarding.spec.ts; this file drills into the click ->
-// persist -> dispatch flow, the persist-then-paint failure path, and dismiss.
+// Contract test for the first-run theme welcome modal. Browser behavior (auto
+// show, persistence across reload, handoff to the tour) is covered by the
+// mocked Playwright spec tests/theme-onboarding.spec.ts; this file drills into
+// the click -> persist -> dispatch flow, the persist-then-paint failure path,
+// and dismiss.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";

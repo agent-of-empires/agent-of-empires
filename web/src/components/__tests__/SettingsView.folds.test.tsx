@@ -9,8 +9,8 @@
 // Every config-backed section is schema-driven (#1692): SchemaSection builds
 // its rows (and the advanced fold) from the descriptor list below, so this
 // mock mirrors the real worktree / sandbox / acp `#[setting(...)]` shapes. The
-// end-to-end persist-after-expand path (story #3) lives in live Playwright at
-// web/tests/live/settings-advanced-fold.spec.ts.
+// browser-level persist-after-expand path (story #3) lives in mocked
+// Playwright at web/tests/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -483,8 +483,8 @@ describe("Settings Advanced fold", () => {
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile
   // from its "" seed to the default. That transition must NOT remount the
   // content fieldset, or a fold expanded during the load window collapses out
-  // from under the user (the deterministic mirror of the live flake in
-  // tests/live/settings-advanced-fold.spec.ts).
+  // from under the user (the deterministic mirror of the flake the retired
+  // live settings-advanced-fold spec used to hit).
   it("keeps an expanded fold open when the initial profile resolves", async () => {
     let resolveProfiles!: (p: typeof PROFILES) => void;
     vi.mocked(api.fetchProfiles).mockImplementationOnce(

@@ -6,9 +6,9 @@
 // module so each assertion can pin whether the network was ever touched,
 // which is the property the validator must guarantee.
 //
-// The lifecycle round-trip against a real backend lives in
-// `web/tests/live/profile-lifecycle.spec.ts`. This test focuses on the
-// validation branches that don't need a server.
+// The lifecycle round-trip through the full app lives in the mocked
+// Playwright spec `web/tests/profile-lifecycle.spec.ts`. This test focuses on
+// the validation branches that don't need a browser.
 
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";

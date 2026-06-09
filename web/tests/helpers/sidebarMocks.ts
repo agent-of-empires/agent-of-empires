@@ -14,9 +14,11 @@ export interface MockSessionInput {
   branch: string | null;
   /** ISO 8601 timestamp; controls newest-first default ordering. */
   created_at?: string;
+  /** User group (`aoe add -g`); empty means Ungrouped on the group axis. */
+  group?: string;
 }
 
-type MockSession = Required<MockSessionInput>;
+type MockSession = MockSessionInput & { created_at: string };
 
 function fillCreatedAt(s: MockSessionInput, fallbackIndex: number): MockSession {
   return {
@@ -33,7 +35,10 @@ function sessionResponse(s: MockSession) {
     id: s.id,
     title: s.title,
     project_path: s.project_path,
-    group_path: s.project_path,
+    // The server stores the `-g` group here and leaves it empty when the
+    // session was added without one; empty buckets as Ungrouped on the
+    // group axis. The repo axis never reads it.
+    group_path: s.group ?? "",
     tool: "claude",
     status: "Idle",
     yolo_mode: false,
@@ -75,6 +80,11 @@ export interface SidebarMockOptions {
   ordering?: string[];
   /** Add `read_only: true` to the `/api/about` response. */
   readOnly?: boolean;
+  /** Mirror the real server: a successful PUT replaces the ordering
+   *  served by subsequent GET /api/sessions, so reload round-trips are
+   *  meaningful. Off by default; the failure-mode story relies on a
+   *  rejected PUT leaving the served order untouched either way. */
+  persistPutOrdering?: boolean;
 }
 
 /** Install routes for the surface the sidebar uses. Returns a handle
@@ -88,7 +98,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     readOnly: !!opts.readOnly,
   };
 
-  const ordering = opts.ordering ?? filled.map((s) => workspaceId(s));
+  let ordering = opts.ordering ?? filled.map((s) => workspaceId(s));
 
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
@@ -107,6 +117,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
       const override = handle.nextPutResponse;
       handle.nextPutResponse = null;
       if (override) return r.fulfill(override);
+      if (opts.persistPutOrdering && body?.order) ordering = body.order;
     }
     return r.fulfill({ json: { order: [] } });
   });

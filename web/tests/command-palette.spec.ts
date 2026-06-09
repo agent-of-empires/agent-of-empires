@@ -6,7 +6,11 @@ test.describe("Command palette", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.keyboard.press("ControlOrMeta+k");
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
+    const search = page.getByPlaceholder("Search actions, sessions, settings…");
+    await expect(search).toBeVisible();
+    // The search input must receive focus on open so the user can type
+    // immediately (ported from the live shortcut-palette story).
+    await expect(search).toBeFocused();
   });
 
   test("opens with Meta+K", async ({ page }) => {
