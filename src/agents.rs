@@ -73,6 +73,31 @@ pub struct AgentHookConfig {
     pub events: &'static [HookEvent],
 }
 
+/// Installer for an agent whose status hooks live in a config format the
+/// generic [`AgentHookConfig`] (JSON `settings.json`) path cannot emit: settl
+/// (TOML), hermes (YAML), kiro (per-agent JSON). Bundling the host path, the
+/// sandbox path, and the install/uninstall function pointers here lets every
+/// call site (`status_hook_env_prefix`, host install, sandbox install,
+/// `uninstall_all_hooks`) dispatch through one field instead of matching agent
+/// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+pub struct SidecarHooks {
+    /// Config path relative to the home directory for a host session
+    /// (e.g. `.hermes/config.yaml`).
+    pub host_config_subpath: &'static str,
+    /// Config path relative to the home directory for a sandboxed session
+    /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
+    /// container staging dir. Empty (and unused) for `host_only` agents.
+    pub sandbox_config_subpath: &'static str,
+    /// Write AoE status hooks into the config file at the given path.
+    pub install: fn(&std::path::Path) -> anyhow::Result<()>,
+    /// Remove AoE status hooks from the config file at the given path.
+    /// Returns whether anything was changed.
+    pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
+    /// Optional host-only follow-up run after a successful host install
+    /// (e.g. kiro promotes its `aoe-hooks` agent to the active default).
+    pub post_install_host: Option<fn()>,
+}
+
 /// Everything we know about a single agent CLI.
 pub struct AgentDef {
     /// Canonical name: `"claude"`, `"opencode"`, etc.
@@ -98,6 +123,10 @@ pub struct AgentDef {
     /// hooks into the agent's settings file so status is written to a file instead
     /// of being parsed from tmux pane content.
     pub hook_config: Option<AgentHookConfig>,
+    /// Sidecar hook installer for agents whose config format the generic
+    /// `hook_config` path cannot emit (settl/hermes/kiro). Mutually exclusive
+    /// with `hook_config`.
+    pub sidecar_hooks: Option<SidecarHooks>,
     /// How this agent resumes a prior session.
     pub resume_strategy: ResumeStrategy,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
@@ -289,6 +318,7 @@ pub const AGENTS: &[AgentDef] = &[
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -308,6 +338,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_opencode_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -324,6 +355,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_vibe_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -348,6 +380,7 @@ pub const AGENTS: &[AgentDef] = &[
             config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
@@ -396,6 +429,7 @@ pub const AGENTS: &[AgentDef] = &[
                 },
             ],
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -416,6 +450,7 @@ pub const AGENTS: &[AgentDef] = &[
             config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -432,6 +467,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -449,6 +485,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_pi_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -465,6 +502,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_droid_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -480,7 +518,17 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: false,
         detect_status: status_detection::detect_settl_status,
         container_env: &[],
+        // settl uses TOML config (`[[hooks]]` entries), not the JSON
+        // settings.json schema, so it installs via a sidecar hook. host_only,
+        // so the sandbox subpath is unused.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".settl/config.toml",
+            sandbox_config_subpath: "",
+            install: crate::hooks::install_settl_hooks,
+            uninstall: crate::hooks::uninstall_settl_hooks,
+            post_install_host: None,
+        }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
@@ -503,9 +551,16 @@ pub const AGENTS: &[AgentDef] = &[
         // allowlist file, which AoE pre-populates in install_hermes_hooks.
         container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
         // Hermes uses YAML (`hooks: { event: [...] }`) rather than the
-        // JSON settings.json schema shared by Claude/Cursor/Gemini, so
-        // hook_config: None and install is special-cased like settl.
+        // JSON settings.json schema shared by Claude/Cursor/Gemini, so it
+        // installs via a sidecar hook rather than hook_config.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".hermes/config.yaml",
+            sandbox_config_subpath: ".hermes/sandbox/config.yaml",
+            install: crate::hooks::install_hermes_hooks,
+            uninstall: crate::hooks::uninstall_hermes_hooks,
+            post_install_host: None,
+        }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -524,10 +579,18 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
-        // by Claude/Cursor/Gemini, so hook_config: None and install is
-        // special-cased like hermes/settl. Status comes from the hook sidecar
-        // file written by install_kiro_hooks; the pane stub is unused.
+        // by Claude/Cursor/Gemini, so it installs via a sidecar hook. Status
+        // comes from the hook sidecar file written by install_kiro_hooks; the
+        // pane stub is unused. post_install_host promotes the aoe-hooks agent
+        // to Kiro's active default.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
+            sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
+            install: crate::hooks::install_kiro_hooks,
+            uninstall: crate::hooks::uninstall_kiro_hooks,
+            post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
+        }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -548,6 +611,7 @@ pub const AGENTS: &[AgentDef] = &[
             config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -567,6 +631,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_antigravity_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,

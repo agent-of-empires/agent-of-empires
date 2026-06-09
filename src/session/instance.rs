@@ -270,15 +270,8 @@ fn default_true() -> bool {
     true
 }
 
-fn status_hook_env_prefix(
-    instance_id: &str,
-    tool: &str,
-    agent: Option<&crate::agents::AgentDef>,
-) -> String {
-    let has_hooks = agent.and_then(|a| a.hook_config.as_ref()).is_some()
-        || tool == "settl"
-        || tool == "hermes"
-        || tool == "kiro";
+fn status_hook_env_prefix(instance_id: &str, agent: Option<&crate::agents::AgentDef>) -> String {
+    let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
         format!("AOE_INSTANCE_ID={} ", instance_id)
@@ -1930,28 +1923,22 @@ impl Instance {
         if !hooks_enabled {
             return;
         }
-        if self.tool == "settl" {
-            // settl uses TOML config, not JSON settings
-            if let Err(e) = crate::hooks::install_settl_hooks() {
-                tracing::warn!(target: "session.store", "Failed to install settl hooks: {}", e);
-            }
-        } else if self.tool == "hermes" && !self.is_sandboxed() {
-            // Hermes uses YAML config; sandbox path is handled by build_container_config
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(".hermes").join("config.yaml");
-                if let Err(e) = crate::hooks::install_hermes_hooks(&config_path) {
-                    tracing::warn!(target: "session.store", "Failed to install hermes hooks: {}", e);
-                }
-            }
-        } else if self.tool == "kiro" && !self.is_sandboxed() {
-            // Kiro uses its own JSON agent config format; sandbox path is
-            // handled by build_container_config.
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(crate::hooks::KIRO_HOOKS_AGENT_FILE);
-                match crate::hooks::install_kiro_hooks(&config_path) {
-                    Ok(()) => crate::hooks::set_kiro_default_agent_if_builtin(),
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to install kiro hooks: {}", e)
+        if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
+            // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
+            // install into a host config file; sandbox install is handled by
+            // build_container_config. host_only agents (settl) are never
+            // sandboxed, so the gate is a no-op for them.
+            if !self.is_sandboxed() {
+                if let Some(home) = dirs::home_dir() {
+                    let config_path = home.join(sidecar.host_config_subpath);
+                    match (sidecar.install)(&config_path) {
+                        Ok(()) => {
+                            if let Some(post_install) = sidecar.post_install_host {
+                                post_install();
+                            }
+                        }
+                        Err(e) => tracing::warn!(target: "session.store",
+                            "Failed to install {} hooks: {}", self.tool, e),
                     }
                 }
             }
@@ -2026,7 +2013,7 @@ impl Instance {
             }
         }
 
-        let mut env_prefix = status_hook_env_prefix(&self.id, &self.tool, agent);
+        let mut env_prefix = status_hook_env_prefix(&self.id, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -3743,7 +3730,7 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("abc123", "codex", agent),
+            status_hook_env_prefix("abc123", agent),
             "AOE_INSTANCE_ID=abc123 "
         );
     }
@@ -5285,23 +5272,23 @@ mod tests {
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
-            status_hook_env_prefix("abc123", "hermes", crate::agents::get_agent("hermes")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("hermes")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "settl", crate::agents::get_agent("settl")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("settl")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "claude", crate::agents::get_agent("claude")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("claude")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "opencode", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "kiro", crate::agents::get_agent("kiro")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("kiro")),
             "AOE_INSTANCE_ID=abc123 "
         );
     }

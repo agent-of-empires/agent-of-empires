@@ -1292,11 +1292,10 @@ pub(crate) fn build_container_config(
     let hooks_enabled = profile_session_config.agent_status_hooks;
     if let Some(agent) = active_agent {
         if hooks_enabled {
-            // Hermes (YAML) and Kiro (per-agent JSON) use schemas the generic
-            // hook_config path below cannot emit, so they're special-cased here.
-            let hermes_hooks = agent.name == "hermes";
-            let kiro_hooks = agent.name == "kiro";
-            if hermes_hooks || kiro_hooks || agent.hook_config.is_some() {
+            // Sidecar agents (hermes YAML, kiro per-agent JSON) use schemas the
+            // generic hook_config path below cannot emit; they install through
+            // their SidecarHooks installer at the sandbox config subpath.
+            if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
                 let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
                     "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
                 )?;
@@ -1314,17 +1313,10 @@ pub(crate) fn build_container_config(
                 });
             }
 
-            if hermes_hooks {
-                let sandbox_dir = home.join(".hermes").join(SANDBOX_SUBDIR);
-                let config_file = sandbox_dir.join("config.yaml");
-                if let Err(e) = crate::hooks::install_hermes_hooks(&config_file) {
-                    tracing::warn!(target: "session.profile", "Failed to install hermes hooks in sandbox: {}", e);
-                }
-            } else if kiro_hooks {
-                let sandbox_dir = home.join(".kiro").join(SANDBOX_SUBDIR);
-                let config_file = sandbox_dir.join("agents").join("aoe-hooks.json");
-                if let Err(e) = crate::hooks::install_kiro_hooks(&config_file) {
-                    tracing::warn!(target: "session.profile", "Failed to install kiro hooks in sandbox: {}", e);
+            if let Some(sidecar) = &agent.sidecar_hooks {
+                let config_file = home.join(sidecar.sandbox_config_subpath);
+                if let Err(e) = (sidecar.install)(&config_file) {
+                    tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
                 // Install hooks into the sandbox config file for the containerized agent.
@@ -3010,6 +3002,90 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             "status hook directory should be mounted"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // Regression guard for the trap in #958: a sidecar agent (settl TOML,
+    // hermes YAML, kiro per-agent JSON) that lands without wiring up the
+    // sandbox install branch silently breaks status detection in containers.
+    // Driving every sandboxable sidecar agent through build_container_config
+    // and asserting its config lands at `sandbox_config_subpath` (plus a
+    // mounted hook dir) means a future agent that forgets to set
+    // `sidecar_hooks` fails this test instead of shipping broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_installs_sidecar_hooks_files() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
+            .iter()
+            .filter(|a| a.sidecar_hooks.is_some() && !a.host_only)
+            .collect();
+        assert!(
+            sidecar_agents.iter().any(|a| a.name == "hermes")
+                && sidecar_agents.iter().any(|a| a.name == "kiro"),
+            "expected hermes and kiro to be sandboxable sidecar agents"
+        );
+
+        for agent in sidecar_agents {
+            let sidecar = agent.sidecar_hooks.as_ref().unwrap();
+            assert!(
+                !sidecar.sandbox_config_subpath.is_empty(),
+                "{} is sandboxable so it needs a sandbox_config_subpath",
+                agent.name
+            );
+
+            let sandbox_info = super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+            };
+            let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new(agent.name, None),
+                false,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+
+            let sandbox_config = temp_home.path().join(sidecar.sandbox_config_subpath);
+            assert!(
+                sandbox_config.exists(),
+                "{} sandbox hook config should be installed at {}",
+                agent.name,
+                sandbox_config.display()
+            );
+            let contents = fs::read_to_string(&sandbox_config).unwrap();
+            assert!(
+                contents.contains("aoe-hooks"),
+                "{} sandbox config should contain the AoE hook marker",
+                agent.name
+            );
+
+            let hook_dir = crate::hooks::hook_status_dir(&instance_id)
+                .expect("test id must be allowlist-safe");
+            assert!(
+                config
+                    .volumes
+                    .iter()
+                    .any(|v| v.host_path == hook_dir.to_string_lossy()),
+                "{} should mount its status hook directory",
+                agent.name
+            );
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
     }
 
     #[test]
